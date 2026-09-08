@@ -114,8 +114,9 @@ $$;
 
 - Hybrid retrieval: HNSW cosine branch + FTS branch, fused with RRF
   (reciprocal rank fusion, constant 60). Each branch pulls top `3k`.
-- `project IS NOT DISTINCT FROM project` → filter when given, all-projects when
-  NULL.
+- `p_project IS NULL OR project = p_project` — filter when given, all-projects when
+  NULL. (v3 fix: v2's `IS NOT DISTINCT FROM p_project` matched zero rows when the
+  param was NULL — found 2026-09-08 in testing.)
 - Vector branch naturally returns nothing useful for pure keyword queries and
   FTS covers exact terms; RRF handles the mix without score normalization.
 
