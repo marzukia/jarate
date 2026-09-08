@@ -82,7 +82,11 @@ def collect(roots: list[str]) -> list[tuple[str, str, str]]:
         if not content.strip():
             return
         rel = os.path.relpath(path, home)
-        project = rel.split(os.sep)[0]
+        parts = rel.split(os.sep)
+        project = parts[0]
+        # ~/projects/<name>/... → tag with the project dir, not "projects"
+        if parts[0] == "projects" and len(parts) > 2:
+            project = parts[1]
         files.append((project, path, content))
 
     for root in roots:
