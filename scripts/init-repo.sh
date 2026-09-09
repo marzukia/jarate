@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 DIR="" OWNER_REPO="" PUSH=0 PRIVATE=0 FORCE=0 DRY=0 BIOME=0
 LEAD="TBD (fill before first merge)"
@@ -153,8 +153,14 @@ fi
 git -C "$DIR" add -A
 # --no-verify: the bootstrap commit lands on main, which the template's
 # no-commit-to-branch hook (rightly) refuses for day-to-day work.
-git -C "$DIR" commit -q --no-verify -m "chore: init ${REPO} from fleet boilerplate"
-echo "  commit     $(git -C "$DIR" rev-parse --short HEAD)"
+# Guard: --force re-render with zero content diff stages nothing; an empty
+# commit exits 1 and set -e would report failure on a successful no-op.
+if git -C "$DIR" diff --cached --quiet; then
+  echo "  commit     $(git -C "$DIR" rev-parse --short HEAD) (unchanged — no new commit)"
+else
+  git -C "$DIR" commit -q --no-verify -m "chore: init ${REPO} from fleet boilerplate"
+  echo "  commit     $(git -C "$DIR" rev-parse --short HEAD)"
+fi
 
 # --- remote / push ---------------------------------------------------------
 if ! git -C "$DIR" remote get-url origin >/dev/null 2>&1; then
