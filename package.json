@@ -1,0 +1,14 @@
+{
+  "name": "jarate",
+  "private": true,
+  "description": "Monorepo for the pi + piscord agent stack: piscord bridge, pi-bg dispatch, agent-say, installer.",
+  "license": "MIT",
+  "scripts": {
+    "lint": "bunx biome check .",
+    "test": "cd piscord && bun x bun test",
+    "typecheck": "cd piscord && bun x tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.12"
+  }
+}

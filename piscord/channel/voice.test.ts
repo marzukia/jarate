@@ -1,7 +1,7 @@
-import { test, expect, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
-  isVoiceAttachment,
   getVoiceAttachmentMatchReason,
+  isVoiceAttachment,
   voiceNoteText,
 } from "./voice";
 
@@ -24,8 +24,12 @@ describe("isVoiceAttachment", () => {
   });
 
   test("normal files rejected", () => {
-    expect(isVoiceAttachment({ name: "photo.png", contentType: "image/png" })).toBe(false);
-    expect(isVoiceAttachment({ name: "report.pdf", contentType: "application/pdf" })).toBe(false);
+    expect(
+      isVoiceAttachment({ name: "photo.png", contentType: "image/png" }),
+    ).toBe(false);
+    expect(
+      isVoiceAttachment({ name: "report.pdf", contentType: "application/pdf" }),
+    ).toBe(false);
   });
 
   test("empty ref rejected", () => {
@@ -35,14 +39,22 @@ describe("isVoiceAttachment", () => {
 
 describe("getVoiceAttachmentMatchReason", () => {
   test("preference order: content type, duration, waveform, filename", () => {
-    expect(getVoiceAttachmentMatchReason({ contentType: "audio/mpeg", duration: 1, name: "x.txt" }))
-      .toBe("contentType:audio/mpeg");
-    expect(getVoiceAttachmentMatchReason({ duration: 1, name: "x.txt" }))
-      .toBe("duration:1");
-    expect(getVoiceAttachmentMatchReason({ waveform: "1", name: "x.txt" }))
-      .toBe("waveform");
-    expect(getVoiceAttachmentMatchReason({ name: "clip.m4a" }))
-      .toBe("extension:.m4a");
+    expect(
+      getVoiceAttachmentMatchReason({
+        contentType: "audio/mpeg",
+        duration: 1,
+        name: "x.txt",
+      }),
+    ).toBe("contentType:audio/mpeg");
+    expect(getVoiceAttachmentMatchReason({ duration: 1, name: "x.txt" })).toBe(
+      "duration:1",
+    );
+    expect(
+      getVoiceAttachmentMatchReason({ waveform: "1", name: "x.txt" }),
+    ).toBe("waveform");
+    expect(getVoiceAttachmentMatchReason({ name: "clip.m4a" })).toBe(
+      "extension:.m4a",
+    );
     expect(getVoiceAttachmentMatchReason({ name: "x.txt" })).toBeNull();
   });
 });
@@ -55,11 +67,15 @@ describe("voiceNoteText", () => {
   });
 
   test("no filename falls back to generic label", () => {
-    expect(voiceNoteText({ duration: 5 })).toBe("[voice note: voice note (5s)]");
+    expect(voiceNoteText({ duration: 5 })).toBe(
+      "[voice note: voice note (5s)]",
+    );
   });
 
   test("no duration", () => {
-    expect(voiceNoteText({ filename: "clip.ogg" })).toBe("[voice note: clip.ogg]");
+    expect(voiceNoteText({ filename: "clip.ogg" })).toBe(
+      "[voice note: clip.ogg]",
+    );
   });
 
   test("empty ref", () => {
@@ -67,6 +83,8 @@ describe("voiceNoteText", () => {
   });
 
   test("discord formatting in filename is escaped", () => {
-    expect(voiceNoteText({ filename: "a```b.mp3" })).toBe("[voice note: a\\`\\`\\`b.mp3]");
+    expect(voiceNoteText({ filename: "a```b.mp3" })).toBe(
+      "[voice note: a\\`\\`\\`b.mp3]",
+    );
   });
 });

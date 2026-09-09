@@ -31,7 +31,7 @@ export function limitHeadingDepth(markdown: string, maxDepth = 3): string {
       const heading = token as Tokens.Heading;
       if (heading.depth > maxDepth) {
         const hashes = "#".repeat(maxDepth);
-        result += hashes + " " + heading.text + "\n";
+        result += `${hashes} ${heading.text}\n`;
       } else {
         result += token.raw;
       }
@@ -83,7 +83,7 @@ export function unnestCodeBlocksFromLists(markdown: string): string {
       typeof nextRaw === "string" &&
       !nextRaw.startsWith("\n");
 
-    result.push(needsNewline ? chunk + "\n" : chunk);
+    result.push(needsNewline ? `${chunk}\n` : chunk);
   }
   return result.join("");
 }
@@ -140,7 +140,7 @@ function processListItem(item: Tokens.ListItem, prefix: string): Segment[] {
       const lang = codeToken.lang || "";
       segments.push({
         type: "code",
-        content: "```" + lang + "\n" + codeToken.text + "\n```\n",
+        content: `\`\`\`${lang}\n${codeToken.text}\n\`\`\`\n`,
       });
       seenCodeBlock = true;
       continue;
@@ -217,12 +217,12 @@ function renderSegments(segments: Segment[]): string {
     } else {
       // list-item
       if (segment.prefix) {
-        result.push(segment.prefix + segment.content + "\n");
+        result.push(`${segment.prefix + segment.content}\n`);
       } else {
         // Raw content (no prefix means it's original raw)
         // Ensure raw ends with newline for proper separation from next segment
         const raw = segment.content.trimEnd();
-        result.push(raw + "\n");
+        result.push(`${raw}\n`);
       }
     }
   }
@@ -251,7 +251,7 @@ export function formatMarkdownTables(markdown: string): string {
     if (isTableToken(token)) {
       // Preserve the table's trailing newlines so following paragraphs keep
       // their separation.
-      const tail = token.raw.match(/\n{0,2}$/)![0];
+      const tail = token.raw.match(/\n{0,2}$/)?.[0];
       result += tableToKeyValue(token) + tail;
     } else {
       result += token.raw;
@@ -268,7 +268,9 @@ function tableToKeyValue(table: Tokens.Table): string {
   for (const row of table.rows) {
     for (let i = 0; i < row.length; i++) {
       const cell = row[i]!;
-      lines.push(`**${headers[i] || `col ${i + 1}`}** ${extractCellText(cell.tokens)}`);
+      lines.push(
+        `**${headers[i] || `col ${i + 1}`}** ${extractCellText(cell.tokens)}`,
+      );
     }
   }
   return lines.join("\n");
@@ -334,7 +336,7 @@ export function escapeBackticksInCodeBlocks(markdown: string): string {
   for (const token of tokens) {
     if (token.type === "code") {
       const escapedCode = token.text.replace(/`/g, "\\`");
-      result += "```" + (token.lang || "") + "\n" + escapedCode + "\n```\n";
+      result += `\`\`\`${token.lang || ""}\n${escapedCode}\n\`\`\`\n`;
     } else {
       result += token.raw;
     }
@@ -410,10 +412,16 @@ export function convertInlineForDiscord(md: string): string {
       continue;
     }
     // # heading → **heading**
-    let converted = line.replace(/^(#{1,6})\s+(.+)$/, (_m, _hashes: string, text: string) => `**${text}**`);
+    let converted = line.replace(
+      /^(#{1,6})\s+(.+)$/,
+      (_m, _hashes: string, text: string) => `**${text}**`,
+    );
     // [text](url) → text (<url>) — skip image refs ![alt](url) and code spans
     converted = codeSpans(converted, (part) =>
-      part.replace(/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g, (_m, text: string, url: string) => `${text} (<${url}>)`),
+      part.replace(
+        /(?<!!)\[([^\]]+)\]\(([^)]+)\)/g,
+        (_m, text: string, url: string) => `${text} (<${url}>)`,
+      ),
     );
     out.push(converted);
   }

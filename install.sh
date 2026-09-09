@@ -7,6 +7,7 @@
 #      Runs `bun install` there only if package.json changed.
 #   2. dispatch/pi-bg, dispatch/pi-wait -> ~/scripts/
 #   3. bin/agent-say -> ~/bin/agent-say
+#   4. git config core.hooksPath .githooks (source checkout only, idempotent)
 #
 # Usage:
 #   ./install.sh [--dry-run] [--piscord-dir DIR]
@@ -103,6 +104,12 @@ fi
 run cp -f "$SRC/bin/agent-say" "$HOME/bin/agent-say"
 run chmod +x "$HOME/bin/agent-say"
 echo "  bin: agent-say -> $HOME/bin/agent-say"
+
+# --- 4. git hooks (jarate checkout only, idempotent) ------------------------
+if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  run git -C "$SRC" config core.hooksPath .githooks
+echo "  git: core.hooksPath -> .githooks (in $SRC)"
+fi
 
 # --- summary ---------------------------------------------------------------
 echo
