@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**", "!**/*.sh", "!**/bun.lock"]
+    "includes": ["**", "!**/*.sh", "!**/bun.lock", "!templates"]
   },
   "formatter": {
     "enabled": true,

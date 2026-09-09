@@ -1,0 +1,32 @@
+# .pre-commit-config.yaml — {{REPO}}
+#
+# Cheap, fast hooks that catch the same drift CI rejects — on the
+# machine, before the push. Heavy gates stay in CI.
+#
+# Setup:
+#   pip install pre-commit    # or: uvx pre-commit
+#   pre-commit install        # writes .git/hooks/pre-commit itself; do NOT set
+#                             # core.hooksPath first — pre-commit refuses to
+#
+# Bypass (rare): git commit --no-verify — only with the lead's say-so.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  # Local preflight: whitespace + lint + test before every commit.
+  # Runs on every commit by design; once the layout is stable, narrow
+  # with a files: regex so docs-only commits stay cheap.
+  - repo: local
+    hooks:
+      - id: preflight
+        name: make preflight
+        entry: make preflight
+        language: system
+        pass_filenames: false
