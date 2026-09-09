@@ -1,9 +1,11 @@
-import { test, expect } from "bun:test";
+import { expect, test } from "bun:test";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 
 const sharpModule = await import("sharp").catch(() => null);
 const hasSharp = Boolean(sharpModule);
-const sharp: any = hasSharp ? (sharpModule as any).default ?? sharpModule : null;
+const sharp: any = hasSharp
+  ? ((sharpModule as any).default ?? sharpModule)
+  : null;
 
 /** sharp 0.34 has no .create() — build images from raw buffers instead. */
 function rawSharp(width: number, height: number, background = "#fff") {
@@ -49,10 +51,10 @@ test("optimizeImageBuffer: oversized image resized under 2000px", async () => {
   const big = await rawSharp(3000, 3000).png().toBuffer();
   const result = await optimizeImageBuffer(big, "image/png");
   expect(result).not.toBeNull();
-  const meta = await sharp(result!.buffer).metadata();
+  const meta = await sharp(result?.buffer).metadata();
   expect(meta.width).toBeLessThanOrEqual(2000);
   expect(meta.height).toBeLessThanOrEqual(2000);
-  expect(result!.mime).toBe("image/png");
+  expect(result?.mime).toBe("image/png");
 });
 
 test("optimizeImageBuffer: oversized jpeg resized and under 4MB", async () => {
@@ -62,6 +64,6 @@ test("optimizeImageBuffer: oversized jpeg resized and under 4MB", async () => {
     .toBuffer();
   const result = await optimizeImageBuffer(jpeg, "image/jpeg");
   expect(result).not.toBeNull(); // 2500px > 2000px always resizes
-  expect(result!.buffer.length).toBeLessThanOrEqual(4 * 1024 * 1024);
-  expect(result!.mime).toBe("image/jpeg");
+  expect(result?.buffer.length).toBeLessThanOrEqual(4 * 1024 * 1024);
+  expect(result?.mime).toBe("image/jpeg");
 });

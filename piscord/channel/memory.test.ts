@@ -1,5 +1,5 @@
-import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { condenseMemoryMd, memoryToc } from "./memory";
@@ -72,7 +72,7 @@ describe("memoryToc", () => {
   test("oversized MEMORY.md returns empty string", async () => {
     const ws = join(dir, "ws2");
     mkdirSync(ws);
-    const huge = "# T\n\n" + "x".repeat(200_000) + "\n";
+    const huge = `# T\n\n${"x".repeat(200_000)}\n`;
     writeFileSync(join(ws, "MEMORY.md"), huge);
     expect(await memoryToc(ws)).toBe("");
   });

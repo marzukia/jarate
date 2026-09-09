@@ -16,61 +16,66 @@
  * (20 MB per-file cap, skipped files noted in the LLM message); file info
  * is included in the LLM message as a folder reference.
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {getMarkdownTheme, SettingsManager } from "@earendil-works/pi-coding-agent";
-import {Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
 
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
-
-import {
-  loadChannelConfig,
-  getDefaultChannel,
-  getChannel,
-  type ChannelConfig,
-  type ChannelMessage,
-  type AttachmentRef,
-} from "./types";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import { BTW_HINT, extractBtwSuffix } from "./btw";
 
 import {
   connectDiscord,
+  connectDiscordPresence,
+  type DiscordCallbacks,
+  deferInteraction,
+  deleteDiscordMessage,
   disconnectDiscord,
+  editDiscordMessage,
+  editInteractionMessage,
+  getDiscordChannelId,
+  getDiscordToken,
+  loadDiscordAttachment,
+  MAX_ATTACHMENT_BYTES,
+  registerDiscordCommands,
+  respondToInteraction,
   sendDiscordMessage,
   sendDiscordMessageWithFiles,
-  loadDiscordAttachment,
-  getDiscordToken,
-  getDiscordChannelId,
-  unreactMessage,
-  connectDiscordPresence,
+  sendDiscordTyping,
+  sendFilesToDiscord,
+  setDiscordInteractionHandler,
   setDiscordPresenceActivity,
   stopDiscordPresence,
-  sendDiscordTyping,
-  editDiscordMessage,
-  deleteDiscordMessage,
-  sendFilesToDiscord,
-  MAX_ATTACHMENT_BYTES,
   suppressAutoReact,
-  setDiscordInteractionHandler,
-  respondToInteraction,
-  deferInteraction,
-  editInteractionMessage,
-  registerDiscordCommands,
-  type DiscordCallbacks,
+  unreactMessage,
 } from "./discord";
 
 import { mdToDiscord } from "./format";
-import { BTW_HINT, extractBtwSuffix } from "./btw";
-import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { memoryToc } from "./memory";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
+import {
+  type AttachmentRef,
+  type ChannelConfig,
+  type ChannelMessage,
+  getChannel,
+  getDefaultChannel,
+  loadChannelConfig,
+} from "./types";
+import { isVoiceAttachment, voiceNoteText } from "./voice";
 
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
 const verboseOverride = new Map<string, boolean>();
-interface BurstBuffer { parts: { body: string; id?: string }[]; timer: ReturnType<typeof setTimeout> | null; }
+interface BurstBuffer {
+  parts: { body: string; id?: string }[];
+  timer: ReturnType<typeof setTimeout> | null;
+}
 const burstBuffers = new Map<string, BurstBuffer>();
 const BURST_WINDOW_MS = 2500;
 // Last inbound Discord message id per channel — the 👀 ack target. The
@@ -91,14 +96,18 @@ let userStoppedRun = false;
 // warning line is posted instead. The counter resets on any different
 // final or on a new inbound user message.
 const finalReps = new Map<string, string[]>();
-export const REPEAT_WARNING = "⚠️ repetition loop detected — run stopped. Say /reset if it persists.";
+export const REPEAT_WARNING =
+  "⚠️ repetition loop detected — run stopped. Say /reset if it persists.";
 
 /** Record a posted final; true on the third consecutive identical one. */
 export function recordFinalRepeat(channelId: string, text: string): boolean {
   const t = text.trim();
   const arr = finalReps.get(channelId) ?? [];
   if (arr.length > 0 && arr[arr.length - 1] === t) arr.push(t);
-  else { arr.length = 0; arr.push(t); }
+  else {
+    arr.length = 0;
+    arr.push(t);
+  }
   if (arr.length >= 3) {
     finalReps.set(channelId, []);
     return true;
@@ -132,12 +141,19 @@ function formatToolCallLine(toolName: string, input: any): string {
         .replace(/\s*2>&1\s*$/, "");
       return `┣ bash ${esc(one(seg, 80))}`;
     }
-    case "read": return `┣ read ${esc(one(p, 80))}`;
-    case "edit": return `◼︎ edit ${esc(one(p, 80))}`;
-    case "write": return `◼︎ write ${esc(one(p, 80))}`;
+    case "read":
+      return `┣ read ${esc(one(p, 80))}`;
+    case "edit":
+      return `◼︎ edit ${esc(one(p, 80))}`;
+    case "write":
+      return `◼︎ write ${esc(one(p, 80))}`;
     default: {
       let args: string;
-      try { args = JSON.stringify(input); } catch { args = String(input); }
+      try {
+        args = JSON.stringify(input);
+      } catch {
+        args = String(input);
+      }
       return `┣ ${toolName} ${esc(one(args, 60))}`;
     }
   }
@@ -150,7 +166,8 @@ function statusLine(action: string, n: number, t0: number): string {
 }
 
 /** Local files referenced in final text (images + common docs). */
-const ATTACHABLE_RE = /(?:\/[\w.+\-]+)+\.(?:png|jpe?g|gif|webp|bmp|mp4|mov|webm|pdf|md|txt|log|csv|json)(?=[\s)`"',.:;!?)\]]|$)/gi;
+const ATTACHABLE_RE =
+  /(?:\/[\w.+-]+)+\.(?:png|jpe?g|gif|webp|bmp|mp4|mov|webm|pdf|md|txt|log|csv|json)(?=[\s)`"',.:;!?)\]]|$)/gi;
 
 function detectAttachmentFiles(text: string): string[] {
   const out: string[] = [];
@@ -163,7 +180,9 @@ function detectAttachmentFiles(text: string): string[] {
       const st = fs.statSync(p);
       if (!st.isFile() || st.size > 25 * 1024 * 1024) continue;
       out.push(p);
-    } catch { continue; }
+    } catch {
+      continue;
+    }
     if (out.length >= 10) break;
   }
   return out;
@@ -186,8 +205,10 @@ function splitLongLine(line: string, max: number): string[] {
   const out: string[] = [];
   let cur = "";
   for (const cp of Array.from(line)) {
-    if (cur.length + cp.length > max) { out.push(cur); cur = cp; }
-    else cur += cp;
+    if (cur.length + cp.length > max) {
+      out.push(cur);
+      cur = cp;
+    } else cur += cp;
   }
   if (cur) out.push(cur);
   return out;
@@ -202,7 +223,12 @@ function splitLongLine(line: string, max: number): string[] {
 export function chunkText(text: string, max: number): string[] {
   const out: string[] = [];
   let cur = "";
-  const flush = () => { if (cur) { out.push(cur); cur = ""; } };
+  const flush = () => {
+    if (cur) {
+      out.push(cur);
+      cur = "";
+    }
+  };
   const lines = text.split("\n");
   let i = 0;
   while (i < lines.length) {
@@ -215,8 +241,15 @@ export function chunkText(text: string, max: number): string[] {
       const block: string[] = [line];
       let closed = false;
       i++;
-      while (i < lines.length && !closeRe.test(lines[i])) { block.push(lines[i]); i++; }
-      if (i < lines.length) { block.push(lines[i]); i++; closed = true; } // closing fence
+      while (i < lines.length && !closeRe.test(lines[i])) {
+        block.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) {
+        block.push(lines[i]);
+        i++;
+        closed = true;
+      } // closing fence
       const blockText = block.join("\n");
       if (blockText.length > max) {
         flush();
@@ -270,7 +303,13 @@ export function chunkText(text: string, max: number): string[] {
 function cleanThinking(text: string): string {
   const O = "<think>";
   const C = "</think>";
-  const strip = (t: string) => t.split(O).join("").split(C).join("").replace(/\n{3,}/g, "\n\n");
+  const strip = (t: string) =>
+    t
+      .split(O)
+      .join("")
+      .split(C)
+      .join("")
+      .replace(/\n{3,}/g, "\n\n");
   const firstO = text.indexOf(O);
   if (firstO >= 0) {
     const lastC = text.lastIndexOf(C);
@@ -307,7 +346,11 @@ export function parseReplyTo(text: string): { text: string; replyTo?: string } {
     if (f) {
       if (!openFence) {
         openFence = f[1];
-      } else if (f[1][0] === openFence[0] && f[1].length >= openFence.length && f[2].trim() === "") {
+      } else if (
+        f[1][0] === openFence[0] &&
+        f[1].length >= openFence.length &&
+        f[2].trim() === ""
+      ) {
         openFence = null;
       }
       return line; // fence lines are never tag carriers
@@ -330,14 +373,20 @@ export function parseReplyTo(text: string): { text: string; replyTo?: string } {
  * inbound message ids (details.messageIds), it wins over the default
  * last-message target. Exported for tests.
  */
-export function collectFinals(messages: unknown[]): { text: string; replyTo?: string }[] {
+export function collectFinals(
+  messages: unknown[],
+): { text: string; replyTo?: string }[] {
   const finals: { text: string; replyTo?: string }[] = [];
   let replyTo: string | undefined;
   let allowed: Set<string> | null = null;
   for (const m of messages as any[]) {
     if (m?.customType === CHANNEL_MSG_TYPE) {
       replyTo = m.details?.messageId;
-      const ids = Array.isArray(m.details?.messageIds) ? m.details.messageIds : (replyTo ? [replyTo] : []);
+      const ids = Array.isArray(m.details?.messageIds)
+        ? m.details.messageIds
+        : replyTo
+          ? [replyTo]
+          : [];
       allowed = new Set(ids.map(String));
       continue;
     }
@@ -352,7 +401,8 @@ export function collectFinals(messages: unknown[]): { text: string; replyTo?: st
     const clean = cleanThinking(text.trim());
     if (!clean) continue;
     const rt = parseReplyTo(clean);
-    const chosen = rt.replyTo && allowed?.has(rt.replyTo) ? rt.replyTo : replyTo;
+    const chosen =
+      rt.replyTo && allowed?.has(rt.replyTo) ? rt.replyTo : replyTo;
     finals.push({ text: rt.text, replyTo: chosen });
   }
   return finals;
@@ -364,31 +414,97 @@ export function collectFinals(messages: unknown[]): { text: string; replyTo?: st
  * form absorbs nothing, so "stop that" is chat, not /stop.
  * Exported for tests.
  */
-export function matchCommand(body: string): { name: string; arg?: string } | null {
-  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model)(?:\s+([\s\S]+))?|stop)$/i);
+export function matchCommand(
+  body: string,
+): { name: string; arg?: string } | null {
+  const m = body.match(
+    /^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs)(?:\s+([\s\S]+))?|stop)$/i,
+  );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
 }
 
+// ─── /jobs: in-flight pi-bg dispatches ─────────────────────────────────
+// The pi-bg wrapper's command line carries profile + task, and the wrapper
+// process exists only while the run is live, so `ps` is the reliable
+// in-flight marker (the prompt/out artifacts are written at run end).
+// Match the wrapper line shape: <etime> <bash> <...>scripts/pi-bg <profile> <task>
+export function parseJobsFromPs(
+  psOut: string,
+): { profile: string; age: string; task: string }[] {
+  const out: { profile: string; age: string; task: string }[] = [];
+  for (const line of psOut.split("\n")) {
+    const m = line
+      .trim()
+      .match(
+        /^(\S+)\s+\S*bash\s+\S*scripts\/pi-bg\s+(worker|reviewer)\s+(.+)$/,
+      );
+    if (!m) continue;
+    const task = m[3]
+      .trim()
+      .replace(/^"+|"+$/g, "")
+      .split("\n")[0]
+      .slice(0, 70);
+    out.push({ age: m[1], profile: m[2], task });
+  }
+  return out;
+}
+
+export function listInflightJobs(): string {
+  let raw = "";
+  try {
+    const uid = process.getuid?.();
+    raw = execSync(
+      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o etime,args | grep '[s]cripts/pi-bg'`,
+      { encoding: "utf8", timeout: 5000 },
+    );
+  } catch {
+    return "No jobs in flight.";
+  }
+  const jobs = parseJobsFromPs(raw);
+  if (jobs.length === 0) return "No jobs in flight.";
+  const lines = jobs.map((j) => `- ${j.profile} · ${j.age} · ${j.task}`);
+  return `${jobs.length} job${jobs.length > 1 ? "s" : ""} in flight:\n${lines.join("\n")}`;
+}
+
 /** ! shell passthrough: run bash -c in the working directory, 60s cap.
  *  Keeps the first 20k chars of combined stdout+stderr. Exported for tests. */
-export function runShellPassthrough(cmd: string, cwd: string): Promise<{ out: string; code: number; timedOut: boolean }> {
+export function runShellPassthrough(
+  cmd: string,
+  cwd: string,
+): Promise<{ out: string; code: number; timedOut: boolean }> {
   return new Promise((resolve) => {
     const p = spawn("bash", ["-c", cmd], { cwd, env: process.env });
     let out = "";
     let timedOut = false;
-    const cap = (s: string) => { if (out.length < 20_000) out += s.slice(0, 20_000 - out.length); };
-    const t = setTimeout(() => { timedOut = true; try { p.kill("SIGKILL"); } catch {} }, 60_000);
+    const cap = (s: string) => {
+      if (out.length < 20_000) out += s.slice(0, 20_000 - out.length);
+    };
+    const t = setTimeout(() => {
+      timedOut = true;
+      try {
+        p.kill("SIGKILL");
+      } catch {}
+    }, 60_000);
     p.stdout?.on("data", (d) => cap(String(d)));
     p.stderr?.on("data", (d) => cap(String(d)));
-    p.on("error", (e) => { clearTimeout(t); resolve({ out: `spawn failed: ${e.message}`, code: 1, timedOut: false }); });
-    p.on("close", (code) => { clearTimeout(t); resolve({ out, code: code ?? 1, timedOut }); });
+    p.on("error", (e) => {
+      clearTimeout(t);
+      resolve({ out: `spawn failed: ${e.message}`, code: 1, timedOut: false });
+    });
+    p.on("close", (code) => {
+      clearTimeout(t);
+      resolve({ out, code: code ?? 1, timedOut });
+    });
   });
 }
 
 /** Fenced code block sized to the content's backtick runs. */
 function wrapFence(t: string): string {
-  const n = (t.match(/`+/g) || ["`"]).reduce((m, r) => Math.max(m, r.length), 0);
+  const n = (t.match(/`+/g) || ["`"]).reduce(
+    (m, r) => Math.max(m, r.length),
+    0,
+  );
   const f = "`".repeat(Math.max(3, n + 1));
   return `${f}\n${t}\n${f}`;
 }
@@ -400,11 +516,17 @@ function wrapFence(t: string): string {
  * with an errorMessage when the run was NOT user-stopped — return the
  * post text; null otherwise. Exported for tests.
  */
-export function failurePostText(messages: unknown[], userStopped: boolean): string | null {
+export function failurePostText(
+  messages: unknown[],
+  userStopped: boolean,
+): string | null {
   const last = messages.at(-1) as any;
-  if (!last || last.role !== "assistant") return null;
+  if (last?.role !== "assistant") return null;
   const err = typeof last.errorMessage === "string" ? last.errorMessage : "";
-  if (last.stopReason === "error" || (last.stopReason === "aborted" && err && !userStopped)) {
+  if (
+    last.stopReason === "error" ||
+    (last.stopReason === "aborted" && err && !userStopped)
+  ) {
     return `⚠️ ${err || "run failed"}`;
   }
   return null;
@@ -461,7 +583,7 @@ const CHANNEL_MSG_TYPE = "channel-inbound";
 
 interface ChannelMessageDetails {
   title: string; // e.g. "discord/Discord Main"
-  body: string;  // user-visible message body (no channel-ctx)
+  body: string; // user-visible message body (no channel-ctx)
   messageId?: string; // source message id, used for reply threading
   messageIds?: string[]; // all source message ids (burst merges carry >1)
 }
@@ -483,14 +605,17 @@ const ATTACHMENT_BATCH_TTL_MS = 10 * 60 * 1000;
 
 /** Synthesized prompt for file-only messages when bufferFileOnly is off. */
 export function fileOnlyPrompt(files: AttachmentRef[]): string {
-  const names = files.map(f => f.filename).join(", ");
+  const names = files.map((f) => f.filename).join(", ");
   return `[user sent ${files.length} ${files.length === 1 ? "file" : "files"} without text: ${names}]`;
 }
 
 /** Drop expired batches for a channel; return the ones still fresh. */
-export function prunePendingBatches(channelId: string, now = Date.now()): AttachmentBatch[] {
+export function prunePendingBatches(
+  channelId: string,
+  now = Date.now(),
+): AttachmentBatch[] {
   const all = pendingAttachments.get(channelId) || [];
-  const fresh = all.filter(b => now - b.addedAt < ATTACHMENT_BATCH_TTL_MS);
+  const fresh = all.filter((b) => now - b.addedAt < ATTACHMENT_BATCH_TTL_MS);
   if (fresh.length === all.length) return fresh;
   if (fresh.length === 0) pendingAttachments.delete(channelId);
   else pendingAttachments.set(channelId, fresh);
@@ -513,20 +638,38 @@ export default function (pi: ExtensionAPI) {
   // ─── TUI rendering for inbound channel messages ──────────────────────
   // Mimics the user-message look (boxed markdown) with a type/name title;
   // the <channel-ctx> block stays LLM-only.
-  pi.registerMessageRenderer<ChannelMessageDetails>(CHANNEL_MSG_TYPE, (message, _options, theme) => {
-    const details = message.details ?? { title: "channel", body: "" };
-    const body = details.body || (typeof message.content === "string" ? message.content : "");
+  pi.registerMessageRenderer<ChannelMessageDetails>(
+    CHANNEL_MSG_TYPE,
+    (message, _options, theme) => {
+      const details = message.details ?? { title: "channel", body: "" };
+      const body =
+        details.body ||
+        (typeof message.content === "string" ? message.content : "");
 
-    const box = new Box(1, 1, (t: string) => theme.bg("userMessageBg", t));
-    box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(details.title)), 0, 0));
-    if (body) {
-      box.addChild(new Spacer(1));
-      box.addChild(new Markdown(body, 0, 0, getMarkdownTheme(),
-        { color: (t: string) => theme.fg("userMessageText", t) },
-        { preserveOrderedListMarkers: true }));
-    }
-    return box;
-  });
+      const box = new Box(1, 1, (t: string) => theme.bg("userMessageBg", t));
+      box.addChild(
+        new Text(
+          theme.fg("customMessageLabel", theme.bold(details.title)),
+          0,
+          0,
+        ),
+      );
+      if (body) {
+        box.addChild(new Spacer(1));
+        box.addChild(
+          new Markdown(
+            body,
+            0,
+            0,
+            getMarkdownTheme(),
+            { color: (t: string) => theme.fg("userMessageText", t) },
+            { preserveOrderedListMarkers: true },
+          ),
+        );
+      }
+      return box;
+    },
+  );
 
   // ─── Startup / Shutdown ────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
@@ -534,7 +677,7 @@ export default function (pi: ExtensionAPI) {
     workspaceRoot = ctx.cwd;
     channels = loadChannelConfig(ctx.cwd);
 
-    const enabled = channels.filter(c => c.enabled);
+    const enabled = channels.filter((c) => c.enabled);
     if (enabled.length === 0) return;
 
     const defaultCh = getDefaultChannel(channels);
@@ -546,21 +689,33 @@ export default function (pi: ExtensionAPI) {
           onMessage(msg) {
             msg.channelId = ch.id;
             handleInbound(pi, msg, ctx).catch((e) => {
-              console.error("[channel] inbound failed:", sanitizeUnknownValue(e));
+              console.error(
+                "[channel] inbound failed:",
+                sanitizeUnknownValue(e),
+              );
             });
           },
-          onError(_c, err) { console.error(`[discord] ${sanitizeSensitiveText(err)}`); },
+          onError(_c, err) {
+            console.error(`[discord] ${sanitizeSensitiveText(err)}`);
+          },
         };
-        const ok = await connectDiscord(ch, discordCallbacks, path.join(ctx.cwd, ".tmp"));
+        const ok = await connectDiscord(
+          ch,
+          discordCallbacks,
+          path.join(ctx.cwd, ".tmp"),
+        );
         if (!ok) {
-          ctx.ui.setStatus("Channel",`discord/${ch.name}: connection failed`)
+          ctx.ui.setStatus("Channel", `discord/${ch.name}: connection failed`);
         } else {
-          ctx.ui.setStatus("Channel",`discord/${ch.name}`)
+          ctx.ui.setStatus("Channel", `discord/${ch.name}`);
           const bt = ch.botToken;
           if (bt) {
             connectDiscordPresence(bt);
             registerDiscordCommands(bt).catch(() => {});
-            setDiscordInteractionHandler(bt, buildInteractionHandler(pi, ctx, ch, bt));
+            setDiscordInteractionHandler(
+              bt,
+              buildInteractionHandler(pi, ctx, ch, bt),
+            );
           }
           // startupMessage is posted by the poller once the bot's own user
           // id is resolved (prevents the self-echo window).
@@ -570,17 +725,21 @@ export default function (pi: ExtensionAPI) {
     writeChannelState(workspaceRoot, channels);
 
     // LLM tool: send local file(s) to the active Discord channel.
-    if (enabled.some(c => c.type === "discord" && (getDiscordToken(c.id) || c.botToken))) {
+    if (
+      enabled.some(
+        (c) => c.type === "discord" && (getDiscordToken(c.id) || c.botToken),
+      )
+    ) {
       registerSendFileTool(pi, channels);
     }
   });
 
-    pi.on("session_shutdown", async () => {
-      if (typingTimer) {
-        clearInterval(typingTimer);
-        typingTimer = null;
-      }
-      for (const ch of channels) {
+  pi.on("session_shutdown", async () => {
+    if (typingTimer) {
+      clearInterval(typingTimer);
+      typingTimer = null;
+    }
+    for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
         if (ch.botToken) {
@@ -609,22 +768,38 @@ export default function (pi: ExtensionAPI) {
       runStartedAt = Date.now();
       // reuse the line only while it is fresh; an old one is buried in
       // history — delete it and start near the current conversation
-      if (statusMsgId && statusChannelId === ch.id && Date.now() - statusMsgAt > 10 * 60 * 1000) {
+      if (
+        statusMsgId &&
+        statusChannelId === ch.id &&
+        Date.now() - statusMsgAt > 10 * 60 * 1000
+      ) {
         await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
         statusMsgId = null;
       }
     }
     runToolCount += 1;
-    const line = statusLine(formatToolCallLine(event.toolName, event.input), runToolCount, runStartedAt);
+    const line = statusLine(
+      formatToolCallLine(event.toolName, event.input),
+      runToolCount,
+      runStartedAt,
+    );
     toolCallsThisTurn.push(line);
     try {
       if (!statusMsgId) {
         const r = await sendDiscordMessage(ch, line);
-        if (r.success && r.messageId) { statusMsgId = r.messageId; statusMsgAt = Date.now(); }
-        else if (!r.success) console.error(`[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`);
+        if (r.success && r.messageId) {
+          statusMsgId = r.messageId;
+          statusMsgAt = Date.now();
+        } else if (!r.success)
+          console.error(
+            `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
       } else {
         const r = await editDiscordMessage(ch, statusMsgId, line);
-        if (!r.success) console.error(`[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`);
+        if (!r.success)
+          console.error(
+            `[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
       }
     } catch {}
   });
@@ -632,7 +807,7 @@ export default function (pi: ExtensionAPI) {
   // ─── Typing indicator while working ────────────────────────────────────
   pi.on("turn_start", async (_event, ctx) => {
     const ch = lastActiveChannel;
-    if (!ch || ch.type !== "discord") return;
+    if (ch?.type !== "discord") return;
     userStoppedRun = false; // a new run makes any earlier /stop flag stale
     // activity block: every run gets a placeholder, edited in place as
     // tool calls fire, closed at agent_end. turn_start fires per step,
@@ -652,7 +827,10 @@ export default function (pi: ExtensionAPI) {
     console.log("[channel] typing indicator started");
     sendDiscordTyping(ch).catch(() => {});
     if (typingTimer) clearInterval(typingTimer);
-    typingTimer = setInterval(() => sendDiscordTyping(ch).catch(() => {}), 8000);
+    typingTimer = setInterval(
+      () => sendDiscordTyping(ch).catch(() => {}),
+      8000,
+    );
     agentBusy = true;
     refreshActivity(ctx);
   });
@@ -663,15 +841,19 @@ export default function (pi: ExtensionAPI) {
     try {
       const u = ctx.getContextUsage?.();
       const pct = u?.percent;
-      const modelId = String((ctx.model as any)?.id ?? (ctx.model as any)?.name ?? "");
+      const modelId = String(
+        (ctx.model as any)?.id ?? (ctx.model as any)?.name ?? "",
+      );
       const model = modelId.split("/").pop() || "";
       const parts: string[] = [];
-      if (typeof pct === "number" && Number.isFinite(pct)) parts.push(`ctx ${Math.round(pct)}%`);
+      if (typeof pct === "number" && Number.isFinite(pct))
+        parts.push(`ctx ${Math.round(pct)}%`);
       if (model) parts.push(model);
       parts.push(agentBusy ? "working" : "idle");
       const text = parts.join(" • ");
       for (const ch of channels) {
-        if (ch.type === "discord" && ch.botToken) setDiscordPresenceActivity(ch.botToken, text);
+        if (ch.type === "discord" && ch.botToken)
+          setDiscordPresenceActivity(ch.botToken, text);
       }
     } catch {}
   };
@@ -698,20 +880,33 @@ export default function (pi: ExtensionAPI) {
       // Third consecutive identical final — a stuck loop. Drop the
       // repeated final, abort the run, post one warning line instead.
       userStoppedRun = true;
-      if (ch.type === "discord") sendDiscordMessage(ch, REPEAT_WARNING).catch(() => {});
-      try { ctx.abort(); } catch {}
+      if (ch.type === "discord")
+        sendDiscordMessage(ch, REPEAT_WARNING).catch(() => {});
+      try {
+        ctx.abort();
+      } catch {}
       return;
     }
     const rt = parseReplyTo(text);
     const allowed = runInboundIds.get(ch.id);
-    const tagged = rt.replyTo && allowed?.includes(rt.replyTo) ? rt.replyTo : undefined;
-    const replyTo = tagged ?? (early === null ? lastInboundIds.get(ch.id) : undefined);
+    const tagged =
+      rt.replyTo && allowed?.includes(rt.replyTo) ? rt.replyTo : undefined;
+    const replyTo =
+      tagged ?? (early === null ? lastInboundIds.get(ch.id) : undefined);
     const chunks = chunkText(rt.text, 1900);
     const files = detectAttachmentFiles(rt.text);
     for (let i = 0; i < chunks.length; i++) {
       try {
-        const r = await sendFinalWithFiles(ch, chunks[i], i === 0 ? files : [], i === 0 ? replyTo : undefined);
-        if (!r.success) console.error(`[channel] early send failed: ${sanitizeSensitiveText(r.error || "")}`);
+        const r = await sendFinalWithFiles(
+          ch,
+          chunks[i],
+          i === 0 ? files : [],
+          i === 0 ? replyTo : undefined,
+        );
+        if (!r.success)
+          console.error(
+            `[channel] early send failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
       } catch {}
     }
     // Unreact the 👀 ack on this channel's last inbound message (A1):
@@ -737,7 +932,10 @@ export default function (pi: ExtensionAPI) {
     // and the early return below. Clearing at the bottom leaked the typing
     // timer (typing indicator ran forever) and left agentBusy stuck (presence
     // stuck on "working") — 2026-09-08.
-    if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
+    if (typingTimer) {
+      clearInterval(typingTimer);
+      typingTimer = null;
+    }
     agentBusy = false;
     refreshActivity(ctx);
     if (!lastActiveChannel) return;
@@ -749,7 +947,8 @@ export default function (pi: ExtensionAPI) {
     if (statusMsgId && statusChannelId === ch.id) {
       const secs = Math.round((Date.now() - runStartedAt) / 1000);
       await editDiscordMessage(
-        ch, statusMsgId,
+        ch,
+        statusMsgId,
         `┗ done · ${runToolCount} call${runToolCount === 1 ? "" : "s"} · ${secs}s`,
       ).catch(() => {});
     }
@@ -770,7 +969,10 @@ export default function (pi: ExtensionAPI) {
       if (failText) {
         try {
           const r = await send(failText);
-          if (!r.success) console.error(`[channel] error post failed: ${sanitizeSensitiveText(r.error || "")}`);
+          if (!r.success)
+            console.error(
+              `[channel] error post failed: ${sanitizeSensitiveText(r.error || "")}`,
+            );
         } catch {}
       }
       return;
@@ -785,9 +987,14 @@ export default function (pi: ExtensionAPI) {
         if (ch.type === "discord") {
           try {
             const r = await send(REPEAT_WARNING);
-            if (!r.success) console.error(`[channel] repetition warning failed: ${sanitizeSensitiveText(r.error || "")}`);
+            if (!r.success)
+              console.error(
+                `[channel] repetition warning failed: ${sanitizeSensitiveText(r.error || "")}`,
+              );
           } catch {}
-          try { ctx.abort(); } catch {}
+          try {
+            ctx.abort();
+          } catch {}
         }
         continue;
       }
@@ -795,7 +1002,10 @@ export default function (pi: ExtensionAPI) {
       for (let i = 0; i < chunks.length; i++) {
         try {
           const r = await send(chunks[i], i === 0 ? f.replyTo : undefined);
-          if (!r.success) console.error(`[channel] send failed: ${sanitizeSensitiveText(r.error || "")}`);
+          if (!r.success)
+            console.error(
+              `[channel] send failed: ${sanitizeSensitiveText(r.error || "")}`,
+            );
         } catch {}
       }
       // Clear the ack even when every chunk failed, so a failed reply
@@ -803,10 +1013,10 @@ export default function (pi: ExtensionAPI) {
       if (ch.type === "discord" && f.replyTo) {
         const token = getDiscordToken(ch.id) || ch.botToken;
         const channelId = getDiscordChannelId(ch.id);
-        if (token && channelId) unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
+        if (token && channelId)
+          unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
       }
     }
-
   });
 }
 
@@ -829,10 +1039,14 @@ const HELP_TEXT = [
   "`/verbose on|off` — forward tool calls to the channel (owner)",
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
+  "`/jobs` — list in-flight pi-bg dispatches",
   "`/help` — this message",
 ].join("\n");
 
-function channelTitle(ch: ChannelConfig | undefined, msg: ChannelMessage): string {
+function channelTitle(
+  ch: ChannelConfig | undefined,
+  msg: ChannelMessage,
+): string {
   const type = ch?.type || msg.channelType;
   const name = ch?.name || msg.channelName || msg.channelId;
   return `${type}/${name}`;
@@ -848,11 +1062,17 @@ function escapePromptAttr(value: string): string {
 }
 
 function escapePromptText(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 /** Build the <replied-message> LLM block, or "" when there is no reply ref. Exported for tests. */
-export function buildRepliedMessageBlock(rm?: { author: string; text: string }): string {
+export function buildRepliedMessageBlock(rm?: {
+  author: string;
+  text: string;
+}): string {
   if (!rm?.text) return "";
   const author = rm.author ? ` author="${escapePromptAttr(rm.author)}"` : "";
   return `This message was a reply to message\n\n<replied-message${author}>\n${escapePromptText(rm.text)}\n</replied-message>`;
@@ -864,13 +1084,15 @@ function buildChannelContext(
   opts?: { btw?: boolean },
 ): string {
   const type = ch?.type || msg.channelType;
-  const name = (ch?.name || msg.channelName || msg.channelId).replace(/"/g, "'");
-  const from = (msg.isRoom ? (msg.roomName || msg.from) : msg.from).replace(/"/g, "'");
-  const attrs = [
-    `type="${type}"`,
-    `name="${name}"`,
-    `from="${from}"`,
-  ];
+  const name = (ch?.name || msg.channelName || msg.channelId).replace(
+    /"/g,
+    "'",
+  );
+  const from = (msg.isRoom ? msg.roomName || msg.from : msg.from).replace(
+    /"/g,
+    "'",
+  );
+  const attrs = [`type="${type}"`, `name="${name}"`, `from="${from}"`];
   if (msg.isRoom) {
     attrs.push(`sender="${(msg.fromId || msg.from).replace(/"/g, "'")}"`);
     attrs.push(`room="true"`);
@@ -908,16 +1130,28 @@ export function buildInteractionHandler(
     const cid = getDiscordChannelId(ch.id) || ch.channel;
     if (!cid || String(d.channel_id) !== String(cid)) {
       // No async work before this ack — a plain type-4 reply is safe.
-      respondToInteraction(botToken, d, `use me in #${ch.name}`).catch(() => {});
+      respondToInteraction(botToken, d, `use me in #${ch.name}`).catch(
+        () => {},
+      );
       return;
     }
     await deferInteraction(botToken, d);
     const opt = Array.isArray(d.data?.options)
-      ? d.data.options.find((o: any) => ["question", "mode", "instructions", "name"].includes(o?.name))
+      ? d.data.options.find((o: any) =>
+          ["question", "mode", "instructions", "name"].includes(o?.name),
+        )
       : undefined;
     let text: string | undefined;
     try {
-      const r = await runChannelCommand(pi, ctx, ch, d.data?.name, opt?.value ?? undefined, d.user?.id, true);
+      const r = await runChannelCommand(
+        pi,
+        ctx,
+        ch,
+        d.data?.name,
+        opt?.value ?? undefined,
+        d.user?.id,
+        true,
+      );
       text = r.btw ? undefined : (r.immediate ?? "ok");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -971,17 +1205,28 @@ async function runChannelCommand(
       const question = (arg || "").trim();
       if (!question) return { immediate: "usage: `/btw <question>`" };
       const msg: ChannelMessage = {
-        channelId: ch.id, channelName: ch.name, channelType: "discord",
-        messageId: "", from: fromId || "unknown", fromId,
-        body: question, timestamp: new Date().toISOString(),
-        attachments: [], isRoom: false,
+        channelId: ch.id,
+        channelName: ch.name,
+        channelType: "discord",
+        messageId: "",
+        from: fromId || "unknown",
+        fromId,
+        body: question,
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        isRoom: false,
       };
       const channelCtx = buildChannelContext(ch, msg);
-      sendToPi(pi, ch.id, `${channelCtx}\n\n${BTW_HINT}\n\n${question}`,
-        `${ch.type}/${ch.name}`, question);
+      sendToPi(
+        pi,
+        ch.id,
+        `${channelCtx}\n\n${BTW_HINT}\n\n${question}`,
+        `${ch.type}/${ch.name}`,
+        question,
+      );
       return { btw: true };
     }
-    case "status":
+    case "status": {
       if (!isOwner) return ownerOnly;
       let text: string;
       try {
@@ -989,16 +1234,21 @@ async function runChannelCommand(
         const model = (ctx.model as any)?.id ?? (ctx.model as any)?.name ?? "?";
         const elapsed = Date.now() - sessionStartTs;
         const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
-        text = `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"} • model ${model} • up ${up}${ctx.isIdle() ? " • idle" : " • running"}`;
+        text = `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"} • model ${model} • up ${up}${ctx.isIdle() ? " • idle" : " • running"}`;
       } catch {
         text = "status unavailable";
       }
       return { immediate: text };
+    }
     case "reset":
       if (!isOwner) return ownerOnly;
       userStoppedRun = true;
       ctx.abort();
-      setTimeout(() => { try { ctx.shutdown(); } catch {} }, 800);
+      setTimeout(() => {
+        try {
+          ctx.shutdown();
+        } catch {}
+      }, 800);
       return { immediate: "🔄 restarting session…" };
     case "verbose": {
       if (!isOwner) return ownerOnly;
@@ -1013,33 +1263,58 @@ async function runChannelCommand(
       try {
         // Fire-and-forget by design (pi's API does not return a promise);
         // completion shows up as a session_compact event, not here.
-        ctx.compact(instructions ? { customInstructions: instructions } : undefined);
+        ctx.compact(
+          instructions ? { customInstructions: instructions } : undefined,
+        );
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return { immediate: `⚠️ compact failed: ${sanitizeSensitiveText(msg)}` };
       }
       return { immediate: "🗜️ compacting…" };
     }
+    case "jobs": {
+      // Informational, open to all channel members (private channel).
+      return { immediate: listInflightJobs() };
+    }
     case "model": {
       if (!isOwner) return ownerOnly;
       const req = (arg || "").trim();
       let models: any[] = [];
-      try { models = ctx.modelRegistry?.getAvailable?.() ?? []; } catch {}
+      try {
+        models = ctx.modelRegistry?.getAvailable?.() ?? [];
+      } catch {}
       if (!req) {
         if (models.length === 0) return { immediate: "no models available" };
-        const names = models.slice(0, 20).map((m: any) => `${m.provider}/${m.id}`);
-        return { immediate: `models:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}` };
+        const names = models
+          .slice(0, 20)
+          .map((m: any) => `${m.provider}/${m.id}`);
+        return {
+          immediate: `models:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
+        };
       }
       const lower = req.toLowerCase();
-      let found: any | undefined = models.find((m: any) =>
-        String(m.id).toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower);
+      let found: any | undefined = models.find(
+        (m: any) =>
+          String(m.id).toLowerCase() === lower ||
+          `${m.provider}/${m.id}`.toLowerCase() === lower,
+      );
       if (!found) {
-        const partial = models.filter((m: any) =>
-          String(m.id).toLowerCase().includes(lower) || String(m.name ?? "").toLowerCase().includes(lower));
+        const partial = models.filter(
+          (m: any) =>
+            String(m.id).toLowerCase().includes(lower) ||
+            String(m.name ?? "")
+              .toLowerCase()
+              .includes(lower),
+        );
         if (partial.length === 1) found = partial[0];
         else if (partial.length > 1) {
-          const cands = partial.slice(0, 5).map((m: any) => `${m.provider}/${m.id}`).join(", ");
-          return { immediate: `ambiguous \"${req}\": ${cands}${partial.length > 5 ? "…" : ""}` };
+          const cands = partial
+            .slice(0, 5)
+            .map((m: any) => `${m.provider}/${m.id}`)
+            .join(", ");
+          return {
+            immediate: `ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
+          };
         }
       }
       if (!found) return { immediate: `model not found: ${req}` };
@@ -1060,11 +1335,15 @@ async function runChannelCommand(
 // (multipart upload, 25 MB per-file cap). Replaces the webdrop round-trip
 // for anything small.
 
-function registerSendFileTool(pi: ExtensionAPI, channels: ChannelConfig[]): void {
+function registerSendFileTool(
+  pi: ExtensionAPI,
+  channels: ChannelConfig[],
+): void {
   pi.registerTool({
     name: "send-file",
     label: "Send file",
-    description: "Send file(s) from this machine to the active Discord channel. Use it when the user should receive an image, report, log, or any file. Files up to 25 MB each; all files are sent in one message (images shown in a grid).",
+    description:
+      "Send file(s) from this machine to the active Discord channel. Use it when the user should receive an image, report, log, or any file. Files up to 25 MB each; all files are sent in one message (images shown in a grid).",
     promptSnippet: "Send local file(s) to the active Discord channel",
     promptGuidelines: [
       "Use send-file to deliver files to the user instead of pasting long paths or webdrop links.",
@@ -1072,27 +1351,61 @@ function registerSendFileTool(pi: ExtensionAPI, channels: ChannelConfig[]): void
     parameters: Type.Object({
       files: Type.Array(Type.String(), {
         minItems: 1,
-        description: "File paths (absolute, or relative to the working directory)",
+        description:
+          "File paths (absolute, or relative to the working directory)",
       }),
     }),
-    async execute(_toolCallId, params: { files: string[] }, _signal, _onUpdate, ctx: ExtensionContext) {
-      const active = lastActiveChannel && lastActiveChannel.type === "discord" ? lastActiveChannel : null;
+    async execute(
+      _toolCallId,
+      params: { files: string[] },
+      _signal,
+      _onUpdate,
+      ctx: ExtensionContext,
+    ) {
+      const active =
+        lastActiveChannel && lastActiveChannel.type === "discord"
+          ? lastActiveChannel
+          : null;
       const ch = active || getDefaultChannel(channels);
-      if (!ch || ch.type !== "discord") {
-        return { content: [{ type: "text", text: "No Discord channel available" }], details: {} };
+      if (ch?.type !== "discord") {
+        return {
+          content: [{ type: "text", text: "No Discord channel available" }],
+          details: {},
+        };
       }
       const token = getDiscordToken(ch.id) || ch.botToken;
       const channelId = getDiscordChannelId(ch.id);
       if (!token || !channelId) {
-        return { content: [{ type: "text", text: `Channel ${ch.name}: no bot token/channel id` }], details: {} };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Channel ${ch.name}: no bot token/channel id`,
+            },
+          ],
+          details: {},
+        };
       }
       // Some models prefix paths with @ — normalize it.
-      const files = params.files.map(f => path.resolve(ctx.cwd, f.replace(/^@/, "")));
+      const files = params.files.map((f) =>
+        path.resolve(ctx.cwd, f.replace(/^@/, "")),
+      );
       const r = await sendFilesToDiscord(channelId, files, token);
       if (r.success) {
-        return { content: [{ type: "text", text: `Sent ${files.length} file(s) to ${ch.name}` }], details: {} };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Sent ${files.length} file(s) to ${ch.name}`,
+            },
+          ],
+          details: {},
+        };
       }
-      return { content: [{ type: "text", text: r.error || "send failed" }], details: {} };
+      return {
+        content: [{ type: "text", text: r.error || "send failed" }],
+        details: {},
+      };
     },
   });
 }
@@ -1100,7 +1413,11 @@ function registerSendFileTool(pi: ExtensionAPI, channels: ChannelConfig[]): void
 // ─── Inbound handler ──────────────────────────────────────────────────────
 // (named export for test harness; pi itself only uses the default factory)
 
-export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: ExtensionContext) {
+export async function handleInbound(
+  pi: ExtensionAPI,
+  msg: ChannelMessage,
+  ctx: ExtensionContext,
+) {
   const ch = getChannel(loadChannelConfig(ctx.cwd), msg.channelId);
   // Channel removed/renamed in settings while running: drop the message
   // instead of dereferencing `ch` further down.
@@ -1124,13 +1441,31 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
   };
   // Commands reply directly instead of running a turn — tell the poller
   // not to ack these messages with 👀 (synchronous, no race).
-  const noAck = () => { if (ch?.type === "discord" && msg.messageId) suppressAutoReact(msg.messageId); };
+  const noAck = () => {
+    if (ch?.type === "discord" && msg.messageId)
+      suppressAutoReact(msg.messageId);
+  };
 
   const cmd = matchCommand(rawBody);
   if (cmd) {
-    const r = await runChannelCommand(pi, ctx, ch, cmd.name, cmd.arg, msg.fromId, false);
-    if (r.btw) { noAck(); return; }
-    if (r.immediate !== undefined) { noAck(); replyCmd(r.immediate); return; }
+    const r = await runChannelCommand(
+      pi,
+      ctx,
+      ch,
+      cmd.name,
+      cmd.arg,
+      msg.fromId,
+      false,
+    );
+    if (r.btw) {
+      noAck();
+      return;
+    }
+    if (r.immediate !== undefined) {
+      noAck();
+      replyCmd(r.immediate);
+      return;
+    }
   }
 
   // ── ! shell passthrough (owner only) ─────────────────────────────────
@@ -1142,16 +1477,23 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
       return;
     }
     const shellCmd = bang[1].trim();
-    replyCmd(`┣ bash ${shellCmd.length > 200 ? shellCmd.slice(0, 200) + "…" : shellCmd}`);
     sendDiscordTyping(ch).catch(() => {});
     const r = await runShellPassthrough(shellCmd, ctx.cwd);
     const truncated = r.out.length >= 20_000;
     const shown = r.out.length > 4000 ? r.out.slice(0, 4000) : r.out;
-    const status = r.timedOut ? "timeout 60s"
-      : r.code === 0 ? (r.out ? "" : "exit 0")
-      : `exit ${r.code}`;
-    const tail = [shown ? (truncated ? `… (truncated)` : "") : "(no output)", status]
-      .filter(Boolean).join(" · ");
+    const status = r.timedOut
+      ? "timeout 60s"
+      : r.code === 0
+        ? r.out
+          ? ""
+          : "exit 0"
+        : `exit ${r.code}`;
+    const tail = [
+      shown ? (truncated ? `… (truncated)` : "") : "(no output)",
+      status,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     replyCmd(r.out ? `${wrapFence(shown)}\n${tail}` : tail);
     return;
   }
@@ -1168,7 +1510,9 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
     channelCtx,
     repliedBlock,
     toc ? `<channel-memory>\n${toc}\n</channel-memory>` : "",
-  ].filter(Boolean).join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
   const withCtx = (text: string) => `${ctxBlock}\n\n${text}`;
 
   // ── Handle attachments ──────────────────────────────────────────────
@@ -1188,21 +1532,32 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
     if (ch?.type === "discord") {
       const token = getDiscordToken(ch.id) || ch.botToken;
       if (token) {
-        await Promise.all(msg.attachments.map(async (att) => {
-          try {
-            const content = await loadDiscordAttachment(token, att, batchFolderAbs);
-            if (!content) {
-              const reason = att.size > MAX_ATTACHMENT_BYTES
-                ? `skipped, larger than ${formatBytes(MAX_ATTACHMENT_BYTES)} cap`
-                : "download failed";
-              notes.set(att.id, reason);
-              console.error(`[channel] attachment not saved: ${sanitizeSensitiveText(att.filename)} (${att.contentType}, ${formatBytes(att.size)}) — ${reason}`);
+        await Promise.all(
+          msg.attachments.map(async (att) => {
+            try {
+              const content = await loadDiscordAttachment(
+                token,
+                att,
+                batchFolderAbs,
+              );
+              if (!content) {
+                const reason =
+                  att.size > MAX_ATTACHMENT_BYTES
+                    ? `skipped, larger than ${formatBytes(MAX_ATTACHMENT_BYTES)} cap`
+                    : "download failed";
+                notes.set(att.id, reason);
+                console.error(
+                  `[channel] attachment not saved: ${sanitizeSensitiveText(att.filename)} (${att.contentType}, ${formatBytes(att.size)}) — ${reason}`,
+                );
+              }
+            } catch (e) {
+              notes.set(att.id, "download failed");
+              console.error(
+                `[channel] attachment download error: ${sanitizeSensitiveText(String(e))}`,
+              );
             }
-          } catch (e) {
-            notes.set(att.id, "download failed");
-            console.error(`[channel] attachment download error: ${sanitizeSensitiveText(String(e))}`);
-          }
-        }));
+          }),
+        );
       }
     }
     const fileLine = (a: AttachmentRef) => {
@@ -1211,8 +1566,8 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
     };
 
     const voiceLines = msg.attachments
-      .filter(a => isVoiceAttachment(a))
-      .map(a => voiceNoteText(a));
+      .filter((a) => isVoiceAttachment(a))
+      .map((a) => voiceNoteText(a));
 
     // No text and no voice note
     let prompt = body;
@@ -1244,15 +1599,21 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
     if (prior.length > 0) {
       pendingAttachments.delete(msg.channelId);
       for (const b of prior) {
-        const lines = b.files.map(a => {
-          const note = b.notes?.[a.id];
-          return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
-        }).join("\n");
-        attParts.push(`<user-action-ctx>User attached file(s) in ${b.folder}/\n${lines}</user-action-ctx>`);
+        const lines = b.files
+          .map((a) => {
+            const note = b.notes?.[a.id];
+            return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
+          })
+          .join("\n");
+        attParts.push(
+          `<user-action-ctx>User attached file(s) in ${b.folder}/\n${lines}</user-action-ctx>`,
+        );
       }
     }
-    const fwd = [attParts.join("\n\n"), ...voiceLines, prompt].filter(Boolean).join("\n\n");
-    const dispFiles = [...prior.flatMap(b => b.files), ...msg.attachments];
+    const fwd = [attParts.join("\n\n"), ...voiceLines, prompt]
+      .filter(Boolean)
+      .join("\n\n");
+    const dispFiles = [...prior.flatMap((b) => b.files), ...msg.attachments];
     const disp =
       [attachmentSummary(dispFiles), ...voiceLines, prompt]
         .filter(Boolean)
@@ -1266,15 +1627,17 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
 
   if (batches.length > 0) {
     pendingAttachments.delete(msg.channelId);
-    const allFiles = batches.flatMap(b => b.files);
+    const allFiles = batches.flatMap((b) => b.files);
     const allVoiceLines = allFiles
-      .filter(a => isVoiceAttachment(a))
-      .map(a => voiceNoteText(a));
-    const attParts = batches.map(b => {
-      const files = b.files.map(a => {
-        const note = b.notes?.[a.id];
-        return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
-      }).join("\n");
+      .filter((a) => isVoiceAttachment(a))
+      .map((a) => voiceNoteText(a));
+    const attParts = batches.map((b) => {
+      const files = b.files
+        .map((a) => {
+          const note = b.notes?.[a.id];
+          return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
+        })
+        .join("\n");
       return `<user-action-ctx>User attached file(s) in ${b.folder}/\n${files}</user-action-ctx>`;
     });
     const fwd = [attParts.join("\n\n"), ...allVoiceLines, body]
@@ -1294,7 +1657,10 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
   const runActive = !ctx.isIdle() || ctx.hasPendingMessages?.();
   if (runActive) {
     let buf = burstBuffers.get(msg.channelId);
-    if (!buf) { buf = { parts: [], timer: null }; burstBuffers.set(msg.channelId, buf); }
+    if (!buf) {
+      buf = { parts: [], timer: null };
+      burstBuffers.set(msg.channelId, buf);
+    }
     buf.parts.push({ body: body || "(empty)", id: msg.messageId });
     if (!buf.timer) {
       buf.timer = setTimeout(() => {
@@ -1302,37 +1668,63 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
         burstBuffers.delete(msg.channelId);
         if (!b || b.parts.length === 0) return;
         const last = b.parts[b.parts.length - 1];
-        const merged = b.parts.length === 1
-          ? b.parts[0].body
-          : `The user sent ${b.parts.length} messages in quick succession:\n${b.parts.map((p, i) => `${i + 1}. ${p.id ? `[msgId=${p.id}] ` : ""}${p.body}`).join("\n")}\nRespond once to all of them.`;
-        sendToPi(pi, msg.channelId, withCtx(merged), title, b.parts.map(p => p.body).join("\n\n"), last.id,
-          b.parts.map(p => p.id).filter((x): x is string => Boolean(x)));
+        const merged =
+          b.parts.length === 1
+            ? b.parts[0].body
+            : `The user sent ${b.parts.length} messages in quick succession:\n${b.parts.map((p, i) => `${i + 1}. ${p.id ? `[msgId=${p.id}] ` : ""}${p.body}`).join("\n")}\nRespond once to all of them.`;
+        sendToPi(
+          pi,
+          msg.channelId,
+          withCtx(merged),
+          title,
+          b.parts.map((p) => p.body).join("\n\n"),
+          last.id,
+          b.parts.map((p) => p.id).filter((x): x is string => Boolean(x)),
+        );
       }, BURST_WINDOW_MS);
     }
     return;
   }
 
-  sendToPi(pi, ch.id, withCtx(body || "(empty)"), title, body || "(empty)", msg.messageId);
+  sendToPi(
+    pi,
+    ch.id,
+    withCtx(body || "(empty)"),
+    title,
+    body || "(empty)",
+    msg.messageId,
+  );
 }
 
 // ─── Send to pi session ──────────────────────────────────────────────────
 
-function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: string, displayBody: string, messageId?: string, messageIds?: string[]) {
+function sendToPi(
+  pi: ExtensionAPI,
+  channelId: string,
+  text: string,
+  title: string,
+  displayBody: string,
+  messageId?: string,
+  messageIds?: string[],
+) {
   const ids = messageIds ?? (messageId ? [messageId] : []);
   if (ids.length > 0) runInboundIds.set(channelId, ids);
   try {
-    pi.sendMessage({
-      customType: CHANNEL_MSG_TYPE,
-      content: text, // LLM context: full channel-ctx + body
-      display: true,
-      // TUI: title + body only; messageId/messageIds drive reply threading
-      details: {
-        title,
-        body: displayBody,
-        ...(messageId ? { messageId } : {}),
-        ...(ids.length > 0 ? { messageIds: ids } : {}),
+    pi.sendMessage(
+      {
+        customType: CHANNEL_MSG_TYPE,
+        content: text, // LLM context: full channel-ctx + body
+        display: true,
+        // TUI: title + body only; messageId/messageIds drive reply threading
+        details: {
+          title,
+          body: displayBody,
+          ...(messageId ? { messageId } : {}),
+          ...(ids.length > 0 ? { messageIds: ids } : {}),
+        },
       },
-    }, { triggerTurn: true, deliverAs: "steer" });
+      { triggerTurn: true, deliverAs: "steer" },
+    );
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
   }
@@ -1342,7 +1734,9 @@ function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: stri
 
 // One-line-per-file display summary (no XML tags) shown in the TUI body.
 function attachmentSummary(files: AttachmentRef[]): string {
-  return files.map(a => `📎 ${a.filename} (${formatBytes(a.size)})`).join("\n");
+  return files
+    .map((a) => `📎 ${a.filename} (${formatBytes(a.size)})`)
+    .join("\n");
 }
 
 function formatBytes(bytes: number): string {
@@ -1358,14 +1752,32 @@ function writeChannelState(wsRoot: string, chs: ChannelConfig[]): void {
   fs.mkdirSync(stateDir, { recursive: true });
   const status: Record<string, any> = {
     count: chs.length,
-    connected: chs.filter(c => c.enabled).map(c => ({
-      id: c.id, name: c.name, type: c.type,
-    })),
+    connected: chs
+      .filter((c) => c.enabled)
+      .map((c) => ({
+        id: c.id,
+        name: c.name,
+        type: c.type,
+      })),
   };
-  fs.writeFileSync(path.join(stateDir, "channel.json"), JSON.stringify({
-    pkg: "channel",
-    ts: new Date().toISOString(),
-    status,
-    settings: { channels: chs.map(c => ({ id: c.id, name: c.name, type: c.type, enabled: c.enabled })) },
-  }, null, 2));
+  fs.writeFileSync(
+    path.join(stateDir, "channel.json"),
+    JSON.stringify(
+      {
+        pkg: "channel",
+        ts: new Date().toISOString(),
+        status,
+        settings: {
+          channels: chs.map((c) => ({
+            id: c.id,
+            name: c.name,
+            type: c.type,
+            enabled: c.enabled,
+          })),
+        },
+      },
+      null,
+      2,
+    ),
+  );
 }
