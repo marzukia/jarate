@@ -965,7 +965,7 @@ const HELP_TEXT = [
   "`/stop` — stop the current run",
   "`/btw <question>` — quick side question, answered briefly",
   "`/status` — session stats (owner)",
-  "`/reset` — restart the session (owner)",
+  "`/reset` — start a NEW session, clearing context (owner)",
   "`/verbose on|off` — forward tool calls to the channel (owner)",
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
@@ -1169,12 +1169,22 @@ async function runChannelCommand(
         text = "status unavailable";
       }
       return { immediate: text };
-    case "reset":
+    case "reset": {
       if (!isOwner) return ownerOnly;
       userStoppedRun = true;
-      ctx.abort();
-      setTimeout(() => { try { ctx.shutdown(); } catch {} }, 800);
-      return { immediate: "🔄 restarting session…" };
+      try { ctx.abort(); } catch {}
+      // New session in-process (same flow as TUI /new): session_before_switch
+      // -> session_shutdown -> session_start {reason:"new"}. The session_start
+      // handler reconnects Discord + re-registers tools. No process restart —
+      // a respawn via systemd would resume the LAST session (pi -c in the unit).
+      setTimeout(async () => {
+        try { await ctx.newSession(); } catch (e) {
+          console.error("[reset] newSession failed, falling back to shutdown:", e);
+          try { ctx.shutdown(); } catch {}
+        }
+      }, 800);
+      return { immediate: "🆕 new session started (context cleared)…" };
+    }
     case "verbose": {
       if (!isOwner) return ownerOnly;
       const a = arg?.toLowerCase();
