@@ -1,0 +1,31 @@
+# {{REPO}} — CI
+#
+# Single gate: lint + test via the Makefile, so CI and `make preflight`
+# run the same commands. When the project grows expensive signals
+# (production build, integration suite, e2e), split them into a second
+# workflow that fires only on ready_for_review / a ready label — keep
+# the per-push lane cheap.
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # TODO: toolchain setup (uv / pnpm / node) before this step.
+      - name: Preflight (whitespace + lint + test)
+        run: make preflight

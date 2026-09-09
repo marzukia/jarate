@@ -34,6 +34,8 @@ per-agent notes (frank cross-user pattern included).
 | `dispatch/` | `pi-bg` (dispatch worker/reviewer, cgroup escape, webhooks), `pi-wait` (in-turn wait) |
 | `bin/agent-say` | agent-to-agent Discord messaging |
 | `pgrag/` | RAG corpus tool for agents (uv + Postgres `rag` db; PEP-723 scripts, memory layer) |
+| `templates/` | newrepo boilerplate (repo governance: AGENTS/CONTRIBUTING/CI/hooks) |
+| `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
 | `install.sh` | idempotent installer (`--dry-run`, `--piscord-dir`) |
 | `docs/DISPATCH.md` | orchestration pattern: roles, worktrees, cgroup escape, callback protocol |
 | `docs/COMMANDS.md` | every Discord command with examples |
@@ -99,6 +101,19 @@ bunx biome check .     # from repo root (formatter + linter)
 ```
 
 Contribute: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## New repos
+
+```bash
+./scripts/init-repo.sh <dir> <owner/repo> --push --private \
+  --lead "..." --commit-identity "name <email>" --stack "one-liner"
+```
+
+Renders `templates/newrepo` (AGENTS.md, CLAUDE.md, CONTRIBUTING.md, MEMORY.md,
+Makefile, pre-commit hooks, CI workflow, PR/issue templates, docs scaffold),
+does `git init -b main` + initial commit, installs the pre-commit hook.
+Idempotent: refuses to clobber without `--force`; `--dry-run` prints the
+plan. See `templates/README.md`.
 
 ## Verify the install
 

@@ -1,0 +1,27 @@
+# --- env / secrets ---
+.env
+.secrets/
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- node / ts ---
+node_modules/
+dist/
+coverage/
+
+# --- editor / os ---
+.DS_Store
+*.swp
+.idea/
+
+# --- local agent notes ---
+CLAUDE.local.md
+
+# --- scratch (repo-root artefacts only) ---
+*.log
