@@ -10,19 +10,13 @@
  * (20 MB per-file cap). All message text is wrapped in <channel-context>
  * before reaching the LLM.
  */
-
+import WebSocket from "ws";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import WebSocket from "ws";
+import type { ChannelConfig, ChannelMessage, AttachmentRef, AttachmentContent } from "./types";
 import { serializeEmbeds } from "./format";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 import { sanitizeSensitiveText } from "./sanitize";
-import type {
-  AttachmentContent,
-  AttachmentRef,
-  ChannelConfig,
-  ChannelMessage,
-} from "./types";
 
 const DISCORD_API = "https://discord.com/api/v10";
 /** Poll interval (ms) when the gateway is NOT delivering messages. */
@@ -78,8 +72,7 @@ async function discordFetch(
       let waitMs = 1500;
       try {
         const data: any = await resp.json();
-        if (typeof data?.retry_after === "number")
-          waitMs = data.retry_after * 1000 + 100;
+        if (typeof data?.retry_after === "number") waitMs = data.retry_after * 1000 + 100;
       } catch {}
       if (attempt < 2) {
         await new Promise((r) => setTimeout(r, waitMs));
@@ -115,8 +108,7 @@ async function discordFetchRaw(
       let waitMs = 1500;
       try {
         const data: any = await resp.json();
-        if (typeof data?.retry_after === "number")
-          waitMs = data.retry_after * 1000 + 100;
+        if (typeof data?.retry_after === "number") waitMs = data.retry_after * 1000 + 100;
       } catch {}
       if (attempt < 2) {
         await new Promise((r) => setTimeout(r, waitMs));
@@ -140,10 +132,7 @@ const idCache = new Map<string, string>();
 const idCacheKey = (token: string, name: string) => `${token}\u0000${name}`;
 
 /** Resolve a Discord channel reference (numeric id or name) to a channel id. Exported for tests. */
-export async function resolveChannelId(
-  token: string,
-  raw: string,
-): Promise<string | null> {
+export async function resolveChannelId(token: string, raw: string): Promise<string | null> {
   if (/^\d+$/.test(raw)) return raw; // already an ID
   const key = idCacheKey(token, raw);
   if (idCache.has(key)) return idCache.get(key)!;
@@ -151,12 +140,9 @@ export async function resolveChannelId(
   // Try guild channels first
   try {
     const guilds = await discordFetch(token, "/users/@me/guilds");
-    for (const guild of guilds || []) {
-      const channels = await discordFetch(
-        token,
-        `/guilds/${guild.id}/channels`,
-      );
-      for (const ch of channels || []) {
+    for (const guild of (guilds || [])) {
+      const channels = await discordFetch(token, `/guilds/${guild.id}/channels`);
+      for (const ch of (channels || [])) {
         if (ch.name === raw.replace(/^#/, "") && ch.type === 0) {
           idCache.set(key, ch.id);
           return ch.id;
@@ -165,16 +151,14 @@ export async function resolveChannelId(
     }
     // Try DMs
     const dms = await discordFetch(token, "/users/@me/channels");
-    for (const dm of dms || []) {
-      const name = dm.name || dm.recipients?.[0]?.username;
+    for (const dm of (dms || [])) {
+      const name = dm.name || (dm.recipients?.[0]?.username);
       if (name === raw.replace(/^@/, "")) {
         idCache.set(key, dm.id);
         return dm.id;
       }
     }
-  } catch {
-    /* fall through */
-  }
+  } catch { /* fall through */ }
 
   return null;
 }
@@ -228,10 +212,7 @@ export async function connectDiscord(
     botUserId = me?.id || null;
   } catch {}
   if (!botUserId) {
-    callbacks.onError(
-      config.id,
-      "Could not resolve bot user id; will retry on poll",
-    );
+    callbacks.onError(config.id, "Could not resolve bot user id; will retry on poll");
   }
 
   const state: DiscordState = {
@@ -270,9 +251,7 @@ export async function connectDiscord(
     if (botUserId) {
       setTimeout(() => {
         if (states.get(config.id) === state && state.config.startupMessage) {
-          sendDiscordMessage(state.config, state.config.startupMessage).catch(
-            () => {},
-          );
+          sendDiscordMessage(state.config, state.config.startupMessage).catch(() => {});
         }
       }, 3000);
     } else {
@@ -291,14 +270,10 @@ export async function connectDiscord(
 // "now" and losing them).
 
 /** Read persisted cursors (discord channel id → last message id). Corrupt file = empty. */
-export function loadPersistedCursors(
-  stateDir: string | null | undefined,
-): Record<string, string> {
+export function loadPersistedCursors(stateDir: string | null | undefined): Record<string, string> {
   if (!stateDir) return {};
   try {
-    const data = JSON.parse(
-      fs.readFileSync(path.join(stateDir, "channel-state.json"), "utf-8"),
-    );
+    const data = JSON.parse(fs.readFileSync(path.join(stateDir, "channel-state.json"), "utf-8"));
     return typeof data === "object" && data ? data : {};
   } catch {
     return {};
@@ -316,27 +291,22 @@ export function persistChannelCursor(state: DiscordState): void {
     // Atomic write: temp file + rename so a crash cannot leave a torn
     // channel-state.json (the loader treats non-JSON as an empty cursor
     // map, which would reseed and lose history).
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
-    fs.renameSync(`${file}.tmp`, file);
+    fs.writeFileSync(file + ".tmp", JSON.stringify(data, null, 2));
+    fs.renameSync(file + ".tmp", file);
   } catch {}
 }
 
 /** Poll interval for a channel: backfill (60s) while its token's gateway
  *  is connected, fast (5s) otherwise. */
 export function currentPollIntervalMs(state: DiscordState): number {
-  const ps = state.config.botToken
-    ? presenceStates.get(state.config.botToken)
-    : undefined;
+  const ps = state.config.botToken ? presenceStates.get(state.config.botToken) : undefined;
   return ps?.gatewayOk ? POLL_BACKFILL_MS : POLL_INTERVAL_MS;
 }
 
 /** (Re)start the poll timer at the interval matching gateway status. */
 export function restartPollTimer(state: DiscordState): void {
   if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = setInterval(
-    () => pollDiscord(state.config.id),
-    currentPollIntervalMs(state),
-  );
+  state.pollTimer = setInterval(() => pollDiscord(state.config.id), currentPollIntervalMs(state));
 }
 
 /** Flip gateway status for a token and adjust poll intervals on all its
@@ -374,21 +344,15 @@ export async function pollDiscord(configId: string): Promise<void> {
       } catch {}
     }
     // Bot identity just resolved — post the queued startup message now.
-    if (
-      state.startupPending &&
-      state.botUserId &&
-      state.config.startupMessage
-    ) {
+    if (state.startupPending && state.botUserId && state.config.startupMessage) {
       state.startupPending = false;
-      sendDiscordMessage(state.config, state.config.startupMessage).catch(
-        () => {},
-      );
+      sendDiscordMessage(state.config, state.config.startupMessage).catch(() => {});
     }
     const url = lastMessageId
       ? `/channels/${channelId}/messages?after=${lastMessageId}&limit=10`
       : `/channels/${channelId}/messages?limit=1`;
 
-    const msgs: any[] = (await discordFetch(token, url)) || [];
+    const msgs: any[] = await discordFetch(token, url) || [];
     state.consecutiveErrors = 0;
     state.pollPauseUntil = 0;
 
@@ -400,16 +364,10 @@ export async function pollDiscord(configId: string): Promise<void> {
     }
   } catch (err) {
     state.consecutiveErrors += 1;
-    const pauseMs = Math.min(
-      5_000 * 2 ** Math.min(state.consecutiveErrors - 1, 4),
-      60_000,
-    );
+    const pauseMs = Math.min(5_000 * 2 ** Math.min(state.consecutiveErrors - 1, 4), 60_000);
     state.pollPauseUntil = Date.now() + pauseMs;
     const safe = sanitizeSensitiveText((err as Error).message || String(err));
-    callbacks.onError(
-      config.id,
-      `Poll error: ${safe} (retry in ${Math.round(pauseMs / 1000)}s)`,
-    );
+    callbacks.onError(config.id, `Poll error: ${safe} (retry in ${Math.round(pauseMs / 1000)}s)`);
   } finally {
     state.polling = false;
   }
@@ -423,8 +381,7 @@ export async function pollDiscord(configId: string): Promise<void> {
  */
 export function isBgWebhook(raw: any): boolean {
   if (raw?.webhook_id == null) return false;
-  if (typeof raw?.content === "string" && raw.content.startsWith("[bg:"))
-    return true;
+  if (typeof raw?.content === "string" && raw.content.startsWith("[bg:")) return true;
   // Embed-only callbacks (pi-bg Variant D): no top-level content —
   // identify by the embed author name the pi-bg webhook builder sets.
   const authorName = raw?.embeds?.[0]?.author?.name;
@@ -454,24 +411,17 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
   const peerBots = config.peerBotIds ?? [];
   // Skip other bots unless exempt: [bg: webhook wakes, or peer agents
   // posting into this channel via agent-say (author.id in peerBotIds).
-  if (
-    raw.author?.bot &&
-    !isBgWebhook(raw) &&
-    !peerBots.includes(String(raw.author.id))
-  )
-    return false;
+  if (raw.author?.bot && !isBgWebhook(raw) && !peerBots.includes(String(raw.author.id))) return false;
 
-  const attachments: AttachmentRef[] = (raw.attachments || []).map(
-    (a: any) => ({
-      id: a.id,
-      filename: a.filename || "file",
-      contentType: a.content_type || "application/octet-stream",
-      size: a.size || 0,
-      url: a.url,
-      duration: typeof a.duration === "number" ? a.duration : undefined,
-      waveform: typeof a.waveform === "string" ? a.waveform : undefined,
-    }),
-  );
+  const attachments: AttachmentRef[] = (raw.attachments || []).map((a: any) => ({
+    id: a.id,
+    filename: a.filename || "file",
+    contentType: a.content_type || "application/octet-stream",
+    size: a.size || 0,
+    url: a.url,
+    duration: typeof a.duration === "number" ? a.duration : undefined,
+    waveform: typeof a.waveform === "string" ? a.waveform : undefined,
+  }));
 
   // Embeds (rich text from other bots, app interactions) are not in
   // raw.content — serialize them into the body so the LLM can read them.
@@ -482,13 +432,12 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
   // poll payloads carry referenced_message). Rendered as a
   // <replied-message> block in the LLM context by the inbound handler.
   const ref = raw.referenced_message;
-  const repliedMessage =
-    typeof ref?.content === "string" && ref.content
-      ? {
-          author: ref.author?.global_name || ref.author?.username || "",
-          text: ref.content.slice(0, 1000),
-        }
-      : undefined;
+  const repliedMessage = typeof ref?.content === "string" && ref.content
+    ? {
+        author: ref.author?.global_name || ref.author?.username || "",
+        text: ref.content.slice(0, 1000),
+      }
+    : undefined;
 
   const channelMsg: ChannelMessage = {
     channelId: config.id,
@@ -568,10 +517,7 @@ async function reactToMessage(
  * parse:['users'] + explicit user list pings exactly those users.
  * Exported for tests.
  */
-export function allowedMentionsFor(text: string): {
-  parse: string[];
-  users?: string[];
-} {
+export function allowedMentionsFor(text: string): { parse: string[]; users?: string[] } {
   const ids = [...text.matchAll(/<@!?([0-9]+)>/g)].map((m) => m[1]);
   return ids.length ? { parse: ["users"], users: ids } : { parse: [] };
 }
@@ -582,8 +528,7 @@ export async function sendDiscordMessage(
   text: string,
   replyToMessageId?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-  if (config.type !== "discord")
-    return { success: false, error: "Not a Discord channel" };
+  if (config.type !== "discord") return { success: false, error: "Not a Discord channel" };
 
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
@@ -624,10 +569,7 @@ export async function sendDiscordMessage(
       const resp = await fetch(config.webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: text,
-          allowed_mentions: allowedMentionsFor(text),
-        }),
+        body: JSON.stringify({ content: text, allowed_mentions: allowedMentionsFor(text) }),
       });
       if (resp.ok) return { success: true };
       return { success: false, error: `Webhook ${resp.status}` };
@@ -645,15 +587,13 @@ export async function editDiscordMessage(
   messageId: string,
   text: string,
 ): Promise<{ success: boolean; error?: string }> {
-  if (config.type !== "discord")
-    return { success: false, error: "Not a Discord channel" };
+  if (config.type !== "discord") return { success: false, error: "Not a Discord channel" };
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (!token) return { success: false, error: "No bot token" };
   try {
     await discordFetch(token, `/channels/${channelId}/messages/${messageId}`, {
-      method: "PATCH",
-      body: { content: text },
+      method: "PATCH", body: { content: text },
     });
     return { success: true };
   } catch (err) {
@@ -666,15 +606,12 @@ export async function deleteDiscordMessage(
   config: ChannelConfig,
   messageId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  if (config.type !== "discord")
-    return { success: false, error: "Not a Discord channel" };
+  if (config.type !== "discord") return { success: false, error: "Not a Discord channel" };
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (!token) return { success: false, error: "No bot token" };
   try {
-    await discordFetch(token, `/channels/${channelId}/messages/${messageId}`, {
-      method: "DELETE",
-    });
+    await discordFetch(token, `/channels/${channelId}/messages/${messageId}`, { method: "DELETE" });
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };
@@ -689,38 +626,18 @@ export const MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024;
 // Minimal extension → MIME map (no runtime dep). Unknown extensions fall
 // back to application/octet-stream; Discord still renders the file.
 const MIME_BY_EXT: Record<string, string> = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".bmp": "image/bmp",
-  ".svg": "image/svg+xml",
-  ".mp4": "video/mp4",
-  ".webm": "video/webm",
-  ".ogv": "video/ogg",
-  ".mp3": "audio/mpeg",
-  ".ogg": "audio/ogg",
-  ".opus": "audio/opus",
-  ".wav": "audio/wav",
-  ".m4a": "audio/mp4",
-  ".txt": "text/plain",
-  ".md": "text/markdown",
-  ".html": "text/html",
-  ".css": "text/css",
-  ".js": "text/javascript",
-  ".ts": "text/typescript",
-  ".json": "application/json",
-  ".csv": "text/csv",
-  ".xml": "application/xml",
-  ".pdf": "application/pdf",
-  ".zip": "application/zip",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+  ".svg": "image/svg+xml", ".mp4": "video/mp4", ".webm": "video/webm",
+  ".ogv": "video/ogg", ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
+  ".opus": "audio/opus", ".wav": "audio/wav", ".m4a": "audio/mp4",
+  ".txt": "text/plain", ".md": "text/markdown", ".html": "text/html",
+  ".css": "text/css", ".js": "text/javascript", ".ts": "text/typescript",
+  ".json": "application/json", ".csv": "text/csv", ".xml": "application/xml",
+  ".pdf": "application/pdf", ".zip": "application/zip",
 };
 export function mimeForFile(filePath: string): string {
-  return (
-    MIME_BY_EXT[path.extname(filePath).toLowerCase()] ||
-    "application/octet-stream"
-  );
+  return MIME_BY_EXT[path.extname(filePath).toLowerCase()] || "application/octet-stream";
 }
 
 /**
@@ -738,14 +655,11 @@ export async function sendFilesToDiscord(
   if (files.length === 0) return { success: true };
 
   for (const file of files) {
-    let stat: fs.Stats;
+    let stat;
     try {
       stat = fs.statSync(file);
     } catch (e) {
-      return {
-        success: false,
-        error: `Cannot read file: ${path.basename(file)} (${(e as Error).message})`,
-      };
+      return { success: false, error: `Cannot read file: ${path.basename(file)} (${(e as Error).message})` };
     }
     if (stat.size > MAX_OUTBOUND_FILE_BYTES) {
       return {
@@ -756,12 +670,7 @@ export async function sendFilesToDiscord(
   }
 
   const formData = new FormData();
-  formData.append(
-    "payload_json",
-    JSON.stringify({
-      attachments: files.map((f, i) => ({ id: i, filename: path.basename(f) })),
-    }),
-  );
+  formData.append("payload_json", JSON.stringify({ attachments: files.map((f, i) => ({ id: i, filename: path.basename(f) })) }));
   for (const [i, file] of files.entries()) {
     let buffer: Buffer;
     try {
@@ -770,16 +679,9 @@ export async function sendFilesToDiscord(
       // File disappeared or became unreadable between the stat pre-check
       // and the read (e.g. a directory): fail clean instead of throwing
       // mid-loop after earlier files were already appended.
-      return {
-        success: false,
-        error: `Cannot read file: ${path.basename(file)} (${(e as Error).message})`,
-      };
+      return { success: false, error: `Cannot read file: ${path.basename(file)} (${(e as Error).message})` };
     }
-    formData.append(
-      `files[${i}]`,
-      new Blob([buffer], { type: mimeForFile(file) }),
-      path.basename(file),
-    );
+    formData.append(`files[${i}]`, new Blob([buffer], { type: mimeForFile(file) }), path.basename(file));
   }
 
   try {
@@ -790,10 +692,7 @@ export async function sendFilesToDiscord(
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      return {
-        success: false,
-        error: `Discord API ${resp.status}: ${text.slice(0, 200)}`,
-      };
+      return { success: false, error: `Discord API ${resp.status}: ${text.slice(0, 200)}` };
     }
     return { success: true };
   } catch (err) {
@@ -814,43 +713,26 @@ export async function sendDiscordMessageWithFiles(
   files: string[],
   replyToMessageId?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-  if (config.type !== "discord")
-    return { success: false, error: "Not a Discord channel" };
+  if (config.type !== "discord") return { success: false, error: "Not a Discord channel" };
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (!token) return { success: false, error: "No bot token" };
   try {
     const formData = new FormData();
-    formData.append(
-      "payload_json",
-      JSON.stringify({
-        content: text,
-        allowed_mentions: allowedMentionsFor(text),
-        ...(replyToMessageId
-          ? { message_reference: { message_id: replyToMessageId } }
-          : {}),
-        attachments: files.map((f, i) => ({
-          id: i,
-          filename: path.basename(f),
-        })),
-      }),
-    );
+    formData.append("payload_json", JSON.stringify({
+      content: text,
+      allowed_mentions: allowedMentionsFor(text),
+      ...(replyToMessageId ? { message_reference: { message_id: replyToMessageId } } : {}),
+      attachments: files.map((f, i) => ({ id: i, filename: path.basename(f) })),
+    }));
     for (const [i, file] of files.entries()) {
       const buffer = fs.readFileSync(file);
-      formData.append(
-        `files[${i}]`,
-        new Blob([buffer], { type: mimeForFile(file) }),
-        path.basename(file),
-      );
+      formData.append(`files[${i}]`, new Blob([buffer], { type: mimeForFile(file) }), path.basename(file));
     }
-    const result: any = await discordFetchRaw(
-      token,
-      `/channels/${channelId}/messages`,
-      {
-        method: "POST",
-        body: formData,
-      },
-    );
+    const result: any = await discordFetchRaw(token, `/channels/${channelId}/messages`, {
+      method: "POST",
+      body: formData,
+    });
     return { success: true, messageId: result?.id };
   } catch (err) {
     return { success: false, error: (err as Error).message };
@@ -863,7 +745,7 @@ export async function sendDiscordMessageWithFiles(
  * the folder reference.
  */
 export async function loadDiscordAttachment(
-  _token: string,
+  token: string,
   attachment: AttachmentRef,
   saveDir: string,
 ): Promise<AttachmentContent | null> {
@@ -882,14 +764,12 @@ export async function loadDiscordAttachment(
 
     // Optimize oversized images before saving so they fit LLM API limits.
     if (isSupportedImageMime(contentType)) {
-      const optimized = await optimizeImageBuffer(buffer, contentType).catch(
-        () => null,
-      );
+      const optimized = await optimizeImageBuffer(buffer, contentType).catch(() => null);
       if (optimized) {
         buffer = optimized.buffer;
         contentType = optimized.mime;
         if (optimized.mime === "image/jpeg" && !/\.(jpe?g)$/i.test(filename)) {
-          filename = `${filename.replace(/\.[^.]+$/, "")}.jpg`;
+          filename = filename.replace(/\.[^.]+$/, "") + ".jpg";
         }
       }
     }
@@ -983,19 +863,17 @@ function statesForToken(token: string): DiscordState[] {
 const presenceStates = new Map<string, PresenceState>();
 
 function sendPresenceOp(st: PresenceState): void {
-  if (st.ws?.readyState !== 1) return;
-  st.ws.send(
-    JSON.stringify({
-      op: 3,
-      d: {
-        since: 0,
-        // type 4 = Custom Status ("Custom Status: …"); type 5 would show "Competing in …".
-        activities: st.activity ? [{ name: st.activity, type: 4 }] : [],
-        status: "online",
-        afk: false,
-      },
-    }),
-  );
+  if (!st.ws || st.ws.readyState !== 1) return;
+  st.ws.send(JSON.stringify({
+    op: 3,
+    d: {
+      since: 0,
+      // type 4 = Custom Status ("Custom Status: …"); type 5 would show "Competing in …".
+      activities: st.activity ? [{ name: st.activity, type: 4 }] : [],
+      status: "online",
+      afk: false,
+    },
+  }));
 }
 
 function connectPresence(st: PresenceState): void {
@@ -1010,30 +888,20 @@ function connectPresence(st: PresenceState): void {
   st.ws = ws;
 
   ws.onopen = () => {
-    ws.send(
-      JSON.stringify({
-        op: 2,
-        d: {
-          token: st.token,
-          properties: {
-            os: "linux",
-            browser: "monky",
-            device: "monky-channel",
-          },
-          compress: false,
-          intents: GATEWAY_INTENTS,
-        },
-      }),
-    );
+    ws.send(JSON.stringify({
+      op: 2,
+      d: {
+        token: st.token,
+        properties: { os: "linux", browser: "monky", device: "monky-channel" },
+        compress: false,
+        intents: GATEWAY_INTENTS,
+      },
+    }));
   };
 
   ws.onmessage = (ev: any) => {
     let msg: any;
-    try {
-      msg = JSON.parse(String(ev.data));
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(String(ev.data)); } catch { return; }
     if (msg.op === 10) {
       st.hbAck = true;
       if (st.hb) clearInterval(st.hb);
@@ -1041,9 +909,7 @@ function connectPresence(st: PresenceState): void {
         if (ws.readyState !== 1) return;
         if (!st.hbAck) {
           console.log("[presence] heartbeat timeout, reconnecting");
-          try {
-            ws.close();
-          } catch {}
+          try { ws.close(); } catch {}
           return;
         }
         ws.send(JSON.stringify({ op: 1, d: null }));
@@ -1057,9 +923,7 @@ function connectPresence(st: PresenceState): void {
       // Invalid Session: our sequence is stale — reconnect immediately.
       st.invalidSession = true;
       console.log("[presence] invalid session, reconnecting");
-      try {
-        ws.close();
-      } catch {}
+      try { ws.close(); } catch {}
     } else if (msg.op === 0 && msg.t === "READY") {
       st.ready = true;
       st.backoff = 5_000;
@@ -1074,8 +938,7 @@ function connectPresence(st: PresenceState): void {
             s.startupPending = false;
             const text = s.config.startupMessage;
             setTimeout(() => {
-              if (states.get(s.config.id) === s)
-                sendDiscordMessage(s.config, text).catch(() => {});
+              if (states.get(s.config.id) === s) sendDiscordMessage(s.config, text).catch(() => {});
             }, 3000);
           }
         }
@@ -1083,38 +946,21 @@ function connectPresence(st: PresenceState): void {
       setGatewayOk(st, true); // poll drops to 60s backfill
       sendPresenceOp(st);
     } else if (msg.op === 0 && msg.t === "MESSAGE_CREATE") {
-      try {
-        handleMessageCreate(st, msg.d);
-      } catch (e) {
-        console.error(
-          "[gateway] MESSAGE_CREATE failed:",
-          sanitizeSensitiveText(String(e)),
-        );
+      try { handleMessageCreate(st, msg.d); } catch (e) {
+        console.error("[gateway] MESSAGE_CREATE failed:", sanitizeSensitiveText(String(e)));
       }
     } else if (msg.op === 0 && msg.t === "INTERACTIONS_CREATE") {
       const h = interactionHandlers.get(st.token);
       if (h) {
-        try {
-          h(msg.d);
-        } catch (e) {
-          console.error(
-            "[interactions] handler failed:",
-            sanitizeSensitiveText(String(e)),
-          );
-        }
+        try { h(msg.d); } catch (e) { console.error("[interactions] handler failed:", sanitizeSensitiveText(String(e))); }
       } else {
-        console.log(
-          `[interactions] no handler for command ${msg.d.data?.name}, channel ${msg.d.channel_id}`,
-        );
+        console.log(`[interactions] no handler for command ${msg.d.data?.name}, channel ${msg.d.channel_id}`);
       }
     }
   };
 
   ws.onclose = (ev: any) => {
-    if (st.hb) {
-      clearInterval(st.hb);
-      st.hb = null;
-    }
+    if (st.hb) { clearInterval(st.hb); st.hb = null; }
     st.ready = false;
     if (st.stopped) return;
     setGatewayOk(st, false); // poll goes back to 5s
@@ -1127,22 +973,14 @@ function connectPresence(st: PresenceState): void {
     // per process so persistent 4004s do not spam.
     if (code === 4004 && !intent4004Logged) {
       intent4004Logged = true;
-      console.log(
-        "gateway: 4004 — enable MESSAGE CONTENT INTENT in https://discord.com/developers/applications (bot tab) — falling back to 5s polling",
-      );
+      console.log("gateway: 4004 — enable MESSAGE CONTENT INTENT in https://discord.com/developers/applications (bot tab) — falling back to 5s polling");
     }
 
     let delay: number;
     if (st.rebalance) {
       st.rebalance = false;
       delay = 500;
-    } else if (
-      st.invalidSession ||
-      code === 1000 ||
-      code === 1001 ||
-      code === 1012 ||
-      code === 1013
-    ) {
+    } else if (st.invalidSession || code === 1000 || code === 1001 || code === 1012 || code === 1013) {
       // Clean closes and "new session" — retry right away.
       st.invalidSession = false;
       st.backoff = 5_000;
@@ -1151,9 +989,7 @@ function connectPresence(st: PresenceState): void {
       delay = st.backoff;
       st.backoff = Math.min(st.backoff * 2, 300_000);
     }
-    console.log(
-      `[presence] closed code=${code ?? "?"}${reason}, reconnect in ${Math.round(delay / 1000)}s`,
-    );
+    console.log(`[presence] closed code=${code ?? "?"}${reason}, reconnect in ${Math.round(delay / 1000)}s`);
     setTimeout(() => connectPresence(st), delay);
   };
 
@@ -1166,18 +1002,9 @@ export function ensurePresenceState(token: string): PresenceState {
   let st = presenceStates.get(token);
   if (!st) {
     st = {
-      token,
-      ws: null,
-      hb: null,
-      hbAck: null,
-      stopped: false,
-      ready: false,
-      activity: "",
-      backoff: 5_000,
-      rebalance: false,
-      invalidSession: false,
-      botUserId: null,
-      gatewayOk: false,
+      token, ws: null, hb: null, hbAck: null, stopped: false, ready: false,
+      activity: "", backoff: 5_000, rebalance: false, invalidSession: false,
+      botUserId: null, gatewayOk: false,
     };
     presenceStates.set(token, st);
   }
@@ -1186,10 +1013,7 @@ export function ensurePresenceState(token: string): PresenceState {
 
 /** Open a gateway session so the bot shows ONLINE and delivers
  *  MESSAGE_CREATE. Call once per token. */
-export function connectDiscordPresence(
-  token: string,
-  initialActivity = "",
-): void {
+export function connectDiscordPresence(token: string, initialActivity = ""): void {
   if (!token || presenceStates.has(token)) return;
   const st = ensurePresenceState(token);
   st.activity = initialActivity;
@@ -1214,10 +1038,7 @@ export function handleMessageCreate(st: PresenceState, d: any): void {
 }
 
 /** Update the bot custom status text. Re-sent immediately when ready. */
-export function setDiscordPresenceActivity(
-  token: string,
-  activity: string,
-): void {
+export function setDiscordPresenceActivity(token: string, activity: string): void {
   const st = presenceStates.get(token);
   if (!st) return;
   if (st.activity === activity) return;
@@ -1233,9 +1054,7 @@ export function stopDiscordPresence(token: string): void {
   if (!st) return;
   st.stopped = true;
   if (st.hb) clearInterval(st.hb);
-  try {
-    st.ws?.close();
-  } catch {}
+  try { st.ws?.close(); } catch {}
   setGatewayOk(st, false);
   presenceStates.delete(token);
 }
@@ -1249,31 +1068,21 @@ type InteractionHandler = (d: any) => void;
 const interactionHandlers = new Map<string, InteractionHandler>();
 
 /** Route INTERACTIONS_CREATE events for one bot token. */
-export function setDiscordInteractionHandler(
-  token: string,
-  fn: InteractionHandler | null,
-): void {
+export function setDiscordInteractionHandler(token: string, fn: InteractionHandler | null): void {
   if (fn) interactionHandlers.set(token, fn);
   else interactionHandlers.delete(token);
 }
 
 /** Ack a slash command with text (callback type 4). Use only for
  *  replies with no async command work before them. */
-export async function respondToInteraction(
-  botToken: string,
-  d: any,
-  text?: string,
-): Promise<void> {
+export async function respondToInteraction(botToken: string, d: any, text?: string): Promise<void> {
   try {
     await discordFetch(botToken, `/interactions/${d.id}/${d.token}/callback`, {
       method: "POST",
       body: { type: 4, data: text ? { content: text } : {} },
     });
   } catch (e) {
-    console.error(
-      "[interactions] callback failed:",
-      sanitizeSensitiveText(String(e)),
-    );
+    console.error("[interactions] callback failed:", sanitizeSensitiveText(String(e)));
   }
 }
 
@@ -1281,43 +1090,26 @@ export async function respondToInteraction(
  *  Discord from showing "did not respond in time" (3s window) — call it
  *  BEFORE any command work. The deferred message shows "Thinking" until
  *  edited via editInteractionMessage. */
-export async function deferInteraction(
-  botToken: string,
-  d: any,
-): Promise<void> {
+export async function deferInteraction(botToken: string, d: any): Promise<void> {
   try {
     await discordFetch(botToken, `/interactions/${d.id}/${d.token}/callback`, {
       method: "POST",
       body: { type: 5 },
     });
   } catch (e) {
-    console.error(
-      "[interactions] defer failed:",
-      sanitizeSensitiveText(String(e)),
-    );
+    console.error("[interactions] defer failed:", sanitizeSensitiveText(String(e)));
   }
 }
 
 /** Edit the deferred slash-command message ("Thinking" → result text). */
-export async function editInteractionMessage(
-  botToken: string,
-  d: any,
-  text: string,
-): Promise<void> {
+export async function editInteractionMessage(botToken: string, d: any, text: string): Promise<void> {
   try {
-    await discordFetch(
-      botToken,
-      `/webhooks/${d.application_id}/${d.token}/messages/@original`,
-      {
-        method: "PATCH",
-        body: { content: text },
-      },
-    );
+    await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}/messages/@original`, {
+      method: "PATCH",
+      body: { content: text },
+    });
   } catch (e) {
-    console.error(
-      "[interactions] edit failed:",
-      sanitizeSensitiveText(String(e)),
-    );
+    console.error("[interactions] edit failed:", sanitizeSensitiveText(String(e)));
   }
 }
 
@@ -1328,62 +1120,21 @@ export async function editInteractionMessage(
  *  registerDiscordCommands pushes an EMPTY list to clear the slash menu. */
 const SLASH_COMMANDS = [
   { name: "stop", description: "Stop the current run" },
-  {
-    name: "btw",
-    description: "Quick side question, answered briefly",
-    options: [
-      {
-        type: 3,
-        name: "question",
-        description: "your question",
-        required: true,
-      },
-    ],
-  },
+  { name: "btw", description: "Quick side question, answered briefly",
+    options: [{ type: 3, name: "question", description: "your question", required: true }] },
   { name: "help", description: "List the commands" },
   { name: "status", description: "Session stats (owner)" },
   { name: "reset", description: "Restart the session (owner)" },
-  {
-    name: "verbose",
-    description: "Forward tool calls (owner)",
-    options: [
-      {
-        type: 3,
-        name: "mode",
-        description: "on or off",
-        required: false,
-        choices: [
-          { name: "on", value: "on" },
-          { name: "off", value: "off" },
-        ],
-      },
-    ],
-  },
-  {
-    name: "compact",
-    description: "Compact session context (owner)",
-    options: [
-      {
-        type: 3,
-        name: "instructions",
-        description: "optional focus instructions",
-        required: false,
-      },
-    ],
-  },
-  {
-    name: "model",
-    description: "Switch or list models (owner)",
-    options: [
-      {
-        type: 3,
-        name: "name",
-        description: "model id (omit to list)",
-        required: false,
-      },
-    ],
-  },
+  { name: "verbose", description: "Forward tool calls (owner)",
+    options: [{ type: 3, name: "mode", description: "on or off", required: false,
+      choices: [{ name: "on", value: "on" }, { name: "off", value: "off" }] }] },
+  { name: "compact", description: "Compact session context (owner)",
+    options: [{ type: 3, name: "instructions", description: "optional focus instructions", required: false }] },
+  { name: "model", description: "Switch or list models (owner)",
+    options: [{ type: 3, name: "name", description: "model id (omit to list)", required: false }] },
   { name: "jobs", description: "List in-flight pi-bg dispatches" },
+  { name: "todos", description: "Show the channel todo board ('all' for every channel)",
+    options: [{ type: 3, name: "scope", description: "'all' for every channel", required: false }] },
 ];
 
 /** Clear guild + global slash commands so the native "/" menu is empty
@@ -1396,46 +1147,26 @@ export async function registerDiscordCommands(token: string): Promise<void> {
     const guilds = await discordFetch(token, "/users/@me/guilds");
     const guildList: any[] = Array.isArray(guilds) ? guilds : [];
     if (guildList.length === 0) {
-      console.log(
-        "[interactions] no guilds for guild-scoped registration (DM-only bot?) — skipping",
-      );
+      console.log("[interactions] no guilds for guild-scoped registration (DM-only bot?) — skipping");
       return;
     }
     let ok = 0;
     for (const g of guildList) {
       const label = g?.name ?? g?.id ?? "?";
       try {
-        await discordFetch(
-          token,
-          `/applications/${me.id}/guilds/${g.id}/commands`,
-          { method: "PUT", body: list },
-        );
+        await discordFetch(token, `/applications/${me.id}/guilds/${g.id}/commands`, { method: "PUT", body: list });
         ok += 1;
-        console.log(
-          `[interactions] registered ${list.length} slash commands in guild ${label}`,
-        );
+        console.log(`[interactions] registered ${list.length} slash commands in guild ${label}`);
       } catch (e) {
-        console.error(
-          `[interactions] register failed for guild ${label}:`,
-          sanitizeSensitiveText(String(e)),
-        );
+        console.error(`[interactions] register failed for guild ${label}:`, sanitizeSensitiveText(String(e)));
       }
     }
-    if (ok === 0)
-      console.error(
-        `[interactions] guild command registration failed for all ${guildList.length} guilds`,
-      );
+    if (ok === 0) console.error(`[interactions] guild command registration failed for all ${guildList.length} guilds`);
     // Clear legacy GLOBAL commands too (native slash UI is disabled).
-    await discordFetch(token, `/applications/${me.id}/commands`, {
-      method: "PUT",
-      body: list,
-    });
+    await discordFetch(token, `/applications/${me.id}/commands`, { method: "PUT", body: list });
     console.log("[interactions] global command list synced (text-only mode)");
   } catch (e) {
-    console.error(
-      "[interactions] register failed:",
-      sanitizeSensitiveText(String(e)),
-    );
+    console.error("[interactions] register failed:", sanitizeSensitiveText(String(e)));
   }
 }
 
@@ -1443,7 +1174,5 @@ export async function registerDiscordCommands(token: string): Promise<void> {
 export async function sendDiscordTyping(config: ChannelConfig): Promise<void> {
   if (config.type !== "discord" || !config.botToken) return;
   const channelId = states.get(config.id)?.channelId || config.channel;
-  await discordFetch(config.botToken, `/channels/${channelId}/typing`, {
-    method: "POST",
-  });
+  await discordFetch(config.botToken, `/channels/${channelId}/typing`, { method: "POST" });
 }

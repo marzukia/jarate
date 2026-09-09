@@ -128,16 +128,10 @@ carries the thread.
 - `stop` / `/stop` — anyone in the channel aborts the in-flight run
 - `/btw <question>` — anyone: quick side question, answered briefly
 - `/help` — anyone: list the commands
-- `/jobs` — anyone: list in-flight pi-bg dispatches
 - `/status` — owner: context-window usage, model, uptime
 - `/reset` — owner: abort and restart the pi session
 - `/verbose on|off` — owner: toggle tool-call forwarding until restart
   (bare `/verbose` toggles)
-- `/compact [instructions]` — owner: compact session context (optionally with
-  custom instructions)
-- `/model [name]` — owner: switch model, or list models when bare
-- `! <command>` — owner: run `bash -c` in the working directory (60s cap,
-  20k-char capture, 4k-char display)
 
 ## Layout
 

@@ -98,11 +98,7 @@ export interface DiscordEmbed {
   title?: string | null;
   description?: string | null;
   url?: string | null;
-  author?: {
-    name?: string | null;
-    url?: string | null;
-    icon_url?: string | null;
-  };
+  author?: { name?: string | null; url?: string | null; icon_url?: string | null };
   footer?: { text?: string | null; icon_url?: string | null };
   fields?: DiscordEmbedField[];
 }
@@ -113,9 +109,9 @@ export interface AttachmentContent {
   filename: string;
   contentType: string;
   size: number;
-  path: string; // saved to disk
-  text?: string; // text content if extractable (txt, code, etc.)
-  base64?: string; // for images
+  path: string;      // saved to disk
+  text?: string;     // text content if extractable (txt, code, etc.)
+  base64?: string;   // for images
 }
 
 /** Status of a channel's connection. */
@@ -132,8 +128,8 @@ export interface ChannelStatus {
 // ─── Settings loading ─────────────────────────────────────────────────────
 
 import * as fs from "node:fs";
-import { homedir } from "node:os";
 import * as path from "node:path";
+import { homedir } from "node:os";
 
 /**
  * Load channel config from settings cascade:
@@ -154,9 +150,7 @@ export function loadChannelConfig(cwd: string): ChannelConfig[] {
       if (Array.isArray(channels) && channels.length > 0) {
         return channels.map(normalizeChannel);
       }
-    } catch {
-      /* continue to next source */
-    }
+    } catch { /* continue to next source */ }
   }
 
   return [];
@@ -178,25 +172,18 @@ function normalizeChannel(raw: any): ChannelConfig {
     forwardToolCalls: raw.forwardToolCalls === true,
     bufferFileOnly: raw.bufferFileOnly !== false,
     startupMessage: raw.startupMessage,
-    peerBotIds: Array.isArray(raw.peerBotIds)
-      ? raw.peerBotIds.filter((x: any) => typeof x === "string")
-      : undefined,
+    peerBotIds: Array.isArray(raw.peerBotIds) ? raw.peerBotIds.filter((x: any) => typeof x === "string") : undefined,
   };
 }
 
 /** Return the default channel (first with default:true, or first enabled). */
-export function getDefaultChannel(
-  channels: ChannelConfig[],
-): ChannelConfig | undefined {
-  const def = channels.find((c) => c.enabled && c.default);
+export function getDefaultChannel(channels: ChannelConfig[]): ChannelConfig | undefined {
+  const def = channels.find(c => c.enabled && c.default);
   if (def) return def;
-  return channels.find((c) => c.enabled);
+  return channels.find(c => c.enabled);
 }
 
 /** Find a channel by id or name. */
-export function getChannel(
-  channels: ChannelConfig[],
-  idOrName: string,
-): ChannelConfig | undefined {
-  return channels.find((c) => c.id === idOrName || c.name === idOrName);
+export function getChannel(channels: ChannelConfig[], idOrName: string): ChannelConfig | undefined {
+  return channels.find(c => c.id === idOrName || c.name === idOrName);
 }

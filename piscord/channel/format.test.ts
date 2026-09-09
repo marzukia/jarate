@@ -1,13 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import {
-  convertInlineForDiscord,
+  mdToDiscord,
+  limitHeadingDepth,
+  unnestCodeBlocksFromLists,
+  formatMarkdownTables,
   escapeBackticksInCodeBlocks,
   escapeDiscordFormatting,
-  formatMarkdownTables,
-  limitHeadingDepth,
-  mdToDiscord,
   serializeEmbeds,
-  unnestCodeBlocksFromLists,
+  convertInlineForDiscord,
 } from "./format";
 import type { DiscordEmbed } from "./types";
 
@@ -37,9 +37,7 @@ describe("unnestCodeBlocksFromLists", () => {
   \`\`\`js
   const x = 1
   \`\`\``;
-    expect(unnestCodeBlocksFromLists(input)).toBe(
-      "- Item 1\n\n```js\nconst x = 1\n```",
-    );
+    expect(unnestCodeBlocksFromLists(input)).toBe("- Item 1\n\n```js\nconst x = 1\n```");
   });
 
   test("code in middle item only", () => {
@@ -79,9 +77,7 @@ describe("unnestCodeBlocksFromLists", () => {
   const x = 1
   \`\`\`
   End text`;
-    expect(unnestCodeBlocksFromLists(input)).toBe(
-      "- Start text\n\n```js\nconst x = 1\n```\n- End text",
-    );
+    expect(unnestCodeBlocksFromLists(input)).toBe("- Start text\n\n```js\nconst x = 1\n```\n- End text");
   });
 
   test("code block at root level unchanged", () => {
@@ -174,9 +170,7 @@ describe("serializeEmbeds", () => {
 
   test("multiple embeds joined with blank line", () => {
     const embeds: DiscordEmbed[] = [{ title: "1" }, { title: "2" }];
-    expect(serializeEmbeds(embeds)).toBe(
-      "<embed>\nTitle: 1\n</embed>\n\n<embed>\nTitle: 2\n</embed>",
-    );
+    expect(serializeEmbeds(embeds)).toBe("<embed>\nTitle: 1\n</embed>\n\n<embed>\nTitle: 2\n</embed>");
   });
 });
 
@@ -197,9 +191,7 @@ describe("convertInlineForDiscord", () => {
     );
   });
   test("links inside code spans untouched", () => {
-    expect(convertInlineForDiscord("code `[a](b)` here")).toBe(
-      "code `[a](b)` here",
-    );
+    expect(convertInlineForDiscord("code `[a](b)` here")).toBe("code `[a](b)` here");
   });
   test("code block content untouched", () => {
     const input = "```\n# not a heading\n[a](b)\n```";

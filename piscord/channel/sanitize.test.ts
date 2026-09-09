@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 
 describe("sanitizeSensitiveText", () => {
@@ -8,47 +8,37 @@ describe("sanitizeSensitiveText", () => {
 
   test("redacts Bearer tokens (and the surrounding key)", () => {
     // The Authorization key/value rule also fires, so both spots are redacted
-    expect(sanitizeSensitiveText("Authorization: Bearer abc123def456")).toBe(
-      "Authorization: [REDACTED] [REDACTED]",
-    );
-    expect(sanitizeSensitiveText("Bearer abc123def456 on its own")).toBe(
-      "Bearer [REDACTED] on its own",
-    );
+    expect(sanitizeSensitiveText("Authorization: Bearer abc123def456"))
+      .toBe("Authorization: [REDACTED] [REDACTED]");
+    expect(sanitizeSensitiveText("Bearer abc123def456 on its own"))
+      .toBe("Bearer [REDACTED] on its own");
   });
 
   test("redacts OpenAI-style sk- keys", () => {
-    expect(sanitizeSensitiveText("key: sk-abcdefghijklmnop1234")).toBe(
-      "key: [REDACTED_OPENAI_KEY]",
-    );
+    expect(sanitizeSensitiveText("key: sk-abcdefghijklmnop1234"))
+      .toBe("key: [REDACTED_OPENAI_KEY]");
   });
 
   test("redacts Discord bot tokens", () => {
-    const token =
-      "MTA5MTk5NTIxMTM4OTk3NzUxMg.MnOpQr.STU-VWXyzaBCdefGHIjklMNOpQrSTU";
-    expect(sanitizeSensitiveText(`bot=${token}`)).toBe(
-      "bot=[REDACTED_DISCORD_TOKEN]",
-    );
+    const token = "MTA5MTk5NTIxMTM4OTk3NzUxMg.MnOpQr.STU-VWXyzaBCdefGHIjklMNOpQrSTU";
+    expect(sanitizeSensitiveText(`bot=${token}`)).toBe("bot=[REDACTED_DISCORD_TOKEN]");
   });
 
   test("redacts secrets in query strings", () => {
-    expect(
-      sanitizeSensitiveText("https://x.test/cb?token=abcdef123456&x=1"),
-    ).toBe("https://x.test/cb?token=[REDACTED]");
+    expect(sanitizeSensitiveText("https://x.test/cb?token=abcdef123456&x=1"))
+      .toBe("https://x.test/cb?token=[REDACTED]");
   });
 
   test("redacts quoted key secrets", () => {
-    expect(sanitizeSensitiveText('api_key: "supersecretvalue"')).toBe(
-      "api_key: [REDACTED]",
-    );
+    expect(sanitizeSensitiveText('api_key: "supersecretvalue"'))
+      .toBe("api_key: [REDACTED]");
   });
 
   test("redacts bare key=value for sensitive key names only", () => {
-    expect(sanitizeSensitiveText("secret=abcd1234efgh5678")).toBe(
-      "secret=[REDACTED]",
-    );
-    expect(sanitizeSensitiveText("session=abcd1234efgh5678")).toBe(
-      "session=abcd1234efgh5678",
-    );
+    expect(sanitizeSensitiveText("secret=abcd1234efgh5678"))
+      .toBe("secret=[REDACTED]");
+    expect(sanitizeSensitiveText("session=abcd1234efgh5678"))
+      .toBe("session=abcd1234efgh5678");
   });
 
   test("redacts unix paths when redactPaths is set", () => {
@@ -57,15 +47,12 @@ describe("sanitizeSensitiveText", () => {
     });
     expect(out).toBe("path is [REDACTED_PATH]");
     // without the flag, paths stay
-    expect(sanitizeSensitiveText("path is /home/u/.config/opencode")).toBe(
-      "path is /home/u/.config/opencode",
-    );
+    expect(sanitizeSensitiveText("path is /home/u/.config/opencode"))
+      .toBe("path is /home/u/.config/opencode");
   });
 
   test("ordinary text unchanged", () => {
-    expect(sanitizeSensitiveText("hello world, all good")).toBe(
-      "hello world, all good",
-    );
+    expect(sanitizeSensitiveText("hello world, all good")).toBe("hello world, all good");
   });
 });
 
@@ -82,9 +69,8 @@ describe("sanitizeUnknownValue", () => {
   });
 
   test("Date becomes ISO string", () => {
-    expect(sanitizeUnknownValue(new Date("2026-01-02T03:04:05Z"))).toBe(
-      "2026-01-02T03:04:05.000Z",
-    );
+    expect(sanitizeUnknownValue(new Date("2026-01-02T03:04:05Z")))
+      .toBe("2026-01-02T03:04:05.000Z");
   });
 
   test("Error becomes plain object, cause recursed", () => {
@@ -113,15 +99,12 @@ describe("sanitizeUnknownValue", () => {
   });
 
   test("nested object and array", () => {
-    expect(sanitizeUnknownValue({ a: [1, "two"], b: { c: 3 } })).toEqual({
-      a: [1, "two"],
-      b: { c: 3 },
-    });
+    expect(sanitizeUnknownValue({ a: [1, "two"], b: { c: 3 } }))
+      .toEqual({ a: [1, "two"], b: { c: 3 } });
   });
 
   test("strings inside objects are sanitized", () => {
-    expect(sanitizeUnknownValue({ url: "sk-abcdefghijklmnop1234" })).toEqual({
-      url: "[REDACTED_OPENAI_KEY]",
-    });
+    expect(sanitizeUnknownValue({ url: "sk-abcdefghijklmnop1234" }))
+      .toEqual({ url: "[REDACTED_OPENAI_KEY]" });
   });
 });

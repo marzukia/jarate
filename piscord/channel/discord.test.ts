@@ -3,26 +3,26 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-  allowedMentionsFor,
   connectDiscord,
-  deferInteraction,
   disconnectDiscord,
-  editInteractionMessage,
+  pollDiscord,
+  resolveChannelId,
+  suppressAutoReact,
+  handleMessageCreate,
   ensurePresenceState,
   getDiscordStates,
-  handleMessageCreate,
-  isBgWebhook,
-  loadPersistedCursors,
-  mimeForFile,
-  POLL_BACKFILL_MS,
   POLL_INTERVAL_MS,
-  pollDiscord,
-  registerDiscordCommands,
-  resolveChannelId,
-  respondToInteraction,
+  POLL_BACKFILL_MS,
   sendDiscordMessage,
   sendFilesToDiscord,
-  suppressAutoReact,
+  allowedMentionsFor,
+  loadPersistedCursors,
+  mimeForFile,
+  registerDiscordCommands,
+  deferInteraction,
+  editInteractionMessage,
+  respondToInteraction,
+  isBgWebhook,
 } from "./discord";
 
 // ─── fetch mock plumbing ───────────────────────────────────────────────────
@@ -55,21 +55,7 @@ const cfg = (id: string, extra: Record<string, unknown> = {}): any => ({
 });
 
 afterEach(() => {
-  for (const id of [
-    "m3",
-    "l3",
-    "react",
-    "noack",
-    "gw",
-    "burst",
-    "r1",
-    "o1",
-    "o2",
-    "o3",
-    "c1",
-    "p1",
-  ])
-    disconnectDiscord(id);
+  for (const id of ["m3", "l3", "react", "noack", "gw", "burst", "r1", "o1", "o2", "o3", "c1", "p1"]) disconnectDiscord(id);
 });
 
 // ─── M3: startup message gated on bot identity ─────────────────────────────
@@ -154,8 +140,7 @@ test("poller auto-reacts unless suppressed or ack disabled (L6, F2)", async () =
       puts.push(u.split("/messages/")[1]?.split("/")[0] || "?");
       return jsonResp(204, null);
     }
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("m0", "u-1")]);
+    if (u.includes("/messages?limit=1")) return jsonResp(200, [userMsg("m0", "u-1")]);
     if (u.includes("/messages")) {
       pollCount++;
       if (pollCount === 1) {
@@ -201,12 +186,9 @@ test("ack: false disables the auto-react (F2)", async () => {
       puts.push(u.split("/messages/")[1]?.split("/")[0] || "?");
       return jsonResp(204, null);
     }
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("n0", "u-2")]);
+    if (u.includes("/messages?limit=1")) return jsonResp(200, [userMsg("n0", "u-2")]);
     if (u.includes("/messages")) {
-      return seen.length
-        ? jsonResp(200, [])
-        : jsonResp(200, [userMsg("n1", "u-2")]);
+      return seen.length ? jsonResp(200, []) : jsonResp(200, [userMsg("n1", "u-2")]);
     }
     return jsonResp(200, null);
   });
@@ -233,10 +215,7 @@ test("gateway MESSAGE_CREATE delivers once; duplicate dropped; poll backfill ded
     if (u.includes("/messages")) {
       // Worst case: backfill re-sees the gateway-delivered g1 plus new g2
       // (oldest first, as Discord returns them).
-      return jsonResp(200, [
-        userMsg("9000000000000000001", "u-9"),
-        userMsg("9000000000000000002", "u-9"),
-      ]);
+      return jsonResp(200, [userMsg("9000000000000000001", "u-9"), userMsg("9000000000000000002", "u-9")]);
     }
     return jsonResp(200, null);
   });
@@ -253,12 +232,9 @@ test("gateway MESSAGE_CREATE delivers once; duplicate dropped; poll backfill ded
   st.botUserId = "bot-g";
 
   const d = (id: string, authorId = "u-9", channelId = "999") => ({
-    id,
-    channel_id: channelId,
+    id, channel_id: channelId,
     author: { id: authorId, username: "user" },
-    content: "hi",
-    attachments: [],
-    embeds: [],
+    content: "hi", attachments: [], embeds: [],
     timestamp: new Date().toISOString(),
   });
 
@@ -281,18 +257,12 @@ test("gateway MESSAGE_CREATE delivers once; duplicate dropped; poll backfill ded
   // Poll backfill: g1 below cursor dropped, g2 delivered exactly once.
   await pollDiscord("gw");
   await tick();
-  expect(seen.map((m) => m.messageId)).toEqual([
-    "9000000000000000001",
-    "9000000000000000002",
-  ]);
+  expect(seen.map((m) => m.messageId)).toEqual(["9000000000000000001", "9000000000000000002"]);
 
   // Second backfill tick: everything at/below cursor → nothing new.
   await pollDiscord("gw");
   await tick();
-  expect(seen.map((m) => m.messageId)).toEqual([
-    "9000000000000000001",
-    "9000000000000000002",
-  ]);
+  expect(seen.map((m) => m.messageId)).toEqual(["9000000000000000001", "9000000000000000002"]);
 });
 
 test("backfill batch of 3 is delivered oldest-first; cursor ends at newest", async () => {
@@ -307,11 +277,7 @@ test("backfill batch of 3 is delivered oldest-first; cursor ends at newest", asy
       const m = u.match(/after=([^&]+)/);
       if (m) afters.push(m[1]);
       // Burst of 3, ascending ids, all above the cursor.
-      return jsonResp(200, [
-        userMsg("101", "u-3"),
-        userMsg("102", "u-3"),
-        userMsg("103", "u-3"),
-      ]);
+      return jsonResp(200, [userMsg("101", "u-3"), userMsg("102", "u-3"), userMsg("103", "u-3")]);
     }
     return jsonResp(200, null);
   });
@@ -348,30 +314,20 @@ test("referenced_message → repliedMessage on inbound (T1)", async () => {
   const seen: any[] = [];
   setFetch(async (u) => {
     if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-r" });
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("500", "u-1")]);
+    if (u.includes("/messages?limit=1")) return jsonResp(200, [userMsg("500", "u-1")]);
     if (u.includes("/messages")) {
-      return jsonResp(200, [
-        {
-          ...userMsg("501", "u-1"),
-          referenced_message: {
-            id: "500",
-            content: "what is this about <@123> & stuff",
-            author: {
-              id: "u-2",
-              global_name: "Ref Author",
-              username: "refauthor",
-            },
-          },
+      return jsonResp(200, [{
+        ...userMsg("501", "u-1"),
+        referenced_message: {
+          id: "500",
+          content: "what is this about <@123> & stuff",
+          author: { id: "u-2", global_name: "Ref Author", username: "refauthor" },
         },
-      ]);
+      }]);
     }
     return jsonResp(200, null);
   });
-  await connectDiscord(cfg("r1"), {
-    onMessage: (m) => seen.push(m),
-    onError: () => {},
-  });
+  await connectDiscord(cfg("r1"), { onMessage: (m) => seen.push(m), onError: () => {} });
   await pollDiscord("r1");
   await tick();
   expect(seen.length).toBe(1);
@@ -386,44 +342,36 @@ test("gateway reply carries repliedMessage too (T1)", () => {
   st.botUserId = "bot-r2";
   const states = getDiscordStates();
   // Reuse a live state if one exists from the poll test; else build minimal.
-  const state =
-    states.get("r1") ||
-    ({
-      config: cfg("r1") as any,
-      channelId: "999",
-      botUserId: "bot-r2",
-      lastMessageId: null,
-      stateDir: null,
-      pollTimer: null,
-      consecutiveErrors: 0,
-      pollPauseUntil: 0,
-      polling: false,
-      callbacks: { onMessage: () => {}, onError: () => {} },
-      startupPending: false,
-    } as any);
+  let state = states.get("r1") || {
+    config: cfg("r1") as any,
+    channelId: "999",
+    botUserId: "bot-r2",
+    lastMessageId: null,
+    stateDir: null,
+    pollTimer: null,
+    consecutiveErrors: 0,
+    pollPauseUntil: 0,
+    polling: false,
+    callbacks: { onMessage: () => {}, onError: () => {} },
+    startupPending: false,
+  } as any;
   if (!states.has("r1")) states.set("r1", state);
   const seen: any[] = [];
   state.callbacks.onMessage = (m: any) => seen.push(m);
   state.lastMessageId = null;
   handleMessageCreate(st, {
-    id: "510",
-    channel_id: "999",
+    id: "510", channel_id: "999",
     author: { id: "u-1", username: "user" },
     content: "the thing you said",
     referenced_message: {
-      id: "509",
-      content: "original text",
+      id: "509", content: "original text",
       author: { id: "u-9", username: "other" },
     },
-    attachments: [],
-    embeds: [],
+    attachments: [], embeds: [],
     timestamp: new Date().toISOString(),
   });
   expect(seen.length).toBe(1);
-  expect(seen[0].repliedMessage).toEqual({
-    author: "other",
-    text: "original text",
-  });
+  expect(seen[0].repliedMessage).toEqual({ author: "other", text: "original text" });
 });
 
 // ─── T3: other-bot filter ─────────────────────────────────────────────────
@@ -434,19 +382,13 @@ test("other bots are skipped; cursor still advances (T3)", async () => {
     if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-o" });
     if (u.includes("/messages")) {
       return jsonResp(200, [
-        {
-          ...userMsg("601", "bot-other"),
-          author: { id: "bot-other", username: "otherbot", bot: true },
-        },
+        { ...userMsg("601", "bot-other"), author: { id: "bot-other", username: "otherbot", bot: true } },
         { ...userMsg("602", "u-1") },
       ]);
     }
     return jsonResp(200, null);
   });
-  await connectDiscord(cfg("o1"), {
-    onMessage: (m) => seen.push(m.messageId),
-    onError: () => {},
-  });
+  await connectDiscord(cfg("o1"), { onMessage: (m) => seen.push(m.messageId), onError: () => {} });
   await pollDiscord("o1");
   await tick();
   expect(seen).toEqual(["602"]);
@@ -458,8 +400,7 @@ test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg s
   const seen: any[] = [];
   setFetch(async (u) => {
     if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-w" });
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("600", "u-1")]);
+    if (u.includes("/messages?limit=1")) return jsonResp(200, [userMsg("600", "u-1")]);
     if (u.includes("/messages")) {
       return jsonResp(200, [
         // Realistic pi-bg dispatch webhook payload.
@@ -468,30 +409,18 @@ test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg s
           author: { id: "1546765929298272346", username: "monky", bot: true },
           webhook_id: "1546765929298272346",
           content: "[bg:worker:OK] task 42 done",
-          attachments: [],
-          embeds: [],
+          attachments: [], embeds: [],
           timestamp: new Date().toISOString(),
         },
         // Plain bot message (no [bg: prefix) — still skipped.
-        {
-          ...userMsg("612", "bot-other"),
-          author: { id: "bot-other", username: "otherbot", bot: true },
-        },
+        { ...userMsg("612", "bot-other"), author: { id: "bot-other", username: "otherbot", bot: true } },
         // Webhook author id but human content — not a dispatch wake.
-        {
-          ...userMsg("613", "1546765929298272346"),
-          author: { id: "1546765929298272346", username: "monky", bot: true },
-          webhook_id: "1546765929298272346",
-          content: "just a webhook note",
-        },
+        { ...userMsg("613", "1546765929298272346"), author: { id: "1546765929298272346", username: "monky", bot: true }, webhook_id: "1546765929298272346", content: "just a webhook note" },
       ]);
     }
     return jsonResp(200, null);
   });
-  await connectDiscord(cfg("o2"), {
-    onMessage: (m) => seen.push(m),
-    onError: () => {},
-  });
+  await connectDiscord(cfg("o2"), { onMessage: (m) => seen.push(m), onError: () => {} });
   await pollDiscord("o2");
   await tick();
   // Only the [bg: webhook message reached the handler — the dispatch wake.
@@ -505,31 +434,20 @@ test("peer bot (author.id in peerBotIds) is delivered; other bots still skipped"
   const seen: string[] = [];
   setFetch(async (u) => {
     if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-p" });
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("700", "u-1")]);
+    if (u.includes("/messages?limit=1")) return jsonResp(200, [userMsg("700", "u-1")]);
     if (u.includes("/messages")) {
       return jsonResp(200, [
         // agent-say: peer agent posting as its own bot — allowed through.
-        {
-          ...userMsg("701", "peer-1"),
-          author: { id: "peer-1", username: "frank", bot: true },
-          content: "[from frank] check this",
-        },
+        { ...userMsg("701", "peer-1"), author: { id: "peer-1", username: "frank", bot: true }, content: "[from frank] check this" },
         // Bot not in peerBotIds — still filtered.
-        {
-          ...userMsg("702", "bot-other"),
-          author: { id: "bot-other", username: "otherbot", bot: true },
-        },
+        { ...userMsg("702", "bot-other"), author: { id: "bot-other", username: "otherbot", bot: true } },
         // Human — always delivered.
         { ...userMsg("703", "u-1") },
       ]);
     }
     return jsonResp(200, null);
   });
-  await connectDiscord(cfg("o3", { peerBotIds: ["peer-1"] }), {
-    onMessage: (m) => seen.push(m.messageId),
-    onError: () => {},
-  });
+  await connectDiscord(cfg("o3", { peerBotIds: ["peer-1"] }), { onMessage: (m) => seen.push(m.messageId), onError: () => {} });
   await pollDiscord("o3");
   await tick();
   expect(seen).toEqual(["701", "703"]);
@@ -559,11 +477,7 @@ test("cursor persists to channel-state.json and seeds the next connect (T4)", as
 
     // First run: no saved cursor → limit=1 seed (700); deliver 701.
     const seen: string[] = [];
-    await connectDiscord(
-      cfg("c1"),
-      { onMessage: (m) => seen.push(m.messageId), onError: () => {} },
-      dir,
-    );
+    await connectDiscord(cfg("c1"), { onMessage: (m) => seen.push(m.messageId), onError: () => {} }, dir);
     await pollDiscord("c1");
     await tick();
     expect(seen).toEqual(["701"]);
@@ -572,20 +486,14 @@ test("cursor persists to channel-state.json and seeds the next connect (T4)", as
     expect(loadPersistedCursors(dir)["999"]).toBe("701");
     // Atomic write left no temp file behind; the file itself is valid JSON.
     expect(fs.existsSync(path.join(dir, "channel-state.json.tmp"))).toBe(false);
-    const onDisk = JSON.parse(
-      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
-    );
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"));
     expect(onDisk["999"]).toBe("701");
     disconnectDiscord("c1");
 
     // Second run: cursor seeded from disk — no limit=1 reseed, and the
     // first poll queries after the persisted cursor.
     const seen2: string[] = [];
-    await connectDiscord(
-      cfg("c1"),
-      { onMessage: (m) => seen2.push(m.messageId), onError: () => {} },
-      dir,
-    );
+    await connectDiscord(cfg("c1"), { onMessage: (m) => seen2.push(m.messageId), onError: () => {} }, dir);
     expect(seeds).toEqual(["seed"]); // no reseed
     await pollDiscord("c1");
     await tick();
@@ -619,16 +527,10 @@ test("outbound: silent by default; real <@id> keeps users parse (T5)", async () 
     return jsonResp(200, null);
   });
   expect(allowedMentionsFor("plain text")).toEqual({ parse: [] });
-  expect(allowedMentionsFor("hi <@5> and <@!9>")).toEqual({
-    parse: ["users"],
-    users: ["5", "9"],
-  });
+  expect(allowedMentionsFor("hi <@5> and <@!9>")).toEqual({ parse: ["users"], users: ["5", "9"] });
 
   await sendDiscordMessage(cfg("p1"), "echoed @everyone <@999> back");
-  expect(bodies[0].allowed_mentions).toEqual({
-    parse: ["users"],
-    users: ["999"],
-  });
+  expect(bodies[0].allowed_mentions).toEqual({ parse: ["users"], users: ["999"] });
   await sendDiscordMessage(cfg("p1"), "no mention here @everyone");
   expect(bodies[1].allowed_mentions).toEqual({ parse: [] });
 });
@@ -668,11 +570,7 @@ test("sendFilesToDiscord: multipart payload, MIME, 25 MB gate, missing file (T2)
     expect(r2.error).toContain("25 MB");
 
     // Missing file.
-    const r3 = await sendFilesToDiscord(
-      "999",
-      [path.join(dir, "nope.txt")],
-      "tok",
-    );
+    const r3 = await sendFilesToDiscord("999", [path.join(dir, "nope.txt")], "tok");
     expect(r3.success).toBe(false);
     expect(r3.error).toContain("Cannot read file");
 
@@ -685,18 +583,14 @@ test("sendFilesToDiscord: multipart payload, MIME, 25 MB gate, missing file (T2)
     let r4: { success: boolean; error?: string } | null = null;
     try {
       r4 = await sendFilesToDiscord("999", [a, sub], "tok");
-    } catch {
-      threw = true;
-    }
+    } catch { threw = true; }
     expect(threw).toBe(false);
-    expect(r4?.success).toBe(false);
-    expect(r4?.error).toContain("Cannot read file");
-    expect(r4?.error).toContain("sub");
+    expect(r4!.success).toBe(false);
+    expect(r4!.error).toContain("Cannot read file");
+    expect(r4!.error).toContain("sub");
 
     // Empty list is a no-op success.
-    expect(await sendFilesToDiscord("999", [], "tok")).toEqual({
-      success: true,
-    });
+    expect(await sendFilesToDiscord("999", [], "tok")).toEqual({ success: true });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -718,13 +612,9 @@ test("registerDiscordCommands is per-guild, logs failures, keeps the rest (G1)",
     const method = init?.method || "GET";
     if (u.endsWith("/applications/@me")) return jsonResp(200, { id: "app1" });
     if (u.endsWith("/users/@me/guilds")) {
-      return jsonResp(200, [
-        { id: "g1", name: "One" },
-        { id: "g2", name: "Two" },
-      ]);
+      return jsonResp(200, [{ id: "g1", name: "One" }, { id: "g2", name: "Two" }]);
     }
-    if (method === "PUT" && u.includes("/guilds/g2/commands"))
-      return jsonResp(403, { error: "nope" });
+    if (method === "PUT" && u.includes("/guilds/g2/commands")) return jsonResp(403, { error: "nope" });
     if (method === "PUT" && u.endsWith("/guilds/g1/commands")) {
       puts.push({ url: u, body: JSON.parse(init.body) });
       return jsonResp(200, null);
@@ -737,9 +627,7 @@ test("registerDiscordCommands is per-guild, logs failures, keeps the rest (G1)",
   // Text-only mode: one empty PUT per guild (clears the slash menu);
   // the legacy global list is cleared too (no per-command names).
   expect(puts.length).toBe(1);
-  expect(puts[0].url).toBe(
-    "https://discord.com/api/v10/applications/app1/guilds/g1/commands",
-  );
+  expect(puts[0].url).toBe("https://discord.com/api/v10/applications/app1/guilds/g1/commands");
   expect(puts[0].body).toEqual([]);
 });
 
@@ -752,30 +640,22 @@ test("registerDiscordCommands skips cleanly with no guilds", async () => {
     return jsonResp(200, null);
   });
   await registerDiscordCommands("tok-dm");
-  expect(seen.some((u) => u.includes("/commands"))).toBe(false);
+  expect(seen.some(u => u.includes("/commands"))).toBe(false);
 });
 
 test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @original (P0)", async () => {
   const calls: { url: string; method: string; body: any }[] = [];
   setFetch(async (u, init) => {
-    calls.push({
-      url: u,
-      method: init?.method ?? "GET",
-      body: JSON.parse(init.body),
-    });
+    calls.push({ url: u, method: init?.method ?? "GET", body: JSON.parse(init.body) });
     return jsonResp(200, { id: "m" });
   });
 
   await deferInteraction("tok-d", interaction);
-  expect(calls[0].url).toBe(
-    "https://discord.com/api/v10/interactions/i1/tok123/callback",
-  );
+  expect(calls[0].url).toBe("https://discord.com/api/v10/interactions/i1/tok123/callback");
   expect(calls[0].body).toEqual({ type: 5 });
 
   await editInteractionMessage("tok-d", interaction, "result");
-  expect(calls[1].url).toBe(
-    "https://discord.com/api/v10/webhooks/app1/tok123/messages/@original",
-  );
+  expect(calls[1].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123/messages/@original");
   expect(calls[1].method).toBe("PATCH");
   expect(calls[1].body).toEqual({ content: "result" });
 
@@ -785,37 +665,15 @@ test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @or
 
 test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only)", () => {
   // legacy plain-text callback
-  expect(
-    isBgWebhook({
-      webhook_id: "w1",
-      content: "[bg:worker:OK] task...",
-      author: { bot: true },
-    }),
-  ).toBe(true);
+  expect(isBgWebhook({ webhook_id: "w1", content: "[bg:worker:OK] task...", author: { bot: true } })).toBe(true);
   // embed-only callback (Variant D): no top-level content, identified by embed author
-  expect(
-    isBgWebhook({
-      webhook_id: "w1",
-      content: "",
-      author: { bot: true },
-      embeds: [
-        { author: { name: "pi-bg ticket \u00b7 20260909-023328-9001" } },
-      ],
-    }),
-  ).toBe(true);
+  expect(isBgWebhook({ webhook_id: "w1", content: "", author: { bot: true },
+    embeds: [{ author: { name: "pi-bg ticket \u00b7 20260909-023328-9001" } }] })).toBe(true);
   // non-webhook bot message with [bg: text is not exempt
   expect(isBgWebhook({ content: "[bg:x]", author: { bot: true } })).toBe(false);
   // webhook without the pi-bg markers is not exempt
-  expect(
-    isBgWebhook({ webhook_id: "w1", content: "hello", author: { bot: true } }),
-  ).toBe(false);
-  expect(
-    isBgWebhook({
-      webhook_id: "w1",
-      content: "",
-      author: { bot: true },
-      embeds: [{ author: { name: "other thing" } }],
-    }),
-  ).toBe(false);
+  expect(isBgWebhook({ webhook_id: "w1", content: "hello", author: { bot: true } })).toBe(false);
+  expect(isBgWebhook({ webhook_id: "w1", content: "", author: { bot: true },
+    embeds: [{ author: { name: "other thing" } }] })).toBe(false);
   expect(isBgWebhook(null)).toBe(false);
 });
