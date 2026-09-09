@@ -7,10 +7,14 @@
 #      Runs `bun install` there only if package.json changed.
 #   2. dispatch/pi-bg, dispatch/pi-wait -> ~/scripts/
 #   3. bin/agent-say -> ~/bin/agent-say
-#   4. git config core.hooksPath .githooks (source checkout only, idempotent)
+#   4. pgrag/  -> ~/projects/pgrag
+#      rsync --delete, keeps .git/__pycache__/.venv at the destination;
+#      --delete is skipped if the destination is a git repo with uncommitted
+#      changes.
+#   5. git config core.hooksPath .githooks (source checkout only, idempotent)
 #
 # Usage:
-#   ./install.sh [--dry-run] [--piscord-dir DIR]
+#   ./install.sh [--dry-run] [--piscord-dir DIR] [--pgrag-dir DIR]
 #
 # Guarantees:
 #   - never touches ~/.pi/agent/settings.json (it lives outside $PISCORD_DIR)
@@ -23,11 +27,13 @@ set -euo pipefail
 
 DRY=0
 PISCORD_DIR="${HOME}/.pi/agent/piscord"
+PGRAG_DIR="${HOME}/projects/pgrag"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --piscord-dir) PISCORD_DIR="${2:?--piscord-dir needs a path}"; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,20p'; exit 0 ;;
+    --pgrag-dir) PGRAG_DIR="${2:?--pgrag-dir needs a path}"; shift ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,22p'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -105,7 +111,24 @@ run cp -f "$SRC/bin/agent-say" "$HOME/bin/agent-say"
 run chmod +x "$HOME/bin/agent-say"
 echo "  bin: agent-say -> $HOME/bin/agent-say"
 
-# --- 4. git hooks (jarate checkout only, idempotent) ------------------------
+# --- 4. pgrag sync ---------------------------------------------------------
+# Protect a destination git repo with uncommitted changes: never run
+# rsync --delete there (same protect-discipline as settings.json).
+if [ "$DRY" = 1 ]; then
+  echo "[dry-run] rsync -a --delete --exclude .git --exclude __pycache__ --exclude .venv $SRC/pgrag/ $PGRAG_DIR/"
+else
+  mkdir -p "$PGRAG_DIR"
+  if git -C "$PGRAG_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     && [ -n "$(git -C "$PGRAG_DIR" status --porcelain)" ]; then
+    echo "  pgrag: $PGRAG_DIR is a git repo with uncommitted changes; syncing WITHOUT --delete"
+    rsync -a --exclude .git --exclude __pycache__ --exclude .venv "$SRC/pgrag/" "$PGRAG_DIR/"
+  else
+    rsync -a --delete --exclude .git --exclude __pycache__ --exclude .venv "$SRC/pgrag/" "$PGRAG_DIR/"
+  fi
+fi
+echo "  pgrag: $SRC/pgrag/ -> $PGRAG_DIR"
+
+# --- 5. git hooks (jarate checkout only, idempotent) ------------------------
 if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   run git -C "$SRC" config core.hooksPath .githooks
 echo "  git: core.hooksPath -> .githooks (in $SRC)"

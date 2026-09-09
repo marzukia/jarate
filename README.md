@@ -33,6 +33,7 @@ per-agent notes (frank cross-user pattern included).
 | `piscord/` | Discord channel bridge for pi (TypeScript, bun; 168 tests, tsc clean) |
 | `dispatch/` | `pi-bg` (dispatch worker/reviewer, cgroup escape, webhooks), `pi-wait` (in-turn wait) |
 | `bin/agent-say` | agent-to-agent Discord messaging |
+| `pgrag/` | RAG corpus tool for agents (uv + Postgres `rag` db; PEP-723 scripts, memory layer) |
 | `install.sh` | idempotent installer (`--dry-run`, `--piscord-dir`) |
 | `docs/DISPATCH.md` | orchestration pattern: roles, worktrees, cgroup escape, callback protocol |
 | `docs/COMMANDS.md` | every Discord command with examples |

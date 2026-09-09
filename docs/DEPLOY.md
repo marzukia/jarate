@@ -20,7 +20,7 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
 
 ## What install.sh does
 
-`install.sh` is idempotent. Flags: `--dry-run`, `--piscord-dir DIR`, `-h`.
+`install.sh` is idempotent. Flags: `--dry-run`, `--piscord-dir DIR`, `--pgrag-dir DIR`, `-h`.
 
 1. **piscord sync** — `rsync -a --delete` from `piscord/` to `$PISCORD_DIR`
    (default `~/.pi/agent/piscord`), excluding `.git` and `node_modules` at the
@@ -30,7 +30,12 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
    `~/scripts/` (a pre-existing symlink is replaced, not modified).
 3. **agent-say** — copy `bin/agent-say` to `~/bin/agent-say` (same symlink
    handling).
-4. **git hooks** — in the source checkout,
+4. **pgrag sync** — `rsync -a --delete` from `pgrag/` to `$PGRAG_DIR`
+   (default `~/projects/pgrag`), excluding `.git`, `__pycache__`, and `.venv`
+   at the destination. If the destination is a git repo **with uncommitted
+   changes**, `--delete` is skipped (files still sync) and a notice is
+   printed — the destination's local git state always survives.
+5. **git hooks** — in the source checkout,
    `git config core.hooksPath .githooks` (idempotent; no-op if the source is
    not a git checkout).
 
@@ -49,6 +54,38 @@ cd piscord && bun install
 bun x tsc --noEmit
 bun x bun test    # 168 pass
 ```
+
+## pgrag
+
+`pgrag/` is the agents' RAG corpus tool (PEP-723 inline-metadata Python,
+run via `uv run`). Query contract used by agents:
+
+```
+RAG_PROJECT=<project> uv run query.py "<question>"   # from pgrag/
+```
+
+Files under `~/projects/<name>/` are auto-tagged with the project dir on
+`uv run ingest.py`.
+
+**Prerequisite: a Postgres `rag` database on the box.** The schema is
+`pgrag/schema.sql` (create the db and apply it if missing). The sync step
+copies files only — it never touches the database. Without the db the files
+land fine, but queries fail; that is an operator action, not an install
+action.
+
+**Sync behavior:** idempotent `rsync` to `~/projects/pgrag` (override with
+`--pgrag-dir DIR`). `--delete` keeps the copy exact; the only exception is a
+destination git repo with uncommitted changes, where `--delete` is skipped
+so local work is never deleted (same protect-discipline as
+`settings.json`). `.git`, `__pycache__`, `.venv` are excluded.
+
+**Per-agent:**
+
+- **monky** (marzuki-hydrogen): the `rag` db exists on this host; nothing to
+  do.
+- **frank**: his box has no `rag` db yet. It would need to be created from
+  `pgrag/schema.sql` before pgrag queries work there. Not created by this
+  PR or by install.sh — documented, operator action.
 
 ## Per-agent notes (marzuki-hydrogen)
 
