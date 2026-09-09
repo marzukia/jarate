@@ -57,6 +57,9 @@ bun x bun test    # 168 pass
 
 ## pgrag
 
+Fresh setup (db, role, embed host, first ingest, env) is a from-zero
+runbook: [PGRAG-SETUP.md](PGRAG-SETUP.md).
+
 `pgrag/` is the agents' RAG corpus tool (PEP-723 inline-metadata Python,
 run via `uv run`). Query contract used by agents:
 
