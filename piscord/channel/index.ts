@@ -685,6 +685,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     lastActiveChannel = null;
+    pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
     pendingAttachments.clear();
     midTurnQueues.clear();
     finalReps.clear();
@@ -1173,17 +1174,45 @@ async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       userStoppedRun = true;
       try { ctx.abort(); } catch {}
-      // New session in-process (same flow as TUI /new): session_before_switch
-      // -> session_shutdown -> session_start {reason:"new"}. The session_start
-      // handler reconnects Discord + re-registers tools. No process restart —
-      // a respawn via systemd would resume the LAST session (pi -c in the unit).
-      setTimeout(async () => {
-        try { await ctx.newSession(); } catch (e) {
-          console.error("[reset] newSession failed, falling back to shutdown:", e);
-          try { ctx.shutdown(); } catch {}
+      // /reset = NEW session. Mechanism: move the current session file aside,
+      // then shutdown. The systemd respawn runs 'pi -c' (continue LAST
+      // session); with the last file gone it starts fresh. (ctx.newSession
+      // does NOT exist on event ctx — only on registerCommand ctx — reviewer
+      // F1, jarate 2026-09-10.)
+      setTimeout(() => {
+        try {
+          const home = process.env.HOME || "/root";
+          const sessionsBase = path.join(home, ".pi", "agent", "sessions");
+          const encDir = path.join(
+            sessionsBase,
+            "-" + String(ctx.cwd).replace(/\//g, "-") + "-",
+          );
+          let target: string | null = null;
+          const candidates: Array<[string, number]> = [];
+          const scan = (dir: string) => {
+            for (const f of fs.readdirSync(dir)) {
+              if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-*
+              const p = path.join(dir, f);
+              try { candidates.push([p, fs.statSync(p).mtimeMs]); } catch {}
+            }
+          };
+          if (fs.existsSync(encDir)) scan(encDir);
+          else if (fs.existsSync(sessionsBase)) {
+            for (const d of fs.readdirSync(sessionsBase)) {
+              const sub = path.join(sessionsBase, d);
+              try { if (fs.statSync(sub).isDirectory()) scan(sub); } catch {}
+            }
+          }
+          candidates.sort((a, b) => b[1] - a[1]);
+          target = candidates[0]?.[0] ?? null;
+          if (target) fs.renameSync(target, `${target}.reset-${Date.now()}`);
+          try { ctx.shutdown(); } catch { process.exit(1); }
+        } catch (e) {
+          console.error("[reset] failed, forcing respawn:", e);
+          process.exit(1); // F3: never leave a zombie half-state
         }
       }, 800);
-      return { immediate: "🆕 new session started (context cleared)…" };
+      return { immediate: "🆕 new session (context cleared) — restarting…" };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
