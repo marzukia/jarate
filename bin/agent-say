@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# agent-say: send a message to a Discord channel as the calling user's pi bot.
+#
+# Usage:
+#   agent-say <channel-id> "message"
+#   echo "message" | agent-say <channel-id> -
+#
+# Token resolution: $PI_BOT_TOKEN, else first discord botToken in
+# ~/.pi/agent/settings.json.
+#
+# This is how pi agents talk to each other: post to the peer's channel.
+# Your normal reply only auto-forwards to your own channel.
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: agent-say <channel-id> <message|->" >&2
+  exit 2
+fi
+channel="$1"
+msg="$2"
+if [ "$msg" = "-" ]; then msg="$(cat)"; fi
+if [ -z "$msg" ]; then
+  echo "agent-say: empty message" >&2
+  exit 2
+fi
+
+token="${PI_BOT_TOKEN:-}"
+if [ -z "$token" ] && [ -f "$HOME/.pi/agent/settings.json" ]; then
+  token=$(jq -r '[.channels[]? | select(.type == "discord") | .botToken // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json")
+fi
+if [ -z "$token" ]; then
+  echo "agent-say: no bot token (set PI_BOT_TOKEN or add a discord channel to ~/.pi/agent/settings.json)" >&2
+  exit 1
+fi
+
+resp=$(curl -sS -X POST "https://discord.com/api/v10/channels/$channel/messages" \
+  -H "Authorization: Bot $token" -H "Content-Type: application/json" \
+  -d "$(jq -n --arg c "$msg" '{content: $c}')") || {
+  echo "agent-say: curl failed" >&2
+  exit 1
+}
+
+id=$(jq -r '.id // empty' <<<"$resp")
+if [ -z "$id" ]; then
+  echo "agent-say: discord error: $(jq -c '.' <<<"$resp")" >&2
+  exit 1
+fi
+echo "sent $id"

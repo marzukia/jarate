@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# pi-wait — poll the monky Discord channel for the next bus event (in-turn wait)
+# usage: pi-wait --since <message-id> [--timeout 300] [--check 5]
+# exits:
+#   0 = webhook callback arrived  → prints its content
+#   2 = human message arrived     → prints "human: <name>" (break early)
+#   3 = timeout                   → prints "timeout"
+# config (all from ~/.pi/agent/settings.json, no secrets in this repo):
+#   bot token + channel id from channels[0]
+#   webhook author id from ~/.config/pi-dispatch/webhook_author
+set -euo pipefail
+
+since=""; timeout=300; check=5
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) since="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --check) check="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$since" ] || { echo "--since <message-id> required" >&2; exit 2; }
+
+cfg="${HOME}/.pi/agent/settings.json"
+token="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["botToken"])')"
+channel="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["channel"])')"
+botid="$(curl -s https://discord.com/api/v10/users/@me -H "Authorization: Bot ${token}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+wa="$(head -1 "${HOME}/.config/pi-dispatch/webhook_author" 2>/dev/null || true)"
+[ -n "$wa" ] || { echo "webhook_author missing" >&2; exit 2; }
+
+end=$(( $(date +%s) + timeout ))
+while [ "$(date +%s)" -lt "$end" ]; do
+  msgs="$(curl -s "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50" \
+    -H "Authorization: Bot ${token}")"
+  event="$(MSGS="$msgs" python3 - "$wa" "$botid" <<'EOF'
+import json, os, sys
+wa, bot = sys.argv[1], sys.argv[2]
+for m in json.loads(os.environ["MSGS"]):
+    a = m.get("author", {}).get("id")
+    if a == bot:
+        continue  # my own messages
+    if m.get("webhook_id") and a == wa:
+        print("0\t" + m["id"] + "\t" + (m.get("content") or ""))
+        break
+    name = m.get("author", {}).get("global_name") or m.get("author", {}).get("username", "")
+    print("2\t" + m["id"] + "\t" + name)
+    break
+EOF
+)"
+  if [ -n "$event" ]; then
+    code="${event%%$'\t'*}"
+    rest="${event#*$'\t'}"
+    newid="${rest%%$'\t'*}"
+    detail="${rest#*$'\t'}"
+    if [ "$code" = "0" ]; then
+      echo "CALLBACK $newid"; printf '%s\n' "$detail"; exit 0
+    else
+      echo "HUMAN $newid: ${detail}"; exit 2
+    fi
+  fi
+  sleep "$check"
+done
+echo "timeout"; exit 3

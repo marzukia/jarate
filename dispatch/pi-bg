@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# pi-bg — one-shot pi agent on a role profile (no Discord presence)
+# profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
+# usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] "task"
+#
+# --worktree [ref]: run the agent in a fresh git worktree instead of the live
+#   checkout. ref defaults to HEAD (only consumed as ref when more args
+#   follow it — otherwise the next arg is the task). Worktree:
+#   $PI_BG_WT_DIR/<repo>/<id> (default ~/.pi-bg-wt/<repo>/<id>),
+#   branch pi-bg/<id>. The worktree is KEPT after the run so the orchestrator
+#   can diff/commit/merge it; path + branch are printed and in the callback.
+#
+# On completion, posts a callback to the configured Discord webhook:
+#   webhook URL from $PI_DISPATCH_WEBHOOK or ~/.config/pi-dispatch/webhook
+#   (file absent = no callback; stdout is always printed)
+set -uo pipefail
+
+profile="${1:-worker}"
+case "$profile" in
+  worker|reviewer) shift ;;
+  *) echo "unknown profile: $profile (want worker|reviewer)" >&2; exit 2 ;;
+esac
+
+export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
+
+# --- per-run switchboard session id (unique ledger entry per dispatch) ---
+run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
+export PI_SESSION_ID="pi-${USER}-${profile}-${run_id}"
+
+# --- optional --worktree [ref] (consumed before pi flags) ---
+wt_ref=""
+wt_mode=0
+args=()
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--worktree" ]; then
+    wt_mode=1
+    shift
+    # ref is the next arg only if something still follows it (else it's the task)
+    if [ $# -ge 2 ]; then wt_ref="$1"; shift; fi
+  else
+    args+=("$1")
+    shift
+  fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+wt_path=""
+wt_branch=""
+if [ "$wt_mode" -eq 1 ]; then
+  ref="${wt_ref:-HEAD}"
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "pi-bg: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2; exit 3; }
+  id="$run_id"
+  wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
+  wt_branch="pi-bg/$id"
+  if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
+    echo "pi-bg: worktree add failed (ref=$ref path=$wt_path)" >&2; exit 3; fi
+  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) — kept after run"
+fi
+
+# task = last positional arg
+task="${@: -1}"
+
+# --- cgroup escape (automatic, persistent): move THIS process (and all
+#     children, incl. pi and the later webhook post) out of pi.service's
+#     cgroup so an orchestrator restart can't kill an in-flight run.
+#     systemd kills a unit's whole cgroup subtree on stop; a sibling cgroup
+#     under the user slice survives. Fallback: run in place if cgroup v2
+#     delegation is unavailable (mkdir/proc write fails). ---
+ESCAPE_CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/pi-bg/${run_id}"
+if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/dev/null; then
+  echo "[pi-bg] cgroup escape active: $ESCAPE_CG"
+  trap 'rmdir "$ESCAPE_CG" 2>/dev/null' EXIT
+else
+  rmdir "$ESCAPE_CG" 2>/dev/null
+  echo "[pi-bg] cgroup escape unavailable, running in caller cgroup"
+fi
+
+# retry on empty completion (local model quirk: some phrasings return nothing)
+out=""; rc=1
+for attempt in 1 2 3; do
+  if [ "$wt_mode" -eq 1 ]; then
+    out="$(cd "$wt_path" && pi -p --no-extensions "$@")"
+  else
+    out="$(pi -p --no-extensions "$@")"
+  fi
+  rc=$?
+  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] && break
+  echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
+  sleep 3
+done
+
+webhook="${PI_DISPATCH_WEBHOOK:-}"
+if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
+fi
+
+# --- webdrop: full prompt + full output behind a link (channel gets a brief) ---
+purl=""; ourl=""
+if command -v webdrop >/dev/null 2>&1; then
+  pf="/tmp/pi-bg-${run_id}-prompt.md"
+  of="/tmp/pi-bg-${run_id}-out.md"
+  { printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$pf"
+  printf '%s\n' "$out" > "$of"
+  purl="$(webdrop "$pf" "pi-bg-${run_id}-prompt" --ttl 7d 2>/dev/null | tail -1)" || purl=""
+  ourl="$(webdrop "$of" "pi-bg-${run_id}-out" --ttl 7d 2>/dev/null | tail -1)" || ourl=""
+fi
+
+if [ -n "$webhook" ]; then
+  status="OK"; [ $rc -ne 0 ] && status="FAIL"
+  [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] && status="EMPTY"
+  # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
+  verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
+  dur=${SECONDS}
+  BG_WEBHOOK="$webhook" BG_PROFILE="$profile" BG_STATUS="$status" BG_RC="$rc" \
+  BG_VERDICT="$verdict" BG_DUR="$dur" BG_TASK="${task:0:200}" BG_BRIEF="${out:0:400}" \
+  BG_WT="$wt_path" BG_BRANCH="$wt_branch" BG_CWD="$(pwd)" BG_RUN="$run_id" \
+  BG_PURL="$purl" BG_OURL="$ourl" \
+  python3 - > /tmp/pi-bg-${run_id}-body.json 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("BG_" + k, "")
+prof, status, rc, verdict = E("PROFILE"), E("STATUS"), E("RC"), E("VERDICT")
+dur = int(E("DUR") or 0)
+dstr = f"{dur//60}m{dur%60:02d}s"
+GREEN, RED, ORANGE = 3066993, 15158332, 15105570
+if prof == "reviewer" and verdict:
+    ok = verdict == "PASS"
+    title = ("\u2713 reviewer \u00b7 PASS" if ok else "\u2717 reviewer \u00b7 FAIL") + f" \u00b7 {dstr}"
+    color = GREEN if ok else RED
+elif status == "OK":
+    title = f"\u2713 {prof} \u00b7 OK \u00b7 {dstr}"; color = GREEN
+elif status == "FAIL":
+    title = f"\u2717 {prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"; color = RED
+else:
+    title = f"\u26a0 {prof} \u00b7 EMPTY \u00b7 {dstr}"; color = ORANGE
+meta = ["$ pi-bg " + prof + (" --worktree" if E("WT") else ""),
+        f"status : {status}" + (f" (rc={rc})" if status == "FAIL" else "")]
+if E("WT"):
+    wtdir = os.path.dirname(E("WT").rstrip("/"))
+    meta += [f"repo   : {os.path.basename(wtdir) or '?'}",
+             f"wt     : {E('WT')}", f"branch : {E('BRANCH')}"]
+else:
+    meta += [f"cwd    : {E('CWD')}"]
+embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('RUN')}"},
+         "color": color, "title": title,
+         "description": "```bash\n" + "\n".join(meta) + "```",
+         "fields": [{"name": "task", "value": E("TASK") or "-", "inline": False},
+                    {"name": "result", "value": E("BRIEF") or "-", "inline": False}],
+         "footer": {"text": "pi-bg"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+if E("PURL"):  embed["fields"].append({"name": "prompt", "value": f"[view]({E('PURL')})", "inline": True})
+if E("OURL"):  embed["fields"].append({"name": "full output", "value": f"[view]({E('OURL')})", "inline": True})
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+  if [ -s /tmp/pi-bg-${run_id}-body.json ]; then
+    curl -s -o /dev/null -X POST "$webhook" -H 'Content-Type: application/json' \
+      --data @/tmp/pi-bg-${run_id}-body.json
+  else
+    # fallback: legacy plain text if the embed builder failed
+    body="[bg:${profile}:${status}] cwd=$(pwd) task=${task:0:120}\n\n${out:0:400}"
+    curl -s -o /dev/null -X POST "$webhook" -H 'Content-Type: application/json' \
+      --data "$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body")"
+  fi
+fi
+
+printf '%s\n' "$out"
+[ "$wt_mode" -eq 1 ] && printf '[pi-bg] worktree kept: %s (branch %s)\n' "$wt_path" "$wt_branch"
+exit $rc

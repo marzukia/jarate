@@ -1,0 +1,43 @@
+{
+  "name": "piscord",
+  "version": "1.1.0",
+  "description": "Discord channel bridge for pi. Inbound messages arrive as plain user messages. Responses are auto-forwarded to the last active channel.",
+  "keywords": [
+    "pi-package",
+    "discord",
+    "channel",
+    "messaging",
+    "chat"
+  ],
+  "license": "MIT",
+  "repository": "https://github.com/marzukia/piscord",
+  "pi": {
+    "extensions": [
+      "./channel"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "marked": "^17.0.5",
+    "ws": "^8.21.1"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
+    "@earendil-works/pi-tui": "^0.85.0",
+    "@types/node": "^22",
+    "@types/ws": "^8.18.1",
+    "bun-types": "^1.4.2",
+    "jiti": "^2.4.0"
+  }
+}
