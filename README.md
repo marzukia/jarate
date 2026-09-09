@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="assets/jarate-icon.png" height="120" alt="jarate — a jar of piss"/>
+</p>
+
 # jarate
 
 Monorepo for the pi + piscord agent stack. One repo, one installer, every agent box in sync.
