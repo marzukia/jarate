@@ -155,7 +155,7 @@ let userStoppedRun = false;
 // warning line is posted instead. The counter resets on any different
 // final or on a new inbound user message.
 const finalReps = new Map<string, string[]>();
-export const REPEAT_WARNING = "⚠️ repetition loop detected — run stopped. Say /reset if it persists.";
+export const REPEAT_WARNING = "[!] repetition loop detected — run stopped. Say /reset if it persists.";
 
 /** Record a posted final; true on the third consecutive identical one. */
 export function recordFinalRepeat(channelId: string, text: string): boolean {
@@ -499,7 +499,7 @@ export function failurePostText(messages: unknown[], userStopped: boolean): stri
   if (!last || last.role !== "assistant") return null;
   const err = typeof last.errorMessage === "string" ? last.errorMessage : "";
   if (last.stopReason === "error" || (last.stopReason === "aborted" && err && !userStopped)) {
-    return `⚠️ ${err || "run failed"}`;
+    return `[!] ${err || "run failed"}`;
   }
   return null;
 }
@@ -833,7 +833,7 @@ export default function (pi: ExtensionAPI) {
     const pc = pendingCompact;
     pendingCompact = null;
     const err = startCompact(pc, ctx);
-    if (err !== null) sendDiscordMessage(pc.ch, `⚠️ compact failed: ${err}`).catch(() => {});
+    if (err !== null) sendDiscordMessage(pc.ch, `[!] compact failed: ${err}`).catch(() => {});
   };
   pi.on("session_compact", (_event, ctx) => { flushPendingCompact(ctx); });
   pi.on("session_compact_failed", (_event, ctx) => { flushPendingCompact(ctx); });
@@ -1071,7 +1071,7 @@ export function buildInteractionHandler(
       text = r.btw ? undefined : (r.immediate ?? "ok");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      text = `⚠️ command failed: ${sanitizeSensitiveText(msg)}`;
+      text = `[!] command failed: ${sanitizeSensitiveText(msg)}`;
     }
     if (text !== undefined) await editInteractionMessage(botToken, d, text);
   };
@@ -1080,7 +1080,7 @@ export function buildInteractionHandler(
 // ─── /compact: execute + report ─────────────────────────────────────────
 // pi's ctx.compact() is fire-and-forget and swallows failures silently
 // (the dist IIFE only calls onError when one is passed). Always report:
-// onComplete → token delta, onError → ⚠️ line. A sync throw returns the
+// onComplete → token delta, onError → [!] line. A sync throw returns the
 // sanitized error message (null on success) so the caller reports it on
 // its own path (command reply vs channel post).
 function startCompact(pending: { ch: ChannelConfig; instructions?: string }, ctx: ExtensionContext): string | null {
@@ -1093,12 +1093,12 @@ function startCompact(pending: { ch: ChannelConfig; instructions?: string }, ctx
         const before = typeof result?.tokensBefore === "number" ? result.tokensBefore : null;
         const after = typeof result?.estimatedTokensAfter === "number" ? result.estimatedTokensAfter : null;
         report(before != null && after != null
-          ? `✅ compacted: ${before} → ${after} tokens`
-          : "✅ compacted");
+          ? `[ok] compacted: ${before} → ${after} tokens`
+          : "[ok] compacted");
       },
       onError: (err) => {
         const msg = err instanceof Error && err.message ? err.message : String(err);
-        report(`⚠️ compact failed: ${sanitizeSensitiveText(msg)}`);
+        report(`[!] compact failed: ${sanitizeSensitiveText(msg)}`);
       },
     });
     return null;
@@ -1212,7 +1212,7 @@ async function runChannelCommand(
           process.exit(1); // F3: never leave a zombie half-state
         }
       }, 800);
-      return { immediate: "🆕 new session (context cleared) — restarting…" };
+      return { immediate: "[new] new session (context cleared) - restarting..." };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
@@ -1232,10 +1232,10 @@ async function runChannelCommand(
         const replacing = pendingCompact !== null;
         pendingCompact = { ch, instructions };
         const why = agentBusy ? "run in progress" : "compact already in progress";
-        return { immediate: `🗜️ queued (${why})${replacing ? ", replaces earlier" : ""}` };
+        return { immediate: `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}` };
       }
       const err = startCompact({ ch, instructions }, ctx);
-      return { immediate: err !== null ? `⚠️ compact failed: ${err}` : "🗜️ compacting…" };
+      return { immediate: err !== null ? `[!] compact failed: ${err}` : "[..] compacting..." };
     }
     case "jobs": {
       // Informational, open to all channel members (private channel).
@@ -1280,8 +1280,8 @@ async function runChannelCommand(
       const ok = await pi.setModel(found);
       return {
         immediate: ok
-          ? `🔄 model ${found.provider}/${found.id}`
-          : `⚠️ no auth configured for ${found.provider}/${found.id}`,
+          ? `[ok] model ${found.provider}/${found.id}`
+          : `[!] no auth configured for ${found.provider}/${found.id}`,
       };
     }
     default:
@@ -1441,7 +1441,7 @@ export function registerTodoTool(pi: ExtensionAPI, channels: ChannelConfig[]): v
       } catch (e) {
         // State write failed — report it but still echo the list so the
         // model keeps its copy.
-        stateNote = `\n\n⚠️ board save failed: ${sanitizeUnknownValue(e)}`;
+        stateNote = `\n\n[!] board save failed: ${sanitizeUnknownValue(e)}`;
       }
       await syncTodoBoard(ch, board);
       const text = todos.length === 0 ? "todo board cleared" : renderBoard(todos);
@@ -1717,7 +1717,7 @@ function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: stri
 
 // One-line-per-file display summary (no XML tags) shown in the TUI body.
 function attachmentSummary(files: AttachmentRef[]): string {
-  return files.map(a => `📎 ${a.filename} (${formatBytes(a.size)})`).join("\n");
+  return files.map(a => `- ${a.filename} (${formatBytes(a.size)})`).join("\n");
 }
 
 function formatBytes(bytes: number): string {

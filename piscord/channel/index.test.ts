@@ -328,15 +328,15 @@ describe("failurePostText (A2)", () => {
   });
 
   test("error stopReason posts the errorMessage", () => {
-    expect(failurePostText([failure("error", "boom")], false)).toBe("⚠️ boom");
+    expect(failurePostText([failure("error", "boom")], false)).toBe("[!] boom");
   });
 
   test("error without errorMessage posts a fallback", () => {
-    expect(failurePostText([failure("error")], false)).toBe("⚠️ run failed");
+    expect(failurePostText([failure("error")], false)).toBe("[!] run failed");
   });
 
   test("aborted with errorMessage posts when the run was not user-stopped", () => {
-    expect(failurePostText([failure("aborted", "interrupted")], false)).toBe("⚠️ interrupted");
+    expect(failurePostText([failure("aborted", "interrupted")], false)).toBe("[!] interrupted");
   });
 
   test("aborted with errorMessage is silent when the user stopped the run", () => {
@@ -528,7 +528,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(body.message_reference?.message_id).toBe("111");
   });
 
-  test("A2: agent_end posts ⚠️ + errorMessage on a failed run", async () => {
+  test("A2: agent_end posts [!] + errorMessage on a failed run", async () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     const failure = {
       role: "assistant",
@@ -541,7 +541,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     expect(post).toBeDefined();
-    expect(JSON.parse(post!.body).content).toBe("⚠️ boom");
+    expect(JSON.parse(post!.body).content).toBe("[!] boom");
   });
 
   test("A2: user /stop abort is not posted as a run error", async () => {
@@ -560,7 +560,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     const errors = fetchCalls.filter(
       c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages")
-        && String(JSON.parse(c.body).content).startsWith("⚠️"),
+        && String(JSON.parse(c.body).content).startsWith("[!]"),
     );
     expect(errors.length).toBe(0);
   });
@@ -1006,10 +1006,10 @@ describe("compact: defer mid-run + always report", () => {
     ctx.compact = (o?: any) => { opts = o; };
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
-    expect(channelPosts().some(t => t === "🗜️ compacting…")).toBe(true);
+    expect(channelPosts().some(t => t === "[..] compacting...")).toBe(true);
     opts.onComplete({ summary: "s", firstKeptEntryId: "e", tokensBefore: 219997, estimatedTokensAfter: 35000 });
     await tick();
-    expect(channelPosts().some(t => t === "✅ compacted: 219997 → 35000 tokens")).toBe(true);
+    expect(channelPosts().some(t => t === "[ok] compacted: 219997 → 35000 tokens")).toBe(true);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
@@ -1026,15 +1026,15 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     opts.onError(new Error("Nothing to compact (session too small)"));
     await tick();
-    expect(channelPosts().some(t => t === "⚠️ compact failed: Nothing to compact (session too small)")).toBe(true);
+    expect(channelPosts().some(t => t === "[!] compact failed: Nothing to compact (session too small)")).toBe(true);
   });
 
   test("sync throw from ctx.compact is reported, not swallowed", async () => {
     ctx.compact = () => { throw new Error("boom-ctx"); };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
-    expect(channelPosts().some(t => t === "⚠️ compact failed: boom-ctx")).toBe(true);
-    expect(channelPosts().some(t => t === "🗜️ compacting…")).toBe(false);
+    expect(channelPosts().some(t => t === "[!] compact failed: boom-ctx")).toBe(true);
+    expect(channelPosts().some(t => t === "[..] compacting...")).toBe(false);
   });
 
   test("mid-run /compact defers; agent_end flushes it with the stored instructions", async () => {
@@ -1047,7 +1047,7 @@ describe("compact: defer mid-run + always report", () => {
     // /compact mid-run
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts).toBeNull(); // not started yet — the run would be aborted
-    expect(channelPosts().some(t => t.startsWith("🗜️ queued (run in progress)"))).toBe(true);
+    expect(channelPosts().some(t => t.startsWith("[queued] compact (run in progress)"))).toBe(true);
     // run ends → flush
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
@@ -1061,7 +1061,7 @@ describe("compact: defer mid-run + always report", () => {
     await handlers.turn_start(null, ctx);
     await handleInbound(pi, inbound("/compact first", "m1"), ctx);
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
-    expect(channelPosts().some(t => t.startsWith("🗜️ queued (run in progress), replaces earlier"))).toBe(true);
+    expect(channelPosts().some(t => t.startsWith("[queued] compact (run in progress), replaces earlier"))).toBe(true);
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("second");
   });
@@ -1072,7 +1072,7 @@ describe("compact: defer mid-run + always report", () => {
     ctx.isIdle = () => false; // isCompacting; agentBusy stays false
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
     expect(opts).toBeNull();
-    expect(channelPosts().some(t => t.startsWith("🗜️ queued (compact already in progress)"))).toBe(true);
+    expect(channelPosts().some(t => t.startsWith("[queued] compact (compact already in progress)"))).toBe(true);
     handlers.session_compact?.({ compactionEntry: {}, fromExtension: true, reason: "manual", willRetry: false }, ctx);
     await tick();
     expect(opts?.customInstructions).toBe("second");
