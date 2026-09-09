@@ -28,6 +28,14 @@ TS/JS/JSON and fails fast on violations. `install.sh` sets
 (biome + piscord jobs) re-runs everything on the PR; the branch rule
 references context `ci` when the org upgrades to Pro.
 
+## Style (user-facing strings)
+
+**No emoji** in command acks, warnings, or anything posted to Discord —
+use kimaki-style ASCII tags: `[!]` warning/error, `[ok]` success,
+`[new]`/`[..]`/`[queued]` state, `- ` list items. Emoji only where the
+platform requires them (Discord reactions, e.g. the 👀 inbound ack).
+See AGENTS.md § Style. (Andryo, 2026-09-10)
+
 ## PR description template
 
 ```markdown

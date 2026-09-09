@@ -38,6 +38,16 @@ bash install.sh --dry-run          # installer regression check
 - **Do not force-push** to your PR branch after review has started.
 - `install.sh` must stay idempotent and `--dry-run`-clean. Test with a fake
   HOME: `HOME=/tmp/fake bash install.sh --dry-run`.
+
+## Style
+
+- **No emoji in user-facing strings.** Command acks, warnings, error lines,
+  and anything posted to Discord use kimaki-style ASCII tags:
+  `[!]` warning/error, `[ok]` success, `[new]`/`[..]`/`[queued]` state, `- ` list
+  items. Plain words beat decoration. (Andryo, 2026-09-10)
+- Emoji are allowed ONLY where the platform requires them: Discord
+  **reactions** (the 👀 inbound ack is a reaction and stays).
+- Applies to new code; don't bulk-strip emoji outside your change's scope.
 - `marzukia/piscord` (the standalone repo) stays untouched. jarate
   (`piscord/`) is the source of truth; do not re-sync from the old repo.
 
