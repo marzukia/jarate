@@ -54,7 +54,7 @@ reconstructed from box state, not exercised on a fresh install.
 ### 1. Prerequisites
 
 - Fedora (or any cgroup-v2 Linux with systemd user sessions)
-- `git`, `python3` (pi-bg embed builder, pi-wait message classification)
+- `git`, `python3` (pi-bg embed builder, pi-wait message classification), `jq` (step 11 checklist)
 - Node ≥ 20 + npm (pi is a node CLI) `[verified: node --version → v22.22.2]`
 - bun ≥ 1.4 (bridge deps, recall CLI, biome) `[verified: bun --version → 1.4.2]`
 - A Discord bot app + a channel it is invited to (step 3)
@@ -358,7 +358,8 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
 
 ```
                  Discord
-                    |  REST polling (5s) + gateway (presence)
+                    |  gateway MESSAGE_CREATE push (primary)
+                    |  + REST polling (backfill: 60s up, 5s if gateway down)
                     v
         +---------------------------+
         |  bridge (pi package)      |  <jarate>/packages/bridge
