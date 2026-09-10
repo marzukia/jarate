@@ -79,6 +79,15 @@ import {
   type TodoBoard,
 } from "./todos";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import {
+  startRun,
+  stageFileTouch,
+  finishRun,
+  performUndo,
+  performRedo,
+  findSessionFile,
+  type UndoRun,
+} from "./undo";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { memoryToc } from "./memory";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
@@ -86,6 +95,9 @@ import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
+// /undo run store: the in-flight run's snapshot handle (pre-state captured
+// at run start, file touches staged during the run, finalized at agent_end).
+let undoRun: UndoRun | null = null;
 // /compact queued while the session is busy (run in progress, or a
 // compaction already in flight). pi's compact() starts with await
 // abort(), so a mid-run compact would silently kill the in-flight
@@ -429,7 +441,7 @@ export function collectFinals(messages: unknown[]): { text: string; replyTo?: st
  * Exported for tests.
  */
 export function matchCommand(body: string): { name: string; arg?: string } | null {
-  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i);
+  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs|todos|undo|redo)(?:\s+([\s\S]+))?|stop)$/i);
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
 }
@@ -691,6 +703,23 @@ export default function (pi: ExtensionAPI) {
     finalReps.clear();
   });
 
+  // ─── /undo store: non-git preimages ─────────────────────────────────
+  // tool_execution_start fires in the preflight phase, BEFORE the tool
+  // executes — the only window to capture the pre-write content of a file
+  // the run touches (write/edit). Git dirs do not need this (the git
+  // snapshot at run start covers them).
+  pi.on("tool_execution_start", async (event, ctx) => {
+    try {
+      if (!undoRun || undoRun.git) return;
+      if (event.toolName !== "write" && event.toolName !== "edit") return;
+      const p = event.args?.path;
+      if (typeof p !== "string" || p.length === 0) return;
+      stageFileTouch(undoRun, ctx.cwd, p); // resolve against CURRENT cwd (agent may have cd'd)
+    } catch (e) {
+      console.error("[undo] stage touch failed:", sanitizeUnknownValue(e));
+    }
+  });
+
   // ─── Live status line (edit-in-place, deleted at run end) ───
   pi.on("tool_call", async (event) => {
     if (!lastActiveChannel) return;
@@ -738,6 +767,9 @@ export default function (pi: ExtensionAPI) {
       runOpen = true;
       runToolCount = 0;
       runStartedAt = Date.now();
+      // /undo store: capture the pre-run state (once per run). Best-effort:
+      // a snapshot failure must never break the run.
+      try { undoRun = startRun(ctx.cwd); } catch (e) { undoRun = null; console.error("[undo] start failed:", sanitizeUnknownValue(e)); }
       // fresh block per user message; previous blocks stay in history
       const r = await sendDiscordMessage(ch, "┣ working…");
       if (r.success && r.messageId) {
@@ -851,6 +883,18 @@ export default function (pi: ExtensionAPI) {
     if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
     agentBusy = false;
     refreshActivity(ctx);
+    // /undo store: finalize THIS run's snapshot before the re-wake below
+    // hands the queue to pi (so the post-state reflects this run, not the
+    // next). Best-effort: a snapshot failure must never break run end.
+    try {
+      if (undoRun) {
+        finishRun(undoRun, ctx.cwd, safeSessionFile(ctx));
+        undoRun = null;
+      }
+    } catch (e) {
+      undoRun = null;
+      console.error("[undo] finish failed:", sanitizeUnknownValue(e));
+    }
     // Deferred /compact (queued while this run was in progress). The
     // IIFE inside pi's compact() awaits abort()+waitForIdle() before it
     // compacts, so it runs only after this run settles (including the
@@ -967,6 +1011,8 @@ const HELP_TEXT = [
   "`/btw <question>` — quick side question, answered briefly",
   "`/status` — session stats (owner)",
   "`/reset` — start a NEW session, clearing context (owner)",
+  "`/undo` — revert last assistant turn: files + conversation (owner)",
+  "`/redo` — reapply an /undo (one level deep, owner)",
   "`/verbose on|off` — forward tool calls to the channel (owner)",
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
@@ -1075,6 +1121,53 @@ export function buildInteractionHandler(
     }
     if (text !== undefined) await editInteractionMessage(botToken, d, text);
   };
+}
+
+// ─── /undo + /redo: session + file revert ──────────────────────────────
+// See channel/undo.ts. The conversation revert works like /reset: pi resumes
+// with the LAST line of the session file as leaf, so truncating the file and
+// restarting pi takes the revert into effect.
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function safeSessionFile(ctx: ExtensionContext): string | null {
+  try {
+    return ctx.sessionManager?.getSessionFile?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Same respawn mechanism as /reset: systemd Restart=always re-runs
+// `pi -c`, which continues the (now truncated or re-appended) session.
+function scheduleRestart(ctx: ExtensionContext, label: string): void {
+  setTimeout(() => {
+    try {
+      ctx.shutdown();
+    } catch {
+      console.error(`[undo] ${label}: shutdown failed, forcing exit`);
+      process.exit(1);
+    }
+  }, 800);
+}
+
+async function runUndo(ctx: ExtensionContext): Promise<{ text: string; restarted: boolean }> {
+  if (!ctx.isIdle()) {
+    // Abort the in-flight run first (its agent_end finalizes the snapshot).
+    userStoppedRun = true;
+    try { ctx.abort(); } catch {}
+    await sleep(900);
+  }
+  const sessionFile = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
+  const r = performUndo(sessionFile);
+  if (r.restarted) scheduleRestart(ctx, "undo");
+  return r;
+}
+
+async function runRedo(ctx: ExtensionContext): Promise<{ text: string; restarted: boolean }> {
+  const r = performRedo();
+  if (r.restarted) scheduleRestart(ctx, "redo");
+  return r;
 }
 
 // ─── /compact: execute + report ─────────────────────────────────────────
@@ -1213,6 +1306,16 @@ async function runChannelCommand(
         }
       }, 800);
       return { immediate: "[new] new session (context cleared) - restarting..." };
+    }
+    case "undo": {
+      if (!isOwner) return ownerOnly;
+      const r = await runUndo(ctx);
+      return { immediate: r.text };
+    }
+    case "redo": {
+      if (!isOwner) return ownerOnly;
+      const r = await runRedo(ctx);
+      return { immediate: r.text };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;

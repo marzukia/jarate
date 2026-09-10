@@ -1125,6 +1125,8 @@ const SLASH_COMMANDS = [
   { name: "help", description: "List the commands" },
   { name: "status", description: "Session stats (owner)" },
   { name: "reset", description: "Restart the session (owner)" },
+  { name: "undo", description: "Revert last assistant turn: files + conversation (owner)" },
+  { name: "redo", description: "Reapply an /undo (one level deep, owner)" },
   { name: "verbose", description: "Forward tool calls (owner)",
     options: [{ type: 3, name: "mode", description: "on or off", required: false,
       choices: [{ name: "on", value: "on" }, { name: "off", value: "off" }] }] },
