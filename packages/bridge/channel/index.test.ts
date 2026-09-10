@@ -6,7 +6,9 @@ import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
   chunkText,
+  clearAllCompacting,
   clearAllInterrupts,
+  clearQueuedInbound,
   collectFinals,
   deleteQueuedInbound,
   deliverDueWakes,
@@ -15,6 +17,7 @@ import extension, {
   fileOnlyPrompt,
   handleInbound,
   interruptStepTimeoutMs,
+  isCompacting,
   matchCommand,
   midTurnQueues,
   parseJobsFromPs,
@@ -1936,7 +1939,12 @@ describe("compact: defer mid-run + always report", () => {
 
   afterEach(() => {
     jest.useRealTimers();
+    clearAllCompacting();
+    for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
+    queuedAcks.clear();
+    pendingInterrupts.clear();
     handlers.agent_end?.({ messages: [] }, ctx); // clears typing timer; flushes any pending compact
+    clearAllCompacting();
     globalThis.fetch = realFetch;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -2086,6 +2094,382 @@ describe("compact: defer mid-run + always report", () => {
     );
     await tick();
     expect(opts?.customInstructions).toBe("second");
+  });
+});
+
+describe("compaction-queue guard", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const inbound = (
+    body: string,
+    id: string,
+    channelId = "ch1",
+    fromId = "owner1",
+  ): ChannelMessage => ({
+    channelId,
+    channelName: channelId === "ch2" ? "Test2" : "Test",
+    channelType: "discord",
+    messageId: id,
+    from: fromId,
+    fromId,
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  // The settle drain is macrotask-deferred, and the re-wake handleInbound
+  // chain has its own awaits before pi.sendMessage — settle a few ticks.
+  const settleTicks = async () => {
+    await tick();
+    await tick();
+    await tick();
+  };
+
+  const channelPosts = (chId = "ch1") =>
+    fetchCalls
+      .filter(
+        (c) =>
+          (c.url.includes(`/channels/${chId}/messages`) ||
+            // ch2 resolves its Discord channel id from settings
+            (chId === "ch2" && c.url.includes("/channels/999/messages"))) &&
+          c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+
+  const piSends = () =>
+    sent.filter((s) => s.m?.customType === "channel-inbound");
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-test-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            channel: "ch1",
+            ack: true,
+            ownerUserId: "owner1",
+          },
+          {
+            id: "ch2",
+            name: "Test2",
+            type: "discord",
+            botToken: "tok2",
+            channel: "999",
+            ack: true,
+            ownerUserId: "owner1",
+          },
+        ],
+      }),
+    );
+    handlers = {};
+    fetchCalls = [];
+    sent = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      compact: () => {},
+      modelRegistry: { getAvailable: () => [] },
+      getContextUsage: () => undefined,
+      model: { id: "cur", name: "Cur" },
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    clearAllCompacting();
+    for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
+    queuedAcks.clear();
+    pendingInterrupts.clear();
+    handlers.agent_end?.({ messages: [] }, ctx); // flush any pending compact
+    clearAllCompacting();
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("flag lifecycle: set on /compact dispatch, cleared by session_compact and session_compact_failed", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    expect(isCompacting("ch1")).toBe(true);
+    expect(isCompacting("ch2")).toBe(false);
+
+    handlers.session_compact?.(
+      {
+        type: "session_compact",
+        compactionEntry: {},
+        fromExtension: false,
+        reason: "manual",
+        willRetry: false,
+      },
+      ctx,
+    );
+    expect(isCompacting("ch1")).toBe(false);
+
+    // re-open, then a FAILED settle also clears
+    await handleInbound(pi, inbound("/compact", "m2"), ctx);
+    expect(isCompacting("ch1")).toBe(true);
+    handlers.session_compact_failed?.(
+      {
+        type: "session_compact_failed",
+        reason: "manual",
+        errorMessage: "model down",
+        aborted: false,
+        willRetry: false,
+        fromExtension: false,
+      },
+      ctx,
+    );
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("fallback timer: clears the flag after 10 min with a console.warn", async () => {
+    jest.useFakeTimers();
+    const warns: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: any[]) => {
+      warns.push(a.join(" "));
+    };
+    try {
+      ctx.compact = () => {};
+      await handleInbound(pi, inbound("/compact", "m1"), ctx); // dispatched idle
+      expect(isCompacting("ch1")).toBe(true);
+      jest.advanceTimersByTime(10 * 60 * 1000);
+      expect(isCompacting("ch1")).toBe(false);
+      expect(warns.some((w) => w.includes("still compacting"))).toBe(true);
+    } finally {
+      console.warn = realWarn;
+      jest.useRealTimers();
+    }
+  });
+
+  test("fallback timer drains a queued message behind the stuck window", async () => {
+    jest.useFakeTimers();
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx); // dispatched idle
+    // flag set: even with isIdle true the gate keeps the window active,
+    // so a plain message queues (with the flag, isIdle stays moot)
+    await handleInbound(pi, inbound("late msg", "m2"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    jest.advanceTimersByTime(10 * 60 * 1000); // fallback: clear + drain (idle)
+    jest.useRealTimers(); // let the async re-wake run on real timers
+    await tick();
+    expect(piSends().some((s) => s.m.details?.body === "late msg")).toBe(true);
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("plain message while compacting: queued with ack, interrupt NOT armed", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false; // compaction now in flight
+    expect(isCompacting("ch1")).toBe(true);
+
+    await handleInbound(pi, inbound("hello while compacting", "m2"), ctx);
+    await tick();
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    expect(pendingInterrupts.has("ch1")).toBe(false); // no interrupt armed
+    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+    expect(piSends().length).toBe(0); // not sent to pi yet
+  });
+
+  test("queued message delivered on the SUCCESS settle without further inbound (pi emits session_compact BEFORE clearing its compaction state, so isIdle() is still false at event time)", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false; // compaction in flight
+    await handleInbound(pi, inbound("queued one", "m2"), ctx);
+    await handleInbound(pi, inbound("queued two", "m3"), ctx);
+    expect(piSends().length).toBe(0);
+
+    // pi real ordering (agent-session.js): await emit(session_compact) with
+    // _compactionAbortController still set -> isIdle() false DURING the
+    // handler; _clearManualCompactionState() runs only after the emit
+    // returns. The settle drain is macrotask-deferred, so it must survive
+    // the false-at-event-time isIdle.
+    handlers.session_compact?.(
+      {
+        compactionEntry: {},
+        reason: "manual",
+        willRetry: false,
+        fromExtension: false,
+      },
+      ctx,
+    );
+    ctx.isIdle = () => true; // _clearManualCompactionState() ran
+    await settleTicks();
+    // No further inbound: the queued message is re-woken by the settle.
+    const first = piSends().find((s) => s.m.details?.body === "queued one");
+    expect(first).toBeDefined();
+    expect(first?.o?.triggerTurn).toBe(true);
+    // one re-wake per settle; the run's agent_end drains the rest
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+  });
+
+  test("queued messages also drain after a failed compaction", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("queued one", "m2"), ctx);
+    // pi real ordering (failure path): _clearManualCompactionState() runs
+    // BEFORE the emit, so isIdle() is already true at event time.
+    ctx.isIdle = () => true;
+    handlers.session_compact_failed?.(
+      {
+        reason: "manual",
+        errorMessage: "model down",
+        aborted: false,
+        willRetry: false,
+        fromExtension: false,
+      },
+      ctx,
+    );
+    await settleTicks();
+    expect(piSends().some((s) => s.m.details?.body === "queued one")).toBe(
+      true,
+    );
+  });
+
+  test("/status works while compacting (read-only, shows compacting)", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("/status", "m2"), ctx);
+    await tick();
+    const st = channelPosts().find((t) => t.startsWith("[status]"));
+    expect(st).toBeDefined();
+    expect(st).toContain("compacting");
+    expect(midTurnQueues.has("ch1")).toBe(false); // consumed, not queued
+  });
+
+  test("/stop while compacting: owner clears the window, aborts, drops the queue", async () => {
+    let aborted = 0;
+    ctx.compact = () => {};
+    ctx.abort = () => {
+      aborted++;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("wait for me", "m2"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+
+    await handleInbound(pi, inbound("/stop", "m3"), ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false);
+    expect(aborted).toBe(1);
+    expect(midTurnQueues.has("ch1")).toBe(false); // /stop drained the queue
+    expect(channelPosts().some((t) => t === "[-] stopped")).toBe(true);
+  });
+
+  test("/stop while compacting is owner-only: non-owner gets an immediate reply, nothing queued, window stays", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("/stop", "m2", "ch1", "other"), ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true); // window untouched
+    expect(channelPosts().some((t) => t === "[!] owner only")).toBe(true);
+    // Not queued: a queued /stop would re-run ungated after the window
+    // closes and drop the channel's re-wake queue + abort the next run.
+    expect(midTurnQueues.has("ch1")).toBe(false);
+    expect(piSends().length).toBe(0);
+    expect(pendingInterrupts.has("ch1")).toBe(false);
+  });
+
+  test("/compact while compacting: '[!] already compacting', single dispatch", async () => {
+    let compacts = 0;
+    ctx.compact = () => {
+      compacts++;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("/compact again", "m2"), ctx);
+    await tick();
+    expect(compacts).toBe(1);
+    expect(channelPosts().some((t) => t === "[!] already compacting")).toBe(
+      true,
+    );
+    expect(isCompacting("ch1")).toBe(true); // window unchanged
+  });
+
+  test("other commands while compacting are queued like plain messages", async () => {
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("/reset", "m2"), ctx);
+    await tick();
+    expect(midTurnQueues.get("ch1")?.[0]?.msg.body).toBe("/reset");
+    expect(pendingInterrupts.has("ch1")).toBe(false);
+  });
+
+  test("channel isolation: ch2 unaffected while ch1 is compacting", async () => {
+    jest.useFakeTimers();
+    ctx.compact = () => {};
+    await handleInbound(pi, inbound("/compact", "m1"), ctx); // ch1
+    ctx.isIdle = () => false;
+    expect(isCompacting("ch1")).toBe(true);
+    expect(isCompacting("ch2")).toBe(false);
+
+    // ch1: queued, interrupt NOT armed
+    await handleInbound(pi, inbound("ch1 msg", "m2"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    expect(pendingInterrupts.has("ch1")).toBe(false);
+
+    // ch2: queued too (isIdle false) and interrupt NOT armed — compaction
+    // is session-wide, a ch2 interrupt (ctx.abort()) would kill ch1's
+    // compaction, so arming is suppressed while ANY window is open.
+    await handleInbound(pi, inbound("ch2 msg", "m3", "ch2"), ctx);
+    expect(midTurnQueues.get("ch2")?.length).toBe(1);
+    expect(pendingInterrupts.has("ch2")).toBe(false);
+
+    // ch2 /compact is allowed (its own window is closed): it defers behind
+    // the session-wide in-flight compaction
+    await handleInbound(pi, inbound("/compact", "m4", "ch2"), ctx);
+    expect(
+      channelPosts("ch2").some((t) =>
+        t.startsWith("[queued] compact (compact already in progress)"),
+      ),
+    ).toBe(true);
+    jest.useRealTimers();
   });
 });
 

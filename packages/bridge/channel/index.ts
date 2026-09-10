@@ -376,6 +376,81 @@ export function clearAllInterrupts(): void {
   interruptCancelled.clear();
 }
 
+// ─── Compaction window (per channel) ─────────────────────────────────────
+// Set when /compact is dispatched for a channel (startCompact), cleared
+// when pi settles the compaction (session_compact / session_compact_failed
+// extension events), by /stop, on session_shutdown, or by the 10-min
+// fallback timer. While set, inbounds for that channel are QUEUED WITHOUT
+// arming the mid-run interrupt: an interrupt calls ctx.abort(), which kills
+// the in-flight compaction (live incident on the frank agent, 2026-09-10).
+const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
+interface CompactingEntry {
+  since: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+export const compactingChannels = new Map<string, CompactingEntry>();
+
+export function isCompacting(channelId: string): boolean {
+  return compactingChannels.has(channelId);
+}
+
+/** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
+ *  fired without a completion event. */
+export function clearCompacting(channelId: string, warn = false): void {
+  const e = compactingChannels.get(channelId);
+  if (!e) return;
+  clearTimeout(e.timer);
+  compactingChannels.delete(channelId);
+  if (warn)
+    console.warn(
+      `[channel] ${channelId} still compacting after ${COMPACT_FALLBACK_MS / 60000} min; clearing flag (no completion event)`,
+    );
+}
+
+/** Clear every flag + timer (session_shutdown). */
+export function clearAllCompacting(): void {
+  for (const id of [...compactingChannels.keys()]) clearCompacting(id);
+}
+
+/** Open the window: set the flag + arm the 10-min fallback. The fallback
+ *  clears with a console.warn and drains whatever was queued behind the
+ *  compaction, in case the completion event never arrives. */
+function beginCompacting(
+  pi: ExtensionAPI,
+  ch: ChannelConfig,
+  ctx: ExtensionContext,
+): void {
+  clearCompacting(ch.id);
+  const timer = setTimeout(() => {
+    clearCompacting(ch.id, true);
+    drainQueuedAfterCompact(pi, ctx);
+  }, COMPACT_FALLBACK_MS);
+  (timer as any).unref?.();
+  compactingChannels.set(ch.id, { since: Date.now(), timer });
+  console.log(`[channel] compacting window open for ${ch.id}`);
+}
+
+/** Deliver ONE queued inbound that was waiting out a compaction (same
+ *  re-wake as the agent_end path). No-op when a run is already active:
+ *  that run's agent_end drains the rest. */
+export function drainQueuedAfterCompact(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  if (!ctx.isIdle()) return;
+  const queued = popOldestQueuedInbound();
+  if (!queued) return;
+  console.log(
+    `[channel] compaction settled: re-waking queued inbound (${queued.channelId})`,
+  );
+  handleInbound(pi, queued.msg, ctx, true).catch((e) => {
+    console.error(
+      "[channel] post-compact re-wake failed:",
+      sanitizeUnknownValue(e),
+    );
+  });
+}
+
 /**
  * Force-deliver one queued message and abort the in-flight step.
  * Called by the interrupt timer. Sequence (verified against a live pi
@@ -1350,6 +1425,7 @@ export default function (pi: ExtensionAPI) {
     }
     lastActiveChannel = null;
     pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
+    clearAllCompacting();
     pendingAttachments.clear();
     midTurnQueues.clear();
     queuedAcks.clear();
@@ -1583,19 +1659,42 @@ export default function (pi: ExtensionAPI) {
   // is active, so agent_end will never flush it — flush it when the
   // blocking compaction settles, success or failure. (Aborted-settle is
   // fine: a superseding compaction's own settle flushes the pending one.)
-  const flushPendingCompact = (ctx: ExtensionContext) => {
-    if (!pendingCompact) return;
+  const flushPendingCompact = (ctx: ExtensionContext): boolean => {
+    if (!pendingCompact) return false;
     const pc = pendingCompact;
     pendingCompact = null;
-    const err = startCompact(pc, ctx);
+    const err = startCompact(pi, pc, ctx);
     if (err !== null)
       sendDiscordMessage(pc.ch, `[!] compact failed: ${err}`).catch(() => {});
+    return err === null;
+  };
+  // A compaction settled (success or failure): close the window, then
+  // flush a /compact queued behind it. Clear BEFORE the flush: a flushed
+  // /compact re-opens the window for its own channel and must not be
+  // swept by this settle. When no new compaction started, drain whatever
+  // was queued behind the window (no agent_end fires on its own while pi
+  // is idle, so queued inbounds would stall otherwise).
+  const settleCompacting = (ctx: ExtensionContext): void => {
+    for (const id of [...compactingChannels.keys()]) clearCompacting(id);
+    const started = flushPendingCompact(ctx);
+    if (started) return;
+    // Drain on BOTH settle paths, but deferred one macrotask. pi's SUCCESS
+    // path emits session_compact BEFORE clearing its own compaction state
+    // (agent-session.js: emit, then _clearManualCompactionState), and the
+    // extension runner awaits the handler inside the emit — so at event
+    // time ctx.isIdle() is still false there, and a synchronous drain
+    // bails (the queued message then stalls until the next inbound). The
+    // failure path clears state before emitting, so the deferral is
+    // harmless there. By the time the timer fires pi has cleared state
+    // and isIdle() is true; if a run started in between, the drain
+    // no-ops and that run's agent_end owns delivery.
+    setTimeout(() => drainQueuedAfterCompact(pi, ctx), 0);
   };
   pi.on("session_compact", (_event, ctx) => {
-    flushPendingCompact(ctx);
+    settleCompacting(ctx);
   });
   pi.on("session_compact_failed", (_event, ctx) => {
-    flushPendingCompact(ctx);
+    settleCompacting(ctx);
   });
 
   // ─── Auto-forward on turn end ──────────────────────────────────────────
@@ -1994,6 +2093,7 @@ async function runRedo(
 // sanitized error message (null on success) so the caller reports it on
 // its own path (command reply vs channel post).
 function startCompact(
+  pi: ExtensionAPI,
   pending: { ch: ChannelConfig; instructions?: string },
   ctx: ExtensionContext,
 ): string | null {
@@ -2005,6 +2105,10 @@ function startCompact(
     ctx.compact({
       customInstructions: instructions,
       onComplete: (result) => {
+        // The session_compact event also settles the window; this is the
+        // belt: if the event is ever missing, the fallback timer is the
+        // only clear. (No-op once the event has cleared the flag.)
+        clearCompacting(pending.ch.id);
         const before =
           typeof result?.tokensBefore === "number" ? result.tokensBefore : null;
         const after =
@@ -2021,8 +2125,10 @@ function startCompact(
         const msg =
           err instanceof Error && err.message ? err.message : String(err);
         report(`[!] compact failed: ${sanitizeSensitiveText(msg)}`);
+        clearCompacting(pending.ch.id);
       },
     });
+    beginCompacting(pi, pending.ch, ctx);
     return null;
   } catch (e) {
     return sanitizeSensitiveText(e instanceof Error ? e.message : String(e));
@@ -2050,6 +2156,15 @@ async function runChannelCommand(
     : {};
   switch (name.toLowerCase()) {
     case "stop": {
+      // /stop while compacting is owner-only (isOwner pattern): it aborts
+      // the in-flight compaction, a state change, not a read. Answer
+      // immediately for non-owners (even plain text): a queued /stop would
+      // re-run ungated after the window closes and drop the channel's
+      // re-wake queue (including owner messages) + abort the next run.
+      if (isCompacting(ch.id) && !isOwner)
+        return { immediate: "[!] owner only" };
+      clearCompacting(ch.id); // the abort's settle (session_compact_failed)
+      // re-clears + drains; the queue drop below wins for THIS /stop
       // A4: drain the mid-turn re-wake queue so /stop does not immediately
       // re-wake a message that was waiting for this run to end. (Steer
       // messages already queued in pi are a known upstream gap — the
@@ -2112,7 +2227,11 @@ async function runChannelCommand(
           `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
           `model ${model}`,
           `up ${up}`,
-          ctx.isIdle() ? "idle" : "running",
+          isCompacting(ch.id)
+            ? "compacting"
+            : ctx.isIdle()
+              ? "idle"
+              : "running",
         ];
         // Interrupt state, honestly: in flight, or armed with time to fire.
         if (interruptingChannels.has(ch.id)) {
@@ -2233,6 +2352,11 @@ async function runChannelCommand(
     case "compact": {
       if (!isOwner) return ownerOnly;
       const instructions = (arg || "").trim() || undefined;
+      if (isCompacting(ch.id)) {
+        // The channel's own compaction window is open: one compact at a
+        // time, reject the second instead of queueing it.
+        return { immediate: "[!] already compacting" };
+      }
       if (!ctx.isIdle()) {
         // Run in progress (compact would abort it) or a compaction already
         // in flight: queue it. One slot — a later /compact replaces the
@@ -2247,7 +2371,7 @@ async function runChannelCommand(
           immediate: `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
         };
       }
-      const err = startCompact({ ch, instructions }, ctx);
+      const err = startCompact(pi, { ch, instructions }, ctx);
       return {
         immediate:
           err !== null ? `[!] compact failed: ${err}` : "[..] compacting...",
@@ -2764,23 +2888,35 @@ export async function handleInbound(
 
   const cmd = matchCommand(rawBody);
   if (cmd) {
-    const r = await runChannelCommand(
-      pi,
-      ctx,
-      ch,
-      cmd.name,
-      cmd.arg,
-      msg.fromId,
-      false,
-    );
-    if (r.btw) {
-      noAck();
-      return;
-    }
-    if (r.immediate !== undefined) {
-      noAck();
-      replyCmd(r.immediate);
-      return;
+    // While compacting: /status, /jobs, /sleep stay read-only, /stop
+    // clears the window and stops, /compact reports it. Everything else
+    // falls through and is queued like a plain message — executed on the
+    // re-wake, after the compaction settles.
+    const allowedWhileCompacting =
+      cmd.name === "status" ||
+      cmd.name === "jobs" ||
+      cmd.name === "sleep" ||
+      cmd.name === "stop" ||
+      cmd.name === "compact";
+    if (!isCompacting(ch.id) || allowedWhileCompacting) {
+      const r = await runChannelCommand(
+        pi,
+        ctx,
+        ch,
+        cmd.name,
+        cmd.arg,
+        msg.fromId,
+        false,
+      );
+      if (r.btw) {
+        noAck();
+        return;
+      }
+      if (r.immediate !== undefined) {
+        noAck();
+        replyCmd(r.immediate);
+        return;
+      }
     }
   }
 
@@ -2877,7 +3013,7 @@ export async function handleInbound(
   // (the re-wake path) bypasses the gate so the message is never re-queued.
   const runActive = forceDirect
     ? false
-    : !ctx.isIdle() || ctx.hasPendingMessages?.();
+    : !ctx.isIdle() || ctx.hasPendingMessages?.() || isCompacting(ch.id);
   // Returns true (caller should `return`) when the inbound was queued for a
   // re-wake. Ownership is unambiguous: a message is either sent to pi now or
   // queued for a re-wake — never both. `armInterrupt` false = ". queue"-
@@ -2889,14 +3025,17 @@ export async function handleInbound(
     armInterrupt = true,
   ): boolean => {
     if (!runActive) return false;
-    const pos = queueMidTurnInbound(
-      ch.id,
-      msg,
-      text,
-      gateTitle,
-      display,
-      armInterrupt,
-    );
+    // While compacting the message waits the line WITHOUT arming the
+    // mid-run interrupt (an interrupt aborts the compaction). It drains
+    // when the compaction settles (drainQueuedAfterCompact) or at the
+    // next agent_end.
+    // Compaction is session-wide (one shared pi session): an interrupt
+    // from ANY channel calls ctx.abort(), which aborts the in-flight
+    // compaction (agent-session.js abort() → abortCompaction). So suppress
+    // arming for every channel while ANY window is open, not just the
+    // compacting one — a ch2 interrupt would otherwise kill ch1's compact.
+    const arm = armInterrupt && compactingChannels.size === 0;
+    const pos = queueMidTurnInbound(ch.id, msg, text, gateTitle, display, arm);
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
     noAck();
