@@ -11,6 +11,8 @@ import {
   ensurePresenceState,
   getDiscordStates,
   handleMessageCreate,
+  handleMessageDelete,
+  handleMessageUpdate,
   isBgWebhook,
   loadPersistedCursors,
   mimeForFile,
@@ -68,6 +70,7 @@ afterEach(() => {
     "o3",
     "c1",
     "p1",
+    "qu",
   ])
     disconnectDiscord(id);
 });
@@ -818,4 +821,120 @@ test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only
     }),
   ).toBe(false);
   expect(isBgWebhook(null)).toBe(false);
+});
+
+// ─── Queue control: MESSAGE_UPDATE / MESSAGE_DELETE gateway dispatch ─────
+
+test("MESSAGE_UPDATE/DELETE dispatch routes to the channel callbacks", async () => {
+  setFetch(async (u) => {
+    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-qu" });
+    if (u.includes("/messages")) return jsonResp(200, []);
+    return jsonResp(200, null);
+  });
+
+  const updates: unknown[][] = [];
+  const deletes: string[][] = [];
+  const ok = await connectDiscord(cfg("qu"), {
+    onMessage: () => {},
+    onError: () => {},
+    onMessageUpdate: (chId, msgId, content, atts, authorId) =>
+      updates.push([chId, msgId, content, atts, authorId]),
+    onMessageDelete: (chId, msgId) => deletes.push([chId, msgId]),
+  });
+  expect(ok).toBe(true);
+
+  const st = ensurePresenceState("tok-qu");
+  st.ready = true;
+  st.botUserId = "bot-qu";
+
+  // User edit: content + attachments + author forwarded.
+  handleMessageUpdate(st, {
+    id: "9100000000000000001",
+    channel_id: "999",
+    content: "edited text",
+    attachments: [
+      { id: "a1", filename: "f.txt", content_type: "text/plain", size: 1 },
+    ],
+    author: { id: "u-9", username: "user" },
+  });
+  expect(updates).toEqual([
+    [
+      "qu",
+      "9100000000000000001",
+      "edited text",
+      [
+        {
+          id: "a1",
+          filename: "f.txt",
+          contentType: "text/plain",
+          size: 1,
+          url: undefined,
+          duration: undefined,
+          waveform: undefined,
+        },
+      ],
+      "u-9",
+    ],
+  ]);
+
+  // Edit without attachments → empty list.
+  handleMessageUpdate(st, {
+    id: "9100000000000000002",
+    channel_id: "999",
+    content: "plain edit",
+    author: { id: "u-9", username: "user" },
+  });
+  expect(updates.length).toBe(2);
+  expect(updates[1]?.[3]).toEqual([]);
+
+  // Bot's own message (the bridge edits its status line) → skipped.
+  handleMessageUpdate(st, {
+    id: "9100000000000000003",
+    channel_id: "999",
+    content: "self edit",
+    author: { id: "bot-qu", username: "bot" },
+  });
+  expect(updates.length).toBe(2);
+
+  // Channel not in config → skipped.
+  handleMessageUpdate(st, {
+    id: "9100000000000000004",
+    channel_id: "424242",
+    content: "other channel",
+    author: { id: "u-9", username: "user" },
+  });
+  expect(updates.length).toBe(2);
+
+  // Delete: id + channel only (no author in the payload).
+  handleMessageDelete(st, { id: "9100000000000000005", channel_id: "999" });
+  expect(deletes).toEqual([["qu", "9100000000000000005"]]);
+  handleMessageDelete(st, { id: "9100000000000000006", channel_id: "424242" });
+  expect(deletes.length).toBe(1);
+});
+
+test("callbacks without update/delete handlers are no-ops", async () => {
+  setFetch(async (u) => {
+    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-qu" });
+    if (u.includes("/messages")) return jsonResp(200, []);
+    return jsonResp(200, null);
+  });
+  const ok = await connectDiscord(cfg("qu"), {
+    onMessage: () => {},
+    onError: () => {},
+  });
+  expect(ok).toBe(true);
+  const st = ensurePresenceState("tok-qu");
+  st.botUserId = "bot-qu";
+  // No throw when the optional callbacks are absent.
+  expect(() =>
+    handleMessageUpdate(st, {
+      id: "9200000000000000001",
+      channel_id: "999",
+      content: "x",
+      author: { id: "u-9" },
+    }),
+  ).not.toThrow();
+  expect(() =>
+    handleMessageDelete(st, { id: "9200000000000000002", channel_id: "999" }),
+  ).not.toThrow();
 });

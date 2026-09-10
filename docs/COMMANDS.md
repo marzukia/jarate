@@ -13,6 +13,9 @@ Access: **anyone** = any member of the channel; **owner** = the configured
 |---|---|---|
 | `stop` / `/stop` | anyone | abort the in-flight run |
 | *(any plain message)* | anyone | during a run: interrupts the current step after ~3s, then takes over |
+| `*. queue` (trailing suffix) | anyone | park the message for the re-wake queue: no interrupt, delivered when the run ends |
+| *edit a queued message* | owner | the queued entry is re-rendered from the edited text |
+| *delete a queued message* | owner | the queued entry (and its interrupt) is dropped |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list in-flight `pi-bg` dispatches (profile, age, task) |
@@ -63,6 +66,38 @@ sent, so it is delivered exactly once. If the session does not settle within
 re-wake queue and is delivered when the run ends — still exactly once.
 `/stop`, `/reset` and `/restart` during the settle window drop the pending
 send, consistent with those commands dropping queued messages.
+
+### queue control (`. queue`, edit, delete)
+
+Every message that gets queued while a run is in flight gets a reply ack:
+
+```
+[queued] 1 in line
+```
+
+The number is the position in that channel's re-wake queue (several messages
+may queue behind one run). The `[queued]` line replaces the 👀 ack reaction
+for queued messages.
+
+**Edit:** if the owner edits a message that is in the queue, the queued entry
+is re-rendered from the edited text. The interrupt (if armed) and the re-wake
+both deliver the new text; attachments in the edit are picked up too.
+
+**Delete:** if the owner deletes a queued message, the entry is dropped from
+the re-wake queue, its pending interrupt is disarmed, and its `[queued]` ack
+is deleted. The remaining line is renumbered.
+
+**`. queue` suffix:** a plain message ending in `. queue` is parked in the
+re-wake queue **without** arming the mid-run interrupt — it is delivered as a
+fresh run when the current run ends, instead of aborting the in-flight step.
+
+```
+run the benchmark suite . queue
+```
+
+The suffix is stripped before delivery, so the agent receives `run the
+benchmark suite`. The message still gets its `[queued] N in line` ack. This is
+the tool for "do this next, but don't interrupt what you're doing".
 
 ### /btw
 

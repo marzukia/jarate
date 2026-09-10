@@ -184,6 +184,20 @@ export async function resolveChannelId(
 export interface DiscordCallbacks {
   onMessage: (msg: ChannelMessage) => void;
   onError: (channelId: string, error: string) => void;
+  /** A message in this channel was EDITED (gateway MESSAGE_UPDATE /
+   *  CHANNEL_MESSAGE_UPDATE). content/attachments are the NEW state;
+   *  authorId is the message's author (the editor). Optional. */
+  onMessageUpdate?: (
+    channelId: string,
+    messageId: string,
+    content: string,
+    attachments: AttachmentRef[],
+    authorId: string | undefined,
+  ) => void;
+  /** A message in this channel was DELETED (gateway MESSAGE_DELETE /
+   *  CHANNEL_MESSAGE_DELETE). The payload carries no author — the handler
+   *  resolves identity from its own state. Optional. */
+  onMessageDelete?: (channelId: string, messageId: string) => void;
 }
 
 /**
@@ -433,6 +447,19 @@ export function isBgWebhook(raw: any): boolean {
 
 // ─── Shared inbound delivery (poll + gateway) ───────────────────────────
 
+/** Map a raw Discord attachments array to AttachmentRefs. */
+function mapAttachmentRefs(raw: any): AttachmentRef[] {
+  return (raw || []).map((a: any) => ({
+    id: a.id,
+    filename: a.filename || "file",
+    contentType: a.content_type || "application/octet-stream",
+    size: a.size || 0,
+    url: a.url,
+    duration: typeof a.duration === "number" ? a.duration : undefined,
+    waveform: typeof a.waveform === "string" ? a.waveform : undefined,
+  }));
+}
+
 /**
  * One delivery path for both ingest routes. Dedupes against the shared
  * per-channel cursor (a message at or below the cursor is dropped),
@@ -461,17 +488,7 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
   )
     return false;
 
-  const attachments: AttachmentRef[] = (raw.attachments || []).map(
-    (a: any) => ({
-      id: a.id,
-      filename: a.filename || "file",
-      contentType: a.content_type || "application/octet-stream",
-      size: a.size || 0,
-      url: a.url,
-      duration: typeof a.duration === "number" ? a.duration : undefined,
-      waveform: typeof a.waveform === "string" ? a.waveform : undefined,
-    }),
-  );
+  const attachments: AttachmentRef[] = mapAttachmentRefs(raw.attachments);
 
   // Embeds (rich text from other bots, app interactions) are not in
   // raw.content — serialize them into the body so the LLM can read them.
@@ -1091,6 +1108,30 @@ function connectPresence(st: PresenceState): void {
           sanitizeSensitiveText(String(e)),
         );
       }
+    } else if (
+      msg.op === 0 &&
+      (msg.t === "MESSAGE_UPDATE" || msg.t === "CHANNEL_MESSAGE_UPDATE")
+    ) {
+      try {
+        handleMessageUpdate(st, msg.d);
+      } catch (e) {
+        console.error(
+          "[gateway] MESSAGE_UPDATE failed:",
+          sanitizeSensitiveText(String(e)),
+        );
+      }
+    } else if (
+      msg.op === 0 &&
+      (msg.t === "MESSAGE_DELETE" || msg.t === "CHANNEL_MESSAGE_DELETE")
+    ) {
+      try {
+        handleMessageDelete(st, msg.d);
+      } catch (e) {
+        console.error(
+          "[gateway] MESSAGE_DELETE failed:",
+          sanitizeSensitiveText(String(e)),
+        );
+      }
     } else if (msg.op === 0 && msg.t === "INTERACTIONS_CREATE") {
       const h = interactionHandlers.get(st.token);
       if (h) {
@@ -1210,6 +1251,46 @@ export function handleMessageCreate(st: PresenceState, d: any): void {
   if (!chId) return;
   for (const state of statesForToken(st.token)) {
     if (state.channelId === chId) deliverInboundMessage(state, d);
+  }
+}
+
+/**
+ * Handle a MESSAGE_UPDATE / CHANNEL_MESSAGE_UPDATE dispatch. Skips the
+ * bot's own messages (the bridge edits its status line in place) and
+ * channels not in config, then forwards the new content to the channel
+ * callback. Exported for tests.
+ */
+export function handleMessageUpdate(st: PresenceState, d: any): void {
+  const msgId = d?.id != null ? String(d.id) : null;
+  if (!msgId) return;
+  if (st.botUserId && d.author?.id === st.botUserId) return; // skip self
+  const chId = d?.channel_id != null ? String(d.channel_id) : null;
+  if (!chId) return;
+  for (const state of statesForToken(st.token)) {
+    if (state.channelId !== chId) continue;
+    state.callbacks.onMessageUpdate?.(
+      state.config.id,
+      msgId,
+      typeof d.content === "string" ? d.content : "",
+      mapAttachmentRefs(d.attachments),
+      d.author?.id != null ? String(d.author.id) : undefined,
+    );
+  }
+}
+
+/**
+ * Handle a MESSAGE_DELETE / CHANNEL_MESSAGE_DELETE dispatch. The payload
+ * carries only id + channel_id — no author. Channels not in config are
+ * skipped. Exported for tests.
+ */
+export function handleMessageDelete(st: PresenceState, d: any): void {
+  const msgId = d?.id != null ? String(d.id) : null;
+  if (!msgId) return;
+  const chId = d?.channel_id != null ? String(d.channel_id) : null;
+  if (!chId) return;
+  for (const state of statesForToken(st.token)) {
+    if (state.channelId !== chId) continue;
+    state.callbacks.onMessageDelete?.(state.config.id, msgId);
   }
 }
 

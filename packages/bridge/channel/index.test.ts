@@ -8,6 +8,7 @@ import extension, {
   chunkText,
   clearAllInterrupts,
   collectFinals,
+  deleteQueuedInbound,
   deliverDueWakes,
   earlySendText,
   failurePostText,
@@ -21,12 +22,15 @@ import extension, {
   pendingAttachments,
   pendingInterrupts,
   prunePendingBatches,
+  queuedAcks,
+  queueMidTurnInbound,
   REPEAT_WARNING,
   registerSleepTool,
   registerTodoTool,
   runShellPassthrough,
   setInterruptCtx,
   TODO_TOOL_DESCRIPTION,
+  updateQueuedInbound,
 } from "./index";
 import {
   CLAIM_TTL_MS,
@@ -1137,6 +1141,276 @@ describe("extension handlers (A1/A2/A4)", () => {
         .find((t) => t.includes("running"));
       expect(statusPost).toBeDefined();
       expect(statusPost).toContain("interrupt in ");
+    });
+  });
+
+  describe("queue control (. queue suffix, edit, delete)", () => {
+    let abortCount: number;
+    let idle: boolean;
+    const flush = async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+
+    beforeEach(() => {
+      abortCount = 0;
+      idle = false;
+      ctx.isIdle = () => idle;
+      ctx.abort = () => {
+        abortCount += 1;
+        idle = true;
+      };
+      setInterruptCtx(ctx);
+    });
+
+    afterEach(() => {
+      setInterruptCtx(null);
+      clearAllInterrupts();
+      pendingInterrupts.clear();
+      queuedAcks.clear();
+      jest.useRealTimers();
+    });
+
+    test("queued ack shows the position in line (and suppresses the 👀)", async () => {
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      const ack1 = fetchCalls.find(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+      );
+      expect(ack1).toBeDefined();
+      expect(JSON.parse(ack1!.body).message_reference?.message_id).toBe("m1");
+
+      await handleInbound(pi, inbound("second", "m2"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(2);
+      const ack2 = fetchCalls.find(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body).content) === "[queued] 2 in line",
+      );
+      expect(ack2).toBeDefined();
+
+      // The [queued] line IS the ack: no 👀 reaction on the queued message.
+      const react = fetchCalls.find(
+        (c) => c.method === "PUT" && c.url.includes("/messages/m1/reactions/"),
+      );
+      expect(react).toBeUndefined();
+    });
+
+    test("'. queue' parks in the re-wake queue and does NOT arm the interrupt", async () => {
+      jest.useFakeTimers();
+      idle = false;
+      await handleInbound(pi, inbound("later. queue", "m1"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      // The ack still shows the position.
+      const ack = fetchCalls.find(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+      );
+      expect(ack).toBeDefined();
+      jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
+      expect(abortCount).toBe(0);
+      expect(sent.length).toBe(0);
+      jest.useRealTimers();
+
+      // The run ends → re-wake delivers the SUFFIX-STRIPPED text.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.body).toBe("later");
+      expect(sent[0].m.content).not.toContain(". queue");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("plain message still arms the interrupt (unchanged behavior)", async () => {
+      jest.useFakeTimers();
+      idle = false;
+      await handleInbound(pi, inbound("plain", "m1"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.body).toBe("plain");
+      // Consumed entry's ack is dropped with it.
+      expect(queuedAcks.has("m1")).toBe(false);
+      jest.useRealTimers();
+    });
+
+    test("mid-sentence 'queue' is NOT treated as the suffix", async () => {
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("put it in the queue", "m1"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // No suffix → interrupt armed...
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      // ...and the queued ack still shows the position.
+      const ack = fetchCalls.find(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+      );
+      expect(ack).toBeDefined();
+    });
+
+    test("edit re-renders the queued entry (interrupt delivers the new text)", async () => {
+      jest.useFakeTimers();
+      idle = false;
+      await handleInbound(pi, inbound("original text", "m1"), ctx);
+      await flush();
+      expect(
+        await updateQueuedInbound(ctx, "ch1", "m1", "edited text", [], "uid"),
+      ).toBe(true);
+      const entry = midTurnQueues.get("ch1")?.[0];
+      expect(entry?.msg.body).toBe("edited text");
+      expect(entry?.text).toContain("edited text");
+
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.content).toContain("edited text");
+      expect(sent[0].m.content).not.toContain("original text");
+      expect(sent[0].m.details.messageId).toBe("m1");
+      jest.useRealTimers();
+    });
+
+    test("edit of a non-queued message is a no-op", async () => {
+      expect(
+        await updateQueuedInbound(ctx, "ch1", "nope", "x", [], "uid"),
+      ).toBe(false);
+    });
+
+    test("edit is owner-only", async () => {
+      fs.writeFileSync(
+        path.join(tmp, ".pi", "settings.json"),
+        JSON.stringify({
+          channels: [
+            {
+              id: "ch1",
+              name: "Test",
+              type: "discord",
+              botToken: "tok1",
+              ownerUserId: "owner1",
+            },
+          ],
+        }),
+      );
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("orig", "m1"), ctx);
+      await flush();
+      expect(
+        await updateQueuedInbound(ctx, "ch1", "m1", "nope", [], "uid"),
+      ).toBe(false);
+      expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe("orig");
+      expect(
+        await updateQueuedInbound(ctx, "ch1", "m1", "yes", [], "owner1"),
+      ).toBe(true);
+      expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe("yes");
+    });
+
+    test("delete drops the entry (other channels untouched) and disarms it", async () => {
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      await flush();
+      const m2: ChannelMessage = {
+        ...inbound("other channel", "cm2"),
+        channelId: "ch2",
+        channelName: "Other",
+      };
+      queueMidTurnInbound("ch2", m2, "ctx\n\ntext", "discord/Other", "text");
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(midTurnQueues.get("ch2")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch2")?.length).toBe(1);
+
+      await deleteQueuedInbound(ctx, "ch1", "m1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      // ch2's entry + armed interrupt survive.
+      expect(midTurnQueues.get("ch2")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch2")?.length).toBe(1);
+      // Deleting an unknown message is a no-op.
+      await deleteQueuedInbound(ctx, "ch1", "ghost");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("delete cleans up the ack and renumbers the remaining line", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      await handleInbound(pi, inbound("second", "m2"), ctx);
+      await flush();
+      expect(queuedAcks.get("m1")?.pos).toBe(1);
+      expect(queuedAcks.get("m2")?.pos).toBe(2);
+
+      await deleteQueuedInbound(ctx, "ch1", "m1");
+      await flush();
+      expect(queuedAcks.has("m1")).toBe(false);
+      expect(queuedAcks.get("m2")?.pos).toBe(1);
+      const del = fetchCalls.find(
+        (c) =>
+          c.method === "DELETE" && c.url.includes("/channels/ch1/messages/"),
+      );
+      expect(del).toBeDefined();
+      const patch = fetchCalls.find(
+        (c) =>
+          c.method === "PATCH" &&
+          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+      );
+      expect(patch).toBeDefined();
+    });
+
+    test("delete is owner-only", async () => {
+      fs.writeFileSync(
+        path.join(tmp, ".pi", "settings.json"),
+        JSON.stringify({
+          channels: [
+            {
+              id: "ch1",
+              name: "Test",
+              type: "discord",
+              botToken: "tok1",
+              ownerUserId: "owner1",
+            },
+          ],
+        }),
+      );
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      await flush();
+      // m1's author is "uid" — not the owner → entry and ack survive.
+      await deleteQueuedInbound(ctx, "ch1", "m1");
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(queuedAcks.has("m1")).toBe(true);
+    });
+
+    test("consumed re-wake drops its ack and renumbers the rest", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      await handleInbound(pi, inbound("second", "m2"), ctx);
+      await flush();
+      expect(queuedAcks.get("m2")?.pos).toBe(2);
+
+      idle = true; // the run ends
+      await handlers.agent_end({ messages: [] }, ctx);
+      await flush();
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.body).toBe("first");
+      expect(queuedAcks.has("m1")).toBe(false);
+      expect(queuedAcks.get("m2")?.pos).toBe(1);
+      const del = fetchCalls.find(
+        (c) =>
+          c.method === "DELETE" && c.url.includes("/channels/ch1/messages/"),
+      );
+      expect(del).toBeDefined();
     });
   });
 

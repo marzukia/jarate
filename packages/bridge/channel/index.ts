@@ -58,6 +58,7 @@ import {
 } from "./discord";
 import { mdToDiscord } from "./format";
 import { memoryToc } from "./memory";
+import { extractQueueSuffix } from "./queue";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
@@ -144,13 +145,63 @@ interface QueuedInbound {
 }
 export const midTurnQueues = new Map<string, QueuedInbound[]>();
 
-/** Queue a mid-turn inbound for a re-wake. Returns the new queue depth. */
+// ─── Queue acks ([queued] N in line) ─────────────────────────────────────
+// One ack message per queued inbound, keyed by the inbound's Discord
+// message id. Deleted when the entry is consumed/dropped; renumbered when
+// an entry ahead of it leaves the line (delete or consume).
+export const queuedAcks = new Map<
+  string,
+  { ackId: string; fromId?: string; pos: number }
+>();
+// Workspace root captured at session_start — lets module-level queue
+// helpers resolve ChannelConfig without a ctx.
+let configRoot: string | null = null;
+
+function resolveChannel(channelId: string): ChannelConfig | undefined {
+  return configRoot
+    ? getChannel(loadChannelConfig(configRoot), channelId)
+    : undefined;
+}
+
+/** Drop the stored ack for a consumed/dropped message, then renumber the
+ *  acks of the entries still in line. Fire-and-forget REST. */
+function consumeQueuedAck(channelId: string, messageId: string): void {
+  const ack = queuedAcks.get(messageId);
+  if (ack) {
+    queuedAcks.delete(messageId);
+    const ch = resolveChannel(channelId);
+    if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
+  }
+  renumberQueuedAcks(channelId);
+}
+
+/** Re-edit the channel's remaining queued acks so positions stay true
+ *  after an entry ahead of them left the line. No-op when already correct. */
+function renumberQueuedAcks(channelId: string): void {
+  const ch = resolveChannel(channelId);
+  if (!ch) return;
+  const q = midTurnQueues.get(channelId) ?? [];
+  q.forEach((e, i) => {
+    const ack = queuedAcks.get(e.msg.messageId);
+    if (!ack || ack.pos === i + 1) return;
+    ack.pos = i + 1;
+    editDiscordMessage(ch, ack.ackId, `[queued] ${i + 1} in line`).catch(
+      () => {},
+    );
+  });
+}
+
+/** Queue a mid-turn inbound for a re-wake. Returns the new queue depth
+ *  (the message's 1-based position in its channel's line). `armInterrupt`
+ *  defaults to true; ". queue"-suffixed messages pass false so they wait
+ *  their turn instead of jumping it. */
 export function queueMidTurnInbound(
   channelId: string,
   msg: ChannelMessage,
   text?: string,
   title?: string,
   display?: string,
+  armInterrupt = true,
 ): number {
   let q = midTurnQueues.get(channelId);
   if (!q) {
@@ -161,7 +212,7 @@ export function queueMidTurnInbound(
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
-  armInterruptTimer(channelId, msg.messageId);
+  if (armInterrupt) armInterruptTimer(channelId, msg.messageId);
   return q.length;
 }
 
@@ -185,6 +236,7 @@ export function popOldestQueuedInbound(): {
   const q = midTurnQueues.get(oldest.channelId)!;
   if (q[0].queuedAt === oldest.queuedAt) q.shift();
   if (q.length === 0) midTurnQueues.delete(oldest.channelId);
+  consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
   return { channelId: oldest.channelId, msg: oldest.msg };
 }
 
@@ -192,9 +244,22 @@ export function popOldestQueuedInbound(): {
 export function clearQueuedInbound(channelId: string): number {
   const q = midTurnQueues.get(channelId);
   if (!q) return 0;
+  for (const e of q) consumeQueuedAck(channelId, e.msg.messageId);
   const n = q.length;
   midTurnQueues.delete(channelId);
   return n;
+}
+
+/** Remove one armed interrupt timer (the queue entry for it is gone).
+ *  No-op when the message never armed one. */
+export function disarmInterrupt(channelId: string, messageId: string): void {
+  const list = pendingInterrupts.get(channelId);
+  if (!list) return;
+  const i = list.findIndex((p) => p.messageId === messageId);
+  if (i === -1) return;
+  clearTimeout(list[i].timer);
+  list.splice(i, 1);
+  if (list.length === 0) pendingInterrupts.delete(channelId);
 }
 
 // ─── Mid-run interrupt ─────────────────────────────────────────────────
@@ -392,6 +457,7 @@ export async function runMidRunInterrupt(
       console.log(
         `[channel] mid-run interrupt cancelled: ${messageId} dropped`,
       );
+      consumeQueuedAck(channelId, messageId);
       return;
     }
     if (!ctx.isIdle()) {
@@ -406,6 +472,7 @@ export async function runMidRunInterrupt(
       );
       return;
     }
+    consumeQueuedAck(channelId, messageId); // entry is owned by the fresh run
     sendToPi(
       pi,
       channelId,
@@ -418,6 +485,90 @@ export async function runMidRunInterrupt(
     interruptingChannels.delete(channelId);
   }
 }
+// ─── Queue control: edit + delete of queued inbounds ─────────────────────
+// The re-wake queue keeps the FULL ChannelMessage per entry, so the
+// Discord MESSAGE_UPDATE / MESSAGE_DELETE gateway events (routed per
+// channel in discord.ts) can target an entry by message id. Owner-only,
+// same isOwner rule as the channel commands.
+
+/** Re-render a queued entry after its Discord message was edited.
+ *  Updates the stored ChannelMessage (the re-wake path re-processes it
+ *  through the full inbound pipeline) and the pre-rendered interrupt text
+ *  (the plain-path ctx pipeline: channel-ctx + replied-message + memory
+ *  TOC + suffix-stripped body). FIFO position is kept. Returns false when
+ *  the message is not queued or the editor is not the owner. */
+export async function updateQueuedInbound(
+  ctx: ExtensionContext,
+  channelId: string,
+  messageId: string,
+  content: string,
+  attachments: AttachmentRef[],
+  authorId: string | undefined,
+): Promise<boolean> {
+  const q = midTurnQueues.get(channelId);
+  const entry = q?.find((e) => e.msg.messageId === messageId);
+  if (!entry) return false;
+  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
+  if (ch?.ownerUserId && authorId !== ch.ownerUserId) return false;
+  entry.msg.body = content;
+  entry.msg.attachments = attachments;
+
+  // Plain-path re-render (same pipeline as handleInbound's no-attachment
+  // branch). Entries queued WITH attachments keep their stored file-folder
+  // text stale for the interrupt path; the re-wake path (the common one)
+  // re-downloads and re-renders them fully from entry.msg.
+  const { prompt: body, forceBtw } = extractBtwSuffix(content.trim());
+  const channelCtx = buildChannelContext(ch, entry.msg, { btw: forceBtw });
+  const repliedBlock = buildRepliedMessageBlock(entry.msg.repliedMessage);
+  const toc = await memoryToc(ctx.cwd);
+  const ctxBlock = [
+    channelCtx,
+    repliedBlock,
+    toc ? `<channel-memory>\n${toc}\n</channel-memory>` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  entry.text = `${ctxBlock}\n\n${body || "(empty)"}`;
+  entry.title = channelTitle(ch, entry.msg);
+  entry.display = body || "(empty)";
+  console.log(
+    `[channel] queued inbound ${messageId} re-rendered from message edit`,
+  );
+  return true;
+}
+
+/** Drop a queued entry after its Discord message was deleted. Removes the
+ *  entry, disarms its interrupt timer, deletes the "[queued] N in line"
+ *  ack, and renumbers the remaining line. Owner-only. */
+export async function deleteQueuedInbound(
+  ctx: ExtensionContext,
+  channelId: string,
+  messageId: string,
+): Promise<void> {
+  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
+  const q = midTurnQueues.get(channelId);
+  const idx = q ? q.findIndex((e) => e.msg.messageId === messageId) : -1;
+  const ack = queuedAcks.get(messageId);
+  if (idx === -1 && !ack) return; // never queued, no ack: not ours
+  if (ch?.ownerUserId) {
+    const fromId = idx !== -1 && q ? q[idx].msg.fromId : ack?.fromId;
+    if (fromId !== ch.ownerUserId) return; // owner only
+  }
+  if (idx !== -1 && q) {
+    q.splice(idx, 1);
+    if (q.length === 0) midTurnQueues.delete(channelId);
+    disarmInterrupt(channelId, messageId);
+    console.log(
+      `[channel] queued inbound ${messageId} dropped (message deleted)`,
+    );
+  }
+  if (ack) {
+    queuedAcks.delete(messageId);
+    if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
+  }
+  renumberQueuedAcks(channelId);
+}
+
 // Last inbound Discord message id per channel — the 👀 ack target. The
 // message_end early-send path unreacts it (A1: step-finals carry no
 // replyTo, so the agent_end unreact branch never sees them).
@@ -1037,6 +1188,7 @@ export default function (pi: ExtensionAPI) {
     sessionStartTs = Date.now();
     setInterruptCtx(ctx);
     workspaceRoot = ctx.cwd;
+    configRoot = ctx.cwd;
     channels = loadChannelConfig(ctx.cwd);
 
     const enabled = channels.filter((c) => c.enabled);
@@ -1053,6 +1205,35 @@ export default function (pi: ExtensionAPI) {
             handleInbound(pi, msg, ctx).catch((e) => {
               console.error(
                 "[channel] inbound failed:",
+                sanitizeUnknownValue(e),
+              );
+            });
+          },
+          onMessageUpdate(
+            channelId,
+            messageId,
+            content,
+            attachments,
+            authorId,
+          ) {
+            updateQueuedInbound(
+              ctx,
+              channelId,
+              messageId,
+              content,
+              attachments,
+              authorId,
+            ).catch((e) => {
+              console.error(
+                "[channel] queued inbound edit failed:",
+                sanitizeUnknownValue(e),
+              );
+            });
+          },
+          onMessageDelete(channelId, messageId) {
+            deleteQueuedInbound(ctx, channelId, messageId).catch((e) => {
+              console.error(
+                "[channel] queued inbound delete failed:",
                 sanitizeUnknownValue(e),
               );
             });
@@ -1171,6 +1352,7 @@ export default function (pi: ExtensionAPI) {
     pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
     pendingAttachments.clear();
     midTurnQueues.clear();
+    queuedAcks.clear();
     clearAllInterrupts();
     setInterruptCtx(null);
     finalReps.clear();
@@ -2694,14 +2876,36 @@ export async function handleInbound(
     : !ctx.isIdle() || ctx.hasPendingMessages?.();
   // Returns true (caller should `return`) when the inbound was queued for a
   // re-wake. Ownership is unambiguous: a message is either sent to pi now or
-  // queued for a re-wake — never both.
+  // queued for a re-wake — never both. `armInterrupt` false = ". queue"-
+  // suffixed: wait the line, no mid-run interrupt.
   const gateForRewake = (
     text: string,
     gateTitle: string,
     display: string,
+    armInterrupt = true,
   ): boolean => {
     if (!runActive) return false;
-    queueMidTurnInbound(ch.id, msg, text, gateTitle, display);
+    const pos = queueMidTurnInbound(
+      ch.id,
+      msg,
+      text,
+      gateTitle,
+      display,
+      armInterrupt,
+    );
+    // Ack = one line with the position; suppress the 👀 so the line IS the
+    // ack. The ack id is tracked for edit/delete cleanup + renumbering.
+    noAck();
+    sendDiscordMessage(ch, `[queued] ${pos} in line`, msg.messageId)
+      .then((res) => {
+        if (res.success && res.messageId)
+          queuedAcks.set(msg.messageId, {
+            ackId: res.messageId,
+            fromId: msg.fromId,
+            pos,
+          });
+      })
+      .catch(() => {});
     return true;
   };
 
@@ -2857,10 +3061,15 @@ export async function handleInbound(
   // The queued message is also armed with a mid-run interrupt: if the step
   // is still in flight after the timeout, the step is aborted and, once the
   // session settles, the message starts a fresh run (runMidRunInterrupt).
-  const plainText = withCtx(body || "(empty)");
-  if (gateForRewake(plainText, title, body || "(empty)")) return;
+  // A ". queue" suffix opts OUT of the interrupt: the message waits its
+  // turn in the re-wake queue (kimaki parity: interrupt = jump the queue,
+  // ". queue" = wait your turn).
+  const { prompt: queuedBody, forceQueue } = extractQueueSuffix(body);
+  const plainText = withCtx(queuedBody || "(empty)");
+  if (gateForRewake(plainText, title, queuedBody || "(empty)", !forceQueue))
+    return;
 
-  sendToPi(pi, ch.id, plainText, title, body || "(empty)", msg.messageId);
+  sendToPi(pi, ch.id, plainText, title, queuedBody || "(empty)", msg.messageId);
 }
 
 // ─── Send to pi session ──────────────────────────────────────────────────
