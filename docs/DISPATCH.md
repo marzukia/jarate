@@ -25,11 +25,14 @@ Profiles are separate pi homes: `~/.pi/agent-worker`, `~/.pi/agent-reviewer`
 All agents share one vLLM endpoint (8 concurrent sequences max). Concurrent
 pi-bg dispatches = concurrent generation streams = queue depth.
 
-- **monky: max 2** concurrent dispatches (workers + reviewers combined)
+- **monky: max 3** concurrent dispatches (workers + reviewers combined)
 - **frank: max 3**
 
-Andryo, 2026-09-10 (monky lowered from 3 after a 3-worker + 2-agent wave
-saturated the queue: 8 running / 4 waiting). Count live before dispatching:
+Andryo, 2026-09-10. (A temporary monky cap of 2 followed a queue scare that
+turned out to be a 524K-ctx session starving the prefix cache, not worker
+count - restored to 3 the same day. Keep fleet sessions compacted well under
+~300K: big resident contexts evict prefix blocks for everyone.) Count live
+before dispatching:
 
 ```bash
 ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l
