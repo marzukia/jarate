@@ -1688,7 +1688,7 @@ async function runChannelCommand(
         const elapsed = Date.now() - sessionStartTs;
         const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
         const parts = [
-          `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
+          `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"}`,
           `model ${model}`,
           `up ${up}`,
           ctx.isIdle() ? "idle" : "running",
