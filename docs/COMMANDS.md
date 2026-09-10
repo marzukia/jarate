@@ -52,7 +52,9 @@ fix the build
 The second message interrupts the in-flight step after ~3s and the agent picks
 it up. This is for **plain** messages only — commands (`/stop`, `/btw`, …) keep
 their existing behavior. `/status` shows an armed interrupt (`interrupt in 3s`)
-and an in-flight one (`interrupting`).
+and an in-flight one (`interrupting`). Webhook traffic follows the same rule:
+pi-bg dispatch callbacks are plain messages, so a callback that arrives mid-run
+interrupts the in-flight step (faster wake than waiting for the run to end).
 
 If the step finishes before the grace period, the message is delivered normally
 as a fresh run instead (the existing mid-turn re-wake). Nothing is ever queued

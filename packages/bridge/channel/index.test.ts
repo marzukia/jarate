@@ -6,25 +6,27 @@ import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
   chunkText,
+  clearAllInterrupts,
   collectFinals,
   earlySendText,
   failurePostText,
   fileOnlyPrompt,
   handleInbound,
+  heldInterrupts,
+  interruptStepTimeoutMs,
   matchCommand,
   midTurnQueues,
   parseJobsFromPs,
   parseReplyTo,
   pendingAttachments,
+  pendingInterrupts,
   prunePendingBatches,
   REPEAT_WARNING,
   registerTodoTool,
   runShellPassthrough,
-  TODO_TOOL_DESCRIPTION,
-  interruptStepTimeoutMs,
-  pendingInterrupts,
-  clearAllInterrupts,
   setInterruptCtx,
+  stoppedSinceAbort,
+  TODO_TOOL_DESCRIPTION,
 } from "./index";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
@@ -394,11 +396,15 @@ describe("failurePostText (A2)", () => {
     // errorMessage "This operation was aborted" (verified in a live
     // session, 2026-09-10). /stop, /reset and the mid-run interrupt set
     // the user-stopped flag, so the failure post is expected noise.
-    expect(failurePostText([failure("error", "This operation was aborted")], true)).toBeNull();
+    expect(
+      failurePostText([failure("error", "This operation was aborted")], true),
+    ).toBeNull();
   });
 
   test("error run shaped stopReason=error still posts when NOT user-stopped", () => {
-    expect(failurePostText([failure("error", "This operation was aborted")], false)).toBe("[!] This operation was aborted");
+    expect(
+      failurePostText([failure("error", "This operation was aborted")], false),
+    ).toBe("[!] This operation was aborted");
   });
 
   test("aborted with errorMessage is silent when the user stopped the run", () => {
@@ -855,7 +861,10 @@ describe("extension handlers (A1/A2/A4)", () => {
       idle = false;
       // Model the real session: abort kills the run and it settles (idle).
       ctx.isIdle = () => idle;
-      ctx.abort = () => { abortCount += 1; idle = true; };
+      ctx.abort = () => {
+        abortCount += 1;
+        idle = true;
+      };
       setInterruptCtx(ctx);
     });
 
@@ -863,6 +872,8 @@ describe("extension handlers (A1/A2/A4)", () => {
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
+      heldInterrupts.clear();
+      stoppedSinceAbort.clear();
       jest.useRealTimers();
     });
 
@@ -885,7 +896,10 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(sent[0].m.content).toContain("redirect me");
       expect(sent[0].m.details.body).toBe("redirect me");
       expect(sent[0].m.details.messageId).toBe("m1");
-      expect(sent[0].o).toMatchObject({ triggerTurn: true, deliverAs: "steer" });
+      expect(sent[0].o).toMatchObject({
+        triggerTurn: true,
+        deliverAs: "steer",
+      });
       // Consumed from the re-wake queue: no second delivery at agent_end.
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
@@ -916,8 +930,14 @@ describe("extension handlers (A1/A2/A4)", () => {
         errorMessage: "This operation was aborted",
       };
       await handlers.agent_end({ messages: [fail] }, ctx);
-      const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/messages"));
-      expect(posts.every(p => !String(JSON.parse(p.body).content).startsWith("[!]"))).toBe(true);
+      const posts = fetchCalls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/messages"),
+      );
+      expect(
+        posts.every(
+          (p) => !String(JSON.parse(p.body).content).startsWith("[!]"),
+        ),
+      ).toBe(true);
     });
 
     test("command during a run is NOT interrupted", async () => {
@@ -964,6 +984,9 @@ describe("extension handlers (A1/A2/A4)", () => {
       await handlers.agent_end({ messages: [] }, ctx);
       expect(sent.length).toBe(1); // re-wake fired
       expect(midTurnQueues.has("ch1")).toBe(false);
+      // F6: the re-wake owns the entry now — its armed timer is dropped so
+      // /status does not show a stale "interrupt in Xs" fragment.
+      expect(pendingInterrupts.has("ch1")).toBe(false);
       jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
       expect(sent.length).toBe(1); // timer found no entry, no double send
       expect(abortCount).toBe(0);
@@ -992,7 +1015,9 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     test("interrupt waits for a slow settle before sending", async () => {
       // abort does NOT settle immediately — the wait loop must poll isIdle
-      ctx.abort = () => { abortCount += 1; };
+      ctx.abort = () => {
+        abortCount += 1;
+      };
       await handleInbound(pi, inbound("slow", "m1"), ctx);
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
@@ -1008,14 +1033,135 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(sent[0].m.details.messageId).toBe("m1");
     });
 
+    test("F1: settle >10s — no send while not idle; re-arm retries until settled", async () => {
+      // abort does NOT settle: the full 400×25ms poll window expires.
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      await handleInbound(pi, inbound("redirect", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+
+      // Run the whole poll window. One microtask flush per 25ms tick: each
+      // poll continuation registers the next 25ms timer, which only fires
+      // on the next advance.
+      for (let i = 0; i < 400; i++) {
+        jest.advanceTimersByTime(25);
+        await Promise.resolve();
+      }
+      // Still not idle: no steer-send into the still-dying run; the entry is
+      // held and a 250ms retry is armed.
+      expect(sent.length).toBe(0);
+      expect(heldInterrupts.get("ch1")?.messageId).toBe("m1");
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch1")?.[0].messageId).toBe("m1");
+
+      // Next fire: still not idle → re-arm again, still no send.
+      jest.advanceTimersByTime(250);
+      await Promise.resolve();
+      expect(sent.length).toBe(0);
+      expect(heldInterrupts.get("ch1")?.messageId).toBe("m1");
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+
+      // Session settles: the retry delivers exactly once.
+      idle = true;
+      jest.advanceTimersByTime(250);
+      await Promise.resolve();
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m1");
+      expect(heldInterrupts.has("ch1")).toBe(false);
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("F2: /stop during the settle window cancels the pending send", async () => {
+      // abort does NOT settle: the interrupt is in its settle window.
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0);
+
+      // /stop while settle is pending.
+      await handleInbound(pi, inbound("/stop", "m2"), ctx);
+      expect(abortCount).toBe(2); // /stop's own abort
+      expect(stoppedSinceAbort.has("ch1")).toBe(true);
+
+      // Session settles: the pending send must NOT start a new run.
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(0);
+    });
+
+    test("F4: re-arm log is suppressed while an interrupt is in flight", async () => {
+      const flush = async (n: number) => {
+        for (let i = 0; i < n; i++) await Promise.resolve();
+      };
+      // m1's interrupt aborts and is stuck in its settle poll (never idle).
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      await handleInbound(pi, inbound("a", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await flush(130); // drain m1's poll conts up to the fire point
+      expect(abortCount).toBe(1);
+
+      // Second message arms its own timer while m1 is in flight: that arm
+      // logs once; the 200ms re-arm cycles after it must be silent.
+      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await handleInbound(pi, inbound("b", "m2"), ctx);
+        const afterArm = logSpy.mock.calls
+          .map((c) => String(c[0]))
+          .filter((t) => t.includes("armed mid-run interrupt"));
+        expect(afterArm.length).toBe(1); // m2's initial arm logged once
+
+        jest.advanceTimersByTime(interruptStepTimeoutMs());
+        await flush(130);
+        for (let i = 0; i < 4; i++) {
+          jest.advanceTimersByTime(200);
+          await flush(16);
+        }
+        const armLogs = logSpy.mock.calls
+          .map((c) => String(c[0]))
+          .filter((t) => t.includes("armed mid-run interrupt"));
+        expect(armLogs.length).toBe(1); // no per-cycle spam
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    test("F1/F2: a later /stop does not cancel a later, unrelated interrupt", async () => {
+      // The cancel flag is per-stop: a new run (turn_start) clears it, so a
+      // subsequent interrupt is not silently dropped.
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      await handleInbound(pi, inbound("/stop", "m2"), ctx);
+      expect(stoppedSinceAbort.has("ch1")).toBe(true);
+
+      // Next run starts: the flag is stale.
+      await handlers.turn_start({}, ctx);
+      expect(stoppedSinceAbort.has("ch1")).toBe(false);
+    });
+
     test("/status shows the armed interrupt state", async () => {
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("x", "m1"), ctx);
       await handleInbound(pi, inbound("/status", "m2"), ctx);
-      const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/messages"));
+      const posts = fetchCalls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/messages"),
+      );
       const statusPost = posts
-        .map(p => String(JSON.parse(p.body).content))
-        .find(t => t.includes("running"));
+        .map((p) => String(JSON.parse(p.body).content))
+        .find((t) => t.includes("running"));
       expect(statusPost).toBeDefined();
       expect(statusPost).toContain("interrupt in ");
     });
