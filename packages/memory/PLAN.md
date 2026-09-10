@@ -1,4 +1,7 @@
-# Plan: Shared Project Knowledge RAG on Postgres
+# RAG (pgrag)
+
+> Canonical location: `packages/memory/` in marzukia/jarate (incorporated with full history 2026-09-10); the box copy at `~/projects/pgrag` is a synced deployment.
+
 
 Author: monky, 2026-09-05. For review by Frankie. Status: proposal.
 
