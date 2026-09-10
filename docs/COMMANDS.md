@@ -20,6 +20,7 @@ Access: **anyone** = any member of the channel; **owner** = the configured
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
 | `/model [name]` | owner | switch model, or list models when run bare |
+| `/sleep [list \| cancel <id>]` | owner | list or cancel pending session wakes |
 | `! <command>` | owner | shell passthrough: run `bash -c "<command>"` in the working directory |
 
 ## Examples
@@ -122,6 +123,27 @@ as normal chat.
 
 > ⚠️ `!` executes arbitrary shell on the agent box. In a private, trusted
 > channel this is a feature; it is not a sandbox.
+
+### /sleep
+
+```
+/sleep               # list pending wakes (same as /sleep list)
+/sleep list
+/sleep cancel <id>   # cancel one
+```
+
+Owner only. Lists the agent's pending session wakes (id, channel, wake time,
+relative countdown, note) or cancels one by id. The wakes are created by the
+`sleep` LLM tool, not by a command.
+
+The `sleep` tool (agent-facing): `sleep(minutes=30, note="...")` or
+`sleep(until="2026-09-10T15:00:00Z")` records a wake in
+`~/.pi/agent/sleep/wakes.json` and the agent ends its run. The wake is
+delivered as a new message in the SAME session when the time comes — via a
+30s poller while the bridge is alive, or at `session_start` after a restart
+or reboot (due wakes are caught up; stale delivery claims > 10 min old are
+re-delivered, so a wake is lost only if the channel is disabled, not if the
+process dies).
 
 ### /help
 

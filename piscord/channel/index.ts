@@ -79,6 +79,16 @@ import {
   type TodoBoard,
 } from "./todos";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import {
+  loadWakes,
+  dueWakes,
+  markClaimed,
+  scheduleWake,
+  cancelWake,
+  parseWakeAt,
+  formatWakePrompt,
+  formatDurationMs,
+} from "./sleep";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { memoryToc } from "./memory";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
@@ -86,6 +96,8 @@ import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
+// 30s poller for due sleep wakes (session_start / session_shutdown owned).
+let sleepPoller: ReturnType<typeof setInterval> | null = null;
 // /compact queued while the session is busy (run in progress, or a
 // compaction already in flight). pi's compact() starts with await
 // abort(), so a mid-run compact would silently kill the in-flight
@@ -429,7 +441,7 @@ export function collectFinals(messages: unknown[]): { text: string; replyTo?: st
  * Exported for tests.
  */
 export function matchCommand(body: string): { name: string; arg?: string } | null {
-  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i);
+  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs|todos|sleep)(?:\s+([\s\S]+))?|stop)$/i);
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
 }
@@ -663,10 +675,29 @@ export default function (pi: ExtensionAPI) {
     }
     writeChannelState(workspaceRoot, channels);
 
-    // LLM tools: send local file(s) / maintain the todo board.
+    // LLM tools: send local file(s) / maintain the todo board / session sleep.
     if (enabled.some(c => c.type === "discord" && (getDiscordToken(c.id) || c.botToken))) {
       registerSendFileTool(pi, channels);
       registerTodoTool(pi, channels);
+      registerSleepTool(pi, channels);
+    }
+
+    // Sleep wakes: deliver anything due NOW (the pending list is on disk,
+    // so this catches up after a pi.service restart or a machine reboot),
+    // then poll every 30s for the rest.
+    if (enabled.some(c => c.type === "discord")) {
+      const due = deliverDueWakes(pi, channels);
+      if (due > 0) console.log(`[sleep] delivered ${due} due wake(s) on startup`);
+      if (sleepPoller) clearInterval(sleepPoller);
+      sleepPoller = setInterval(() => {
+        try {
+          const n = deliverDueWakes(pi, channels);
+          if (n > 0) console.log(`[sleep] delivered ${n} due wake(s)`);
+        } catch (e) {
+          console.error("[sleep] poller failed:", sanitizeUnknownValue(e));
+        }
+      }, 30_000);
+      (sleepPoller as any).unref?.();
     }
   });
 
@@ -689,6 +720,7 @@ export default function (pi: ExtensionAPI) {
     pendingAttachments.clear();
     midTurnQueues.clear();
     finalReps.clear();
+    if (sleepPoller) { clearInterval(sleepPoller); sleepPoller = null; }
   });
 
   // ─── Live status line (edit-in-place, deleted at run end) ───
@@ -972,6 +1004,7 @@ const HELP_TEXT = [
   "`/model [name]` — switch or list models (owner)",
   "`/jobs` — list in-flight pi-bg dispatches",
   "`/todos` — show the channel todo board (arg `all` for every channel)",
+  "`/sleep [list | cancel <id>]` — list or cancel pending session wakes (owner)",
   "`/help` — this message",
 ].join("\n");
 
@@ -1241,6 +1274,32 @@ async function runChannelCommand(
       // Informational, open to all channel members (private channel).
       return { immediate: listInflightJobs() };
     }
+    case "sleep": {
+      if (!isOwner) return ownerOnly;
+      const argText = (arg || "").trim();
+      const sub = argText ? argText.split(/\s+/)[0]!.toLowerCase() : "list";
+      if (sub === "list") {
+        const names = new Map(loadChannelConfig(ctx.cwd).map(c => [c.id, c.name]));
+        const wakes = loadWakes();
+        if (wakes.length === 0) return { immediate: "no pending wakes" };
+        const lines = wakes.map(w => {
+          const chName = names.get(w.channelId) || w.channelName || w.channelId;
+          const at = new Date(w.wakeAt).toISOString();
+          const m = Math.round((w.wakeAt - Date.now()) / 60000);
+          const state = w.status === "claimed" ? "claimed" : m > 0 ? `in ${formatDurationMs(m * 60000)}` : "due";
+          const note = w.note ? ` \u00b7 note: ${w.note}` : "";
+          return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
+        });
+        return { immediate: `${wakes.length} pending wake${wakes.length > 1 ? "s" : ""}:\n${lines.join("\n")}` };
+      }
+      if (sub === "cancel") {
+        const id = argText.slice("cancel".length).trim();
+        if (!id) return { immediate: "usage: `/sleep cancel <id>`" };
+        const ok = cancelWake(id);
+        return { immediate: ok ? `[ok] cancelled wake ${id}` : `[!] no wake with id ${id}` };
+      }
+      return { immediate: "usage: `/sleep [list | cancel <id>]`" };
+    }
     case "todos": {
       // Informational, open to all channel members (private channel).
       if ((arg || "").trim().toLowerCase() === "all") {
@@ -1451,6 +1510,74 @@ export function registerTodoTool(pi: ExtensionAPI, channels: ChannelConfig[]): v
 }
 
 // ─── Inbound handler ──────────────────────────────────────────────────────
+// ─── Sleep wake delivery ────────────────────────────────────────────────
+// Claim (markClaimed) BEFORE injection so a crash between claim and
+// sendToPi re-delivers once the claim goes stale (at-least-once, kimaki's
+// session-sleep invariant). Returns the number of wakes delivered.
+export function deliverDueWakes(pi: ExtensionAPI, channels: ChannelConfig[], home?: string, now = Date.now()): number {
+  const enabledIds = new Set(channels.filter(c => c.enabled && c.type === "discord").map(c => c.id));
+  const due = [...enabledIds].flatMap(id => dueWakes(id, now, home));
+  if (due.length === 0) return 0;
+  for (const w of due) markClaimed(w.id, now, home);
+  for (const w of due) {
+    const ch = getChannel(channels, w.channelId);
+    const name = ch?.name || w.channelName || w.channelId;
+    const text = formatWakePrompt(w, now);
+    console.log(`[sleep] delivering wake ${w.id} for ${name}`);
+    sendToPi(pi, w.channelId, text, `discord/${name}`, text);
+  }
+  return due.length;
+}
+
+// ─── sleep tool ───────────────────────────────────────────────────────────
+// Durable "wake me at X": records the wake on disk, tells the model to end
+// the run. Delivery is external (session_start catch-up + 30s poller) so it
+// survives pi.service restarts and machine reboots. The wake lands as a
+// fresh channel-inbound turn in the same session.
+export const SLEEP_TOOL_DESCRIPTION = `Pause this session and wake it at a later time. Schedule a wake (minutes from now, or an ISO time), optionally with a note for your waking self, then END YOUR REPLY IMMEDIATELY — the run ends now and a "Woke after sleeping until ..." message starts the next turn in this same session. Use it to sleep until a known time (deploy window closes, meeting ends, CI should be done) instead of polling. The wake survives process restarts.`;
+
+export function registerSleepTool(pi: ExtensionAPI, channels: ChannelConfig[]): void {
+  pi.registerTool({
+    name: "sleep",
+    label: "Sleep",
+    description: SLEEP_TOOL_DESCRIPTION,
+    promptSnippet: "Pause the session and wake it at a later time (minutes or ISO until, optional note)",
+    promptGuidelines: [
+      "After calling sleep, end the reply immediately — do not keep working or poll; the wake arrives as a new message in this session.",
+    ],
+    parameters: Type.Object({
+      minutes: Type.Optional(Type.Union([Type.Number(), Type.String()], {
+        description: "Sleep length in minutes (e.g. 30)",
+      })),
+      until: Type.Optional(Type.String({
+        description: "Wake time as ISO timestamp, e.g. 2026-09-10T15:00:00Z (exactly one of minutes/until)",
+      })),
+      note: Type.Optional(Type.String({
+        description: "Optional note stored and shown back at wake time",
+      })),
+    }),
+    async execute(_toolCallId, params: { minutes?: number | string; until?: string; note?: string }, _signal, _onUpdate, ctx: ExtensionContext) {
+      const active = lastActiveChannel && lastActiveChannel.type === "discord" ? lastActiveChannel : null;
+      const ch = active || getDefaultChannel(channels);
+      if (!ch || ch.type !== "discord") {
+        return { content: [{ type: "text", text: "No Discord channel available" }], details: {} };
+      }
+      const res = parseWakeAt(params);
+      if (res.error !== undefined || res.wakeAt === undefined) {
+        return { content: [{ type: "text", text: `[!] ${res.error ?? "invalid wake time"}` }], details: {} };
+      }
+      const wake = scheduleWake({
+        channelId: ch.id,
+        channelName: ch.name,
+        wakeAt: res.wakeAt,
+        note: params.note,
+      });
+      const text = `[ok] sleeping until ${new Date(wake.wakeAt).toISOString()} (id ${wake.id}). End your reply now; this session wakes at that time.`;
+      return { content: [{ type: "text", text }], details: { wake } };
+    },
+  });
+}
+
 // (named export for test harness; pi itself only uses the default factory)
 
 export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: ExtensionContext, forceDirect = false) {

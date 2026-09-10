@@ -1135,6 +1135,8 @@ const SLASH_COMMANDS = [
   { name: "jobs", description: "List in-flight pi-bg dispatches" },
   { name: "todos", description: "Show the channel todo board ('all' for every channel)",
     options: [{ type: 3, name: "scope", description: "'all' for every channel", required: false }] },
+  { name: "sleep", description: "List/cancel pending session wakes (owner)",
+    options: [{ type: 3, name: "scope", description: "'list' or 'cancel <id>'", required: false }] },
 ];
 
 /** Clear guild + global slash commands so the native "/" menu is empty
