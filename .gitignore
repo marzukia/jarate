@@ -1,5 +1,6 @@
-# jarate
 node_modules/
-.tmp/
+__pycache__/
+*.pyc
+.venv/
+dist/
 *.log
-.DS_Store
