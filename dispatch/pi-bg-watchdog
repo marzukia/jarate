@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# pi-bg-watchdog — periodic sweep for dead pi-bg dispatches (lost callbacks)
+#
+# GAP covered: pi-bg posts its Discord callback from a hardened EXIT path
+# (issue #14), but SIGKILL/OOM cannot be trapped. When the pi-bg shell dies
+# untrapably, no callback is posted and the worktree under
+# ~/.pi-bg-wt/<repo>/<ticket>/ lingers with the cgroup escape dir behind it.
+#
+# This sweep runs every 15 min (pi-bg-watchdog.timer) and does:
+#   1. enumerate ~/.pi-bg-wt/*/*/ ticket dirs
+#   2. skip tickets with a LIVE process:
+#        - any pid still inside the escape cgroup
+#          /sys/fs/cgroup/.../pi-bg/<ticket>/cgroup.procs|threads, OR
+#        - any same-user process whose cwd IS the worktree dir (covers the
+#          cgroup-escape-unavailable fallback). A cmdline grep for the ticket
+#          id is deliberately NOT used: a live pi-bg whose TASK TEXT happens
+#          to mention the id would mask a dead ticket (false negative).
+#   3. skip tickets that completed normally: /tmp/pi-bg-<ticket>-out.md
+#      exists and is non-empty (normal exit keeps the worktree BY DESIGN so
+#      the orchestrator can diff it; the callback was already posted)
+#   4. if the dir mtime is older than 20 min and the ticket is not already
+#      in today's dead letter log -> post a DEAD webhook (same url source
+#      and embed format as pi-bg) and append ~/.pi-bg-deadlog
+#
+# config (same source as pi-bg):
+#   $PI_DISPATCH_WEBHOOK or first line of ~/.config/pi-dispatch/webhook
+#   (no webhook configured = sweep still runs, posts skipped)
+# args:
+#   --quiet   log-only mode: append to dead log, post no webhooks
+#             (use for the first run after install to baseline existing debris)
+#   --dry-run print what would be done, change nothing
+#   --age-min N  override the 20-minute age threshold
+set -uo pipefail
+
+WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
+DEADLOG="${HOME}/.pi-bg-deadlog"
+AGE_MIN=20
+QUIET=0
+DRY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet)   QUIET=1; shift ;;
+    --dry-run) DRY=1; shift ;;
+    --age-min) AGE_MIN="$2"; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+CG_DIR="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/pi-bg"
+today="$(date -u +%Y-%m-%d)"
+
+webhook="${PI_DISPATCH_WEBHOOK:-}"
+if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
+fi
+
+# is_live <ticket> <wt-path>: 0 if a process still matches this ticket
+is_live() {
+  local t="$1" d="$2" p cwd me
+  me="$(id -un)"
+  [ -s "$CG_DIR/$t/cgroup.procs" ] && return 0
+  [ -s "$CG_DIR/$t/cgroup.threads" ] && return 0
+  for p in /proc/[0-9]*; do
+    [ "$(stat -c %U "$p" 2>/dev/null)" = "$me" ] || continue
+    cwd="$(readlink "$p/cwd" 2>/dev/null)" || continue
+    [ "$cwd" = "$d" ] && return 0
+  done
+  return 1
+}
+
+# dedupe: already logged as dead on <today>
+already_dead() {
+  local t="$1"
+  grep -q "^${today} ${t} " "$DEADLOG" 2>/dev/null
+}
+
+# wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
+wd_post() {
+  local body="$1" code i
+  [ -n "$webhook" ] || return 1
+  for i in 1 2 3; do
+    code="$(curl -s -o /tmp/pi-bg-watchdog-wb-resp.txt -w '%{http_code}' -X POST "$webhook" \
+      -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
+    case "$code" in 2*) return 0 ;; esac
+    [ "$i" -lt 3 ] && sleep $((i * 3))
+  done
+  echo "[pi-bg-watchdog] webhook FAILED (http=$code) for body: $body" >&2
+  return 1
+}
+
+# wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason>
+# embed format mirrors pi-bg bg_build (author header, bash meta block, footer)
+wd_build() {
+  local bodyfile="$1" t="$2" repo="$3" path="$4" last="$5" reason="$6"
+  WD_T="$t" WD_REPO="$repo" WD_PATH="$path" WD_LAST="$last" WD_REASON="$reason" \
+  python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("WD_" + k, "")
+meta = [f"repo   : {E('REPO')}",
+        f"wt     : {E('PATH')}",
+        f"last   : {E('LAST')}",
+        f"reason : {E('REASON')}",
+        "note   : no live pi-bg process, no completion report - callback lost (SIGKILL/OOM)"]
+embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('T')}"},
+         "color": 15105570,  # orange, same as pi-bg DIED
+         "title": f"pi-bg {E('T')} \u00b7 DEAD (watchdog sweep)",
+         "description": "```bash\n" + "\n".join(meta) + "```",
+         "footer": {"text": "pi-bg watchdog"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+}
+
+found=0
+for d in "$WT_DIR"/*/*/; do
+  d="${d%/}"
+  [ -d "$d" ] || continue
+  t="$(basename "$d")"
+  repo="$(basename "$(dirname "$d")")"
+  # sanity: ticket ids are YYYYMMDD-HHMMSS-NNNNN
+  [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+  # 1) live dispatch -> leave alone
+  if is_live "$t" "$d"; then continue; fi
+  # 2) normal completion (out.md written) -> callback was posted, worktree kept by design
+  if [ -s "/tmp/pi-bg-${t}-out.md" ]; then continue; fi
+  # 3) recent activity -> give it time
+  mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
+  [ $(( $(date +%s) - mtime )) -gt $((AGE_MIN * 60)) ] || continue
+  # 4) dedupe on today's dead letter
+  if already_dead "$t"; then continue; fi
+
+  found=$((found + 1))
+  last="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)"
+  if [ -f "/tmp/pi-bg-${t}-webhook-failed" ]; then
+    reason="webhook dead letter exists (callback attempted, post failed)"
+  else
+    reason="no callback on record (SIGKILL/OOM suspected)"
+  fi
+
+  echo "[pi-bg-watchdog] DEAD $repo/$t (last activity $last, $reason)"
+  if [ "$DRY" -eq 1 ]; then continue; fi
+
+  if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
+    bodyf="/tmp/pi-bg-watchdog-${t}-body.json"
+    wd_build "$bodyf" "$t" "$repo" "$d" "$last" "$reason"
+    if [ -s "$bodyf" ]; then
+      wd_post "$bodyf" || echo "[pi-bg-watchdog] DEAD post failed for $t (dead log still updated)" >&2
+      rm -f "$bodyf"
+    fi
+  fi
+  printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
+done
+
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found (quiet=$QUIET dry=$DRY)"
+exit 0

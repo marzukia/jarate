@@ -1,0 +1,11 @@
+[Unit]
+Description=Run pi-bg watchdog sweep every 15 min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

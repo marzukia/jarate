@@ -1,0 +1,8 @@
+[Unit]
+Description=pi-bg watchdog sweep (recover dead dispatches with lost callbacks)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/scripts/pi-bg-watchdog
