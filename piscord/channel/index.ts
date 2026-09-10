@@ -83,6 +83,9 @@ import {
   loadWakes,
   dueWakes,
   markClaimed,
+  completeWake,
+  cancelPendingWakes,
+  collectOrphanTmpFiles,
   scheduleWake,
   cancelWake,
   parseWakeAt,
@@ -686,6 +689,13 @@ export default function (pi: ExtensionAPI) {
     // so this catches up after a pi.service restart or a machine reboot),
     // then poll every 30s for the rest.
     if (enabled.some(c => c.type === "discord")) {
+      // Best-effort cleanup of tmp files orphaned by a crash mid-write.
+      try {
+        const orphans = collectOrphanTmpFiles();
+        if (orphans > 0) console.log(`[sleep] collected ${orphans} orphan wake tmp file(s)`);
+      } catch {
+        /* best-effort only */
+      }
       const due = deliverDueWakes(pi, channels);
       if (due > 0) console.log(`[sleep] delivered ${due} due wake(s) on startup`);
       if (sleepPoller) clearInterval(sleepPoller);
@@ -1282,6 +1292,7 @@ async function runChannelCommand(
         const names = new Map(loadChannelConfig(ctx.cwd).map(c => [c.id, c.name]));
         const wakes = loadWakes();
         if (wakes.length === 0) return { immediate: "no pending wakes" };
+        const pending = wakes.filter(w => w.status === "pending").length;
         const lines = wakes.map(w => {
           const chName = names.get(w.channelId) || w.channelName || w.channelId;
           const at = new Date(w.wakeAt).toISOString();
@@ -1290,7 +1301,7 @@ async function runChannelCommand(
           const note = w.note ? ` \u00b7 note: ${w.note}` : "";
           return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
         });
-        return { immediate: `${wakes.length} pending wake${wakes.length > 1 ? "s" : ""}:\n${lines.join("\n")}` };
+        return { immediate: `${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}` };
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
@@ -1513,7 +1524,9 @@ export function registerTodoTool(pi: ExtensionAPI, channels: ChannelConfig[]): v
 // ─── Sleep wake delivery ────────────────────────────────────────────────
 // Claim (markClaimed) BEFORE injection so a crash between claim and
 // sendToPi re-delivers once the claim goes stale (at-least-once, kimaki's
-// session-sleep invariant). Returns the number of wakes delivered.
+// session-sleep invariant). After injection SUCCEEDS the wake is completed
+// (removed from the file) — otherwise the stale-claim path would re-deliver
+// it every CLAIM_TTL_MS, forever. Returns the number of wakes delivered.
 export function deliverDueWakes(pi: ExtensionAPI, channels: ChannelConfig[], home?: string, now = Date.now()): number {
   const enabledIds = new Set(channels.filter(c => c.enabled && c.type === "discord").map(c => c.id));
   const due = [...enabledIds].flatMap(id => dueWakes(id, now, home));
@@ -1524,7 +1537,9 @@ export function deliverDueWakes(pi: ExtensionAPI, channels: ChannelConfig[], hom
     const name = ch?.name || w.channelName || w.channelId;
     const text = formatWakePrompt(w, now);
     console.log(`[sleep] delivering wake ${w.id} for ${name}`);
-    sendToPi(pi, w.channelId, text, `discord/${name}`, text);
+    const ok = sendToPi(pi, w.channelId, text, `discord/${name}`, text);
+    if (ok) completeWake(w.id, home);
+    else console.error(`[sleep] injection failed for wake ${w.id} — claim stays, retried after TTL`);
   }
   return due.length;
 }
@@ -1611,6 +1626,17 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
     const r = await runChannelCommand(pi, ctx, ch, cmd.name, cmd.arg, msg.fromId, false);
     if (r.btw) { noAck(); return; }
     if (r.immediate !== undefined) { noAck(); replyCmd(r.immediate); return; }
+  }
+
+  // Kimaki parity: a real inbound user message means the agent is awake
+  // again — cancel this channel's PENDING wakes (claimed ones are
+  // mid-delivery and left alone). /btw and commands returned above and
+  // never reach this line.
+  try {
+    const cancelled = cancelPendingWakes(ch.id);
+    if (cancelled > 0) console.log(`[sleep] ${cancelled} pending wake(s) cancelled by inbound message in ${ch.name || ch.id}`);
+  } catch (e) {
+    console.error("[sleep] cancel-on-inbound failed:", sanitizeUnknownValue(e));
   }
 
   // ── pi-bg worker intake: a callback body carrying "TODO: " lines adds
@@ -1819,7 +1845,7 @@ export async function handleInbound(pi: ExtensionAPI, msg: ChannelMessage, ctx: 
 
 // ─── Send to pi session ──────────────────────────────────────────────────
 
-function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: string, displayBody: string, messageId?: string, messageIds?: string[]) {
+function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: string, displayBody: string, messageId?: string, messageIds?: string[]): boolean {
   const ids = messageIds ?? (messageId ? [messageId] : []);
   if (ids.length > 0) runInboundIds.set(channelId, ids);
   try {
@@ -1837,7 +1863,9 @@ function sendToPi(pi: ExtensionAPI, channelId: string, text: string, title: stri
     }, { triggerTurn: true, deliverAs: "steer" });
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
+    return false;
   }
+  return true;
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────

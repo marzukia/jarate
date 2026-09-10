@@ -34,6 +34,7 @@ import {
   CLAIM_TTL_MS,
   cancelWake,
   loadWakes,
+  markClaimed,
   scheduleWake,
 } from "./sleep";
 import { loadChannelConfig, type ChannelMessage } from "./types";
@@ -1441,7 +1442,7 @@ describe("sleep (integration)", () => {
     const w = scheduleWake({ channelId: "ch1", channelName: "Test", wakeAt: Date.now() + 30 * 60000, note: "check CI", home: tmp });
     await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
     const content = replyContent();
-    expect(content).toContain("1 pending wake:");
+    expect(content).toContain("1 pending wake (of 1 total):");
     expect(content).toContain(w.id);
     expect(content).toContain("Test");
     expect(content).toContain(new Date(w.wakeAt).toISOString());
@@ -1465,7 +1466,7 @@ describe("sleep (integration)", () => {
     expect(replyContent()).toBe("usage: `/sleep [list | cancel <id>]`");
   });
 
-  test("due-on-startup delivery: injects a channel-inbound wake, claims it, no double delivery", () => {
+  test("due-on-startup delivery: injects a channel-inbound wake, completes it, no double delivery", () => {
     const w = scheduleWake({ channelId: "ch1", channelName: "Test", wakeAt: NOW - 1000, note: "check the deploy", home: tmp, now: NOW - 2000 });
     const channels = loadChannelConfig(tmp);
     expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(1);
@@ -1475,20 +1476,35 @@ describe("sleep (integration)", () => {
     expect(s.m.content).toContain("Woke after sleeping until");
     expect(s.m.content).toContain("Note: check the deploy");
     expect(s.m.details.title).toBe("discord/Test");
-    // claimed on disk — a fresh process re-reads the same file
-    expect(loadWakes(tmp)[0]).toMatchObject({ id: w.id, status: "claimed" });
+    // completed on disk (removed) — a healthy process never re-delivers it
+    expect(loadWakes(tmp).find(x => x.id === w.id)).toBeUndefined();
     // immediate re-check: no double delivery
     expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(0);
     expect(sent).toHaveLength(1);
   });
 
-  test("restart simulation: stale claim re-delivers after CLAIM_TTL_MS", () => {
+  test("stale claim after PROCESS DEATH re-delivers once after CLAIM_TTL_MS", () => {
+    const w = scheduleWake({ channelId: "ch1", wakeAt: NOW - 1000, home: tmp, now: NOW - 2000 });
+    // claim, then the process dies before completion (crash guard state)
+    markClaimed(w.id, NOW, tmp);
+    expect(loadWakes(tmp)[0]).toMatchObject({ id: w.id, status: "claimed", claimedAt: NOW });
+    // a new session starts long after the claim (bridge was down through the TTL window)
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueWakes(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(1);
+    expect(sent).toHaveLength(1);
+    // that redelivery is also completed — the loop must end
+    expect(loadWakes(tmp)).toHaveLength(0);
+    expect(deliverDueWakes(pi, channels, tmp, NOW + 2 * CLAIM_TTL_MS + 2)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("same-process late tick: a delivered wake is NOT re-delivered after the TTL (F1)", () => {
     scheduleWake({ channelId: "ch1", wakeAt: NOW - 1000, home: tmp, now: NOW - 2000 });
     const channels = loadChannelConfig(tmp);
     expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(1);
-    // a new session starts long after the claim (bridge was down through the TTL window)
-    expect(deliverDueWakes(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(1);
-    expect(sent).toHaveLength(2);
+    // 10 minutes later, same live process: the wake was completed, not claimed-stale
+    expect(deliverDueWakes(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(0);
+    expect(sent).toHaveLength(1);
   });
 
   test("deliverDueWakes skips disabled channels (no claim, no injection)", () => {
@@ -1497,6 +1513,42 @@ describe("sleep (integration)", () => {
     expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(0);
     expect(sent).toHaveLength(0);
     expect(loadWakes(tmp)[0].status).toBe("pending");
+  });
+
+  test("/sleep list header counts only pending (claimed stays visible, not counted)", async () => {
+    const p = scheduleWake({ channelId: "ch1", channelName: "Test", wakeAt: Date.now() + 30 * 60000, note: "pending one", home: tmp });
+    const c = scheduleWake({ channelId: "ch1", channelName: "Test", wakeAt: Date.now() + 60 * 60000, note: "claimed one", home: tmp });
+    markClaimed(c.id, Date.now(), tmp);
+    await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
+    const content = replyContent();
+    expect(content).toContain("1 pending wake (of 2 total):");
+    expect(content).toContain(p.id);
+    expect(content).toContain(c.id);
+  });
+
+  test("inbound user message cancels PENDING wakes (kimaki parity); claimed ones survive", async () => {
+    const p = scheduleWake({ channelId: "ch1", wakeAt: Date.now() + 30 * 60000, home: tmp });
+    const c = scheduleWake({ channelId: "ch1", wakeAt: Date.now() + 60 * 60000, home: tmp });
+    markClaimed(c.id, Date.now(), tmp);
+    await handleInbound(pi, inbound("hey, are you awake?", "m1"), ctx);
+    const ids = loadWakes(tmp).map(w => w.id);
+    expect(ids).not.toContain(p.id);
+    expect(ids).toContain(c.id); // claimed = mid-delivery, not cancelled
+  });
+
+  test("/btw and commands do NOT cancel pending wakes", async () => {
+    const a = scheduleWake({ channelId: "ch1", wakeAt: Date.now() + 30 * 60000, home: tmp });
+    await handleInbound(pi, inbound("/btw what is 2+2", "m1"), ctx);
+    expect(loadWakes(tmp).map(w => w.id)).toContain(a.id);
+    const b = scheduleWake({ channelId: "ch1", wakeAt: Date.now() + 30 * 60000, home: tmp });
+    await handleInbound(pi, inbound("/help", "m2"), ctx);
+    expect(loadWakes(tmp).map(w => w.id)).toContain(b.id);
+  });
+
+  test("inbound message on channel A does not cancel wakes on channel B", async () => {
+    const w = scheduleWake({ channelId: "other-ch", wakeAt: Date.now() + 30 * 60000, home: tmp });
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    expect(loadWakes(tmp).map(x => x.id)).toEqual([w.id]);
   });
 
   test("sleep tool: minutes -> wake on disk + ack telling the model to end the reply", async () => {
@@ -1516,7 +1568,7 @@ describe("sleep (integration)", () => {
   });
 
   test("sleep tool: bad params -> error, nothing scheduled", async () => {
-    for (const params of [{}, { minutes: 5, until: "2026-09-10T15:00:00Z" }, { until: "yesterday" }, { minutes: -1 }]) {
+    for (const params of [{}, { minutes: 5, until: "2026-09-10T15:00:00Z" }, { until: "yesterday" }, { minutes: -1 }, { until: "2036-01-01T00:00:00Z" }]) {
       const r = await tools["sleep"].execute("1", params, undefined, undefined, ctx);
       expect(r.content[0].text).toContain("[!]");
     }

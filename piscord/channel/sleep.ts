@@ -12,10 +12,19 @@
  * `home` parameter on every fs function exists for test isolation.
  *
  * Delivery is at-least-once (kimaki's session-sleep invariant): a wake is
- * marked `claimed` before it is injected; a `claimed` wake older than
- * CLAIM_TTL_MS is treated as stale and re-delivered. The claim is a crash
- * guard, not a lock — a double wake is one extra turn, a lost wake is the
- * bug we are protecting against.
+ * marked `claimed` before it is injected; after injection succeeds it is
+ * COMPLETED (removed from the file), so a healthy process never re-delivers
+ * it. A `claimed` wake older than CLAIM_TTL_MS (process died between claim
+ * and completion) is stale and re-delivered exactly once. The claim is a
+ * crash guard, not a lock — a double wake is one extra turn, a lost wake is
+ * the bug we are protecting against.
+ *
+ * Single-writer assumption: all state ops are read-modify-write with no
+ * lock. One pi process per HOME (the normal case) is safe — JS is
+ * single-threaded and the initial catch-up finishes before the poller arms.
+ * Two concurrent processes sharing one HOME race on the file: a lost claim
+ * write can double-wake (accepted, bounded by TTL), a lost scheduleWake
+ * write can drop a scheduled wake (known gap, outside at-least-once).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -124,6 +133,7 @@ export function parseWakeAt(
     const t = Date.parse(String(params.until));
     if (Number.isNaN(t)) return { error: `invalid until: "${params.until}" (ISO time, e.g. 2026-09-10T15:00:00Z)` };
     if (t <= now) return { error: `until must be in the future: ${params.until}` };
+    if (t - now > MAX_WAKE_MS) return { error: "until too far out (max 30d from now)" };
     return { wakeAt: t };
   }
 
@@ -179,6 +189,60 @@ export function markClaimed(id: string, now = Date.now(), home = defaultHome()):
     return { ...w, status: "claimed" as const, claimedAt: now };
   });
   if (changed) saveWakes(next, home);
+}
+
+/**
+ * Complete a delivered wake: remove it from the file. Completion = deletion,
+ * which keeps wakes.json bounded and /sleep list honest. Call only AFTER
+ * injection succeeded — crash between injection and completion leaves the
+ * stale claim, which re-delivers once after CLAIM_TTL_MS (at-least-once).
+ * True when something was removed.
+ */
+export function completeWake(id: string, home = defaultHome()): boolean {
+  const wakes = loadWakes(home);
+  const next = wakes.filter(w => w.id !== id);
+  if (next.length === wakes.length) return false;
+  saveWakes(next, home);
+  return true;
+}
+
+/**
+ * Cancel all PENDING wakes for a channel (claimed ones are mid-delivery and
+ * left alone). Kimaki parity: any real inbound user message means the agent
+ * is awake again, so the pending wake is stale. Returns the count removed.
+ */
+export function cancelPendingWakes(channelId: string, home = defaultHome()): number {
+  const wakes = loadWakes(home);
+  const next = wakes.filter(w => !(w.channelId === channelId && w.status === "pending"));
+  const removed = wakes.length - next.length;
+  if (removed > 0) saveWakes(next, home);
+  return removed;
+}
+
+/**
+ * Collect orphan tmp files (crash between tmp write and rename). Best-effort:
+ * never throws, called once per process start. Files are wakes.json.*.tmp.
+ */
+export function collectOrphanTmpFiles(home = defaultHome()): number {
+  const dir = sleepsDir(home);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0; // no dir yet — nothing to collect
+  }
+  const target = path.basename(wakesPath(home));
+  let removed = 0;
+  for (const n of names) {
+    if (!n.startsWith(`${target}.`) || !n.endsWith(".tmp")) continue;
+    try {
+      fs.unlinkSync(path.join(dir, n));
+      removed++;
+    } catch {
+      // best-effort; a locked/dead tmp file can stay, it is harmless
+    }
+  }
+  return removed;
 }
 
 /**

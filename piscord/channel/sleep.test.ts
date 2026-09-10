@@ -6,6 +6,9 @@ import {
   CLAIM_TTL_MS,
   MAX_WAKE_MS,
   cancelWake,
+  cancelPendingWakes,
+  collectOrphanTmpFiles,
+  completeWake,
   dueWakes,
   formatDurationMs,
   formatWakePrompt,
@@ -59,6 +62,12 @@ describe("sleep: parseWakeAt", () => {
 
   test("minutes over 30d cap -> error", () => {
     expect(parseWakeAt({ minutes: MAX_WAKE_MS / 60000 + 1 }, NOW).error).toContain("too large");
+  });
+
+  test("until within 30d cap is accepted; over the cap -> error", () => {
+    const ok = parseWakeAt({ until: new Date(NOW + MAX_WAKE_MS - 1000).toISOString() }, NOW);
+    expect(ok.wakeAt).toBeDefined();
+    expect(parseWakeAt({ until: new Date(NOW + MAX_WAKE_MS + 1000).toISOString() }, NOW).error).toContain("too far out");
   });
 });
 
@@ -120,6 +129,46 @@ describe("sleep: state file", () => {
     markClaimed(a.id, NOW, tmp);
     // process died; new process re-reads the file at now+TTL+1ms
     expect(dueWakes("ch1", NOW + CLAIM_TTL_MS + 1, tmp).map(w => w.id)).toEqual([a.id]);
+  });
+
+  test("completeWake removes the wake: no re-due even after the TTL", () => {
+    const a = scheduleWake({ channelId: "ch1", wakeAt: NOW - 1000, home: tmp, now: NOW - 2000 });
+    markClaimed(a.id, NOW, tmp);
+    expect(completeWake(a.id, tmp)).toBe(true);
+    expect(loadWakes(tmp)).toHaveLength(0);
+    // same-process late tick: a completed wake never comes back
+    expect(dueWakes("ch1", NOW + CLAIM_TTL_MS + 1, tmp)).toHaveLength(0);
+    expect(completeWake(a.id, tmp)).toBe(false);
+  });
+
+  test("cancelPendingWakes removes only PENDING wakes for the channel", () => {
+    const pending = scheduleWake({ channelId: "ch1", wakeAt: NOW + 60000, home: tmp, now: NOW });
+    const other = scheduleWake({ channelId: "ch2", wakeAt: NOW + 60000, home: tmp, now: NOW });
+    const claimed = scheduleWake({ channelId: "ch1", wakeAt: NOW + 120000, home: tmp, now: NOW });
+    markClaimed(claimed.id, NOW, tmp);
+    expect(cancelPendingWakes("ch1", tmp)).toBe(1);
+    const ids = loadWakes(tmp).map(w => w.id).sort();
+    expect(ids).toEqual([claimed.id, other.id].sort());
+    expect(cancelPendingWakes("ch1", tmp)).toBe(0); // nothing pending left
+    expect(loadWakes(tmp)).toHaveLength(2); // claimed + other-channel survive
+    expect(pending).toBeDefined();
+  });
+
+  test("collectOrphanTmpFiles removes wakes.json.*.tmp, leaves the rest", () => {
+    fs.mkdirSync(path.dirname(wakesPath(tmp)), { recursive: true });
+    fs.writeFileSync(wakesPath(tmp), JSON.stringify({ wakes: [] }));
+    const orphan1 = `${wakesPath(tmp)}.123.456.tmp`;
+    const orphan2 = `${wakesPath(tmp)}.999.888.tmp`;
+    fs.writeFileSync(orphan1, "{} ");
+    fs.writeFileSync(orphan2, "{} ");
+    expect(collectOrphanTmpFiles(tmp)).toBe(2);
+    expect(fs.existsSync(orphan1)).toBe(false);
+    expect(fs.existsSync(orphan2)).toBe(false);
+    expect(fs.existsSync(wakesPath(tmp))).toBe(true);
+  });
+
+  test("collectOrphanTmpFiles: no dir yet -> 0, no throw", () => {
+    expect(collectOrphanTmpFiles(tmp)).toBe(0);
   });
 
   test("dueWakes only matches the channel", () => {
