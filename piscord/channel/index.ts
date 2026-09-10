@@ -429,7 +429,7 @@ export function collectFinals(messages: unknown[]): { text: string; replyTo?: st
  * Exported for tests.
  */
 export function matchCommand(body: string): { name: string; arg?: string } | null {
-  const m = body.match(/^(?:\/(stop|help|btw|status|reset|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i);
+  const m = body.match(/^(?:\/(stop|help|btw|status|reset|restart|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i);
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
 }
@@ -966,7 +966,8 @@ const HELP_TEXT = [
   "`/stop` — stop the current run",
   "`/btw <question>` — quick side question, answered briefly",
   "`/status` — session stats (owner)",
-  "`/reset` — start a NEW session, clearing context (owner)",
+  "`/reset` - start a NEW session, clearing context (owner)",
+  "`/restart` - restart pi, resuming THIS session (owner)",
   "`/verbose on|off` — forward tool calls to the channel (owner)",
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
@@ -1212,7 +1213,17 @@ async function runChannelCommand(
           process.exit(1); // F3: never leave a zombie half-state
         }
       }, 800);
-      return { immediate: "[new] new session (context cleared) - restarting..." };
+      return { immediate: "[new] new session (context cleared) - restarting…" };
+    }
+    case "restart": {
+      if (!isOwner) return ownerOnly;
+      // /restart = process restart that RESUMES this session: systemd respawns
+      // 'pi -c' which continues the last session file (the opposite of /reset,
+      // which moves that file aside first).
+      userStoppedRun = true;
+      try { ctx.abort(); } catch {}
+      setTimeout(() => { try { ctx.shutdown(); } catch {} }, 800);
+      return { immediate: "[..] restarting pi - this session resumes on boot…" };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
