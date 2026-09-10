@@ -13,7 +13,7 @@ Every command / system output the user sees starts with ONE ASCII tag
 (kimaki style, no emoji). Bracketed state tags: `[ok]` applied / success,
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
 `[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
-bracketed content tag (`[status]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`).
+bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`).
 Live run state uses the box-drawing family (`┣ working…`, `┗ done · N calls`),
 the todo board its glyph family (`⬦` pending, `⬥` in progress, `✓` done,
 `✕` cancelled, `▤` board header) — both families are exempt from the bracket
@@ -23,6 +23,7 @@ scheme. Webhook callback embeds are structured and untagged.
 |---|---|
 | `/stop` | `[-] stopped` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
+| `/usage [all\|session]` | `[usage] …` (error: `[!] usage: …`) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
@@ -55,6 +56,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list in-flight `pi-bg` dispatches (profile, age, task) |
 | `/status` | owner | context-window usage, model, uptime |
+| `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
@@ -154,6 +156,29 @@ what's the webhook TTL? . btw
 ```
 
 Owner only. Reports context-window usage, active model, and uptime.
+
+### /usage
+
+```
+/usage             # current session (same as /usage session)
+/usage session     # current session
+/usage all         # lifetime, every session file in the agent home
+```
+
+Reads pi's session store (`~/.pi/agent/sessions/*/*.jsonl`), sums assistant
+`usage` per entry (de-duplicated by entry id; streaming `message_update`
+deltas, missing and zero-usage entries skipped; a torn last line tolerated),
+and prices it at the OpenRouter list rates in
+`/home/monky/scripts/pi-token-cost.py` (prompt 0.42/1M, completion 3.00/1M,
+cacheRead 0.085/1M). One compact line, no emoji:
+
+```
+[usage] session   2026-09-10        | 341 turns | in 8.2M | out 61K | cacheRead 0 | est $4.13
+[usage] lifetime  2026-08-01..now   | 9,296 turns | in 627.6M | out 6.4M | est $284.39
+```
+
+`cacheRead` is shown on the session line as-is (0 on our vLLM); the lifetime
+line shows it only when nonzero.
 
 ### /reset
 

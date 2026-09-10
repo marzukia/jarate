@@ -567,10 +567,15 @@ function applyRunSnapshot(
 
 // ─── Session file ──────────────────────────────────────────────────────────
 
+/** Base dir for this agent's pi session store (shared discovery root). */
+export function sessionsBaseDir(): string {
+  const home = process.env.HOME || "/root";
+  return path.join(home, ".pi", "agent", "sessions");
+}
+
 /** Fallback session discovery: newest .jsonl under cwd's session dir (same scan as /reset). */
 export function findSessionFile(cwd: string): string | null {
-  const home = process.env.HOME || "/root";
-  const sessionsBase = path.join(home, ".pi", "agent", "sessions");
+  const sessionsBase = sessionsBaseDir();
   const encDir = path.join(sessionsBase, "-" + cwd.replace(/\//g, "-") + "-");
   const candidates: Array<[string, number]> = [];
   const scan = (dir: string) => {

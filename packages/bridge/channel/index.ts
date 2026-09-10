@@ -105,6 +105,7 @@ import {
   startRun,
   type UndoRun,
 } from "./undo";
+import { renderUsage } from "./usage";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 
 let lastActiveChannel: ChannelConfig | null = null;
@@ -984,7 +985,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -1878,6 +1879,7 @@ const HELP_TEXT = [
   "plain message during a run — interrupts the step after ~3s, then takes over",
   "`/btw <question>` — quick side question, answered briefly",
   "`/status` — session stats (owner)",
+  "`/usage [all|session]` — token usage: current session, or all sessions",
   "`/reset` - start a NEW session, clearing context (owner)",
   "`/restart` - restart pi, resuming THIS session (owner)",
   "`/undo` — revert last assistant turn: files + conversation (owner)",
@@ -2251,6 +2253,17 @@ async function runChannelCommand(
         text = "[!] status unavailable";
       }
       return { immediate: text };
+    }
+    case "usage": {
+      // Read-only token stats from the session store. Session discovery
+      // reuses the /undo path: active ctx session file, else newest .jsonl
+      // under cwd's session dir (findSessionFile fallback).
+      try {
+        const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
+        return { immediate: text };
+      } catch {
+        return { immediate: "[!] usage stats unavailable" };
+      }
     }
     case "reset": {
       if (!isOwner) return ownerOnly;
@@ -2894,6 +2907,7 @@ export async function handleInbound(
     // re-wake, after the compaction settles.
     const allowedWhileCompacting =
       cmd.name === "status" ||
+      cmd.name === "usage" ||
       cmd.name === "jobs" ||
       cmd.name === "sleep" ||
       cmd.name === "stop" ||
