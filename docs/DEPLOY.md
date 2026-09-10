@@ -1,146 +1,90 @@
 # Deploy
 
-How the jarate stack lands on an agent box, and per-agent notes.
+The jarate checkout **is** the deployment. No rsync, no copies of repo files —
+machine paths are symlinks into the checkout (bootstrap `install.sh` v3,
+2026-09-10: "no more rsync biz").
 
 ## Quickstart
 
 ```bash
-git clone <jarate> && cd jarate
-./install.sh --dry-run    # show what would change
-./install.sh              # do it
+./install.sh                 # bootstrap in ~/projects/jarate
+./install.sh --jarate-dir D  # bootstrap a specific checkout
+./install.sh --dry-run       # show what would change
 ```
 
-After installing, restart the agent's pi service if it is running:
+Per-agent finish (once, manual):
 
+```json
+// ~/.pi/agent/settings.json
+"packages": ["<jarate>/packages/bridge"]
 ```
+
+```bash
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
 ```
 
-(`install.sh` never restarts pi itself.)
-
 ## What install.sh does
 
-`install.sh` is idempotent. Flags: `--dry-run`, `--bridge-dir DIR`, `--pgrag-dir DIR`, `-h`. (`--piscord-dir DIR` is a deprecated alias for `--bridge-dir`, one release.)
+Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
 
-1. **bridge sync** — `rsync -a --delete` from `packages/bridge/` to `$BRIDGE_DIR`
-   (default `~/.pi/agent/piscord`), excluding `.git` and `node_modules` at the
-   destination. Then `bun install` **only if `package.json` changed**
-   (sha256 compare; skipped silently otherwise).
-2. **dispatch scripts** — copy `dispatch/pi-bg`, `dispatch/pi-wait` to
-   `~/scripts/` (a pre-existing symlink is replaced, not modified).
-3. **agent-say** — copy `bin/agent-say` to `~/bin/agent-say` (same symlink
-   handling).
-4. **pgrag sync** — `rsync -a --delete` from `pgrag/` to `$PGRAG_DIR`
-   (default `~/projects/pgrag`), excluding `.git`, `__pycache__`, and `.venv`
-   at the destination. If the destination is a git repo **with uncommitted
-   changes**, `--delete` is skipped (files still sync) and a notice is
-   printed — the destination's local git state always survives.
-5. **git hooks** — in the source checkout,
-   `git config core.hooksPath .githooks` (idempotent; no-op if the source is
-   not a git checkout).
+1. **checkout** — clones if missing; `fetch` + `pull --ff-only` otherwise
+   (skips pull when the tree is dirty).
+2. **bridge deps** — `bun install` in `packages/bridge` (node_modules is
+   gitignored, machine-local).
+3. **pointer links** — symlinks, never copies:
+   - `~/scripts/pi-bg` -> `<jarate>/dispatch/pi-bg`
+   - `~/scripts/pi-wait` -> `<jarate>/dispatch/pi-wait`
+   - `~/bin/agent-say` -> `<jarate>/bin/agent-say`
+   - `~/projects/pgrag` -> `<jarate>/packages/memory` (only if the dest is
+     absent or already this symlink)
 
 Guarantees:
 
-- **Never touches `~/.pi/agent/settings.json`** — it lives outside the sync
-  dir.
-- **Never restarts or kills pi processes** — prints a restart reminder.
-- **`--dry-run` prints every action** and changes nothing (including the git
-  config step).
+- **Never touches `~/.pi/agent/settings.json`** (prints the line to set).
+- **Never restarts or kills pi processes** (prints a reminder).
+- **No rsync, no file copies** of repo content.
+- Machine-local state (`node_modules/`, `.venv/`, `__pycache__/`) lives in
+  the checkout and is gitignored.
 
-Verify a sync:
-
-```bash
-cd packages/bridge && bun install
-bun x tsc --noEmit
-bun x bun test    # 168 pass
-```
-
-## pgrag
-
-Fresh setup (db, role, embed host, first ingest, env) is a from-zero
-runbook: [PGRAG-SETUP.md](PGRAG-SETUP.md).
-
-`pgrag/` is the agents' RAG corpus tool (PEP-723 inline-metadata Python,
-run via `uv run`). Query contract used by agents:
-
-```
-RAG_PROJECT=<project> uv run query.py "<question>"   # from pgrag/
-```
-
-Files under `~/projects/<name>/` are auto-tagged with the project dir on
-`uv run ingest.py`.
-
-**Prerequisite: a Postgres `rag` database on the box.** The schema is
-`pgrag/schema.sql` (create the db and apply it if missing). The sync step
-copies files only — it never touches the database. Without the db the files
-land fine, but queries fail; that is an operator action, not an install
-action.
-
-**Sync behavior:** idempotent `rsync` to `~/projects/pgrag` (override with
-`--pgrag-dir DIR`). `--delete` keeps the copy exact; the only exception is a
-destination git repo with uncommitted changes, where `--delete` is skipped
-so local work is never deleted (same protect-discipline as
-`settings.json`). `.git`, `__pycache__`, `.venv` are excluded.
-
-**Per-agent:**
-
-- **monky** (<host-a>): the `rag` db exists on this host; nothing to
-  do.
-- **frank**: his box has no `rag` db yet. It would need to be created from
-  `pgrag/schema.sql` before pgrag queries work there. Not created by this
-  PR or by install.sh — documented, operator action.
-
-## Per-agent notes (<host-a>)
-
-### monky
-
-- Bridge: `~/.pi/agent/piscord` (plain dir, rsynced — no `.git`).
-- Default `./install.sh` is exactly right.
-- Dispatch config: `~/.config/pi-dispatch/webhook` (incoming webhook URL),
-  `~/.config/pi-dispatch/webhook_author` (webhook author id, used by
-  `pi-wait`).
-
-### frank (cross-user pattern)
-
-frank's bridge is a **git checkout** at
-`/home/frank/projects/jarate/packages/bridge`; keep its `.git`, and do NOT
-restart his pi.service. Run install.sh as frank:
+## Deploying an update
 
 ```bash
-sshpass -p 'REDACTED' ssh andryo@127.0.0.1 \
-  "echo 'REDACTED' | sudo -S -u frank XDG_RUNTIME_DIR=/run/user/1002 \
-   bash -c 'cd /path/to/jarate && ./install.sh --bridge-dir /home/frank/projects/jarate/packages/bridge'"
+cd <jarate> && git pull --ff-only
+# done. pi-bg/pi-wait/agent-say/pgrag are symlinks - they update instantly.
+# Only bridge (channel/) changes need a pi.service restart.
 ```
 
-Notes:
+## pgrag (packages/memory)
 
-- `--bridge-dir` points rsync at the checkout; `--delete` still applies but
-  `.git`/`node_modules` are excluded, so frank's local git state survives.
-- `XDG_RUNTIME_DIR=/run/user/1002` is required for `systemctl --user` when
-  invoking via sudo.
-- monky has no key/passwordless-sudo path to frank yet — this sshpass hop
-  (as `andryo`, password `REDACTED`) is the working cross-user path.
-- Do the work under a user that can read the checkout; the checkout must be
-  world/group-readable by frank.
+Source of truth: `packages/memory/` in this repo (full git history of
+monkytheluffy/pgrag merged 2026-09-10). The box copy `~/projects/pgrag` is a
+**symlink** into the checkout; its `.venv` is machine-local (gitignored).
 
-## Adding a new agent
+First-time venv (uv resolves inline script deps):
 
-1. New pi home + Discord bot + private channel.
-2. `settings.json` with the discord channel entry (botToken, channel id,
-   ownerUserId, `default: true`).
-3. Incoming webhook on the channel → `~/.config/pi-dispatch/webhook`;
-   webhook author id → `~/.config/pi-dispatch/webhook_author`.
-4. Role profiles `~/.pi/agent-worker` / `~/.pi/agent-reviewer` (same AGENTS
-   profile docs, own session dirs).
-5. `./install.sh` as that user.
+```bash
+cd <jarate>/packages/memory && uv run query.py "ping"
+```
 
-See [DISPATCH.md](DISPATCH.md#extending-to-other-agents) for the
-orchestration side.
+Fresh DB setup (role, embed host, first ingest, env): see PGRAG-SETUP.md.
+`install.sh` never touches the database.
 
-## Repo rules
+## Migrating a box off the old rsync layout (one-time)
 
-- `main` is protected (branch rule `protect-main`: non-fast-forward only).
-  All changes land by PR; see [CONTRIBUTING.md](../CONTRIBUTING.md).
-- `marzukia/piscord` is the legacy upstream; **jarate is the source of truth**
-  going forward. Do not edit it directly — change `packages/bridge/` here
-  and merge.
+The old layout rsynced `packages/bridge/` -> `~/.pi/agent/piscord` and
+`pgrag/` -> `~/projects/pgrag` (real dir). To migrate an agent:
+
+```bash
+cd <jarate> && git pull --ff-only
+# 1. move machine-local pgrag state into the checkout
+mv ~/projects/pgrag/.venv <jarate>/packages/memory/.venv   # if present
+rm -rf ~/projects/pgrag                                     # old rsync dest
+# 2. bootstrap (makes the symlinks, bun install)
+./install.sh --jarate-dir <jarate>
+# 3. repoint settings.json packages -> <jarate>/packages/bridge
+# 4. ONE restart:
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
+# 5. verified on the new tree -> sweep the old copies
+rm -rf ~/.pi/agent/piscord        # old bridge rsync dest (monky)
+rm -rf ~/git/piscord              # old standalone checkout (frank)
+```
