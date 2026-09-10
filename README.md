@@ -30,18 +30,18 @@ per-agent notes (frank cross-user pattern included).
 
 | path | what |
 |---|---|
-| `piscord/` | Discord channel bridge for pi (TypeScript, bun; 168 tests, tsc clean) |
+| `packages/bridge/` | `@jarate/bridge` — Discord channel bridge for pi (TypeScript, bun; 168 tests, tsc clean) |
 | `dispatch/` | `pi-bg` (dispatch worker/reviewer, cgroup escape, webhooks), `pi-wait` (in-turn wait) |
 | `bin/agent-say` | agent-to-agent Discord messaging |
 | `pgrag/` | RAG corpus tool for agents (uv + Postgres `rag` db; PEP-723 scripts, memory layer) |
 | `templates/` | newrepo boilerplate (repo governance: AGENTS/CONTRIBUTING/CI/hooks) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
-| `install.sh` | idempotent installer (`--dry-run`, `--piscord-dir`) |
+| `install.sh` | idempotent installer (`--dry-run`, `--bridge-dir`) |
 | `docs/DISPATCH.md` | orchestration pattern: roles, worktrees, cgroup escape, callback protocol |
 | `docs/COMMANDS.md` | every Discord command with examples |
 | `docs/DEPLOY.md` | install.sh internals, per-agent deploy notes |
 | `.githooks/` | pre-commit (biome gate) |
-| `.github/workflows/ci.yml` | CI: biome + piscord typecheck/tests (context `ci`) |
+| `.github/workflows/ci.yml` | CI: biome + bridge typecheck/tests (context `ci`) |
 
 ## Discord commands
 
@@ -94,7 +94,7 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
 ## Develop
 
 ```bash
-cd piscord && bun install
+cd packages/bridge && bun install
 bun x tsc --noEmit     # typecheck
 bun x bun test         # 168 pass
 bunx biome check .     # from repo root (formatter + linter)

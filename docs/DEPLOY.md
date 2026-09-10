@@ -20,9 +20,9 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
 
 ## What install.sh does
 
-`install.sh` is idempotent. Flags: `--dry-run`, `--piscord-dir DIR`, `--pgrag-dir DIR`, `-h`.
+`install.sh` is idempotent. Flags: `--dry-run`, `--bridge-dir DIR`, `--pgrag-dir DIR`, `-h`. (`--piscord-dir DIR` is a deprecated alias for `--bridge-dir`, one release.)
 
-1. **piscord sync** — `rsync -a --delete` from `piscord/` to `$PISCORD_DIR`
+1. **bridge sync** — `rsync -a --delete` from `packages/bridge/` to `$BRIDGE_DIR`
    (default `~/.pi/agent/piscord`), excluding `.git` and `node_modules` at the
    destination. Then `bun install` **only if `package.json` changed**
    (sha256 compare; skipped silently otherwise).
@@ -50,7 +50,7 @@ Guarantees:
 Verify a sync:
 
 ```bash
-cd piscord && bun install
+cd packages/bridge && bun install
 bun x tsc --noEmit
 bun x bun test    # 168 pass
 ```
@@ -102,18 +102,19 @@ so local work is never deleted (same protect-discipline as
 
 ### frank (cross-user pattern)
 
-frank's bridge is a **git checkout** at `/home/frank/git/piscord`; keep its
-`.git`, and do NOT restart his pi.service. Run install.sh as frank:
+frank's bridge is a **git checkout** at
+`/home/frank/projects/jarate/packages/bridge`; keep its `.git`, and do NOT
+restart his pi.service. Run install.sh as frank:
 
 ```bash
 sshpass -p 'REDACTED' ssh andryo@127.0.0.1 \
   "echo 'REDACTED' | sudo -S -u frank XDG_RUNTIME_DIR=/run/user/1002 \
-   bash -c 'cd /path/to/jarate && ./install.sh --piscord-dir /home/frank/git/piscord'"
+   bash -c 'cd /path/to/jarate && ./install.sh --bridge-dir /home/frank/projects/jarate/packages/bridge'"
 ```
 
 Notes:
 
-- `--piscord-dir` points rsync at the checkout; `--delete` still applies but
+- `--bridge-dir` points rsync at the checkout; `--delete` still applies but
   `.git`/`node_modules` are excluded, so frank's local git state survives.
 - `XDG_RUNTIME_DIR=/run/user/1002` is required for `systemctl --user` when
   invoking via sudo.
@@ -141,4 +142,5 @@ orchestration side.
 - `main` is protected (branch rule `protect-main`: non-fast-forward only).
   All changes land by PR; see [CONTRIBUTING.md](../CONTRIBUTING.md).
 - `marzukia/piscord` is the legacy upstream; **jarate is the source of truth**
-  going forward. Do not edit it directly — change `piscord/` here and merge.
+  going forward. Do not edit it directly — change `packages/bridge/` here
+  and merge.

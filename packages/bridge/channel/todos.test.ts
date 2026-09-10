@@ -17,10 +17,10 @@ import {
   sanitizeStatus,
   sanitizeTodos,
   saveBoard,
-  todoBoardContextBlock,
-  todoLine,
   type Todo,
   type TodoBoard,
+  todoBoardContextBlock,
+  todoLine,
 } from "./todos";
 
 describe("todos: state file ops", () => {
@@ -45,7 +45,9 @@ describe("todos: state file ops", () => {
     expect(fs.existsSync(p)).toBe(true);
     expect(JSON.parse(fs.readFileSync(p, "utf8"))).toEqual(board);
     // atomic write leaves no tmp litter
-    expect(fs.readdirSync(path.dirname(p)).filter(f => f.endsWith(".tmp"))).toEqual([]);
+    expect(
+      fs.readdirSync(path.dirname(p)).filter((f) => f.endsWith(".tmp")),
+    ).toEqual([]);
   });
 
   test("loadBoard round-trips and tolerates corrupt/missing files", () => {
@@ -69,16 +71,19 @@ describe("todos: state file ops", () => {
 
   test("loadBoard coerces bad statuses and drops empty items", () => {
     fs.mkdirSync(path.join(home, ".pi", "agent", "todos"), { recursive: true });
-    fs.writeFileSync(boardPath("ch2", home), JSON.stringify({
-      channelId: "ch2",
-      todos: [
-        { content: "ok", status: "pending" },
-        { content: "weird", status: "bogus" },
-        { content: "", status: "pending" },
-        { status: "pending" },
-      ],
-      updatedAt: "t",
-    }));
+    fs.writeFileSync(
+      boardPath("ch2", home),
+      JSON.stringify({
+        channelId: "ch2",
+        todos: [
+          { content: "ok", status: "pending" },
+          { content: "weird", status: "bogus" },
+          { content: "", status: "pending" },
+          { status: "pending" },
+        ],
+        updatedAt: "t",
+      }),
+    );
     const b = loadBoard("ch2", home);
     expect(b?.todos).toEqual([
       { content: "ok", status: "pending" },
@@ -87,19 +92,33 @@ describe("todos: state file ops", () => {
   });
 
   test("clearBoard removes the file (no-op when absent)", () => {
-    saveBoard({ channelId: "ch1", todos: [{ content: "a", status: "pending" }], updatedAt: "t" }, home);
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+      },
+      home,
+    );
     clearBoard("ch1", home);
     expect(loadBoard("ch1", home)).toBeNull();
     expect(() => clearBoard("ch1", home)).not.toThrow();
   });
 
   test("listBoards returns every board sorted, skipping corrupt files", () => {
-    saveBoard({ channelId: "zz", todos: [{ content: "z", status: "pending" }], updatedAt: "t" }, home);
+    saveBoard(
+      {
+        channelId: "zz",
+        todos: [{ content: "z", status: "pending" }],
+        updatedAt: "t",
+      },
+      home,
+    );
     saveBoard({ channelId: "aa", todos: [], updatedAt: "t" }, home);
     fs.mkdirSync(path.join(home, ".pi", "agent", "todos"), { recursive: true });
     fs.writeFileSync(boardPath("corrupt", home), "x", { encoding: "utf8" });
     const boards = listBoards(home);
-    expect(boards.map(b => b.channelId)).toEqual(["aa", "zz"]);
+    expect(boards.map((b) => b.channelId)).toEqual(["aa", "zz"]);
     expect(listBoards(path.join(home, "empty"))).toEqual([]);
   });
 });
@@ -153,7 +172,13 @@ describe("todos: rendering", () => {
 
   test("renderBoard is header + one line per item", () => {
     expect(renderBoard(all)).toBe(
-      ["▤ todos · 2 open", "⬦ write tests", "⬥ **fix the bug**", "✓ ~~read the docs~~", "✕ old idea"].join("\n"),
+      [
+        "▤ todos · 2 open",
+        "⬦ write tests",
+        "⬥ **fix the bug**",
+        "✓ ~~read the docs~~",
+        "✕ old idea",
+      ].join("\n"),
     );
   });
 
@@ -167,8 +192,13 @@ describe("todos: rendering", () => {
 
 describe("todos: worker intake", () => {
   test("extractTodoLines picks 'TODO: ' lines anywhere in the body", () => {
-    const body = "[bg: worker OK · r1]\n\n<embed>\nresult: ```bash\ndone\nTODO: follow up on X\nTODO:verify Y\nTODO:   zed  \nno todo here TODO later\n``` \n</embed>";
-    expect(extractTodoLines(body)).toEqual(["follow up on X", "verify Y", "zed"]);
+    const body =
+      "[bg: worker OK · r1]\n\n<embed>\nresult: ```bash\ndone\nTODO: follow up on X\nTODO:verify Y\nTODO:   zed  \nno todo here TODO later\n``` \n</embed>";
+    expect(extractTodoLines(body)).toEqual([
+      "follow up on X",
+      "verify Y",
+      "zed",
+    ]);
     expect(extractTodoLines("nothing here")).toEqual([]);
   });
 
@@ -177,7 +207,13 @@ describe("todos: worker intake", () => {
       { content: "alpha", status: "in_progress" },
       { content: "beta", status: "completed" },
     ];
-    const merged = mergeTodoLines(existing, ["gamma", "alpha", "beta", "", "gamma"]);
+    const merged = mergeTodoLines(existing, [
+      "gamma",
+      "alpha",
+      "beta",
+      "",
+      "gamma",
+    ]);
     expect(merged).toEqual([
       { content: "alpha", status: "in_progress" },
       { content: "beta", status: "completed" },
@@ -193,7 +229,11 @@ describe("todos: worker intake", () => {
   test("isBgCallbackBody recognizes content-prefix and embed-author shapes", () => {
     expect(isBgCallbackBody("[bg: worker OK · r1]")).toBe(true);
     expect(isBgCallbackBody("[bg:worker:OK] legacy")).toBe(true);
-    expect(isBgCallbackBody("<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker · OK\n</embed>")).toBe(true);
+    expect(
+      isBgCallbackBody(
+        "<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker · OK\n</embed>",
+      ),
+    ).toBe(true);
     expect(isBgCallbackBody("hello TODO: world")).toBe(false);
     expect(isBgCallbackBody("")).toBe(false);
   });

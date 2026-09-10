@@ -31,15 +31,18 @@ const CORE_SENSITIVE_REPLACEMENTS: Array<{
     replacement: "[REDACTED_DISCORD_TOKEN]",
   },
   {
-    pattern: /([?&](?:token|api[_-]?key|key|secret|password|authorization)=)[^&\s]+/gi,
+    pattern:
+      /([?&](?:token|api[_-]?key|key|secret|password|authorization)=)[^&\s]+/gi,
     replacement: "$1[REDACTED]",
   },
   {
-    pattern: /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*")([^"]+)(")/gi,
+    pattern:
+      /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*")([^"]+)(")/gi,
     replacement: "$1[REDACTED]$3",
   },
   {
-    pattern: /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*)([^\s,;]+)/gi,
+    pattern:
+      /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*)([^\s,;]+)/gi,
     replacement: "$1[REDACTED]",
   },
 ];
@@ -123,7 +126,11 @@ export function sanitizeUnknownValue(
 
   if (Array.isArray(value)) {
     return value.map((item) => {
-      return sanitizeUnknownValue(item, { depth: depth + 1, seen, redactPaths });
+      return sanitizeUnknownValue(item, {
+        depth: depth + 1,
+        seen,
+        redactPaths,
+      });
     });
   }
 

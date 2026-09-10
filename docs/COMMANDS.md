@@ -130,7 +130,7 @@ as normal chat.
 ```
 
 Lists the command set (the canonical list lives in
-`piscord/channel/index.ts`).
+`packages/bridge/channel/index.ts`).
 
 ## Non-command behavior worth knowing
 

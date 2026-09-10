@@ -16,16 +16,16 @@ PR.
 
 ```bash
 bunx biome check .            # repo root: 0 diagnostics (pre-commit enforces staged files)
-cd piscord && bun install
-cd piscord && bun x tsc --noEmit
-cd piscord && bun x bun test  # 168 pass, 0 fail
+cd packages/bridge && bun install
+cd packages/bridge && bun x tsc --noEmit
+cd packages/bridge && bun x bun test  # 168 pass, 0 fail
 bash install.sh --dry-run     # if install.sh changed
 ```
 
 The pre-commit hook (`.githooks/pre-commit`) runs biome on staged
 TS/JS/JSON and fails fast on violations. `install.sh` sets
 `core.hooksPath .githooks` on every checkout it syncs. The `ci` workflow
-(biome + piscord jobs) re-runs everything on the PR; the branch rule
+(biome + bridge jobs) re-runs everything on the PR; the branch rule
 references context `ci` when the org upgrades to Pro.
 
 ## Style (user-facing strings)

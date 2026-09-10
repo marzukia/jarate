@@ -15,7 +15,12 @@ import * as path from "node:path";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
-export const TODO_STATUSES: TodoStatus[] = ["pending", "in_progress", "completed", "cancelled"];
+export const TODO_STATUSES: TodoStatus[] = [
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+];
 
 export interface Todo {
   content: string;
@@ -50,7 +55,10 @@ export function boardPath(channelId: string, home = defaultHome()): string {
 }
 
 /** Load a channel's board; null when missing or unreadable/corrupt. */
-export function loadBoard(channelId: string, home = defaultHome()): TodoBoard | null {
+export function loadBoard(
+  channelId: string,
+  home = defaultHome(),
+): TodoBoard | null {
   let raw: string;
   try {
     raw = fs.readFileSync(boardPath(channelId, home), "utf8");
@@ -66,11 +74,13 @@ export function loadBoard(channelId: string, home = defaultHome()): TodoBoard | 
       todos.push({ content: t.content, status: sanitizeStatus(t.status) });
     }
     const board: TodoBoard = {
-      channelId: typeof data.channelId === "string" ? data.channelId : channelId,
+      channelId:
+        typeof data.channelId === "string" ? data.channelId : channelId,
       todos,
       updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : "",
     };
-    if (typeof data.boardMessageId === "string" && data.boardMessageId) board.boardMessageId = data.boardMessageId;
+    if (typeof data.boardMessageId === "string" && data.boardMessageId)
+      board.boardMessageId = data.boardMessageId;
     return board;
   } catch {
     return null;
@@ -91,7 +101,9 @@ export function saveBoard(board: TodoBoard, home = defaultHome()): void {
 export function clearBoard(channelId: string, home = defaultHome()): void {
   try {
     fs.unlinkSync(boardPath(channelId, home));
-  } catch { /* absent or unreadable: fine */ }
+  } catch {
+    /* absent or unreadable: fine */
+  }
 }
 
 /** Every board on disk (corrupt files skipped), sorted by channel id. */
@@ -116,7 +128,9 @@ export function listBoards(home = defaultHome()): TodoBoard[] {
 
 /** Coerce an unknown status; unknown/missing → "pending". */
 export function sanitizeStatus(s: unknown): TodoStatus {
-  return TODO_STATUSES.includes(s as TodoStatus) ? (s as TodoStatus) : "pending";
+  return TODO_STATUSES.includes(s as TodoStatus)
+    ? (s as TodoStatus)
+    : "pending";
 }
 
 /** Coerce raw tool params / parsed state into clean todos (order preserved). */
@@ -134,16 +148,22 @@ export function sanitizeTodos(input: unknown): Todo[] {
 
 /** Items still needing work (pending + in_progress). */
 export function openCount(todos: Todo[]): number {
-  return todos.filter(t => t.status === "pending" || t.status === "in_progress").length;
+  return todos.filter(
+    (t) => t.status === "pending" || t.status === "in_progress",
+  ).length;
 }
 
 /** One line per item, glyph per status. */
 export function todoLine(t: Todo): string {
   switch (t.status) {
-    case "pending": return `⬦ ${t.content}`;
-    case "in_progress": return `⬥ **${t.content}**`;
-    case "completed": return `✓ ~~${t.content}~~`;
-    case "cancelled": return `✕ ${t.content}`;
+    case "pending":
+      return `⬦ ${t.content}`;
+    case "in_progress":
+      return `⬥ **${t.content}**`;
+    case "completed":
+      return `✓ ~~${t.content}~~`;
+    case "cancelled":
+      return `✕ ${t.content}`;
   }
 }
 
@@ -188,7 +208,7 @@ export function extractTodoLines(text: string): string[] {
  */
 export function mergeTodoLines(existing: Todo[], lines: string[]): Todo[] {
   const out = [...existing];
-  const seen = new Set(out.map(t => t.content));
+  const seen = new Set(out.map((t) => t.content));
   for (const l of lines) {
     if (!l || seen.has(l)) continue;
     seen.add(l);
