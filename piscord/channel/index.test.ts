@@ -29,6 +29,7 @@ import extension, {
 } from "./index";
 import { loadBoard, saveBoard, renderBoard, type TodoBoard } from "./todos";
 import { loadChannelConfig, type ChannelMessage } from "./types";
+import { performUndo } from "./undo";
 
 describe("chunkText", () => {
   test("short fenced block is unchanged", () => {
@@ -433,6 +434,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     fetchCalls = [];
     pi = {
       registerMessageRenderer: () => {},
+      registerTool: () => {},
       on: (n: string, fn: any) => { handlers[n] = fn; },
       sendMessage: (m: any, o?: any) => { sent.push({ m, o }); },
     };
@@ -821,6 +823,51 @@ describe("extension handlers (A1/A2/A4)", () => {
       .filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"))
       .map(c => JSON.parse(c.body).content);
     expect(contents.filter(t => t === REPEAT_WARNING).length).toBe(1);
+  });
+
+  test("F1: /undo re-run — session_start re-sends the parked trigger after the undo-restart", async () => {
+    // Redirect HOME so the undo store + sessions dir live under tmp.
+    const oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    const sessDir = path.join(process.env.HOME, ".pi", "agent", "sessions", "-" + tmp + "-");
+    fs.mkdirSync(sessDir, { recursive: true });
+    const sess = path.join(sessDir, "s.jsonl");
+    const lines = [
+      { type: "session", version: 3, id: "s1", timestamp: "t", cwd: tmp },
+      {
+        type: "custom_message", id: "t1", parentId: null, customType: "channel-inbound",
+        content: "<channel-ctx>ch: Test</channel-ctx>\n\nfix the bug",
+        details: { title: "Test", body: "fix the bug" },
+      },
+      { type: "message", id: "a1", parentId: "t1", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+    ];
+    fs.writeFileSync(sess, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    // /undo: truncate + park the re-run trigger (restarted=true would then
+    // scheduleRestart -> systemd respawns pi -> fresh process, new session_start).
+    const r = performUndo(sess);
+    expect(r.restarted).toBe(true);
+    expect(r.reRun).toBe(true);
+    expect(fs.readFileSync(sess, "utf8").trim().split("\n")).toHaveLength(2); // through t1 (a1 removed)
+
+    const sentBefore = sent.length;
+    await handlers.session_start?.(null, ctx);
+    process.env.HOME = oldHome;
+
+    // the bridge re-sent the kept trigger through the normal inbound path
+    const rerun = sent.slice(sentBefore).find(s => s.m.customType === "channel-inbound" && s.m.details?.body === "fix the bug");
+    expect(rerun).toBeDefined();
+    expect(rerun?.o?.triggerTurn).toBe(true);
+  });
+
+  test("F1: session_start without a parked rerun sends nothing", async () => {
+    const oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home"); // keep the store away from the real HOME
+    fs.mkdirSync(process.env.HOME, { recursive: true });
+    const sentBefore = sent.length;
+    await handlers.session_start?.(null, ctx);
+    process.env.HOME = oldHome;
+    expect(sent.length).toBe(sentBefore);
   });
 });
 

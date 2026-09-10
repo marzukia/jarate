@@ -86,6 +86,7 @@ import {
   performUndo,
   performRedo,
   findSessionFile,
+  consumeRerun,
   type UndoRun,
 } from "./undo";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
@@ -675,6 +676,25 @@ export default function (pi: ExtensionAPI) {
     }
     writeChannelState(workspaceRoot, channels);
 
+    // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
+    // kept trigger in the session file alone would not re-run the prompt.
+    // performUndo parked a durable rerun trigger before the restart; if
+    // this session is the one it targeted and the record is fresh, re-send
+    // the trigger text as a new inbound (same path as a channel message).
+    try {
+      const cur = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
+      const rerunText = consumeRerun(cur);
+      if (rerunText) {
+        const ch = lastActiveChannel ?? enabled.find((c) => c.type === "discord") ?? null;
+        if (ch) {
+          console.log(`[channel] /undo re-run: re-sending kept trigger to ${ch.id}`);
+          sendToPi(pi, ch.id, rerunText, "undo re-run", rerunText);
+        }
+      }
+    } catch (e) {
+      console.error("[undo] re-run consume failed:", sanitizeUnknownValue(e));
+    }
+
     // LLM tools: send local file(s) / maintain the todo board.
     if (enabled.some(c => c.type === "discord" && (getDiscordToken(c.id) || c.botToken))) {
       registerSendFileTool(pi, channels);
@@ -888,7 +908,19 @@ export default function (pi: ExtensionAPI) {
     // next). Best-effort: a snapshot failure must never break run end.
     try {
       if (undoRun) {
-        finishRun(undoRun, ctx.cwd, safeSessionFile(ctx));
+        // F3: record whether this run actually answered, so /undo skips
+        // empty runs (/stop before the first step) instead of cutting the
+        // previous run's conversation while keeping this run's file state.
+        const assistantOutput = (event.messages ?? []).some((m: any) => {
+          if (m?.role !== "assistant") return false;
+          if (Array.isArray(m.content)) {
+            return m.content.some(
+              (b: any) => b?.type === "text" && typeof b.text === "string" && b.text.trim() !== "",
+            );
+          }
+          return typeof m.content === "string" && m.content.trim() !== "";
+        });
+        finishRun(undoRun, ctx.cwd, safeSessionFile(ctx), assistantOutput);
         undoRun = null;
       }
     } catch (e) {
@@ -1151,13 +1183,23 @@ function scheduleRestart(ctx: ExtensionContext, label: string): void {
   }, 800);
 }
 
+// /undo + /redo share the idle guard: abort the in-flight run, drop the
+// mid-turn re-wake queue (F11: otherwise agent_end starts a fresh run
+// that /undo then truncates or kills mid-flight), then wait for idle.
+// Bounded — a stuck agent should not block the command forever.
+async function waitIdle(ctx: ExtensionContext, label: string): Promise<void> {
+  if (ctx.isIdle()) return;
+  userStoppedRun = true;
+  try { ctx.abort(); } catch {}
+  let dropped = 0;
+  for (const chId of [...midTurnQueues.keys()]) dropped += clearQueuedInbound(chId);
+  if (dropped > 0) console.log(`[undo] ${label} dropped ${dropped} queued re-wake inbound(s)`);
+  const t0 = Date.now();
+  while (!ctx.isIdle() && Date.now() - t0 < 3000) await sleep(100);
+}
+
 async function runUndo(ctx: ExtensionContext): Promise<{ text: string; restarted: boolean }> {
-  if (!ctx.isIdle()) {
-    // Abort the in-flight run first (its agent_end finalizes the snapshot).
-    userStoppedRun = true;
-    try { ctx.abort(); } catch {}
-    await sleep(900);
-  }
+  await waitIdle(ctx, "undo");
   const sessionFile = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
   const r = performUndo(sessionFile);
   if (r.restarted) scheduleRestart(ctx, "undo");
@@ -1165,6 +1207,7 @@ async function runUndo(ctx: ExtensionContext): Promise<{ text: string; restarted
 }
 
 async function runRedo(ctx: ExtensionContext): Promise<{ text: string; restarted: boolean }> {
+  await waitIdle(ctx, "redo"); // F6: busy /redo raced the re-wake + restart
   const r = performRedo();
   if (r.restarted) scheduleRestart(ctx, "redo");
   return r;

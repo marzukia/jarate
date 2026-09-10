@@ -17,6 +17,10 @@ import {
   finishRun,
   storeRoot,
   truncateSession,
+  consumeRerun,
+  writeRerun,
+  triggerText,
+  RERUN_TTL_MS,
 } from "./undo";
 
 let tmp: string;
@@ -172,6 +176,30 @@ describe("undo in a git repo", () => {
     expect(git(cwd, "status", "--porcelain")).toBe("");
   });
 
+  test("binary file changes survive undo + redo (F2: --binary capture)", () => {
+    const cwd = makeRepo(path.join(tmp, "binrepo"));
+    const bin = Buffer.from([0x00, 0x01, 0xff, 0x00, 0x80, 0x7f]);
+    fs.writeFileSync(path.join(cwd, "img.bin"), bin);
+    fs.writeFileSync(path.join(cwd, "a.txt"), "A");
+    commit(cwd, "base");
+
+    const run = startRun(cwd)!;
+    fs.writeFileSync(path.join(cwd, "img.bin"), Buffer.from([0x02, 0x03, 0x04]));
+    fs.writeFileSync(path.join(cwd, "a.txt"), "A-modified");
+    finishRun(run, cwd, null);
+
+    const undo = performUndo(null);
+    expect(undo.text).toMatch(/^\[ok\] undone: \d+ files$/);
+    expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A");
+    // the text file must NOT be lost when a binary file is in the same patch
+    expect(fs.readFileSync(path.join(cwd, "img.bin"))).toEqual(bin);
+
+    const redo = performRedo();
+    expect(redo.text).toMatch(/^\[ok\] redone: \d+ files$/);
+    expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A-modified");
+    expect(fs.readFileSync(path.join(cwd, "img.bin"))).toEqual(Buffer.from([0x02, 0x03, 0x04]));
+  });
+
   test("untracked cleanup removes run-created files but keeps pre-existing ones", () => {
     const cwd = makeRepo(path.join(tmp, "repo3"));
     commit(cwd, "base");
@@ -239,6 +267,146 @@ describe("session truncation", () => {
     const removed = truncateSession(file)!;
     expect(removed.map((l) => JSON.parse(l).id)).toEqual(["u2"]);
   });
+
+  test("truncate backs up the full session before the rewrite (F8)", () => {
+    const file = makeSession(tmp, [header, triggerA, assistantA, toolResultA, triggerB, assistantB]);
+    const before = fs.readFileSync(file, "utf8");
+    truncateSession(file)!;
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    const backups = fs.readdirSync(dir).filter((f) => f.startsWith(`${base}.undo-`));
+    expect(backups.length).toBe(1);
+    expect(fs.readFileSync(path.join(dir, backups[0]), "utf8")).toBe(before);
+  });
+
+  test("no trigger root-ward of the last assistant -> abort, file unchanged (F8)", () => {
+    const asst = { type: "message", id: "a", parentId: null, message: { role: "assistant", content: [{ type: "text", text: "x" }] } };
+    const file = makeSession(tmp, [header, asst]);
+    const before = fs.readFileSync(file, "utf8");
+    expect(truncateSession(file)).toBeNull();
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+  });
+});
+
+// ─── re-run trigger (F1) ──────────────────────────────────────────────────
+
+describe("re-run trigger (F1)", () => {
+  const header = { type: "session", version: 3, id: "s1", timestamp: "t", cwd: "/x" };
+
+  test("performUndo parks the kept trigger; consumeRerun fires once for the matching session", () => {
+    const cwd = path.join(tmp, "rerun");
+    fs.mkdirSync(cwd, { recursive: true });
+    const t1 = {
+      type: "custom_message", id: "t1", parentId: null, customType: "channel-inbound",
+      content: "<channel-ctx>ch: monky</channel-ctx>\n\nfix the bug",
+      details: { title: "monky", body: "fix the bug" },
+    };
+    const a1 = { type: "message", id: "a1", parentId: "t1", message: { role: "assistant", content: [{ type: "text", text: "done" }] } };
+    const file = makeSession(cwd, [header, t1, a1]);
+
+    const undo = performUndo(file);
+    expect(undo.reRun).toBe(true);
+    expect(undo.text).toBe("[ok] undone: conversation (re-running)");
+
+    // post-restart: the bridge consumes the trigger for this session
+    expect(consumeRerun(file)).toBe("fix the bug");
+    // consumed: a later unrelated restart must not re-fire it
+    expect(consumeRerun(file)).toBeNull();
+  });
+
+  test("triggerText prefers the raw body; user messages fall back to content", () => {
+    expect(triggerText({ type: "custom_message", content: "ctx\n\nraw", details: { body: "raw" } })).toBe("raw");
+    expect(triggerText({ type: "custom_message", content: "plain" })).toBe("plain");
+    expect(triggerText({ type: "message", message: { role: "user", content: "hello" } })).toBe("hello");
+    expect(triggerText({ type: "message", message: { role: "user", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] } })).toBe("a\nb");
+    expect(triggerText({ type: "message", message: { role: "assistant", content: [] } })).toBeNull();
+  });
+
+  test("stale or mismatched rerun records are dropped (and consumed)", () => {
+    const other = "/x/s.jsonl";
+    writeRerun({ sessionFile: other, text: "old", ts: new Date(Date.now() - (RERUN_TTL_MS + 60_000)).toISOString() });
+    expect(consumeRerun(other)).toBeNull();
+
+    writeRerun({ sessionFile: "/x/other.jsonl", text: "not this session", ts: new Date().toISOString() });
+    expect(consumeRerun(other)).toBeNull();
+
+    // no record left for a later restart
+    expect(consumeRerun(other)).toBeNull();
+  });
+});
+
+// ─── run targeting guards (F3, F4, F5) ────────────────────────────────────
+
+describe("run targeting (F3/F4/F5)", () => {
+  test("empty run (no assistant output) is skipped by latestRun (F3)", () => {
+    const cwd = path.join(tmp, "f3");
+    fs.mkdirSync(cwd, { recursive: true });
+    const sess = path.join(cwd, "sess.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+    const a = path.join(cwd, "a.txt");
+    fs.writeFileSync(a, "pre");
+
+    const r1 = startRun(cwd)!;
+    stageFileTouch(r1, cwd, a);
+    fs.writeFileSync(a, "run1 work");
+    finishRun(r1, cwd, sess, true);
+
+    const r2 = startRun(cwd)!; // aborted before any answer
+    finishRun(r2, cwd, sess, false);
+
+    expect(latestRun(sess)?.meta.assistantOutput).toBe(true); // r1, not r2
+    expect(latestRun(null)?.meta.assistantOutput).toBe(true);
+
+    const undo = performUndo(sess);
+    expect(undo.text).toBe("[ok] undone: 1 file");
+    expect(fs.readFileSync(a, "utf8")).toBe("pre"); // run1's files reverted
+  });
+
+  test("redo refuses when a newer run completed after the undo (F4)", () => {
+    const cwd = path.join(tmp, "f4");
+    fs.mkdirSync(cwd, { recursive: true });
+    const header = { type: "session", version: 3, id: "s1", timestamp: "t", cwd };
+    const t1 = { type: "custom_message", id: "t1", parentId: null, customType: "channel-inbound", content: "q1" };
+    const a1 = { type: "message", id: "a1", parentId: "t1", message: { role: "assistant", content: [{ type: "text", text: "r1" }] } };
+    const sess = makeSession(cwd, [header, t1, a1]);
+
+    const r1 = startRun(cwd)!;
+    finishRun(r1, cwd, sess, true);
+    performUndo(sess);
+
+    // a new turn runs and completes (newer seq)
+    const r2 = startRun(cwd)!;
+    finishRun(r2, cwd, sess, true);
+
+    const redo = performRedo();
+    expect(redo.text).toBe("[!] redo stale: newer run completed");
+    // record kept: the state is still restorable once the new turn is dealt with
+    expect(fs.existsSync(path.join(storeRoot(), "redo.json"))).toBe(true);
+  });
+
+  test("prune keeps the run referenced by redo.json (F5)", () => {
+    const cwd = path.join(tmp, "f5");
+    fs.mkdirSync(cwd, { recursive: true });
+    const sess = path.join(cwd, "sess.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+    const dirs: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      const r = startRun(cwd)!;
+      finishRun(r, cwd, sess, true);
+      dirs.push(path.basename(r.dir));
+    }
+    // after the first prune, survivors are dirs[2..11]; pin the oldest
+    const victim = dirs[2];
+    fs.writeFileSync(
+      path.join(storeRoot(), "redo.json"),
+      JSON.stringify({ run: victim, sessionFile: null, removed: [] }),
+    );
+    for (let i = 0; i < 2; i++) {
+      const r = startRun(cwd)!;
+      finishRun(r, cwd, sess, true); // each finishRun prunes
+    }
+    expect(fs.existsSync(path.join(storeRoot(), "runs", victim))).toBe(true);
+  });
 });
 
 // ─── run store: session alignment + pruning ────────────────────────────────
@@ -301,10 +469,13 @@ describe("performUndo + performRedo end to end", () => {
 
     // no runs recorded (store empty) -> conversation-only revert
     const undo = performUndo(file);
-    expect(undo.text).toBe("[ok] undone: conversation");
+    expect(undo.text).toBe("[ok] undone: conversation (re-running)");
     expect(undo.restarted).toBe(true);
     const kept = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l).id);
     expect(kept).toEqual(["s1", "t1", "a1", "t2"]);
+
+    // F1: the kept trigger is parked for the post-restart re-send
+    expect(consumeRerun(file)).toBe("q2");
 
     const redo = performRedo();
     expect(redo.text).toBe("[ok] redone: conversation");
@@ -326,5 +497,52 @@ describe("performUndo + performRedo end to end", () => {
     fs.utimesSync(f1, past / 1000, past / 1000);
     expect(findSessionFile(cwd)).toBe(f2);
     expect(findSessionFile(path.join(tmp, "nowhere"))).toBe(f2); // base-wide fallback
+  });
+});
+
+// ─── F7 + F10 hardening ───────────────────────────────────────────────────
+
+describe("cap and exclusion hardening (F7/F10)", () => {
+  test("pre-existing >20MB file is kept, not deleted (F7)", () => {
+    const cwd = path.join(tmp, "f7");
+    fs.mkdirSync(cwd, { recursive: true });
+    const big = path.join(cwd, "big.bin");
+    fs.writeFileSync(big, Buffer.alloc(21 * 1024 * 1024, 7));
+    const small = path.join(cwd, "small.txt");
+    fs.writeFileSync(small, "pre");
+
+    const run = startRun(cwd)!;
+    stageFileTouch(run, cwd, big); // exceeds the cap -> pre = "cap"
+    stageFileTouch(run, cwd, small);
+    fs.writeFileSync(big, "now small (edited)");
+    fs.writeFileSync(small, "edited");
+    finishRun(run, cwd, null);
+
+    const undo = performUndo(null);
+    expect(undo.text).toBe("[ok] undone: 1 file (kept 1 >20MB file, not restored)");
+    expect(fs.readFileSync(small, "utf8")).toBe("pre"); // normal file restored
+    expect(fs.existsSync(big)).toBe(true); // NOT deleted
+    expect(fs.readFileSync(big, "utf8")).toBe("now small (edited)"); // content not restorable
+  });
+
+  test("session file inside the git cwd is excluded from untracked copy-back (F10)", () => {
+    const cwd = makeRepo(path.join(tmp, "f10"));
+    commit(cwd, "base");
+    const header = { type: "session", version: 3, id: "s1", timestamp: "t", cwd };
+    const tA = { type: "custom_message", id: "tA", parentId: null, customType: "channel-inbound", content: "do A" };
+    const aA = { type: "message", id: "aA", parentId: "tA", message: { role: "assistant", content: [{ type: "text", text: "did A" }] } };
+    const tB = { type: "custom_message", id: "tB", parentId: "aA", customType: "channel-inbound", content: "do B" };
+    const sess = path.join(cwd, "sess.jsonl"); // untracked, inside the repo
+    fs.writeFileSync(sess, [header, tA, aA, tB].map((l) => JSON.stringify(l)).join("\n") + "\n");
+
+    const run = startRun(cwd)!; // pre-snapshot captures sess.jsonl (4 lines, incl. tB)
+    finishRun(run, cwd, sess, false); // aborted run: tB is in-flight
+
+    performUndo(sess); // truncate keeps through tA (the run's trigger)
+
+    // without the F10 fix the pre-run copy of sess.jsonl would be copied
+    // back over the truncated file, resurrecting the removed tail (aA, tB)
+    const kept = fs.readFileSync(sess, "utf8").trim().split("\n").map((l) => JSON.parse(l).id);
+    expect(kept).toEqual(["s1", "tA"]);
   });
 });

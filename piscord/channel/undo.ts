@@ -57,8 +57,8 @@ export function encPath(abs: string): string {
 
 interface GitSnap {
   head: string | null;
-  /** diff HEAD at capture time (worktree incl. staged vs commit) */
-  patch: string | null;
+  /** true when <prefix>.patch was written (diff HEAD --binary) */
+  hasPatch: boolean;
   /** tracked files changed vs head (for the ack count) */
   files: string[];
   /** untracked files (relative to cwd) */
@@ -70,6 +70,16 @@ function git(cwd: string, args: string[], input?: string): string {
     cwd,
     timeout: GIT_TIMEOUT_MS,
     encoding: "utf8",
+    input,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+}
+
+/** Raw-buffer git: `diff --binary` output must not pass through utf8. */
+function gitBuf(cwd: string, args: string[], input?: string): Buffer {
+  return execFileSync("git", args, {
+    cwd,
+    timeout: GIT_TIMEOUT_MS,
     input,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -92,12 +102,20 @@ function captureGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): void 
   } catch {
     head = null; // empty repo (no commits yet)
   }
-  let patch: string | null = null;
+  let hasPatch = false;
   let files: string[] = [];
+  const snapDir = path.join(dir, prefix);
+  fs.mkdirSync(path.join(snapDir, "untracked"), { recursive: true });
   if (head) {
     try {
-      const raw = git(cwd, ["diff", "HEAD"]);
-      if (raw.trim().length > 0) patch = raw;
+      // --binary + raw buffer: a text-only diff cannot carry binary file
+      // changes, so one binary file used to fail `git apply` and drop the
+      // ENTIRE patch (reviewer F2).
+      const raw = gitBuf(cwd, ["diff", "HEAD", "--binary"]);
+      if (raw.length > 0) {
+        fs.writeFileSync(path.join(snapDir, `${prefix}.patch`), raw);
+        hasPatch = true;
+      }
       files = git(cwd, ["diff", "HEAD", "--name-only"]).trim().split("\n").filter(Boolean);
     } catch {}
   }
@@ -109,11 +127,8 @@ function captureGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): void 
       .filter(Boolean);
   } catch {}
 
-  const snap: GitSnap = { head, patch, files, untracked };
-  const snapDir = path.join(dir, prefix);
-  fs.mkdirSync(path.join(snapDir, "untracked"), { recursive: true });
+  const snap: GitSnap = { head, hasPatch, files, untracked };
   fs.writeFileSync(path.join(snapDir, `${prefix}.git.json`), JSON.stringify(snap, null, 1));
-  if (patch !== null) fs.writeFileSync(path.join(snapDir, `${prefix}.patch`), patch);
   for (const rel of untracked) {
     const src = path.join(cwd, rel);
     try {
@@ -134,12 +149,43 @@ function readGitSnap(dir: string, prefix: "pre" | "post"): GitSnap | null {
   }
 }
 
+/** Paths the untracked copy-back/cleanup must never touch (F10): the
+ * session file itself and anything under the pi sessions dir, when they
+ * live inside a git repo. */
+function isUndoExcludedPath(abs: string, sessionFile: string | null): boolean {
+  if (sessionFile) {
+    if (abs === sessionFile) return true;
+    if (abs.startsWith(`${sessionFile}.undo-`)) return true; // F8 backup
+  }
+  return abs.includes("/.pi/agent/sessions/");
+}
+
+/** File names a patch touches (works for text and binary sections: the
+ * `diff --git` header lines are always ASCII). */
+function patchPatchNames(patchFile: string): Set<string> {
+  const names = new Set<string>();
+  try {
+    const raw = fs.readFileSync(patchFile, "utf8");
+    // quoted (paths with spaces) or bare path forms; must not cross lines,
+    // because binary patch bodies contain " characters
+    const re = /^diff --git (?:"a\/([^"]+)"|a\/(\S+)) ?(?:"b\/([^"]+)"|b\/(\S+))/gm;
+    for (const m of raw.matchAll(re)) {
+      const name = m[3] ?? m[4] ?? m[1] ?? m[2];
+      if (name) names.add(name);
+    }
+  } catch {}
+  return names;
+}
+
 /** Restore a stored git snapshot into cwd. Returns the number of files touched. */
-function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): number {
+function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post", sessionFile: string | null): number {
   const snap = readGitSnap(dir, prefix);
   if (!snap) return 0;
   const snapDir = path.join(dir, prefix);
-  let count = 0;
+  // set-based count: files the reset reverts + files the patch re-applies
+  // + untracked copies/deletes. (Patch-only changes on a clean worktree
+  // used to count as 0, so /redo said "nothing to redo".)
+  const touched = new Set<string>();
   let currentHead: string | null = null;
   try {
     currentHead = git(cwd, ["rev-parse", "HEAD"]).trim();
@@ -147,7 +193,6 @@ function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): number 
   if (snap.head) {
     // count the files whose state will change: worktree/index diff vs the
     // snapshot head, plus any commits made after it
-    const touched = new Set<string>();
     try {
       for (const f of git(cwd, ["diff", "--name-only", snap.head]).trim().split("\n")) {
         if (f) touched.add(f);
@@ -160,7 +205,6 @@ function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): number 
         }
       } catch {}
     }
-    count += touched.size;
     try {
       git(cwd, ["reset", "--hard", snap.head]);
     } catch (e) {
@@ -168,21 +212,23 @@ function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): number 
     }
   }
   const patchFile = path.join(snapDir, `${prefix}.patch`);
-  if (snap.patch !== null && fs.existsSync(patchFile)) {
+  if (snap.hasPatch && fs.existsSync(patchFile)) {
     try {
-      git(cwd, ["apply", "--whitespace=nowarn", patchFile]);
+      git(cwd, ["apply", "--binary", "--whitespace=nowarn", patchFile]);
+      for (const f of patchPatchNames(patchFile)) touched.add(f);
     } catch (e) {
       console.error(`[undo] git apply failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   // Restore untracked files from the snapshot.
   for (const rel of snap.untracked) {
-    const src = path.join(snapDir, "untracked", rel);
     const dst = path.join(cwd, rel);
+    if (isUndoExcludedPath(dst, sessionFile)) continue; // F10
+    const src = path.join(snapDir, "untracked", rel);
     try {
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.copyFileSync(src, dst);
-      count += 1;
+      touched.add(rel);
     } catch {}
   }
   // Delete untracked files/dirs that exist now but not in the snapshot
@@ -195,22 +241,29 @@ function applyGitSnap(cwd: string, dir: string, prefix: "pre" | "post"): number 
     const keep = new Set(snap.untracked);
     for (const rel of current) {
       if (keep.has(rel)) continue;
-      fs.rmSync(path.join(cwd, rel), { force: true });
-      count += 1;
+      const dst = path.join(cwd, rel);
+      if (isUndoExcludedPath(dst, sessionFile)) continue; // F10 (e.g. the .undo-<ts> backup)
+      fs.rmSync(dst, { force: true });
+      touched.add(rel);
     }
   } catch (e) {
     console.error(`[undo] untracked cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return count;
+  return touched.size;
 }
 
 // ─── File snapshots (non-git dirs) ─────────────────────────────────────────
 
 interface FileSnapEntry {
   abs: string;
-  /** stored preimage name under pre/files/, or null = absent before the run */
+  /** stored preimage name under pre/files/, null = absent before the run,
+   *  or PRE_CAP_SKIPPED = existed before but was over the size cap (F7) */
   pre: string | null;
 }
+
+/** Sentinel: pre-existing file existed at run start but was too big to
+ * store. /undo must NOT delete it (that would destroy un-restorable data). */
+const PRE_CAP_SKIPPED = "cap";
 
 function writeFileSnap(dir: string, prefix: "pre" | "post", entries: FileSnapEntry[]): void {
   fs.mkdirSync(path.join(dir, prefix, "files"), { recursive: true });
@@ -241,10 +294,11 @@ function copyIfFits(src: string, dst: string): boolean {
   }
 }
 
-/** Restore a stored file snapshot. Returns the number of files touched. */
-function applyFileSnap(dir: string, prefix: "pre" | "post"): number {
+/** Restore a stored file snapshot. Returns touched + cap-skipped counts. */
+function applyFileSnap(dir: string, prefix: "pre" | "post"): { count: number; skipped: number } {
   const entries = readFileSnap(dir, prefix);
   let count = 0;
+  let skipped = 0;
   for (const e of entries) {
     if (prefix === "pre") {
       if (e.pre === null) {
@@ -254,6 +308,9 @@ function applyFileSnap(dir: string, prefix: "pre" | "post"): number {
             count += 1;
           }
         } catch {}
+      } else if (e.pre === PRE_CAP_SKIPPED) {
+        // F7: pre-existing >20MB file: keep it, do not delete it.
+        skipped += 1;
       } else {
         const src = path.join(dir, "pre", "files", e.pre);
         if (copyIfFits(src, e.abs)) count += 1;
@@ -263,7 +320,7 @@ function applyFileSnap(dir: string, prefix: "pre" | "post"): number {
       if (copyIfFits(src, e.abs)) count += 1;
     }
   }
-  return count;
+  return { count, skipped };
 }
 
 // ─── Run store ─────────────────────────────────────────────────────────────
@@ -321,13 +378,18 @@ export function stageFileTouch(run: UndoRun, cwd: string, absPath: string): void
     if (fs.existsSync(p)) {
       const dst = path.join(run.dir, "pre", "files", encPath(p));
       if (copyIfFits(p, dst)) pre = encPath(p);
+      else pre = PRE_CAP_SKIPPED; // F7: existed, but too big to store
     }
   } catch {}
   run.preFiles.set(p, pre);
 }
 
-/** Finish a run entry: capture the post-run state, write meta, prune. */
-export function finishRun(run: UndoRun, cwd: string, sessionFile: string | null): void {
+/** Finish a run entry: capture the post-run state, write meta, prune.
+ * `assistantOutput` (F3): whether the run produced an assistant answer.
+ * Runs that answered nothing (e.g. /stop before the first step) must not
+ * become /undo's target — otherwise the file revert and the conversation
+ * cut point at different turns. */
+export function finishRun(run: UndoRun, cwd: string, sessionFile: string | null, assistantOutput = true): void {
   try {
     if (run.git) {
       captureGitSnap(cwd, run.dir, "post");
@@ -351,6 +413,7 @@ export function finishRun(run: UndoRun, cwd: string, sessionFile: string | null)
       sessionFile,
       ts: new Date().toISOString(),
       seq: path.basename(run.dir).match(/^(\d+)_/)?.[1] ?? "0",
+      assistantOutput,
     };
     fs.writeFileSync(path.join(run.dir, "meta.json"), JSON.stringify(meta, null, 1));
     pruneRuns();
@@ -359,14 +422,17 @@ export function finishRun(run: UndoRun, cwd: string, sessionFile: string | null)
   }
 }
 
-/** Keep only the last MAX_RUNS run dirs. */
+/** Keep only the last MAX_RUNS run dirs — except the one a live redo.json
+ * references (F5): pruning it would make /redo silently lose the files. */
 export function pruneRuns(): void {
   try {
     const rd = runsDir();
     if (!fs.existsSync(rd)) return;
     const dirs = fs.readdirSync(rd).filter((d) => /^\d+_\d+$/.test(d));
     dirs.sort();
+    const pin = readRedo()?.run ?? null;
     for (const d of dirs.slice(0, -MAX_RUNS)) {
+      if (d === pin) continue;
       fs.rmSync(path.join(rd, d), { recursive: true, force: true });
     }
   } catch (e) {
@@ -380,6 +446,8 @@ interface RunMeta {
   sessionFile: string | null;
   ts: string;
   seq: string;
+  /** F3: false = run produced no assistant answer (e.g. aborted early) */
+  assistantOutput?: boolean;
 }
 
 function readRunMeta(dir: string): RunMeta | null {
@@ -392,24 +460,33 @@ function readRunMeta(dir: string): RunMeta | null {
   }
 }
 
-/** Newest completed run for this session file (newest run if none known). */
+/** Newest completed run for this session file (newest run if none known).
+ * Skips runs that produced no assistant output (F3) so /undo does not
+ * cut the PREVIOUS run's conversation while keeping the empty run's files;
+ * falls back to empty runs only when there is nothing else. */
 export function latestRun(sessionFile: string | null): { dir: string; meta: RunMeta } | null {
   const rd = runsDir();
   if (!fs.existsSync(rd)) return null;
   const dirs = fs.readdirSync(rd).filter((d) => /^\d+_\d+$/.test(d)).sort().reverse();
-  for (const d of dirs) {
-    const meta = readRunMeta(path.join(rd, d));
-    if (!meta) continue;
-    if (sessionFile && meta.sessionFile && meta.sessionFile !== sessionFile) continue;
-    return { dir: path.join(rd, d), meta };
-  }
-  return null;
+  const pass = (withOutput: boolean) => {
+    for (const d of dirs) {
+      const meta = readRunMeta(path.join(rd, d));
+      if (!meta) continue;
+      if (sessionFile && meta.sessionFile && meta.sessionFile !== sessionFile) continue;
+      const has = meta.assistantOutput !== false;
+      if (withOutput ? !has : has) continue;
+      return { dir: path.join(rd, d), meta };
+    }
+    return null;
+  };
+  return pass(true) ?? pass(false);
 }
 
-/** Apply a run's stored snapshot ("pre" = revert, "post" = reapply). Returns file count. */
-function applyRunSnapshot(runDir: string, meta: RunMeta, which: "pre" | "post"): number {
-  if (meta.mode === "git") return applyGitSnap(meta.cwd, runDir, which);
-  return applyFileSnap(runDir, which);
+/** Apply a run's stored snapshot ("pre" = revert, "post" = reapply). */
+function applyRunSnapshot(runDir: string, meta: RunMeta, which: "pre" | "post"): { files: number; skipped: number } {
+  if (meta.mode === "git") return { files: applyGitSnap(meta.cwd, runDir, which, meta.sessionFile), skipped: 0 };
+  const r = applyFileSnap(runDir, which);
+  return { files: r.count, skipped: which === "pre" ? r.skipped : 0 };
 }
 
 // ─── Session file ──────────────────────────────────────────────────────────
@@ -451,6 +528,23 @@ function isTrigger(entry: any): boolean {
     (entry.type === "message" && entry.message?.role === "user") ||
     entry.type === "custom_message"
   );
+}
+
+/** Keep at most N pre-truncation backups per session file (F8). */
+const MAX_UNDO_BACKUPS = 5;
+
+function pruneUndoBackups(sessionFile: string): void {
+  const dir = path.dirname(sessionFile);
+  const base = path.basename(sessionFile);
+  try {
+    const backups = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith(`${base}.undo-`))
+      .sort();
+    for (const f of backups.slice(0, -MAX_UNDO_BACKUPS)) {
+      fs.rmSync(path.join(dir, f), { force: true });
+    }
+  } catch {}
 }
 
 /**
@@ -500,7 +594,7 @@ export function truncateSession(sessionFile: string): string[] | null {
   if (assistantPos === -1) return null;
   // closest trigger strictly before the assistant = root-ward of it in
   // pathIdx (which runs leaf -> root)
-  let keepIdx = 0; // default: keep header only
+  let keepIdx = -1;
   for (let i = assistantPos + 1; i < pathIdx.length; i++) {
     try {
       if (isTrigger(JSON.parse(lines[pathIdx[i]]))) {
@@ -509,9 +603,21 @@ export function truncateSession(sessionFile: string): string[] | null {
       }
     } catch {}
   }
+  if (keepIdx === -1) {
+    // F8: no trigger root-ward of the last assistant — cutting to the
+    // header would drop the whole conversation for no reason. Abort.
+    return null;
+  }
   const kept = lines.slice(0, keepIdx + 1);
   const removed = lines.slice(keepIdx + 1);
   if (removed.length === 0) return null;
+  // F8: back up the full session before the rewrite — the removed lines'
+  // other home (redo.json) is written only after the rename, so a crash in
+  // between used to lose them outright.
+  try {
+    fs.copyFileSync(sessionFile, `${sessionFile}.undo-${Date.now()}`);
+    pruneUndoBackups(sessionFile);
+  } catch {}
   const tmp = `${sessionFile}.undo-tmp`;
   fs.writeFileSync(tmp, kept.join("\n") + "\n");
   fs.renameSync(tmp, sessionFile);
@@ -524,6 +630,75 @@ export function reappendSession(sessionFile: string, removed: string[]): void {
 }
 
 // ─── Redo record ───────────────────────────────────────────────────────────
+
+// ─── Re-run trigger (F1) ────────────────────────────────────────────────
+// The deployment runs `pi` in RPC mode, which never auto-prompts at
+// startup — so "keep the trigger in the file" alone does NOT re-run the
+// prompt. performUndo therefore parks a durable re-run record; the bridge
+// re-sends the trigger text on session_start after the undo-restart.
+
+export interface RerunRecord {
+  sessionFile: string | null;
+  /** the kept trigger's user-visible text */
+  text: string;
+  ts: string;
+}
+
+/** How long a parked re-run stays valid (guards against an unrelated
+ * restart re-firing a stale trigger). */
+export const RERUN_TTL_MS = 10 * 60 * 1000;
+
+export function rerunPath(): string {
+  return path.join(storeRoot(), "rerun.json");
+}
+
+export function writeRerun(rec: RerunRecord): void {
+  fs.mkdirSync(storeRoot(), { recursive: true });
+  fs.writeFileSync(rerunPath(), JSON.stringify(rec, null, 1));
+}
+
+/** Extract the user-visible text of a trigger entry (custom_message from
+ * the channel, or a user-role message). */
+export function triggerText(entry: any): string | null {
+  if (entry?.type === "custom_message") {
+    // details.body is the raw user text; content is the full LLM context
+    const b = entry.details?.body;
+    const t = typeof b === "string" && b.trim() ? b : typeof entry.content === "string" ? entry.content : null;
+    return t && t.trim() ? t : null;
+  }
+  if (entry?.type === "message" && entry.message?.role === "user") {
+    const c = entry.message.content;
+    if (typeof c === "string") return c.trim() ? c : null;
+    if (Array.isArray(c)) {
+      const t = c
+        .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+        .map((b: any) => b.text)
+        .join("\n")
+        .trim();
+      return t ? t : null;
+    }
+  }
+  return null;
+}
+
+/** Read + consume the parked re-run. Returns the text to re-send, or null
+ * (no record, stale, or written for a different session file). The file
+ * is consumed either way. */
+export function consumeRerun(currentSessionFile: string | null, now = Date.now()): string | null {
+  let rec: RerunRecord | null = null;
+  try {
+    const p = rerunPath();
+    if (fs.existsSync(p)) rec = JSON.parse(fs.readFileSync(p, "utf8")) as RerunRecord;
+  } catch {
+    rec = null;
+  } finally {
+    try { fs.rmSync(rerunPath(), { force: true }); } catch {}
+  }
+  if (!rec?.text) return null;
+  if (now - Date.parse(rec.ts) > RERUN_TTL_MS) return null; // stale restart
+  if (rec.sessionFile && currentSessionFile && rec.sessionFile !== currentSessionFile) return null;
+  return rec.text;
+}
 
 interface RedoRecord {
   run: string | null;
@@ -547,14 +722,20 @@ export interface UndoResult {
   text: string;
   /** true when the session file changed and pi must restart to pick up the new leaf */
   restarted: boolean;
+  /** true when a re-run trigger was parked for session_start (F1) */
+  reRun: boolean;
 }
 
-function undoAck(files: number, conversation: boolean): string {
+function undoAck(files: number, conversation: boolean, skipped: number): string {
   const parts: string[] = [];
   if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
   if (conversation) parts.push("conversation");
-  if (parts.length === 0) return "[!] nothing to undo";
-  return `[ok] undone: ${parts.join(" + ")}`;
+  const suffix = skipped > 0 ? ` (kept ${skipped} >20MB file, not restored)` : "";
+  if (parts.length === 0) {
+    if (skipped > 0) return `[ok] undone: kept ${skipped} >20MB file (not restored)`;
+    return "[!] nothing to undo";
+  }
+  return `[ok] undone: ${parts.join(" + ")}${suffix}`;
 }
 
 /**
@@ -575,15 +756,38 @@ export function performUndo(sessionFile: string | null): UndoResult {
     }
   }
   let files = 0;
+  let skipped = 0;
   if (run) {
     try {
-      files = applyRunSnapshot(run.dir, run.meta, "pre");
+      const r = applyRunSnapshot(run.dir, run.meta, "pre");
+      files = r.files;
+      skipped = r.skipped;
     } catch (e) {
       console.error(`[undo] restore failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  if (files === 0 && (!removed || removed.length === 0)) {
-    return { text: "[!] nothing to undo", restarted: false };
+  if (files === 0 && skipped === 0 && (!removed || removed.length === 0)) {
+    return { text: "[!] nothing to undo", restarted: false, reRun: false };
+  }
+  // F1: park the re-run trigger. The kept trigger is now the last line.
+  let reRun = false;
+  if (removed && removed.length > 0 && sessionFile) {
+    const keptText = (() => {
+      try {
+        const kept = fs.readFileSync(sessionFile, "utf8").trim().split("\n").filter((l) => l.trim() !== "");
+        return kept.length > 0 ? triggerText(JSON.parse(kept[kept.length - 1])) : null;
+      } catch {
+        return null;
+      }
+    })();
+    if (keptText) {
+      try {
+        writeRerun({ sessionFile, text: keptText, ts: new Date().toISOString() });
+        reRun = true;
+      } catch (e) {
+        console.error(`[undo] rerun record write failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
   }
   const rec: RedoRecord = {
     run: run ? path.basename(run.dir) : null,
@@ -596,20 +800,31 @@ export function performUndo(sessionFile: string | null): UndoResult {
   } catch (e) {
     console.error(`[undo] redo record write failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return { text: undoAck(files, (removed?.length ?? 0) > 0), restarted: (removed?.length ?? 0) > 0 };
+  const text = undoAck(files, (removed?.length ?? 0) > 0, skipped) + (reRun ? " (re-running)" : "");
+  return { text, restarted: (removed?.length ?? 0) > 0, reRun };
 }
 
 /** /redo: reapply the undone run (one level deep). */
 export function performRedo(): UndoResult {
   const rec = readRedo();
-  if (!rec) return { text: "[!] nothing to redo", restarted: false };
+  if (!rec) return { text: "[!] nothing to redo", restarted: false, reRun: false };
+  // F4: if a NEWER run completed after this undo, the session has lines
+  // appended past our cut point; re-appending the removed tail would strand
+  // the new turn off-path. Refuse instead (record is kept).
+  {
+    const undoSeq = Number(rec.run?.match(/^(\d+)_/)?.[1] ?? 0);
+    const newer = latestRun(rec.sessionFile);
+    if (newer && Number(newer.meta.seq ?? 0) > undoSeq) {
+      return { text: "[!] redo stale: newer run completed", restarted: false, reRun: false };
+    }
+  }
   let files = 0;
   if (rec.run) {
     const runDir = path.join(runsDir(), rec.run);
     const meta = readRunMeta(runDir);
     if (meta) {
       try {
-        files = applyRunSnapshot(runDir, meta, "post");
+        files = applyRunSnapshot(runDir, meta, "post").files;
       } catch (e) {
         console.error(`[undo] redo restore failed: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -627,9 +842,9 @@ export function performRedo(): UndoResult {
   try {
     fs.rmSync(redoPath(), { force: true });
   } catch {}
-  if (files === 0 && !conversation) return { text: "[!] nothing to redo", restarted: false };
+  if (files === 0 && !conversation) return { text: "[!] nothing to redo", restarted: false, reRun: false };
   const parts: string[] = [];
   if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
   if (conversation) parts.push("conversation");
-  return { text: `[ok] redone: ${parts.join(" + ")}`, restarted: conversation };
+  return { text: `[ok] redone: ${parts.join(" + ")}`, restarted: conversation, reRun: false };
 }
