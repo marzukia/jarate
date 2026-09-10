@@ -52,14 +52,16 @@ fix the build
 The second message interrupts the in-flight step after ~3s and the agent picks
 it up. This is for **plain** messages only — commands (`/stop`, `/btw`, …) keep
 their existing behavior. `/status` shows an armed interrupt (`interrupt in 3s`)
-and an in-flight one (`interrupting`). Webhook traffic follows the same rule:
-pi-bg dispatch callbacks are plain messages, so a callback that arrives mid-run
-interrupts the in-flight step (faster wake than waiting for the run to end).
+and an in-flight one (`interrupting`).
 
 If the step finishes before the grace period, the message is delivered normally
 as a fresh run instead (the existing mid-turn re-wake). Nothing is ever queued
 twice: an interrupted message is removed from the re-wake queue before it is
-steered in, so it is delivered exactly once.
+sent, so it is delivered exactly once. If the session does not settle within
+120 s of the abort (a stuck retry or compaction), the message goes back to the
+re-wake queue and is delivered when the run ends — still exactly once.
+`/stop`, `/reset` and `/restart` during the settle window drop the pending
+send, consistent with those commands dropping queued messages.
 
 ### /btw
 

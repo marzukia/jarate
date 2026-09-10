@@ -12,7 +12,6 @@ import extension, {
   failurePostText,
   fileOnlyPrompt,
   handleInbound,
-  heldInterrupts,
   interruptStepTimeoutMs,
   matchCommand,
   midTurnQueues,
@@ -25,7 +24,6 @@ import extension, {
   registerTodoTool,
   runShellPassthrough,
   setInterruptCtx,
-  stoppedSinceAbort,
   TODO_TOOL_DESCRIPTION,
 } from "./index";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
@@ -872,8 +870,6 @@ describe("extension handlers (A1/A2/A4)", () => {
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
-      heldInterrupts.clear();
-      stoppedSinceAbort.clear();
       jest.useRealTimers();
     });
 
@@ -984,9 +980,6 @@ describe("extension handlers (A1/A2/A4)", () => {
       await handlers.agent_end({ messages: [] }, ctx);
       expect(sent.length).toBe(1); // re-wake fired
       expect(midTurnQueues.has("ch1")).toBe(false);
-      // F6: the re-wake owns the entry now — its armed timer is dropped so
-      // /status does not show a stale "interrupt in Xs" fragment.
-      expect(pendingInterrupts.has("ch1")).toBe(false);
       jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
       expect(sent.length).toBe(1); // timer found no entry, no double send
       expect(abortCount).toBe(0);
@@ -1033,123 +1026,84 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(sent[0].m.details.messageId).toBe("m1");
     });
 
-    test("F1: settle >10s — no send while not idle; re-arm retries until settled", async () => {
-      // abort does NOT settle: the full 400×25ms poll window expires.
+    test("settle beyond the cap leaves the message to the re-wake queue", async () => {
+      // abort never settles: the poll loop must hit its 120 s cap, restore
+      // the entry (FIFO position) and let the re-wake path own it — never
+      // steer into a still-active run (the lossy path).
       ctx.abort = () => {
         abortCount += 1;
       };
-      await handleInbound(pi, inbound("redirect", "m1"), ctx);
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(1);
-
-      // Run the whole poll window. One microtask flush per 25ms tick: each
-      // poll continuation registers the next 25ms timer, which only fires
-      // on the next advance.
-      for (let i = 0; i < 400; i++) {
+      await handleInbound(pi, inbound("stuck", "m1"), ctx);
+      // 120 x 25 ms covers the interrupt arm; 4800 x 25 ms is the poll cap.
+      for (let i = 0; i < 4925; i++) {
         jest.advanceTimersByTime(25);
         await Promise.resolve();
       }
-      // Still not idle: no steer-send into the still-dying run; the entry is
-      // held and a 250ms retry is armed.
+      expect(abortCount).toBe(1);
       expect(sent.length).toBe(0);
-      expect(heldInterrupts.get("ch1")?.messageId).toBe("m1");
-      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
-      expect(pendingInterrupts.get("ch1")?.[0].messageId).toBe("m1");
+      const q = midTurnQueues.get("ch1");
+      expect(q?.length).toBe(1);
+      expect(q?.[0].msg.messageId).toBe("m1");
+    });
 
-      // Next fire: still not idle → re-arm again, still no send.
-      jest.advanceTimersByTime(250);
+    test("/stop during the settle window drops the pending send", async () => {
+      ctx.abort = () => {
+        abortCount += 1;
+      }; // does not settle immediately
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
+      expect(abortCount).toBe(1);
       expect(sent.length).toBe(0);
-      expect(heldInterrupts.get("ch1")?.messageId).toBe("m1");
-      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
-
-      // Session settles: the retry delivers exactly once.
-      idle = true;
-      jest.advanceTimersByTime(250);
+      // /stop while the settle wait is pending
+      await handleInbound(pi, inbound("/stop", "m2"), ctx);
+      jest.advanceTimersByTime(25);
       await Promise.resolve();
-      expect(sent.length).toBe(1);
-      expect(sent[0].m.details.messageId).toBe("m1");
-      expect(heldInterrupts.has("ch1")).toBe(false);
+      expect(sent.length).toBe(0); // send dropped, entry not restored
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
-    test("F2: /stop during the settle window cancels the pending send", async () => {
-      // abort does NOT settle: the interrupt is in its settle window.
-      ctx.abort = () => {
-        abortCount += 1;
-      };
-      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+    test("/stop while idle does not poison later interrupts (F7 guard)", async () => {
+      // /stop with no in-flight interrupt must not set the cancel flag
+      idle = true;
+      await handleInbound(pi, inbound("/stop", "m0"), ctx);
+      // A run becomes active; a plain message is queued and armed
+      idle = false;
+      await handleInbound(pi, inbound("m9 message", "m9"), ctx);
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      // Timer fires while the run is still active: the interrupt must be
+      // delivered, not dropped by a stale flag (abort mock settles at once)
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
       expect(abortCount).toBe(1);
-      expect(sent.length).toBe(0);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m9");
+    });
 
-      // /stop while settle is pending.
+    test("a dropped interrupt does not poison later interrupts (F7 consume)", async () => {
+      ctx.abort = () => {
+        abortCount += 1;
+      }; // does not settle immediately
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      // /stop during the settle window: drops m1 AND consumes the flag
       await handleInbound(pi, inbound("/stop", "m2"), ctx);
-      expect(abortCount).toBe(2); // /stop's own abort
-      expect(stoppedSinceAbort.has("ch1")).toBe(true);
-
-      // Session settles: the pending send must NOT start a new run.
-      idle = true;
       jest.advanceTimersByTime(25);
       await Promise.resolve();
       expect(sent.length).toBe(0);
-    });
-
-    test("F4: re-arm log is suppressed while an interrupt is in flight", async () => {
-      const flush = async (n: number) => {
-        for (let i = 0; i < n; i++) await Promise.resolve();
-      };
-      // m1's interrupt aborts and is stuck in its settle poll (never idle).
-      ctx.abort = () => {
-        abortCount += 1;
-      };
-      await handleInbound(pi, inbound("a", "m1"), ctx);
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await flush(130); // drain m1's poll conts up to the fire point
-      expect(abortCount).toBe(1);
-
-      // Second message arms its own timer while m1 is in flight: that arm
-      // logs once; the 200ms re-arm cycles after it must be silent.
-      const logSpy = jest.spyOn(console, "log").mockImplementation(() => {});
-      try {
-        await handleInbound(pi, inbound("b", "m2"), ctx);
-        const afterArm = logSpy.mock.calls
-          .map((c) => String(c[0]))
-          .filter((t) => t.includes("armed mid-run interrupt"));
-        expect(afterArm.length).toBe(1); // m2's initial arm logged once
-
-        jest.advanceTimersByTime(interruptStepTimeoutMs());
-        await flush(130);
-        for (let i = 0; i < 4; i++) {
-          jest.advanceTimersByTime(200);
-          await flush(16);
-        }
-        const armLogs = logSpy.mock.calls
-          .map((c) => String(c[0]))
-          .filter((t) => t.includes("armed mid-run interrupt"));
-        expect(armLogs.length).toBe(1); // no per-cycle spam
-      } finally {
-        logSpy.mockRestore();
-      }
-    });
-
-    test("F1/F2: a later /stop does not cancel a later, unrelated interrupt", async () => {
-      // The cancel flag is per-stop: a new run (turn_start) clears it, so a
-      // subsequent interrupt is not silently dropped.
-      ctx.abort = () => {
-        abortCount += 1;
-      };
-      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      // Run still active; m3 is queued and armed — its interrupt must be
+      // delivered (the flag consumed by m1's drop must not kill it)
+      await handleInbound(pi, inbound("third", "m3"), ctx);
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      await handleInbound(pi, inbound("/stop", "m2"), ctx);
-      expect(stoppedSinceAbort.has("ch1")).toBe(true);
-
-      // Next run starts: the flag is stale.
-      await handlers.turn_start({}, ctx);
-      expect(stoppedSinceAbort.has("ch1")).toBe(false);
+      expect(abortCount).toBe(3);
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m3");
     });
 
     test("/status shows the armed interrupt state", async () => {

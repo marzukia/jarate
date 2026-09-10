@@ -207,19 +207,10 @@ interface PendingInterrupt {
 }
 export const pendingInterrupts = new Map<string, PendingInterrupt[]>();
 const interruptingChannels = new Set<string>();
-// Settle >10s (retry/compact/continue — compact is an LLM call): the entry is
-// held out of the re-wake queue and retried on each re-armed fire until the
-// session is idle, so the message is never steered into a still-dying run.
-export const heldInterrupts = new Map<
-  string,
-  { entry: QueuedInbound; messageId: string }
->();
-// /stop was processed after the interrupt's abort: the pending send is
-// dropped. Cleared when a new run starts (turn_start) or when consumed.
-export const stoppedSinceAbort = new Set<string>();
-// Channels that already logged an arm while an interrupt was in flight
-// (re-arms every 200ms; log once, not per cycle).
-const interruptArmLogged = new Set<string>();
+// Channels whose in-flight interrupt was cancelled by /stop, /reset or
+// /restart while the settle wait was running — the pending send is dropped
+// (consistent with those commands dropping queued mid-turn inbounds).
+const interruptCancelled = new Set<string>();
 let interruptHandler: ((channelId: string, messageId: string) => void) | null =
   null;
 let interruptCtx: ExtensionContext | null = null;
@@ -236,14 +227,14 @@ export function setInterruptCtx(ctx: ExtensionContext | null): void {
   interruptCtx = ctx;
 }
 
-/**
- * Arm (or re-arm) an interrupt timer for a queued mid-turn message.
- * Re-arming the same messageId replaces the earlier timer.
- */
+/** Arm (or re-arm) an interrupt timer for a queued mid-turn message.
+ * Re-arming the same messageId replaces the earlier timer. `quiet` suppresses
+ * the log for the short re-arm used while another interrupt is in flight. */
 export function armInterruptTimer(
   channelId: string,
   messageId: string,
   delayMs?: number,
+  quiet = false,
 ): void {
   if (!messageId) return;
   const delay = delayMs ?? interruptStepTimeoutMs();
@@ -270,42 +261,18 @@ export function armInterruptTimer(
   }, delay);
   list.push({ messageId, at, timer });
   pendingInterrupts.set(channelId, list);
-  // While an interrupt is in flight, this channel re-arms on a tight loop
-  // (200ms in-flight re-arm, 250ms settle retry). Log the first re-arm of
-  // each in-flight window; the rest are spam.
-  const isReArm = interruptingChannels.has(channelId);
-  if (isReArm && interruptArmLogged.has(channelId)) {
-    // suppressed
-  } else {
-    if (isReArm) interruptArmLogged.add(channelId);
+  if (!quiet)
     console.log(
       `[channel] armed mid-run interrupt for ${messageId} (in ${delay}ms)`,
     );
-  }
-}
-
-/** Remove one pending interrupt timer (its entry was consumed by the re-wake). */
-export function dropInterrupt(channelId: string, messageId: string): void {
-  const list = pendingInterrupts.get(channelId);
-  if (!list) return;
-  const i = list.findIndex((p) => p.messageId === messageId);
-  if (i === -1) return;
-  clearTimeout(list[i].timer);
-  list.splice(i, 1);
-  if (list.length === 0) pendingInterrupts.delete(channelId);
 }
 
 /** Cancel pending interrupt timers for a channel (/stop, /reset). */
 export function clearInterrupts(channelId: string): void {
   const list = pendingInterrupts.get(channelId);
-  if (list) {
-    for (const p of list) clearTimeout(p.timer);
-    pendingInterrupts.delete(channelId);
-  }
-  // A held entry (settle >10s) would otherwise be orphaned: it is already
-  // spliced from the re-wake queue and its retry timer was just cleared.
-  heldInterrupts.delete(channelId);
-  interruptArmLogged.delete(channelId);
+  if (!list) return;
+  for (const p of list) clearTimeout(p.timer);
+  pendingInterrupts.delete(channelId);
 }
 
 /** Cancel every interrupt timer (session_shutdown). */
@@ -314,9 +281,7 @@ export function clearAllInterrupts(): void {
     for (const p of list) clearTimeout(p.timer);
   pendingInterrupts.clear();
   interruptingChannels.clear();
-  heldInterrupts.clear();
-  stoppedSinceAbort.clear();
-  interruptArmLogged.clear();
+  interruptCancelled.clear();
 }
 
 /**
@@ -330,14 +295,9 @@ export function clearAllInterrupts(): void {
  *      maps the abort there, NOT to stopReason "aborted").
  *   2. wait for isIdle — the post-run loop may retry/compact/continue;
  *      isIdle() covers run + compaction. Common case settles in tens of
- *      ms (the aborted LLM call fails immediately). If it takes >10s the
- *      entry is held and the interrupt re-arms every 250ms — never steer
- *      into a still-dying run (the steer would be drained into its
- *      transcript and lost).
+ *      ms (the aborted LLM call fails immediately).
  *   3. sendToPi — now idle, the message starts a FRESH run. The agent
  *      continues with it: a clean redirect in the transcript.
- * /stop during the settle window cancels the pending send (the user
- * explicitly ended the run; the interrupted message is dropped).
  * The message is spliced out of the re-wake queue BEFORE the abort, so it
  * is owned by exactly one path (never re-woken at the aborted run's
  * agent_end). Do NOT steer before aborting: a steer enqueued while the
@@ -354,39 +314,7 @@ export async function runMidRunInterrupt(
   if (interruptingChannels.has(channelId)) {
     // Another interrupt is in flight for this channel; re-arm shortly —
     // the message is still in the re-wake queue as the fallback owner.
-    armInterruptTimer(channelId, messageId, 200);
-    return;
-  }
-  // A previous fire aborted but the session never settled within the poll
-  // window; the entry was held out of the re-wake queue. Retry it now.
-  const held = heldInterrupts.get(channelId);
-  if (held) {
-    if (!ctx.isIdle()) {
-      // Still not settled — keep holding, retry on the next fire.
-      armInterruptTimer(channelId, held.messageId, 250);
-      return;
-    }
-    heldInterrupts.delete(channelId);
-    interruptingChannels.add(channelId);
-    try {
-      if (stoppedSinceAbort.delete(channelId)) {
-        console.log(
-          `[channel] mid-run interrupt ${held.messageId}: dropped, /stop since abort`,
-        );
-        return;
-      }
-      sendToPi(
-        pi,
-        channelId,
-        held.entry.text!,
-        held.entry.title ?? "",
-        held.entry.display ?? held.entry.msg.body,
-        held.entry.msg.messageId,
-      );
-    } finally {
-      interruptingChannels.delete(channelId);
-      interruptArmLogged.delete(channelId);
-    }
+    armInterruptTimer(channelId, messageId, 200, true);
     return;
   }
   if (ctx.isIdle()) return; // run settled; the re-wake queue owns delivery
@@ -403,8 +331,6 @@ export async function runMidRunInterrupt(
     return;
   }
   interruptingChannels.add(channelId);
-  // First in-flight arm for this window: the next re-arm may log once.
-  interruptArmLogged.delete(channelId);
   console.log(
     `[channel] mid-run interrupt: aborting current step, then sending ${messageId}`,
   );
@@ -419,20 +345,37 @@ export async function runMidRunInterrupt(
     // queued message's re-wake starts a run during this window, we wait
     // for that run too — the interrupt message then follows it as a fresh
     // run. Nothing is lost; order may be inverted for the other message.
-    for (let i = 0; i < 400 && !ctx.isIdle(); i++) {
+    // Cap: 120 s (compaction/retry are LLM calls and can be slow). If
+    // /stop, /reset or /restart lands in this window the send is dropped
+    // (interruptCancelled), consistent with those commands dropping queued
+    // mid-turn inbounds.
+    for (
+      let i = 0;
+      i < 4800 && !ctx.isIdle() && !interruptCancelled.has(channelId);
+      i++
+    ) {
       await new Promise((r) => setTimeout(r, 25));
     }
-    if (!ctx.isIdle()) {
-      // Settle took >10s — do NOT steer into the still-dying run. Hold the
-      // entry (already spliced from the re-wake queue, so it stays owned by
-      // exactly one path) and retry on the next fire.
-      heldInterrupts.set(channelId, { entry, messageId });
-      armInterruptTimer(channelId, messageId, 250);
+    if (interruptCancelled.has(channelId)) {
+      // Consume the cancel so it cannot go stale and drop a LATER
+      // legitimate interrupt (F7): the flag is only ever set while an
+      // interrupt is in flight for this channel, and is cleared the moment
+      // it is acted on.
+      interruptCancelled.delete(channelId);
+      console.log(
+        `[channel] mid-run interrupt cancelled: ${messageId} dropped`,
+      );
       return;
     }
-    if (stoppedSinceAbort.delete(channelId)) {
+    if (!ctx.isIdle()) {
+      // Settle exceeded the cap: restore the entry (FIFO position kept) so
+      // the re-wake path owns delivery from here on — never steer into a
+      // still-active run (that is the lossy path this feature avoids).
+      const qq = midTurnQueues.get(channelId) ?? [];
+      qq.splice(Math.min(idx, qq.length), 0, entry);
+      midTurnQueues.set(channelId, qq);
       console.log(
-        `[channel] mid-run interrupt ${messageId}: dropped, /stop since abort`,
+        `[channel] mid-run interrupt: settle exceeded cap, ${messageId} left to re-wake`,
       );
       return;
     }
@@ -446,7 +389,6 @@ export async function runMidRunInterrupt(
     );
   } finally {
     interruptingChannels.delete(channelId);
-    interruptArmLogged.delete(channelId);
   }
 }
 // Last inbound Discord message id per channel — the 👀 ack target. The
@@ -1205,7 +1147,6 @@ export default function (pi: ExtensionAPI) {
     const ch = lastActiveChannel;
     if (ch?.type !== "discord") return;
     userStoppedRun = false; // a new run makes any earlier /stop flag stale
-    stoppedSinceAbort.clear(); // ...and any earlier interrupt-cancel flag
     // activity block: every run gets a placeholder, edited in place as
     // tool calls fire, closed at agent_end. turn_start fires per step,
     // so the runOpen gate makes this once-per-run.
@@ -1378,9 +1319,6 @@ export default function (pi: ExtensionAPI) {
       console.log(
         `[channel] re-wake: starting run for queued mid-turn inbound (${queued.channelId})`,
       );
-      // The re-wake owns this entry now; drop its armed timer so /status
-      // does not show a stale "interrupt in Xs" fragment.
-      dropInterrupt(queued.channelId, queued.msg.messageId);
       try {
         await handleInbound(pi, queued.msg, ctx, true);
       } catch (e) {
@@ -1700,10 +1638,10 @@ async function runChannelCommand(
       // stale message.
       const dropped = clearQueuedInbound(ch.id);
       clearInterrupts(ch.id);
-      // A pending interrupt send (settle window in progress) is cancelled
-      // too: the user explicitly stopped the run, the interrupted message
-      // must not start a new one. Cleared again on the next turn_start.
-      stoppedSinceAbort.add(ch.id);
+      // Cancel an in-flight interrupt's pending send — but only when one is
+      // actually in flight for this channel, so the flag never goes stale
+      // and drops a later legitimate interrupt (F7).
+      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id);
       if (dropped > 0)
         console.log(
           `[channel] /stop dropped ${dropped} queued mid-turn inbound(s)`,
@@ -1750,7 +1688,7 @@ async function runChannelCommand(
         const elapsed = Date.now() - sessionStartTs;
         const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
         const parts = [
-          `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"}`,
+          `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
           `model ${model}`,
           `up ${up}`,
           ctx.isIdle() ? "idle" : "running",
@@ -1778,6 +1716,7 @@ async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       userStoppedRun = true;
       clearInterrupts(ch.id);
+      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
       try {
         ctx.abort();
       } catch {}
@@ -1837,6 +1776,8 @@ async function runChannelCommand(
       // 'pi -c' which continues the last session file (the opposite of /reset,
       // which moves that file aside first).
       userStoppedRun = true;
+      clearInterrupts(ch.id);
+      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
       try {
         ctx.abort();
       } catch {}
@@ -2522,6 +2463,7 @@ function sendToPi(
 ) {
   const ids = messageIds ?? (messageId ? [messageId] : []);
   if (ids.length > 0) runInboundIds.set(channelId, ids);
+  interruptCancelled.delete(channelId); // a fresh send opens a fresh run
   try {
     pi.sendMessage(
       {
