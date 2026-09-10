@@ -2244,7 +2244,7 @@ describe("todo board (integration)", () => {
 
   test("/todos with an empty board says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
-    expect(replyContent()).toBe("no open todos");
+    expect(replyContent()).toBe("[todos] no open todos");
   });
 
   test("/todos needs no owner", async () => {
@@ -2301,7 +2301,7 @@ describe("todo board (integration)", () => {
 
   test("/todos all with no boards says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    expect(replyContent()).toBe("no open todos");
+    expect(replyContent()).toBe("[todos] no open todos");
   });
 
   test("context injection: non-empty board appended after channel-ctx", async () => {
@@ -2600,7 +2600,7 @@ describe("sleep (integration)", () => {
 
   test("/sleep with no wakes says 'no pending wakes'", async () => {
     await handleInbound(pi, inbound("/sleep", "m1"), ctx);
-    expect(replyContent()).toBe("no pending wakes");
+    expect(replyContent()).toBe("[wake] no pending wakes");
   });
 
   test("/sleep list shows pending wakes with id, channel, time, note", async () => {
@@ -2636,9 +2636,9 @@ describe("sleep (integration)", () => {
     await handleInbound(pi, inbound("/sleep cancel nope", "m1"), ctx);
     expect(replyContent()).toBe("[!] no wake with id nope");
     await handleInbound(pi, inbound("/sleep cancel", "m2"), ctx);
-    expect(replyContent()).toBe("usage: `/sleep cancel <id>`");
+    expect(replyContent()).toBe("[!] usage: `/sleep cancel <id>`");
     await handleInbound(pi, inbound("/sleep xyz", "m3"), ctx);
-    expect(replyContent()).toBe("usage: `/sleep [list | cancel <id>]`");
+    expect(replyContent()).toBe("[!] usage: `/sleep [list | cancel <id>]`");
   });
 
   test("due-on-startup delivery: injects a channel-inbound wake, completes it, no double delivery", () => {

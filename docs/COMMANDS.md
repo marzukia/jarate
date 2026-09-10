@@ -7,6 +7,41 @@ Matching is case-insensitive; every command needs a leading `/` except bare
 Access: **anyone** = any member of the channel; **owner** = the configured
 `ownerUserId`.
 
+## Output tags
+
+Every command / system output the user sees starts with ONE ASCII tag
+(kimaki style, no emoji). Bracketed state tags: `[ok]` applied / success,
+`[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
+`[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
+bracketed content tag (`[status]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`).
+Live run state uses the box-drawing family (`┣ working…`, `┗ done · N calls`),
+the todo board its glyph family (`⬦` pending, `⬥` in progress, `✓` done,
+`✕` cancelled, `▤` board header) — both families are exempt from the bracket
+scheme. Webhook callback embeds are structured and untagged.
+
+| command / output | tag |
+|---|---|
+| `/stop` | `[-] stopped` |
+| `/status` | `[status] …` (error: `[!] status unavailable`) |
+| `/reset` | `[new] …` |
+| `/restart` | `[..] …` |
+| `/undo` / `/redo` | `[ok] …` / `[!] …` |
+| `/verbose on\|off` | `[ok] …` |
+| `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
+| `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
+| `/jobs` | `[jobs] …` |
+| `/todos` | board as-is (`▤` header); empty: `[todos] no open todos` |
+| `/sleep list` | `[wake] …` |
+| `/sleep cancel` | `[ok] …` / `[!] …` |
+| `/btw` usage, other usage errors | `[!] usage: …` |
+| owner-only rejection | `[!] owner only` |
+| queue ack | `[queued] N in line` |
+| run failure post | `[!] …` |
+| repetition loop | `[!] …` |
+| `!` shell (non-owner) | `[!] …` |
+
+New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
+
 ## Command reference
 
 | command | access | what it does |
@@ -169,7 +204,7 @@ Lists in-flight `pi-bg` dispatches by reading the process table (the `pi-bg`
 wrapper process exists only while a run is live):
 
 ```
-2 jobs in flight:
+[jobs] 2 jobs in flight:
 - worker · 04:12 · bulk refactor of channel/
 - reviewer · 01:30 · adversarial review of PR #12
 ```

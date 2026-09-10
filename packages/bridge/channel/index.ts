@@ -950,12 +950,12 @@ export function listInflightJobs(): string {
       { encoding: "utf8", timeout: 5000 },
     );
   } catch {
-    return "No jobs in flight.";
+    return "[jobs] No jobs in flight.";
   }
   const jobs = parseJobsFromPs(raw);
-  if (jobs.length === 0) return "No jobs in flight.";
+  if (jobs.length === 0) return "[jobs] No jobs in flight.";
   const lines = jobs.map((j) => `- ${j.profile} · ${j.age} · ${j.task}`);
-  return `${jobs.length} job${jobs.length > 1 ? "s" : ""} in flight:\n${lines.join("\n")}`;
+  return `[jobs] ${jobs.length} job${jobs.length > 1 ? "s" : ""} in flight:\n${lines.join("\n")}`;
 }
 
 /** ! shell passthrough: run bash -c in the working directory, 60s cap.
@@ -2046,7 +2046,7 @@ async function runChannelCommand(
 ): Promise<{ immediate?: string; btw?: boolean }> {
   const isOwner = !ch.ownerUserId || fromId === ch.ownerUserId;
   const ownerOnly = !isOwner
-    ? { immediate: native ? "owner only" : undefined }
+    ? { immediate: native ? "[!] owner only" : undefined }
     : {};
   switch (name.toLowerCase()) {
     case "stop": {
@@ -2071,13 +2071,13 @@ async function runChannelCommand(
         userStoppedRun = true;
         ctx.abort();
       }
-      return { immediate: "⏹️ stopped" };
+      return { immediate: "[-] stopped" };
     }
     case "help":
       return { immediate: HELP_TEXT };
     case "btw": {
       const question = (arg || "").trim();
-      if (!question) return { immediate: "usage: `/btw <question>`" };
+      if (!question) return { immediate: "[!] usage: `/btw <question>`" };
       const msg: ChannelMessage = {
         channelId: ch.id,
         channelName: ch.name,
@@ -2127,9 +2127,9 @@ async function runChannelCommand(
             parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
           }
         }
-        text = parts.join(" • ");
+        text = `[status] ${parts.join(" • ")}`;
       } catch {
-        text = "status unavailable";
+        text = "[!] status unavailable";
       }
       return { immediate: text };
     }
@@ -2226,7 +2226,9 @@ async function runChannelCommand(
       const a = arg?.toLowerCase();
       const next = a === undefined ? !isVerbose(ch) : a === "on";
       verboseOverride.set(ch.id, next);
-      return { immediate: `verbose ${next ? "on" : "off"} (until restart)` };
+      return {
+        immediate: `[ok] verbose ${next ? "on" : "off"} (until restart)`,
+      };
     }
     case "compact": {
       if (!isOwner) return ownerOnly;
@@ -2264,7 +2266,7 @@ async function runChannelCommand(
           loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
         );
         const wakes = loadWakes();
-        if (wakes.length === 0) return { immediate: "no pending wakes" };
+        if (wakes.length === 0) return { immediate: "[wake] no pending wakes" };
         const pending = wakes.filter((w) => w.status === "pending").length;
         const lines = wakes.map((w) => {
           const chName = names.get(w.channelId) || w.channelName || w.channelId;
@@ -2280,12 +2282,12 @@ async function runChannelCommand(
           return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
         });
         return {
-          immediate: `${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}`,
+          immediate: `[wake] ${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}`,
         };
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: "usage: `/sleep cancel <id>`" };
+        if (!id) return { immediate: "[!] usage: `/sleep cancel <id>`" };
         const ok = cancelWake(id);
         return {
           immediate: ok
@@ -2293,7 +2295,7 @@ async function runChannelCommand(
             : `[!] no wake with id ${id}`,
         };
       }
-      return { immediate: "usage: `/sleep [list | cancel <id>]`" };
+      return { immediate: "[!] usage: `/sleep [list | cancel <id>]`" };
     }
     case "todos": {
       // Informational, open to all channel members (private channel).
@@ -2308,12 +2310,13 @@ async function runChannelCommand(
               `▤ ${names.get(b.channelId) || b.channelId} · ${openCount(b.todos)} open\n${b.todos.map(todoLine).join("\n")}`,
           );
         return {
-          immediate: parts.length > 0 ? parts.join("\n\n") : "no open todos",
+          immediate:
+            parts.length > 0 ? parts.join("\n\n") : "[todos] no open todos",
         };
       }
       const board = loadBoard(ch.id);
       if (!board || board.todos.length === 0)
-        return { immediate: "no open todos" };
+        return { immediate: "[todos] no open todos" };
       return { immediate: renderBoard(board.todos) };
     }
     case "model": {
@@ -2324,12 +2327,13 @@ async function runChannelCommand(
         models = ctx.modelRegistry?.getAvailable?.() ?? [];
       } catch {}
       if (!req) {
-        if (models.length === 0) return { immediate: "no models available" };
+        if (models.length === 0)
+          return { immediate: "[model] no models available" };
         const names = models
           .slice(0, 20)
           .map((m: any) => `${m.provider}/${m.id}`);
         return {
-          immediate: `models:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
+          immediate: `[model] ${models.length} available:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
         };
       }
       const lower = req.toLowerCase();
@@ -2353,11 +2357,11 @@ async function runChannelCommand(
             .map((m: any) => `${m.provider}/${m.id}`)
             .join(", ");
           return {
-            immediate: `ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
+            immediate: `[!] ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
           };
         }
       }
-      if (!found) return { immediate: `model not found: ${req}` };
+      if (!found) return { immediate: `[!] model not found: ${req}` };
       const ok = await pi.setModel(found);
       return {
         immediate: ok
@@ -2825,7 +2829,7 @@ export async function handleInbound(
   if (bang && ch) {
     noAck();
     if (ch.ownerUserId && msg.fromId !== ch.ownerUserId) {
-      replyCmd("`!` shell is owner-only");
+      replyCmd("[!] `!` shell is owner-only");
       return;
     }
     const shellCmd = bang[1].trim();
