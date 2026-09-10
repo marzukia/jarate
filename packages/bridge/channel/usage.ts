@@ -93,10 +93,12 @@ function addEntry(s: UsageStats, entry: unknown, seen: Set<string>): void {
 
 /** Stream a file line by line (never loaded whole); yields a torn last line. */
 async function* linesOf(file: string): AsyncGenerator<string> {
-  const f = Bun.file(file);
+  // NOTE: must be runtime-agnostic - the bridge runs inside pi (node), not
+  // bun. Bun.file() threw ReferenceError in production and the caller's
+  // catch turned it into all-zero stats (2026-09-10 /usage incident).
   const dec = new TextDecoder();
   let buf = "";
-  for await (const chunk of f.stream()) {
+  for await (const chunk of fs.createReadStream(file)) {
     buf += dec.decode(chunk, { stream: true });
     for (;;) {
       const i = buf.indexOf("\n");
