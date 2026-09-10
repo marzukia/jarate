@@ -8,6 +8,7 @@ import extension, {
   chunkText,
   clearAllInterrupts,
   collectFinals,
+  deliverDueWakes,
   earlySendText,
   failurePostText,
   fileOnlyPrompt,
@@ -21,11 +22,19 @@ import extension, {
   pendingInterrupts,
   prunePendingBatches,
   REPEAT_WARNING,
+  registerSleepTool,
   registerTodoTool,
   runShellPassthrough,
   setInterruptCtx,
   TODO_TOOL_DESCRIPTION,
 } from "./index";
+import {
+  CLAIM_TTL_MS,
+  cancelWake,
+  loadWakes,
+  markClaimed,
+  scheduleWake,
+} from "./sleep";
 import { loadBoard, renderBoard, saveBoard, type TodoBoard } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
 import { performUndo } from "./undo";
@@ -319,6 +328,12 @@ describe("matchCommand (A3)", () => {
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined });
     expect(matchCommand("/todos")).toEqual({ name: "todos", arg: undefined });
     expect(matchCommand("/todos all")).toEqual({ name: "todos", arg: "all" });
+    expect(matchCommand("/sleep")).toEqual({ name: "sleep", arg: undefined });
+    expect(matchCommand("/sleep list")).toEqual({ name: "sleep", arg: "list" });
+    expect(matchCommand("/sleep cancel abc123")).toEqual({
+      name: "sleep",
+      arg: "cancel abc123",
+    });
   });
 
   test("bare stop is exact-match only", () => {
@@ -343,6 +358,8 @@ describe("matchCommand (A3)", () => {
     expect(matchCommand("/stopx")).toBeNull();
     expect(matchCommand("/todosx")).toBeNull();
     expect(matchCommand("todos")).toBeNull();
+    expect(matchCommand("sleep")).toBeNull();
+    expect(matchCommand("/sleepx")).toBeNull();
     expect(matchCommand(" stop")).toBeNull();
     expect(matchCommand("/ /stop")).toBeNull();
   });
@@ -2211,5 +2228,338 @@ describe("todo board (integration)", () => {
     );
     const board = loadBoard("ch1", tmp);
     expect(board).toBeNull();
+  });
+});
+
+describe("sleep (integration)", () => {
+  let tmp = "";
+  let realHome = "";
+  let pi: any;
+  let ctx: any;
+  let sent: { m: any; o?: any }[] = [];
+  let tools: Record<string, any> = {};
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const NOW = Date.parse("2026-09-10T12:00:00Z");
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const replyContent = (): string => {
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    return JSON.parse(posts.at(-1)!.body).content;
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-sleep-"));
+    realHome = process.env.HOME!;
+    process.env.HOME = tmp; // isolate ~/.pi/agent/sleep from the real home
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    sent = [];
+    tools = {};
+    fetchCalls = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: (t: any) => {
+        tools[t.name] = t;
+      },
+      on: () => {},
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    registerSleepTool(pi, loadChannelConfig(tmp));
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.env.HOME = realHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("/sleep with no wakes says 'no pending wakes'", async () => {
+    await handleInbound(pi, inbound("/sleep", "m1"), ctx);
+    expect(replyContent()).toBe("no pending wakes");
+  });
+
+  test("/sleep list shows pending wakes with id, channel, time, note", async () => {
+    const w = scheduleWake({
+      channelId: "ch1",
+      channelName: "Test",
+      wakeAt: Date.now() + 30 * 60000,
+      note: "check CI",
+      home: tmp,
+    });
+    await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
+    const content = replyContent();
+    expect(content).toContain("1 pending wake (of 1 total):");
+    expect(content).toContain(w.id);
+    expect(content).toContain("Test");
+    expect(content).toContain(new Date(w.wakeAt).toISOString());
+    expect(content).toContain("in 30m");
+    expect(content).toContain("note: check CI");
+  });
+
+  test("/sleep cancel removes the wake from disk", async () => {
+    const w = scheduleWake({
+      channelId: "ch1",
+      wakeAt: Date.now() + 30 * 60000,
+      home: tmp,
+    });
+    await handleInbound(pi, inbound(`/sleep cancel ${w.id}`, "m1"), ctx);
+    expect(replyContent()).toBe(`[ok] cancelled wake ${w.id}`);
+    expect(loadWakes(tmp)).toHaveLength(0);
+  });
+
+  test("/sleep cancel: unknown id, missing id, bogus subcommand", async () => {
+    await handleInbound(pi, inbound("/sleep cancel nope", "m1"), ctx);
+    expect(replyContent()).toBe("[!] no wake with id nope");
+    await handleInbound(pi, inbound("/sleep cancel", "m2"), ctx);
+    expect(replyContent()).toBe("usage: `/sleep cancel <id>`");
+    await handleInbound(pi, inbound("/sleep xyz", "m3"), ctx);
+    expect(replyContent()).toBe("usage: `/sleep [list | cancel <id>]`");
+  });
+
+  test("due-on-startup delivery: injects a channel-inbound wake, completes it, no double delivery", () => {
+    const w = scheduleWake({
+      channelId: "ch1",
+      channelName: "Test",
+      wakeAt: NOW - 1000,
+      note: "check the deploy",
+      home: tmp,
+      now: NOW - 2000,
+    });
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(1);
+    const s = sent.at(-1)!;
+    expect(s.o?.triggerTurn).toBe(true);
+    expect(s.m.customType).toBe("channel-inbound");
+    expect(s.m.content).toContain("Woke after sleeping until");
+    expect(s.m.content).toContain("Note: check the deploy");
+    expect(s.m.details.title).toBe("discord/Test");
+    // completed on disk (removed) — a healthy process never re-delivers it
+    expect(loadWakes(tmp).find((x) => x.id === w.id)).toBeUndefined();
+    // immediate re-check: no double delivery
+    expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("stale claim after PROCESS DEATH re-delivers once after CLAIM_TTL_MS", () => {
+    const w = scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW - 1000,
+      home: tmp,
+      now: NOW - 2000,
+    });
+    // claim, then the process dies before completion (crash guard state)
+    markClaimed(w.id, NOW, tmp);
+    expect(loadWakes(tmp)[0]).toMatchObject({
+      id: w.id,
+      status: "claimed",
+      claimedAt: NOW,
+    });
+    // a new session starts long after the claim (bridge was down through the TTL window)
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueWakes(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(1);
+    expect(sent).toHaveLength(1);
+    // that redelivery is also completed — the loop must end
+    expect(loadWakes(tmp)).toHaveLength(0);
+    expect(deliverDueWakes(pi, channels, tmp, NOW + 2 * CLAIM_TTL_MS + 2)).toBe(
+      0,
+    );
+    expect(sent).toHaveLength(1);
+  });
+
+  test("same-process late tick: a delivered wake is NOT re-delivered after the TTL (F1)", () => {
+    scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW - 1000,
+      home: tmp,
+      now: NOW - 2000,
+    });
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(1);
+    // 10 minutes later, same live process: the wake was completed, not claimed-stale
+    expect(deliverDueWakes(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("deliverDueWakes skips disabled channels (no claim, no injection)", () => {
+    scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW - 1000,
+      home: tmp,
+      now: NOW - 2000,
+    });
+    const channels = loadChannelConfig(tmp).map((c) => ({
+      ...c,
+      enabled: false,
+    }));
+    expect(deliverDueWakes(pi, channels, tmp, NOW)).toBe(0);
+    expect(sent).toHaveLength(0);
+    expect(loadWakes(tmp)[0].status).toBe("pending");
+  });
+
+  test("/sleep list header counts only pending (claimed stays visible, not counted)", async () => {
+    const p = scheduleWake({
+      channelId: "ch1",
+      channelName: "Test",
+      wakeAt: Date.now() + 30 * 60000,
+      note: "pending one",
+      home: tmp,
+    });
+    const c = scheduleWake({
+      channelId: "ch1",
+      channelName: "Test",
+      wakeAt: Date.now() + 60 * 60000,
+      note: "claimed one",
+      home: tmp,
+    });
+    markClaimed(c.id, Date.now(), tmp);
+    await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
+    const content = replyContent();
+    expect(content).toContain("1 pending wake (of 2 total):");
+    expect(content).toContain(p.id);
+    expect(content).toContain(c.id);
+  });
+
+  test("inbound user message cancels PENDING wakes (kimaki parity); claimed ones survive", async () => {
+    const p = scheduleWake({
+      channelId: "ch1",
+      wakeAt: Date.now() + 30 * 60000,
+      home: tmp,
+    });
+    const c = scheduleWake({
+      channelId: "ch1",
+      wakeAt: Date.now() + 60 * 60000,
+      home: tmp,
+    });
+    markClaimed(c.id, Date.now(), tmp);
+    await handleInbound(pi, inbound("hey, are you awake?", "m1"), ctx);
+    const ids = loadWakes(tmp).map((w) => w.id);
+    expect(ids).not.toContain(p.id);
+    expect(ids).toContain(c.id); // claimed = mid-delivery, not cancelled
+  });
+
+  test("/btw and commands do NOT cancel pending wakes", async () => {
+    const a = scheduleWake({
+      channelId: "ch1",
+      wakeAt: Date.now() + 30 * 60000,
+      home: tmp,
+    });
+    await handleInbound(pi, inbound("/btw what is 2+2", "m1"), ctx);
+    expect(loadWakes(tmp).map((w) => w.id)).toContain(a.id);
+    const b = scheduleWake({
+      channelId: "ch1",
+      wakeAt: Date.now() + 30 * 60000,
+      home: tmp,
+    });
+    await handleInbound(pi, inbound("/help", "m2"), ctx);
+    expect(loadWakes(tmp).map((w) => w.id)).toContain(b.id);
+  });
+
+  test("inbound message on channel A does not cancel wakes on channel B", async () => {
+    const w = scheduleWake({
+      channelId: "other-ch",
+      wakeAt: Date.now() + 30 * 60000,
+      home: tmp,
+    });
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    expect(loadWakes(tmp).map((x) => x.id)).toEqual([w.id]);
+  });
+
+  test("sleep tool: minutes -> wake on disk + ack telling the model to end the reply", async () => {
+    const r = await tools["sleep"].execute(
+      "1",
+      { minutes: 30, note: "verify the build" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toContain("[ok] sleeping until");
+    expect(r.content[0].text).toContain("End your reply now");
+    const wakes = loadWakes(tmp);
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].channelId).toBe("ch1");
+    expect(wakes[0].note).toBe("verify the build");
+    expect(wakes[0].wakeAt).toBeGreaterThanOrEqual(Date.now() + 29 * 60000);
+  });
+
+  test("sleep tool: until ISO -> wake at that time", async () => {
+    await tools["sleep"].execute(
+      "1",
+      { until: "2026-09-10T15:00:00Z" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(loadWakes(tmp)[0].wakeAt).toBe(Date.parse("2026-09-10T15:00:00Z"));
+  });
+
+  test("sleep tool: bad params -> error, nothing scheduled", async () => {
+    for (const params of [
+      {},
+      { minutes: 5, until: "2026-09-10T15:00:00Z" },
+      { until: "yesterday" },
+      { minutes: -1 },
+      { until: "2036-01-01T00:00:00Z" },
+    ]) {
+      const r = await tools["sleep"].execute(
+        "1",
+        params,
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(r.content[0].text).toContain("[!]");
+    }
+    expect(loadWakes(tmp)).toHaveLength(0);
   });
 });
