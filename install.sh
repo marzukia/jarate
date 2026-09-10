@@ -10,8 +10,8 @@
 #        ~/scripts/pi-bg     -> <jarate>/dispatch/pi-bg
 #        ~/scripts/pi-wait   -> <jarate>/dispatch/pi-wait
 #        ~/bin/agent-say     -> <jarate>/bin/agent-say
-#        ~/projects/pgrag    -> <jarate>/packages/memory   (only if the dest
-#                              is absent or already this symlink)
+#        ~/projects/recall   -> <jarate>/packages/recall   (only if the dest
+#                               is absent or already this symlink)
 #
 # Deploy after a git pull = nothing. Code is live at the checkout; restart pi
 # only to pick up bridge (channel/) changes.
@@ -106,13 +106,13 @@ link_into "$HOME/scripts/pi-bg"   "$JARATE_DIR/dispatch/pi-bg"
 link_into "$HOME/scripts/pi-wait" "$JARATE_DIR/dispatch/pi-wait"
 link_into "$HOME/bin/agent-say"   "$JARATE_DIR/bin/agent-say"
 
-# pgrag: only adopt if the dest is absent or already our symlink (a live
+# recall: only adopt if the dest is absent or already our symlink (a live
 # deployed dir with .venv/.git is migrated manually, see DEPLOY.md)
-PGRAG_DEST="$HOME/projects/pgrag"
-if [ ! -e "$PGRAG_DEST" ] || { [ -L "$PGRAG_DEST" ] && [ "$(readlink "$PGRAG_DEST")" = "$JARATE_DIR/packages/memory" ]; }; then
-  link_into "$PGRAG_DEST" "$JARATE_DIR/packages/memory"
+RECALL_DEST="$HOME/projects/recall"
+if [ ! -e "$RECALL_DEST" ] || { [ -L "$RECALL_DEST" ] && [ "$(readlink "$RECALL_DEST")" = "$JARATE_DIR/packages/recall" ]; }; then
+  link_into "$RECALL_DEST" "$JARATE_DIR/packages/recall"
 else
-  echo "  pgrag: $PGRAG_DEST exists (not this symlink); left untouched"
+  echo "  recall: $RECALL_DEST exists (not this symlink); left untouched"
 fi
 
 # --- 4. finish ---------------------------------------------------------------

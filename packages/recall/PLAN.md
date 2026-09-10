@@ -1,9 +1,14 @@
-# RAG (pgrag)
+# RAG (recall)
 
-> Canonical location: `packages/memory/` in marzukia/jarate (incorporated with full history 2026-09-10); the box copy at `~/projects/pgrag` is a synced deployment.
+> Canonical location: `packages/recall/` in marzukia/jarate. The box copy
+> `~/projects/recall` is a symlink into the checkout. TypeScript port of the
+> old Python `pgrag` (`packages/memory/`, removed 2026-09-10): same behavior,
+> same schema, same db — **no data migration**. The `uv run` workflow is dead;
+> usage is now `bun recall ...` (see README.md).
 
 
 Author: monky, 2026-09-05. For review by Frankie. Status: proposal.
+Ported to TypeScript by monky, 2026-09-10.
 
 ## Goal
 
@@ -58,7 +63,7 @@ Notes:
   change in lockstep.
 - `UNIQUE (content_hash)` gives idempotent upserts.
 
-### 2. Ingest (one uv script, `~/projects/rag/ingest.py`, ~80 lines)
+### 2. Ingest (`bun recall ingest`, `src/ingest.ts`)
 
 - Walk configured roots (e.g. `~/projects/**`, `~/memory/**`, `~/research/**`).
 - Skip: `.git`, `node_modules`, binaries, lockfiles (skip list in config).
@@ -70,7 +75,7 @@ Notes:
 - Upsert on `content_hash`; **prune on by default** (delete hashes no longer
   present, `--no-prune` to disable) — with path-in-hash, a rename otherwise
   orphans the old row.
-- No framework. `uv run` + `httpx` + `psycopg`.
+- No framework. Bun + `postgres` driver + fetch.
 
 ### 3. Search (one SQL function)
 
@@ -123,10 +128,10 @@ $$;
 - Vector branch naturally returns nothing useful for pure keyword queries and
   FTS covers exact terms; RRF handles the mix without score normalization.
 
-### 4. Query CLI (one uv script, `~/projects/rag/query.py`, ~40 lines)
+### 4. Query CLI (`bun recall query`, `src/query.ts`)
 
-- `rag-query "text"` → embed query with the same model → call `search()` →
-  print top-k with source paths and scores.
+- `bun recall query "text"` → embed query with the same model → call
+  `search()` → print top-k with source paths and scores.
 - This is the only programmatic door. Agents (monky/frank) and humans both use
   it. A future API is a thin wrapper around the same function.
 

@@ -1,0 +1,21 @@
+{
+  "name": "@jarate/recall",
+  "version": "1.0.0",
+  "description": "recall: shared project knowledge RAG on Postgres + pgvector. Ingest, embed via Ollama, hybrid (vector + FTS) search through the search() SQL function.",
+  "license": "MIT",
+  "bin": {
+    "recall": "./bin/recall.ts"
+  },
+  "scripts": {
+    "recall": "bin/recall.ts",
+    "test": "bun test",
+    "typecheck": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "bun-types": "^1.4.2"
+  }
+}

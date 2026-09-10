@@ -1,5 +1,10 @@
 # pgrag setup (from zero)
 
+> **2026-09-10: the workflow moved to `recall`** (`packages/recall`,
+> TypeScript/bun). The old `uv run ingest.py / query.py` is dead; the CLI is
+> now `bun recall ...` from `~/projects/recall`. This runbook still stands for
+> the DB + embed setup (schema, roles, pgpass, Ollama).
+
 Runbook for setting up the RAG corpus on a new agent box. Verified
 2026-09-09 against <host-a> (PostgreSQL 16.13, Ollama on
 <host-b>). Two gotchas at the end — read them first.
@@ -62,7 +67,7 @@ Apply the schema (as the agent role; adjust the two `GRANT ... TO frank`
 lines to the new role if it is not `frank`):
 
 ```bash
-psql "host=127.0.0.1 dbname=rag user=<agentuser>" -f pgrag/schema.sql
+psql "host=127.0.0.1 dbname=rag user=<agentuser>" -f <jarate>/packages/recall/schema.sql
 ```
 
 Store the password for psql/psycopg (the default `RAG_DSN` carries no
@@ -106,26 +111,25 @@ curl -s http://<ollama-host>:11434/v1/embeddings \
 
 ```bash
 git clone <jarate-url> jarate && cd jarate
-uv --version || curl -LsSf https://astral.sh/uv/install.sh | sh
-./install.sh            # syncs pgrag/ -> ~/projects/pgrag
+./install.sh            # links ~/projects/recall -> packages/recall
 ```
 
 `install.sh` never touches the database (see DEPLOY.md).
 
-## D. First ingest (as the agent user, from `~/projects/pgrag`)
+## D. First ingest (as the agent user, from `~/projects/recall`)
 
 ```bash
-uv run ingest.py ~/memory ~/projects ~/AGENTS.md
+bun recall ingest ~/memory ~/projects ~/AGENTS.md
 ```
 
-(The script's built-in default is `~/memory ~/projects`; the fleet passes
+(The command's built-in default is `~/memory ~/projects`; the fleet passes
 `~/AGENTS.md` too.) Idempotent; `--no-prune` keeps orphans.
 
 ## E. Verify
 
 ```bash
-cd ~/projects/pgrag
-RAG_PROJECT=pgrag uv run query.py "what does search() do"
+cd ~/projects/recall
+RAG_PROJECT=pgrag bun recall query "what does search() do"
 ```
 
 Must print scored rows like:
