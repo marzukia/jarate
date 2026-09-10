@@ -13,6 +13,14 @@
 # On completion, posts a callback to the configured Discord webhook:
 #   webhook URL from $PI_DISPATCH_WEBHOOK or ~/.config/pi-dispatch/webhook
 #   (file absent = no callback; stdout is always printed)
+# Callback delivery (issue #14, 2026-09-10): the callback is the ONLY wake
+#   mechanism for the orchestrator, so it is hardened:
+#   - curl: 3 attempts, backoff 3s/6s, --max-time 15; non-2xx retried
+#   - fallback: if the process exits before out.md exists/is non-empty and no
+#     callback was posted, an EXIT/TERM/INT trap posts a 'DIED (no report)'
+#     callback so a killed worker still wakes the orchestrator
+#     (SIGKILL cannot be trapped - see DISPATCH.md recommendations)
+#   - dead letter: final post failure writes /tmp/pi-bg-<id>-webhook-failed
 set -uo pipefail
 
 profile="${1:-worker}"
@@ -58,8 +66,9 @@ if [ "$wt_mode" -eq 1 ]; then
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) — kept after run"
 fi
 
-# task = last positional arg
+# task = last positional arg (early: the exit trap needs it)
 task="${@: -1}"
+out=""; rc=1; purl=""; ourl=""
 
 # --- cgroup escape (automatic, persistent): move THIS process (and all
 #     children, incl. pi and the later webhook post) out of pi.service's
@@ -70,53 +79,50 @@ task="${@: -1}"
 ESCAPE_CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/pi-bg/${run_id}"
 if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/dev/null; then
   echo "[pi-bg] cgroup escape active: $ESCAPE_CG"
-  trap 'rmdir "$ESCAPE_CG" 2>/dev/null' EXIT
 else
   rmdir "$ESCAPE_CG" 2>/dev/null
   echo "[pi-bg] cgroup escape unavailable, running in caller cgroup"
 fi
-
-# retry on empty completion (local model quirk: some phrasings return nothing)
-out=""; rc=1
-for attempt in 1 2 3; do
-  if [ "$wt_mode" -eq 1 ]; then
-    out="$(cd "$wt_path" && pi -p --no-extensions "$@")"
-  else
-    out="$(pi -p --no-extensions "$@")"
-  fi
-  rc=$?
-  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] && break
-  echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
-  sleep 3
-done
 
 webhook="${PI_DISPATCH_WEBHOOK:-}"
 if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
 fi
 
-# --- webdrop: full prompt + full output behind a link (channel gets a brief) ---
-purl=""; ourl=""
-if command -v webdrop >/dev/null 2>&1; then
-  pf="/tmp/pi-bg-${run_id}-prompt.md"
-  of="/tmp/pi-bg-${run_id}-out.md"
-  { printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$pf"
-  printf '%s\n' "$out" > "$of"
-  purl="$(webdrop "$pf" "pi-bg-${run_id}-prompt" --ttl 7d 2>/dev/null | tail -1)" || purl=""
-  ourl="$(webdrop "$of" "pi-bg-${run_id}-out" --ttl 7d 2>/dev/null | tail -1)" || ourl=""
-fi
+# --- callback helpers (issue #14): the webhook post is the only wake
+#     mechanism, so never let it fail silently. ---
+BG_CB_DONE=0
+BG_DEAD="/tmp/pi-bg-${run_id}-webhook-failed"
+BG_WB_RESP="/tmp/pi-bg-${run_id}-wb-resp.txt"
 
-if [ -n "$webhook" ]; then
-  status="OK"; [ $rc -ne 0 ] && status="FAIL"
-  [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] && status="EMPTY"
-  # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
-  verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
-  dur=${SECONDS}
-  BG_WEBHOOK="$webhook" BG_PROFILE="$profile" BG_STATUS="$status" BG_RC="$rc" \
-  BG_VERDICT="$verdict" BG_DUR="$dur" BG_TASK="${task:0:200}" BG_BRIEF="${out:0:400}" \
+# bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
+# final failure: dead-letter file + stderr note, return 1.
+bg_post() {
+  local body="$1" code i
+  [ -n "$webhook" ] || return 1
+  for i in 1 2 3; do
+    code="$(curl -s -o "$BG_WB_RESP" -w '%{http_code}' -X POST "$webhook" \
+      -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
+    case "$code" in 2*) BG_CB_DONE=1; rm -f "$BG_DEAD" "$BG_WB_RESP"; return 0 ;; esac
+    [ "$i" -lt 3 ] && sleep $((i * 3))
+  done
+  { printf 'ticket   : %s\n' "$run_id"
+    printf 'http     : %s (3 attempts)\n' "$code"
+    printf 'when     : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'response : %s\n' "$(head -c 300 "$BG_WB_RESP" 2>/dev/null)"
+    printf 'body     : %s\n' "$body"; } > "$BG_DEAD"
+  echo "[pi-bg] webhook FAILED (http=$code) - dead letter: $BG_DEAD" >&2
+  return 1
+}
+
+# bg_build <body-file> <status> <brief> <rc> <verdict>: existing embed format
+bg_build() {
+  local bodyfile="$1" status="$2" brief="$3" brc="$4" verdict="$5"
+  BG_WEBHOOK="$webhook" BG_PROFILE="$profile" BG_STATUS="$status" BG_RC="$brc" \
+  BG_VERDICT="$verdict" BG_DUR="${SECONDS}" BG_TASK="${task:0:200}" BG_BRIEF="$brief" \
   BG_WT="$wt_path" BG_BRANCH="$wt_branch" BG_CWD="$(pwd)" BG_RUN="$run_id" \
   BG_PURL="$purl" BG_OURL="$ourl" \
-  python3 - > /tmp/pi-bg-${run_id}-body.json 2>/dev/null <<'PY'
+  python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("BG_" + k, "")
 prof, status, rc, verdict = E("PROFILE"), E("STATUS"), E("RC"), E("VERDICT")
@@ -131,10 +137,12 @@ elif status == "OK":
     title = f"\u2713 {prof} \u00b7 OK \u00b7 {dstr}"; color = GREEN
 elif status == "FAIL":
     title = f"\u2717 {prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"; color = RED
+elif status == "DIED":
+    title = f"\u26a0 {prof} \u00b7 DIED (no report) \u00b7 {dstr}"; color = ORANGE
 else:
     title = f"\u26a0 {prof} \u00b7 EMPTY \u00b7 {dstr}"; color = ORANGE
 meta = ["$ pi-bg " + prof + (" --worktree" if E("WT") else ""),
-        f"status : {status}" + (f" (rc={rc})" if status == "FAIL" else "")]
+        f"status : {status}" + (f" (rc={rc})" if status in ("FAIL", "DIED") else "")]
 if E("WT"):
     wtdir = os.path.dirname(E("WT").rstrip("/"))
     meta += [f"repo   : {os.path.basename(wtdir) or '?'}",
@@ -152,14 +160,76 @@ if E("PURL"):  embed["fields"].append({"name": "prompt", "value": f"[view]({E('P
 if E("OURL"):  embed["fields"].append({"name": "full output", "value": f"[view]({E('OURL')})", "inline": True})
 json.dump({"embeds": [embed]}, sys.stdout)
 PY
+}
+
+# bg_on_exit: cgroup cleanup + the 'died without report' fallback. If we exit
+# with no out.md and no posted callback, post DIED so the orchestrator wakes.
+# (covers TERM/INT/normal-exit paths; SIGKILL cannot be trapped)
+bg_on_exit() {
+  local ec=$?
+  if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
+     [ ! -s "/tmp/pi-bg-${run_id}-out.md" ]; then
+    [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
+    bg_build "/tmp/pi-bg-${run_id}-body.json" "DIED" \
+      "no output captured - pi-bg exited before completion (exit=$ec)" "$ec" ""
+    bg_post "/tmp/pi-bg-${run_id}-body.json" || true
+  fi
+  rmdir "$ESCAPE_CG" 2>/dev/null
+}
+trap bg_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# retry on empty completion (local model quirk: some phrasings return nothing)
+# pi runs in background + wait so a trapped TERM/INT fires immediately
+# (a trapped signal during a foreground command is deferred until it returns)
+pi_pid=""
+rawf="/tmp/pi-bg-${run_id}-raw.out"
+errf="/tmp/pi-bg-${run_id}-err.log"
+for attempt in 1 2 3; do
+  if [ "$wt_mode" -eq 1 ]; then
+    ( cd "$wt_path" && exec pi -p --no-extensions "$@" ) > "$rawf" 2> "$errf" &
+  else
+    pi -p --no-extensions "$@" > "$rawf" 2> "$errf" &
+  fi
+  pi_pid=$!
+  wait "$pi_pid"; rc=$?; pi_pid=""
+  out="$(cat "$rawf")"
+  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] && break
+  echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
+  sleep 3
+done
+
+# --- webdrop: full prompt + full output behind a link (channel gets a brief) ---
+# pf/of are always written: the exit trap uses out.md to detect a silent death
+pf="/tmp/pi-bg-${run_id}-prompt.md"
+of="/tmp/pi-bg-${run_id}-out.md"
+{ printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$pf"
+printf '%s\n' "$out" > "$of"
+if command -v webdrop >/dev/null 2>&1; then
+  purl="$(webdrop "$pf" "pi-bg-${run_id}-prompt" --ttl 7d 2>/dev/null | tail -1)" || purl=""
+  ourl="$(webdrop "$of" "pi-bg-${run_id}-out" --ttl 7d 2>/dev/null | tail -1)" || ourl=""
+fi
+
+if [ -n "$webhook" ]; then
+  if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    # empty output: rc!=0 means pi died (killed/crashed), rc==0 is the
+    # local-model empty-completion quirk (retried 3x already)
+    [ $rc -ne 0 ] && status="DIED" || status="EMPTY"
+  else
+    status="OK"; [ $rc -ne 0 ] && status="FAIL"
+  fi
+  # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
+  verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
+  bg_build /tmp/pi-bg-${run_id}-body.json "$status" "${out:0:400}" "$rc" "$verdict"
   if [ -s /tmp/pi-bg-${run_id}-body.json ]; then
-    curl -s -o /dev/null -X POST "$webhook" -H 'Content-Type: application/json' \
-      --data @/tmp/pi-bg-${run_id}-body.json
+    bg_post /tmp/pi-bg-${run_id}-body.json
   else
     # fallback: legacy plain text if the embed builder failed
+    bodyf="/tmp/pi-bg-${run_id}-body-plain.json"
     body="[bg:${profile}:${status}] cwd=$(pwd) task=${task:0:120}\n\n${out:0:400}"
-    curl -s -o /dev/null -X POST "$webhook" -H 'Content-Type: application/json' \
-      --data "$(python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body")"
+    python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body" > "$bodyf"
+    bg_post "$bodyf" || rm -f "$bodyf"
   fi
 fi
 
