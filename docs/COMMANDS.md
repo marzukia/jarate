@@ -187,10 +187,14 @@ an immediate reply.
 
 While pi is compacting, messages sent to the channel are queued
 (`[queued] N in line`) instead of starting a run, so they cannot interrupt or
-kill the compaction; they drain in order when the compaction settles. Commands
-behave the same: `/status`, `/jobs`, `/sleep` stay read-only, `/stop` clears
-the window and stops (owner only), `/compact` answers `[!] already
-compacting`, everything else is queued. If no completion event arrives, the
+kill the compaction; they drain in order when the compaction settles. While
+ANY channel is compacting, queued messages from every channel wait without
+arming the mid-run interrupt (compaction is session-wide; an interrupt
+aborts it). Commands behave the same: `/status`, `/jobs`, `/sleep` stay
+read-only, `/stop` clears the window and stops (owner only; a non-owner
+`/stop` mid-compaction gets an immediate `[!] owner only` instead of being
+queued), `/compact` answers `[!] already compacting`, everything else is
+queued. If no completion event arrives, the
 window clears itself after 10 minutes (logged with a warning).
 
 ### /model

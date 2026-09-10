@@ -1677,7 +1677,18 @@ export default function (pi: ExtensionAPI) {
   const settleCompacting = (ctx: ExtensionContext): void => {
     for (const id of [...compactingChannels.keys()]) clearCompacting(id);
     const started = flushPendingCompact(ctx);
-    if (!started) drainQueuedAfterCompact(pi, ctx);
+    if (started) return;
+    // Drain on BOTH settle paths, but deferred one macrotask. pi's SUCCESS
+    // path emits session_compact BEFORE clearing its own compaction state
+    // (agent-session.js: emit, then _clearManualCompactionState), and the
+    // extension runner awaits the handler inside the emit — so at event
+    // time ctx.isIdle() is still false there, and a synchronous drain
+    // bails (the queued message then stalls until the next inbound). The
+    // failure path clears state before emitting, so the deferral is
+    // harmless there. By the time the timer fires pi has cleared state
+    // and isIdle() is true; if a run started in between, the drain
+    // no-ops and that run's agent_end owns delivery.
+    setTimeout(() => drainQueuedAfterCompact(pi, ctx), 0);
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
@@ -2146,8 +2157,12 @@ async function runChannelCommand(
   switch (name.toLowerCase()) {
     case "stop": {
       // /stop while compacting is owner-only (isOwner pattern): it aborts
-      // the in-flight compaction, a state change, not a read.
-      if (isCompacting(ch.id) && !isOwner) return ownerOnly;
+      // the in-flight compaction, a state change, not a read. Answer
+      // immediately for non-owners (even plain text): a queued /stop would
+      // re-run ungated after the window closes and drop the channel's
+      // re-wake queue (including owner messages) + abort the next run.
+      if (isCompacting(ch.id) && !isOwner)
+        return { immediate: "[!] owner only" };
       clearCompacting(ch.id); // the abort's settle (session_compact_failed)
       // re-clears + drains; the queue drop below wins for THIS /stop
       // A4: drain the mid-turn re-wake queue so /stop does not immediately
@@ -3014,7 +3029,12 @@ export async function handleInbound(
     // mid-run interrupt (an interrupt aborts the compaction). It drains
     // when the compaction settles (drainQueuedAfterCompact) or at the
     // next agent_end.
-    const arm = armInterrupt && !isCompacting(ch.id);
+    // Compaction is session-wide (one shared pi session): an interrupt
+    // from ANY channel calls ctx.abort(), which aborts the in-flight
+    // compaction (agent-session.js abort() → abortCompaction). So suppress
+    // arming for every channel while ANY window is open, not just the
+    // compacting one — a ch2 interrupt would otherwise kill ch1's compact.
+    const arm = armInterrupt && compactingChannels.size === 0;
     const pos = queueMidTurnInbound(ch.id, msg, text, gateTitle, display, arm);
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.

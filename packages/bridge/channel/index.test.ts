@@ -2125,6 +2125,13 @@ describe("compaction-queue guard", () => {
   });
 
   const tick = () => new Promise((r) => setTimeout(r, 0));
+  // The settle drain is macrotask-deferred, and the re-wake handleInbound
+  // chain has its own awaits before pi.sendMessage — settle a few ticks.
+  const settleTicks = async () => {
+    await tick();
+    await tick();
+    await tick();
+  };
 
   const channelPosts = (chId = "ch1") =>
     fetchCalls
@@ -2306,15 +2313,19 @@ describe("compaction-queue guard", () => {
     expect(piSends().length).toBe(0); // not sent to pi yet
   });
 
-  test("queued messages drain after completion (session_compact re-wake)", async () => {
+  test("queued message delivered on the SUCCESS settle without further inbound (pi emits session_compact BEFORE clearing its compaction state, so isIdle() is still false at event time)", async () => {
     ctx.compact = () => {};
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
-    ctx.isIdle = () => false;
+    ctx.isIdle = () => false; // compaction in flight
     await handleInbound(pi, inbound("queued one", "m2"), ctx);
     await handleInbound(pi, inbound("queued two", "m3"), ctx);
     expect(piSends().length).toBe(0);
 
-    ctx.isIdle = () => true; // compaction done
+    // pi real ordering (agent-session.js): await emit(session_compact) with
+    // _compactionAbortController still set -> isIdle() false DURING the
+    // handler; _clearManualCompactionState() runs only after the emit
+    // returns. The settle drain is macrotask-deferred, so it must survive
+    // the false-at-event-time isIdle.
     handlers.session_compact?.(
       {
         compactionEntry: {},
@@ -2324,11 +2335,13 @@ describe("compaction-queue guard", () => {
       },
       ctx,
     );
-    await tick();
-    // one re-wake per settle; the run's agent_end drains the rest
+    ctx.isIdle = () => true; // _clearManualCompactionState() ran
+    await settleTicks();
+    // No further inbound: the queued message is re-woken by the settle.
     const first = piSends().find((s) => s.m.details?.body === "queued one");
     expect(first).toBeDefined();
     expect(first?.o?.triggerTurn).toBe(true);
+    // one re-wake per settle; the run's agent_end drains the rest
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
   });
 
@@ -2337,6 +2350,8 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     ctx.isIdle = () => false;
     await handleInbound(pi, inbound("queued one", "m2"), ctx);
+    // pi real ordering (failure path): _clearManualCompactionState() runs
+    // BEFORE the emit, so isIdle() is already true at event time.
     ctx.isIdle = () => true;
     handlers.session_compact_failed?.(
       {
@@ -2348,7 +2363,7 @@ describe("compaction-queue guard", () => {
       },
       ctx,
     );
-    await tick();
+    await settleTicks();
     expect(piSends().some((s) => s.m.details?.body === "queued one")).toBe(
       true,
     );
@@ -2385,14 +2400,18 @@ describe("compaction-queue guard", () => {
     expect(channelPosts().some((t) => t === "[-] stopped")).toBe(true);
   });
 
-  test("/stop while compacting is owner-only: non-owner is queued, window stays", async () => {
+  test("/stop while compacting is owner-only: non-owner gets an immediate reply, nothing queued, window stays", async () => {
     ctx.compact = () => {};
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     ctx.isIdle = () => false;
     await handleInbound(pi, inbound("/stop", "m2", "ch1", "other"), ctx);
     await tick();
     expect(isCompacting("ch1")).toBe(true); // window untouched
-    expect(midTurnQueues.get("ch1")?.[0]?.msg.body).toBe("/stop"); // fell through, queued like plain
+    expect(channelPosts().some((t) => t === "[!] owner only")).toBe(true);
+    // Not queued: a queued /stop would re-run ungated after the window
+    // closes and drop the channel's re-wake queue + abort the next run.
+    expect(midTurnQueues.has("ch1")).toBe(false);
+    expect(piSends().length).toBe(0);
     expect(pendingInterrupts.has("ch1")).toBe(false);
   });
 
@@ -2435,10 +2454,12 @@ describe("compaction-queue guard", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     expect(pendingInterrupts.has("ch1")).toBe(false);
 
-    // ch2: queued too (isIdle false) but interrupt ARMED (not compacting)
+    // ch2: queued too (isIdle false) and interrupt NOT armed — compaction
+    // is session-wide, a ch2 interrupt (ctx.abort()) would kill ch1's
+    // compaction, so arming is suppressed while ANY window is open.
     await handleInbound(pi, inbound("ch2 msg", "m3", "ch2"), ctx);
     expect(midTurnQueues.get("ch2")?.length).toBe(1);
-    expect(pendingInterrupts.get("ch2")?.length).toBe(1);
+    expect(pendingInterrupts.has("ch2")).toBe(false);
 
     // ch2 /compact is allowed (its own window is closed): it defers behind
     // the session-wide in-flight compaction
