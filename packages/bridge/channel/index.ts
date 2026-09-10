@@ -965,6 +965,8 @@ export default function (pi: ExtensionAPI) {
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
+  let statusTick: ReturnType<typeof setInterval> | null = null;
+  let lastToolAction: string | null = null;
 
   // Mid-run interrupt: when an armed timer fires, abort the in-flight step
   // and, once the session settles, send the queued message as a fresh run
@@ -1110,6 +1112,10 @@ export default function (pi: ExtensionAPI) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
+    if (statusTick) {
+      clearInterval(statusTick);
+      statusTick = null;
+    }
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
@@ -1146,6 +1152,28 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ─── Live status line (edit-in-place, deleted at run end) ───
+  // 5s tick: the block shows elapsed time (5s, 10s, 15s, ...) even while no
+  // tool call has fired yet (model thinking) - "┣ working… 10s". (Andryo
+  // 2026-09-10.) Self-clears when the run closes or the block is gone.
+  const startStatusTick = () => {
+    if (statusTick) clearInterval(statusTick);
+    statusTick = setInterval(() => {
+      if (!runOpen || !statusMsgId || !lastActiveChannel) {
+        if (statusTick) clearInterval(statusTick);
+        statusTick = null;
+        return;
+      }
+      const ch = lastActiveChannel;
+      if (ch.type !== "discord" || statusChannelId !== ch.id) return;
+      const secs = Math.floor((Date.now() - runStartedAt) / 1000);
+      const inc = Math.floor(secs / 5) * 5;
+      const text = lastToolAction
+        ? `${lastToolAction} · ${runToolCount} call${runToolCount === 1 ? "" : "s"} · ${inc}s`
+        : `┣ working… ${inc}s`;
+      editDiscordMessage(ch, statusMsgId, text).catch(() => {});
+    }, 5000);
+  };
+
   pi.on("tool_call", async (event) => {
     if (!lastActiveChannel) return;
     const ch = lastActiveChannel;
@@ -1153,6 +1181,7 @@ export default function (pi: ExtensionAPI) {
       // new channel: this channel gets its own line (old channel's line stays)
       statusMsgId = null;
       statusChannelId = ch.id;
+      lastToolAction = null;
     }
     if (!runOpen) {
       runOpen = true;
@@ -1170,11 +1199,8 @@ export default function (pi: ExtensionAPI) {
       }
     }
     runToolCount += 1;
-    const line = statusLine(
-      formatToolCallLine(event.toolName, event.input),
-      runToolCount,
-      runStartedAt,
-    );
+    lastToolAction = formatToolCallLine(event.toolName, event.input);
+    const line = statusLine(lastToolAction, runToolCount, runStartedAt);
     toolCallsThisTurn.push(line);
     try {
       if (!statusMsgId) {
@@ -1182,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
           statusMsgAt = Date.now();
+          startStatusTick();
         } else if (!r.success)
           console.error(
             `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -1207,6 +1234,7 @@ export default function (pi: ExtensionAPI) {
     if (!runOpen) {
       runOpen = true;
       runToolCount = 0;
+      lastToolAction = null;
       runStartedAt = Date.now();
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
@@ -1222,6 +1250,7 @@ export default function (pi: ExtensionAPI) {
         statusMsgId = r.messageId;
         statusChannelId = ch.id;
         statusMsgAt = Date.now();
+        startStatusTick();
       }
     }
     console.log("[channel] typing indicator started");
@@ -1355,6 +1384,11 @@ export default function (pi: ExtensionAPI) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
+    if (statusTick) {
+      clearInterval(statusTick);
+      statusTick = null;
+    }
+    lastToolAction = null;
     agentBusy = false;
     refreshActivity(ctx);
     // /undo store: finalize THIS run's snapshot before the re-wake below
