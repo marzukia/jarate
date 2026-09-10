@@ -1343,6 +1343,12 @@ const SLASH_COMMANDS = [
   { name: "help", description: "List the commands" },
   { name: "status", description: "Session stats (owner)" },
   { name: "reset", description: "Restart the session (owner)" },
+  { name: "restart", description: "Restart pi, resuming this session (owner)" },
+  {
+    name: "undo",
+    description: "Revert last assistant turn: files + conversation (owner)",
+  },
+  { name: "redo", description: "Reapply an /undo (one level deep, owner)" },
   {
     name: "verbose",
     description: "Forward tool calls (owner)",
