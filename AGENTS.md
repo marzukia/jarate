@@ -8,6 +8,8 @@ agent stack). Read this before touching anything.
 - `packages/bridge/` — the Discord bridge, `@jarate/bridge` (TypeScript, bun,
   strict tsc). Source of truth for the bridge; the live boxes run rsync
   copies of this dir.
+- `packages/recall/` — `@jarate/recall`, the RAG CLI (`bun recall ingest|query`).
+  TS port of the old Python pgrag (removed 2026-09-10); db `rag` unchanged.
 - `dispatch/` — `pi-bg`, `pi-wait` bash scripts (the orchestration machinery).
 - `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
@@ -20,6 +22,9 @@ agent stack). Read this before touching anything.
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit   # must stay clean
 cd packages/bridge && bun x bun test       # 168 pass, 0 fail
+cd packages/recall && bun x tsc --noEmit   # must stay clean
+cd packages/recall && bun test             # unit + integration (integration
+                                           # skips if Postgres/Ollama unreachable)
 bunx biome check .                 # from repo root; 0 diagnostics
 bunx biome check --write .         # fix formatting + safe lints
 bash install.sh --dry-run          # installer regression check

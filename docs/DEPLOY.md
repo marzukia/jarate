@@ -35,8 +35,8 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
    - `~/scripts/pi-bg` -> `<jarate>/dispatch/pi-bg`
    - `~/scripts/pi-wait` -> `<jarate>/dispatch/pi-wait`
    - `~/bin/agent-say` -> `<jarate>/bin/agent-say`
-   - `~/projects/pgrag` -> `<jarate>/packages/memory` (only if the dest is
-     absent or already this symlink)
+   - `~/projects/recall` -> `<jarate>/packages/recall` (only if the dest is
+     absent or already this symlink; replaces the old `pgrag` symlink)
 
 Guarantees:
 
@@ -50,24 +50,27 @@ Guarantees:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# done. pi-bg/pi-wait/agent-say/pgrag are symlinks - they update instantly.
+# done. pi-bg/pi-wait/agent-say/recall are symlinks - they update instantly.
 # Only bridge (channel/) changes need a pi.service restart.
 ```
 
-## pgrag (packages/memory)
+## recall (packages/recall)
 
-Source of truth: `packages/memory/` in this repo (full git history of
-monkytheluffy/pgrag merged 2026-09-10). The box copy `~/projects/pgrag` is a
-**symlink** into the checkout; its `.venv` is machine-local (gitignored).
+Source of truth: `packages/recall/` in this repo (TypeScript port of the
+Python pgrag, 2026-09-10; full git history of monkytheluffy/pgrag lives
+under `packages/memory/` in the old refs). The box copy `~/projects/recall`
+is a **symlink** into the checkout; it **replaces the old `~/projects/pgrag`
+symlink** (orchestrator migrates the box link).
 
-First-time venv (uv resolves inline script deps):
+No venv: deps install with the workspace `bun install`. Smoke test:
 
 ```bash
-cd <jarate>/packages/memory && uv run query.py "ping"
+cd <jarate>/packages/recall && bun recall query "ping"
 ```
 
-Fresh DB setup (role, embed host, first ingest, env): see PGRAG-SETUP.md.
-`install.sh` never touches the database.
+The db `rag` data is unchanged — no data migration; only the CLI moved from
+`uv run` to `bun recall`. Fresh DB setup (role, embed host, first ingest,
+env): see PGRAG-SETUP.md. `install.sh` never touches the database.
 
 ## Migrating a box off the old rsync layout (one-time)
 
@@ -77,7 +80,7 @@ The old layout rsynced `packages/bridge/` -> `~/.pi/agent/piscord` and
 ```bash
 cd <jarate> && git pull --ff-only
 # 1. move machine-local pgrag state into the checkout
-mv ~/projects/pgrag/.venv <jarate>/packages/memory/.venv   # if present
+mv ~/projects/pgrag/.venv <jarate>/packages/recall/.venv   # if present
 rm -rf ~/projects/pgrag                                     # old rsync dest
 # 2. bootstrap (makes the symlinks, bun install)
 ./install.sh --jarate-dir <jarate>

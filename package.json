@@ -8,8 +8,8 @@
   ],
   "scripts": {
     "lint": "bunx biome check .",
-    "test": "cd packages/bridge && bun x bun test",
-    "typecheck": "cd packages/bridge && bun x tsc --noEmit"
+    "test": "cd packages/bridge && bun x bun test && cd ../recall && bun test",
+    "typecheck": "cd packages/bridge && bun x tsc --noEmit && cd ../recall && bun x tsc --noEmit"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12"
