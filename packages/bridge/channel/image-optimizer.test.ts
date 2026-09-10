@@ -1,9 +1,11 @@
-import { test, expect } from "bun:test";
+import { expect, test } from "bun:test";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 
 const sharpModule = await import("sharp").catch(() => null);
 const hasSharp = Boolean(sharpModule);
-const sharp: any = hasSharp ? (sharpModule as any).default ?? sharpModule : null;
+const sharp: any = hasSharp
+  ? ((sharpModule as any).default ?? sharpModule)
+  : null;
 
 /** sharp 0.34 has no .create() — build images from raw buffers instead. */
 function rawSharp(width: number, height: number, background = "#fff") {

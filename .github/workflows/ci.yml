@@ -16,14 +16,14 @@ jobs:
       - name: Biome check
         run: bunx biome check .
 
-  piscord:
+  bridge:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - name: Install
-        run: cd piscord && bun install
+        run: cd packages/bridge && bun install
       - name: Typecheck
-        run: cd piscord && bun x tsc --noEmit
+        run: cd packages/bridge && bun x tsc --noEmit
       - name: Test
-        run: cd piscord && bun x bun test
+        run: cd packages/bridge && bun x bun test

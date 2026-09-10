@@ -2,7 +2,7 @@
 # jarate installer — idempotent.
 #
 # Syncs the pi agent stack onto the calling user's box:
-#   1. piscord/  -> $PISCORD_DIR (default ~/.pi/agent/piscord)
+#   1. packages/bridge/  -> $BRIDGE_DIR (default ~/.pi/agent/piscord)
 #      rsync --delete, preserves .git and node_modules at the destination.
 #      Runs `bun install` there only if package.json changed.
 #   2. dispatch/pi-bg, dispatch/pi-wait -> ~/scripts/
@@ -14,26 +14,31 @@
 #   5. git config core.hooksPath .githooks (source checkout only, idempotent)
 #
 # Usage:
-#   ./install.sh [--dry-run] [--piscord-dir DIR] [--pgrag-dir DIR]
+#   ./install.sh [--dry-run] [--bridge-dir DIR] [--pgrag-dir DIR]
+#
+#   --piscord-dir DIR is a deprecated alias for --bridge-dir (one release).
 #
 # Guarantees:
-#   - never touches ~/.pi/agent/settings.json (it lives outside $PISCORD_DIR)
+#   - never touches ~/.pi/agent/settings.json (it lives outside $BRIDGE_DIR)
 #   - never restarts or kills pi processes; prints a restart reminder
 #
 # Frank variant (bridge is a git checkout, keep its .git, don't restart):
-#   ./install.sh --piscord-dir /home/frank/git/piscord
+#   ./install.sh --bridge-dir /home/frank/projects/jarate/packages/bridge
 
 set -euo pipefail
 
 DRY=0
-PISCORD_DIR="${HOME}/.pi/agent/piscord"
+BRIDGE_DIR="${HOME}/.pi/agent/piscord"
 PGRAG_DIR="${HOME}/projects/pgrag"
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
-    --piscord-dir) PISCORD_DIR="${2:?--piscord-dir needs a path}"; shift ;;
+    --bridge-dir) BRIDGE_DIR="${2:?--bridge-dir needs a path}"; shift ;;
+    --piscord-dir)
+      echo "[!] --piscord-dir is deprecated; use --bridge-dir (alias, one release)"
+      BRIDGE_DIR="${2:?--piscord-dir needs a path}"; shift ;;
     --pgrag-dir) PGRAG_DIR="${2:?--pgrag-dir needs a path}"; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,22p'; exit 0 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,23p'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -49,29 +54,29 @@ run() {
   fi
 }
 
-[ -d "$SRC/piscord" ] || { echo "install.sh: $SRC/piscord missing (run from the jarate checkout)" >&2; exit 1; }
+[ -d "$SRC/packages/bridge" ] || { echo "install.sh: $SRC/packages/bridge missing (run from the jarate checkout)" >&2; exit 1; }
 command -v rsync >/dev/null || { echo "install.sh: rsync not found" >&2; exit 1; }
 
 echo "== jarate install (dry-run=$DRY, user=$(id -un))"
 
-# --- 1. piscord sync ------------------------------------------------------
+# --- 1. bridge sync (packages/bridge) -------------------------------------
 pkg_hash() { sha256sum "$1" | cut -d' ' -f1; }
-src_pkg="$SRC/piscord/package.json"
+src_pkg="$SRC/packages/bridge/package.json"
 pre_pkg=""
-[ -f "$PISCORD_DIR/package.json" ] && pre_pkg="$(pkg_hash "$PISCORD_DIR/package.json")"
+[ -f "$BRIDGE_DIR/package.json" ] && pre_pkg="$(pkg_hash "$BRIDGE_DIR/package.json")"
 post_pkg_hash="$(pkg_hash "$src_pkg")"
 
 if [ "$DRY" = 1 ]; then
-  echo "[dry-run] rsync -a --delete --exclude .git --exclude node_modules $SRC/piscord/ $PISCORD_DIR/"
+  echo "[dry-run] rsync -a --delete --exclude .git --exclude node_modules $SRC/packages/bridge/ $BRIDGE_DIR/"
 else
-  mkdir -p "$PISCORD_DIR"
-  rsync -a --delete --exclude .git --exclude node_modules "$SRC/piscord/" "$PISCORD_DIR/"
+  mkdir -p "$BRIDGE_DIR"
+  rsync -a --delete --exclude .git --exclude node_modules "$SRC/packages/bridge/" "$BRIDGE_DIR/"
 fi
-echo "  piscord: $SRC/piscord/ -> $PISCORD_DIR"
+echo "  bridge: $SRC/packages/bridge/ -> $BRIDGE_DIR"
 
 if [ "$pre_pkg" != "$post_pkg_hash" ]; then
   if command -v bun >/dev/null; then
-    run bun install --cwd "$PISCORD_DIR"
+    run bun install --cwd "$BRIDGE_DIR"
     echo "  bun install: ran (package.json changed)"
   else
     echo "  WARN: package.json changed but bun not found; skipping bun install"
@@ -137,5 +142,5 @@ fi
 # --- summary ---------------------------------------------------------------
 echo
 echo "== done (settings.json untouched, no pi processes touched)"
-echo "REMINDER: restart pi.service to pick up the new piscord, if it is running on this box."
+echo "REMINDER: restart pi.service to pick up the new bridge, if it is running on this box."
 echo "  XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service"

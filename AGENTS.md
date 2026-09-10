@@ -5,8 +5,9 @@ agent stack). Read this before touching anything.
 
 ## Layout
 
-- `piscord/` — the Discord bridge (TypeScript, bun, strict tsc). Source of
-  truth for the bridge; the live boxes run rsync copies of this dir.
+- `packages/bridge/` — the Discord bridge, `@jarate/bridge` (TypeScript, bun,
+  strict tsc). Source of truth for the bridge; the live boxes run rsync
+  copies of this dir.
 - `dispatch/` — `pi-bg`, `pi-wait` bash scripts (the orchestration machinery).
 - `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
@@ -16,9 +17,9 @@ agent stack). Read this before touching anything.
 ## Commands
 
 ```bash
-cd piscord && bun install
-cd piscord && bun x tsc --noEmit   # must stay clean
-cd piscord && bun x bun test       # 168 pass, 0 fail
+cd packages/bridge && bun install
+cd packages/bridge && bun x tsc --noEmit   # must stay clean
+cd packages/bridge && bun x bun test       # 168 pass, 0 fail
 bunx biome check .                 # from repo root; 0 diagnostics
 bunx biome check --write .         # fix formatting + safe lints
 bash install.sh --dry-run          # installer regression check
@@ -27,7 +28,8 @@ bash install.sh --dry-run          # installer regression check
 ## Rules
 
 - **Do not touch live boxes:** `~/.pi/agent/settings.json`,
-  `~/.pi/agent/piscord`, `/home/frank/git/piscord` are live deployments, not
+  `~/.pi/agent/piscord`, `/home/frank/projects/jarate/packages/bridge` are
+  live deployments, not
   part of this repo. Never edit, restart, or `git config` anything there.
   (Reading them for reference is fine.)
 - **Never restart `pi.service`** as part of a change. Restart reminders are
@@ -49,15 +51,16 @@ bash install.sh --dry-run          # installer regression check
   **reactions** (the 👀 inbound ack is a reaction and stays).
 - Applies to new code; don't bulk-strip emoji outside your change's scope.
 - `marzukia/piscord` (the standalone repo) stays untouched. jarate
-  (`piscord/`) is the source of truth; do not re-sync from the old repo.
+  (`packages/bridge/`) is the source of truth; do not re-sync from the old
+  repo.
 
 ## Test expectations
 
-- Any change under `piscord/`: tsc clean + all 168 tests pass, before
+- Any change under `packages/bridge/`: tsc clean + all 168 tests pass, before
   committing.
 - Biome must be clean at the repo root before committing (pre-commit hook
   enforces it; if you bypass git, run `bunx biome check .`).
-- Behavior changes in `piscord/` need a test. Format/lint-only changes need
+- Behavior changes in `packages/bridge/` need a test. Format/lint-only changes need
   zero behavior diff — prove it by running the suite.
 
 ## PR flow
@@ -68,12 +71,12 @@ bash install.sh --dry-run          # installer regression check
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
    merge: `~/scripts/pi-bg reviewer "adversarially review <branch/PR> ..."`.
-5. Merge only on PASS + green `ci` (biome + piscord jobs).
+5. Merge only on PASS + green `ci` (biome + bridge jobs).
 
 ## Do-not-touch list
 
 - `~/.pi/agent/settings.json` on live boxes (bot tokens)
-- `/home/monky/.pi/agent/piscord`, `/home/frank/git/piscord` (live checkouts)
+- `/home/monky/.pi/agent/piscord`, `/home/frank/projects/jarate/packages/bridge` (live checkouts)
 - `pi.service` (never restart from within a task)
 - `marzukia/piscord` repo (legacy upstream)
 - `bun.lock` churn beyond what `bun install` does

@@ -31,7 +31,7 @@
   },
   "overrides": [
     {
-      "includes": ["piscord/**/*.ts"],
+      "includes": ["packages/bridge/**/*.ts"],
       "linter": {
         "rules": {
           "style": {

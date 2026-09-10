@@ -15,9 +15,10 @@ const BTW_SUFFIX_RE = /(?:[.!?,;:])\s*btw\.?\s*$|\n\s*btw\.?\s*$/i;
 export const BTW_HINT =
   "Side question (btw): answer briefly, in one or two sentences.";
 
-export function extractBtwSuffix(
-  content: string,
-): { prompt: string; forceBtw: boolean } {
+export function extractBtwSuffix(content: string): {
+  prompt: string;
+  forceBtw: boolean;
+} {
   if (!BTW_SUFFIX_RE.test(content)) {
     return { prompt: content, forceBtw: false };
   }

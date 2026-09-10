@@ -4,31 +4,26 @@ import * as os from "node:os";
 import * as path from "node:path";
 import extension, {
   buildInteractionHandler,
+  buildRepliedMessageBlock,
   chunkText,
   collectFinals,
   earlySendText,
-  buildRepliedMessageBlock,
   failurePostText,
   fileOnlyPrompt,
   handleInbound,
   matchCommand,
+  midTurnQueues,
   parseJobsFromPs,
-  registerTodoTool,
-  runShellPassthrough,
   parseReplyTo,
   pendingAttachments,
   prunePendingBatches,
-  recordFinalRepeat,
   REPEAT_WARNING,
-  resetFinalRepeats,
-  midTurnQueues,
-  queueMidTurnInbound,
-  popOldestQueuedInbound,
-  clearQueuedInbound,
+  registerTodoTool,
+  runShellPassthrough,
   TODO_TOOL_DESCRIPTION,
 } from "./index";
-import { loadBoard, saveBoard, renderBoard, type TodoBoard } from "./todos";
-import { loadChannelConfig, type ChannelMessage } from "./types";
+import { loadBoard, renderBoard, saveBoard } from "./todos";
+import { type ChannelMessage, loadChannelConfig } from "./types";
 
 describe("chunkText", () => {
   test("short fenced block is unchanged", () => {
@@ -51,7 +46,7 @@ describe("chunkText", () => {
       .map((c) => c.replace(/^```js\n/, "").replace(/\n```$/, ""))
       .join("\n")
       .replace(/\n/g, "");
-    expect(stripped).toBe(line + "const y = 2");
+    expect(stripped).toBe(`${line}const y = 2`);
   });
 
   test("single oversized code line inside a fence is split (M1)", () => {
@@ -85,7 +80,12 @@ describe("collectFinals", () => {
 
   test("pairs each final with the nearest preceding inbound (L4)", () => {
     // Steering run shape: [A, X, B, Y] must thread X → A and Y → B.
-    const finals = collectFinals([inbound("A"), assistantText("X"), inbound("B"), assistantText("Y")]);
+    const finals = collectFinals([
+      inbound("A"),
+      assistantText("X"),
+      inbound("B"),
+      assistantText("Y"),
+    ]);
     expect(finals).toEqual([
       { text: "X", replyTo: "A" },
       { text: "Y", replyTo: "B" },
@@ -95,7 +95,10 @@ describe("collectFinals", () => {
   test("tool-call turns are not finals (L4)", () => {
     const finals = collectFinals([
       inbound("A"),
-      { role: "assistant", content: [{ type: "toolCall", toolName: "read", arguments: {} }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", toolName: "read", arguments: {} }],
+      },
       assistantText("done"),
     ]);
     expect(finals).toEqual([{ text: "done", replyTo: "A" }]);
@@ -111,7 +114,10 @@ describe("collectFinals", () => {
       customType: "channel-inbound",
       details: { messageId: "333", messageIds: ["111", "222", "333"] },
     };
-    const finals = collectFinals([burst, assistantText("<reply-to:111>\nthanks andy")]);
+    const finals = collectFinals([
+      burst,
+      assistantText("<reply-to:111>\nthanks andy"),
+    ]);
     expect(finals).toEqual([{ text: "thanks andy", replyTo: "111" }]);
   });
 
@@ -120,7 +126,10 @@ describe("collectFinals", () => {
       customType: "channel-inbound",
       details: { messageId: "333", messageIds: ["111", "222", "333"] },
     };
-    const finals = collectFinals([burst, assistantText("done, see above <reply-to: 222 >")]);
+    const finals = collectFinals([
+      burst,
+      assistantText("done, see above <reply-to: 222 >"),
+    ]);
     expect(finals).toEqual([{ text: "done, see above ", replyTo: "222" }]);
   });
 
@@ -152,8 +161,16 @@ describe("parseJobsFromPs (/jobs)", () => {
       "",
     ].join("\n");
     expect(parseJobsFromPs(ps)).toEqual([
-      { age: "00:42", profile: "worker", task: "Resume the jarate migration stuff" },
-      { age: "01:05:03", profile: "reviewer", task: "Check PR #15 for regressions" },
+      {
+        age: "00:42",
+        profile: "worker",
+        task: "Resume the jarate migration stuff",
+      },
+      {
+        age: "01:05:03",
+        profile: "reviewer",
+        task: "Check PR #15 for regressions",
+      },
     ]);
   });
 
@@ -180,11 +197,17 @@ describe("parseReplyTo", () => {
   });
 
   test("strips a tag anywhere in the text", () => {
-    expect(parseReplyTo("a <reply-to:123> b")).toEqual({ text: "a  b", replyTo: "123" });
+    expect(parseReplyTo("a <reply-to:123> b")).toEqual({
+      text: "a  b",
+      replyTo: "123",
+    });
   });
 
   test("no tag: text unchanged, replyTo undefined", () => {
-    expect(parseReplyTo("plain text")).toEqual({ text: "plain text", replyTo: undefined });
+    expect(parseReplyTo("plain text")).toEqual({
+      text: "plain text",
+      replyTo: undefined,
+    });
   });
 
   test("non-numeric payload is not a tag", () => {
@@ -206,7 +229,9 @@ describe("parseReplyTo", () => {
   });
 
   test("tag outside a fence next to a fenced tag is honored, fenced one kept", () => {
-    expect(parseReplyTo("```\n<reply-to:111>\n```\nsee above <reply-to:222>")).toEqual({
+    expect(
+      parseReplyTo("```\n<reply-to:111>\n```\nsee above <reply-to:222>"),
+    ).toEqual({
       text: "```\n<reply-to:111>\n```\nsee above ",
       replyTo: "222",
     });
@@ -222,7 +247,10 @@ describe("parseReplyTo", () => {
 
 describe("fileOnlyPrompt", () => {
   const att = (filename: string) => ({
-    id: "1", filename, contentType: "image/jpeg", size: 1024,
+    id: "1",
+    filename,
+    contentType: "image/jpeg",
+    size: 1024,
   });
 
   test("single file uses singular wording", () => {
@@ -242,11 +270,15 @@ describe("prunePendingBatches", () => {
   test("drops batches older than the 10-minute TTL", () => {
     const now = Date.now();
     pendingAttachments.set("ch1", [
-      { folder: ".tmp/attachments/old", files: [], addedAt: now - 11 * 60 * 1000 },
+      {
+        folder: ".tmp/attachments/old",
+        files: [],
+        addedAt: now - 11 * 60 * 1000,
+      },
       { folder: ".tmp/attachments/fresh", files: [], addedAt: now - 60 * 1000 },
     ]);
     const fresh = prunePendingBatches("ch1", now);
-    expect(fresh.map(b => b.folder)).toEqual([".tmp/attachments/fresh"]);
+    expect(fresh.map((b) => b.folder)).toEqual([".tmp/attachments/fresh"]);
     pendingAttachments.delete("ch1");
   });
 
@@ -261,12 +293,24 @@ describe("matchCommand (A3)", () => {
     expect(matchCommand("/stop")).toEqual({ name: "stop", arg: undefined });
     expect(matchCommand("/stop now")).toEqual({ name: "stop", arg: "now" });
     expect(matchCommand("/status")).toEqual({ name: "status", arg: undefined });
-    expect(matchCommand("/reset the table")).toEqual({ name: "reset", arg: "the table" });
+    expect(matchCommand("/reset the table")).toEqual({
+      name: "reset",
+      arg: "the table",
+    });
     expect(matchCommand("/verbose on")).toEqual({ name: "verbose", arg: "on" });
     expect(matchCommand("/help")).toEqual({ name: "help", arg: undefined });
-    expect(matchCommand("/btw what is up")).toEqual({ name: "btw", arg: "what is up" });
-    expect(matchCommand("/compact keep the decisions")).toEqual({ name: "compact", arg: "keep the decisions" });
-    expect(matchCommand("/model hydrogen/qwen3.8-27b")).toEqual({ name: "model", arg: "hydrogen/qwen3.8-27b" });
+    expect(matchCommand("/btw what is up")).toEqual({
+      name: "btw",
+      arg: "what is up",
+    });
+    expect(matchCommand("/compact keep the decisions")).toEqual({
+      name: "compact",
+      arg: "keep the decisions",
+    });
+    expect(matchCommand("/model hydrogen/qwen3.8-27b")).toEqual({
+      name: "model",
+      arg: "hydrogen/qwen3.8-27b",
+    });
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined });
     expect(matchCommand("/todos")).toEqual({ name: "todos", arg: undefined });
     expect(matchCommand("/todos all")).toEqual({ name: "todos", arg: "all" });
@@ -336,11 +380,15 @@ describe("failurePostText (A2)", () => {
   });
 
   test("aborted with errorMessage posts when the run was not user-stopped", () => {
-    expect(failurePostText([failure("aborted", "interrupted")], false)).toBe("[!] interrupted");
+    expect(failurePostText([failure("aborted", "interrupted")], false)).toBe(
+      "[!] interrupted",
+    );
   });
 
   test("aborted with errorMessage is silent when the user stopped the run", () => {
-    expect(failurePostText([failure("aborted", "interrupted")], true)).toBeNull();
+    expect(
+      failurePostText([failure("aborted", "interrupted")], true),
+    ).toBeNull();
   });
 
   test("aborted without errorMessage is silent", () => {
@@ -361,17 +409,30 @@ describe("earlySendText", () => {
   const toolCall = { type: "toolCall", toolName: "bash", arguments: {} };
 
   test("intermediate assistant message (text + toolCall) returns the text", () => {
-    const msg = { role: "assistant", content: [{ type: "text", text: "checking files" }, toolCall] };
+    const msg = {
+      role: "assistant",
+      content: [{ type: "text", text: "checking files" }, toolCall],
+    };
     expect(earlySendText(msg)).toBe("checking files");
   });
 
   test("multiple text blocks are joined", () => {
-    const msg = { role: "assistant", content: [{ type: "text", text: "a " }, { type: "text", text: "b" }, toolCall] };
+    const msg = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "a " },
+        { type: "text", text: "b" },
+        toolCall,
+      ],
+    };
     expect(earlySendText(msg)).toBe("a b");
   });
 
   test("final (text only, no toolCall) returns null", () => {
-    const msg = { role: "assistant", content: [{ type: "text", text: "done" }] };
+    const msg = {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+    };
     expect(earlySendText(msg)).toBeNull();
   });
 
@@ -381,7 +442,12 @@ describe("earlySendText", () => {
   });
 
   test("non-assistant message returns null", () => {
-    expect(earlySendText({ role: "user", content: [{ type: "text", text: "hi" }, toolCall] })).toBeNull();
+    expect(
+      earlySendText({
+        role: "user",
+        content: [{ type: "text", text: "hi" }, toolCall],
+      }),
+    ).toBeNull();
     expect(earlySendText(undefined)).toBeNull();
     expect(earlySendText(null)).toBeNull();
   });
@@ -389,13 +455,22 @@ describe("earlySendText", () => {
   test("thinking tags are stripped from the result", () => {
     const msg = {
       role: "assistant",
-      content: [{ type: "text", text: "\u003cthink\u003epondering\u003c/think\u003eabout to read the file" }, toolCall],
+      content: [
+        {
+          type: "text",
+          text: "\u003cthink\u003epondering\u003c/think\u003eabout to read the file",
+        },
+        toolCall,
+      ],
     };
     expect(earlySendText(msg)).toBe("about to read the file");
   });
 
   test("whitespace-only text returns null", () => {
-    const msg = { role: "assistant", content: [{ type: "text", text: "  \n " }, toolCall] };
+    const msg = {
+      role: "assistant",
+      content: [{ type: "text", text: "  \n " }, toolCall],
+    };
     expect(earlySendText(msg)).toBeNull();
   });
 });
@@ -415,17 +490,35 @@ describe("extension handlers (A1/A2/A4)", () => {
   const realFetch = globalThis.fetch;
 
   const inbound = (body: string, id: string): ChannelMessage => ({
-    channelId: "ch1", channelName: "Test", channelType: "discord",
-    messageId: id, from: "u", fromId: "uid", body,
-    timestamp: new Date().toISOString(), attachments: [], isRoom: false,
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
   });
 
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-test-"));
     fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".pi", "settings.json"), JSON.stringify({
-      channels: [{ id: "ch1", name: "Test", type: "discord", botToken: "tok1", ack: true }],
-    }));
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
     handlers = {};
     sent = [];
     midTurnQueues.clear();
@@ -433,8 +526,12 @@ describe("extension handlers (A1/A2/A4)", () => {
     fetchCalls = [];
     pi = {
       registerMessageRenderer: () => {},
-      on: (n: string, fn: any) => { handlers[n] = fn; },
-      sendMessage: (m: any, o?: any) => { sent.push({ m, o }); },
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
     };
     extension(pi);
     ctx = {
@@ -445,8 +542,17 @@ describe("extension handlers (A1/A2/A4)", () => {
       abort: () => {},
     };
     globalThis.fetch = (async (url: any, init?: any) => {
-      fetchCalls.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
-      return { ok: true, status: 200, json: async () => ({ id: "out1" }), text: async () => "" };
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
     }) as any;
   });
 
@@ -474,9 +580,15 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.message_end({ message: stepFinal }, ctx);
 
-    const posted = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posted = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     expect(posted.length).toBeGreaterThan(0);
-    const unreact = fetchCalls.find(c => c.method === "DELETE" && c.url.includes("/channels/ch1/messages/m123/reactions/"));
+    const unreact = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" &&
+        c.url.includes("/channels/ch1/messages/m123/reactions/"),
+    );
     expect(unreact).toBeDefined();
   });
 
@@ -489,7 +601,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.message_end({ message: stepFinal }, ctx);
 
-    const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     expect(post).toBeDefined();
     const body = JSON.parse(post!.body);
@@ -506,7 +620,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.message_end({ message: stepFinal }, ctx);
 
-    const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     const body = JSON.parse(post!.body);
     expect(body.content).toBe("hi there");
@@ -522,7 +638,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.message_end({ message: stepFinal }, ctx);
 
-    const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     const body = JSON.parse(post!.body);
     expect(body.message_reference?.message_id).toBe("111");
@@ -538,7 +656,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.agent_end({ messages: [failure] }, ctx);
 
-    const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     expect(post).toBeDefined();
     expect(JSON.parse(post!.body).content).toBe("[!] boom");
@@ -559,8 +679,10 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.agent_end({ messages: [failure] }, ctx);
 
     const errors = fetchCalls.filter(
-      c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages")
-        && String(JSON.parse(c.body).content).startsWith("[!]"),
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch1/messages") &&
+        String(JSON.parse(c.body).content).startsWith("[!]"),
     );
     expect(errors.length).toBe(0);
   });
@@ -575,20 +697,29 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.agent_end({ messages: [pureTextFinal] }, ctx);
 
     const placeholder = fetchCalls.find(
-      c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages")
-        && String(JSON.parse(c.body).content).startsWith("┣ working"),
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch1/messages") &&
+        String(JSON.parse(c.body).content).startsWith("┣ working"),
     );
     expect(placeholder).toBeDefined(); // live block existed during the run
-    const deleted = fetchCalls.find(c => c.method === "DELETE" && c.url.includes("/messages/out1"));
+    const deleted = fetchCalls.find(
+      (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
+    );
     expect(deleted).toBeDefined(); // 0 calls: block deleted, not left behind
-    const doneEdit = fetchCalls.find(c => c.method === "PATCH" && String(c.body).includes("┗ done"));
+    const doneEdit = fetchCalls.find(
+      (c) => c.method === "PATCH" && String(c.body).includes("┗ done"),
+    );
     expect(doneEdit).toBeUndefined(); // no "done · 0 calls" line
   });
 
   test("activity block: 1+ tool calls -> closed with done line (regression)", async () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
-    await handlers.tool_call({ toolName: "bash", input: { command: "ls" } }, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
     const withTool = {
       role: "assistant",
       content: [
@@ -598,9 +729,15 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
     await handlers.agent_end({ messages: [withTool] }, ctx);
 
-    const doneEdit = fetchCalls.find(c => c.method === "PATCH" && String(JSON.parse(c.body).content).includes("┗ done · 1 call"));
+    const doneEdit = fetchCalls.find(
+      (c) =>
+        c.method === "PATCH" &&
+        String(JSON.parse(c.body).content).includes("┗ done · 1 call"),
+    );
     expect(doneEdit).toBeDefined(); // block stays, shows the finished run
-    const deleted = fetchCalls.find(c => c.method === "DELETE" && c.url.includes("/messages/out1"));
+    const deleted = fetchCalls.find(
+      (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
+    );
     expect(deleted).toBeUndefined();
   });
 
@@ -657,7 +794,9 @@ describe("extension handlers (A1/A2/A4)", () => {
   test("mid-turn inbound with attachments keeps full context on re-wake", async () => {
     ctx.isIdle = () => false;
     const withAtt = inbound("look at this", "m200");
-    withAtt.attachments = [{ id: "a1", filename: "x.jpg", contentType: "image/jpeg", size: 100 }];
+    withAtt.attachments = [
+      { id: "a1", filename: "x.jpg", contentType: "image/jpeg", size: 100 },
+    ];
     await handleInbound(pi, withAtt, ctx);
     expect(sent.length).toBe(0);
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
@@ -690,16 +829,38 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   test("F2: second-channel inbound during the re-wake await does not retarget the first run's failure post", async () => {
     // Two channels configured so the second channel resolves.
-    fs.writeFileSync(path.join(tmp, ".pi", "settings.json"), JSON.stringify({
-      channels: [
-        { id: "ch1", name: "One", type: "discord", botToken: "tok1", ack: true },
-        { id: "ch2", name: "Two", type: "discord", botToken: "tok2", ack: true },
-      ],
-    }));
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "One",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+          {
+            id: "ch2",
+            name: "Two",
+            type: "discord",
+            botToken: "tok2",
+            ack: true,
+          },
+        ],
+      }),
+    );
     const ch2 = (body: string, id: string): ChannelMessage => ({
-      channelId: "ch2", channelName: "Two", channelType: "discord",
-      messageId: id, from: "u2", fromId: "uid2", body,
-      timestamp: new Date().toISOString(), attachments: [], isRoom: false,
+      channelId: "ch2",
+      channelName: "Two",
+      channelType: "discord",
+      messageId: id,
+      from: "u2",
+      fromId: "uid2",
+      body,
+      timestamp: new Date().toISOString(),
+      attachments: [],
+      isRoom: false,
     });
 
     ctx.isIdle = () => false; // a run is in flight on ch1
@@ -726,10 +887,18 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(sent.length).toBe(1);
     // The ORIGINAL run's failure post targets ch1 (channel captured before
     // the re-wake await), not ch2 — what lastActiveChannel points at after.
-    const ch1Posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
-    expect(ch1Posts.some(c => String(JSON.parse(c.body).content).includes("boom"))).toBe(true);
-    const ch2FailPosts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch2/messages")
-      && String(JSON.parse(c.body).content).includes("boom"));
+    const ch1Posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(
+      ch1Posts.some((c) => String(JSON.parse(c.body).content).includes("boom")),
+    ).toBe(true);
+    const ch2FailPosts = fetchCalls.filter(
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch2/messages") &&
+        String(JSON.parse(c.body).content).includes("boom"),
+    );
     expect(ch2FailPosts.length).toBe(0);
   });
 
@@ -737,7 +906,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     ctx.isIdle = () => false; // a run is in flight
     // 1. File-only message → buffered (no text, no voice note).
     const fileOnly = inbound("", "m300");
-    fileOnly.attachments = [{ id: "b1", filename: "notes.txt", contentType: "text/plain", size: 50 }];
+    fileOnly.attachments = [
+      { id: "b1", filename: "notes.txt", contentType: "text/plain", size: 50 },
+    ];
     await handleInbound(pi, fileOnly, ctx);
     expect(pendingAttachments.get("ch1")?.length).toBe(1);
     expect(sent.length).toBe(0);
@@ -758,36 +929,50 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   test("repetition: 3 consecutive identical finals → abort + one warning, 3rd dropped", async () => {
     let aborts = 0;
-    ctx.abort = () => { aborts++; };
+    ctx.abort = () => {
+      aborts++;
+    };
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
-    const fin = (t: string) => ({ role: "assistant", content: [{ type: "text", text: t }] });
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
     await handlers.message_end({ message: fin("same") }, ctx);
     await handlers.message_end({ message: fin("same") }, ctx);
     await handlers.message_end({ message: fin("same") }, ctx);
 
     expect(aborts).toBe(1);
     const contents = fetchCalls
-      .filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"))
-      .map(c => JSON.parse(c.body).content);
-    expect(contents.filter(t => t === "same").length).toBe(2); // 3rd dropped
-    expect(contents.filter(t => t === REPEAT_WARNING).length).toBe(1);
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => JSON.parse(c.body).content);
+    expect(contents.filter((t) => t === "same").length).toBe(2); // 3rd dropped
+    expect(contents.filter((t) => t === REPEAT_WARNING).length).toBe(1);
 
     // 4th identical does not re-warn (counter reset after the trip).
     await handlers.message_end({ message: fin("same") }, ctx);
     expect(aborts).toBe(1);
     const after = fetchCalls
-      .filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"))
-      .map(c => JSON.parse(c.body).content);
-    expect(after.filter(t => t === REPEAT_WARNING).length).toBe(1);
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => JSON.parse(c.body).content);
+    expect(after.filter((t) => t === REPEAT_WARNING).length).toBe(1);
   });
 
   test("repetition: a different final resets the counter", async () => {
     let aborts = 0;
-    ctx.abort = () => { aborts++; };
+    ctx.abort = () => {
+      aborts++;
+    };
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
-    const fin = (t: string) => ({ role: "assistant", content: [{ type: "text", text: t }] });
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
     for (const t of ["a", "a", "b", "a", "a"]) {
       await handlers.message_end({ message: fin(t) }, ctx);
     }
@@ -796,10 +981,15 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   test("repetition: a new inbound user message resets the counter", async () => {
     let aborts = 0;
-    ctx.abort = () => { aborts++; };
+    ctx.abort = () => {
+      aborts++;
+    };
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
-    const fin = (t: string) => ({ role: "assistant", content: [{ type: "text", text: t }] });
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
     await handlers.message_end({ message: fin("a") }, ctx);
     await handlers.message_end({ message: fin("a") }, ctx);
     await handleInbound(pi, inbound("more", "m2"), ctx); // resets the counter
@@ -810,30 +1000,46 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   test("repetition: agent_end finals trip the guard once, warning posted", async () => {
     let aborts = 0;
-    ctx.abort = () => { aborts++; };
+    ctx.abort = () => {
+      aborts++;
+    };
     await handleInbound(pi, inbound("hello", "m1"), ctx);
-    const fin = (t: string) => ({ role: "assistant", content: [{ type: "text", text: t }] });
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
     await handlers.agent_end({ messages: [fin("x"), fin("x")] }, ctx);
     expect(aborts).toBe(0);
     await handlers.agent_end({ messages: [fin("x")] }, ctx);
     expect(aborts).toBe(1);
     const contents = fetchCalls
-      .filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"))
-      .map(c => JSON.parse(c.body).content);
-    expect(contents.filter(t => t === REPEAT_WARNING).length).toBe(1);
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => JSON.parse(c.body).content);
+    expect(contents.filter((t) => t === REPEAT_WARNING).length).toBe(1);
   });
 });
 
 describe("buildInteractionHandler (defer-first ack)", () => {
   const realFetch = globalThis.fetch;
-  const ch: any = { id: "ich", name: "IntTest", type: "discord", botToken: "tok-i", channel: "888" };
+  const ch: any = {
+    id: "ich",
+    name: "IntTest",
+    type: "discord",
+    botToken: "tok-i",
+    channel: "888",
+  };
   let pi: any;
   let ctx: any;
   let calls: { url: string; method: string; body?: any }[];
 
   const d = (name: string, extra: Record<string, any> = {}) => ({
-    id: "i1", token: "tok123", application_id: "app1",
-    channel_id: "888", user: { id: "owner1" },
+    id: "i1",
+    token: "tok123",
+    application_id: "app1",
+    channel_id: "888",
+    user: { id: "owner1" },
     data: { name, options: extra.options },
     ...extra,
   });
@@ -852,8 +1058,17 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       model: { id: "cur", name: "Cur" },
     };
     globalThis.fetch = (async (url: any, init?: any) => {
-      calls.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
-      return { ok: true, status: 200, json: async () => ({}), text: async () => "" };
+      calls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => "",
+      };
     }) as any;
   });
 
@@ -865,9 +1080,13 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h(d("help"));
     expect(calls.length).toBe(2);
-    expect(calls[0].url).toBe("https://discord.com/api/v10/interactions/i1/tok123/callback");
+    expect(calls[0].url).toBe(
+      "https://discord.com/api/v10/interactions/i1/tok123/callback",
+    );
     expect(JSON.parse(calls[0].body).type).toBe(5);
-    expect(calls[1].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123/messages/@original");
+    expect(calls[1].url).toBe(
+      "https://discord.com/api/v10/webhooks/app1/tok123/messages/@original",
+    );
     expect(calls[1].method).toBe("PATCH");
     expect(JSON.parse(calls[1].body).content).toContain("**Commands**");
   });
@@ -875,32 +1094,45 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   test("a throwing command still produces the defer ack and an error edit", async () => {
     let abortCalled = false;
     ctx.isIdle = () => false; // a run is active, so /stop calls ctx.abort()
-    ctx.abort = () => { abortCalled = true; throw new Error("boom"); };
+    ctx.abort = () => {
+      abortCalled = true;
+      throw new Error("boom");
+    };
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h(d("stop")); // must not throw
     expect(abortCalled).toBe(true);
-    expect(calls[0].url).toBe("https://discord.com/api/v10/interactions/i1/tok123/callback");
+    expect(calls[0].url).toBe(
+      "https://discord.com/api/v10/interactions/i1/tok123/callback",
+    );
     expect(JSON.parse(calls[0].body).type).toBe(5);
-    const edit = calls.find(c => c.url.endsWith("/webhooks/app1/tok123/messages/@original"));
+    const edit = calls.find((c) =>
+      c.url.endsWith("/webhooks/app1/tok123/messages/@original"),
+    );
     expect(edit).toBeDefined();
     expect(JSON.parse(edit!.body).content).toContain("boom");
   });
 
   test("btw defers, sends to pi, and leaves the deferred message alone", async () => {
     let sent = false;
-    pi.sendMessage = () => { sent = true; };
+    pi.sendMessage = () => {
+      sent = true;
+    };
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h(d("btw", { options: [{ name: "question", value: "is 42 ok?" }] }));
     expect(sent).toBe(true);
     expect(JSON.parse(calls[0].body).type).toBe(5);
-    expect(calls.find(c => c.url.endsWith("/messages/@original"))).toBeUndefined();
+    expect(
+      calls.find((c) => c.url.endsWith("/messages/@original")),
+    ).toBeUndefined();
   });
 
   test("wrong channel: typed reply, no command run", async () => {
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h(d("help", { channel_id: "424242" }));
     expect(calls.length).toBe(1);
-    expect(calls[0].url).toBe("https://discord.com/api/v10/interactions/i1/tok123/callback");
+    expect(calls[0].url).toBe(
+      "https://discord.com/api/v10/interactions/i1/tok123/callback",
+    );
     const body = JSON.parse(calls[0].body);
     expect(body.type).toBe(4);
     expect(body.data.content).toBe("use me in #IntTest");
@@ -908,34 +1140,49 @@ describe("buildInteractionHandler (defer-first ack)", () => {
 
   test("native /model routes through pi.setModel; /compact through ctx.compact", async () => {
     let set: any = null;
-    pi.setModel = async (m: any) => { set = m; return true; };
-    ctx.modelRegistry = { getAvailable: () => [
-      { id: "qwen3.8-27b", name: "Qwen", provider: "hydrogen" },
-      { id: "other-123", name: "Other", provider: "hydrogen" },
-    ] };
+    pi.setModel = async (m: any) => {
+      set = m;
+      return true;
+    };
+    ctx.modelRegistry = {
+      getAvailable: () => [
+        { id: "qwen3.8-27b", name: "Qwen", provider: "hydrogen" },
+        { id: "other-123", name: "Other", provider: "hydrogen" },
+      ],
+    };
     let compacted: any = null;
-    ctx.compact = (o?: any) => { compacted = o; };
+    ctx.compact = (o?: any) => {
+      compacted = o;
+    };
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
 
     await h(d("model", { options: [{ name: "name", value: "qwen3.8-27b" }] }));
     expect(set?.id).toBe("qwen3.8-27b");
     const modelEdit = calls.at(-1);
-    expect(JSON.parse(modelEdit!.body).content).toContain("hydrogen/qwen3.8-27b");
+    expect(JSON.parse(modelEdit!.body).content).toContain(
+      "hydrogen/qwen3.8-27b",
+    );
 
-    await h(d("compact", { options: [{ name: "instructions", value: "focus on X" }] }));
+    await h(
+      d("compact", {
+        options: [{ name: "instructions", value: "focus on X" }],
+      }),
+    );
     expect(compacted?.customInstructions).toBe("focus on X");
     expect(typeof compacted?.onComplete).toBe("function");
     expect(typeof compacted?.onError).toBe("function");
   });
 
   test("/model with no arg lists available models", async () => {
-    ctx.modelRegistry = { getAvailable: () => [
-      { id: "m1", name: "M1", provider: "p" },
-      { id: "m2", name: "M2", provider: "p" },
-    ] };
+    ctx.modelRegistry = {
+      getAvailable: () => [
+        { id: "m1", name: "M1", provider: "p" },
+        { id: "m2", name: "M2", provider: "p" },
+      ],
+    };
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h(d("model"));
-    const edit = calls.find(c => c.url.endsWith("/messages/@original"));
+    const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
     const content = JSON.parse(edit!.body).content;
     expect(content).toContain("p/m1");
     expect(content).toContain("p/m2");
@@ -951,29 +1198,55 @@ describe("compact: defer mid-run + always report", () => {
   const realFetch = globalThis.fetch;
 
   const inbound = (body: string, id: string): ChannelMessage => ({
-    channelId: "ch1", channelName: "Test", channelType: "discord",
-    messageId: id, from: "u", fromId: "uid", body,
-    timestamp: new Date().toISOString(), attachments: [], isRoom: false,
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
   });
 
-  const tick = () => new Promise(r => setTimeout(r, 0));
+  const tick = () => new Promise((r) => setTimeout(r, 0));
 
   // contents of the extension's posts to the Discord channel
-  const channelPosts = () => fetchCalls
-    .filter(c => c.url.includes("/channels/ch1/messages") && c.method === "POST")
-    .map(c => (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content);
+  const channelPosts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.url.includes("/channels/ch1/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
 
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-test-"));
     fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".pi", "settings.json"), JSON.stringify({
-      channels: [{ id: "ch1", name: "Test", type: "discord", botToken: "tok1", ack: true }],
-    }));
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
     handlers = {};
     fetchCalls = [];
     pi = {
       registerMessageRenderer: () => {},
-      on: (n: string, fn: any) => { handlers[n] = fn; },
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
       sendMessage: () => {},
     };
     extension(pi);
@@ -989,8 +1262,17 @@ describe("compact: defer mid-run + always report", () => {
       model: { id: "cur", name: "Cur" },
     };
     globalThis.fetch = (async (url: any, init?: any) => {
-      fetchCalls.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
-      return { ok: true, status: 200, json: async () => ({ id: "out1" }), text: async () => "" };
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
     }) as any;
   });
 
@@ -1003,18 +1285,29 @@ describe("compact: defer mid-run + always report", () => {
 
   test("idle /compact runs immediately and reports the token delta on completion", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
-    expect(channelPosts().some(t => t === "[..] compacting...")).toBe(true);
-    opts.onComplete({ summary: "s", firstKeptEntryId: "e", tokensBefore: 219997, estimatedTokensAfter: 35000 });
+    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    opts.onComplete({
+      summary: "s",
+      firstKeptEntryId: "e",
+      tokensBefore: 219997,
+      estimatedTokensAfter: 35000,
+    });
     await tick();
-    expect(channelPosts().some(t => t === "[ok] compacted: 219997 → 35000 tokens")).toBe(true);
+    expect(
+      channelPosts().some((t) => t === "[ok] compacted: 219997 → 35000 tokens"),
+    ).toBe(true);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     expect(opts).not.toBeNull();
     expect(opts.customInstructions).toBeUndefined();
@@ -1022,24 +1315,37 @@ describe("compact: defer mid-run + always report", () => {
 
   test("idle /compact reports onError (the swallowed-error path)", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     opts.onError(new Error("Nothing to compact (session too small)"));
     await tick();
-    expect(channelPosts().some(t => t === "[!] compact failed: Nothing to compact (session too small)")).toBe(true);
+    expect(
+      channelPosts().some(
+        (t) =>
+          t === "[!] compact failed: Nothing to compact (session too small)",
+      ),
+    ).toBe(true);
   });
 
   test("sync throw from ctx.compact is reported, not swallowed", async () => {
-    ctx.compact = () => { throw new Error("boom-ctx"); };
+    ctx.compact = () => {
+      throw new Error("boom-ctx");
+    };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
-    expect(channelPosts().some(t => t === "[!] compact failed: boom-ctx")).toBe(true);
-    expect(channelPosts().some(t => t === "[..] compacting...")).toBe(false);
+    expect(
+      channelPosts().some((t) => t === "[!] compact failed: boom-ctx"),
+    ).toBe(true);
+    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(false);
   });
 
   test("mid-run /compact defers; agent_end flushes it with the stored instructions", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     ctx.isIdle = () => false;
     // establish the active channel, then start a run
     await handleInbound(pi, inbound("hello", "m0"), ctx);
@@ -1047,7 +1353,11 @@ describe("compact: defer mid-run + always report", () => {
     // /compact mid-run
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts).toBeNull(); // not started yet — the run would be aborted
-    expect(channelPosts().some(t => t.startsWith("[queued] compact (run in progress)"))).toBe(true);
+    expect(
+      channelPosts().some((t) =>
+        t.startsWith("[queued] compact (run in progress)"),
+      ),
+    ).toBe(true);
     // run ends → flush
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
@@ -1055,36 +1365,67 @@ describe("compact: defer mid-run + always report", () => {
 
   test("mid-run: a later /compact replaces the earlier pending one", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     ctx.isIdle = () => false;
     await handleInbound(pi, inbound("hello", "m0"), ctx);
     await handlers.turn_start(null, ctx);
     await handleInbound(pi, inbound("/compact first", "m1"), ctx);
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
-    expect(channelPosts().some(t => t.startsWith("[queued] compact (run in progress), replaces earlier"))).toBe(true);
+    expect(
+      channelPosts().some((t) =>
+        t.startsWith("[queued] compact (run in progress), replaces earlier"),
+      ),
+    ).toBe(true);
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("second");
   });
 
   test("/compact while a compaction is in flight defers; session_compact flushes it", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     ctx.isIdle = () => false; // isCompacting; agentBusy stays false
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
     expect(opts).toBeNull();
-    expect(channelPosts().some(t => t.startsWith("[queued] compact (compact already in progress)"))).toBe(true);
-    handlers.session_compact?.({ compactionEntry: {}, fromExtension: true, reason: "manual", willRetry: false }, ctx);
+    expect(
+      channelPosts().some((t) =>
+        t.startsWith("[queued] compact (compact already in progress)"),
+      ),
+    ).toBe(true);
+    handlers.session_compact?.(
+      {
+        compactionEntry: {},
+        fromExtension: true,
+        reason: "manual",
+        willRetry: false,
+      },
+      ctx,
+    );
     await tick();
     expect(opts?.customInstructions).toBe("second");
   });
 
   test("/compact while a compaction is in flight defers; session_compact_failed also flushes", async () => {
     let opts: any = null;
-    ctx.compact = (o?: any) => { opts = o; };
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
     ctx.isIdle = () => false;
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
     expect(opts).toBeNull();
-    handlers.session_compact_failed?.({ reason: "manual", errorMessage: "model down", aborted: false, willRetry: false, fromExtension: false }, ctx);
+    handlers.session_compact_failed?.(
+      {
+        reason: "manual",
+        errorMessage: "model down",
+        aborted: false,
+        willRetry: false,
+        fromExtension: false,
+      },
+      ctx,
+    );
     await tick();
     expect(opts?.customInstructions).toBe("second");
   });
@@ -1092,9 +1433,12 @@ describe("compact: defer mid-run + always report", () => {
 
 describe("buildRepliedMessageBlock", () => {
   test("renders author attribute + escaped text (T1)", () => {
-    const out = buildRepliedMessageBlock({ author: 'al "ice"', text: "a < b & c" });
+    const out = buildRepliedMessageBlock({
+      author: 'al "ice"',
+      text: "a < b & c",
+    });
     expect(out).toBe(
-      'This message was a reply to message\n\n<replied-message author="al \'ice\'">\na &lt; b &amp; c\n</replied-message>',
+      "This message was a reply to message\n\n<replied-message author=\"al 'ice'\">\na &lt; b &amp; c\n</replied-message>",
     );
   });
 
@@ -1128,14 +1472,23 @@ describe("todo board (integration)", () => {
   const realFetch = globalThis.fetch;
 
   const inbound = (body: string, id: string): ChannelMessage => ({
-    channelId: "ch1", channelName: "Test", channelType: "discord",
-    messageId: id, from: "u", fromId: "uid", body,
-    timestamp: new Date().toISOString(), attachments: [], isRoom: false,
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
   });
 
   const ok = { id: "out1" };
   const replyContent = (): string => {
-    const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     return JSON.parse(posts.at(-1)!.body).content;
   };
 
@@ -1144,9 +1497,20 @@ describe("todo board (integration)", () => {
     realHome = process.env.HOME!;
     process.env.HOME = tmp; // isolate ~/.pi/agent/todos from the real home
     fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".pi", "settings.json"), JSON.stringify({
-      channels: [{ id: "ch1", name: "Test", type: "discord", botToken: "tok1", ack: true }],
-    }));
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
     handlers = {};
     sent = [];
     tools = {};
@@ -1154,9 +1518,15 @@ describe("todo board (integration)", () => {
     fetchImpl = null;
     pi = {
       registerMessageRenderer: () => {},
-      registerTool: (t: any) => { tools[t.name] = t; },
-      on: (n: string, fn: any) => { handlers[n] = fn; },
-      sendMessage: (m: any, o?: any) => { sent.push({ m, o }); },
+      registerTool: (t: any) => {
+        tools[t.name] = t;
+      },
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
     };
     extension(pi);
     // The factory registers LLM tools in session_start, which this
@@ -1170,9 +1540,18 @@ describe("todo board (integration)", () => {
       abort: () => {},
     };
     globalThis.fetch = (async (url: any, init?: any) => {
-      fetchCalls.push({ url: String(url), method: init?.method ?? "GET", body: init?.body });
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
       if (fetchImpl) return fetchImpl(url, init);
-      return { ok: true, status: 200, json: async () => ok, text: async () => "" };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ok,
+        text: async () => "",
+      };
     }) as any;
   });
 
@@ -1183,17 +1562,25 @@ describe("todo board (integration)", () => {
   });
 
   test("/todos prints the channel board", async () => {
-    saveBoard({
-      channelId: "ch1",
-      todos: [{ content: "fix bug", status: "in_progress" }, { content: "tests", status: "pending" }],
-      updatedAt: "t",
-    }, tmp);
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [
+          { content: "fix bug", status: "in_progress" },
+          { content: "tests", status: "pending" },
+        ],
+        updatedAt: "t",
+      },
+      tmp,
+    );
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
     const content = replyContent();
-    expect(content).toBe(renderBoard([
-      { content: "fix bug", status: "in_progress" },
-      { content: "tests", status: "pending" },
-    ]));
+    expect(content).toBe(
+      renderBoard([
+        { content: "fix bug", status: "in_progress" },
+        { content: "tests", status: "pending" },
+      ]),
+    );
     expect(content).toContain("▤ todos · 2 open");
   });
 
@@ -1203,21 +1590,49 @@ describe("todo board (integration)", () => {
   });
 
   test("/todos needs no owner", async () => {
-    fs.writeFileSync(path.join(tmp, ".pi", "settings.json"), JSON.stringify({
-      channels: [{ id: "ch1", name: "Test", type: "discord", botToken: "tok1", ownerUserId: "owner1" }],
-    }));
-    saveBoard({
-      channelId: "ch1",
-      todos: [{ content: "x", status: "pending" }],
-      updatedAt: "t",
-    }, tmp);
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "owner1",
+          },
+        ],
+      }),
+    );
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "x", status: "pending" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
     await handleInbound(pi, inbound("/todos", "m1"), ctx); // fromId "uid" ≠ owner1
     expect(replyContent()).toContain("⬦ x");
   });
 
   test("/todos all prints every channel's board", async () => {
-    saveBoard({ channelId: "ch1", todos: [{ content: "a", status: "pending" }], updatedAt: "t" }, tmp);
-    saveBoard({ channelId: "ch2", todos: [{ content: "b", status: "completed" }], updatedAt: "t" }, tmp);
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
+    saveBoard(
+      {
+        channelId: "ch2",
+        todos: [{ content: "b", status: "completed" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
     const content = replyContent();
     expect(content).toContain("▤ Test · 1 open");
@@ -1232,16 +1647,21 @@ describe("todo board (integration)", () => {
   });
 
   test("context injection: non-empty board appended after channel-ctx", async () => {
-    saveBoard({
-      channelId: "ch1",
-      todos: [{ content: "fix bug", status: "in_progress" }],
-      updatedAt: "t",
-    }, tmp);
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "fix bug", status: "in_progress" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     const content = sent.at(-1)!.m.content;
     expect(content).toContain("</channel-ctx>");
     expect(content).toContain("<todo-board>\n⬥ **fix bug**\n</todo-board>");
-    expect(content.indexOf("</channel-ctx>")).toBeLessThan(content.indexOf("<todo-board>"));
+    expect(content.indexOf("</channel-ctx>")).toBeLessThan(
+      content.indexOf("<todo-board>"),
+    );
   });
 
   test("context injection: no board block when the board is empty", async () => {
@@ -1250,34 +1670,59 @@ describe("todo board (integration)", () => {
   });
 
   test("todo tool: posts the board, edits in place, deletes on clear", async () => {
-    const t = tools["todo"];
+    const t = tools.todo;
     expect(t).toBeDefined();
     expect(t.description).toBe(TODO_TOOL_DESCRIPTION);
 
     // 1) first call: posts one board message, stores the id in state
-    const r1 = await t.execute("1", { todos: [
-      { content: "a", status: "in_progress" },
-      { content: "b", status: "pending" },
-    ] }, undefined, undefined, ctx);
-    expect(r1.content[0].text).toBe(renderBoard([
-      { content: "a", status: "in_progress" },
-      { content: "b", status: "pending" },
-    ]));
+    const r1 = await t.execute(
+      "1",
+      {
+        todos: [
+          { content: "a", status: "in_progress" },
+          { content: "b", status: "pending" },
+        ],
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r1.content[0].text).toBe(
+      renderBoard([
+        { content: "a", status: "in_progress" },
+        { content: "b", status: "pending" },
+      ]),
+    );
     let board = loadBoard("ch1", tmp);
     expect(board?.boardMessageId).toBe("out1");
-    let posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    let posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     expect(posts.length).toBe(1);
     expect(JSON.parse(posts[0].body).content).toContain("▤ todos · 2 open");
 
     // 2) second call: edits the SAME message, no new post
-    const r2 = await t.execute("2", { todos: [
-      { content: "a", status: "completed" },
-      { content: "b", status: "pending" },
-    ] }, undefined, undefined, ctx);
+    const r2 = await t.execute(
+      "2",
+      {
+        todos: [
+          { content: "a", status: "completed" },
+          { content: "b", status: "pending" },
+        ],
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
     expect(r2.content[0].text).toContain("✓ ~~a~~");
-    posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"));
+    posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
     expect(posts.length).toBe(1);
-    const patch = fetchCalls.find(c => c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/out1"));
+    const patch = fetchCalls.find(
+      (c) =>
+        c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/out1"),
+    );
     expect(patch).toBeDefined();
     expect(JSON.parse(patch!.body).content).toContain("✓ ~~a~~");
     expect(JSON.parse(patch!.body).content).toContain("▤ todos · 1 open");
@@ -1285,7 +1730,10 @@ describe("todo board (integration)", () => {
     // 3) empty list: deletes the board message, clears the state
     const r3 = await t.execute("3", { todos: [] }, undefined, undefined, ctx);
     expect(r3.content[0].text).toBe("todo board cleared");
-    const del = fetchCalls.find(c => c.method === "DELETE" && c.url.endsWith("/channels/ch1/messages/out1"));
+    const del = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" && c.url.endsWith("/channels/ch1/messages/out1"),
+    );
     expect(del).toBeDefined();
     board = loadBoard("ch1", tmp);
     expect(board?.todos).toEqual([]);
@@ -1293,20 +1741,39 @@ describe("todo board (integration)", () => {
   });
 
   test("todo tool: a failed board edit does not fail the call", async () => {
-    saveBoard({
-      channelId: "ch1",
-      todos: [{ content: "a", status: "pending" }],
-      updatedAt: "t",
-      boardMessageId: "gone1",
-    }, tmp);
-    fetchImpl = (url: any, init?: any) => {
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+        boardMessageId: "gone1",
+      },
+      tmp,
+    );
+    fetchImpl = (_url: any, init?: any) => {
       if (init?.method === "PATCH") {
-        return Promise.resolve({ ok: false, status: 404, json: async () => ({}), text: async () => "Not Found" });
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+          text: async () => "Not Found",
+        });
       }
-      return Promise.resolve({ ok: true, status: 200, json: async () => ok, text: async () => "" });
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ok,
+        text: async () => "",
+      });
     };
-    const t = tools["todo"];
-    const r = await t.execute("1", { todos: [{ content: "a", status: "completed" }] }, undefined, undefined, ctx);
+    const t = tools.todo;
+    const r = await t.execute(
+      "1",
+      { todos: [{ content: "a", status: "completed" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
     expect(r.content[0].text).toContain("✓ ~~a~~");
     // state still updated; id kept so the next sync retries the edit
     const board = loadBoard("ch1", tmp);
@@ -1316,20 +1783,34 @@ describe("todo board (integration)", () => {
 
   test("todo tool: no channel available", async () => {
     await handlers.session_shutdown(); // clears lastActiveChannel
-    const barePi: any = { registerTool: (t: any) => { tools["todo"] = t; } };
+    const barePi: any = {
+      registerTool: (t: any) => {
+        tools.todo = t;
+      },
+    };
     registerTodoTool(barePi, []);
-    const r = await tools["todo"].execute("1", { todos: [{ content: "a", status: "pending" }] }, undefined, undefined, ctx);
+    const r = await tools.todo.execute(
+      "1",
+      { todos: [{ content: "a", status: "pending" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
     expect(r.content[0].text).toBe("No Discord channel available");
   });
 
   test("worker intake: bg callback TODO lines merge into the board and re-render it", async () => {
-    saveBoard({
-      channelId: "ch1",
-      todos: [{ content: "alpha", status: "in_progress" }],
-      updatedAt: "t",
-      boardMessageId: "board1",
-    }, tmp);
-    const body = "[bg: worker OK · r1]\n\n<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "alpha", status: "in_progress" }],
+        updatedAt: "t",
+        boardMessageId: "board1",
+      },
+      tmp,
+    );
+    const body =
+      "[bg: worker OK · r1]\n\n<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
     await handleInbound(pi, inbound(body, "m1"), ctx);
 
     let board = loadBoard("ch1", tmp);
@@ -1339,7 +1820,10 @@ describe("todo board (integration)", () => {
       { content: "verify the deploy", status: "pending" },
     ]);
     // board message edited in place with the new items
-    const patch = fetchCalls.find(c => c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/board1"));
+    const patch = fetchCalls.find(
+      (c) =>
+        c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/board1"),
+    );
     expect(patch).toBeDefined();
     expect(JSON.parse(patch!.body).content).toContain("⬦ follow up on X");
     expect(JSON.parse(patch!.body).content).toContain("⬥ **alpha**");
@@ -1353,7 +1837,11 @@ describe("todo board (integration)", () => {
   });
 
   test("worker intake: plain messages with TODO: lines are not merged", async () => {
-    await handleInbound(pi, inbound("TODO: something I typed by hand", "m1"), ctx);
+    await handleInbound(
+      pi,
+      inbound("TODO: something I typed by hand", "m1"),
+      ctx,
+    );
     const board = loadBoard("ch1", tmp);
     expect(board).toBeNull();
   });
