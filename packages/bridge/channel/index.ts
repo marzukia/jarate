@@ -107,6 +107,13 @@ const verboseOverride = new Map<string, boolean>();
 interface QueuedInbound {
   msg: ChannelMessage;
   queuedAt: number;
+  /** Pre-rendered LLM text (channel ctx + body/attachments), captured at
+   *  queue time so the mid-run interrupt can force-deliver it without async
+   *  re-rendering (re-rendering is async and would widen the send/abort
+   *  race window). The re-wake path still re-renders via handleInbound. */
+  text?: string;
+  title?: string;
+  display?: string;
 }
 export const midTurnQueues = new Map<string, QueuedInbound[]>();
 
@@ -114,16 +121,15 @@ export const midTurnQueues = new Map<string, QueuedInbound[]>();
 export function queueMidTurnInbound(
   channelId: string,
   msg: ChannelMessage,
+  text?: string,
+  title?: string,
+  display?: string,
 ): number {
   let q = midTurnQueues.get(channelId);
-  if (!q) {
-    q = [];
-    midTurnQueues.set(channelId, q);
-  }
-  q.push({ msg, queuedAt: Date.now() });
-  console.log(
-    `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
-  );
+  if (!q) { q = []; midTurnQueues.set(channelId, q); }
+  q.push({ msg, queuedAt: Date.now(), text, title, display });
+  console.log(`[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`);
+  armInterruptTimer(channelId, msg.messageId);
   return q.length;
 }
 
@@ -158,6 +164,156 @@ export function clearQueuedInbound(channelId: string): number {
   midTurnQueues.delete(channelId);
   return n;
 }
+
+// ─── Mid-run interrupt ─────────────────────────────────────────────────
+// A PLAIN message that arrives while a run is active is queued for a
+// re-wake (above) AND armed with an interrupt timer. If the current step
+// is still in flight when the timer fires (default 3000 ms, env
+// PISCORD_INTERRUPT_STEP_TIMEOUT_MS), the message is force-delivered: the
+// in-flight step (LLM stream or tool call) is aborted and the message
+// starts a fresh run, so the agent continues with it — a redirect, not a
+// full stop.
+//
+// Abort semantics (verified in a live pi session, 2026-09-10):
+// ctx.abort() kills ONLY the active run — not the session. It does not
+// clear the steering queue, but a steer enqueued while the run is active
+// gets drained into the dying loop's transcript and its LLM call fails on
+// the already-aborted signal (message in history, never processed). So the
+// interrupt aborts FIRST, waits for isIdle, then sends the message as a
+// fresh prompt (see runMidRunInterrupt for the full sequence).
+//
+// Commands (/stop, /reset, ...) never reach this path — they are consumed
+// before the mid-turn gate. /stop clears the timers so a stopped run is
+// not interrupted by a stale message.
+const DEFAULT_INTERRUPT_STEP_TIMEOUT_MS = 3000;
+
+/** Interrupt step timeout in ms (env PISCORD_INTERRUPT_STEP_TIMEOUT_MS, default 3000). */
+export function interruptStepTimeoutMs(): number {
+  const raw = process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS;
+  if (!raw) return DEFAULT_INTERRUPT_STEP_TIMEOUT_MS;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_INTERRUPT_STEP_TIMEOUT_MS;
+}
+
+interface PendingInterrupt { messageId: string; at: number; timer: ReturnType<typeof setTimeout>; }
+export const pendingInterrupts = new Map<string, PendingInterrupt[]>();
+const interruptingChannels = new Set<string>();
+let interruptHandler: ((channelId: string, messageId: string) => void) | null = null;
+let interruptCtx: ExtensionContext | null = null;
+
+/** Set by the extension factory: fires when an armed interrupt timer elapses. May be async (fire-and-forget). */
+export function setInterruptHandler(fn: ((channelId: string, messageId: string) => void) | null): void {
+  interruptHandler = fn;
+}
+
+/** The pi context for out-of-event aborts (session_start / shutdown). Exported for tests. */
+export function setInterruptCtx(ctx: ExtensionContext | null): void {
+  interruptCtx = ctx;
+}
+
+/**
+ * Arm (or re-arm) an interrupt timer for a queued mid-turn message.
+ * Re-arming the same messageId replaces the earlier timer.
+ */
+export function armInterruptTimer(channelId: string, messageId: string, delayMs?: number): void {
+  if (!messageId) return;
+  const delay = delayMs ?? interruptStepTimeoutMs();
+  const list = pendingInterrupts.get(channelId) ?? [];
+  const existing = list.find((p) => p.messageId === messageId);
+  if (existing) clearTimeout(existing.timer);
+  const at = Date.now() + delay;
+  const timer = setTimeout(() => {
+    const l = pendingInterrupts.get(channelId);
+    if (l) {
+      const i = l.findIndex((p) => p.messageId === messageId);
+      if (i !== -1) l.splice(i, 1);
+      if (l.length === 0) pendingInterrupts.delete(channelId);
+    }
+    if (!interruptHandler) return;
+    try {
+      interruptHandler(channelId, messageId);
+    } catch (e) {
+      console.error("[channel] mid-run interrupt failed:", sanitizeUnknownValue(e));
+    }
+  }, delay);
+  list.push({ messageId, at, timer });
+  pendingInterrupts.set(channelId, list);
+  console.log(`[channel] armed mid-run interrupt for ${messageId} (in ${delay}ms)`);
+}
+
+/** Cancel pending interrupt timers for a channel (/stop, /reset). */
+export function clearInterrupts(channelId: string): void {
+  const list = pendingInterrupts.get(channelId);
+  if (!list) return;
+  for (const p of list) clearTimeout(p.timer);
+  pendingInterrupts.delete(channelId);
+}
+
+/** Cancel every interrupt timer (session_shutdown). */
+export function clearAllInterrupts(): void {
+  for (const list of pendingInterrupts.values()) for (const p of list) clearTimeout(p.timer);
+  pendingInterrupts.clear();
+  interruptingChannels.clear();
+}
+
+/**
+ * Force-deliver one queued message and abort the in-flight step.
+ * Called by the interrupt timer. Sequence (verified against a live pi
+ * session, 2026-09-10):
+ *   1. ctx.abort() — kills the current run (the in-flight LLM stream or
+ *      tool call). The tool gets a "Command aborted" result; the run
+ *      settles with an empty assistant message (stopReason "error",
+ *      errorMessage "This operation was aborted" — the pi stream layer
+ *      maps the abort there, NOT to stopReason "aborted").
+ *   2. wait for isIdle — the post-run loop may retry/compact/continue;
+ *      isIdle() covers run + compaction. Common case settles in tens of
+ *      ms (the aborted LLM call fails immediately).
+ *   3. sendToPi — now idle, the message starts a FRESH run. The agent
+ *      continues with it: a clean redirect in the transcript.
+ * The message is spliced out of the re-wake queue BEFORE the abort, so it
+ * is owned by exactly one path (never re-woken at the aborted run's
+ * agent_end). Do NOT steer before aborting: a steer enqueued while the
+ * run is still active gets drained into the dying loop's transcript and
+ * its LLM call fails on the already-aborted signal — the message lands
+ * in history but the agent never replies to it.
+ */
+export async function runMidRunInterrupt(pi: ExtensionAPI, ctx: ExtensionContext, channelId: string, messageId: string): Promise<void> {
+  if (interruptingChannels.has(channelId)) {
+    // Another interrupt is in flight for this channel; re-arm shortly —
+    // the message is still in the re-wake queue as the fallback owner.
+    armInterruptTimer(channelId, messageId, 200);
+    return;
+  }
+  if (ctx.isIdle()) return; // run settled; the re-wake queue owns delivery
+  const q = midTurnQueues.get(channelId);
+  const idx = q ? q.findIndex((e) => e.msg.messageId === messageId) : -1;
+  if (!q || idx === -1) return; // already re-woken or cleared by /stop
+  const [entry] = q.splice(idx, 1);
+  if (q.length === 0) midTurnQueues.delete(channelId);
+  if (!entry.text) {
+    // No pre-rendered text: put the entry back, the re-wake path owns it.
+    const qq = midTurnQueues.get(channelId) ?? [];
+    qq.splice(Math.min(idx, qq.length), 0, entry);
+    midTurnQueues.set(channelId, qq);
+    return;
+  }
+  interruptingChannels.add(channelId);
+  console.log(`[channel] mid-run interrupt: aborting current step, then sending ${messageId}`);
+  try {
+    userStoppedRun = true; // silence the aborted run's failure post
+    try { ctx.abort(); } catch { /* best-effort abort */ }
+    // Wait for the session to fully settle (see function doc). If another
+    // queued message's re-wake starts a run during this window, we wait
+    // for that run too — the interrupt message then follows it as a fresh
+    // run. Nothing is lost; order may be inverted for the other message.
+    for (let i = 0; i < 400 && !ctx.isIdle(); i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    sendToPi(pi, channelId, entry.text, entry.title ?? "", entry.display ?? entry.msg.body, entry.msg.messageId);
+  } finally {
+    interruptingChannels.delete(channelId);
+  }
+}
 // Last inbound Discord message id per channel — the 👀 ack target. The
 // message_end early-send path unreacts it (A1: step-finals carry no
 // replyTo, so the agent_end unreact branch never sees them).
@@ -166,8 +322,8 @@ const lastInboundIds = new Map<string, string>();
 // validation set for <reply-to:MSGID> on the message_end early-send path
 // (event.messages is not available there). Updated on every sendToPi.
 const runInboundIds = new Map<string, string[]>();
-// Set when /stop aborts a run, so agent_end does not post the abort's
-// errorMessage as if it were a model/API failure (A2).
+// Set when /stop or a mid-run interrupt aborts a run, so agent_end does not
+// post the abort's errorMessage as if it were a model/API failure (A2).
 let userStoppedRun = false;
 
 // ─── Repetition guard ────────────────────────────────────────────────────
@@ -603,10 +759,13 @@ export function failurePostText(
   const last = messages.at(-1) as any;
   if (last?.role !== "assistant") return null;
   const err = typeof last.errorMessage === "string" ? last.errorMessage : "";
-  if (
-    last.stopReason === "error" ||
-    (last.stopReason === "aborted" && err && !userStopped)
-  ) {
+  // An abort surfaces as stopReason "error" + errorMessage "This operation
+  // was aborted" (pi stream layer), or stopReason "aborted". Suppress the
+  // failure post for both shapes when the user stopped the run (/stop,
+  // /reset, or a mid-run interrupt) — it is expected, not a model/API failure.
+  const isAbort = last.stopReason === "aborted" || (last.stopReason === "error" && /abort/i.test(err));
+  if (userStopped && isAbort) return null;
+  if (last.stopReason === "error" || (last.stopReason === "aborted" && err)) {
     return `[!] ${err || "run failed"}`;
   }
   return null;
@@ -715,6 +874,17 @@ export default function (pi: ExtensionAPI) {
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Mid-run interrupt: when an armed timer fires, abort the in-flight step
+  // and, once the session settles, send the queued message as a fresh run
+  // (see runMidRunInterrupt).
+  setInterruptHandler((channelId, messageId) => {
+    const c = interruptCtx;
+    if (!c) return;
+    runMidRunInterrupt(pi, c, channelId, messageId).catch((e) => {
+      console.error("[channel] mid-run interrupt failed:", sanitizeUnknownValue(e));
+    });
+  });
+
   // ─── TUI rendering for inbound channel messages ──────────────────────
   // Mimics the user-message look (boxed markdown) with a type/name title;
   // the <channel-ctx> block stays LLM-only.
@@ -754,6 +924,7 @@ export default function (pi: ExtensionAPI) {
   // ─── Startup / Shutdown ────────────────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
     sessionStartTs = Date.now();
+    setInterruptCtx(ctx);
     workspaceRoot = ctx.cwd;
     channels = loadChannelConfig(ctx.cwd);
 
@@ -833,6 +1004,8 @@ export default function (pi: ExtensionAPI) {
     pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
     pendingAttachments.clear();
     midTurnQueues.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
     finalReps.clear();
   });
 
@@ -1170,6 +1343,7 @@ const CHANNEL_FORMAT_HINTS: Record<ChannelConfig["type"], string> = {
 const HELP_TEXT = [
   "**Commands**",
   "`/stop` — stop the current run",
+  "plain message during a run — interrupts the step after ~3s, then takes over",
   "`/btw <question>` — quick side question, answered briefly",
   "`/status` — session stats (owner)",
   "`/reset` - start a NEW session, clearing context (owner)",
@@ -1377,12 +1551,12 @@ async function runChannelCommand(
       // re-wake a message that was waiting for this run to end. (Steer
       // messages already queued in pi are a known upstream gap — the
       // extension context exposes hasPendingMessages() but no clearQueue(),
-      // so they land at the next run's first turn boundary.)
+      // so they land at the next run's first turn boundary.) Armed mid-run
+      // interrupts are cleared too: a stopped run is not interrupted by a
+      // stale message.
       const dropped = clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /stop dropped ${dropped} queued mid-turn inbound(s)`,
-        );
+      clearInterrupts(ch.id);
+      if (dropped > 0) console.log(`[channel] /stop dropped ${dropped} queued mid-turn inbound(s)`);
       if (!ctx.isIdle()) {
         userStoppedRun = true;
         ctx.abort();
@@ -1424,7 +1598,23 @@ async function runChannelCommand(
         const model = (ctx.model as any)?.id ?? (ctx.model as any)?.name ?? "?";
         const elapsed = Date.now() - sessionStartTs;
         const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
-        text = `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"} • model ${model} • up ${up}${ctx.isIdle() ? " • idle" : " • running"}`;
+        const parts = [
+          `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
+          `model ${model}`,
+          `up ${up}`,
+          ctx.isIdle() ? "idle" : "running",
+        ];
+        // Interrupt state, honestly: in flight, or armed with time to fire.
+        if (interruptingChannels.has(ch.id)) {
+          parts.push("interrupting");
+        } else {
+          const pend = pendingInterrupts.get(ch.id);
+          if (pend && pend.length > 0) {
+            const msLeft = Math.max(0, Math.min(...pend.map((p) => p.at)) - Date.now());
+            parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
+          }
+        }
+        text = parts.join(" • ");
       } catch {
         text = "status unavailable";
       }
@@ -1433,9 +1623,8 @@ async function runChannelCommand(
     case "reset": {
       if (!isOwner) return ownerOnly;
       userStoppedRun = true;
-      try {
-        ctx.abort();
-      } catch {}
+      clearInterrupts(ch.id);
+      try { ctx.abort(); } catch {}
       // /reset = NEW session. Mechanism: move the current session file aside,
       // then shutdown. The systemd respawn runs 'pi -c' (continue LAST
       // session); with the last file gone it starts fresh. (ctx.newSession
@@ -1988,9 +2177,9 @@ export async function handleInbound(
   // Returns true (caller should `return`) when the inbound was queued for a
   // re-wake. Ownership is unambiguous: a message is either sent to pi now or
   // queued for a re-wake — never both.
-  const gateForRewake = (): boolean => {
+  const gateForRewake = (text: string, gateTitle: string, display: string): boolean => {
     if (!runActive) return false;
-    queueMidTurnInbound(ch.id, msg);
+    queueMidTurnInbound(ch.id, msg, text, gateTitle, display);
     return true;
   };
 
@@ -2099,9 +2288,10 @@ export async function handleInbound(
       [attachmentSummary(dispFiles), ...voiceLines, prompt]
         .filter(Boolean)
         .join("\n\n") || "(empty)";
-    if (gateForRewake()) return;
+    const fwdText = withCtx(fwd);
+    if (gateForRewake(fwdText, title, disp)) return;
     if (prior.length > 0) pendingAttachments.delete(msg.channelId);
-    sendToPi(pi, ch.id, withCtx(fwd), title, disp, msg.messageId);
+    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId);
     return;
   }
 
@@ -2131,9 +2321,10 @@ export async function handleInbound(
       [attachmentSummary(allFiles), ...allVoiceLines, body]
         .filter(Boolean)
         .join("\n\n") || "(empty)";
-    if (gateForRewake()) return;
+    const fwdText = withCtx(fwd);
+    if (gateForRewake(fwdText, title, disp)) return;
     pendingAttachments.delete(msg.channelId);
-    sendToPi(pi, ch.id, withCtx(fwd), title, disp, msg.messageId);
+    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId);
     return;
   }
 
@@ -2141,16 +2332,13 @@ export async function handleInbound(
   // While a run is in flight, queue for a guaranteed re-wake at agent_end
   // (one message = one queued run) instead of steering into the in-flight
   // run, which pi may swallow if the run ends before a model step consumes it.
-  if (gateForRewake()) return;
+  // The queued message is also armed with a mid-run interrupt: if the step
+  // is still in flight after the timeout, the step is aborted and, once the
+  // session settles, the message starts a fresh run (runMidRunInterrupt).
+  const plainText = withCtx(body || "(empty)");
+  if (gateForRewake(plainText, title, body || "(empty)")) return;
 
-  sendToPi(
-    pi,
-    ch.id,
-    withCtx(body || "(empty)"),
-    title,
-    body || "(empty)",
-    msg.messageId,
-  );
+  sendToPi(pi, ch.id, plainText, title, body || "(empty)", msg.messageId);
 }
 
 // ─── Send to pi session ──────────────────────────────────────────────────

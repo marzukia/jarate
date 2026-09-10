@@ -12,6 +12,7 @@ Access: **anyone** = any member of the channel; **owner** = the configured
 | command | access | what it does |
 |---|---|---|
 | `stop` / `/stop` | anyone | abort the in-flight run |
+| *(any plain message)* | anyone | during a run: interrupts the current step after ~3s, then takes over |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list in-flight `pi-bg` dispatches (profile, age, task) |
@@ -32,6 +33,31 @@ Access: **anyone** = any member of the channel; **owner** = the configured
 
 Aborts the current run immediately. The run's partial output stays in the
 channel (steered steps are already forwarded live).
+
+### mid-run interrupt (any plain message)
+
+A plain message that arrives while a run is in flight does not wait for the
+run to finish. After a short grace period (default **3000 ms**, override with
+`PISCORD_INTERRUPT_STEP_TIMEOUT_MS` when starting the bridge) the message is
+force-delivered: the in-flight step (the current LLM stream / tool call) is
+aborted, and once the session settles (~tens of ms) the message starts a
+fresh run. The agent continues with your message as its next step — a
+redirect, not a full stop.
+
+```
+fix the build
+> (10s later, still running) actually fix the tests instead
+```
+
+The second message interrupts the in-flight step after ~3s and the agent picks
+it up. This is for **plain** messages only — commands (`/stop`, `/btw`, …) keep
+their existing behavior. `/status` shows an armed interrupt (`interrupt in 3s`)
+and an in-flight one (`interrupting`).
+
+If the step finishes before the grace period, the message is delivered normally
+as a fresh run instead (the existing mid-turn re-wake). Nothing is ever queued
+twice: an interrupted message is removed from the re-wake queue before it is
+steered in, so it is delivered exactly once.
 
 ### /btw
 

@@ -21,6 +21,10 @@ import extension, {
   registerTodoTool,
   runShellPassthrough,
   TODO_TOOL_DESCRIPTION,
+  interruptStepTimeoutMs,
+  pendingInterrupts,
+  clearAllInterrupts,
+  setInterruptCtx,
 } from "./index";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
@@ -385,6 +389,18 @@ describe("failurePostText (A2)", () => {
     );
   });
 
+  test("aborted run shaped stopReason=error is suppressed when user-stopped", () => {
+    // pi's stream layer maps ctx.abort() to stopReason "error" +
+    // errorMessage "This operation was aborted" (verified in a live
+    // session, 2026-09-10). /stop, /reset and the mid-run interrupt set
+    // the user-stopped flag, so the failure post is expected noise.
+    expect(failurePostText([failure("error", "This operation was aborted")], true)).toBeNull();
+  });
+
+  test("error run shaped stopReason=error still posts when NOT user-stopped", () => {
+    expect(failurePostText([failure("error", "This operation was aborted")], false)).toBe("[!] This operation was aborted");
+  });
+
   test("aborted with errorMessage is silent when the user stopped the run", () => {
     expect(
       failurePostText([failure("aborted", "interrupted")], true),
@@ -563,6 +579,8 @@ describe("extension handlers (A1/A2/A4)", () => {
     // next test's mock pi (shared `sent` binding).
     midTurnQueues.clear();
     pendingAttachments.clear();
+    clearAllInterrupts(); // armed interrupt timers + in-flight flags
+    setInterruptCtx(null);
     await handlers.agent_end?.({ messages: [] }, ctx); // clears any typing interval
     globalThis.fetch = realFetch;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -825,6 +843,182 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.agent_end({ messages: [] }, ctx);
     // The re-wake sends it exactly once (not a second time).
     expect(sent.length).toBe(1);
+  });
+
+  describe("mid-run interrupt", () => {
+    let abortCount: number;
+    let idle: boolean;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      abortCount = 0;
+      idle = false;
+      // Model the real session: abort kills the run and it settles (idle).
+      ctx.isIdle = () => idle;
+      ctx.abort = () => { abortCount += 1; idle = true; };
+      setInterruptCtx(ctx);
+    });
+
+    afterEach(() => {
+      setInterruptCtx(null);
+      clearAllInterrupts();
+      pendingInterrupts.clear();
+      jest.useRealTimers();
+    });
+
+    test("plain message during a run interrupts after the timeout (abort + fresh run)", async () => {
+      expect(idle).toBe(false);
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      expect(sent.length).toBe(0);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+
+      jest.advanceTimersByTime(interruptStepTimeoutMs() - 1);
+      expect(abortCount).toBe(0);
+      expect(sent.length).toBe(0);
+      jest.advanceTimersByTime(1);
+
+      // Force-delivered: in-flight step aborted, message sent as a fresh run
+      // after the session settles.
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.content).toContain("redirect me");
+      expect(sent[0].m.details.body).toBe("redirect me");
+      expect(sent[0].m.details.messageId).toBe("m1");
+      expect(sent[0].o).toMatchObject({ triggerTurn: true, deliverAs: "steer" });
+      // Consumed from the re-wake queue: no second delivery at agent_end.
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("no duplicate delivery after interrupt (agent_end sees an empty queue)", async () => {
+      await handleInbound(pi, inbound("redirect", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(sent.length).toBe(1);
+
+      // The aborted run's agent_end: nothing queued, so no re-wake send.
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(1);
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("aborted run from an interrupt posts no failure line", async () => {
+      await handleInbound(pi, inbound("redirect", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(1);
+
+      // pi's aborted run ends with an empty assistant message shaped
+      // stopReason "error" + errorMessage "This operation was aborted".
+      // userStoppedRun suppresses the failure post for that shape.
+      const fail = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "error",
+        errorMessage: "This operation was aborted",
+      };
+      await handlers.agent_end({ messages: [fail] }, ctx);
+      const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/messages"));
+      expect(posts.every(p => !String(JSON.parse(p.body).content).startsWith("[!]"))).toBe(true);
+    });
+
+    test("command during a run is NOT interrupted", async () => {
+      await handleInbound(pi, inbound("/status", "m1"), ctx);
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
+      expect(abortCount).toBe(0);
+      expect(sent.length).toBe(0);
+    });
+
+    test("PISCORD_INTERRUPT_STEP_TIMEOUT_MS is honored", async () => {
+      process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS = "500";
+      try {
+        expect(interruptStepTimeoutMs()).toBe(500);
+        await handleInbound(pi, inbound("go", "m1"), ctx);
+        jest.advanceTimersByTime(499);
+        expect(abortCount).toBe(0);
+        jest.advanceTimersByTime(1);
+        expect(abortCount).toBe(1);
+        expect(sent.length).toBe(1);
+      } finally {
+        delete process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS;
+      }
+    });
+
+    test("invalid env value falls back to the 3000ms default", async () => {
+      process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS = "not-a-number";
+      try {
+        expect(interruptStepTimeoutMs()).toBe(3000);
+        await handleInbound(pi, inbound("go", "m1"), ctx);
+        jest.advanceTimersByTime(2999);
+        expect(abortCount).toBe(0);
+        jest.advanceTimersByTime(1);
+        expect(abortCount).toBe(1);
+      } finally {
+        delete process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS;
+      }
+    });
+
+    test("run that ends before the timeout: re-wake delivers, timer is a no-op", async () => {
+      await handleInbound(pi, inbound("later", "m1"), ctx);
+      idle = true; // the run ends
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(1); // re-wake fired
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
+      expect(sent.length).toBe(1); // timer found no entry, no double send
+      expect(abortCount).toBe(0);
+    });
+
+    test("/stop clears armed interrupts", async () => {
+      await handleInbound(pi, inbound("x", "m1"), ctx);
+      expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+      await handleInbound(pi, inbound("/stop", "m2"), ctx);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      expect(abortCount).toBe(1); // /stop's own abort
+      jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
+      expect(abortCount).toBe(1); // no interrupt abort
+      expect(sent.length).toBe(0);
+    });
+
+    test("interrupt does not fire when pi is idle at timer time", async () => {
+      await handleInbound(pi, inbound("x", "m1"), ctx);
+      idle = true; // run settled before the timer fires
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(0);
+      expect(sent.length).toBe(0);
+      // message stays in the re-wake queue, owned by agent_end
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    });
+
+    test("interrupt waits for a slow settle before sending", async () => {
+      // abort does NOT settle immediately — the wait loop must poll isIdle
+      ctx.abort = () => { abortCount += 1; };
+      await handleInbound(pi, inbound("slow", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0); // not sent while the run is still settling
+      // settle after 2 polls (microtask flush after each fake-timer advance)
+      jest.advanceTimersByTime(50);
+      await Promise.resolve();
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m1");
+    });
+
+    test("/status shows the armed interrupt state", async () => {
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("x", "m1"), ctx);
+      await handleInbound(pi, inbound("/status", "m2"), ctx);
+      const posts = fetchCalls.filter(c => c.method === "POST" && c.url.endsWith("/messages"));
+      const statusPost = posts
+        .map(p => String(JSON.parse(p.body).content))
+        .find(t => t.includes("running"));
+      expect(statusPost).toBeDefined();
+      expect(statusPost).toContain("interrupt in ");
+    });
   });
 
   test("F2: second-channel inbound during the re-wake await does not retarget the first run's failure post", async () => {
