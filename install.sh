@@ -66,11 +66,32 @@ pre_pkg=""
 [ -f "$BRIDGE_DIR/package.json" ] && pre_pkg="$(pkg_hash "$BRIDGE_DIR/package.json")"
 post_pkg_hash="$(pkg_hash "$src_pkg")"
 
+# Stale-source guard: the previous install stamped the source commit that
+# last synced into $BRIDGE_DIR. If the source HEAD is no longer AHEAD of that
+# stamp (behind or diverged), refuse -- a behind->ahead sync would roll the
+# live bridge back. (--delete would also wipe the newer files.)
+STAMP="$BRIDGE_DIR/.jarate-src"
+if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  src_head="$(git -C "$SRC" rev-parse HEAD)"
+  if [ -f "$STAMP" ]; then
+    stamp="$(cat "$STAMP")"
+    if ! git -C "$SRC" merge-base --is-ancestor "$stamp" "$src_head" 2>/dev/null; then
+      echo "install.sh: REFUSING stale sync: $BRIDGE_DIR was last installed from $stamp, source HEAD $src_head is not ahead of it (behind or diverged)." >&2
+      echo "  fix: git -C $SRC pull --ff-only, or move the stamp: rm $STAMP" >&2
+      exit 3
+    fi
+    [ "$DRY" = 1 ] && echo "[dry-run] stale-source guard: stamp $stamp is ancestor of $src_head, ok"
+  fi
+fi
+
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] rsync -a --delete --exclude .git --exclude node_modules $SRC/packages/bridge/ $BRIDGE_DIR/"
 else
   mkdir -p "$BRIDGE_DIR"
   rsync -a --delete --exclude .git --exclude node_modules "$SRC/packages/bridge/" "$BRIDGE_DIR/"
+  if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$SRC" rev-parse HEAD > "$STAMP"
+  fi
 fi
 echo "  bridge: $SRC/packages/bridge/ -> $BRIDGE_DIR"
 
