@@ -20,6 +20,21 @@ Components (all in this repo):
 Profiles are separate pi homes: `~/.pi/agent-worker`, `~/.pi/agent-reviewer`
 (env `PI_CODING_AGENT_DIR`, set by `pi-bg` automatically).
 
+## Fleet caps (vLLM queue protection)
+
+All agents share one vLLM endpoint (8 concurrent sequences max). Concurrent
+pi-bg dispatches = concurrent generation streams = queue depth.
+
+- **monky: max 2** concurrent dispatches (workers + reviewers combined)
+- **frank: max 3**
+
+Andryo, 2026-09-10 (monky lowered from 3 after a 3-worker + 2-agent wave
+saturated the queue: 8 running / 4 waiting). Count live before dispatching:
+
+```bash
+ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l
+```
+
 ## The flow (default: fire-and-forget)
 
 Dispatch, confirm, end the turn. The callback wakes the orchestrator as a new
