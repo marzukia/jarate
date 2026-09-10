@@ -80,14 +80,15 @@ bun --version
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) →
    New Application → Bot → Reset Token → copy the token (`<BOT_TOKEN>`).
-2. Invite it to your server: `https://discord.com/api/oauth2/authorize?client_id=<APP_ID>&permissions=512&scope=bot`
-   (permissions: view channels, send messages, read message history, attach
-   files, embed links). `[verify-on-fresh-box]`
+2. Invite it to your server: `https://discord.com/api/oauth2/authorize?client_id=<APP_ID>&permissions=127760&scope=bot`
+   (127760 = view channels + send messages + read message history + attach
+   files + embed links; a lower value like 512 grants only STREAM and the
+   bot cannot see the channel). `[verify-on-fresh-box]`
 3. Collect the three IDs the config needs:
    - **channel ID**: Discord settings → Advanced → Developer Mode → right-click
      a channel → Copy Channel ID
    - **your user ID**: right-click your avatar → Copy User ID
-   - **webhook** (step 10): right-click channel → Edit Channel → Integrations
+   - **webhook** (step 9.1): right-click channel → Edit Channel → Integrations
      → New Webhook → Copy Webhook URL
 
 ### 4. Clone + bootstrap
@@ -137,7 +138,7 @@ Minimal working shape (ref box values, secrets redacted):
       "botToken": "<BOT_TOKEN>",
       "default": true,
       "ownerUserId": "<YOUR_DISCORD_USER_ID>",
-      "forwardToolCalls": false,
+      "forwardToolCalls": true,
       "ack": false
     }
   ]
@@ -180,7 +181,7 @@ vLLM behind an OpenAI-compatible endpoint:
 `defaultProvider`/`defaultModel` in settings.json must match the provider
 and model ids above. Hosted providers (OpenRouter, OpenAI, Anthropic) work
 the same way — their API key can live in an env file that the unit loads
-(step 7, `EnvironmentFile`).
+(step 6, `EnvironmentFile`).
 
 ### 6. `pi.service` (systemd user unit)
 
@@ -233,8 +234,10 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u pi.service --no-pager \
 ```
 
 Expected (ref box, `[verified]`): a recent line containing
-`registered 6 slash commands`. Then message the channel on Discord — the
-bridge should reply.
+`registered 0 slash commands` (the bridge runs text-only mode since
+2026-09-09 - it registers no Discord slash commands; the line proves the
+bridge booted the interaction registrar). Then message the channel on
+Discord — the bridge should reply.
 
 ### 8. RAG setup (`packages/recall`)
 
@@ -298,7 +301,7 @@ nohup ~/scripts/pi-bg worker "self-contained task" > stdout.log 2>&1 &
 ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l  # count live
 ```
 
-Fleet caps (vLLM queue protection — see docs/DISPATCH.md): monky max 2
+Fleet caps (vLLM queue protection — see docs/DISPATCH.md): monky max 3
 concurrent dispatches, frank max 3. Reviewer verdicts: `VERDICT:
 PASS|FAIL` is the signal. Full protocol, cgroup escape, worktree flow,
 pi-wait exit codes: [docs/DISPATCH.md](docs/DISPATCH.md).
@@ -335,7 +338,7 @@ HOME=/tmp/fake bash install.sh --dry-run; echo $?         # 0, nothing changed
 jq -e '.packages[0]' ~/.pi/agent/settings.json            # ends /packages/bridge
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user status pi.service   # active (running)
 XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u pi.service --no-pager | grep 'slash commands' | tail -1
-                                                          # "registered 6 slash commands"  [verified]
+                                                          # "registered 0 slash commands" (text-only mode)  [verified]
 cd ~/projects/recall && bun recall query "ping"           # scored rows (or "no results" on an empty db)  [verified]
 ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l   # 0 before dispatching
 ```
