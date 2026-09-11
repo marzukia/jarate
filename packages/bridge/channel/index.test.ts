@@ -32,6 +32,7 @@ import extension, {
   registerTodoTool,
   runShellPassthrough,
   setInterruptCtx,
+  stopAllCompactTicks,
   TODO_TOOL_DESCRIPTION,
   updateQueuedInbound,
 } from "./index";
@@ -2116,11 +2117,13 @@ describe("compact: defer mid-run + always report", () => {
 
   afterEach(() => {
     jest.useRealTimers();
+    stopAllCompactTicks();
     clearAllCompacting();
     for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
     queuedAcks.clear();
     pendingInterrupts.clear();
     handlers.agent_end?.({ messages: [] }, ctx); // clears typing timer; flushes any pending compact
+    stopAllCompactTicks();
     clearAllCompacting();
     globalThis.fetch = realFetch;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -2133,6 +2136,7 @@ describe("compact: defer mid-run + always report", () => {
     };
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
+    await tick();
     expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
     opts.onComplete({
       summary: "s",
@@ -2141,9 +2145,90 @@ describe("compact: defer mid-run + always report", () => {
       estimatedTokensAfter: 35000,
     });
     await tick();
+    // The report REPLACES the ticking placeholder in place (PATCH), not a
+    // fresh post — no double message when the compact lands.
+    const reportText = "[ok] compacted: 219997 → 35000 tokens";
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
     expect(
-      channelPosts().some((t) => t === "[ok] compacted: 219997 → 35000 tokens"),
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          reportText,
+      ),
     ).toBe(true);
+    expect(channelPosts().some((t) => t === reportText)).toBe(false);
+  });
+
+  test("idle /compact placeholder ticks in place every 5s while compaction runs", async () => {
+    jest.useFakeTimers();
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+
+    // No edit before the first 5s tick
+    jest.advanceTimersByTime(4999);
+    expect(edits().length).toBe(0);
+    jest.advanceTimersByTime(1);
+    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    // subsequent ticks keep updating the SAME message in place
+    jest.advanceTimersByTime(5000);
+    expect(edits()).toEqual(["[..] compacting… 5s", "[..] compacting… 10s"]);
+    jest.advanceTimersByTime(5000);
+    expect(edits()).toEqual([
+      "[..] compacting… 5s",
+      "[..] compacting… 10s",
+      "[..] compacting… 15s",
+    ]);
+
+    // Settle: the report replaces the placeholder in place, tick stops
+    opts.onComplete({ tokensBefore: 100, estimatedTokensAfter: 10 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(edits().at(-1)).toBe("[ok] compacted: 100 → 10 tokens");
+    jest.advanceTimersByTime(60000);
+    expect(edits().length).toBe(4); // no further ticks after settle
+    expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
+  });
+
+  test("idle /compact onError replaces the ticking placeholder in place", async () => {
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await tick();
+    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    opts.onError(new Error("model down"));
+    await tick();
+    const failText = "[!] compact failed: model down";
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
+    expect(
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          failText,
+      ),
+    ).toBe(true);
+    expect(channelPosts().some((t) => t === failText)).toBe(false);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
@@ -2201,9 +2286,11 @@ describe("compact: defer mid-run + always report", () => {
         t.startsWith("[queued] compact (run in progress)"),
       ),
     ).toBe(true);
-    // run ends → flush
+    // run ends → flush (flushed compact posts its own ticking placeholder)
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
+    await tick();
+    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
   });
 
   test("mid-run: a later /compact replaces the earlier pending one", async () => {
