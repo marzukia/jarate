@@ -434,6 +434,66 @@ function beginCompacting(
   console.log(`[channel] compacting window open for ${ch.id}`);
 }
 
+// ─── Compaction placeholder live tick (issue #22) ────────────────────
+// Same pattern as the working-block statusTick (d2a8afc): while a
+// compaction runs, the "[..] compacting..." placeholder is edited in
+// place every 5s with the elapsed seconds; when the compaction settles,
+// the placeholder is replaced in place with the final report (or failure
+// line). The interval self-stops once the compaction window closes, but
+// the entry is KEPT so the settle can still replace the message.
+export const COMPACT_PLACEHOLDER = "[..] compacting...";
+interface CompactTickEntry {
+  ch: ChannelConfig;
+  msgId: string;
+  since: number;
+  timer: ReturnType<typeof setInterval>;
+}
+const compactTicks = new Map<string, CompactTickEntry>();
+
+export function armCompactTick(ch: ChannelConfig, msgId: string): void {
+  const prev = compactTicks.get(ch.id);
+  if (prev) clearInterval(prev.timer);
+  const since = Date.now();
+  const timer = setInterval(() => {
+    const entry = compactTicks.get(ch.id);
+    if (!entry) return;
+    if (!isCompacting(ch.id)) {
+      // window closed: stop ticking, keep the entry for the settle replace
+      clearInterval(entry.timer);
+      return;
+    }
+    const secs = Math.floor((Date.now() - since) / 1000);
+    const inc = Math.floor(secs / 5) * 5;
+    editDiscordMessage(ch, msgId, `[..] compacting… ${inc}s`).catch(() => {});
+  }, 5000);
+  (timer as any).unref?.();
+  compactTicks.set(ch.id, { ch, msgId, since, timer });
+}
+
+/** Replace the ticking placeholder in place with the final line. Returns
+ *  false when no tick was armed (native slash path / settle raced the
+ *  post) — the caller then falls back to a fresh post. */
+export function settleCompactTick(channelId: string, text: string): boolean {
+  const entry = compactTicks.get(channelId);
+  if (!entry) return false;
+  clearInterval(entry.timer);
+  compactTicks.delete(channelId);
+  editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
+  return true;
+}
+
+/** Stop + drop the tick without a final replace (session_shutdown). */
+export function stopCompactTick(channelId: string): void {
+  const entry = compactTicks.get(channelId);
+  if (!entry) return;
+  clearInterval(entry.timer);
+  compactTicks.delete(channelId);
+}
+
+export function stopAllCompactTicks(): void {
+  for (const id of [...compactTicks.keys()]) stopCompactTick(id);
+}
+
 /** Deliver ONE queued inbound that was waiting out a compaction (same
  *  re-wake as the agent_end path). No-op when a run is already active:
  *  that run's agent_end drains the rest. */
@@ -1528,6 +1588,7 @@ export default function (pi: ExtensionAPI) {
     lastActiveChannel = null;
     pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
     clearAllCompacting();
+    stopAllCompactTicks();
     pendingAttachments.clear();
     midTurnQueues.clear();
     queuedAcks.clear();
@@ -1769,7 +1830,7 @@ export default function (pi: ExtensionAPI) {
     if (!pendingCompact) return false;
     const pc = pendingCompact;
     pendingCompact = null;
-    const err = startCompact(pi, pc, ctx);
+    const err = startCompact(pi, pc, ctx, true);
     if (err !== null)
       sendDiscordMessage(pc.ch, `[!] compact failed: ${err}`).catch(() => {});
     return err === null;
@@ -2117,7 +2178,9 @@ export function buildInteractionHandler(
         d.user?.id,
         true,
       );
-      text = r.btw ? undefined : (r.immediate ?? "ok");
+      text = r.btw
+        ? undefined
+        : (r.immediate ?? (r.consumed ? undefined : "ok"));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       text = `[!] command failed: ${sanitizeSensitiveText(msg)}`;
@@ -2203,10 +2266,15 @@ function startCompact(
   pi: ExtensionAPI,
   pending: { ch: ChannelConfig; instructions?: string },
   ctx: ExtensionContext,
+  postPlaceholder = false,
 ): string | null {
   const { ch, instructions } = pending;
   const report = (text: string) => {
-    sendDiscordMessage(ch, text).catch(() => {});
+    // Replace the ticking placeholder in place when one is armed; the
+    // fresh-post fallback covers the native slash path and the (impossible
+    // in practice) settle-before-post race.
+    if (!settleCompactTick(ch.id, text))
+      sendDiscordMessage(ch, text).catch(() => {});
   };
   try {
     ctx.compact({
@@ -2236,6 +2304,15 @@ function startCompact(
       },
     });
     beginCompacting(pi, pending.ch, ctx);
+    if (postPlaceholder && ch.type === "discord") {
+      // Fire-and-forget: the placeholder gets its live tick; a settle
+      // faster than the post simply gets the fresh-post fallback via report().
+      sendDiscordMessage(ch, COMPACT_PLACEHOLDER)
+        .then((r) => {
+          if (r.success && r.messageId) armCompactTick(ch, r.messageId);
+        })
+        .catch(() => {});
+    }
     return null;
   } catch (e) {
     return sanitizeSensitiveText(e instanceof Error ? e.message : String(e));
@@ -2256,7 +2333,7 @@ async function runChannelCommand(
   arg: string | undefined,
   fromId: string | undefined,
   native: boolean,
-): Promise<{ immediate?: string; btw?: boolean }> {
+): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
   const isOwner = !ch.ownerUserId || fromId === ch.ownerUserId;
   const ownerOnly = !isOwner
     ? { immediate: native ? "[!] owner only" : undefined }
@@ -2489,11 +2566,12 @@ async function runChannelCommand(
           immediate: `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
         };
       }
-      const err = startCompact(pi, { ch, instructions }, ctx);
-      return {
-        immediate:
-          err !== null ? `[!] compact failed: ${err}` : "[..] compacting...",
-      };
+      // Text path: startCompact posts the placeholder (armed with its live
+      // tick) and reports settle-in-place. Native: the deferred interaction
+      // shows the placeholder instead; the report posts fresh.
+      const err = startCompact(pi, { ch, instructions }, ctx, !native);
+      if (err !== null) return { immediate: `[!] compact failed: ${err}` };
+      return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
       // Informational, open to all channel members (private channel).
@@ -3028,6 +3106,12 @@ export async function handleInbound(
         false,
       );
       if (r.btw) {
+        noAck();
+        return;
+      }
+      if (r.consumed) {
+        // The command posted its own reply (e.g. the ticking compact
+        // placeholder) — no ack, no fall-through to a run.
         noAck();
         return;
       }
