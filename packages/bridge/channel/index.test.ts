@@ -2712,9 +2712,10 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     ctx.isIdle = () => false;
     // /reset would open a second op window on the re-wake — refuse now
+    // (F5: names the ACTIVE op — compaction, not a restart)
     await handleInbound(pi, inbound("/reset", "m2"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[!] already restarting")).toBe(
+    expect(channelPosts().some((t) => t === "[!] already compacting")).toBe(
       true,
     );
     // a queued-eligible command (/undo) still waits like a plain message
@@ -3786,20 +3787,64 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(fs.existsSync(p)).toBe(false); // consumed either way
   });
 
-  test("/stop during an op clears the window and rewinds the cursor", async () => {
+  test("/stop during an op CANCELS it: no shutdown, no systemd restart, session file kept", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    fs.mkdirSync(sessDir, { recursive: true });
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+    let restartRequests = 0;
+    setSystemdRestartHookForTest(() => {
+      restartRequests++;
+    });
+
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
-    setChannelCursor("ch1", "1200");
+    setChannelCursor("ch1", "1200"); // an op-window inbound was delivered
 
     await handleInbound(pi, inbound("/stop", "m3"), ctx);
     await tick();
     expect(isCompacting("ch1")).toBe(false);
-    expect(getChannelCursor("ch1")).toBe("1000");
-    expect(channelPosts().some((t) => t === "[-] stopped")).toBe(true);
-    await waitOpShutdown(); // let the original op timer fire harmlessly
+    expect(getChannelCursor("ch1")).toBe("1000"); // cursor restored
+    expect(
+      channelPosts().some((t) => t === "[-] stopped (restart cancelled)"),
+    ).toBe(true);
+    // the marker goes with the cancelled op — no stale settle on next boot
+    expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
+
+    // The original op timer (armed at 300ms) must NOT fire the chain.
+    await waitOpShutdown();
+    expect(shutdowns).toBe(0); // no ctx.shutdown
+    expect(restartRequests).toBe(0); // no systemd restart request
+    expect(fs.existsSync(sess)).toBe(true); // session file NOT moved aside
+    expect(fs.readdirSync(sessDir).some((f) => f.includes(".reset-"))).toBe(
+      false,
+    );
   });
 
-  test("second /reset while an op window is open is rejected; /status shows the op label", async () => {
+  test("session_shutdown re-rewinds the op cursor: a gap inbound after the rewind cannot advance it", async () => {
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    await waitOpShutdown(); // chain ran: rewound to 1000 + persisted
+    expect(getChannelCursor("ch1")).toBe("1000");
+
+    // an inbound lands in the gap: after the op's rewind, before the
+    // shutdown's disconnects
+    setChannelCursor("ch1", "1200");
+    expect(getChannelCursor("ch1")).toBe("1200");
+
+    await handlers.session_shutdown?.();
+    // re-rewound (in-memory + persisted) — the respawn replays 1000..1200
+    expect(getChannelCursor("ch1")).toBe("1000");
+    expect(loadPersistedCursors(path.join(tmp, ".tmp")).ch1).toBe("1000");
+  });
+
+  test("second /reset while an op window is open is rejected; /compact sees the active op; /status shows the op label", async () => {
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
     await handleInbound(pi, inbound("/reset", "m4"), ctx);
@@ -3807,6 +3852,12 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(
       channelPosts().filter((t) => t === "[!] already restarting").length,
     ).toBe(1);
+    // F5: /compact while resetting names the ACTIVE op, not itself
+    await handleInbound(pi, inbound("/compact", "m4b"), ctx);
+    await tick();
+    expect(
+      channelPosts().filter((t) => t === "[!] already restarting").length,
+    ).toBe(2);
 
     await handleInbound(pi, inbound("/status", "m5"), ctx);
     await tick();

@@ -410,6 +410,9 @@ interface CompactingEntry {
   rewindTo: string | null;
 }
 export const compactingChannels = new Map<string, CompactingEntry>();
+/** Pending op-shutdown timers by channel (F1). The window is cleared on
+ *  /stop, which clears this timer, so the shutdown chain never runs. */
+const opShutdownTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /**
  * True while an op window is open: compaction OR a restart-class op
@@ -425,6 +428,15 @@ export function opWindowLabel(channelId: string): OpLabel | null {
   return compactingChannels.get(channelId)?.label ?? null;
 }
 
+/** Double-op refusal text (F5, owner 2026-09-11): name the ACTIVE op —
+ *  a compaction window says "already compacting", a restart-class op
+ *  window says "already restarting". */
+function opBusyRefusal(channelId: string): string {
+  return opWindowLabel(channelId) === "compacting"
+    ? "[!] already compacting"
+    : "[!] already restarting";
+}
+
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
  *  fired without a completion event. */
 export function clearCompacting(channelId: string, warn = false): void {
@@ -432,6 +444,11 @@ export function clearCompacting(channelId: string, warn = false): void {
   if (!e) return;
   clearTimeout(e.timer);
   compactingChannels.delete(channelId);
+  // F1: window closed = restart-class op cancelled — drop the pending
+  // op-shutdown timer so its chain never runs.
+  const opTimer = opShutdownTimers.get(channelId);
+  if (opTimer) clearTimeout(opTimer);
+  opShutdownTimers.delete(channelId);
   if (warn)
     console.warn(
       `[channel] ${channelId} still compacting after ${COMPACT_FALLBACK_MS / 60000} min; clearing flag (no completion event)`,
@@ -1669,6 +1686,13 @@ export default function (pi: ExtensionAPI) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
+    // F2: inbounds delivered between the op's rewind and this shutdown
+    // advanced the persisted cursor — re-rewind BEFORE the disconnects
+    // below (which drop the live state setChannelCursor needs) so the
+    // respawn replays the full op window. Restart-class ops only:
+    // rewindTo is null for compaction.
+    for (const [id, e] of compactingChannels)
+      if (e.rewindTo) setChannelCursor(id, e.rewindTo);
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
@@ -2387,7 +2411,7 @@ function consumeOpMarker(ctx: ExtensionContext): void {
     return;
   }
   const ch = getChannel(loadChannelConfig(ctx.cwd), m.channelId);
-  if (!ch || ch.type !== "discord") return;
+  if (ch?.type !== "discord") return;
   console.log(
     `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
   );
@@ -2396,6 +2420,15 @@ function consumeOpMarker(ctx: ExtensionContext): void {
       sendDiscordMessage(ch, m.finalText).catch(() => {}),
     );
   else sendDiscordMessage(ch, m.finalText).catch(() => {});
+}
+
+/** Drop the op marker (F1: /stop cancels the op — no respawn comes from
+ *  this process, so a stale marker must not settle the old placeholder
+ *  on the next unrelated boot). */
+function clearOpMarker(ctx: ExtensionContext): void {
+  try {
+    fs.unlinkSync(opMarkerPath(ctx.cwd));
+  } catch {}
 }
 
 let systemdRestartHook: (() => void) | null = null;
@@ -2475,8 +2508,21 @@ function scheduleOpShutdown(
   placeholderP: Promise<string | null>,
   preShutdown?: () => void,
 ): void {
-  setTimeout(() => {
+  const entry = compactingChannels.get(ch.id);
+  const timer = setTimeout(() => {
+    opShutdownTimers.delete(ch.id);
     void (async () => {
+      // F1 (owner: cancel): the window was cleared before this fired
+      // (/stop) — the op is off. Skip the whole chain: no preShutdown
+      // (session-file move), no systemd restart request, no ctx.shutdown.
+      // clearCompacting drops the timer; this check covers a stop that
+      // landed after the callback was already queued.
+      if (!entry || compactingChannels.get(ch.id) !== entry) {
+        console.log(
+          `[op] ${ch.id} window closed before shutdown — op cancelled`,
+        );
+        return;
+      }
       // Bounded settle: the aborted run is usually done in ms; a stuck
       // session must not hold the respawn hostage (2s cap, then go).
       const t0 = Date.now();
@@ -2501,6 +2547,7 @@ function scheduleOpShutdown(
       }
     })();
   }, OP_SHUTDOWN_DELAY_MS);
+  opShutdownTimers.set(ch.id, timer);
 }
 
 /** /reset = NEW session: move the current session file aside so the
@@ -2665,13 +2712,20 @@ async function runChannelCommand(
       // re-wake queue (including owner messages) + abort the next run.
       if (isCompacting(ch.id) && !isOwner)
         return { immediate: "[!] owner only" };
-      // A restart-class op rewound its Discord cursor at window open;
+      // A restart-class op captured its Discord cursor at window open;
       // /stop clears the window AND restores that cursor so inbounds
-      // delivered during the op replay after the respawn instead of
-      // being lost with the window.
+      // delivered during the op replay on the next boot instead of being
+      // lost with the window (they are dropped from the re-wake queue
+      // below).
       const stoppedEntry = compactingChannels.get(ch.id);
+      // F1 (owner: cancel): a restart-class op (rewindTo set) was in
+      // flight — /stop CANCELS it. clearCompacting drops the pending
+      // shutdown timer, the marker goes with the op, and the ack says
+      // so. A compaction-only stop keeps the plain "[-] stopped".
+      const restartCancelled = stoppedEntry?.rewindTo != null;
       clearCompacting(ch.id); // the abort's settle (session_compact_failed)
       // re-clears + drains; the queue drop below wins for THIS /stop
+      if (restartCancelled) clearOpMarker(ctx);
       if (stoppedEntry?.rewindTo)
         setChannelCursor(ch.id, stoppedEntry.rewindTo);
       // A4: drain the mid-turn re-wake queue so /stop does not immediately
@@ -2695,7 +2749,11 @@ async function runChannelCommand(
         userStoppedRun = true;
         ctx.abort();
       }
-      return { immediate: "[-] stopped" };
+      return {
+        immediate: restartCancelled
+          ? "[-] stopped (restart cancelled)"
+          : "[-] stopped",
+      };
     }
     case "help":
       return { immediate: HELP_TEXT };
@@ -2772,7 +2830,7 @@ async function runChannelCommand(
     }
     case "reset": {
       if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
+      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
@@ -2802,7 +2860,7 @@ async function runChannelCommand(
       // 'pi -c' which continues the last session file (the opposite of
       // /reset, which moves that file aside first). Same block + tick +
       // cursor-replay dance as /reset, minus the session-file move.
-      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
+      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
@@ -2822,7 +2880,7 @@ async function runChannelCommand(
     }
     case "undo": {
       if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
+      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runUndo(ctx);
       if (!r.restarted) return { immediate: r.text };
       // performUndo already truncated the session file + parked the re-run
@@ -2841,7 +2899,7 @@ async function runChannelCommand(
     }
     case "redo": {
       if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
+      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runRedo(ctx);
       if (!r.restarted) return { immediate: r.text };
       const placeholderP = beginRestartOp(
@@ -2868,9 +2926,9 @@ async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       const instructions = (arg || "").trim() || undefined;
       if (isCompacting(ch.id)) {
-        // The channel's own compaction window is open: one compact at a
-        // time, reject the second instead of queueing it.
-        return { immediate: "[!] already compacting" };
+        // The channel's own op window is open: one op at a time, reject
+        // the second instead of queueing it (F5: name the active op).
+        return { immediate: opBusyRefusal(ch.id) };
       }
       if (!ctx.isIdle()) {
         // Run in progress (compact would abort it) or a compaction already
