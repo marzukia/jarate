@@ -35,12 +35,14 @@ Voice-note attachments (audio content type, duration, waveform, or
 audio file extension) are labeled `[voice note: name (12s)]` inline and
 delivered immediately. Other file attachments are downloaded on arrival
 into a batch folder (20 MB per-file cap; oversize or failed downloads
-are noted next to the file in the LLM message). File-only messages buffer
-for up to 10 minutes until the user sends follow-up text (follow-up text
-with its own attachments also flushes the buffer; expired batches are
-dropped silently). Set `"bufferFileOnly": false` on a channel to skip
-buffering: file-only messages synthesize a prompt like
-`[user sent file without text: IMG_1358.jpg]` and fire a turn immediately.
+are noted next to the file in the LLM message). By default, file-only
+messages fire a turn immediately with a synthesized prompt like
+`[user sent file without text: IMG_1358.jpg]`. Set `"bufferFileOnly": true`
+on a channel to buffer them for up to 10 minutes until the user sends
+follow-up text (the buffer posts one visible
+`[buffered] N file(s) - send text to attach them` ack line; follow-up
+with its own attachments also flushes the buffer; a batch that never
+gets follow-up text is auto-flushed as a file-only turn at 10 minutes).
 
 ### Sending files to the user
 

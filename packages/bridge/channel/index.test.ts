@@ -1493,6 +1493,22 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("F3: re-wake preserves the pending attachment batch", async () => {
+    // #24 flipped the default (file-only now fires a turn); this test pins
+    // the explicit bufferFileOnly: true behavior.
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            bufferFileOnly: true,
+          },
+        ],
+      }),
+    );
     ctx.isIdle = () => false; // a run is in flight
     // 1. File-only message → buffered (no text, no voice note).
     const fileOnly = inbound("", "m300");
@@ -1515,6 +1531,167 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(sent[0].m.details.body).toContain("read this");
     // The batch was consumed by the re-wake pass.
     expect(pendingAttachments.has("ch1")).toBe(false);
+  });
+
+  test("#24: file-only with default config fires a turn immediately (no buffer)", async () => {
+    // No bufferFileOnly in settings → default FALSE → file-only fires a turn.
+    const fileOnly = inbound("", "m400");
+    fileOnly.attachments = [
+      { id: "b1", filename: "notes.txt", contentType: "text/plain", size: 50 },
+    ];
+    await handleInbound(pi, fileOnly, ctx);
+    expect(pendingAttachments.has("ch1")).toBe(false);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain(
+      "[user sent 1 file without text: notes.txt]",
+    );
+    expect(sent[0].m.content).toContain("notes.txt");
+    // No [buffered] ack posted on the default path.
+    const bufferedAck = fetchCalls.find(
+      (c) =>
+        c.method === "POST" &&
+        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+    );
+    expect(bufferedAck).toBeUndefined();
+  });
+
+  test("#24: bufferFileOnly:true buffers, posts ONE [buffered] ack, text follow-up consumes", async () => {
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            bufferFileOnly: true,
+          },
+        ],
+      }),
+    );
+    const fileOnly = inbound("", "m401");
+    fileOnly.attachments = [
+      { id: "b1", filename: "a.txt", contentType: "text/plain", size: 10 },
+      { id: "b2", filename: "b.jpg", contentType: "image/jpeg", size: 20 },
+    ];
+    await handleInbound(pi, fileOnly, ctx);
+    // Buffered, no turn.
+    expect(sent.length).toBe(0);
+    expect(pendingAttachments.get("ch1")?.length).toBe(1);
+    // Exactly one visible [buffered] ack line.
+    const acks = fetchCalls.filter(
+      (c) =>
+        c.method === "POST" &&
+        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+    );
+    expect(acks.length).toBe(1);
+    expect(JSON.parse(acks[0].body).content).toBe(
+      "[buffered] 2 files - send text to attach them",
+    );
+    // No regression: text after buffer consumes the batch with file context.
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("look at these", "m402"), ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("a.txt");
+    expect(sent[0].m.content).toContain("b.jpg");
+    expect(sent[0].m.details.body).toContain("look at these");
+    expect(pendingAttachments.has("ch1")).toBe(false);
+    // The text follow-up posts no second [buffered] ack.
+    const acks2 = fetchCalls.filter(
+      (c) =>
+        c.method === "POST" &&
+        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+    );
+    expect(acks2.length).toBe(0);
+  });
+
+  test("#24: buffered batch auto-flushes as a file-only turn at 10 minutes (frozen clock)", async () => {
+    jest.useFakeTimers();
+    const t0 = Date.now();
+    const nowSpy = jest.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      fs.writeFileSync(
+        path.join(tmp, ".pi", "settings.json"),
+        JSON.stringify({
+          channels: [
+            {
+              id: "ch1",
+              name: "Test",
+              type: "discord",
+              botToken: "tok1",
+              bufferFileOnly: true,
+            },
+          ],
+        }),
+      );
+      const fileOnly = inbound("", "m403");
+      fileOnly.attachments = [
+        { id: "b1", filename: "late.txt", contentType: "text/plain", size: 30 },
+      ];
+      await handleInbound(pi, fileOnly, ctx);
+      expect(pendingAttachments.get("ch1")?.length).toBe(1);
+      expect(sent.length).toBe(0);
+      // session_start arms the 60s flush ticker (sleepPoller alongside).
+      await handlers.session_start(null, ctx);
+      // 9 minutes of ticks: batch not yet due, nothing fires.
+      nowSpy.mockReturnValue(t0 + 9 * 60_000);
+      jest.advanceTimersByTime(9 * 60_000);
+      expect(sent.length).toBe(0);
+      expect(pendingAttachments.has("ch1")).toBe(true);
+      // Cross the 10-minute boundary: next tick flushes a file-only turn.
+      nowSpy.mockReturnValue(t0 + 11 * 60_000);
+      jest.advanceTimersByTime(2 * 60_000);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.content).toContain(
+        "[user sent 1 file without text: late.txt]",
+      );
+      expect(sent[0].m.details.body).toContain("late.txt");
+      // The batch was consumed by the flush.
+      expect(pendingAttachments.has("ch1")).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
+  test("#24: voice-note-only message is not buffered (unaffected by the default flip)", async () => {
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            bufferFileOnly: true,
+          },
+        ],
+      }),
+    );
+    const voice = inbound("", "m404");
+    voice.attachments = [
+      {
+        id: "v1",
+        filename: "recording.m4a",
+        contentType: "audio/ogg",
+        size: 1000,
+        duration: 12,
+      },
+    ];
+    await handleInbound(pi, voice, ctx);
+    // Voice note fires a turn with its marker line; nothing buffered, no ack.
+    expect(pendingAttachments.has("ch1")).toBe(false);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("[voice note: recording.m4a (12s)]");
+    expect(sent[0].m.content).not.toContain("[buffered]");
+    const acks = fetchCalls.filter(
+      (c) =>
+        c.method === "POST" &&
+        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+    );
+    expect(acks.length).toBe(0);
   });
 
   test("repetition: 3 consecutive identical finals → abort + one warning, 3rd dropped", async () => {
@@ -3191,14 +3368,11 @@ describe("sleep (integration)", () => {
   });
 
   test("sleep tool: until ISO -> wake at that time", async () => {
-    await tools["sleep"].execute(
-      "1",
-      { until: "2026-09-10T15:00:00Z" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    expect(loadWakes(tmp)[0].wakeAt).toBe(Date.parse("2026-09-10T15:00:00Z"));
+    // Relative future date — a hardcoded ISO became a date bomb on
+    // 2026-09-11 (past `until` is rejected, so the wake list stayed empty).
+    const until = new Date(Date.now() + 30 * 60000).toISOString();
+    await tools["sleep"].execute("1", { until }, undefined, undefined, ctx);
+    expect(loadWakes(tmp)[0].wakeAt).toBe(Date.parse(until));
   });
 
   test("sleep tool: bad params -> error, nothing scheduled", async () => {

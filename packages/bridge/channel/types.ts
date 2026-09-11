@@ -38,8 +38,9 @@ export interface ChannelConfig {
   /** When true, tool calls and results are forwarded to the channel alongside the final response. */
   forwardToolCalls?: boolean;
   /** Buffer file-only messages (no text, no voice note) for up to 10
-   *  minutes until follow-up text arrives (default true). Set false to
-   *  synthesize a prompt and fire a turn immediately. */
+   *  minutes until follow-up text arrives (default false — file-only
+   *  messages fire a turn immediately by default). Set true to buffer;
+   *  buffered batches are auto-flushed as a file-only turn at 10 minutes. */
   bufferFileOnly?: boolean;
   /** Message posted when a channel connects. Unset or empty = no message. */
   startupMessage?: string | null;
@@ -176,7 +177,7 @@ function normalizeChannel(raw: any): ChannelConfig {
     default: raw.default === true,
     ownerUserId: raw.ownerUserId,
     forwardToolCalls: raw.forwardToolCalls === true,
-    bufferFileOnly: raw.bufferFileOnly !== false,
+    bufferFileOnly: raw.bufferFileOnly === true,
     startupMessage: raw.startupMessage,
     peerBotIds: Array.isArray(raw.peerBotIds)
       ? raw.peerBotIds.filter((x: any) => typeof x === "string")

@@ -117,6 +117,9 @@ let undoRun: UndoRun | null = null;
 
 // 30s poller for due sleep wakes (session_start / session_shutdown owned).
 let sleepPoller: ReturnType<typeof setInterval> | null = null;
+// 60s ticker that auto-flushes buffered file-only batches at 10 minutes
+// (session_start / session_shutdown owned). (#24)
+let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
 // /compact queued while the session is busy (run in progress, or a
 // compaction already in flight). pi's compact() starts with await
 // abort(), so a mid-run compact would silently kill the in-flight
@@ -1194,6 +1197,84 @@ export function prunePendingBatches(
   return fresh;
 }
 
+/** Pull expired batches (older than ATTACHMENT_BATCH_TTL_MS) out of a
+ *  channel's pending list; fresh ones stay. (#24) */
+export function collectExpiredBatches(
+  channelId: string,
+  now = Date.now(),
+): AttachmentBatch[] {
+  const all = pendingAttachments.get(channelId) || [];
+  const expired = all.filter((b) => now - b.addedAt >= ATTACHMENT_BATCH_TTL_MS);
+  if (expired.length === 0) return [];
+  const fresh = all.filter((b) => now - b.addedAt < ATTACHMENT_BATCH_TTL_MS);
+  if (fresh.length === 0) pendingAttachments.delete(channelId);
+  else pendingAttachments.set(channelId, fresh);
+  return expired;
+}
+
+/** Auto-flush expired buffered batches as a file-only turn (#24): a
+ *  buffered batch that never got follow-up text must not sit forever —
+ *  at 10 minutes it fires the same fileOnlyPrompt turn as
+ *  bufferFileOnly:false. Returns the number of turns fired. */
+export async function flushExpiredPendingBatches(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  now = Date.now(),
+): Promise<number> {
+  let fired = 0;
+  for (const channelId of [...pendingAttachments.keys()]) {
+    const expired = collectExpiredBatches(channelId, now);
+    if (expired.length === 0) continue;
+    const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
+    if (!ch) continue;
+    const allFiles = expired.flatMap((b) => b.files);
+    const prompt = fileOnlyPrompt(allFiles);
+    const attParts = expired.map((b) => {
+      const files = b.files
+        .map((a) => {
+          const note = b.notes?.[a.id];
+          return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
+        })
+        .join("\n");
+      return `<user-action-ctx>User attached file(s) in ${b.folder}/\n${files}</user-action-ctx>`;
+    });
+    const channelCtx = buildChannelContext(ch, {
+      channelId: ch.id,
+      channelName: ch.name,
+      channelType: "discord",
+      messageId: "",
+      from: "buffered files (no text sent)",
+      body: "",
+      timestamp: new Date().toISOString(),
+      attachments: allFiles,
+      isRoom: false,
+    });
+    const fwd = [attParts.join("\n\n"), prompt].filter(Boolean).join("\n\n");
+    const disp =
+      [attachmentSummary(allFiles), prompt].filter(Boolean).join("\n\n") ||
+      "(empty)";
+    sendToPi(
+      pi,
+      ch.id,
+      `${channelCtx}\n\n${fwd}`,
+      channelTitle(ch, {
+        channelId: ch.id,
+        channelName: ch.name,
+        channelType: "discord",
+        messageId: "",
+        from: "buffered files (no text sent)",
+        body: "",
+        timestamp: new Date().toISOString(),
+        attachments: allFiles,
+        isRoom: false,
+      }),
+      disp,
+    );
+    fired++;
+  }
+  return fired;
+}
+
 export default function (pi: ExtensionAPI) {
   let channels: ChannelConfig[] = [];
   let workspaceRoot = "";
@@ -1404,6 +1485,26 @@ export default function (pi: ExtensionAPI) {
       }, 30_000);
       (sleepPoller as any).unref?.();
     }
+
+    // Buffered file-only batches: auto-flush anything older than 10 minutes
+    // as a file-only turn so the buffer never holds files forever. (#24)
+    if (bufferFlushTicker) clearInterval(bufferFlushTicker);
+    bufferFlushTicker = setInterval(() => {
+      try {
+        flushExpiredPendingBatches(pi, ctx).catch((e) => {
+          console.error(
+            "[channel] buffer flush failed:",
+            sanitizeUnknownValue(e),
+          );
+        });
+      } catch (e) {
+        console.error(
+          "[channel] buffer flush failed:",
+          sanitizeUnknownValue(e),
+        );
+      }
+    }, 60_000);
+    (bufferFlushTicker as any).unref?.();
   });
 
   pi.on("session_shutdown", async () => {
@@ -1436,6 +1537,10 @@ export default function (pi: ExtensionAPI) {
     if (sleepPoller) {
       clearInterval(sleepPoller);
       sleepPoller = null;
+    }
+    if (bufferFlushTicker) {
+      clearInterval(bufferFlushTicker);
+      bufferFlushTicker = null;
     }
   });
 
@@ -3124,7 +3229,9 @@ export async function handleInbound(
     let prompt = body;
     if (!body && voiceLines.length === 0) {
       if (ch?.bufferFileOnly !== false) {
-        // Default: buffer file info, wait for follow-up text
+        // bufferFileOnly: true — buffer file info, wait for follow-up
+        // text. Batches auto-flush as a file-only turn at 10 minutes
+        // (flushExpiredPendingBatches ticker) so they never sit forever. (#24)
         const batches = prunePendingBatches(msg.channelId);
         batches.push({
           folder: batchFolderRel,
@@ -3133,9 +3240,19 @@ export async function handleInbound(
           notes: Object.fromEntries(notes),
         });
         pendingAttachments.set(msg.channelId, batches);
+        // One visible ack line (same noAck pattern as the [queued] acks):
+        // the user must know the file was received and is waiting on text.
+        noAck();
+        const n = msg.attachments.length;
+        sendDiscordMessage(
+          ch,
+          `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
+          msg.messageId,
+        ).catch(() => {});
         return;
       }
-      // bufferFileOnly: false — fire a turn with a synthesized prompt
+      // Default (bufferFileOnly unset/false) — fire a turn with a
+      // synthesized prompt. (#24)
       prompt = fileOnlyPrompt(msg.attachments);
     }
 
