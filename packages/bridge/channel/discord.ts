@@ -14,6 +14,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import WebSocket from "ws";
+import { censor } from "./censor";
 import { serializeEmbeds } from "./format";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 import { sanitizeSensitiveText } from "./sanitize";
@@ -637,6 +638,17 @@ async function reactToMessage(
 // ─── Sending ───────────────────────────────────────────────────────────────
 
 /**
+ * THE egress choke point. Every text-bearing outbound function in this file
+ * (sendDiscordMessage, editDiscordMessage, sendDiscordMessageWithFiles,
+ * sendFilesToDiscord, respondToInteraction, editInteractionMessage) MUST
+ * route its user-visible string through this before it hits the Discord
+ * API — see docs/secret-censor.md. A test asserts this at source level.
+ */
+export function egressText(text: string): string {
+  return censor(text);
+}
+
+/**
  * allowed_mentions for an outbound body. Default = silent (no pings from
  * echoed mention patterns). A real <@id> mention in the text keeps working:
  * parse:['users'] + explicit user list pings exactly those users.
@@ -653,12 +665,13 @@ export function allowedMentionsFor(text: string): {
 /** Send a text message to a Discord channel. */
 export async function sendDiscordMessage(
   config: ChannelConfig,
-  text: string,
+  raw: string,
   replyToMessageId?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
 
+  const text = egressText(raw); // secret censor: single egress choke point
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (token) {
@@ -717,10 +730,11 @@ export async function sendDiscordMessage(
 export async function editDiscordMessage(
   config: ChannelConfig,
   messageId: string,
-  text: string,
+  raw: string,
 ): Promise<{ success: boolean; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
+  const text = egressText(raw); // secret censor
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (!token) return { success: false, error: "No bot token" };
@@ -811,6 +825,8 @@ export async function sendFilesToDiscord(
 ): Promise<{ success: boolean; error?: string }> {
   if (files.length === 0) return { success: true };
 
+  const names = files.map((f) => path.basename(f));
+
   for (const file of files) {
     let stat: fs.Stats;
     try {
@@ -833,7 +849,7 @@ export async function sendFilesToDiscord(
   formData.append(
     "payload_json",
     JSON.stringify({
-      attachments: files.map((f, i) => ({ id: i, filename: path.basename(f) })),
+      attachments: names.map((name, i) => ({ id: i, filename: name })),
     }),
   );
   for (const [i, file] of files.entries()) {
@@ -852,7 +868,7 @@ export async function sendFilesToDiscord(
     formData.append(
       `files[${i}]`,
       new Blob([buffer], { type: mimeForFile(file) }),
-      path.basename(file),
+      egressText(path.basename(file)), // secret censor: filename in payload
     );
   }
 
@@ -884,12 +900,13 @@ export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
  *  The text is the message content; each file becomes an attachment. */
 export async function sendDiscordMessageWithFiles(
   config: ChannelConfig,
-  text: string,
+  raw: string,
   files: string[],
   replyToMessageId?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
+  const text = egressText(raw); // secret censor
   const channelId = states.get(config.id)?.channelId || config.channel;
   const token = config.botToken;
   if (!token) return { success: false, error: "No bot token" };
@@ -905,7 +922,7 @@ export async function sendDiscordMessageWithFiles(
           : {}),
         attachments: files.map((f, i) => ({
           id: i,
-          filename: path.basename(f),
+          filename: egressText(path.basename(f)), // secret censor
         })),
       }),
     );
@@ -914,7 +931,7 @@ export async function sendDiscordMessageWithFiles(
       formData.append(
         `files[${i}]`,
         new Blob([buffer], { type: mimeForFile(file) }),
-        path.basename(file),
+        egressText(path.basename(file)), // secret censor
       );
     }
     const result: any = await discordFetchRaw(
@@ -1405,7 +1422,10 @@ export async function respondToInteraction(
   try {
     await discordFetch(botToken, `/interactions/${d.id}/${d.token}/callback`, {
       method: "POST",
-      body: { type: 4, data: text ? { content: text } : {} },
+      body: {
+        type: 4,
+        data: text ? { content: egressText(text) } : {}, // secret censor
+      },
     });
   } catch (e) {
     console.error(
@@ -1448,7 +1468,7 @@ export async function editInteractionMessage(
       `/webhooks/${d.application_id}/${d.token}/messages/@original`,
       {
         method: "PATCH",
-        body: { content: text },
+        body: { content: egressText(text) }, // secret censor
       },
     );
   } catch (e) {
