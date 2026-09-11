@@ -235,12 +235,19 @@ export async function connectDiscord(
     return false;
   }
 
-  // Get bot's own user ID to skip self-messages
-  let botUserId: string | null = null;
-  try {
-    const me = await discordFetch(token, "/users/@me");
-    botUserId = me?.id || null;
-  } catch {}
+  // Bot identity (M3 self-filter) and the last-message cursor seed are
+  // independent REST calls — fetch them in parallel (~200ms saved on the
+  // ~2.6s connect path; restart speed work 2026-09-11).
+  const persistedCursor = loadPersistedCursors(stateDir)[channelId] || null;
+  const [me, seed] = await Promise.all([
+    discordFetch(token, "/users/@me").catch(() => null),
+    persistedCursor
+      ? Promise.resolve(null as unknown[] | null)
+      : discordFetch(token, `/channels/${channelId}/messages?limit=1`).catch(
+          () => null,
+        ),
+  ]);
+  const botUserId = me?.id || null;
   if (!botUserId) {
     callbacks.onError(
       config.id,
@@ -252,7 +259,7 @@ export async function connectDiscord(
     config: config,
     channelId,
     botUserId,
-    lastMessageId: loadPersistedCursors(stateDir)[channelId] || null,
+    lastMessageId: persistedCursor,
     stateDir: stateDir || null,
     pollTimer: null,
     consecutiveErrors: 0,
@@ -263,20 +270,13 @@ export async function connectDiscord(
   };
   states.set(config.id, state);
 
-  // Fetch last message to start polling from — only when the persisted
-  // cursor did not seed one.
-  if (!state.lastMessageId) {
-    try {
-      const msgs = await discordFetch(
-        token,
-        `/channels/${channelId}/messages?limit=1`,
-      );
-      if (msgs?.length) {
-        state.lastMessageId = msgs[0].id;
-        persistChannelCursor(state);
-      }
-    } catch {}
+  // Seed the cursor from the channel's last message — only when the
+  // persisted cursor did not seed one (restart resumes exactly where it
+  // left off instead of re-reading history).
+  if (!state.lastMessageId && seed?.length) {
+    state.lastMessageId = seed[0].id;
   }
+  persistChannelCursor(state);
 
   // Startup message: only post once the bot's own user id is resolved, so
   // the first poll can skip our own message.
@@ -296,6 +296,11 @@ export async function connectDiscord(
 
   // Start polling (reads live state — no stale closures)
   restartPollTimer(state);
+  // First backfill poll IMMEDIATELY, not after one interval: messages
+  // sent while pi was down (cursor persisted on disk) replay right away —
+  // this is the replay path after a /reset /restart /undo /redo respawn
+  // (saves up to one poll interval of dead air on boot).
+  pollDiscord(config.id).catch(() => {});
   return true;
 }
 
@@ -333,6 +338,58 @@ export function persistChannelCursor(state: DiscordState): void {
     fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
     fs.renameSync(`${file}.tmp`, file);
   } catch {}
+}
+
+/** Read the live in-memory cursor for a channel, or null. Exported for
+ *  the restart-class ops (/reset /restart /undo /redo), which capture it
+ *  when the op window opens and rewind it before shutdown — inbounds
+ *  delivered during the op then replay after the respawn instead of
+ *  dying with the process. */
+export function getChannelCursor(configId: string): string | null {
+  return states.get(configId)?.lastMessageId ?? null;
+}
+
+/** Set + persist the live cursor for a channel. No-op when the channel
+ *  is not connected (nothing to rewind). */
+export function setChannelCursor(
+  configId: string,
+  messageId: string | null,
+): void {
+  const st = states.get(configId);
+  if (!st) return;
+  st.lastMessageId = messageId;
+  persistChannelCursor(st);
+}
+
+/** Register a bare channel state (cursor bookkeeping only, no poller,
+ *  no gateway). Exported for tests. */
+export function seedChannelStateForTest(
+  configId: string,
+  channelId: string,
+  stateDir: string | null = null,
+): void {
+  const config = { id: configId, type: "discord" } as ChannelConfig;
+  states.set(configId, {
+    config,
+    channelId,
+    botUserId: null,
+    lastMessageId: null,
+    stateDir,
+    pollTimer: null,
+    consecutiveErrors: 0,
+    pollPauseUntil: 0,
+    polling: false,
+    callbacks: { onMessage: () => {}, onError: () => {} },
+    startupPending: false,
+  });
+}
+
+/** Drop every discord state + poll timer. Exported for tests. */
+export function clearDiscordStatesForTest(): void {
+  for (const st of states.values()) {
+    if (st.pollTimer) clearInterval(st.pollTimer);
+  }
+  states.clear();
 }
 
 /** Poll interval for a channel: backfill (60s) while its token's gateway

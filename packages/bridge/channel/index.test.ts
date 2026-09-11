@@ -2,6 +2,14 @@ import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+  clearDiscordStatesForTest,
+  getChannelCursor,
+  loadPersistedCursors,
+  pollDiscord,
+  seedChannelStateForTest,
+  setChannelCursor,
+} from "./discord";
 import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
@@ -20,6 +28,7 @@ import extension, {
   isCompacting,
   matchCommand,
   midTurnQueues,
+  opWindowLabel,
   parseJobsFromPs,
   parseReplyTo,
   pendingAttachments,
@@ -30,9 +39,12 @@ import extension, {
   REPEAT_WARNING,
   registerSleepTool,
   registerTodoTool,
+  runMidRunInterrupt,
   runShellPassthrough,
   setInterruptCtx,
+  setSystemdRestartHookForTest,
   stopAllCompactTicks,
+  stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
   updateQueuedInbound,
 } from "./index";
@@ -2695,13 +2707,20 @@ describe("compaction-queue guard", () => {
     expect(isCompacting("ch1")).toBe(true); // window unchanged
   });
 
-  test("other commands while compacting are queued like plain messages", async () => {
+  test("other commands while compacting: queued, but /reset refuses", async () => {
     ctx.compact = () => {};
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     ctx.isIdle = () => false;
+    // /reset would open a second op window on the re-wake — refuse now
     await handleInbound(pi, inbound("/reset", "m2"), ctx);
     await tick();
-    expect(midTurnQueues.get("ch1")?.[0]?.msg.body).toBe("/reset");
+    expect(channelPosts().some((t) => t === "[!] already restarting")).toBe(
+      true,
+    );
+    // a queued-eligible command (/undo) still waits like a plain message
+    await handleInbound(pi, inbound("/undo", "m3"), ctx);
+    await tick();
+    expect(midTurnQueues.get("ch1")?.[0]?.msg.body).toBe("/undo");
     expect(pendingInterrupts.has("ch1")).toBe(false);
   });
 
@@ -3480,5 +3499,354 @@ describe("sleep (integration)", () => {
       expect(r.content[0].text).toContain("[!]");
     }
     expect(loadWakes(tmp)).toHaveLength(0);
+  });
+});
+
+describe("restart-class ops (/reset /restart): block + tick + cursor replay", () => {
+  let tmp = "";
+  let oldHome = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  let shutdowns = 0;
+  let home = "";
+  const realFetch = globalThis.fetch;
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  const channelPosts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.url.includes("/channels/ch1/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+
+  const edits = () =>
+    fetchCalls
+      .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+
+  // wait out a pending op shutdown (300ms arm + immediate isIdle) so the
+  // session-file move happens while HOME still points at tmp
+  const waitOpShutdown = () => new Promise((r) => setTimeout(r, 1100));
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "op-test-"));
+    oldHome = process.env.HOME || "";
+    home = path.join(tmp, "home");
+    process.env.HOME = home;
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    handlers = {};
+    sent = [];
+    fetchCalls = [];
+    shutdowns = 0;
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      compact: () => {},
+      modelRegistry: { getAvailable: () => [] },
+      getContextUsage: () => undefined,
+      model: { id: "cur", name: "Cur" },
+      shutdown: () => {
+        shutdowns++;
+      },
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+    // op machinery needs a live cursor: seed the discord state for ch1.
+    seedChannelStateForTest("ch1", "ch1", path.join(tmp, ".tmp"));
+    setChannelCursor("ch1", "1000");
+    // keep the test from spawning a real `systemctl --user restart`
+    setSystemdRestartHookForTest(() => {});
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    stopAllOpTicks();
+    clearAllCompacting();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    setSystemdRestartHookForTest(null);
+    for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
+    queuedAcks.clear();
+    pendingInterrupts.clear();
+    handlers.agent_end?.({ messages: [] }, ctx);
+    stopAllOpTicks();
+    clearAllCompacting();
+    clearDiscordStatesForTest();
+    process.env.HOME = oldHome;
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("idle /reset: posts ticking placeholder, blocks the channel, moves the session aside, rewinds the cursor", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    fs.mkdirSync(sessDir, { recursive: true });
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    expect(channelPosts().some((t) => t === "[..] resetting...")).toBe(true);
+    expect(isCompacting("ch1")).toBe(true);
+    expect(opWindowLabel("ch1")).toBe("resetting");
+
+    // an inbound lands during the op -> cursor advances past it
+    setChannelCursor("ch1", "1200");
+    await waitOpShutdown();
+    expect(shutdowns).toBe(1);
+    // session file moved aside -> respawn starts a fresh session
+    expect(fs.existsSync(sess)).toBe(false);
+    expect(fs.readdirSync(sessDir).some((f) => f.includes(".reset-"))).toBe(
+      true,
+    );
+    // cursor rewound to the pre-op position, persisted for the respawn
+    expect(getChannelCursor("ch1")).toBe("1000");
+    expect(loadPersistedCursors(path.join(tmp, ".tmp")).ch1).toBe("1000");
+  });
+
+  test("idle /restart: same block + tick, but the session file is KEPT (resumed)", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    fs.mkdirSync(sessDir, { recursive: true });
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+
+    await handleInbound(pi, inbound("/restart", "m1"), ctx);
+    await tick();
+    expect(channelPosts().some((t) => t === "[..] restarting...")).toBe(true);
+    expect(opWindowLabel("ch1")).toBe("restarting");
+    await waitOpShutdown();
+    expect(shutdowns).toBe(1);
+    expect(fs.existsSync(sess)).toBe(true); // not moved aside
+  });
+
+  test("/reset placeholder ticks in place every 5s (shared op tick)", async () => {
+    jest.useFakeTimers();
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(channelPosts().some((t) => t === "[..] resetting...")).toBe(true);
+
+    // the bounded op shutdown lands at +300ms (isIdle is immediate here)
+    jest.advanceTimersByTime(300);
+    // flush the async shutdown chain (race on the placeholder + rewinds)
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(shutdowns).toBe(1);
+
+    // window stays open until the respawn clears it -> ticks keep going
+    jest.advanceTimersByTime(4699); // t=4999
+    expect(edits().length).toBe(0);
+    jest.advanceTimersByTime(1); // t=5000
+    expect(edits()).toEqual(["[..] resetting… 5s"]);
+    jest.advanceTimersByTime(5000); // t=10000
+    expect(edits()).toEqual(["[..] resetting… 5s", "[..] resetting… 10s"]);
+
+    // respawn clears the window -> ticks stop
+    clearAllCompacting();
+    jest.advanceTimersByTime(60000);
+    expect(edits().length).toBe(2);
+  });
+
+  test("inbound during the /reset window: queued with an ack, no interrupt armed", async () => {
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true);
+
+    await handleInbound(pi, inbound("hello", "m2"), ctx);
+    await tick();
+    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+    expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("m2");
+    expect(pendingInterrupts.get("ch1")).toBeUndefined();
+    await waitOpShutdown();
+  });
+
+  test("respawn: session_start settles the placeholder in place + cursor replays the op window", async () => {
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    setChannelCursor("ch1", "1200"); // an op-window inbound was delivered
+    await waitOpShutdown();
+    expect(shutdowns).toBe(1);
+
+    // fresh process boots: old in-memory window/ticks are gone
+    clearAllCompacting();
+    stopAllOpTicks();
+    const editsBefore = edits().length;
+    await handlers.session_start?.(null, ctx);
+    await tick();
+
+    // the placeholder is REPLACED in place with the final line, not re-posted
+    const finalText = "[new] new session (context cleared)";
+    expect(
+      edits()
+        .slice(editsBefore)
+        .some((t) => t === finalText),
+    ).toBe(true);
+    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    // marker consumed
+    expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
+
+    // the new process replays the op window: first poll ranges after the
+    // pre-op cursor (1000), not after the advanced 1200
+    await pollDiscord("ch1");
+    const pollUrl = fetchCalls.find((c) => c.url.includes("after="))?.url;
+    expect(pollUrl).toContain("after=1000");
+  });
+
+  test("stale op marker (>10m) is dropped, not shown", async () => {
+    const p = path.join(tmp, ".tmp", "op-marker.json");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(
+      p,
+      JSON.stringify({
+        op: "reset",
+        channelId: "ch1",
+        at: Date.now() - 11 * 60 * 1000,
+        msgId: "x",
+        finalText: "[new] stale",
+      }),
+    );
+    await handlers.session_start?.(null, ctx);
+    await tick();
+    expect(channelPosts().some((t) => t === "[new] stale")).toBe(false);
+    expect(edits().some((t) => t === "[new] stale")).toBe(false);
+    expect(fs.existsSync(p)).toBe(false); // consumed either way
+  });
+
+  test("/stop during an op clears the window and rewinds the cursor", async () => {
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    setChannelCursor("ch1", "1200");
+
+    await handleInbound(pi, inbound("/stop", "m3"), ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false);
+    expect(getChannelCursor("ch1")).toBe("1000");
+    expect(channelPosts().some((t) => t === "[-] stopped")).toBe(true);
+    await waitOpShutdown(); // let the original op timer fire harmlessly
+  });
+
+  test("second /reset while an op window is open is rejected; /status shows the op label", async () => {
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    await handleInbound(pi, inbound("/reset", "m4"), ctx);
+    await tick();
+    expect(
+      channelPosts().filter((t) => t === "[!] already restarting").length,
+    ).toBe(1);
+
+    await handleInbound(pi, inbound("/status", "m5"), ctx);
+    await tick();
+    expect(channelPosts().some((t) => t.includes("resetting"))).toBe(true);
+    await waitOpShutdown();
+  });
+
+  test("mid-run interrupt ticks the [queued] ack in place", async () => {
+    jest.useFakeTimers();
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+    ctx.isIdle = () => false;
+    const m2 = inbound("hello", "m2");
+    queueMidTurnInbound("ch1", m2, "ctx\n\nhello", "discord/Test", "hello");
+    queuedAcks.set("m2", { ackId: "ack1", fromId: "uid", pos: 1 });
+
+    const ackEdits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/ack1"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+
+    let done = false;
+    const p = runMidRunInterrupt(pi, ctx, "ch1", "m2").then(() => {
+      done = true;
+    });
+    // abort fired, settle-wait running, tick armed on the queued ack
+    jest.advanceTimersByTime(5000);
+    expect(ackEdits()).toEqual(["[..] interrupting… 5s"]);
+
+    ctx.isIdle = () => true;
+    jest.advanceTimersByTime(50);
+    await p;
+    expect(done).toBe(true);
+    // the queued text went through to pi
+    expect(sent.some((s) => s.m.customType === "channel-inbound")).toBe(true);
+    // tick stopped in finally -> no further edits
+    const n = ackEdits().length;
+    jest.advanceTimersByTime(10000);
+    expect(ackEdits().length).toBe(n);
   });
 });

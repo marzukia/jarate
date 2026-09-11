@@ -40,6 +40,7 @@ import {
   disconnectDiscord,
   editDiscordMessage,
   editInteractionMessage,
+  getChannelCursor,
   getDiscordChannelId,
   getDiscordToken,
   loadDiscordAttachment,
@@ -50,6 +51,7 @@ import {
   sendDiscordMessageWithFiles,
   sendDiscordTyping,
   sendFilesToDiscord,
+  setChannelCursor,
   setDiscordInteractionHandler,
   setDiscordPresenceActivity,
   stopDiscordPresence,
@@ -388,14 +390,39 @@ export function clearAllInterrupts(): void {
 // arming the mid-run interrupt: an interrupt calls ctx.abort(), which kills
 // the in-flight compaction (live incident on the frank agent, 2026-09-10).
 const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
+/** Op window labels: compaction + the restart-class ops. */
+export type OpLabel =
+  | "compacting"
+  | "resetting"
+  | "restarting"
+  | "undoing"
+  | "redoing";
+
 interface CompactingEntry {
   since: number;
   timer: ReturnType<typeof setTimeout>;
+  /** Which op owns the window (status display + tick text). */
+  label: OpLabel;
+  /** Discord cursor captured at window open; restart-class ops rewind to
+   *  it before shutdown so inbounds delivered during the op replay after
+   *  the respawn instead of dying with the process. Null for compaction
+   *  (no process restart, no replay needed). */
+  rewindTo: string | null;
 }
 export const compactingChannels = new Map<string, CompactingEntry>();
 
+/**
+ * True while an op window is open: compaction OR a restart-class op
+ * (/reset /restart /undo /redo). The name is historical — everything
+ * that checks "is the channel busy with a long op" uses this.
+ */
 export function isCompacting(channelId: string): boolean {
   return compactingChannels.has(channelId);
+}
+
+/** Label of the open op window for a channel, or null. */
+export function opWindowLabel(channelId: string): OpLabel | null {
+  return compactingChannels.get(channelId)?.label ?? null;
 }
 
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
@@ -418,80 +445,125 @@ export function clearAllCompacting(): void {
 
 /** Open the window: set the flag + arm the 10-min fallback. The fallback
  *  clears with a console.warn and drains whatever was queued behind the
- *  compaction, in case the completion event never arrives. */
+ *  op, in case the completion event never arrives. */
 function beginCompacting(
   pi: ExtensionAPI,
   ch: ChannelConfig,
   ctx: ExtensionContext,
+  opts: { label?: OpLabel; rewindTo?: string | null } = {},
 ): void {
   clearCompacting(ch.id);
+  const label = opts.label ?? "compacting";
+  const rewindTo = opts.rewindTo ?? null;
   const timer = setTimeout(() => {
     clearCompacting(ch.id, true);
     drainQueuedAfterCompact(pi, ctx);
   }, COMPACT_FALLBACK_MS);
   (timer as any).unref?.();
-  compactingChannels.set(ch.id, { since: Date.now(), timer });
-  console.log(`[channel] compacting window open for ${ch.id}`);
+  compactingChannels.set(ch.id, {
+    since: Date.now(),
+    timer,
+    label,
+    rewindTo,
+  });
+  console.log(`[op:${label}] window open for ${ch.id}`);
 }
 
-// ─── Compaction placeholder live tick (issue #22) ────────────────────
-// Same pattern as the working-block statusTick (d2a8afc): while a
-// compaction runs, the "[..] compacting..." placeholder is edited in
-// place every 5s with the elapsed seconds; when the compaction settles,
-// the placeholder is replaced in place with the final report (or failure
-// line). The interval self-stops once the compaction window closes, but
-// the entry is KEPT so the settle can still replace the message.
-export const COMPACT_PLACEHOLDER = "[..] compacting...";
-interface CompactTickEntry {
+// ─── Shared long-op live tick (issue #22, generalized 2026-09-11) ────
+// One 5s edit-in-place ticker for EVERY long-op placeholder: compaction,
+// restart-class ops (/reset /restart /undo /redo), the working block
+// (statusTick), and mid-run interrupts. `render` returns the next line
+// or null to pause (window closed — the entry is KEPT so a settle can
+// still replace the message in place). Same ASCII style as before:
+// `[..] compacting… 5s` / `┣ working… 10s`.
+interface OpTickEntry {
   ch: ChannelConfig;
   msgId: string;
   since: number;
   timer: ReturnType<typeof setInterval>;
+  render: (secs: number) => string | null;
 }
-const compactTicks = new Map<string, CompactTickEntry>();
+const opTicks = new Map<string, OpTickEntry>();
 
-export function armCompactTick(ch: ChannelConfig, msgId: string): void {
-  const prev = compactTicks.get(ch.id);
+/** `[..] <label>… <inc>s` — 5s-increment elapsed, shared tick style. */
+export function opTickLine(label: string, secs: number): string {
+  const inc = Math.floor(secs / 5) * 5;
+  return `[..] ${label}… ${inc}s`;
+}
+
+/** Arm (or re-arm, same key) a live tick on a placeholder message. */
+export function armOpTick(
+  key: string,
+  ch: ChannelConfig,
+  msgId: string,
+  render: (secs: number) => string | null,
+): void {
+  const prev = opTicks.get(key);
   if (prev) clearInterval(prev.timer);
   const since = Date.now();
   const timer = setInterval(() => {
-    const entry = compactTicks.get(ch.id);
+    const entry = opTicks.get(key);
     if (!entry) return;
-    if (!isCompacting(ch.id)) {
-      // window closed: stop ticking, keep the entry for the settle replace
-      clearInterval(entry.timer);
+    const text = entry.render(Math.floor((Date.now() - since) / 1000));
+    if (text === null) {
+      clearInterval(entry.timer); // paused; entry kept for the settle
       return;
     }
-    const secs = Math.floor((Date.now() - since) / 1000);
-    const inc = Math.floor(secs / 5) * 5;
-    editDiscordMessage(ch, msgId, `[..] compacting… ${inc}s`).catch(() => {});
+    editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
   }, 5000);
   (timer as any).unref?.();
-  compactTicks.set(ch.id, { ch, msgId, since, timer });
+  opTicks.set(key, { ch, msgId, since, timer, render });
 }
 
 /** Replace the ticking placeholder in place with the final line. Returns
  *  false when no tick was armed (native slash path / settle raced the
  *  post) — the caller then falls back to a fresh post. */
-export function settleCompactTick(channelId: string, text: string): boolean {
-  const entry = compactTicks.get(channelId);
+export function settleOpTick(key: string, text: string): boolean {
+  const entry = opTicks.get(key);
   if (!entry) return false;
   clearInterval(entry.timer);
-  compactTicks.delete(channelId);
+  opTicks.delete(key);
   editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
   return true;
 }
 
 /** Stop + drop the tick without a final replace (session_shutdown). */
-export function stopCompactTick(channelId: string): void {
-  const entry = compactTicks.get(channelId);
+export function stopOpTick(key: string): void {
+  const entry = opTicks.get(key);
   if (!entry) return;
   clearInterval(entry.timer);
-  compactTicks.delete(channelId);
+  opTicks.delete(key);
+}
+
+/** Stop every tick whose key has the prefix (e.g. "working:"). */
+export function stopOpTickPrefix(prefix: string): void {
+  for (const key of [...opTicks.keys()])
+    if (key.startsWith(prefix)) stopOpTick(key);
+}
+
+export function stopAllOpTicks(): void {
+  for (const key of [...opTicks.keys()]) stopOpTick(key);
+}
+
+// ─── Compact placeholder (built on the shared op-tick) ──────────────
+export const COMPACT_PLACEHOLDER = "[..] compacting...";
+
+export function armCompactTick(ch: ChannelConfig, msgId: string): void {
+  armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>
+    isCompacting(ch.id) ? opTickLine("compacting", secs) : null,
+  );
+}
+
+export function settleCompactTick(channelId: string, text: string): boolean {
+  return settleOpTick(`compact:${channelId}`, text);
+}
+
+export function stopCompactTick(channelId: string): void {
+  stopOpTick(`compact:${channelId}`);
 }
 
 export function stopAllCompactTicks(): void {
-  for (const id of [...compactTicks.keys()]) stopCompactTick(id);
+  stopOpTickPrefix("compact:");
 }
 
 /** Deliver ONE queued inbound that was waiting out a compaction (same
@@ -565,6 +637,21 @@ export async function runMidRunInterrupt(
   console.log(
     `[channel] mid-run interrupt: aborting current step, then sending ${messageId}`,
   );
+  // Live tick on the [queued] ack: the interrupt can wait up to the settle
+  // cap (120s) — show it moving instead of a frozen "[queued] N in line".
+  // The ack post must have landed first (it is queued ahead of the timer).
+  const interruptAck = queuedAcks.get(messageId);
+  const interruptCh = resolveChannel(channelId);
+  if (interruptAck && interruptCh)
+    armOpTick(
+      `interrupt:${channelId}`,
+      interruptCh,
+      interruptAck.ackId,
+      (secs) =>
+        interruptingChannels.has(channelId)
+          ? opTickLine("interrupting", secs)
+          : null,
+    );
   try {
     userStoppedRun = true; // silence the aborted run's failure post
     try {
@@ -622,6 +709,7 @@ export async function runMidRunInterrupt(
     );
   } finally {
     interruptingChannels.delete(channelId);
+    stopOpTick(`interrupt:${channelId}`);
   }
 }
 // ─── Queue control: edit + delete of queued inbounds ─────────────────────
@@ -1347,7 +1435,6 @@ export default function (pi: ExtensionAPI) {
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
-  let statusTick: ReturnType<typeof setInterval> | null = null;
   let lastToolAction: string | null = null;
 
   // Mid-run interrupt: when an armed timer fires, abort the in-flight step
@@ -1484,6 +1571,16 @@ export default function (pi: ExtensionAPI) {
     }
     writeChannelState(workspaceRoot, channels);
 
+    // Restart-class op marker (reset/restart/undo/redo): the previous
+    // process died mid-op. Settle its placeholder with the final line —
+    // to the user the channel is blocked from the op until this lands
+    // (see beginRestartOp). Stale markers are dropped, not shown.
+    try {
+      consumeOpMarker(ctx);
+    } catch (e) {
+      console.error("[op] marker settle failed:", sanitizeUnknownValue(e));
+    }
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -1572,10 +1669,6 @@ export default function (pi: ExtensionAPI) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
-    if (statusTick) {
-      clearInterval(statusTick);
-      statusTick = null;
-    }
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
@@ -1588,7 +1681,7 @@ export default function (pi: ExtensionAPI) {
     lastActiveChannel = null;
     pendingCompact = null; // F4: don't flush a queued /compact onto a dying/new session
     clearAllCompacting();
-    stopAllCompactTicks();
+    stopAllOpTicks();
     pendingAttachments.clear();
     midTurnQueues.clear();
     queuedAcks.clear();
@@ -1623,26 +1716,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ─── Live status line (edit-in-place, deleted at run end) ───
-  // 5s tick: the block shows elapsed time (5s, 10s, 15s, ...) even while no
-  // tool call has fired yet (model thinking) - "┣ working… 10s". (Andryo
-  // 2026-09-10.) Self-clears when the run closes or the block is gone.
-  const startStatusTick = () => {
-    if (statusTick) clearInterval(statusTick);
-    statusTick = setInterval(() => {
-      if (!runOpen || !statusMsgId || !lastActiveChannel) {
-        if (statusTick) clearInterval(statusTick);
-        statusTick = null;
-        return;
-      }
-      const ch = lastActiveChannel;
-      if (ch.type !== "discord" || statusChannelId !== ch.id) return;
+  // Shared op-tick (5s): the block shows elapsed time (5s, 10s, 15s, ...)
+  // even while no tool call has fired yet (model thinking) —
+  // "┣ working… 10s". (Andryo 2026-09-10.) Render returns null when the
+  // run closes or the block is gone; the entry stops at agent_end.
+  const armWorkingTick = () => {
+    const ch = lastActiveChannel;
+    if (!ch || !statusMsgId) return;
+    armOpTick(`working:${ch.id}`, ch, statusMsgId, () => {
+      if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
+      const wch = lastActiveChannel;
+      if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
-      const text = lastToolAction
+      return lastToolAction
         ? `${lastToolAction} · ${runToolCount} call${runToolCount === 1 ? "" : "s"} · ${inc}s`
         : `┣ working… ${inc}s`;
-      editDiscordMessage(ch, statusMsgId, text).catch(() => {});
-    }, 5000);
+    });
   };
 
   pi.on("tool_call", async (event) => {
@@ -1679,7 +1769,7 @@ export default function (pi: ExtensionAPI) {
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
           statusMsgAt = Date.now();
-          startStatusTick();
+          armWorkingTick();
         } else if (!r.success)
           console.error(
             `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -1721,7 +1811,7 @@ export default function (pi: ExtensionAPI) {
         statusMsgId = r.messageId;
         statusChannelId = ch.id;
         statusMsgAt = Date.now();
-        startStatusTick();
+        armWorkingTick();
       }
     }
     console.log("[channel] typing indicator started");
@@ -1878,10 +1968,7 @@ export default function (pi: ExtensionAPI) {
       clearInterval(typingTimer);
       typingTimer = null;
     }
-    if (statusTick) {
-      clearInterval(statusTick);
-      statusTick = null;
-    }
+    stopOpTickPrefix("working:");
     lastToolAction = null;
     agentBusy = false;
     refreshActivity(ctx);
@@ -2205,17 +2292,250 @@ function safeSessionFile(ctx: ExtensionContext): string | null {
   }
 }
 
-// Same respawn mechanism as /reset: systemd Restart=always re-runs
-// `pi -c`, which continues the (now truncated or re-appended) session.
-function scheduleRestart(ctx: ExtensionContext, label: string): void {
+// ─── Restart-class ops: /reset /restart /undo /redo ────────────────────
+// These restart the pi process (systemd respawns `pi -c`). The channel is
+// blocked across the restart the same way compaction blocks it:
+//   1. op window opens (inbound queued with [queued] ack, no interrupts)
+//   2. placeholder posted + live-ticked (shared op-tick helper)
+//   3. op marker written to .tmp/op-marker.json — the RESPAWNED process
+//      settles the placeholder with finalText at its session_start
+//   4. Discord cursor rewound to the pre-op value before shutdown —
+//      inbounds delivered during the op replay after the restart
+//      (persisted cursor + immediate first poll; nothing is lost)
+//   5. bounded shutdown: wait for the aborted run to settle (2s cap), let
+//      the placeholder land (1.5s cap), rewind, op-specific file work,
+//      ask systemd to restart the unit early (skips the 5s RestartSec),
+//      then ctx.shutdown()
+const OP_SHUTDOWN_DELAY_MS = 300;
+const OP_MARKER_TTL_MS = 10 * 60 * 1000;
+interface OpMarker {
+  op: string;
+  channelId: string;
+  at: number;
+  /** Placeholder message id (null = post failed; respawn posts fresh). */
+  msgId: string | null;
+  /** Final line the respawn posts into the channel. */
+  finalText: string;
+}
+const opMarkerPath = (cwd: string) => path.join(cwd, ".tmp", "op-marker.json");
+
+function writeOpMarker(
+  ctx: ExtensionContext,
+  ch: ChannelConfig,
+  op: string,
+  finalText: string,
+): void {
+  try {
+    const p = opMarkerPath(ctx.cwd);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const m: OpMarker = {
+      op,
+      channelId: ch.id,
+      at: Date.now(),
+      msgId: null,
+      finalText,
+    };
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(m));
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    console.error("[op] marker write failed:", sanitizeUnknownValue(e));
+  }
+}
+
+function updateOpMarkerMsgId(
+  ctx: ExtensionContext,
+  channelId: string,
+  msgId: string,
+): void {
+  try {
+    const p = opMarkerPath(ctx.cwd);
+    const m = JSON.parse(fs.readFileSync(p, "utf-8")) as OpMarker;
+    if (!m || m.channelId !== channelId) return;
+    m.msgId = msgId;
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(m));
+    fs.renameSync(tmp, p);
+  } catch {
+    /* placeholder post failed or marker gone — fresh-post fallback */
+  }
+}
+
+/** Respawn-side settle: replace the dead process's op placeholder with
+ *  the final line. Called from session_start. Stale markers (>10m —
+ *  e.g. pi crashed and the channel sat dark) are dropped, not shown. */
+function consumeOpMarker(ctx: ExtensionContext): void {
+  const p = opMarkerPath(ctx.cwd);
+  let m: OpMarker | null = null;
+  try {
+    m = JSON.parse(fs.readFileSync(p, "utf-8")) as OpMarker;
+  } catch {
+    return; // no marker — normal boot
+  }
+  try {
+    fs.unlinkSync(p);
+  } catch {}
+  if (
+    !m ||
+    typeof m.channelId !== "string" ||
+    typeof m.finalText !== "string" ||
+    !m.finalText
+  )
+    return;
+  if (typeof m.at !== "number" || Date.now() - m.at > OP_MARKER_TTL_MS) {
+    console.log(`[op] ${m.op ?? "?"} marker stale (>10m) — dropped`);
+    return;
+  }
+  const ch = getChannel(loadChannelConfig(ctx.cwd), m.channelId);
+  if (!ch || ch.type !== "discord") return;
+  console.log(
+    `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
+  );
+  if (m.msgId)
+    editDiscordMessage(ch, m.msgId, m.finalText).catch(() =>
+      sendDiscordMessage(ch, m.finalText).catch(() => {}),
+    );
+  else sendDiscordMessage(ch, m.finalText).catch(() => {});
+}
+
+let systemdRestartHook: (() => void) | null = null;
+/** Override the early-restart trigger (tests: no real systemctl around). */
+export function setSystemdRestartHookForTest(fn: (() => void) | null): void {
+  systemdRestartHook = fn;
+}
+
+/** Shortcut the 5s systemd RestartSec wait: ask systemd to restart the
+ *  unit ~3s from now — by then our own shutdown has run, so the stop is
+ *  a no-op and the start is immediate. If this never lands (systemd not
+ *  there, hook eaten) the unit's Restart=always still covers us. */
+function requestSystemdRestart(): void {
+  if (systemdRestartHook) {
+    systemdRestartHook();
+    return;
+  }
+  if (!process.env.XDG_RUNTIME_DIR) return; // not under a systemd user unit
+  try {
+    const p = spawn(
+      "sh",
+      ["-c", "sleep 3; systemctl --user restart pi.service"],
+      {
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+      },
+    );
+    p.on("error", () => {});
+    p.unref();
+  } catch {
+    /* auto-restart covers it */
+  }
+}
+
+/** Open the op window + post/ARM the ticking placeholder + write the op
+ *  marker the respawn settles. Returns the placeholder post promise
+ *  (scheduleOpShutdown awaits it, bounded). */
+function beginRestartOp(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  ch: ChannelConfig,
+  op: string,
+  label: OpLabel,
+  finalText: string,
+): Promise<string | null> {
+  beginCompacting(pi, ch, ctx, {
+    label,
+    rewindTo: getChannelCursor(ch.id),
+  });
+  writeOpMarker(ctx, ch, op, finalText);
+  if (ch.type !== "discord") return Promise.resolve(null);
+  return sendDiscordMessage(ch, `[..] ${label}...`)
+    .then((r) => {
+      if (r.success && r.messageId) {
+        updateOpMarkerMsgId(ctx, ch.id, r.messageId);
+        armOpTick(`op:${ch.id}`, ch, r.messageId, (secs) => {
+          const entry = compactingChannels.get(ch.id);
+          return entry ? opTickLine(entry.label, secs) : null;
+        });
+      }
+      return r.success ? (r.messageId ?? null) : null;
+    })
+    .catch(() => null);
+}
+
+/** Rewind the Discord cursor to the pre-op value (persisted) so the
+ *  respawn's immediate first poll replays op-window inbounds. */
+function rewindOpCursor(ch: ChannelConfig): void {
+  const entry = compactingChannels.get(ch.id);
+  if (entry?.rewindTo) setChannelCursor(ch.id, entry.rewindTo);
+}
+
+function scheduleOpShutdown(
+  ctx: ExtensionContext,
+  ch: ChannelConfig,
+  placeholderP: Promise<string | null>,
+  preShutdown?: () => void,
+): void {
   setTimeout(() => {
-    try {
-      ctx.shutdown();
-    } catch {
-      console.error(`[undo] ${label}: shutdown failed, forcing exit`);
-      process.exit(1);
+    void (async () => {
+      // Bounded settle: the aborted run is usually done in ms; a stuck
+      // session must not hold the respawn hostage (2s cap, then go).
+      const t0 = Date.now();
+      while (!ctx.isIdle() && Date.now() - t0 < 2000) await sleep(50);
+      // Let the placeholder post land (bounded) so the respawn can edit
+      // it in place; a failed post gets the fresh-line fallback there.
+      try {
+        await Promise.race([placeholderP, sleep(1500)]);
+      } catch {}
+      rewindOpCursor(ch);
+      try {
+        preShutdown?.();
+      } catch (e) {
+        console.error(`[op] ${ch.id} pre-shutdown failed, forcing respawn:`, e);
+        process.exit(1); // F3 parity: never leave a zombie half-state
+      }
+      requestSystemdRestart();
+      try {
+        ctx.shutdown();
+      } catch {
+        process.exit(1);
+      }
+    })();
+  }, OP_SHUTDOWN_DELAY_MS);
+}
+
+/** /reset = NEW session: move the current session file aside so the
+ *  systemd respawn's 'pi -c' starts fresh. (ctx.newSession does NOT exist
+ *  on event ctx — only on registerCommand ctx — reviewer F1, 2026-09-10.) */
+function moveSessionFileAside(ctx: ExtensionContext): void {
+  const home = process.env.HOME || "/root";
+  const sessionsBase = path.join(home, ".pi", "agent", "sessions");
+  const encDir = path.join(
+    sessionsBase,
+    `-${String(ctx.cwd).replace(/\//g, "-")}-`,
+  );
+  let target: string | null = null;
+  const candidates: Array<[string, number]> = [];
+  const scan = (dir: string) => {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-*
+      const p = path.join(dir, f);
+      try {
+        candidates.push([p, fs.statSync(p).mtimeMs]);
+      } catch {}
     }
-  }, 800);
+  };
+  if (fs.existsSync(encDir)) scan(encDir);
+  else if (fs.existsSync(sessionsBase)) {
+    for (const d of fs.readdirSync(sessionsBase)) {
+      const sub = path.join(sessionsBase, d);
+      try {
+        if (fs.statSync(sub).isDirectory()) scan(sub);
+      } catch {}
+    }
+  }
+  candidates.sort((a, b) => b[1] - a[1]);
+  target = candidates[0]?.[0] ?? null;
+  if (target) fs.renameSync(target, `${target}.reset-${Date.now()}`);
 }
 
 // /undo + /redo share the idle guard: abort the in-flight run, drop the
@@ -2242,18 +2562,16 @@ async function runUndo(
 ): Promise<{ text: string; restarted: boolean }> {
   await waitIdle(ctx, "undo");
   const sessionFile = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
-  const r = performUndo(sessionFile);
-  if (r.restarted) scheduleRestart(ctx, "undo");
-  return r;
+  // The /undo command case owns the block + tick + op shutdown when the
+  // restart actually happens (see beginRestartOp / scheduleOpShutdown).
+  return performUndo(sessionFile);
 }
 
 async function runRedo(
   ctx: ExtensionContext,
 ): Promise<{ text: string; restarted: boolean }> {
   await waitIdle(ctx, "redo"); // F6: busy /redo raced the re-wake + restart
-  const r = performRedo();
-  if (r.restarted) scheduleRestart(ctx, "redo");
-  return r;
+  return performRedo();
 }
 
 // ─── /compact: execute + report ─────────────────────────────────────────
@@ -2347,8 +2665,15 @@ async function runChannelCommand(
       // re-wake queue (including owner messages) + abort the next run.
       if (isCompacting(ch.id) && !isOwner)
         return { immediate: "[!] owner only" };
+      // A restart-class op rewound its Discord cursor at window open;
+      // /stop clears the window AND restores that cursor so inbounds
+      // delivered during the op replay after the respawn instead of
+      // being lost with the window.
+      const stoppedEntry = compactingChannels.get(ch.id);
       clearCompacting(ch.id); // the abort's settle (session_compact_failed)
       // re-clears + drains; the queue drop below wins for THIS /stop
+      if (stoppedEntry?.rewindTo)
+        setChannelCursor(ch.id, stoppedEntry.rewindTo);
       // A4: drain the mid-turn re-wake queue so /stop does not immediately
       // re-wake a message that was waiting for this run to end. (Steer
       // messages already queued in pi are a known upstream gap — the
@@ -2411,11 +2736,9 @@ async function runChannelCommand(
           `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
           `model ${model}`,
           `up ${up}`,
-          isCompacting(ch.id)
-            ? "compacting"
-            : ctx.isIdle()
-              ? "idle"
-              : "running",
+          // Open op window (compaction OR a restart-class op) shows its
+          // label; otherwise the honest idle/running state.
+          opWindowLabel(ch.id) ?? (ctx.isIdle() ? "idle" : "running"),
         ];
         // Interrupt state, honestly: in flight, or armed with time to fire.
         if (interruptingChannels.has(ch.id)) {
@@ -2449,91 +2772,88 @@ async function runChannelCommand(
     }
     case "reset": {
       if (!isOwner) return ownerOnly;
+      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
       try {
         ctx.abort();
       } catch {}
-      // /reset = NEW session. Mechanism: move the current session file aside,
-      // then shutdown. The systemd respawn runs 'pi -c' (continue LAST
-      // session); with the last file gone it starts fresh. (ctx.newSession
-      // does NOT exist on event ctx — only on registerCommand ctx — reviewer
-      // F1, jarate 2026-09-10.)
-      setTimeout(() => {
-        try {
-          const home = process.env.HOME || "/root";
-          const sessionsBase = path.join(home, ".pi", "agent", "sessions");
-          const encDir = path.join(
-            sessionsBase,
-            `-${String(ctx.cwd).replace(/\//g, "-")}-`,
-          );
-          let target: string | null = null;
-          const candidates: Array<[string, number]> = [];
-          const scan = (dir: string) => {
-            for (const f of fs.readdirSync(dir)) {
-              if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-*
-              const p = path.join(dir, f);
-              try {
-                candidates.push([p, fs.statSync(p).mtimeMs]);
-              } catch {}
-            }
-          };
-          if (fs.existsSync(encDir)) scan(encDir);
-          else if (fs.existsSync(sessionsBase)) {
-            for (const d of fs.readdirSync(sessionsBase)) {
-              const sub = path.join(sessionsBase, d);
-              try {
-                if (fs.statSync(sub).isDirectory()) scan(sub);
-              } catch {}
-            }
-          }
-          candidates.sort((a, b) => b[1] - a[1]);
-          target = candidates[0]?.[0] ?? null;
-          if (target) fs.renameSync(target, `${target}.reset-${Date.now()}`);
-          try {
-            ctx.shutdown();
-          } catch {
-            process.exit(1);
-          }
-        } catch (e) {
-          console.error("[reset] failed, forcing respawn:", e);
-          process.exit(1); // F3: never leave a zombie half-state
-        }
-      }, 800);
-      return {
-        immediate: "[new] new session (context cleared) - restarting...",
-      };
+      // BLOCK the channel across the respawn (like /compact): placeholder
+      // + live tick now, the respawn settles it (op marker), the cursor
+      // rewind replays op-window inbounds after boot. /reset = NEW session:
+      // move the session file aside at shutdown.
+      const placeholderP = beginRestartOp(
+        pi,
+        ctx,
+        ch,
+        "reset",
+        "resetting",
+        "[new] new session (context cleared)",
+      );
+      scheduleOpShutdown(ctx, ch, placeholderP, () =>
+        moveSessionFileAside(ctx),
+      );
+      return native ? { immediate: "[..] resetting..." } : { consumed: true };
     }
     case "restart": {
       if (!isOwner) return ownerOnly;
       // /restart = process restart that RESUMES this session: systemd respawns
-      // 'pi -c' which continues the last session file (the opposite of /reset,
-      // which moves that file aside first).
+      // 'pi -c' which continues the last session file (the opposite of
+      // /reset, which moves that file aside first). Same block + tick +
+      // cursor-replay dance as /reset, minus the session-file move.
+      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
       try {
         ctx.abort();
       } catch {}
-      setTimeout(() => {
-        try {
-          ctx.shutdown();
-        } catch {}
-      }, 800);
-      return {
-        immediate: "[..] restarting pi - this session resumes on boot…",
-      };
+      const placeholderP = beginRestartOp(
+        pi,
+        ctx,
+        ch,
+        "restart",
+        "restarting",
+        "[ok] restarted - session resumed",
+      );
+      scheduleOpShutdown(ctx, ch, placeholderP);
+      return native ? { immediate: "[..] restarting..." } : { consumed: true };
     }
     case "undo": {
       if (!isOwner) return ownerOnly;
+      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
       const r = await runUndo(ctx);
-      return { immediate: r.text };
+      if (!r.restarted) return { immediate: r.text };
+      // performUndo already truncated the session file + parked the re-run
+      // trigger (F1); the respawn resumes the pre-turn state. Block + tick
+      // + cursor replay across the respawn, like /reset.
+      const placeholderP = beginRestartOp(
+        pi,
+        ctx,
+        ch,
+        "undo",
+        "undoing",
+        r.text,
+      );
+      scheduleOpShutdown(ctx, ch, placeholderP);
+      return native ? { immediate: "[..] undoing..." } : { consumed: true };
     }
     case "redo": {
       if (!isOwner) return ownerOnly;
+      if (isCompacting(ch.id)) return { immediate: "[!] already restarting" };
       const r = await runRedo(ctx);
-      return { immediate: r.text };
+      if (!r.restarted) return { immediate: r.text };
+      const placeholderP = beginRestartOp(
+        pi,
+        ctx,
+        ch,
+        "redo",
+        "redoing",
+        r.text,
+      );
+      scheduleOpShutdown(ctx, ch, placeholderP);
+      return native ? { immediate: "[..] redoing..." } : { consumed: true };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
@@ -3085,7 +3405,8 @@ export async function handleInbound(
   const cmd = matchCommand(rawBody);
   if (cmd) {
     // While compacting: /status, /jobs, /sleep stay read-only, /stop
-    // clears the window and stops, /compact reports it. Everything else
+    // clears the window and stops, /compact reports it, /reset and
+    // /restart refuse (window already open). Everything else
     // falls through and is queued like a plain message — executed on the
     // re-wake, after the compaction settles.
     const allowedWhileCompacting =
@@ -3094,7 +3415,9 @@ export async function handleInbound(
       cmd.name === "jobs" ||
       cmd.name === "sleep" ||
       cmd.name === "stop" ||
-      cmd.name === "compact";
+      cmd.name === "compact" ||
+      cmd.name === "reset" ||
+      cmd.name === "restart";
     if (!isCompacting(ch.id) || allowedWhileCompacting) {
       const r = await runChannelCommand(
         pi,

@@ -4,11 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   allowedMentionsFor,
+  clearDiscordStatesForTest,
   connectDiscord,
   deferInteraction,
   disconnectDiscord,
   editInteractionMessage,
   ensurePresenceState,
+  getChannelCursor,
   getDiscordStates,
   handleMessageCreate,
   handleMessageDelete,
@@ -22,8 +24,10 @@ import {
   registerDiscordCommands,
   resolveChannelId,
   respondToInteraction,
+  seedChannelStateForTest,
   sendDiscordMessage,
   sendFilesToDiscord,
+  setChannelCursor,
   suppressAutoReact,
 } from "./discord";
 
@@ -71,6 +75,8 @@ afterEach(() => {
     "c1",
     "p1",
     "qu",
+    "ip",
+    "cs",
   ])
     disconnectDiscord(id);
 });
@@ -249,6 +255,10 @@ test("gateway MESSAGE_CREATE delivers once; duplicate dropped; poll backfill ded
     onError: () => {},
   });
   expect(ok).toBe(true);
+  // Let the connect-time immediate first poll finish before we simulate
+  // gateway traffic (the per-channel polling guard would otherwise make
+  // the explicit pollDiscord calls below no-ops racing it).
+  await tick();
 
   // Simulate READY: bot identity from d.user.id, gateway connected.
   const st = ensurePresenceState("tok-gw");
@@ -937,4 +947,35 @@ test("callbacks without update/delete handlers are no-ops", async () => {
   expect(() =>
     handleMessageDelete(st, { id: "9200000000000000002", channel_id: "999" }),
   ).not.toThrow();
+});
+
+test("connectDiscord fires an immediate first backfill poll (restart replay path)", async () => {
+  const urls: string[] = [];
+  setFetch(async (u) => {
+    urls.push(String(u));
+    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-ip" });
+    if (u.includes("/messages")) return jsonResp(200, []);
+    return jsonResp(200, null);
+  });
+  const ok = await connectDiscord(cfg("ip"), {
+    onMessage: () => {},
+    onError: () => {},
+  });
+  expect(ok).toBe(true);
+  // flush the fire-and-forget poll
+  await tick();
+  // a real backfill fetch happened without waiting for the 5s interval:
+  // either the fresh-seed ?limit=1 (no persisted cursor) or a ranged poll
+  const backfill = urls.find((u) => u.includes("/messages") && u.includes("?"));
+  expect(backfill).toBeDefined();
+  disconnectDiscord("ip");
+});
+
+test("getChannelCursor / setChannelCursor round-trip and persist", async () => {
+  seedChannelStateForTest("cs", "777", null);
+  expect(getChannelCursor("cs")).toBeNull();
+  setChannelCursor("cs", "42");
+  expect(getChannelCursor("cs")).toBe("42");
+  clearDiscordStatesForTest();
+  expect(getChannelCursor("cs")).toBeNull();
 });
