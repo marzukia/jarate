@@ -24,6 +24,14 @@ if [ -z "$msg" ]; then
   exit 2
 fi
 
+# Secret censor: the message is Discord egress from outside the bridge, so
+# route it through the same censor + registry (jarate/bin/jarate-censor).
+# Missing tool / bun absent / any error = send as-is (never block the peer).
+AS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+if [ -f "$AS_ROOT/bin/jarate-censor" ] && command -v bun >/dev/null 2>&1; then
+  censored="$(printf '%s' "$msg" | bun "$AS_ROOT/bin/jarate-censor" 2>/dev/null)" && msg="$censored"
+fi
+
 token="${PI_BOT_TOKEN:-}"
 if [ -z "$token" ] && [ -f "$HOME/.pi/agent/settings.json" ]; then
   token=$(jq -r '[.channels[]? | select(.type == "discord") | .botToken // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json")

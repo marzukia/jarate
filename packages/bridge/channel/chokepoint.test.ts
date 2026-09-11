@@ -112,10 +112,11 @@ describe("egress choke point", () => {
   });
 
   test("no bypass: every function that POSTs/PATCHes a content body calls egressText", () => {
-    // Find all top-level function/arrow declarations and flag any that
-    // send a message body with user-visible text but skip egressText.
+    // Find ALL top-level function declarations (exported AND unexported)
+    // and flag any that send a message body with user-visible text or
+    // filenames but skip egressText.
     const fnNames = [
-      ...SRC.matchAll(/^export (?:async )?function (\w+)/gm),
+      ...SRC.matchAll(/^(?:export )?(?:async )?function (\w+)/gm),
     ].map((m) => m[1]);
     const textSenders = fnNames.filter((name) => {
       const body = (() => {
@@ -125,10 +126,15 @@ describe("egress choke point", () => {
           return "";
         }
       })();
-      const postsText =
+      // (1) content senders: a `content:` field going out a Discord POST
+      const postsContent =
         /content\s*:/.test(body) &&
-        /method:\s*["'](?:POST|PATCH)["']|discordFetchRaw/.test(body);
-      return postsText;
+        /method:\s*["'](?:POST|PATCH)["']|discordFetch\(|fetch\(/.test(body);
+      // (2) filename-only senders: multipart uploads where the visible
+      //    text is the payload_json attachments[].filename field
+      const postsFilenames =
+        /new FormData\(\)/.test(body) && /payload_json/.test(body);
+      return postsContent || postsFilenames;
     });
     for (const fn of textSenders) {
       expect(
@@ -136,8 +142,9 @@ describe("egress choke point", () => {
         `${fn} bypasses the egress choke point`,
       ).toContain("egressText(");
     }
-    // sendFilesToDiscord carries no `content` field (filenames only —
-    // covered by the explicit list above), so 5 is the floor.
-    expect(textSenders.length).toBeGreaterThanOrEqual(5);
+    // Floor: the 5 content senders + sendFilesToDiscord (filenames only).
+    // A mutation that adds a NEW sender (exported or not, content: or
+    // payload_json filenames) with raw text must FAIL the loop above.
+    expect(textSenders.length).toBeGreaterThanOrEqual(6);
   });
 });

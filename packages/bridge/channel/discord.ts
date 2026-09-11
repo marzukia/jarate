@@ -825,7 +825,10 @@ export async function sendFilesToDiscord(
 ): Promise<{ success: boolean; error?: string }> {
   if (files.length === 0) return { success: true };
 
-  const names = files.map((f) => path.basename(f));
+  // Secret censor: payload_json carries the API-facing (visible) filename —
+  // the Discord API returns it as attachments[].filename, so it must be the
+  // redacted name, not just the file part.
+  const names = files.map((f) => egressText(path.basename(f)));
 
   for (const file of files) {
     let stat: fs.Stats;

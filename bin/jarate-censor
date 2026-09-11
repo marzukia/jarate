@@ -1,0 +1,20 @@
+#!/usr/bin/env bun
+// jarate-censor: stdin -> censor() -> stdout.
+//
+// Routes out-of-bridge Discord egress (pi-bg dispatch callbacks, agent-say)
+// through the SAME censor + registry the bridge uses (~/.pi/agent/secrets.txt
+// or $JARATE_SECRETS_FILE). Never fails the caller: on any error the raw
+// input is passed through and the exit code is 0.
+//
+// Usage:  echo "text" | bun bin/jarate-censor
+import * as fs from "node:fs";
+import { censor } from "../packages/bridge/channel/censor.ts";
+
+const text = fs.readFileSync(0, "utf-8");
+let out = text;
+try {
+  out = censor(text);
+} catch {
+  // pass through: the censor must never break the callback
+}
+process.stdout.write(out);

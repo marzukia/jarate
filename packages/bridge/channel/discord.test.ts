@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { clearRegistryCache } from "./censor";
 import {
   allowedMentionsFor,
   clearDiscordStatesForTest,
@@ -711,6 +712,41 @@ test("sendFilesToDiscord: multipart payload, MIME, 25 MB gate, missing file (T2)
       success: true,
     });
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sendFilesToDiscord: registry-literal filename is redacted in the API-facing payload_json (secret censor)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-censor-"));
+  const reg = path.join(dir, "secrets.txt");
+  fs.writeFileSync(reg, "trailsecret.txt\n");
+  const file = path.join(dir, "trailsecret.txt");
+  fs.writeFileSync(file, "bytes");
+  const prevEnv = process.env.JARATE_SECRETS_FILE;
+  let captured: { init: any } | null = null;
+  try {
+    process.env.JARATE_SECRETS_FILE = reg;
+    clearRegistryCache();
+    setFetch(async (_u, init) => {
+      captured = { init };
+      return jsonResp(200, { id: "sent" });
+    });
+    const r = await sendFilesToDiscord("999", [file], "tok");
+    expect(r.success).toBe(true);
+    expect(captured!.init.body).toBeInstanceOf(FormData);
+    // payload_json carries the API-facing name — the Discord API returns
+    // it as attachments[].filename, so the raw literal must be gone.
+    const payload = JSON.parse(captured!.init.body.get("payload_json"));
+    expect(payload.attachments[0].filename).toBe("[REDACTED:secret#1]");
+    expect(JSON.stringify(payload)).not.toContain("trailsecret");
+    // and the multipart file part name is redacted too
+    expect((captured!.init.body.get("files[0]") as File).name).toBe(
+      "[REDACTED:secret#1]",
+    );
+  } finally {
+    if (prevEnv === undefined) delete process.env.JARATE_SECRETS_FILE;
+    else process.env.JARATE_SECRETS_FILE = prevEnv;
+    clearRegistryCache();
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -63,7 +63,9 @@ export function loadRegistry(file?: string): RegistryEntry[] {
   if (file === undefined && mtimeMs === cachedMtime) return cachedEntries;
   const entries: RegistryEntry[] = [];
   for (const line of raw.split("\n")) {
-    const literal = line.replace(/\r$/, "");
+    // trim: a trailing space would keep the literal wider than the egress
+    // text (no match), and a whitespace-only line would redact prose spacing
+    const literal = line.replace(/\r$/, "").trim();
     if (!literal || literal.startsWith("#")) continue;
     entries.push({ index: entries.length + 1, literal });
   }
@@ -158,10 +160,11 @@ const RULES: PatternRule[] = [
     sub: (_m, key) => `${key.toLowerCase()}=[REDACTED:kv]`,
   },
   {
-    // key: value — only when the value is quoted or at least 6 chars, so
-    // prose like "the password: reset it" is left alone.
+    // key: value — only when the value is quoted (>=4) or an unquoted
+    // token-like run of >=8 chars, so prose like "the password: forgot it"
+    // (6 letters) is left alone while real tokens are caught.
     cls: "kv",
-    re: /(?<![\w-])\b(password|passwd|secret|token)\b\s*:\s*("[^"]{4,}"|'[^']{4,}'|[^\s,:;'"[\]]{6,})/gi,
+    re: /(?<![\w-])\b(password|passwd|secret|token)\b\s*:\s*("[^"]{4,}"|'[^']{4,}'|[^\s,:;'"[\]]{8,})/gi,
     sub: (_m, key) => `${key.toLowerCase()}: [REDACTED:kv]`,
   },
 ];

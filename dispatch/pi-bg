@@ -89,6 +89,19 @@ if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
 fi
 
+# --- secret censor for callback text (jarate/bin/jarate-censor, bun) ---
+# The callback body (task + worker output) is Discord egress from a process
+# outside the bridge, so it routes through the same censor + registry.
+# Missing tool / bun absent / any error = pass through (never break the wake).
+JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+bg_censor() {
+  local c
+  if [ -n "$1" ] && [ -f "$JB_ROOT/bin/jarate-censor" ] && command -v bun >/dev/null 2>&1; then
+    c="$(printf '%s' "$1" | bun "$JB_ROOT/bin/jarate-censor" 2>/dev/null)" && { printf '%s' "$c"; return; }
+  fi
+  printf '%s' "$1"
+}
+
 # --- callback helpers (issue #14): the webhook post is the only wake
 #     mechanism, so never let it fail silently. ---
 BG_CB_DONE=0
@@ -119,7 +132,8 @@ bg_post() {
 bg_build() {
   local bodyfile="$1" status="$2" brief="$3" brc="$4" verdict="$5"
   BG_WEBHOOK="$webhook" BG_PROFILE="$profile" BG_STATUS="$status" BG_RC="$brc" \
-  BG_VERDICT="$verdict" BG_DUR="${SECONDS}" BG_TASK="${task:0:200}" BG_BRIEF="$brief" \
+  BG_VERDICT="$verdict" BG_DUR="${SECONDS}" BG_TASK="$(bg_censor "${task:0:200}")" \
+  BG_BRIEF="$(bg_censor "$brief")" \
   BG_WT="$wt_path" BG_BRANCH="$wt_branch" BG_CWD="$(pwd)" BG_RUN="$run_id" \
   BG_PURL="$purl" BG_OURL="$ourl" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
@@ -231,6 +245,7 @@ if [ -n "$webhook" ]; then
     # fallback: legacy plain text if the embed builder failed
     bodyf="/tmp/pi-bg-${run_id}-body-plain.json"
     body="[bg:${profile}:${status}] cwd=$(pwd) task=${task:0:120}\n\n${out:0:400}"
+    body="$(bg_censor "$body")"
     python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body" > "$bodyf"
     bg_post "$bodyf" || rm -f "$bodyf"
   fi

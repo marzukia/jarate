@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -132,6 +133,25 @@ describe("pattern classes", () => {
     expect(out).not.toContain("hunter2");
     expect(out).not.toContain("abc123def");
   });
+
+  test("kv colon: short prose values stay, token-like values redact", () => {
+    // reviewer repro: 6-letter English word after a colon is not a secret
+    expect(censor("the password: forgot it quickly", { file: R })).toBe(
+      "the password: forgot it quickly",
+    );
+    // 7 chars (just under the 8-char unquoted bar) also stays
+    expect(censor("token: changed", { file: R })).toBe("token: changed");
+    // real token after colon (12 alnum) — redacted
+    expect(censor("token: a1b2c3d4e5f6", { file: R })).toBe(
+      "token: [REDACTED:kv]",
+    );
+    // quoted values keep the lower 4-char bar
+    expect(censor('password: "abc123"', { file: R })).toBe(
+      "password: [REDACTED:kv]",
+    );
+    // the = rule is unchanged (strongest leak signal, any value)
+    expect(censor("password=x", { file: R })).toBe("password=[REDACTED:kv]");
+  });
 });
 
 describe("registry", () => {
@@ -179,6 +199,22 @@ describe("registry", () => {
     const d = path.join(tmp, "adir");
     fs.mkdirSync(d);
     expect(() => censor("x", { file: d })).not.toThrow();
+  });
+
+  test("registry lines are trimmed; whitespace-only lines skipped", () => {
+    reg(["trailsec  ", "   ", "# comment  "]);
+    expect(loadRegistry(registryFile)).toEqual([
+      { index: 1, literal: "trailsec" },
+    ]);
+    // trailing-space line still matches egress text (reviewer repro)
+    expect(censor("value trailsec. end", { file: registryFile })).toBe(
+      "value [REDACTED:secret#1]. end",
+    );
+    // whitespace-only line must not mangle prose spacing
+    const ws = path.join(tmp, "ws.txt");
+    fs.writeFileSync(ws, "\n   \n");
+    expect(loadRegistry(ws)).toEqual([]);
+    expect(censor("a   b", { file: ws })).toBe("a   b");
   });
 });
 
@@ -259,5 +295,34 @@ describe("behavior", () => {
     censor("ghp_aBc123D456eF78901234567890123456", opts);
     censor("ghp_aBc123D456eF78901234567890123456", opts);
     expect(lines).toHaveLength(1);
+  });
+});
+
+describe("jarate-censor CLI (bin/jarate-censor: stdin -> censor -> stdout)", () => {
+  const BIN = path.resolve(import.meta.dir, "../../../bin/jarate-censor");
+  const run = (input: string, registry: string): string =>
+    cp.execFileSync("bun", [BIN], {
+      input,
+      encoding: "utf-8",
+      env: { ...process.env, JARATE_SECRETS_FILE: registry },
+    });
+
+  test("redacts with the same registry the bridge uses", () => {
+    reg(["trailsecret"]);
+    const out = run(
+      "here is trailsecret and ghp_aBc123D456eF78901234567890123456\n",
+      registryFile,
+    );
+    expect(out).toBe("here is [REDACTED:secret#1] and [REDACTED:github]\n");
+  });
+
+  test("missing registry = patterns only, never fails the caller", () => {
+    const out = run("ghp_aBc123D456eF78901234567890123456", R);
+    expect(out).toBe("[REDACTED:github]");
+  });
+
+  test("pass-through text is unchanged (incl. trailing newline)", () => {
+    const out = run("the password is fine\n", R);
+    expect(out).toBe("the password is fine\n");
   });
 });

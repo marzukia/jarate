@@ -44,14 +44,32 @@ and **all six** functions call it before building their body. A test asserts
 at source level that every text-bearing send function references
 `egressText`, so a new egress path that forgets it fails CI.
 
-Not covered by the bridge (separate processes, noted for later):
-- `pi-bg` dispatch callback — posts directly to the pi-dispatch webhook
-  (`~/.config/pi-dispatch/webhook`). The webhook URL itself is a credential
-  and is in the registry; the callback body is agent output and can leak
-  values too. Mitigation: keep the callback truncated + registry covers the
-  known literals. A pi-bg-side censor is follow-up work.
-- `agent-say` — posts the caller's message to a peer channel via webhook;
-  same class of gap, same mitigation.
+Not in the bridge process, but censored via the **jarate-censor CLI**
+(`bin/jarate-censor`, bun): `stdin -> censor() -> stdout`, same registry
+(`~/.pi/agent/secrets.txt` / `$JARATE_SECRETS_FILE`), never fails the
+caller (any error = pass through). Wired in where the out-of-bridge
+egress lives:
+
+- `dispatch/pi-bg` — the webhook callback embed's `task` and `result`
+  fields (truncated task text + raw worker output, the primary leak
+  surface) and the legacy plain-text fallback body are all run through
+  `jarate-censor` before the POST.
+- `bin/agent-say` — the peer message is run through `jarate-censor`
+  before the Discord POST.
+
+Known open (residual gaps, not covered by any process today):
+
+- **webdrop artifacts** — pi-bg uploads the FULL prompt + output files
+  to webdrop; only the link lands in Discord. The files are readable by
+  anyone with the URL. Acceptable while the TTL is 7d + random slugs;
+  censoring them needs a webdrop-side hook.
+- The registry protects only what the censor runs through: any NEW
+  out-of-bridge process that posts raw text to Discord leaks until it is
+  wired the same one-line way (`printf '%s' "$msg" | bun <jarate>/bin/jarate-censor`).
+  The guarantee scope is: **every Discord egress in this repo routes
+  through `censor()`** — asserted for the bridge at source level (the
+  chokepoint test) and structurally for pi-bg/agent-say (both post only
+  the censored strings).
 
 ## Redaction strategy
 
@@ -87,7 +105,7 @@ agent box must still run with pattern-only redaction.
 | bearer | `Bearer <token>` | `Bearer [REDACTED:bearer]` |
 | dsn | `postgres/redis/mysql/mongodb://user:pass@` (also `://:pass@`) | `scheme://[REDACTED:dsn]@` |
 | sshpass | `sshpass -p <arg>` | `sshpass -p [REDACTED:sshpass]` |
-| kv | `password/passwd/secret/token/api_key = v` anywhere; `key: v` when v is quoted or ≥6 chars | `key: [REDACTED:kv]` |
+| kv | `password/passwd/secret/token/api_key = v` anywhere; `key: v` when v is quoted (>=4) or an unquoted run of >=8 chars | `key: [REDACTED:kv]` |
 
 Replacements are **fixed strings** — the raw value never appears in the
 output, and it is why the censor is idempotent (see below).
@@ -128,5 +146,9 @@ output, and it is why the censor is idempotent (see below).
 `censor.test.ts` (~20 tests): one per pattern class, registry literal +
 longest-first, registry missing-file, DSN, sshpass, code-block kv,
 plain-word pass-through, idempotence, WARN-fingerprint shape (no raw value).
-`discord.test.ts` choke-point test: source-level assert that all six
-text-bearing send functions route through `egressText`.
+`discord.test.ts` choke-point test: source-level assert that all text-
+and filename-bearing send functions in `discord.ts` (exported or not) that
+POST/PATCH a `content` body or a `payload_json` multipart call
+`egressText`, plus a runtime test that a registry-literal filename is
+redacted in the API-facing `payload_json`. `censor.test.ts` covers the
+`jarate-censor` CLI end-to-end (bun, same registry).
