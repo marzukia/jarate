@@ -218,6 +218,13 @@ user's normal session it is already set.
 `pi -c --mode rpc` continues the last session in RPC mode; `tail -f
 /dev/null` holds stdin open for the lifetime of the unit.
 
+**Unit name:** the bridge's `/restart` does not hardcode `pi.service`
+(issue #28). It resolves the unit from `$PI_SERVICE`, else the
+`systemdUnit` field in `settings.json` (same cascade as `channels`),
+else `pi.service`. On a unit with a different name, add
+`"systemdUnit": "<your-unit>.service"` to `~/.pi/agent/settings.json`
+(or set `Environment=PI_SERVICE=<unit>` in the unit file).
+
 ## 6. First-run verification
 
 The agent never restarts `pi.service` itself — a human (or the deploy
@@ -258,7 +265,9 @@ The symlinks from step 3 are the whole install. Remaining pieces, all
 one-time:
 
 1. **Callback webhook.** `pi-bg` reads `$PI_DISPATCH_WEBHOOK` first, else
-   the file below (no file = no callback; stdout still prints):
+   the file below. **No file = no callback, and `pi-bg` says so loudly at
+   dispatch time** (`no completion callback; poll with pi-wait`) and marks
+   the run record `delivery=none` (issue #30):
 
    ```bash
    mkdir -p ~/.config/pi-dispatch
@@ -269,8 +278,13 @@ one-time:
 
    `pi-wait` requires `webhook_author` to recognize the callback message
    (exit 2 without it).
-2. **python3** on PATH (embed body builder, pi-wait classification).
-3. **webdrop** (optional): if `webdrop` is on PATH, every dispatch also
+2. **Role profiles.** `pi-bg` auto-seeds a missing `~/.pi/agent-worker` /
+   `~/.pi/agent-reviewer` from the main agent's `auth.json`/`models.json`
+   plus the repo template `dispatch/profiles/<role>.json` (issue #29).
+   If no provider creds resolve it fails at dispatch (exit 4) with the
+   exact files to copy — never a silent empty run.
+3. **python3** on PATH (embed body builder, pi-wait classification).
+4. **webdrop** (optional): if `webdrop` is on PATH, every dispatch also
    gets 7d prompt/output links in the callback embed.
 
 Then dispatch:

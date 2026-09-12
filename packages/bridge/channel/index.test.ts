@@ -13,6 +13,7 @@ import {
 import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
+  buildRestartCommand,
   chunkText,
   clearAllCompacting,
   clearAllInterrupts,
@@ -48,15 +49,13 @@ import extension, {
   TODO_TOOL_DESCRIPTION,
   updateQueuedInbound,
 } from "./index";
+import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
+import { loadBoard, renderBoard, saveBoard } from "./todos";
 import {
-  CLAIM_TTL_MS,
-  cancelWake,
-  loadWakes,
-  markClaimed,
-  scheduleWake,
-} from "./sleep";
-import { loadBoard, renderBoard, saveBoard, type TodoBoard } from "./todos";
-import { type ChannelMessage, loadChannelConfig } from "./types";
+  type ChannelMessage,
+  loadChannelConfig,
+  resolveSystemdUnit,
+} from "./types";
 import { performUndo } from "./undo";
 
 describe("chunkText", () => {
@@ -1809,7 +1808,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       ".pi",
       "agent",
       "sessions",
-      "-" + tmp + "-",
+      `-${tmp}-`,
     );
     fs.mkdirSync(sessDir, { recursive: true });
     const sess = path.join(sessDir, "s.jsonl");
@@ -1835,7 +1834,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     ];
     fs.writeFileSync(
       sess,
-      lines.map((l) => JSON.stringify(l)).join("\n") + "\n",
+      `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
     );
 
     // /undo: truncate + park the re-run trigger (restarted=true would then
@@ -3458,7 +3457,7 @@ describe("sleep (integration)", () => {
   });
 
   test("sleep tool: minutes -> wake on disk + ack telling the model to end the reply", async () => {
-    const r = await tools["sleep"].execute(
+    const r = await tools.sleep.execute(
       "1",
       { minutes: 30, note: "verify the build" },
       undefined,
@@ -3478,7 +3477,7 @@ describe("sleep (integration)", () => {
     // Relative future date — a hardcoded ISO became a date bomb on
     // 2026-09-11 (past `until` is rejected, so the wake list stayed empty).
     const until = new Date(Date.now() + 30 * 60000).toISOString();
-    await tools["sleep"].execute("1", { until }, undefined, undefined, ctx);
+    await tools.sleep.execute("1", { until }, undefined, undefined, ctx);
     expect(loadWakes(tmp)[0].wakeAt).toBe(Date.parse(until));
   });
 
@@ -3490,7 +3489,7 @@ describe("sleep (integration)", () => {
       { minutes: -1 },
       { until: "2036-01-01T00:00:00Z" },
     ]) {
-      const r = await tools["sleep"].execute(
+      const r = await tools.sleep.execute(
         "1",
         params,
         undefined,
@@ -3899,5 +3898,150 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     const n = ackEdits().length;
     jest.advanceTimersByTime(10000);
     expect(ackEdits().length).toBe(n);
+  });
+
+  test("#28: /restart asks systemd for the env-configured unit, not hardcoded pi.service", async () => {
+    const got: string[] = [];
+    setSystemdRestartHookForTest((u) => {
+      got.push(u);
+    });
+    process.env.PI_SERVICE = "banky-pi.service";
+    try {
+      await handleInbound(pi, inbound("/restart", "m1"), ctx);
+      await tick();
+      await waitOpShutdown();
+    } finally {
+      delete process.env.PI_SERVICE;
+    }
+    expect(got[0]).toBe("banky-pi.service");
+  });
+
+  test("#28: /restart asks systemd for the settings-configured unit (systemdUnit)", async () => {
+    // beforeEach wrote tmp/.pi/settings.json with only channels — add the unit
+    const s = path.join(tmp, ".pi", "settings.json");
+    const cfg = JSON.parse(fs.readFileSync(s, "utf-8"));
+    cfg.systemdUnit = "banky-pi.service";
+    fs.writeFileSync(s, JSON.stringify(cfg));
+    const got: string[] = [];
+    setSystemdRestartHookForTest((u) => {
+      got.push(u);
+    });
+    await handleInbound(pi, inbound("/restart", "m1"), ctx);
+    await tick();
+    await waitOpShutdown();
+    expect(got[0]).toBe("banky-pi.service");
+  });
+
+  test("#28 partial: no respawn after ~15s -> watchdog closes the window, drains the queue, posts the RESOLVED unit", async () => {
+    jest.useFakeTimers();
+    const got: string[] = [];
+    // restart hook that never settles: the unit never respawns
+    setSystemdRestartHookForTest((u) => {
+      got.push(u);
+    });
+    const flush = async (n: number) => {
+      for (let i = 0; i < n; i++) await Promise.resolve();
+    };
+
+    await handleInbound(pi, inbound("/restart", "m1"), ctx);
+    await flush(10);
+    expect(channelPosts().some((t) => t === "[..] restarting...")).toBe(true);
+
+    // an inbound lands during the op -> queued behind the window
+    await handleInbound(pi, inbound("hello", "m2"), ctx);
+    await flush(10);
+    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+
+    // op shutdown chain at +300ms: restart requested, watchdog armed
+    jest.advanceTimersByTime(300);
+    await flush(30);
+    expect(shutdowns).toBe(1);
+    expect(got).toEqual(["pi.service"]); // resolved name
+
+    // 14.9s later: the failure is not yet declared
+    jest.advanceTimersByTime(14_999);
+    expect(isCompacting("ch1")).toBe(true);
+    expect(channelPosts().some((t) => t.startsWith("[!] restart failed"))).toBe(
+      false,
+    );
+
+    // ~15s: watchdog fires — process still alive, same window entry open
+    jest.advanceTimersByTime(2);
+    await flush(10);
+    // the drained inbound's fs I/O (memory toc) needs real event-loop
+    // turns, which microtask flushing alone never yields
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await flush(20);
+    expect(isCompacting("ch1")).toBe(false); // op window closed
+    expect(
+      channelPosts().some(
+        (t) => t === "[!] restart failed - check unit pi.service",
+      ),
+    ).toBe(true); // RESOLVED unit name in the channel
+    // queued inbound drained through pi (replay, not re-queue)
+    const drained = sent.find(
+      (s) =>
+        s.m.customType === "channel-inbound" &&
+        s.m.details?.body?.includes("hello"),
+    );
+    expect(drained).toBeDefined();
+    expect(midTurnQueues.get("ch1")?.length ?? 0).toBe(0);
+    // no stale marker left to settle some future boot
+    expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
+  });
+});
+
+describe("#28: systemd unit resolution (restart command)", () => {
+  test("buildRestartCommand embeds the resolved unit, not a hardcoded one", () => {
+    expect(buildRestartCommand("pi.service")).toBe(
+      "sleep 3; systemctl --user restart pi.service",
+    );
+    expect(buildRestartCommand("banky-pi.service")).toBe(
+      "sleep 3; systemctl --user restart banky-pi.service",
+    );
+  });
+
+  test("resolveSystemdUnit defaults to pi.service", () => {
+    const old = process.env.PI_SERVICE;
+    delete process.env.PI_SERVICE;
+    try {
+      expect(resolveSystemdUnit("/nonexistent-cwd-x")).toBe("pi.service");
+    } finally {
+      if (old !== undefined) process.env.PI_SERVICE = old;
+    }
+  });
+
+  test("env PI_SERVICE beats settings.json systemdUnit", () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+    fs.mkdirSync(path.join(tmpdir, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpdir, ".pi", "settings.json"),
+      JSON.stringify({ systemdUnit: "from-settings.service" }),
+    );
+    process.env.PI_SERVICE = "from-env.service";
+    try {
+      expect(resolveSystemdUnit(tmpdir)).toBe("from-env.service");
+    } finally {
+      delete process.env.PI_SERVICE;
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test("settings.json systemdUnit is honoured when env is unset", () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+    fs.mkdirSync(path.join(tmpdir, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpdir, ".pi", "settings.json"),
+      JSON.stringify({ systemdUnit: "from-settings.service" }),
+    );
+    const old = process.env.PI_SERVICE;
+    delete process.env.PI_SERVICE;
+    try {
+      expect(resolveSystemdUnit(tmpdir)).toBe("from-settings.service");
+    } finally {
+      if (old !== undefined) process.env.PI_SERVICE = old;
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
   });
 });

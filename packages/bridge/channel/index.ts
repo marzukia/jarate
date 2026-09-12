@@ -96,6 +96,7 @@ import {
   getChannel,
   getDefaultChannel,
   loadChannelConfig,
+  resolveSystemdUnit,
 } from "./types";
 import {
   consumeRerun,
@@ -2431,32 +2432,43 @@ function clearOpMarker(ctx: ExtensionContext): void {
   } catch {}
 }
 
-let systemdRestartHook: (() => void) | null = null;
+let systemdRestartHook: ((unit: string) => void) | null = null;
 /** Override the early-restart trigger (tests: no real systemctl around). */
-export function setSystemdRestartHookForTest(fn: (() => void) | null): void {
+export function setSystemdRestartHookForTest(
+  fn: ((unit: string) => void) | null,
+): void {
   systemdRestartHook = fn;
+}
+
+/** The restart command for a resolved unit name (issue #28: the unit is
+ *  NOT hardcoded — see resolveSystemdUnit). */
+export function buildRestartCommand(unit: string): string {
+  return `sleep 3; systemctl --user restart ${unit}`;
 }
 
 /** Shortcut the 5s systemd RestartSec wait: ask systemd to restart the
  *  unit ~3s from now — by then our own shutdown has run, so the stop is
  *  a no-op and the start is immediate. If this never lands (systemd not
  *  there, hook eaten) the unit's Restart=always still covers us. */
-function requestSystemdRestart(): void {
+function requestSystemdRestart(unit: string): void {
   if (systemdRestartHook) {
-    systemdRestartHook();
+    systemdRestartHook(unit);
     return;
   }
-  if (!process.env.XDG_RUNTIME_DIR) return; // not under a systemd user unit
-  try {
-    const p = spawn(
-      "sh",
-      ["-c", "sleep 3; systemctl --user restart pi.service"],
-      {
-        detached: true,
-        stdio: "ignore",
-        env: process.env,
-      },
+  if (!process.env.XDG_RUNTIME_DIR) {
+    // #28: this early return used to be silent — an operator reading the
+    // channel would never know the restart shortcut was skipped.
+    console.error(
+      `[op] no XDG_RUNTIME_DIR - not under a systemd user unit; cannot ask systemd to restart ${unit} (relying on unit auto-restart)`,
     );
+    return;
+  }
+  try {
+    const p = spawn("sh", ["-c", buildRestartCommand(unit)], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
     p.on("error", () => {});
     p.unref();
   } catch {
@@ -2502,7 +2514,39 @@ function rewindOpCursor(ch: ChannelConfig): void {
   if (entry?.rewindTo) setChannelCursor(ch.id, entry.rewindTo);
 }
 
+/** #28 (partial): a restart that never lands (no systemd, unit dead,
+ *  hook eaten) leaves the op window open forever. Arm a ~15s watchdog
+ *  after the restart request: a successful respawn kills this process
+ *  (ctx.shutdown below), so if the timer still fires with the SAME
+ *  window entry open, the restart failed. Close the window, drain the
+ *  queue, and tell the owner which unit to check. */
+const RESTART_WATCHDOG_MS = 15_000;
+function armRestartWatchdog(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  ch: ChannelConfig,
+  unit: string,
+  entry: CompactingEntry,
+): void {
+  const t = setTimeout(() => {
+    // Entry mismatch = window already closed (settle, /stop cancel) or
+    // replaced by a newer op — not a failure. Unref'd: a healthy process
+    // exit removes the timer with it.
+    if (compactingChannels.get(ch.id) !== entry) return;
+    console.error(
+      `[op] ${ch.id} restart failed - process still alive ${RESTART_WATCHDOG_MS / 1000}s after the request (unit: ${unit})`,
+    );
+    clearOpMarker(ctx); // the respawn that would settle it never came
+    clearCompacting(ch.id); // also drops the pending op-shutdown timer
+    drainQueuedAfterCompact(pi, ctx);
+    const line = `[!] restart failed - check unit ${unit}`;
+    if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
+  }, RESTART_WATCHDOG_MS);
+  t.unref?.();
+}
+
 function scheduleOpShutdown(
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
   ch: ChannelConfig,
   placeholderP: Promise<string | null>,
@@ -2539,7 +2583,9 @@ function scheduleOpShutdown(
         console.error(`[op] ${ch.id} pre-shutdown failed, forcing respawn:`, e);
         process.exit(1); // F3 parity: never leave a zombie half-state
       }
-      requestSystemdRestart();
+      const unit = resolveSystemdUnit(ctx.cwd);
+      requestSystemdRestart(unit);
+      armRestartWatchdog(pi, ctx, ch, unit, entry);
       try {
         ctx.shutdown();
       } catch {
@@ -2791,7 +2837,7 @@ async function runChannelCommand(
         const elapsed = Date.now() - sessionStartTs;
         const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
         const parts = [
-          `ctx ${typeof u?.percent === "number" ? Math.round(u.percent) + "%" : "?"}`,
+          `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"}`,
           `model ${model}`,
           `up ${up}`,
           // Open op window (compaction OR a restart-class op) shows its
@@ -2849,7 +2895,7 @@ async function runChannelCommand(
         "resetting",
         "[new] new session (context cleared)",
       );
-      scheduleOpShutdown(ctx, ch, placeholderP, () =>
+      scheduleOpShutdown(pi, ctx, ch, placeholderP, () =>
         moveSessionFileAside(ctx),
       );
       return native ? { immediate: "[..] resetting..." } : { consumed: true };
@@ -2875,7 +2921,7 @@ async function runChannelCommand(
         "restarting",
         "[ok] restarted - session resumed",
       );
-      scheduleOpShutdown(ctx, ch, placeholderP);
+      scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native ? { immediate: "[..] restarting..." } : { consumed: true };
     }
     case "undo": {
@@ -2894,7 +2940,7 @@ async function runChannelCommand(
         "undoing",
         r.text,
       );
-      scheduleOpShutdown(ctx, ch, placeholderP);
+      scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native ? { immediate: "[..] undoing..." } : { consumed: true };
     }
     case "redo": {
@@ -2910,7 +2956,7 @@ async function runChannelCommand(
         "redoing",
         r.text,
       );
-      scheduleOpShutdown(ctx, ch, placeholderP);
+      scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native ? { immediate: "[..] redoing..." } : { consumed: true };
     }
     case "verbose": {
@@ -3390,14 +3436,14 @@ export function registerSleepTool(
       params: { minutes?: number | string; until?: string; note?: string },
       _signal,
       _onUpdate,
-      ctx: ExtensionContext,
+      _ctx: ExtensionContext,
     ) {
       const active =
         lastActiveChannel && lastActiveChannel.type === "discord"
           ? lastActiveChannel
           : null;
       const ch = active || getDefaultChannel(channels);
-      if (!ch || ch.type !== "discord") {
+      if (ch?.type !== "discord") {
         return {
           content: [{ type: "text", text: "No Discord channel available" }],
           details: {},

@@ -21,6 +21,12 @@
 #     callback so a killed worker still wakes the orchestrator
 #     (SIGKILL cannot be trapped - see DISPATCH.md recommendations)
 #   - dead letter: final post failure writes /tmp/pi-bg-<id>-webhook-failed
+# Fresh machine (issue #29): a missing/empty role profile is seeded from the
+#   main agent's ~/.pi/agent/{auth,models}.json + the repo template
+#   dispatch/profiles/<role>.json (settings). Still no provider => exit 4
+#   with instructions — never a silent empty-completion retry loop.
+# No webhook (issue #30): loud warning at dispatch + a run record in
+#   ~/.pi-dispatch/runs/pi-bg-<id>.json marked "delivery":"none".
 set -uo pipefail
 
 profile="${1:-worker}"
@@ -30,6 +36,9 @@ case "$profile" in
 esac
 
 export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
+
+# repo root (script lives in <repo>/dispatch) - profile templates + censor
+JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 
 # --- per-run switchboard session id (unique ledger entry per dispatch) ---
 run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
@@ -89,11 +98,112 @@ if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
 fi
 
+# --- no-webhook warning + run record (issue #30): a missing webhook must
+#     not be a silent no-op — the callback is the ONLY wake mechanism. ---
+if [ -n "$webhook" ]; then
+  delivery="webhook"
+else
+  delivery="none"
+  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with pi-wait" >&2
+fi
+rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+mkdir -p "$rec_dir" 2>/dev/null
+PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_CWD="$(pwd)" \
+PI_BG_REC_DELIVERY="$delivery" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+rec = {
+    "run": os.environ["PI_BG_REC_RUN"],
+    "profile": os.environ["PI_BG_REC_PROFILE"],
+    "cwd": os.environ["PI_BG_REC_CWD"],
+    "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "delivery": os.environ["PI_BG_REC_DELIVERY"],
+}
+with open(sys.argv[1], "w") as fh:
+    json.dump(rec, fh, indent=2)
+PY
+
+# --- profile doctor (issue #29): the role home must hold provider creds.
+#     A fresh machine has none; pi then replies empty and the empty-completion
+#     retry loop below misfiles a credential-shaped failure. Seed a missing
+#     profile from the main agent + the repo template, then fail loud. ---
+profile_seeded() {
+  local dir="$1" f
+  for f in "$dir/auth.json" "$dir/models.json"; do
+    [ -s "$f" ] || continue
+    python3 - "$f" <<'PY' >/dev/null 2>&1 && return 0
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if isinstance(d, (dict, list)) and len(d) else 1)
+PY
+  done
+  return 1
+}
+
+# true when the file is missing, or parses as an empty object/list.
+# A present-but-EMPTY file ({}, which is 2 bytes so [ -s ] passes) is
+# still seedable: a profile with BOTH auth.json={} and models.json={}
+# must not block seeding from the main agent's valid creds.
+empty_json() {
+  local f="$1"
+  [ -e "$f" ] || return 0
+  python3 - "$f" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)  # unparseable = treat as user's content, do not clobber
+sys.exit(0 if isinstance(d, (dict, list)) and not d else 1)
+PY
+}
+
+if ! profile_seeded "$PI_CODING_AGENT_DIR"; then
+  main_agent="${HOME}/.pi/agent"
+  mkdir -p "$PI_CODING_AGENT_DIR" 2>/dev/null
+  for f in auth.json models.json; do
+    if [ -s "$main_agent/$f" ] && empty_json "$PI_CODING_AGENT_DIR/$f"; then
+      cp -L "$main_agent/$f" "$PI_CODING_AGENT_DIR/$f" 2>/dev/null || true
+    fi
+  done
+  if [ ! -e "$PI_CODING_AGENT_DIR/settings.json" ] && [ -n "$JB_ROOT" ] && [ -f "$JB_ROOT/dispatch/profiles/${profile}.json" ]; then
+    python3 - "$PI_CODING_AGENT_DIR/settings.json" \
+      "$JB_ROOT/dispatch/profiles/${profile}.json" "$main_agent/settings.json" <<'PY' 2>/dev/null || true
+import json, sys
+out, tpl, main = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.load(open(tpl))
+    if not isinstance(cfg, dict): cfg = {}
+except Exception:
+    cfg = {}
+try:
+    m = json.load(open(main))
+    for k in ("defaultProvider", "defaultModel"):
+        v = m.get(k)
+        if isinstance(v, str) and v:
+            cfg[k] = v
+except Exception:
+    pass
+with open(out, "w") as fh:
+    json.dump(cfg, fh, indent=2)
+PY
+  fi
+fi
+if ! profile_seeded "$PI_CODING_AGENT_DIR"; then
+  {
+    echo "pi-bg: profile '$profile' has no provider at $PI_CODING_AGENT_DIR (auth.json/models.json missing or empty)"
+    echo "pi-bg: fix: seed credentials, e.g."
+    echo "  cp -L ${HOME}/.pi/agent/auth.json ${HOME}/.pi/agent/models.json $PI_CODING_AGENT_DIR/"
+    echo "  (or run the main agent once to log in), then re-dispatch."
+    if [ -n "$JB_ROOT" ] && [ -f "$JB_ROOT/dispatch/profiles/${profile}.json" ]; then
+      echo "pi-bg: settings template: $JB_ROOT/dispatch/profiles/${profile}.json"
+    fi
+  } >&2
+  exit 4
+fi
+
 # --- secret censor for callback text (jarate/bin/jarate-censor, bun) ---
 # The callback body (task + worker output) is Discord egress from a process
 # outside the bridge, so it routes through the same censor + registry.
 # Missing tool / bun absent / any error = pass through (never break the wake).
-JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 bg_censor() {
   local c
   if [ -n "$1" ] && [ -f "$JB_ROOT/bin/jarate-censor" ] && command -v bun >/dev/null 2>&1; then

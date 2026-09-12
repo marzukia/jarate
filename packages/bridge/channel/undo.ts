@@ -576,7 +576,7 @@ export function sessionsBaseDir(): string {
 /** Fallback session discovery: newest .jsonl under cwd's session dir (same scan as /reset). */
 export function findSessionFile(cwd: string): string | null {
   const sessionsBase = sessionsBaseDir();
-  const encDir = path.join(sessionsBase, "-" + cwd.replace(/\//g, "-") + "-");
+  const encDir = path.join(sessionsBase, `-${cwd.replace(/\//g, "-")}-`);
   const candidates: Array<[string, number]> = [];
   const scan = (dir: string) => {
     for (const f of fs.readdirSync(dir)) {
@@ -700,14 +700,14 @@ export function truncateSession(sessionFile: string): string[] | null {
     pruneUndoBackups(sessionFile);
   } catch {}
   const tmp = `${sessionFile}.undo-tmp`;
-  fs.writeFileSync(tmp, kept.join("\n") + "\n");
+  fs.writeFileSync(tmp, `${kept.join("\n")}\n`);
   fs.renameSync(tmp, sessionFile);
   return removed;
 }
 
 /** Re-append lines removed by truncateSession (for /redo). */
 export function reappendSession(sessionFile: string, removed: string[]): void {
-  fs.appendFileSync(sessionFile, removed.join("\n") + "\n");
+  fs.appendFileSync(sessionFile, `${removed.join("\n")}\n`);
 }
 
 // ─── Redo record ───────────────────────────────────────────────────────────
@@ -750,7 +750,7 @@ export function triggerText(entry: any): string | null {
         : typeof entry.content === "string"
           ? entry.content
           : null;
-    return t && t.trim() ? t : null;
+    return t?.trim() ? t : null;
   }
   if (entry?.type === "message" && entry.message?.role === "user") {
     const c = entry.message.content;

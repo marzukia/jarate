@@ -185,6 +185,31 @@ function normalizeChannel(raw: any): ChannelConfig {
   };
 }
 
+/**
+ * Resolve the systemd user unit that runs pi (issue #28).
+ *   1. env PI_SERVICE
+ *   2. `systemdUnit` in settings.json (same cascade as channels)
+ *   3. "pi.service"
+ */
+export function resolveSystemdUnit(cwd: string): string {
+  const env = process.env.PI_SERVICE;
+  if (typeof env === "string" && env.trim()) return env.trim();
+  const sources = [
+    path.join(cwd, ".pi", "settings.json"),
+    path.join(homedir(), ".pi", "agent", "settings.json"),
+  ];
+  for (const src of sources) {
+    try {
+      const data = JSON.parse(fs.readFileSync(src, "utf-8"));
+      const u = data?.systemdUnit;
+      if (typeof u === "string" && u.trim()) return u.trim();
+    } catch {
+      /* continue to next source */
+    }
+  }
+  return "pi.service";
+}
+
 /** Return the default channel (first with default:true, or first enabled). */
 export function getDefaultChannel(
   channels: ChannelConfig[],
