@@ -96,6 +96,7 @@ import {
   getChannel,
   getDefaultChannel,
   loadChannelConfig,
+  resolveSystemdUnit,
 } from "./types";
 import {
   consumeRerun,
@@ -2431,32 +2432,36 @@ function clearOpMarker(ctx: ExtensionContext): void {
   } catch {}
 }
 
-let systemdRestartHook: (() => void) | null = null;
+let systemdRestartHook: ((unit: string) => void) | null = null;
 /** Override the early-restart trigger (tests: no real systemctl around). */
-export function setSystemdRestartHookForTest(fn: (() => void) | null): void {
+export function setSystemdRestartHookForTest(
+  fn: ((unit: string) => void) | null,
+): void {
   systemdRestartHook = fn;
+}
+
+/** The restart command for a resolved unit name (issue #28: the unit is
+ *  NOT hardcoded — see resolveSystemdUnit). */
+export function buildRestartCommand(unit: string): string {
+  return `sleep 3; systemctl --user restart ${unit}`;
 }
 
 /** Shortcut the 5s systemd RestartSec wait: ask systemd to restart the
  *  unit ~3s from now — by then our own shutdown has run, so the stop is
  *  a no-op and the start is immediate. If this never lands (systemd not
  *  there, hook eaten) the unit's Restart=always still covers us. */
-function requestSystemdRestart(): void {
+function requestSystemdRestart(unit: string): void {
   if (systemdRestartHook) {
-    systemdRestartHook();
+    systemdRestartHook(unit);
     return;
   }
   if (!process.env.XDG_RUNTIME_DIR) return; // not under a systemd user unit
   try {
-    const p = spawn(
-      "sh",
-      ["-c", "sleep 3; systemctl --user restart pi.service"],
-      {
-        detached: true,
-        stdio: "ignore",
-        env: process.env,
-      },
-    );
+    const p = spawn("sh", ["-c", buildRestartCommand(unit)], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
     p.on("error", () => {});
     p.unref();
   } catch {
@@ -2539,7 +2544,7 @@ function scheduleOpShutdown(
         console.error(`[op] ${ch.id} pre-shutdown failed, forcing respawn:`, e);
         process.exit(1); // F3 parity: never leave a zombie half-state
       }
-      requestSystemdRestart();
+      requestSystemdRestart(resolveSystemdUnit(ctx.cwd));
       try {
         ctx.shutdown();
       } catch {

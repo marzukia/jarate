@@ -20,6 +20,19 @@ Components (all in this repo):
 Profiles are separate pi homes: `~/.pi/agent-worker`, `~/.pi/agent-reviewer`
 (env `PI_CODING_AGENT_DIR`, set by `pi-bg` automatically).
 
+**Fresh machine** (issues #29/#30): `pi-bg` runs a profile doctor before
+every dispatch. A missing or empty role profile is auto-seeded from the
+main agent's `~/.pi/agent/{auth,models}.json` + the repo template
+`dispatch/profiles/<role>.json` (thinking level, ctx budget; provider/model
+inherited from the main agent's `settings.json`). If no provider creds
+resolve, `pi-bg` exits 4 with the files to copy — a missing credential is
+not misfiled as the empty-completion quirk. Each dispatch also writes a run
+record to `~/.pi-dispatch/runs/pi-bg-<id>.json` with `delivery:
+"webhook"|"none"`; when no webhook is configured (`$PI_DISPATCH_WEBHOOK`
+or `~/.config/pi-dispatch/webhook`), `pi-bg` warns at dispatch:
+`no completion callback; poll with pi-wait`. Override the record dir with
+`$PI_DISPATCH_RECORD_DIR`.
+
 ## Fleet caps (vLLM queue protection)
 
 All agents share one vLLM endpoint (8 concurrent sequences max). Concurrent

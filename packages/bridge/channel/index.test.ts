@@ -13,6 +13,7 @@ import {
 import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
+  buildRestartCommand,
   chunkText,
   clearAllCompacting,
   clearAllInterrupts,
@@ -56,7 +57,11 @@ import {
   scheduleWake,
 } from "./sleep";
 import { loadBoard, renderBoard, saveBoard, type TodoBoard } from "./todos";
-import { type ChannelMessage, loadChannelConfig } from "./types";
+import {
+  type ChannelMessage,
+  loadChannelConfig,
+  resolveSystemdUnit,
+} from "./types";
 import { performUndo } from "./undo";
 
 describe("chunkText", () => {
@@ -3899,5 +3904,91 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     const n = ackEdits().length;
     jest.advanceTimersByTime(10000);
     expect(ackEdits().length).toBe(n);
+  });
+
+  test("#28: /restart asks systemd for the env-configured unit, not hardcoded pi.service", async () => {
+    const got: string[] = [];
+    setSystemdRestartHookForTest((u) => {
+      got.push(u);
+    });
+    process.env.PI_SERVICE = "banky-pi.service";
+    try {
+      await handleInbound(pi, inbound("/restart", "m1"), ctx);
+      await tick();
+      await waitOpShutdown();
+    } finally {
+      delete process.env.PI_SERVICE;
+    }
+    expect(got[0]).toBe("banky-pi.service");
+  });
+
+  test("#28: /restart asks systemd for the settings-configured unit (systemdUnit)", async () => {
+    // beforeEach wrote tmp/.pi/settings.json with only channels — add the unit
+    const s = path.join(tmp, ".pi", "settings.json");
+    const cfg = JSON.parse(fs.readFileSync(s, "utf-8"));
+    cfg.systemdUnit = "banky-pi.service";
+    fs.writeFileSync(s, JSON.stringify(cfg));
+    const got: string[] = [];
+    setSystemdRestartHookForTest((u) => {
+      got.push(u);
+    });
+    await handleInbound(pi, inbound("/restart", "m1"), ctx);
+    await tick();
+    await waitOpShutdown();
+    expect(got[0]).toBe("banky-pi.service");
+  });
+});
+
+describe("#28: systemd unit resolution (restart command)", () => {
+  test("buildRestartCommand embeds the resolved unit, not a hardcoded one", () => {
+    expect(buildRestartCommand("pi.service")).toBe(
+      "sleep 3; systemctl --user restart pi.service",
+    );
+    expect(buildRestartCommand("banky-pi.service")).toBe(
+      "sleep 3; systemctl --user restart banky-pi.service",
+    );
+  });
+
+  test("resolveSystemdUnit defaults to pi.service", () => {
+    const old = process.env.PI_SERVICE;
+    delete process.env.PI_SERVICE;
+    try {
+      expect(resolveSystemdUnit("/nonexistent-cwd-x")).toBe("pi.service");
+    } finally {
+      if (old !== undefined) process.env.PI_SERVICE = old;
+    }
+  });
+
+  test("env PI_SERVICE beats settings.json systemdUnit", () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+    fs.mkdirSync(path.join(tmpdir, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpdir, ".pi", "settings.json"),
+      JSON.stringify({ systemdUnit: "from-settings.service" }),
+    );
+    process.env.PI_SERVICE = "from-env.service";
+    try {
+      expect(resolveSystemdUnit(tmpdir)).toBe("from-env.service");
+    } finally {
+      delete process.env.PI_SERVICE;
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
+  });
+
+  test("settings.json systemdUnit is honoured when env is unset", () => {
+    const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "unit-test-"));
+    fs.mkdirSync(path.join(tmpdir, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpdir, ".pi", "settings.json"),
+      JSON.stringify({ systemdUnit: "from-settings.service" }),
+    );
+    const old = process.env.PI_SERVICE;
+    delete process.env.PI_SERVICE;
+    try {
+      expect(resolveSystemdUnit(tmpdir)).toBe("from-settings.service");
+    } finally {
+      if (old !== undefined) process.env.PI_SERVICE = old;
+      fs.rmSync(tmpdir, { recursive: true, force: true });
+    }
   });
 });
