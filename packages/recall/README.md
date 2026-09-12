@@ -9,7 +9,7 @@ no data migration.** The old `uv run ingest.py / query.py` workflow is dead.
 
 - Schema: `schema.sql` (dim 768, nomic-embed-text) — the data contract, kept
   exactly.
-- Embeddings: Ollama on neon — `http://10.9.8.7:11434/v1/embeddings`
+- Embeddings: Ollama on neon — `http://localhost:11434/v1/embeddings`
 - DB: Postgres 16 on hydrogen, db `rag`, roles `monky` / `frank` (scram,
   127.0.0.1)
 
@@ -30,7 +30,7 @@ RAG_PROJECT=memory bun recall query "optional project filter"
 | var | default |
 |---|---|
 | `RAG_DSN` | `host=127.0.0.1 dbname=rag user=monky` (key=value or postgres:// URL) |
-| `RAG_EMBED_URL` | `http://10.9.8.7:11434/v1/embeddings` |
+| `RAG_EMBED_URL` | `http://localhost:11434/v1/embeddings` |
 | `RAG_EMBED_MODEL` | `nomic-embed-text` |
 | `RAG_PROJECT` | *(unset = search all projects)* |
 

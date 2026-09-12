@@ -145,7 +145,7 @@ $$;
 
 vLLM serves one model per instance — the running hydrogen server has
 qwen3.8-27b only, no embed model (verified by Frankie). A 274M-param embed
-deploy is CPU-friendly, so: **Ollama on <host-b>** (AMD box, 10.9.8.7) —
+deploy is CPU-friendly: **Ollama** on a box with an AMD/GPU (set RAG_EMBED_URL).
 Andryo's call, over hydrogen. Setup assigned to Frankie 2026-09-05.
 Ingest and
 query hit Ollama for embeddings, vLLM on hydrogen stays chat-only.

@@ -1,5 +1,5 @@
 -- pgrag schema v2 (per PLAN.md)
--- dim 768 = nomic-embed-text on neon (Ollama, http://10.9.8.7:11434)
+-- dim 768 = nomic-embed-text via Ollama (set RAG_EMBED_URL to your embed host)
 
 CREATE EXTENSION IF NOT EXISTS vector;
 

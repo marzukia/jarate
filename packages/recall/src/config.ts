@@ -29,7 +29,7 @@ export interface RecallConfig {
 }
 
 export const DEFAULT_DSN = "host=127.0.0.1 dbname=rag user=monky";
-export const DEFAULT_EMBED_URL = "http://10.9.8.7:11434/v1/embeddings";
+export const DEFAULT_EMBED_URL = "http://localhost:11434/v1/embeddings";
 export const DEFAULT_EMBED_MODEL = "nomic-embed-text";
 
 /** Parse a key=value DSN ("host=... dbname=... user=...") or a postgres:// URL. */

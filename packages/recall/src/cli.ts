@@ -18,7 +18,7 @@ Usage:
 Env:
   RAG_PROJECT     optional filter to one project (query only)
   RAG_DSN         default "host=127.0.0.1 dbname=rag user=monky"
-  RAG_EMBED_URL   default "http://10.9.8.7:11434/v1/embeddings"
+  RAG_EMBED_URL   default "http://localhost:11434/v1/embeddings"
   RAG_EMBED_MODEL default "nomic-embed-text" (must match schema dim 768)`;
 
 export interface IngestArgs {

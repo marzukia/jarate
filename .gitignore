@@ -5,4 +5,7 @@ __pycache__/
 dist/
 *.log
 .env
+.env.*
+!.env.example
+*.local
 .deploy-state

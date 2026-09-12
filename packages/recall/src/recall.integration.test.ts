@@ -1,9 +1,13 @@
 // Integration test: scratch database `recall_test` on the local Postgres.
 //
-// Lifecycle: DROP/CREATE DATABASE (as postgres, via the andryo sudo route -
+// Lifecycle: DROP/CREATE DATABASE (as postgres, via an ssh+sudo route -
 // the agent role has no CREATEDB), CREATE EXTENSION vector (superuser),
 // schema.sql through psql (agent role, unix socket), then real ingest +
 // query calls through the postgres driver.
+//
+// Admin route env (all optional): RECALL_PG_ADMIN_USER, RECALL_PG_ADMIN_PASS,
+// RECALL_PG_ADMIN_HOST (default 127.0.0.1). No committed default password:
+// unset RECALL_PG_ADMIN_PASS skips the suite.
 //
 // Skips cleanly (describe.skip) when Postgres admin or the Ollama embed
 // host is unreachable, so CI-less boxes stay green.
@@ -28,14 +32,18 @@ const PGSOCKET = "/var/run/postgresql";
 const SCHEMA = path.join(import.meta.dir, "..", "schema.sql");
 const TEST_TIMEOUT_MS = 90_000;
 
-/** Run psql as postgres via the box's andryo->sudo route. */
+const PG_ADMIN_USER = process.env.RECALL_PG_ADMIN_USER ?? "root";
+const PG_ADMIN_PASS = process.env.RECALL_PG_ADMIN_PASS ?? "";
+const PG_ADMIN_HOST = process.env.RECALL_PG_ADMIN_HOST ?? "127.0.0.1";
+
+/** Run psql as postgres via ssh user + sudo (see env vars above). */
 function adminPsql(sql: string, db?: string): string {
-  const inner = `echo 'REDACTED' | sudo -S -u postgres psql ${
+  const inner = `echo '${PG_ADMIN_PASS}' | sudo -S -u postgres psql ${
     db ? `-d ${db} ` : ""
   }-c ${JSON.stringify(sql)}`;
   return execFileSync(
     "sshpass",
-    ["-p", "REDACTED", "ssh", "andryo@127.0.0.1", inner],
+    ["-p", PG_ADMIN_PASS, "ssh", `${PG_ADMIN_USER}@${PG_ADMIN_HOST}`, inner],
     {
       encoding: "utf-8",
       timeout: 30_000,
@@ -45,6 +53,7 @@ function adminPsql(sql: string, db?: string): string {
 }
 
 function adminReachable(): boolean {
+  if (!PG_ADMIN_PASS) return false;
   try {
     adminPsql("select 1");
     return true;

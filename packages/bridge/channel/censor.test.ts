@@ -119,9 +119,7 @@ describe("pattern classes", () => {
     const out = censor("sshpass -p hunter2 ssh andryo@10.9.8.7 ls", {
       file: R,
     });
-    expect(out).toBe(
-      "sshpass -p [REDACTED:sshpass] ssh andryo@10.9.8.7 ls",
-    );
+    expect(out).toBe("sshpass -p [REDACTED:sshpass] ssh andryo@10.9.8.7 ls");
   });
 
   test("key-adjacent values in code blocks", () => {
@@ -156,9 +154,9 @@ describe("pattern classes", () => {
 
 describe("registry", () => {
   test("exact literal from secrets.txt, longest-first", () => {
-    reg(["REDACTED", "REDACTED-extended-sudo"]);
+    reg(["testpass", "testpass-extended-sudo"]);
     const out = censor(
-      "run sudo -S with REDACTED-extended-sudo, or just REDACTED",
+      "run sudo -S with testpass-extended-sudo, or just testpass",
       { file: registryFile },
     );
     expect(out).toBe(
@@ -184,14 +182,14 @@ describe("registry", () => {
 
   test("missing file = patterns only, never an error", () => {
     expect(() =>
-      censor("REDACTED and ghp_aBc123D456eF78901234567890123456", {
+      censor("testpass and ghp_aBc123D456eF78901234567890123456", {
         file: R,
       }),
     ).not.toThrow();
-    const out = censor("REDACTED and ghp_aBc123D456eF78901234567890123456", {
+    const out = censor("testpass and ghp_aBc123D456eF78901234567890123456", {
       file: R,
     });
-    expect(out).toContain("REDACTED"); // no registry → literal survives
+    expect(out).toContain("testpass"); // no registry → literal survives
     expect(out).toContain("[REDACTED:github]"); // patterns still fire
   });
 
@@ -249,7 +247,7 @@ describe("behavior", () => {
   });
 
   test("raw value never appears in output", () => {
-    const secret = "REDACTED";
+    const secret = "testpass";
     reg([secret]);
     const out = censor(`echo ${secret}`, { file: registryFile });
     expect(out).not.toContain(secret);
@@ -258,25 +256,25 @@ describe("behavior", () => {
 
   test("registry match logs WARN with fingerprint, not the raw value", () => {
     const lines: string[] = [];
-    reg(["REDACTEDpassword"]);
-    censor("echo REDACTEDpassword", {
+    reg(["testpassphrase"]);
+    censor("echo testpassphrase", {
       file: registryFile,
       log: (l) => lines.push(l),
     });
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("secret#1");
-    expect(lines[0]).toContain("phis"); // first 4
-    expect(lines[0]).toContain("word"); // last 4
-    expect(lines[0]).not.toContain("REDACTEDpassword"); // no raw value
+    expect(lines[0]).toContain("test"); // first 4
+    expect(lines[0]).toContain("rase"); // last 4
+    expect(lines[0]).not.toContain("testpassphrase"); // no raw value
   });
 
   test("short registry secret fingerprint is length only (no leak)", () => {
     const lines: string[] = [];
-    reg(["REDACTED"]); // 8 chars: first4+last4 would be the whole secret
-    censor("echo REDACTED", { file: registryFile, log: (l) => lines.push(l) });
+    reg(["testpass"]); // 8 chars: first4+last4 would be the whole secret
+    censor("echo testpass", { file: registryFile, log: (l) => lines.push(l) });
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("8ch");
-    expect(lines[0]).not.toContain("REDACTED");
+    expect(lines[0]).not.toContain("testpass");
   });
 
   test("pattern match logs WARN with class only", () => {
