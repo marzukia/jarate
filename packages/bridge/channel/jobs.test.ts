@@ -9,6 +9,7 @@ import {
   type JobHistoryEntry,
   parseJobsFromPs,
   scanJobHistory,
+  ticketIdFromPid,
 } from "./jobs";
 
 const REPO = path.resolve(import.meta.dir, "../../..");
@@ -40,19 +41,21 @@ function run(
 // ─── parseJobsFromPs (moved from index.test.ts) ──────────────────────────
 
 describe("parseJobsFromPs (/jobs)", () => {
-  test("parses wrapper lines: age, profile, task", () => {
+  test("parses wrapper lines: pid, age, profile, task; dead pid => id null", () => {
     const ps = [
-      "00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
-      "01:05:03 /usr/bin/bash /home/monky/scripts/pi-bg reviewer Check PR #15 for regressions",
+      "4194001 00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
+      "4194002 01:05:03 /usr/bin/bash /home/monky/scripts/pi-bg reviewer Check PR #15 for regressions",
       "",
     ].join("\n");
     expect(parseJobsFromPs(ps)).toEqual([
       {
+        id: null,
         age: "00:42",
         profile: "worker",
         task: "Resume the jarate migration stuff",
       },
       {
+        id: null,
         age: "01:05:03",
         profile: "reviewer",
         task: "Check PR #15 for regressions",
@@ -62,8 +65,8 @@ describe("parseJobsFromPs (/jobs)", () => {
 
   test("ignores non-wrapper lines (pi child mentioning the script path)", () => {
     const ps = [
-      "00:10 pi -p --no-extensions the task mentions ~/scripts/pi-bg inside its text",
-      "00:01 /usr/bin/bash -c ls scripts",
+      "4194010 pi -p --no-extensions the task mentions ~/scripts/pi-bg inside its text",
+      "4194011 /usr/bin/bash -c ls scripts",
       "",
     ].join("\n");
     expect(parseJobsFromPs(ps)).toEqual([]);
@@ -71,6 +74,49 @@ describe("parseJobsFromPs (/jobs)", () => {
 
   test("empty input is empty", () => {
     expect(parseJobsFromPs("")).toEqual([]);
+  });
+});
+
+// ─── ticketIdFromPid (cgroup escape path -> run_id) ──────────────────────
+
+describe("ticketIdFromPid", () => {
+  let procRoot: string;
+  beforeEach(() => {
+    procRoot = fs.mkdtempSync(path.join(os.tmpdir(), "proc-fake-"));
+  });
+  afterEach(() => {
+    fs.rmSync(procRoot, { recursive: true, force: true });
+  });
+  const fakeCgroup = (pid: number, content: string): void => {
+    const d = path.join(procRoot, String(pid));
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "cgroup"), content);
+  };
+
+  test("cgroup v2 escape path resolves the ticket id", () => {
+    fakeCgroup(
+      4242,
+      "0::/user.slice/user-1000.slice/user@1000.service/pi-bg/20260910-120000-7\n",
+    );
+    expect(ticketIdFromPid(4242, procRoot)).toBe("20260910-120000-7");
+  });
+
+  test("cgroup v1 line shape resolves the ticket id", () => {
+    fakeCgroup(
+      4242,
+      "12:memory:/user.slice/user-1000.slice/user@1000.service/pi-bg/20260910-120000-8\n",
+    );
+    expect(ticketIdFromPid(4242, procRoot)).toBe("20260910-120000-8");
+  });
+
+  test("non-escape cgroup -> null (run in caller cgroup, no escape)", () => {
+    fakeCgroup(4242, "0::/user.slice/user-1000.slice/user@1000.service\n");
+    expect(ticketIdFromPid(4242, procRoot)).toBeNull();
+  });
+
+  test("missing /proc/<pid>/cgroup -> null, no throw", () => {
+    expect(ticketIdFromPid(99999999, procRoot)).toBeNull();
+    expect(ticketIdFromPid(99999999, path.join(procRoot, "nope"))).toBeNull();
   });
 });
 
@@ -181,7 +227,13 @@ describe("scanJobHistory", () => {
 
 describe("formatJobsView", () => {
   const inflight: InflightJob[] = [
-    { profile: "worker", age: "00:42", task: "bulk refactor" },
+    {
+      id: "20260910-120000-7",
+      profile: "worker",
+      age: "00:42",
+      task: "bulk refactor",
+    },
+    { id: null, profile: "reviewer", age: "01:00", task: "no cgroup id" },
   ];
   const history: JobHistoryEntry[] = [
     {
@@ -206,8 +258,9 @@ describe("formatJobsView", () => {
 
   test("text: in-flight lines + recent history with ages", () => {
     const out = formatJobsView(inflight, history, "text", 1_790_000_000);
-    expect(out).toContain("[jobs] 1 job in flight:");
-    expect(out).toContain("- worker · 00:42 · bulk refactor");
+    expect(out).toContain("[jobs] 2 jobs in flight:");
+    expect(out).toContain("- 20260910-120000-7 worker · 00:42 · bulk refactor");
+    expect(out).toContain("- reviewer · 01:00 · no cgroup id (id: none)");
     expect(out).toContain("recent (newest first):");
     expect(out).toContain(
       "- 20260910-103000-4 lost · 0s ago".replace("0s", "0s"),
@@ -259,7 +312,7 @@ describe("pi-bg-tail", () => {
     );
     fs.writeFileSync(
       path.join(tmp, `pi-bg-${tid}-raw.out`),
-      lines.join("\n") + "\n",
+      `${lines.join("\n")}\n`,
     );
   });
   afterEach(() => {
@@ -402,6 +455,19 @@ describe("pi-bg-kill", () => {
     expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-body.json`))).toBe(
       false,
     );
+  });
+
+  test("cgroup dir is reaped after it drains (no leaked empty dirs)", () => {
+    // empty fake cgroup dir: no member files at all, so the drain check
+    // passes immediately and the post-drain rmdir can actually succeed
+    // (a real drained cgroup v2 dir is empty too)
+    fs.rmSync(path.join(cg, "cgroup.procs"), { force: true });
+    fs.rmSync(path.join(cg, "cgroup.kill"), { force: true });
+    const r = run(KILL, [tid], env());
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`killed ${tid}`);
+    expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-killed`))).toBe(true);
+    expect(fs.existsSync(cg)).toBe(false); // dir reaped
   });
 
   test("unknown ticket (no cgroup dir) -> exit 2 + clear error", () => {

@@ -15,7 +15,7 @@
 #          cgroup-escape-unavailable fallback). A cmdline grep for the ticket
 #          id is deliberately NOT used: a live pi-bg whose TASK TEXT happens
 #          to mention the id would mask a dead ticket (false negative).
-#   3. skip tickets that completed normally: /tmp/pi-bg-<ticket>-out.md
+#   3. skip tickets that completed normally: $PI_BG_TMPDIR/pi-bg-<ticket>-out.md
 #      exists and is non-empty (normal exit keeps the worktree BY DESIGN so
 #      the orchestrator can diff it; the callback was already posted)
 #   4. if the dir mtime is older than 20 min and the ticket is not already
@@ -33,6 +33,7 @@
 set -uo pipefail
 
 WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
+BG_TMP="${PI_BG_TMPDIR:-/tmp}"
 DEADLOG="${HOME}/.pi-bg-deadlog"
 AGE_MIN=20
 QUIET=0
@@ -80,7 +81,7 @@ wd_post() {
   local body="$1" code i
   [ -n "$webhook" ] || return 1
   for i in 1 2 3; do
-    code="$(curl -s -o /tmp/pi-bg-watchdog-wb-resp.txt -w '%{http_code}' -X POST "$webhook" \
+    code="$(curl -s -o "$BG_TMP/pi-bg-watchdog-wb-resp.txt" -w '%{http_code}' -X POST "$webhook" \
       -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
     case "$code" in 2*) return 0 ;; esac
     [ "$i" -lt 3 ] && sleep $((i * 3))
@@ -124,7 +125,7 @@ for d in "$WT_DIR"/*/*/; do
   if is_live "$t" "$d"; then continue; fi
   # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
   #    killed on purpose (pi-bg-kill marker) -> not a lost callback
-  if [ -s "/tmp/pi-bg-${t}-out.md" ] || [ -f "/tmp/pi-bg-${t}-killed" ]; then continue; fi
+  if [ -s "$BG_TMP/pi-bg-${t}-out.md" ] || [ -f "$BG_TMP/pi-bg-${t}-killed" ]; then continue; fi
   # 3) recent activity -> give it time
   mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
   [ $(( $(date +%s) - mtime )) -gt $((AGE_MIN * 60)) ] || continue
@@ -133,7 +134,7 @@ for d in "$WT_DIR"/*/*/; do
 
   found=$((found + 1))
   last="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)"
-  if [ -f "/tmp/pi-bg-${t}-webhook-failed" ]; then
+  if [ -f "$BG_TMP/pi-bg-${t}-webhook-failed" ]; then
     reason="webhook dead letter exists (callback attempted, post failed)"
   else
     reason="no callback on record (SIGKILL/OOM suspected)"
@@ -143,7 +144,7 @@ for d in "$WT_DIR"/*/*/; do
   if [ "$DRY" -eq 1 ]; then continue; fi
 
   if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
-    bodyf="/tmp/pi-bg-watchdog-${t}-body.json"
+    bodyf="$BG_TMP/pi-bg-watchdog-${t}-body.json"
     wd_build "$bodyf" "$t" "$repo" "$d" "$last" "$reason"
     if [ -s "$bodyf" ]; then
       wd_post "$bodyf" || echo "[pi-bg-watchdog] DEAD post failed for $t (dead log still updated)" >&2

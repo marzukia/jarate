@@ -172,6 +172,80 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
   });
 });
 
+describe("cgroup escape: self-drain + rmdir on exit; PI_BG_TMPDIR plumbing", () => {
+  test("wrapper escapes into the test cgroup, drains itself, reaps the dir, writes artifacts to PI_BG_TMPDIR", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const cgParent = path.join(fx.tmp, "cg", "user@1.service");
+    fs.mkdirSync(cgParent, { recursive: true });
+    fs.writeFileSync(path.join(cgParent, "cgroup.procs"), "");
+    const tmpdir = path.join(fx.tmp, "artifacts");
+    fx.env.PI_BG_CG_ROOT = cgParent;
+    fx.env.PI_BG_TMPDIR = tmpdir;
+
+    // pi sleeps so the escape cgroup can be inspected mid-run (write before
+    // spawn: pi-bg launches it a couple of ms in)
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(piBin, "#!/bin/sh\nsleep 3\necho pi-run-ok\n");
+    const p = spawn(["bash", PI_BG, "worker", "cgroup drain task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let sawEscapePid = false;
+    let runId = "";
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000) {
+      await Bun.sleep(100);
+      const escDir = path.join(cgParent, "pi-bg");
+      if (!fs.existsSync(escDir)) continue;
+      const ids = fs.readdirSync(escDir);
+      for (const id of ids) {
+        const f = path.join(escDir, id, "cgroup.procs");
+        if (
+          fs.existsSync(f) &&
+          fs.readFileSync(f, "utf8").trim() === String(p.pid)
+        ) {
+          runId = id;
+          sawEscapePid = true;
+          break;
+        }
+      }
+      if (sawEscapePid) break;
+    }
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    if (code !== 0) {
+      throw new Error(`pi-bg exited ${code}\nOUT: ${out}\nERR: ${err}`);
+    }
+    expect(code).toBe(0);
+    expect(out).toContain("cgroup escape active");
+
+    // the wrapper's pid was moved into the escape cgroup at dispatch
+    expect(sawEscapePid).toBe(true);
+
+    // on exit the wrapper moved itself back into the parent cgroup (drain)
+    const parentProcs = fs
+      .readFileSync(path.join(cgParent, "cgroup.procs"), "utf8")
+      .split("\n");
+    expect(parentProcs.filter((l) => l.trim() === String(p.pid))).toHaveLength(
+      1,
+    );
+
+    // and the (now empty) ticket cgroup dir was reaped - no leak
+    expect(fs.existsSync(path.join(cgParent, "pi-bg", runId))).toBe(false);
+
+    // PI_BG_TMPDIR is honored: per-run artifacts live there (issue #F4)
+    const files = fs.readdirSync(tmpdir);
+    expect(files).toContain(`pi-bg-${runId}-out.md`);
+    expect(files).toContain(`pi-bg-${runId}-raw.out`);
+  }, 30_000);
+});
+
 describe("#30: no webhook => loud warning at dispatch + run record delivery=none", () => {
   test("missing webhook: stderr warning + record marked delivery=none", async () => {
     const fx = fixture();

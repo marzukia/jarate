@@ -20,7 +20,7 @@
  * is included in the LLM message as a folder reference.
  */
 
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {

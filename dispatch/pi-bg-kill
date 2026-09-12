@@ -18,6 +18,7 @@
 set -uo pipefail
 
 BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+mkdir -p "$BG_TMP" 2>/dev/null
 CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
 
@@ -118,6 +119,12 @@ if [ "$gone" -eq 0 ]; then
   for p in $pids0; do kill -KILL "$p" 2>/dev/null; done
 fi
 dur=$(( $(date +%s) - t0 ))
+
+# cgroup has drained (every member dead) -> remove the dir. While any member
+# is alive rmdir fails, and SIGKILLed wrappers can't clean up themselves,
+# so this is where the empty pi-bg/<ticket> dirs get reaped (348 leaked,
+# 2026-09-11). Guarded: never break the kill path over a stubborn dir.
+[ -d "$CG" ] && rmdir "$CG" 2>/dev/null
 
 printf '%s killed %s by %s after %ss; pids: %s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(id -un)" "$dur" "$pids0" \

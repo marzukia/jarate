@@ -2,7 +2,10 @@
 //
 // In-flight: the pi-bg wrapper's command line carries profile + task, and the
 // wrapper process exists only while the run is live, so `ps` is the reliable
-// in-flight marker (the prompt/out artifacts are written at run end).
+// in-flight marker (the prompt/out artifacts are written at run end). The
+// ticket id is NOT in the ps line; it is resolved per-pid from
+// /proc/<pid>/cgroup (the escape cgroup path ends in the run_id pi-bg
+// prints as the escape path). Unresolvable pid => id:null, never a crash.
 //
 // History: assembled from the /tmp/pi-bg-<ticket>-* artifacts pi-bg leaves
 // per run — raw.out (run started), out.md (run completed, non-empty),
@@ -13,29 +16,60 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 export interface InflightJob {
+  /** ticket id (run_id) via /proc/<pid>/cgroup, or null when unresolved */
+  id: string | null;
   profile: string;
   age: string;
   task: string;
 }
 
-// Match the wrapper line shape: <etime> <bash> <...>scripts/pi-bg <profile> <task>
-export function parseJobsFromPs(
-  psOut: string,
-): { profile: string; age: string; task: string }[] {
-  const out: { profile: string; age: string; task: string }[] = [];
+// Resolve the pi-bg ticket id for a pid: /proc/<pid>/cgroup carries the
+// cgroup path, which ends in .../pi-bg/<run_id>. procRoot is overridable
+// for tests. Any read/parse failure -> null (caller keeps rendering).
+export function ticketIdFromPid(
+  pid: number,
+  procRoot = "/proc",
+): string | null {
+  try {
+    const raw = fs.readFileSync(
+      path.join(procRoot, String(pid), "cgroup"),
+      "utf8",
+    );
+    for (const line of raw.split("\n")) {
+      // cgroup v2: "0::/path"; v1: "N:controllers:/path"
+      const p = line.includes("::")
+        ? (line.split("::").pop() ?? "")
+        : (line.split(":").pop() ?? "");
+      const m = p.match(/pi-bg\/([0-9]{8}-[0-9]{6}-[0-9]+)(?:\/|$)/);
+      if (m) return m[1];
+    }
+  } catch {
+    // process gone or /proc/<pid>/cgroup unreadable — id stays null
+  }
+  return null;
+}
+
+// Match the wrapper line shape: <pid> <etime> <bash> <...>scripts/pi-bg <profile> <task>
+export function parseJobsFromPs(psOut: string): InflightJob[] {
+  const out: InflightJob[] = [];
   for (const line of psOut.split("\n")) {
     const m = line
       .trim()
       .match(
-        /^(\S+)\s+\S*bash\s+\S*scripts\/pi-bg\s+(worker|reviewer)\s+(.+)$/,
+        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*scripts\/pi-bg\s+(worker|reviewer)\s+(.+)$/,
       );
     if (!m) continue;
-    const task = m[3]
+    const task = m[4]
       .trim()
       .replace(/^"+|"+$/g, "")
       .split("\n")[0]
       .slice(0, 70);
-    out.push({ age: m[1], profile: m[2], task });
+    out.push({
+      id: ticketIdFromPid(Number(m[1])),
+      age: m[2],
+      profile: m[3],
+      task,
+    });
   }
   return out;
 }
@@ -45,7 +79,7 @@ export function collectInflightJobs(): InflightJob[] {
   try {
     const uid = process.getuid?.();
     raw = execSync(
-      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o etime,args | grep '[s]cripts/pi-bg'`,
+      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep '[s]cripts/pi-bg'`,
       { encoding: "utf8", timeout: 5000 },
     );
   } catch {
@@ -173,7 +207,11 @@ export function formatJobsView(
       `[jobs] ${inflight.length} job${inflight.length > 1 ? "s" : ""} in flight:`,
     );
     for (const j of inflight) {
-      lines.push(`- ${j.profile} · ${j.age} · ${j.task}`);
+      lines.push(
+        j.id
+          ? `- ${j.id} ${j.profile} · ${j.age} · ${j.task}`
+          : `- ${j.profile} · ${j.age} · ${j.task} (id: none)`,
+      );
     }
   }
   if (history.length > 0) {

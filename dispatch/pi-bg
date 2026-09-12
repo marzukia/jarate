@@ -20,7 +20,8 @@
 #     callback was posted, an EXIT/TERM/INT trap posts a 'DIED (no report)'
 #     callback so a killed worker still wakes the orchestrator
 #     (SIGKILL cannot be trapped - see DISPATCH.md recommendations)
-#   - dead letter: final post failure writes /tmp/pi-bg-<id>-webhook-failed
+#   - dead letter: final post failure writes $PI_BG_TMPDIR/pi-bg-<id>-webhook-failed
+#     (PI_BG_TMPDIR default /tmp; honored by pi-bg-tail/-kill/-watchdog//jobs)
 # Fresh machine (issue #29): a missing/empty role profile is seeded from the
 #   main agent's ~/.pi/agent/{auth,models}.json + the repo template
 #   dispatch/profiles/<role>.json (settings). Still no provider => exit 4
@@ -43,6 +44,12 @@ JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 # --- per-run switchboard session id (unique ledger entry per dispatch) ---
 run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
 export PI_SESSION_ID="pi-${USER}-${profile}-${run_id}"
+
+# --- per-run artifact dir: PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill,
+#     pi-bg-watchdog and the bridge /jobs history — keep all per-run files in
+#     the same place so every tool finds them. ---
+BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+mkdir -p "$BG_TMP" 2>/dev/null
 
 # --- optional --worktree [ref] (consumed before pi flags) ---
 wt_ref=""
@@ -84,9 +91,14 @@ out=""; rc=1; purl=""; ourl=""
 #     cgroup so an orchestrator restart can't kill an in-flight run.
 #     systemd kills a unit's whole cgroup subtree on stop; a sibling cgroup
 #     under the user slice survives. Fallback: run in place if cgroup v2
-#     delegation is unavailable (mkdir/proc write fails). ---
-ESCAPE_CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/pi-bg/${run_id}"
+#     delegation is unavailable (mkdir/proc write fails).
+#     PI_BG_CG_ROOT overrides the cgroup base (test hook; pi-bg-kill honors
+#     the same var). ---
+CG_PARENT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
+ESCAPE_CG="$CG_PARENT/pi-bg/${run_id}"
+ESCAPE_ACTIVE=0
 if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/dev/null; then
+  ESCAPE_ACTIVE=1
   echo "[pi-bg] cgroup escape active: $ESCAPE_CG"
 else
   rmdir "$ESCAPE_CG" 2>/dev/null
@@ -215,9 +227,9 @@ bg_censor() {
 # --- callback helpers (issue #14): the webhook post is the only wake
 #     mechanism, so never let it fail silently. ---
 BG_CB_DONE=0
-BG_DEAD="/tmp/pi-bg-${run_id}-webhook-failed"
-BG_WB_RESP="/tmp/pi-bg-${run_id}-wb-resp.txt"
-BG_WB_STATUS="/tmp/pi-bg-${run_id}-wb-status"
+BG_DEAD="$BG_TMP/pi-bg-${run_id}-webhook-failed"
+BG_WB_RESP="$BG_TMP/pi-bg-${run_id}-wb-resp.txt"
+BG_WB_STATUS="$BG_TMP/pi-bg-${run_id}-wb-status"
 
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
@@ -296,16 +308,30 @@ PY
 # bg_on_exit: cgroup cleanup + the 'died without report' fallback. If we exit
 # with no out.md and no posted callback, post DIED so the orchestrator wakes.
 # (covers TERM/INT/normal-exit paths; SIGKILL cannot be trapped)
+# cgroup drain: by the time this trap runs, every child is gone — the pi loop
+# uses wait, webdrop/webhook post are synchronous — so the ONLY member left
+# is this shell. Move it back into the parent cgroup (it exits right after),
+# then rmdir: cgroup v2 auto-removes the cgroup files once the last member
+# leaves, so the dir is empty and rmdir succeeds. Without the self-move-out
+# the rmdir always fails (348 leaked empty dirs, 2026-09-11). Guarded: a
+# missing/non-empty dir must never break the exit path. SIGKILLed wrappers
+# can't run this at all — pi-bg-kill reaps the drained cgroup dir itself.
 bg_on_exit() {
   local ec=$?
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
-     [ ! -s "/tmp/pi-bg-${run_id}-out.md" ]; then
+     [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
-    bg_build "/tmp/pi-bg-${run_id}-body.json" "DIED" \
+    bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
       "no output captured - pi-bg exited before completion (exit=$ec)" "$ec" ""
-    bg_post "/tmp/pi-bg-${run_id}-body.json" || true
+    bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
   fi
-  rmdir "$ESCAPE_CG" 2>/dev/null
+  if [ "$ESCAPE_ACTIVE" -eq 1 ]; then
+    echo $$ > "$CG_PARENT/cgroup.procs" 2>/dev/null || true
+    # real cgroup v2 auto-removes its files when the last member leaves;
+    # on a plain test root the fake file must be removed for rmdir to work
+    rm -f "$ESCAPE_CG/cgroup.procs" 2>/dev/null || true
+    rmdir "$ESCAPE_CG" 2>/dev/null || true
+  fi
 }
 trap bg_on_exit EXIT
 trap 'exit 130' INT
@@ -315,8 +341,8 @@ trap 'exit 143' TERM
 # pi runs in background + wait so a trapped TERM/INT fires immediately
 # (a trapped signal during a foreground command is deferred until it returns)
 pi_pid=""
-rawf="/tmp/pi-bg-${run_id}-raw.out"
-errf="/tmp/pi-bg-${run_id}-err.log"
+rawf="$BG_TMP/pi-bg-${run_id}-raw.out"
+errf="$BG_TMP/pi-bg-${run_id}-err.log"
 # standard constraints: append to the final (task) argument of every run
 pi_args=( "$@" )
 pi_args[-1]+=$'\n\nSTANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Bound long commands with `timeout` (default 600s) unless the task says otherwise.'
@@ -336,8 +362,8 @@ done
 
 # --- webdrop: full prompt + full output behind a link (channel gets a brief) ---
 # pf/of are always written: the exit trap uses out.md to detect a silent death
-pf="/tmp/pi-bg-${run_id}-prompt.md"
-of="/tmp/pi-bg-${run_id}-out.md"
+pf="$BG_TMP/pi-bg-${run_id}-prompt.md"
+of="$BG_TMP/pi-bg-${run_id}-out.md"
 { printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$pf"
 printf '%s\n' "$out" > "$of"
 if command -v webdrop >/dev/null 2>&1; then
@@ -355,12 +381,12 @@ if [ -n "$webhook" ]; then
   fi
   # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
   verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
-  bg_build /tmp/pi-bg-${run_id}-body.json "$status" "${out:0:400}" "$rc" "$verdict"
-  if [ -s /tmp/pi-bg-${run_id}-body.json ]; then
-    bg_post /tmp/pi-bg-${run_id}-body.json
+  bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "$status" "${out:0:400}" "$rc" "$verdict"
+  if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
+    bg_post "$BG_TMP/pi-bg-${run_id}-body.json"
   else
     # fallback: legacy plain text if the embed builder failed
-    bodyf="/tmp/pi-bg-${run_id}-body-plain.json"
+    bodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
     body="[bg:${profile}:${status}] cwd=$(pwd) task=${task:0:120}\n\n${out:0:400}"
     body="$(bg_censor "$body")"
     python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body" > "$bodyf"
