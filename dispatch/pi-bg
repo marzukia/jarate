@@ -139,11 +139,28 @@ PY
   return 1
 }
 
+# true when the file is missing, or parses as an empty object/list.
+# A present-but-EMPTY file ({}, which is 2 bytes so [ -s ] passes) is
+# still seedable: a profile with BOTH auth.json={} and models.json={}
+# must not block seeding from the main agent's valid creds.
+empty_json() {
+  local f="$1"
+  [ -e "$f" ] || return 0
+  python3 - "$f" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)  # unparseable = treat as user's content, do not clobber
+sys.exit(0 if isinstance(d, (dict, list)) and not d else 1)
+PY
+}
+
 if ! profile_seeded "$PI_CODING_AGENT_DIR"; then
   main_agent="${HOME}/.pi/agent"
   mkdir -p "$PI_CODING_AGENT_DIR" 2>/dev/null
   for f in auth.json models.json; do
-    if [ -s "$main_agent/$f" ] && [ ! -e "$PI_CODING_AGENT_DIR/$f" ]; then
+    if [ -s "$main_agent/$f" ] && empty_json "$PI_CODING_AGENT_DIR/$f"; then
       cp -L "$main_agent/$f" "$PI_CODING_AGENT_DIR/$f" 2>/dev/null || true
     fi
   done

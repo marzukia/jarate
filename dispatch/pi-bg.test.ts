@@ -125,6 +125,51 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
     expect(r.err).toContain("auth.json");
     expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
   });
+
+  test("both auth.json={} and models.json={} present: seeded from main agent, run succeeds", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const prof = path.join(fx.home, ".pi", "agent-worker");
+    fs.mkdirSync(prof, { recursive: true });
+    fs.writeFileSync(path.join(prof, "auth.json"), "{}");
+    fs.writeFileSync(path.join(prof, "models.json"), "{}");
+    const r = await fx.run(["worker", "test task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    const auth = JSON.parse(
+      fs.readFileSync(path.join(prof, "auth.json"), "utf-8"),
+    );
+    expect(auth.hydrogen.key).toBe("sk-test"); // main creds landed
+    const models = JSON.parse(
+      fs.readFileSync(path.join(prof, "models.json"), "utf-8"),
+    );
+    expect(models.hydrogen.models[0].id).toBe("qwen-test"); // main models landed
+  });
+
+  test("seeding is idempotent: a customized profile survives a second seed", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const prof = path.join(fx.home, ".pi", "agent-worker");
+    // first dispatch: seeds the profile
+    const r1 = await fx.run(["worker", "first task"]);
+    expect(r1.code).toBe(0);
+    // operator customizes between runs
+    const authPath = path.join(prof, "auth.json");
+    const auth = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+    auth.custom = { type: "api_key", key: "sk-custom" };
+    fs.writeFileSync(authPath, JSON.stringify(auth));
+    const settingsPath = path.join(prof, "settings.json");
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    settings.defaultModel = "custom-model";
+    fs.writeFileSync(settingsPath, JSON.stringify(settings));
+    // second dispatch: profile already seeded -> nothing re-copied
+    const r2 = await fx.run(["worker", "second task"]);
+    expect(r2.code).toBe(0);
+    const auth2 = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+    expect(auth2.custom.key).toBe("sk-custom"); // customization survives
+    const settings2 = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    expect(settings2.defaultModel).toBe("custom-model"); // customization survives
+  });
 });
 
 describe("#30: no webhook => loud warning at dispatch + run record delivery=none", () => {

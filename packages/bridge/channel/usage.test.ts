@@ -17,7 +17,7 @@ const asst = (id: string, usage: Record<string, number> | undefined): string =>
   JSON.stringify({
     type: "message",
     id,
-    parentId: "p-" + id,
+    parentId: `p-${id}`,
     timestamp: "2026-09-10T08:00:00.000Z",
     message: { role: "assistant", content: [], usage },
   });
@@ -26,7 +26,7 @@ const user = (id: string): string =>
   JSON.stringify({
     type: "message",
     id,
-    parentId: "u-" + id,
+    parentId: `u-${id}`,
     timestamp: "2026-09-10T08:00:00.000Z",
     message: { role: "user", content: [] },
   });

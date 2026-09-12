@@ -61,7 +61,7 @@ function commit(dir: string, msg: string): string {
 
 function makeSession(dir: string, lines: object[]): string {
   const file = path.join(dir, "session.jsonl");
-  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  fs.writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
   return file;
 }
 
@@ -331,17 +331,16 @@ describe("session truncation", () => {
   test("no assistant on the path -> nothing to truncate", () => {
     const file = makeSession(tmp, [header, triggerA, triggerB]);
     // triggerB.parentId dangles (triggerA's id) — keep it valid:
-    const fixed =
-      fs
-        .readFileSync(file, "utf8")
-        .trim()
-        .split("\n")
-        .map((l, i) => {
-          const e = JSON.parse(l);
-          if (e.id === "tB") e.parentId = "tA";
-          return JSON.stringify(e);
-        })
-        .join("\n") + "\n";
+    const fixed = `${fs
+      .readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((l, _i) => {
+        const e = JSON.parse(l);
+        if (e.id === "tB") e.parentId = "tA";
+        return JSON.stringify(e);
+      })
+      .join("\n")}\n`;
     fs.writeFileSync(file, fixed);
     expect(truncateSession(file)).toBeNull();
     expect(fs.readFileSync(file, "utf8")).toBe(fixed);
@@ -723,7 +722,7 @@ describe("performUndo + performRedo end to end", () => {
       ".pi",
       "agent",
       "sessions",
-      "-" + cwd.replace(/\//g, "-") + "-",
+      `-${cwd.replace(/\//g, "-")}-`,
     );
     fs.mkdirSync(encDir, { recursive: true });
     const f1 = path.join(encDir, "a.jsonl");
@@ -800,7 +799,7 @@ describe("cap and exclusion hardening (F7/F10)", () => {
     const sess = path.join(cwd, "sess.jsonl"); // untracked, inside the repo
     fs.writeFileSync(
       sess,
-      [header, tA, aA, tB].map((l) => JSON.stringify(l)).join("\n") + "\n",
+      `${[header, tA, aA, tB].map((l) => JSON.stringify(l)).join("\n")}\n`,
     );
 
     const run = startRun(cwd)!; // pre-snapshot captures sess.jsonl (4 lines, incl. tB)
