@@ -30,7 +30,6 @@ import extension, {
   matchCommand,
   midTurnQueues,
   opWindowLabel,
-  parseJobsFromPs,
   parseReplyTo,
   pendingAttachments,
   pendingInterrupts,
@@ -183,41 +182,6 @@ describe("collectFinals", () => {
   test("no tag: existing behavior unchanged, text untouched", () => {
     const finals = collectFinals([inbound("A"), assistantText("  spaced  ")]);
     expect(finals).toEqual([{ text: "spaced", replyTo: "A" }]);
-  });
-});
-
-describe("parseJobsFromPs (/jobs)", () => {
-  test("parses wrapper lines: age, profile, task", () => {
-    const ps = [
-      "00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
-      "01:05:03 /usr/bin/bash /home/monky/scripts/pi-bg reviewer Check PR #15 for regressions",
-      "",
-    ].join("\n");
-    expect(parseJobsFromPs(ps)).toEqual([
-      {
-        age: "00:42",
-        profile: "worker",
-        task: "Resume the jarate migration stuff",
-      },
-      {
-        age: "01:05:03",
-        profile: "reviewer",
-        task: "Check PR #15 for regressions",
-      },
-    ]);
-  });
-
-  test("ignores non-wrapper lines (pi child mentioning the script path)", () => {
-    const ps = [
-      "00:10 pi -p --no-extensions the task mentions ~/scripts/pi-bg inside its text",
-      "00:01 /usr/bin/bash -c ls scripts",
-      "",
-    ].join("\n");
-    expect(parseJobsFromPs(ps)).toEqual([]);
-  });
-
-  test("empty input is empty", () => {
-    expect(parseJobsFromPs("")).toEqual([]);
   });
 });
 

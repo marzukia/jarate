@@ -59,6 +59,7 @@ import {
   unreactMessage,
 } from "./discord";
 import { mdToDiscord } from "./format";
+import { jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { extractQueueSuffix } from "./queue";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
@@ -1160,48 +1161,9 @@ export function matchCommand(
   return { name: m[1] ?? "stop", arg: m[2] };
 }
 
-// ─── /jobs: in-flight pi-bg dispatches ─────────────────────────────────
-// The pi-bg wrapper's command line carries profile + task, and the wrapper
-// process exists only while the run is live, so `ps` is the reliable
-// in-flight marker (the prompt/out artifacts are written at run end).
-// Match the wrapper line shape: <etime> <bash> <...>scripts/pi-bg <profile> <task>
-export function parseJobsFromPs(
-  psOut: string,
-): { profile: string; age: string; task: string }[] {
-  const out: { profile: string; age: string; task: string }[] = [];
-  for (const line of psOut.split("\n")) {
-    const m = line
-      .trim()
-      .match(
-        /^(\S+)\s+\S*bash\s+\S*scripts\/pi-bg\s+(worker|reviewer)\s+(.+)$/,
-      );
-    if (!m) continue;
-    const task = m[3]
-      .trim()
-      .replace(/^"+|"+$/g, "")
-      .split("\n")[0]
-      .slice(0, 70);
-    out.push({ age: m[1], profile: m[2], task });
-  }
-  return out;
-}
-
-export function listInflightJobs(): string {
-  let raw = "";
-  try {
-    const uid = process.getuid?.();
-    raw = execSync(
-      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o etime,args | grep '[s]cripts/pi-bg'`,
-      { encoding: "utf8", timeout: 5000 },
-    );
-  } catch {
-    return "[jobs] No jobs in flight.";
-  }
-  const jobs = parseJobsFromPs(raw);
-  if (jobs.length === 0) return "[jobs] No jobs in flight.";
-  const lines = jobs.map((j) => `- ${j.profile} · ${j.age} · ${j.task}`);
-  return `[jobs] ${jobs.length} job${jobs.length > 1 ? "s" : ""} in flight:\n${lines.join("\n")}`;
-}
+// ─── /jobs: in-flight pi-bg dispatches + recent history ─────────────────
+// In-flight via `ps`, history via /tmp/pi-bg-<ticket>-* artifacts.
+// Assembly lives in ./jobs (parseJobsFromPs / scanJobHistory / formatJobsView).
 
 /** ! shell passthrough: run bash -c in the working directory, 60s cap.
  *  Keeps the first 20k chars of combined stdout+stderr. Exported for tests. */
@@ -2165,7 +2127,7 @@ const HELP_TEXT = [
   "`/verbose on|off` — forward tool calls to the channel (owner)",
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
-  "`/jobs` — list in-flight pi-bg dispatches",
+  "`/jobs` — list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
   "`/todos` — show the channel todo board (arg `all` for every channel)",
   "`/sleep [list | cancel <id>]` — list or cancel pending session wakes (owner)",
   "`/help` — this message",
@@ -2999,7 +2961,8 @@ async function runChannelCommand(
     }
     case "jobs": {
       // Informational, open to all channel members (private channel).
-      return { immediate: listInflightJobs() };
+      const sub = (arg || "").trim().toLowerCase();
+      return { immediate: jobsView(sub === "json" ? "json" : "text") };
     }
     case "sleep": {
       if (!isOwner) return ownerOnly;

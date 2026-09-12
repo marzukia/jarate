@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# pi-bg-tail — read a pi-bg worker's live output without opening files (issue #16)
+#
+# pi-bg tees every run's live output to /tmp/pi-bg-<id>-raw.out, so an
+# in-flight run can be watched at any point (removes the blind spot where
+# only the webhook summary survived).
+# usage: pi-bg-tail <ticket-id> [lines] [-f]
+#   lines  how many lines to show (default 40)
+#   -f     follow (tail -f)
+# ticket ids are pi-bg run_ids: YYYYMMDD-HHMMSS-NNNNN
+# exits: 0 = ok, 2 = bad usage / unknown ticket
+set -uo pipefail
+
+BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+id="" lines=40 follow=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f) follow=1; shift ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown arg: $1 (want <ticket-id> [lines] [-f])" >&2; exit 2 ;;
+    *)
+      if [ -z "$id" ]; then
+        id="$1"
+      elif [ "$lines" = 40 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+        lines="$1"
+      else
+        echo "unknown arg: $1 (want <ticket-id> [lines] [-f])" >&2; exit 2
+      fi
+      shift
+      ;;
+  esac
+done
+[ -n "$id" ] || { echo "usage: pi-bg-tail <ticket-id> [lines] [-f]" >&2; exit 2; }
+if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+  echo "pi-bg-tail: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
+  exit 2
+fi
+
+rawf="$BG_TMP/pi-bg-${id}-raw.out"
+if [ ! -f "$rawf" ]; then
+  echo "pi-bg-tail: no live output for ticket '$id' ($rawf missing) — unknown ticket, or the run never started" >&2
+  exit 2
+fi
+
+if [ "$follow" -eq 1 ]; then
+  exec tail -n "$lines" -f "$rawf"
+fi
+tail -n "$lines" "$rawf"

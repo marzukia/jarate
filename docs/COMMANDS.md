@@ -54,7 +54,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | *delete a queued message* | owner | the queued entry (and its interrupt) is dropped |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
-| `/jobs` | anyone | list in-flight `pi-bg` dispatches (profile, age, task) |
+| `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
 | `/status` | owner | context-window usage, model, uptime |
 | `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
@@ -234,17 +234,27 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 ### /jobs
 
 ```
-/jobs
+/jobs           # text: in-flight + last 5 completed
+/jobs json      # machine-readable: {inflight, history(10)}
 ```
 
-Lists in-flight `pi-bg` dispatches by reading the process table (the `pi-bg`
-wrapper process exists only while a run is live):
+In-flight via the process table (the `pi-bg` wrapper process exists only
+while a run is live); recent history from the `/tmp/pi-bg-<ticket>-*`
+artifacts each run leaves (state: `done` / `webhook-failed` / `killed` /
+`lost`, plus the success-path webhook HTTP code when recorded):
 
 ```
-[jobs] 2 jobs in flight:
+[jobs] 1 job in flight:
 - worker · 04:12 · bulk refactor of channel/
-- reviewer · 01:30 · adversarial review of PR #12
+
+recent (newest first):
+- 20260910-135501-48211 done · webhook 200 · 12m ago
+- 20260910-131200-77319 webhook-failed · webhook 502 · 54m ago
 ```
+
+Companion bins (installed like `pi-bg`): `pi-bg-tail <id> [lines] [-f]`
+reads a run's live output; `pi-bg-kill <id> [--dry-run]` cancels a run via
+its cgroup and posts a `KILLED` webhook event.
 
 ### ! shell passthrough
 

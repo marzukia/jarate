@@ -217,8 +217,11 @@ bg_censor() {
 BG_CB_DONE=0
 BG_DEAD="/tmp/pi-bg-${run_id}-webhook-failed"
 BG_WB_RESP="/tmp/pi-bg-${run_id}-wb-resp.txt"
+BG_WB_STATUS="/tmp/pi-bg-${run_id}-wb-status"
 
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
+# success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
+#   issue #14) and $BG_WB_RESP kept as the last response body.
 # final failure: dead-letter file + stderr note, return 1.
 bg_post() {
   local body="$1" code i
@@ -226,8 +229,12 @@ bg_post() {
   for i in 1 2 3; do
     code="$(curl -s -o "$BG_WB_RESP" -w '%{http_code}' -X POST "$webhook" \
       -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
-    case "$code" in 2*) BG_CB_DONE=1; rm -f "$BG_DEAD" "$BG_WB_RESP"; return 0 ;; esac
-    [ "$i" -lt 3 ] && sleep $((i * 3))
+    case "$code" in
+      2*) BG_CB_DONE=1; rm -f "$BG_DEAD"
+          printf '%s %s\n' "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_WB_STATUS"
+          return 0 ;;
+    esac
+    [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
   done
   { printf 'ticket   : %s\n' "$run_id"
     printf 'http     : %s (3 attempts)\n' "$code"

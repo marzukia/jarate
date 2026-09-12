@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# pi-bg-kill — cancel an in-flight pi-bg worker via its cgroup (issue #15)
+#
+# pi-bg moves each run into its own cgroup at dispatch (the escape path is
+# printed on stdout): /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.
+# service/pi-bg/<ticket-id>/. Killing via the cgroup is precise: only this
+# run's process tree dies, nothing else.
+# usage: pi-bg-kill <ticket-id> [--dry-run]
+#   --dry-run  print the process tree that WOULD be killed; change nothing
+# real kill: SIGTERM to every member, wait $PI_BG_KILL_WAIT (default 10s)
+# polling every 0.5s, then SIGKILL the cgroup (cgroup.kill, per-pid
+# fallback). Posts a kind=kill webhook event (same URL source as pi-bg) so
+# the dispatch channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed
+# (the watchdog skips tickets with a killed marker).
+# env: PI_BG_CG_ROOT (cgroup base, test override), PI_BG_KILL_WAIT,
+#      PI_BG_TMPDIR, PI_DISPATCH_WEBHOOK, PI_BG_WB_BACKOFF (test: 0 = no backoff)
+# exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
+set -uo pipefail
+
+BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
+KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
+
+id="" dry=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry=1; shift ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown arg: $1 (want <ticket-id> [--dry-run])" >&2; exit 2 ;;
+    *)
+      if [ -z "$id" ]; then id="$1";
+      else echo "unknown arg: $1 (want <ticket-id> [--dry-run])" >&2; exit 2; fi
+      shift
+      ;;
+  esac
+done
+[ -n "$id" ] || { echo "usage: pi-bg-kill <ticket-id> [--dry-run]" >&2; exit 2; }
+if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+  echo "pi-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
+  exit 2
+fi
+
+CG="$CG_ROOT/pi-bg/$id"
+if [ ! -d "$CG" ]; then
+  echo "pi-bg-kill: no cgroup for ticket '$id' ($CG missing) — unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
+  exit 2
+fi
+
+# --- cgroup members (procs + threads) ---
+cg_procs() { cat "$CG/cgroup.procs" "$CG/cgroup.threads" 2>/dev/null | sort -un; }
+
+# pids whose /proc/<pid>/stat ppid is $1
+children_of() {
+  local want="$1" c s
+  for c in /proc/[0-9]*; do
+    s="$( { tr -d '\n' < "$c/stat"; } 2>/dev/null )" || continue
+    s="${s#*) }"  # drop 'pid (comm)' — comm may contain spaces
+    [ "${s#* }" = "${s}" ] && continue
+    set -- $s
+    [ "$2" = "$want" ] && basename "$c"
+  done
+}
+
+# cgroup members plus every descendant (the cgroup v2 move carries the whole
+# subtree, so descendants close the fallback case where escape failed)
+list_tree() {
+  local p d c queue=() next=()
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    echo "$p"
+    queue=("$p")
+    while [ "${#queue[@]}" -gt 0 ]; do
+      next=()
+      for d in "${queue[@]}"; do
+        for c in $(children_of "$d"); do
+          echo "$c"
+          next+=("$c")
+        done
+      done
+      queue=("${next[@]+"${next[@]}"}")
+    done
+  done < <(cg_procs)
+}
+
+print_tree() {
+  echo "process tree for $id (would be killed):"
+  local p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if ps -o pid=,ppid=,etime=,args= -p "$p" 2>/dev/null; then
+      :
+    else
+      echo "$p  (gone)"
+    fi
+  done < <(list_tree | sort -un)
+}
+
+if [ "$dry" -eq 1 ]; then
+  print_tree
+  echo "dry-run: no signal sent"
+  exit 0
+fi
+
+# --- SIGTERM, wait, escalate to SIGKILL ---
+t0="$(date +%s)"
+pids0="$(list_tree | sort -un | tr '\n' ' ')"
+[ -n "$pids0" ] || pids0="(none in cgroup)"
+for p in $pids0; do kill -TERM "$p" 2>/dev/null; done
+
+gone=0
+while :; do
+  if [ ! -d "$CG" ] || [ -z "$(cg_procs)" ]; then gone=1; break; fi
+  [ $(( $(date +%s) - t0 )) -ge "$KILL_WAIT" ] && break
+  sleep 0.5
+done
+if [ "$gone" -eq 0 ]; then
+  echo 1 > "$CG/cgroup.kill" 2>/dev/null || true
+  for p in $pids0; do kill -KILL "$p" 2>/dev/null; done
+fi
+dur=$(( $(date +%s) - t0 ))
+
+printf '%s killed %s by %s after %ss; pids: %s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(id -un)" "$dur" "$pids0" \
+  > "$BG_TMP/pi-bg-${id}-killed"
+
+# --- kind=kill webhook event (same URL source + embed shape as pi-bg) ---
+webhook="${PI_DISPATCH_WEBHOOK:-}"
+if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
+fi
+if [ -n "$webhook" ]; then
+  bodyf="$BG_TMP/pi-bg-${id}-kill-body.json"
+  KILL_T="$id" KILL_PIDS="$(echo "$pids0" | tr ' ' ',' | cut -c1-200)" KILL_DUR="$dur" \
+  python3 - > "$bodyf" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("KILL_" + k, "")
+meta = ["$ pi-bg-kill " + E("T"),
+        f"pids   : {E('PIDS')}",
+        f"wait   : {E('DUR')}s (SIGTERM then SIGKILL via cgroup)",
+        "state  : killed on request"]
+embed = {"author": {"name": "pi-bg ticket \u00b7 " + E("T")},
+         "color": 15105570,  # orange, same as pi-bg DIED
+         "title": "\u26d4 pi-bg " + E("T") + " \u00b7 KILLED",
+         "description": "```bash\n" + "\n".join(meta) + "```",
+         "footer": {"text": "pi-bg kill"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+  if [ -s "$bodyf" ]; then
+    ok=0; code=000
+    for i in 1 2 3; do
+      code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$webhook" \
+        -H 'Content-Type: application/json' --max-time 15 --data @"$bodyf" 2>/dev/null)" || code="000"
+      case "$code" in 2*) ok=1; break ;; esac
+      [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
+    done
+    if [ "$ok" -eq 0 ]; then
+      printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
+        "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
+      echo "pi-bg-kill: webhook FAILED (http=$code) - dead letter: $BG_TMP/pi-bg-${id}-kill-webhook-failed" >&2
+    fi
+    rm -f "$bodyf"
+  fi
+fi
+
+echo "pi-bg-kill: killed $id after ${dur}s (pids: $pids0)"
+exit 0

@@ -122,8 +122,9 @@ for d in "$WT_DIR"/*/*/; do
   [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
   # 1) live dispatch -> leave alone
   if is_live "$t" "$d"; then continue; fi
-  # 2) normal completion (out.md written) -> callback was posted, worktree kept by design
-  if [ -s "/tmp/pi-bg-${t}-out.md" ]; then continue; fi
+  # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
+  #    killed on purpose (pi-bg-kill marker) -> not a lost callback
+  if [ -s "/tmp/pi-bg-${t}-out.md" ] || [ -f "/tmp/pi-bg-${t}-killed" ]; then continue; fi
   # 3) recent activity -> give it time
   mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
   [ $(( $(date +%s) - mtime )) -gt $((AGE_MIN * 60)) ] || continue

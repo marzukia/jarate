@@ -8,6 +8,8 @@ Components (all in this repo):
 
 - `dispatch/pi-bg` — dispatch a one-shot pi run on a role profile
 - `dispatch/pi-wait` — in-turn wait for the callback / a human message
+- `dispatch/pi-bg-tail` — read a run's live output (`pi-bg-tail <id> [lines] [-f]`)
+- `dispatch/pi-bg-kill` — cancel a run via its cgroup (`pi-bg-kill <id> [--dry-run]`)
 - `bin/agent-say` — agent-to-agent messaging (post to a peer's channel)
 
 ## Roles
@@ -155,6 +157,28 @@ On completion, `pi-bg` posts to the Discord webhook:
 - Inbound exemption: piscord's `isBgWebhook` exempts its own callbacks
   (webhook with `[bg:` content, or embed author name starting `pi-bg`) from
   triggering a run — no echo loops.
+
+### Webhook delivery audit
+
+Per-run artifacts in `/tmp` (the data source for `/jobs` history):
+
+- `pi-bg-<id>-raw.out` — live output (tee'd from the first attempt on)
+- `pi-bg-<id>-out.md` — final output (non-empty = run completed)
+- `pi-bg-<id>-wb-status` — success-path webhook HTTP code + time
+  (recorded at post time; the response body stays in `pi-bg-<id>-wb-resp.txt`)
+- `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail
+- `pi-bg-<id>-killed` — pi-bg-kill marker (the watchdog skips such tickets)
+
+### tail / kill (in-flight control)
+
+- `pi-bg-tail <id> [lines] [-f]` — last N lines (default 40) of
+  `/tmp/pi-bg-<id>-raw.out`, optional follow. No live output = exit 2.
+- `pi-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
+  (`…/user@<uid>.service/pi-bg/<id>/`), dry-run prints the process tree,
+  real kill sends SIGTERM to every member, waits `$PI_BG_KILL_WAIT` (10s),
+  then SIGKILL via `cgroup.kill` (per-pid fallback). Posts a `⛔ KILLED`
+  embed (same webhook URL source as pi-bg; dead letter on post failure).
+  Precise by construction: only the run's cgroup subtree dies.
 
 ## pi-wait internals
 
