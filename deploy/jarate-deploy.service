@@ -1,0 +1,10 @@
+[Unit]
+Description=Jarate deploy (fetch, check, test, restart pi.service, health gate + auto-rollback)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/monky/projects/jarate
+# User units run as monky; no User= key here.
+# deploy.sh sets PATH (bun) and XDG_RUNTIME_DIR itself.
+ExecStart=/home/monky/projects/jarate/deploy/deploy.sh
+TimeoutStartSec=600
