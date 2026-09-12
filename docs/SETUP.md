@@ -350,3 +350,23 @@ needed. State/lock/logs are gitignored (`.deploy-state`,
   one itself: `packages/bridge/skills/channel`.
 - `bin/agent-say <channel-id> "message"` — agent-to-agent messaging; token
   auto-read from `~/.pi/agent/settings.json` (`$PI_BOT_TOKEN` overrides).
+
+## Web search (Tavily, via MCP)
+
+Pi gets `tavily_search` / `tavily_extract` / `tavily_research` / `tavily_crawl` /
+`tavily_map` from the remote Tavily MCP server, bridged by the bundled
+`extensions/mcp-tools.ts` (a generic MCP-over-streamable-HTTP client; no npm
+deps beyond pi's).
+
+1. **Key**: create one at https://app.tavily.com (free dev tier, `tvly-dev-...`),
+   or use a shared key handed to you.
+2. **Extension**: `cp <jarate-clone>/extensions/mcp-tools.ts ~/.pi/agent/extensions/`
+3. **Config**: add to `~/.pi/agent/settings.json` (merge, don't clobber):
+   ```json
+   { "mcp": [ { "name": "tavily",
+       "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=<KEY>" } ] }
+   ```
+   The key rides in the query string - the MCP server takes no headers.
+4. **Restart**: `XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service`
+5. **Verify**: ask the agent "search tavily for the latest pi coding agent release"
+   - a working `tavily_search` call means the bridge registered the tools.
