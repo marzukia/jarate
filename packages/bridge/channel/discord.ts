@@ -385,12 +385,13 @@ export function seedChannelStateForTest(
   });
 }
 
-/** Drop every discord state + poll timer. Exported for tests. */
+/** Drop every discord state + poll timer + suppression marks. Exported for tests. */
 export function clearDiscordStatesForTest(): void {
   for (const st of states.values()) {
     if (st.pollTimer) clearInterval(st.pollTimer);
   }
   states.clear();
+  autoReactSuppressed.clear();
 }
 
 /** Poll interval for a channel: backfill (60s) while its token's gateway
