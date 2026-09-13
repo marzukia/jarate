@@ -77,6 +77,18 @@ import {
   scheduleWake,
 } from "./sleep";
 import {
+  cancelTask,
+  collectOrphanTaskTmpFiles,
+  completeTask,
+  dueTasks,
+  formatTaskLine,
+  formatTaskPrompt,
+  loadTasks,
+  markTaskClaimed,
+  parseTaskSpec,
+  scheduleTask,
+} from "./tasks";
+import {
   extractTodoLines,
   isBgCallbackBody,
   listBoards,
@@ -119,8 +131,9 @@ let agentBusy = false;
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
 
-// 30s poller for due sleep wakes (session_start / session_shutdown owned).
-let sleepPoller: ReturnType<typeof setInterval> | null = null;
+// 30s poller for due wakes + scheduled tasks (session_start /
+// session_shutdown owned).
+let schedPoller: ReturnType<typeof setInterval> | null = null;
 // 60s ticker that auto-flushes buffered file-only batches at 10 minutes
 // (session_start / session_shutdown owned). (#24)
 let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
@@ -1155,7 +1168,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos|tasks)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -1585,7 +1598,8 @@ export default function (pi: ExtensionAPI) {
       console.error("[undo] re-run consume failed:", sanitizeUnknownValue(e));
     }
 
-    // LLM tools: send local file(s) / maintain the todo board / session sleep.
+    // LLM tools: send local file(s) / maintain the todo board / session
+    // sleep / scheduled tasks.
     if (
       enabled.some(
         (c) => c.type === "discord" && (getDiscordToken(c.id) || c.botToken),
@@ -1594,33 +1608,39 @@ export default function (pi: ExtensionAPI) {
       registerSendFileTool(pi, channels);
       registerTodoTool(pi, channels);
       registerSleepTool(pi, channels);
+      registerTaskTool(pi, channels);
     }
 
-    // Sleep wakes: deliver anything due NOW (the pending list is on disk,
-    // so this catches up after a pi.service restart or a machine reboot),
-    // then poll every 30s for the rest.
+    // Sleep wakes + scheduled tasks: deliver anything due NOW (the pending
+    // lists are on disk, so this catches up after a pi.service restart or a
+    // machine reboot), then poll every 30s for the rest.
     if (enabled.some((c) => c.type === "discord")) {
       // Best-effort cleanup of tmp files orphaned by a crash mid-write.
       try {
-        const orphans = collectOrphanTmpFiles();
+        const orphans = collectOrphanTmpFiles() + collectOrphanTaskTmpFiles();
         if (orphans > 0)
-          console.log(`[sleep] collected ${orphans} orphan wake tmp file(s)`);
+          console.log(`[sched] collected ${orphans} orphan tmp file(s)`);
       } catch {
         /* best-effort only */
       }
       const due = deliverDueWakes(pi, channels);
       if (due > 0)
         console.log(`[sleep] delivered ${due} due wake(s) on startup`);
-      if (sleepPoller) clearInterval(sleepPoller);
-      sleepPoller = setInterval(() => {
+      const tDue = deliverDueTasks(pi, channels);
+      if (tDue > 0)
+        console.log(`[task] delivered ${tDue} due task(s) on startup`);
+      if (schedPoller) clearInterval(schedPoller);
+      schedPoller = setInterval(() => {
         try {
           const n = deliverDueWakes(pi, channels);
           if (n > 0) console.log(`[sleep] delivered ${n} due wake(s)`);
+          const tn = deliverDueTasks(pi, channels);
+          if (tn > 0) console.log(`[task] delivered ${tn} due task(s)`);
         } catch (e) {
-          console.error("[sleep] poller failed:", sanitizeUnknownValue(e));
+          console.error("[sched] poller failed:", sanitizeUnknownValue(e));
         }
       }, 30_000);
-      (sleepPoller as any).unref?.();
+      (schedPoller as any).unref?.();
     }
 
     // Buffered file-only batches: auto-flush anything older than 10 minutes
@@ -1675,9 +1695,9 @@ export default function (pi: ExtensionAPI) {
     clearAllInterrupts();
     setInterruptCtx(null);
     finalReps.clear();
-    if (sleepPoller) {
-      clearInterval(sleepPoller);
-      sleepPoller = null;
+    if (schedPoller) {
+      clearInterval(schedPoller);
+      schedPoller = null;
     }
     if (bufferFlushTicker) {
       clearInterval(bufferFlushTicker);
@@ -2130,6 +2150,7 @@ const HELP_TEXT = [
   "`/jobs` — list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
   "`/todos` — show the channel todo board (arg `all` for every channel)",
   "`/sleep [list | cancel <id>]` — list or cancel pending session wakes (owner)",
+  "`/tasks [list | cancel <id>]` — list or cancel scheduled tasks (owner)",
   "`/help` — this message",
 ].join("\n");
 
@@ -3004,6 +3025,39 @@ async function runChannelCommand(
       }
       return { immediate: "[!] usage: `/sleep [list | cancel <id>]`" };
     }
+    case "tasks": {
+      if (!isOwner) return ownerOnly;
+      const argText = (arg || "").trim();
+      const sub = argText ? argText.split(/\s+/)[0]!.toLowerCase() : "list";
+      if (sub === "list") {
+        const names = new Map(
+          loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
+        );
+        const tasks = loadTasks();
+        if (tasks.length === 0)
+          return { immediate: "[tasks] no scheduled tasks" };
+        const pending = tasks.filter((t) => t.status === "pending").length;
+        const lines = tasks.map((t) =>
+          formatTaskLine(t, names.get(t.channelId) || t.channelName),
+        );
+        return {
+          immediate: `[tasks] ${pending} pending task${
+            pending > 1 ? "s" : ""
+          } (of ${tasks.length} total):\n${lines.join("\n")}`,
+        };
+      }
+      if (sub === "cancel") {
+        const id = argText.slice("cancel".length).trim();
+        if (!id) return { immediate: "[!] usage: `/tasks cancel <id>`" };
+        const ok = cancelTask(id);
+        return {
+          immediate: ok
+            ? `[ok] cancelled task ${id}`
+            : `[!] no task with id ${id}`,
+        };
+      }
+      return { immediate: "[!] usage: `/tasks [list | cancel <id>]`" };
+    }
     case "todos": {
       // Informational, open to all channel members (private channel).
       if ((arg || "").trim().toLowerCase() === "all") {
@@ -3433,6 +3487,141 @@ export function registerSleepTool(
   });
 }
 
+// ─── Scheduled task delivery ──────────────────────────────────────────────
+// Same at-least-once discipline as sleep wakes: claim before injection,
+// complete AFTER injection succeeds (one-shot: removed; cron: advance to
+// the next slot). A crash between claim and completion re-delivers once
+// the claim goes stale (> CLAIM_TTL_MS). Returns the number delivered.
+export function deliverDueTasks(
+  pi: ExtensionAPI,
+  channels: ChannelConfig[],
+  home?: string,
+  now = Date.now(),
+): number {
+  const enabledIds = new Set(
+    channels.filter((c) => c.enabled && c.type === "discord").map((c) => c.id),
+  );
+  const due = [...enabledIds].flatMap((id) => dueTasks(id, now, home));
+  if (due.length === 0) return 0;
+  for (const t of due) markTaskClaimed(t.id, now, home);
+  for (const t of due) {
+    const ch = getChannel(channels, t.channelId);
+    const name = ch?.name || t.channelName || t.channelId;
+    const text = formatTaskPrompt(t);
+    console.log(`[task] delivering ${t.id} for ${name}`);
+    const ok = sendToPi(pi, t.channelId, text, `discord/${name}`, text);
+    if (ok) completeTask(t.id, now, home);
+    else
+      console.error(
+        `[task] injection failed for ${t.id} — claim stays, retried after TTL`,
+      );
+  }
+  return due.length;
+}
+
+// ─── task tool ───────────────────────────────────────────────────────────
+// Durable "fire this prompt into this session at a later time": one-shot
+// (minutes from now, or an ISO time) or recurring (5-field cron, optional
+// IANA tz). Delivery is external (session_start catch-up + 30s poller) so
+// it survives pi.service restarts and machine reboots. The fire lands as a
+// fresh channel-inbound turn in the same session.
+export const TASK_TOOL_DESCRIPTION = `Schedule a prompt that fires into THIS session as a new message at a later time. One-shot: minutes from now or an ISO time (e.g. "remind me in 2h to check the build"). Recurring: a 5-field cron expression (e.g. "daily 06:00 run the fleet check" = "0 6 * * *"), optional IANA timezone. The fire arrives as a normal channel message in this same session — a fresh turn for your future self. It survives process restarts and reboots. After scheduling, do not wait or poll; the fire is its own message.`;
+
+export function registerTaskTool(
+  pi: ExtensionAPI,
+  channels: ChannelConfig[],
+): void {
+  pi.registerTool({
+    name: "task",
+    label: "Task",
+    description: TASK_TOOL_DESCRIPTION,
+    promptSnippet:
+      "Schedule a prompt to fire into this session later (one-shot minutes/ISO, or recurring cron)",
+    promptGuidelines: [
+      "Write the prompt for your future self: self-contained, no 'this' or 'it'.",
+      "After calling task, keep working or end the reply — the fire arrives as its own message later.",
+    ],
+    parameters: Type.Object({
+      prompt: Type.String({
+        description:
+          "The message to deliver when the task fires (self-contained instruction)",
+      }),
+      minutes: Type.Optional(
+        Type.Union([Type.Number(), Type.String()], {
+          description:
+            "One-shot: fire N minutes from now (e.g. 120) — exactly one of minutes/at/cron",
+        }),
+      ),
+      at: Type.Optional(
+        Type.String({
+          description:
+            "One-shot: fire time as ISO timestamp, e.g. 2026-09-10T15:00:00Z (exactly one of minutes/at/cron)",
+        }),
+      ),
+      cron: Type.Optional(
+        Type.String({
+          description:
+            "Recurring: 5-field cron (minute hour dom month dow), e.g. '0 6 * * *' = daily 06:00 — exactly one of minutes/at/cron",
+        }),
+      ),
+      tz: Type.Optional(
+        Type.String({
+          description:
+            "IANA timezone for the cron expression (e.g. Australia/Melbourne); default system tz",
+        }),
+      ),
+    }),
+    async execute(
+      _toolCallId,
+      params: {
+        prompt?: string;
+        minutes?: number | string;
+        at?: string;
+        cron?: string;
+        tz?: string;
+      },
+      _signal,
+      _onUpdate,
+      _ctx: ExtensionContext,
+    ) {
+      const active =
+        lastActiveChannel && lastActiveChannel.type === "discord"
+          ? lastActiveChannel
+          : null;
+      const ch = active || getDefaultChannel(channels);
+      if (ch?.type !== "discord") {
+        return {
+          content: [{ type: "text", text: "No Discord channel available" }],
+          details: {},
+        };
+      }
+      const res = parseTaskSpec(params);
+      if (res.error !== undefined || res.spec === undefined) {
+        return {
+          content: [
+            { type: "text", text: `[!] ${res.error ?? "invalid task spec"}` },
+          ],
+          details: {},
+        };
+      }
+      const task = scheduleTask({
+        channelId: ch.id,
+        channelName: ch.name,
+        prompt: params.prompt!.trim(),
+        spec: res.spec,
+      });
+      const when =
+        task.kind === "cron"
+          ? `cron "${task.cron}"${task.tz ? ` (${task.tz})` : " (system tz)"}`
+          : `at ${new Date(task.atMs!).toISOString()}`;
+      const text =
+        `[ok] task ${task.id} scheduled: ${when}, next fire ${new Date(task.nextFireAt).toISOString()} — ` +
+        `it arrives as a message in this channel. Cancel with /tasks cancel ${task.id}.`;
+      return { content: [{ type: "text", text }], details: { task } };
+    },
+  });
+}
+
 // (named export for test harness; pi itself only uses the default factory)
 
 export async function handleInbound(
@@ -3481,6 +3670,7 @@ export async function handleInbound(
       cmd.name === "usage" ||
       cmd.name === "jobs" ||
       cmd.name === "sleep" ||
+      cmd.name === "tasks" ||
       cmd.name === "stop" ||
       cmd.name === "compact" ||
       cmd.name === "reset" ||
