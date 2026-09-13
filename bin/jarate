@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+# jarate — single JSON entrypoint for machine-ops helpers (issue #17).
+#
+#   in:  jarate <cmd> [args...]      (args may also arrive pre-joined; both work)
+#   out: ONE JSON doc on stdout: {"ok": true|false, "error": "...", ...}
+#
+# JSON discipline (stable across calls — agents rely on it):
+#   - snake_case keys, deterministic field order per subcommand
+#   - ok:false + "error" is the ONLY error shape; never throw, never mix
+#   - missing data = null, absent sections omitted
+#   - ISO-8601 UTC timestamps, seconds for ages
+#   - no emoji
+#
+# Commands (first group, all read-only):
+#   ctx-report                    context % + token cost (reuses pi-token-cost.py --json)
+#   journal-errors [--since S]    per-agent pi.service warnings (journalctl -p warning)
+#   memory-grep <query>           search ~/memory, top-20 matches
+#   rag <question> [--project P]  RAG one-call over project knowledge (recall --json)
+#
+# Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
+# Callers use $HOME/bin/jarate — do not rely on PATH.
+#
+# Env overrides (tests / exotic hosts):
+#   JARATE_TOKEN_COST   path to pi-token-cost.py (default: ~/scripts, then repo)
+#   JARATE_CTX_LIMIT    context limit fallback when models.json has none
+#   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
+#   JARATE_SSH_HOST     cross-user hop target (default andryo@127.0.0.1)
+#   JARATE_SUDO_PASS    password for the sudo -S hop (default [REDACTED-2026-09-13])
+#   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
+#   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
+
+set -uo pipefail
+
+JARATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+TMO="${JARATE_TIMEOUT_S:-25}"
+WARN_CAP=100   # max warning lines per agent
+GREP_CAP=20    # memory-grep top-N
+PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
+
+COMMANDS=("ctx-report" "journal-errors" "memory-grep" "rag")
+
+ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# die <error> — emit ok:false JSON and exit 1.
+die() {
+  jq -cn --arg ts "$(ts_now)" --arg e "$1" '{ok: false, ts: $ts, error: $e}'
+  exit 1
+}
+
+# ─── ctx-report ─────────────────────────────────────────────────────────────
+# Context % of the calling agent (newest main-profile session) + lifetime
+# token cost via pi-token-cost.py --json (cross-profile, per-home).
+
+# Print {"tokens": N|null} for the newest assistant usage in a session jsonl.
+# Same accounting as pi-token-cost.py: totalTokens == input+output+cacheRead.
+session_last_usage() {
+  python3 -c '
+import json, sys
+last = None
+try:
+    fh = open(sys.argv[1], "r")
+except Exception:
+    print(json.dumps({"tokens": None}))
+    raise SystemExit(0)
+for line in fh:
+    if "\"type\":\"message\"" not in line:
+        continue
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    m = o.get("message") or {}
+    if m.get("role") != "assistant":
+        continue
+    u = m.get("usage")
+    if isinstance(u, dict) and any(u.get(k) for k in ("input", "output", "cacheRead", "totalTokens")):
+        last = u
+if last is None:
+    print(json.dumps({"tokens": None}))
+else:
+    t = last.get("totalTokens")
+    if not t:
+        t = (last.get("input", 0) or 0) + (last.get("output", 0) or 0) + (last.get("cacheRead", 0) or 0)
+    print(json.dumps({"tokens": t}))
+' "$1" 2>/dev/null
+}
+
+# Locate pi-token-cost.py: env override, ~/scripts, repo scripts/.
+find_token_cost() {
+  if [ -n "${JARATE_TOKEN_COST:-}" ]; then
+    printf '%s' "${JARATE_TOKEN_COST:-}"
+    return
+  fi
+  local c
+  for c in "$HOME/scripts/pi-token-cost.py" "$JARATE_ROOT/scripts/pi-token-cost.py"; do
+    if [ -f "$c" ]; then
+      printf '%s' "$c"
+      return
+    fi
+  done
+}
+
+cmd_ctx_report() {
+  local profile="main"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) profile="${2:?--profile needs a value}"; shift ;;
+      *) die "ctx-report: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  local agent home prof_dir
+  agent="$(id -un)"
+  home="$HOME"
+  case "$profile" in
+    main) prof_dir="$home/.pi/agent" ;;
+    worker) prof_dir="$home/.pi/agent-worker" ;;
+    *) die "ctx-report: profile must be main or worker" ;;
+  esac
+
+  # context limit from the profile's models.json (switchboard header)
+  local limit=""
+  local mf
+  mf="$(ls "$prof_dir"/models.json 2>/dev/null | head -1)"
+  if [ -n "$mf" ]; then
+    limit="$(jq -r '[.providers[].headers["X-Switchboard-Context"]? // empty] | .[0] // empty' "$mf" 2>/dev/null)"
+  fi
+  [ -n "$limit" ] || limit="${JARATE_CTX_LIMIT:-}"
+  local limit_json="null"
+  case "$limit" in
+    ''|*[!0-9]*) limit_json="null" ;;
+    *) limit_json="$limit" ;;
+  esac
+
+  # newest live session jsonl (reset files end .jsonl.reset-*, so -name
+  # '*.jsonl' already skips them)
+  local sess=""
+  sess="$(find "$prof_dir/sessions" -name '*.jsonl' -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+
+  local context="null"
+  if [ -n "$sess" ]; then
+    local usage tokens="null" age=0 pct="null" compact="false"
+    usage="$(session_last_usage "$sess")"
+    tokens="$(jq -r '.tokens // "null"' <<<"$usage" 2>/dev/null)"
+    [ -n "$tokens" ] || tokens="null"
+    age=$(( $(date +%s) - $(stat -c %Y "$sess" 2>/dev/null || echo "$(date +%s)") ))
+    [ "$age" -ge 0 ] || age=0
+    if [ "$tokens" != "null" ] && [ "$limit_json" != "null" ] && [ "$limit" -gt 0 ] 2>/dev/null; then
+      pct=$(( tokens * 100 / limit ))
+      [ "$pct" -ge 80 ] && compact="true"
+    fi
+    context="$(jq -cn \
+      --arg session "$sess" \
+      --argjson age_s "$age" \
+      --argjson tokens "$tokens" \
+      --argjson limit "$limit_json" \
+      --argjson pct "$pct" \
+      --argjson compact "$compact" \
+      '{session: $session, age_s: $age_s, tokens: $tokens, limit: $limit, pct: $pct, compact_recommended: $compact}')" \
+      || context="null"
+  fi
+
+  # cost via pi-token-cost.py --json <home> (hits OpenRouter; bounded)
+  local cost="null" cost_error="" ptc raw
+  ptc="$(find_token_cost)"
+  if [ -z "$ptc" ] || [ ! -f "$ptc" ]; then
+    cost_error="pi-token-cost.py not found (set JARATE_TOKEN_COST)"
+  else
+    if raw="$(timeout "$TMO" python3 "$ptc" --json "$home" 2>/dev/null)"; then
+      cost="$(jq -cn --argjson r "$raw" '
+        ($r.agents[0] // null) as $a
+        | if $a == null then null else
+            {model: ($r.model // null),
+             turns: $a.stats.turns,
+             input: $a.stats.input,
+             output: $a.stats.output,
+             cache_read: $a.stats.cacheRead,
+             cache_write: $a.stats.cacheWrite,
+             total_tokens: $a.stats.totalTokens,
+             usd: ($a.pricing.cost // null)}
+          end' 2>/dev/null)" || cost="null"
+    else
+      cost_error="pi-token-cost.py failed or timed out (${TMO}s)"
+    fi
+  fi
+  [ -n "$cost" ] || cost="null"
+
+  local ok="true" error=""
+  if [ "$context" = "null" ] && { [ "$cost" = "null" ] || [ -n "$cost_error" ]; }; then
+    ok="false"
+    error="no context or cost data for $agent"
+  fi
+
+  jq -cn \
+    --argjson ok "$ok" \
+    --arg ts "$(ts_now)" \
+    --arg agent "$agent" \
+    --arg home "$home" \
+    --arg profile "$profile" \
+    --argjson context "$context" \
+    --argjson cost "$cost" \
+    --arg cost_error "${cost_error:-}" \
+    --arg error "$error" \
+    '{ok: $ok, ts: $ts, agent: $agent, home: $home, profile: $profile,
+      context: $context, cost: $cost,
+      cost_error: (if $cost_error == "" then null else $cost_error end),
+      error: (if $error == "" then null else $error end)}' \
+    || die "ctx-report: json assembly failed"
+  [ "$ok" = "true" ] || exit 1
+}
+
+# ─── journal-errors ─────────────────────────────────────────────────────────
+# Per-agent pi.service warnings. Self via user journal; other agents via the
+# proven sshpass/sudo hop (pi-token-cost.py pattern).
+
+# Remote probe for a peer agent home: prints [jarate:pi] as the first line
+# only if that user has pi.service enabled, followed by the warning lines.
+# Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
+run_remote_probe() { # $1=name $2=uid $3=since
+  local host="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
+  local pass="${JARATE_SUDO_PASS:-[REDACTED-2026-09-13]}"
+  timeout "$TMO" sshpass -p "$pass" \
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
+    "echo '$pass' | sudo -S -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'" 2>/dev/null
+}
+
+cmd_journal_errors() {
+  local since="-1h" agent_filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since) since="${2:?--since needs a value}"; shift ;;
+      --agent) agent_filter="${2:?--agent needs a value}"; shift ;;
+      *) die "journal-errors: unknown arg: $1" ;;
+    esac
+    shift
+  done
+
+  local -a homes=()
+  if [ -n "${JARATE_AGENT_HOMES:-}" ]; then
+    IFS=':' read -r -a homes <<<"$JARATE_AGENT_HOMES"
+  else
+    homes=("$HOME")
+    local ssh_user="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
+    ssh_user="${ssh_user%%@*}"
+    local self="$(id -un)"
+    local u uid
+    while IFS=: read -r u _ _ uid _ _ _; do
+      [ -n "$u" ] || continue
+      [ "$uid" -gt 900 ] 2>/dev/null || continue
+      [ "$u" = "$self" ] && continue
+      [ "$u" = "$ssh_user" ] && continue
+      [ -d "/home/$u" ] && homes+=("/home/$u")
+    done < <(getent passwd)
+  fi
+  [ "${#homes[@]}" -gt 0 ] || die "journal-errors: no agent homes found"
+
+  local rows="[]"
+  local included=0 ok_all="true" failed=""
+  for h in "${homes[@]}"; do
+    local name src err="" text=""
+    name="$(basename "$h")"
+    if [ -n "$agent_filter" ] && [ "$name" != "$agent_filter" ]; then
+      continue
+    fi
+    included=$((included + 1))
+    if [ "$h" = "$HOME" ]; then
+      src="local"
+      if text="$(timeout "$TMO" env XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+        journalctl --user -u pi.service -p warning --since "$since" -q 2>/dev/null)"; then
+        :
+      else
+        err="journalctl failed (rc=$?)"
+      fi
+    else
+      src="ssh+sudo"
+      local uid rc=0
+      uid="$(getent passwd "$name" 2>/dev/null | cut -d: -f3)"
+      text="$(run_remote_probe "$name" "$uid" "$since")" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-andryo@127.0.0.1})"
+      elif [ -z "$text" ] || [ "${text%%$'\n'*}" != "[jarate:pi]" ]; then
+        # no pi.service for this user -> not an agent, skip the row
+        included=$((included - 1))
+        continue
+      else
+        text="${text#*$'\n'}"   # drop the marker line
+        [ "$text" = "[jarate:pi]" ] && text=""
+      fi
+    fi
+
+    local -a wl=()
+    if [ -n "$text" ]; then
+      mapfile -t wl <<<"$text"
+    fi
+    local total="${#wl[@]}" truncated="false"
+    [ "$total" -gt "$WARN_CAP" ] && { wl=("${wl[@]:0:$WARN_CAP}"); truncated="true"; }
+    local warnings
+    warnings="$(printf '%s\n' "${wl[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null)" || warnings="[]"
+    if [ -n "$err" ]; then
+      warnings="null"
+      ok_all="false"
+      failed+="${failed:+,}$name"
+    fi
+    local row
+    row="$(jq -cn \
+      --arg name "$name" \
+      --arg source "$src" \
+      --argjson count "${#wl[@]}" \
+      --argjson warnings "$warnings" \
+      --argjson truncated "$truncated" \
+      --arg error "${err:-}" \
+      '{name: $name, source: $source, count: $count, warnings: $warnings,
+        truncated: $truncated, error: (if $error == "" then null else $error end)}')"
+    rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
+  done
+
+  [ "$included" -gt 0 ] || die "journal-errors: no agents matched --agent $agent_filter"
+  local error=""
+  [ "$ok_all" = "true" ] || error="agent(s) failed: $failed"
+  jq -cn \
+    --argjson ok "$ok_all" \
+    --arg ts "$(ts_now)" \
+    --arg since "$since" \
+    --arg error "$error" \
+    --argjson agents "$rows" \
+    '{ok: $ok, ts: $ts, since: $since,
+      error: (if $error == "" then null else $error end),
+      agents: $agents}' \
+    || die "journal-errors: json assembly failed"
+  [ "$ok_all" = "true" ] || exit 1
+}
+
+# ─── memory-grep ────────────────────────────────────────────────────────────
+# Search ~/memory (file-based memory), top-20 matches. Fixed strings by
+# default; --regex for rg regex. Case-insensitive by default; --case to pin.
+
+cmd_memory_grep() {
+  local root="$HOME/memory" mode="fixed" ci="-i"
+  local -a qw=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) root="${2:?--root needs a value}"; shift ;;
+      --regex) mode="regex" ;;
+      --case) ci="" ;;
+      -*) die "memory-grep: unknown flag: $1" ;;
+      *) qw+=("$1") ;;
+    esac
+    shift
+  done
+  local query="${qw[*]:-}"
+  [ -n "$query" ] || die "memory-grep: usage: jarate memory-grep <query> [--root DIR] [--regex] [--case]"
+  [ -d "$root" ] || die "memory-grep: root not found: $root"
+  command -v rg >/dev/null 2>&1 || die "memory-grep: rg not found on PATH"
+
+  # rg exit codes: 0 = matches, 1 = no matches, >1 = error.
+  # Probe with -q first (cheap, no output), then read the lines.
+  local rc=0
+  rg -q $ci -e "$query" "$root" 2>/dev/null || rc=$?
+  [ "$rc" -le 1 ] || die "memory-grep: rg failed (rc=$rc)"
+  local out=""
+  [ "$rc" -eq 0 ] && out="$(rg -n --no-heading $ci -e "$query" "$root" 2>/dev/null | head -n "$PARSE_CAP")"
+
+  local rows="" truncated="false"
+  local line file rest lineno text
+  # total matches = non-empty lines in out (out itself is head-capped at PARSE_CAP)
+  local total=0
+  while IFS= read -r line; do
+    [ -n "$line" ] && total=$((total + 1))
+  done <<<"$out"
+  [ "$total" -gt "$GREP_CAP" ] && truncated="true"
+  local kept=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "$kept" -ge "$GREP_CAP" ] && break
+    file="${line%%:*}"
+    rest="${line#*:}"
+    lineno="${rest%%:*}"
+    text="${rest#*:}"
+    case "$lineno" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    rows+="$(jq -cn --arg f "$file" --argjson l "$lineno" --arg t "$text" \
+      '{file: $f, line: $l, text: $t}')"$'\n'
+    kept=$((kept + 1))
+  done <<<"$out"
+  local matches
+  matches="$(printf '%s' "$rows" | jq -cs 'map(select(. != null))' 2>/dev/null)" || matches="[]"
+  local count="$total"
+
+  jq -cn \
+    --arg ts "$(ts_now)" \
+    --arg query "$query" \
+    --arg root "$root" \
+    --argjson count "$count" \
+    --argjson truncated "$truncated" \
+    --argjson matches "$matches" \
+    '{ok: true, ts: $ts, query: $query, root: $root, count: $count,
+      truncated: $truncated, matches: $matches}' \
+    || die "memory-grep: json assembly failed"
+}
+
+# ─── rag ────────────────────────────────────────────────────────────────────
+# One-call RAG wrapper over the recall CLI (TS port of pgrag, same db `rag`).
+# `recall query --json` emits a SearchRow array: {source, content, score}.
+
+find_bun() {
+  if command -v bun >/dev/null 2>&1; then
+    command -v bun
+    return
+  fi
+  local c
+  for c in "$HOME/.local/bin/bun" "$HOME/.bun/bin/bun"; do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return
+    fi
+  done
+}
+
+find_recall_cli() {
+  if [ -n "${JARATE_RECALL_CLI:-}" ]; then
+    printf '%s' "${JARATE_RECALL_CLI:-}"
+    return
+  fi
+  local c
+  for c in \
+    "$JARATE_ROOT/packages/recall/bin/recall.ts" \
+    "$HOME/projects/recall/bin/recall.ts"; do
+    if [ -f "$c" ]; then
+      printf '%s' "$c"
+      return
+    fi
+  done
+  command -v recall 2>/dev/null || true
+}
+
+cmd_rag() {
+  local project=""
+  local -a qw=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) project="${2:?--project needs a value}"; shift ;;
+      -*) die "rag: unknown flag: $1" ;;
+      *) qw+=("$1") ;;
+    esac
+    shift
+  done
+  local question="${qw[*]:-}"
+  [ -n "$question" ] || die "rag: usage: jarate rag <question> [--project NAME]"
+
+  local bun
+  bun="$(find_bun)" || true
+  [ -n "$bun" ] || die "rag: bun not found on PATH"
+  local cli
+  cli="$(find_recall_cli)"
+  [ -n "$cli" ] || die "rag: recall CLI not found (repo packages/recall, ~/projects/recall, PATH)"
+
+  local out rc
+  if [ -n "$project" ]; then
+    out="$(timeout "$TMO" env RAG_PROJECT="$project" "$bun" "$cli" query --json "$question" 2>&1)"
+    rc=$?
+  else
+    out="$(timeout "$TMO" "$bun" "$cli" query --json "$question" 2>&1)"
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    die "rag: recall query failed (rc=$rc): $(head -1 <<<"$out")"
+  fi
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out" \
+    || die "rag: unexpected recall output (expected JSON array)"
+  local count
+  count="$(jq 'length' <<<"$out")"
+
+  jq -cn \
+    --arg ts "$(ts_now)" \
+    --arg question "$question" \
+    --arg project "${project:-}" \
+    --argjson count "$count" \
+    --argjson results "$out" \
+    '{ok: true, ts: $ts, backend: "recall", question: $question,
+      project: (if $project == "" then null else $project end),
+      count: $count, results: $results}' \
+    || die "rag: json assembly failed"
+}
+
+# ─── dispatch ───────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  local -a args=()
+  read -r -a args <<<"$*"
+
+  case "$cmd" in
+    "" | help | -h | --help)
+      jq -cn --arg ts "$(ts_now)" \
+        '{ok: true, ts: $ts, usage: "jarate <cmd> [args]",
+          commands: ["ctx-report", "journal-errors", "memory-grep", "rag"]}'
+      ;;
+    ctx-report) cmd_ctx_report "${args[@]}" ;;
+    journal-errors) cmd_journal_errors "${args[@]}" ;;
+    memory-grep) cmd_memory_grep "${args[@]}" ;;
+    rag) cmd_rag "${args[@]}" ;;
+    *)
+      jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
+        '{ok: false, ts: $ts, error: ("unknown command: " + $c),
+          usage: "jarate <cmd> [args]",
+          commands: ["ctx-report", "journal-errors", "memory-grep", "rag"]}'
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

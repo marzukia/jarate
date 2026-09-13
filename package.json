@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "lint": "bunx biome check .",
-    "test": "cd packages/bridge && bun x bun test && cd ../recall && bun test && cd ../../dispatch && bun test",
+    "test": "cd packages/bridge && bun x bun test && cd ../recall && bun test && cd ../../dispatch && bun test && cd ../../bin && bun test",
     "typecheck": "cd packages/bridge && bun x tsc --noEmit && cd ../recall && bun x tsc --noEmit"
   },
   "devDependencies": {
