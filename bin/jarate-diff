@@ -1,0 +1,43 @@
+#!/usr/bin/env bun
+// jarate-diff: publish a diff to the self-hosted webdrop viewer, print the
+// reply (stats line + URL).
+//
+// Usage:
+//   jarate-diff                 working tree diff (git diff HEAD) in cwd
+//   jarate-diff <file>          publish a .patch/.diff/.txt file
+//   jarate-diff <git-range>     publish git diff <range|rev> (main..HEAD, HEAD~3)
+//   jarate-diff -               diff from stdin
+//
+// Exit 0 + stdout = the [ok] reply when published; exit 1 + stderr otherwise.
+// Self-hosted only: uploads to webdrop (env WEBDROP_SERVER/WEBDROP_TOKEN or
+// ~/.config/webdrop/config.toml). No third-party service sees the code.
+//
+// This is the same pipeline the Discord /diff command runs (issue #7).
+import * as fs from "node:fs";
+import { publishDiff } from "../packages/bridge/channel/diff.ts";
+
+const arg = process.argv[2];
+
+let text: string;
+try {
+  if (arg === "-") {
+    const stdin = fs.readFileSync(0, "utf-8");
+    if (!stdin.trim()) {
+      process.stderr.write("jarate-diff: empty stdin\n");
+      process.exit(1);
+    }
+    text = stdin;
+  } else if (arg === undefined) {
+    text = (await publishDiff(process.cwd(), undefined)) ?? "";
+  } else {
+    text = (await publishDiff(process.cwd(), arg)) ?? "";
+  }
+} catch (e) {
+  process.stderr.write(`jarate-diff: ${e instanceof Error ? e.message : String(e)}\n`);
+  process.exit(1);
+}
+
+const ok = text.startsWith("[ok]");
+process.stdout.write(text + "\n");
+if (!ok) process.stderr.write("jarate-diff: not published\n");
+process.exit(ok ? 0 : 1);

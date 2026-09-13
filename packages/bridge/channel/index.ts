@@ -31,6 +31,7 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import { publishDiff } from "./diff";
 import {
   connectDiscord,
   connectDiscordPresence,
@@ -1168,7 +1169,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos|tasks)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2148,6 +2149,7 @@ const HELP_TEXT = [
   "`/compact [instructions]` — compact session context (owner)",
   "`/model [name]` — switch or list models (owner)",
   "`/jobs` — list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
+  "`/diff [git-range | file]` — publish a diff (default: working tree) to a shareable viewer URL",
   "`/todos` — show the channel todo board (arg `all` for every channel)",
   "`/sleep [list | cancel <id>]` — list or cancel pending session wakes (owner)",
   "`/tasks [list | cancel <id>]` — list or cancel scheduled tasks (owner)",
@@ -2855,6 +2857,16 @@ async function runChannelCommand(
         return { immediate: text };
       } catch {
         return { immediate: "[!] usage stats unavailable" };
+      }
+    }
+    case "diff": {
+      // Read-only: git + upload to our own webdrop (issue #7). Open to all
+      // channel members, like /jobs.
+      try {
+        const text = await publishDiff(ctx.cwd, arg);
+        return { immediate: text };
+      } catch {
+        return { immediate: "[!] diff publish failed" };
       }
     }
     case "reset": {
@@ -3669,6 +3681,7 @@ export async function handleInbound(
       cmd.name === "status" ||
       cmd.name === "usage" ||
       cmd.name === "jobs" ||
+      cmd.name === "diff" ||
       cmd.name === "sleep" ||
       cmd.name === "tasks" ||
       cmd.name === "stop" ||
