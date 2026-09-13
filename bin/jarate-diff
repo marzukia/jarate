@@ -26,7 +26,7 @@ try {
       process.stderr.write("jarate-diff: empty stdin\n");
       process.exit(1);
     }
-    text = stdin;
+    text = (await publishDiff(process.cwd(), stdin)) ?? "";
   } else if (arg === undefined) {
     text = (await publishDiff(process.cwd(), undefined)) ?? "";
   } else {

@@ -272,9 +272,12 @@ its cgroup and posts a `KILLED` webhook event.
 
 Renders the diff into a self-contained dark mobile HTML page (syntax
 highlighted, no CDN, no external requests) and publishes it to the
-self-hosted webdrop shelf; the object key is a random 24-hex guid, so the
-URL is unguessable and the drop expires in 7 days. No third-party service
-sees the code (issue #7: critique.work rejected as code exfil).
+self-hosted webdrop shelf; the object key is a random 24-hex guid (96
+bits), so the URL is unguessable and is the access control. A 7-day TTL is
+stored on the drop; webdrop's purge job is phase 3, so the page stays
+fetchable until it is deleted. No third-party service sees the code
+(issue #7: critique.work rejected as code exfil). Input cap: 2 MB.
+`[!] diff too large (… MB, max 2 MB)` beyond that.
 
 ```
 [ok] working tree · 2 files +12 -3 · ttl 7d

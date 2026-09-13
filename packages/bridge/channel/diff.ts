@@ -689,7 +689,9 @@ export function resolveDiffSource(
     } catch {
       // not a file — try git below
     }
-    if (GIT_ARG_RE.test(a)) return { kind: "range", value: a, label: a };
+    // Leading dash = git option (--cached, --stat), not a range/rev.
+    if (GIT_ARG_RE.test(a) && !a.startsWith("-"))
+      return { kind: "range", value: a, label: a };
   }
   return null;
 }

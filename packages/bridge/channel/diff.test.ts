@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -190,6 +191,9 @@ describe("diff source heuristics", () => {
     expect(resolveDiffSource("not a file", tmp)).toBeNull();
     // single token that is neither a file nor a git-arg shape
     expect(resolveDiffSource("has spaces here", tmp)).toBeNull();
+    // option-shaped git args (--stat, --cached) are not ranges
+    expect(resolveDiffSource("--stat", tmp)).toBeNull();
+    expect(resolveDiffSource("--cached", tmp)).toBeNull();
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 });
@@ -604,5 +608,93 @@ describe("publishDiff (pipeline)", () => {
     expect(r).toBe(
       "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
     );
+  });
+});
+
+describe("jarate-diff CLI (bin/jarate-diff: stdin -> publish -> url)", () => {
+  const BIN = path.resolve(import.meta.dir, "../../../bin/jarate-diff");
+  let server: ReturnType<typeof Bun.serve>;
+  let port = 0;
+  let tmpHome: string;
+  let uploads: { auth?: string; ttl?: string; body?: string }[];
+
+  // Async spawn: a sync spawn would block this process's event loop, and
+  // the child's fetch needs the Bun.serve below to answer — deadlock.
+  const run = (input: string) =>
+    new Promise<{ code: number; out: string; err: string }>((resolve) => {
+      const child = cp.spawn("bun", [BIN, "-"], {
+        cwd: tmpHome,
+        env: {
+          ...process.env,
+          HOME: tmpHome,
+          WEBDROP_SERVER: `http://127.0.0.1:${port}`,
+          WEBDROP_TOKEN: "cli-test",
+        },
+      });
+      let out = "";
+      let err = "";
+      child.stdout?.on("data", (d: Buffer) => {
+        out += String(d);
+      });
+      child.stderr?.on("data", (d: Buffer) => {
+        err += String(d);
+      });
+      child.on("close", (code) => resolve({ code: code ?? 1, out, err }));
+      child.stdin?.write(input);
+      child.stdin?.end();
+    });
+
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "diff-cli-"));
+    uploads = [];
+    server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (
+          req.method === "POST" &&
+          new URL(req.url).pathname === "/api/v1/files"
+        ) {
+          uploads.push({
+            auth: req.headers.get("authorization") ?? undefined,
+            ttl: req.headers.get("x-webdrop-ttl") ?? undefined,
+            body: await req.text(),
+          });
+          return Response.json(
+            { url: `http://127.0.0.1:${port}/cli-diff.html` },
+            { status: 201 },
+          );
+        }
+        return Response.json({}, { status: 404 });
+      },
+    });
+    port = server.port!;
+  });
+
+  afterEach(() => {
+    server.stop(true);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  test("piped diff publishes, exits 0, prints [ok] + url", async () => {
+    const r = await run("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n");
+    expect(r.code).toBe(0);
+    expect(r.out).toBe(
+      `[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttp://127.0.0.1:${port}/cli-diff.html\n`,
+    );
+    // uploaded payload is the self-contained viewer page, bearer auth, ttl
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0].auth).toBe("Bearer cli-test");
+    expect(uploads[0].ttl).toBe("7d");
+    expect(uploads[0].body).toContain("<!DOCTYPE html>");
+    // rendered page stores the parsed rows, not raw markers
+    expect(uploads[0].body).toContain('"del","old"');
+    expect(uploads[0].body).toContain('"add","new"');
+  });
+
+  test("empty stdin -> exit 1, nothing published", async () => {
+    const r = await run("  \n");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("empty stdin");
+    expect(uploads).toHaveLength(0);
   });
 });

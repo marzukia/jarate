@@ -4447,13 +4447,14 @@ describe("/diff (issue #7)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest();
     globalThis.fetch = realFetch;
     process.env.HOME = realHome;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
   test("/diff publishes the working tree diff and replies with url + stats", async () => {
-    await handleInbound(pi, inbound("/diff", "m1"), ctx);
+    await handleInbound(pi, inbound("/diff", "dm1"), ctx);
     expect(replyContent()).toBe(
       "[ok] working tree · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
     );
@@ -4475,7 +4476,7 @@ describe("/diff (issue #7)", () => {
       pi,
       inbound(
         "/diff ```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```",
-        "m2",
+        "dm2",
       ),
       ctx,
     );
@@ -4485,7 +4486,7 @@ describe("/diff (issue #7)", () => {
   });
 
   test("/diff with unresolvable arg replies usage", async () => {
-    await handleInbound(pi, inbound("/diff hello\nworld", "m3"), ctx);
+    await handleInbound(pi, inbound("/diff hello\nworld", "dm3"), ctx);
     expect(replyContent()).toBe(
       "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
     );
@@ -4493,7 +4494,7 @@ describe("/diff (issue #7)", () => {
 
   test("/diff without webdrop config reports the gap", async () => {
     fs.rmSync(path.join(tmp, ".config"), { recursive: true, force: true });
-    await handleInbound(pi, inbound("/diff", "m4"), ctx);
+    await handleInbound(pi, inbound("/diff", "dm4"), ctx);
     expect(replyContent()).toBe(
       "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
     );
