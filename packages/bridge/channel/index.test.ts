@@ -11,6 +11,7 @@ import {
   setChannelCursor,
 } from "./discord";
 import extension, {
+  bashToolEssential,
   buildInteractionHandler,
   buildRepliedMessageBlock,
   buildRestartCommand,
@@ -31,12 +32,14 @@ import extension, {
   heldChannels,
   interruptStepTimeoutMs,
   isCompacting,
+  isEssentialToolCall,
   isHeld,
   isVerbose,
   matchCommand,
   midTurnQueues,
   opWindowLabel,
   parseReplyTo,
+  parseVerboseLevel,
   pendingAttachments,
   pendingInterrupts,
   popChannelQueuedInbound,
@@ -60,6 +63,7 @@ import extension, {
   TOOL_LINE_MAX,
   toolActionText,
   updateQueuedInbound,
+  verboseLevel,
   verboseOverride,
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
@@ -739,7 +743,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("activity block: 0 tool calls -> deleted at agent_end (no done line)", async () => {
-    verboseOverride.set("ch1", true); // display gate: block renders only when verbose
+    verboseOverride.set("ch1", 2); // display gate: block renders only when verbose (level 2 = all)
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     const pureTextFinal = {
@@ -766,7 +770,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("activity block: 1+ tool calls -> closed with done line (regression)", async () => {
-    verboseOverride.set("ch1", true); // display gate: block renders only when verbose
+    verboseOverride.set("ch1", 2); // display gate: block renders only when verbose (level 2 = all)
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.tool_call(
@@ -839,7 +843,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   test("verbose-off run leaves the previous run's done line untouched (#38)", async () => {
     // run 1: verbose on — block created, closed with a done line
-    verboseOverride.set("ch1", true);
+    verboseOverride.set("ch1", 2);
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.tool_call(
@@ -859,7 +863,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     // run 2: verbose off, no tool calls — statusMsgId still points at
     // run 1's line; agent_end must not delete or re-edit it
-    verboseOverride.set("ch1", false);
+    verboseOverride.set("ch1", 0);
     fetchCalls.length = 0;
     await handleInbound(pi, inbound("again", "m2"), ctx);
     await handlers.turn_start(null, ctx);
@@ -878,7 +882,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("verbose on->off mid-run deletes the live block (#38)", async () => {
-    verboseOverride.set("ch1", true);
+    verboseOverride.set("ch1", 2);
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.tool_call(
@@ -950,7 +954,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         .filter((c) => String(JSON.parse(c.body).content).includes("┣")),
     ).toHaveLength(0); // quiet run so far
 
-    verboseOverride.set("ch1", true);
+    verboseOverride.set("ch1", 2);
     await handlers.tool_call(
       { toolName: "bash", input: { command: "pwd" } },
       ctx,
@@ -981,14 +985,14 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(st).toContain("quiet");
     expect(st).not.toContain("verbose");
 
-    // /verbose on: the next /status says verbose
+    // /verbose on (legacy = level 2): the next /status says verbose
     await handleInbound(pi, inbound("/verbose on", "m2"), ctx);
     expect(
       fetchCalls.some(
         (c) =>
           c.method === "POST" &&
           c.url.endsWith("/channels/ch1/messages") &&
-          String(JSON.parse(c.body).content).includes("[ok] verbose on"),
+          String(JSON.parse(c.body).content).includes("[ok] verbose: 2"),
       ),
     ).toBe(true);
     fetchCalls.length = 0;
@@ -2336,6 +2340,388 @@ describe("#39 /hold", () => {
     resetRuntimeStateForTest();
     setRuntimeStateDir(dir);
     expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
+  });
+});
+
+// ─── #10 3-level persistent verbosity ────────────────────────────────
+
+describe("#10 verbosity levels", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const OWNER = "<user-id-1>";
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: OWNER,
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+  const posts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => String(JSON.parse(c.body).content));
+  const patches = () =>
+    fetchCalls.filter((c) => c.method === "PATCH").map((c) => String(c.body));
+
+  const setup = (channelOpts: Record<string, unknown> = {}) => {
+    handlers = {};
+    sent = [];
+    fetchCalls = [];
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    verboseOverride.clear();
+    heldChannels.clear();
+    setRuntimeStateDir(null);
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+            ownerUserId: OWNER,
+            forwardToolCalls: false,
+            ...channelOpts,
+          },
+        ],
+      }),
+    );
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-verb-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    setup();
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    setRuntimeStateDir(null);
+    await handlers.agent_end?.({ messages: [] }, ctx);
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("parseVerboseLevel: digits, legacy, kimaki names, garbage", () => {
+    expect(parseVerboseLevel("0")).toBe(0);
+    expect(parseVerboseLevel("off")).toBe(0);
+    expect(parseVerboseLevel("text")).toBe(0);
+    expect(parseVerboseLevel("text-only")).toBe(0);
+    expect(parseVerboseLevel("1")).toBe(1);
+    expect(parseVerboseLevel("essential")).toBe(1);
+    expect(parseVerboseLevel("text-and-essential-tools")).toBe(1);
+    expect(parseVerboseLevel("2")).toBe(2);
+    expect(parseVerboseLevel("on")).toBe(2);
+    expect(parseVerboseLevel("all")).toBe(2);
+    expect(parseVerboseLevel("tools-and-text")).toBe(2);
+    expect(parseVerboseLevel("ON")).toBe(2);
+    expect(parseVerboseLevel("3")).toBeNull();
+    expect(parseVerboseLevel("maybe")).toBeNull();
+  });
+
+  test("bashToolEssential: read-only hidden, side effects shown", () => {
+    const t = (c: string) => bashToolEssential({ command: c });
+    // read-only
+    expect(t("ls")).toBe(false);
+    expect(t("cat /etc/hosts")).toBe(false);
+    expect(t("git log --oneline")).toBe(false);
+    expect(t("git status")).toBe(false);
+    expect(t("git diff")).toBe(false);
+    expect(t("git branch")).toBe(false);
+    expect(t("git tag")).toBe(false);
+    expect(t("git tag -l")).toBe(false);
+    expect(t("git stash list")).toBe(false);
+    expect(t("rg foo bar/")).toBe(false);
+    expect(t("FOO=1 BAR=2 ls -la")).toBe(false);
+    expect(t("ls | grep x")).toBe(false);
+    expect(t("cat a && head b")).toBe(false);
+    // side effects
+    expect(t("git commit -m x")).toBe(true);
+    expect(t("git push")).toBe(true);
+    expect(t("git branch -d old")).toBe(true);
+    expect(t("mkdir -p out")).toBe(true);
+    expect(t("rm -rf node_modules")).toBe(true);
+    expect(t("echo hi > out.txt")).toBe(true);
+    expect(t("ls && rm x")).toBe(true);
+    expect(t("bun test")).toBe(true); // unknown head = shown
+    expect(t("")).toBe(false); // empty: nothing to show
+  });
+
+  test("isEssentialToolCall: non-essential set, MCP always shown", () => {
+    for (const n of [
+      "read",
+      "list",
+      "glob",
+      "grep",
+      "todoread",
+      "skill",
+      "question",
+      "webfetch",
+    ])
+      expect(isEssentialToolCall(n, {})).toBe(false);
+    expect(isEssentialToolCall("edit", {})).toBe(true);
+    expect(isEssentialToolCall("write", {})).toBe(true);
+    expect(isEssentialToolCall("todowrite", {})).toBe(true);
+    expect(isEssentialToolCall("tavily_tavily_search", {})).toBe(true);
+    expect(isEssentialToolCall("jarate", {})).toBe(true);
+    expect(isEssentialToolCall("bash", { command: "ls" })).toBe(false);
+    expect(isEssentialToolCall("bash", { command: "git push" })).toBe(true);
+  });
+
+  test("level 1: non-essential calls hidden live, essentials shown", async () => {
+    verboseOverride.set("ch1", 1);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    // reads + read-only bash: no block created, no line edited
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(posts().some((p) => p.includes("┣"))).toBe(false);
+    // an edit shows up (fresh block)
+    await handlers.tool_call(
+      { toolName: "edit", input: { path: "a.txt" } },
+      ctx,
+    );
+    expect(posts().some((p) => p.includes("┣ edit a.txt"))).toBe(true);
+    // a side-effect bash shows in the existing block
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "git push" } },
+      ctx,
+    );
+    expect(patches().some((p) => p.includes("┣ bash git push"))).toBe(true);
+  });
+
+  test("level 1 done frame lists essentials only; all-read run deletes the block", async () => {
+    verboseOverride.set("ch1", 1);
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
+    // run A: read + edit + bash push -> frame shows 2 calls, no read
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "edit", input: { path: "a.txt" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "git push" } },
+      ctx,
+    );
+    await handlers.agent_end({ messages: [fin("done A")] }, ctx);
+    const donePatch = patches().find((p) => p.includes("┌ done"));
+    expect(donePatch).toBeDefined();
+    expect(donePatch).toContain("┌ done · 2 calls · ");
+    expect(donePatch).toContain("edit a.txt");
+    expect(donePatch).toContain("bash git push");
+    expect(donePatch).not.toContain("read a.txt");
+
+    // run B: only non-essential calls -> no live block at level 1 and no
+    // done frame (nothing was ever posted to close)
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("again", "m2"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "b.txt" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    // level 1: no live block was created at all
+    expect(posts().some((p) => p.includes("┣"))).toBe(false);
+    await handlers.agent_end({ messages: [fin("done B")] }, ctx);
+    expect(patches().some((p) => p.includes("┌ done"))).toBe(false);
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("done B"),
+      ),
+    ).toBe(true); // final still posts
+  });
+
+  test("level 2 shows everything (incl. reads) in the done frame", async () => {
+    verboseOverride.set("ch1", 2);
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "edit", input: { path: "a.txt" } },
+      ctx,
+    );
+    await handlers.agent_end({ messages: [fin("done")] }, ctx);
+    const donePatch = patches().find((p) => p.includes("┌ done"));
+    expect(donePatch).toContain("┌ done · 2 calls · ");
+    expect(donePatch).toContain("read a.txt");
+  });
+
+  test("/verbose sets + persists; bare shows; legacy on/off map to 2/0", async () => {
+    setRuntimeStateDir(path.join(tmp, ".tmp"));
+    const dir = path.join(tmp, ".tmp");
+    await handleInbound(pi, inbound("/verbose 1", "m1"), ctx);
+    expect(posts()).toContain("[ok] verbose: 1 (essential)");
+    let onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.channels.ch1.verbose).toBe(1);
+
+    // bare /verbose shows the current level and changes nothing
+    await handleInbound(pi, inbound("/verbose", "m2"), ctx);
+    expect(posts()).toContain("[ok] verbose: 1 (essential)");
+    onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.channels.ch1.verbose).toBe(1);
+
+    // legacy on/off still accepted
+    await handleInbound(pi, inbound("/verbose on", "m3"), ctx);
+    expect(posts()).toContain("[ok] verbose: 2 (all)");
+    await handleInbound(pi, inbound("/verbose off", "m4"), ctx);
+    expect(posts()).toContain("[ok] verbose: 0 (text)");
+    onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.channels.ch1.verbose).toBe(0);
+
+    // bad arg: usage error, no change
+    await handleInbound(pi, inbound("/verbose 3", "m5"), ctx);
+    expect(posts()).toContain("[!] usage: /verbose 0|1|2");
+    onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.channels.ch1.verbose).toBe(0);
+  });
+
+  test("verbosity level survives a simulated restart (state file reload)", async () => {
+    setRuntimeStateDir(path.join(tmp, ".tmp"));
+    await handleInbound(pi, inbound("/verbose 1", "m1"), ctx);
+    // simulated process restart: in-memory wiped, file reloaded
+    resetRuntimeStateForTest();
+    setRuntimeStateDir(path.join(tmp, ".tmp"));
+    const ch = loadChannelConfig(ctx.cwd)[0]!;
+    expect(verboseLevel(ch)).toBe(1);
+    expect(isVerbose(ch)).toBe(true);
+    // and it renders at level 1
+    await handleInbound(pi, inbound("hello", "m2"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    expect(posts().some((p) => p.includes("┣"))).toBe(false); // read hidden at 1
+  });
+
+  test("forwardToolCalls=true defaults to level 2; override wins", async () => {
+    setup({ forwardToolCalls: true });
+    const ch = loadChannelConfig(ctx.cwd)[0]!;
+    expect(verboseLevel(ch)).toBe(2);
+    verboseOverride.set("ch1", 1);
+    expect(verboseLevel(ch)).toBe(1);
+    verboseOverride.set("ch1", 0);
+    expect(verboseLevel(ch)).toBe(0);
+  });
+
+  test("level 2->1 transition keeps the live block; 1->0 deletes it", async () => {
+    verboseOverride.set("ch1", 2);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    expect(posts().some((p) => p.includes("┣"))).toBe(true); // block at level 2
+
+    // 2 -> 1: block stays (still verbose); reads stop rendering
+    await handleInbound(pi, inbound("/verbose 1", "m2"), ctx);
+    expect(
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
+      ),
+    ).toBe(false);
+    fetchCalls.length = 0;
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "b.txt" } },
+      ctx,
+    );
+    expect(patches().length).toBe(0); // no edit: non-essential at 1
+
+    // 1 -> 0: live block deleted on the transition
+    await handleInbound(pi, inbound("/verbose off", "m3"), ctx);
+    expect(
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
+      ),
+    ).toBe(true);
   });
 });
 

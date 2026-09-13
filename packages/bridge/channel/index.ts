@@ -152,7 +152,42 @@ let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
 let pendingCompact: { ch: ChannelConfig; instructions?: string } | null = null;
 // /verbose per-channel override (until restart). Exported for tests and
 // for #10 (3-level display + persistence builds on this).
-export const verboseOverride = new Map<string, boolean>();
+// /verbose per-channel override (#10): 3-level tool-call display,
+// persisted in channel-state.json (survives restarts).
+//   0 = text only (no tool calls)
+//   1 = text + essential tools (edits, side-effect bash, MCP/custom)
+//   2 = all tool calls
+export type VerboseLevel = 0 | 1 | 2;
+export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
+  0: "text",
+  1: "essential",
+  2: "all",
+};
+export const verboseOverride = new Map<string, VerboseLevel>();
+
+/** #10: parse a /verbose arg into a level. on/2 = all, off/0 = text,
+ *  kimaki names (text/essential/all) accepted; null = not a level. */
+export function parseVerboseLevel(a: string): VerboseLevel | null {
+  switch (a.toLowerCase()) {
+    case "0":
+    case "off":
+    case "text":
+    case "text-only":
+      return 0;
+    case "1":
+    case "essential":
+    case "text-and-essential-tools":
+      return 1;
+    case "2":
+    case "on":
+    case "all":
+    case "tools":
+    case "tools-and-text":
+      return 2;
+    default:
+      return null;
+  }
+}
 // /hold per-channel flag (#39): while held, plain messages buffer in the
 // re-wake queue without starting a run; /hold off drains them in order.
 // Survives restarts via channel-state.json (persistChannelRuntimeState).
@@ -186,6 +221,12 @@ function ensureRuntimeStateLoaded(): void {
     const { channels } = loadChannelStateFile(dir);
     for (const [id, s] of Object.entries(channels)) {
       if (s.hold === true) heldChannels.add(id);
+      // #10: persisted verbosity (valid levels only; garbage is dropped)
+      if (
+        typeof s.verbose === "number" &&
+        (s.verbose === 0 || s.verbose === 1 || s.verbose === 2)
+      )
+        verboseOverride.set(id, s.verbose as VerboseLevel);
     }
   } catch (e) {
     console.error(
@@ -954,8 +995,17 @@ export function resetFinalRepeats(channelId: string): void {
   finalReps.delete(channelId);
 }
 
+/** #10: the channel's effective verbosity level — the /verbose override,
+ *  else the settings default (forwardToolCalls true = 2, unset = 0). */
+export function verboseLevel(ch: ChannelConfig): VerboseLevel {
+  ensureRuntimeStateLoaded();
+  const o = verboseOverride.get(ch.id);
+  if (o !== undefined) return o;
+  return ch.forwardToolCalls ? 2 : 0;
+}
+
 export function isVerbose(ch: ChannelConfig): boolean {
-  return verboseOverride.get(ch.id) ?? ch.forwardToolCalls ?? false;
+  return verboseLevel(ch) > 0;
 }
 
 /** #39: is this channel held (plain messages buffer until /hold off)? */
@@ -1023,6 +1073,113 @@ export function toolActionText(toolName: string, input: any): string {
       return fit(`${toolName} ${esc(one(args))}`, 36);
     }
   }
+}
+
+// #10 level 1: essential-tool filter, ported from kimaki
+// (docs/essential-tools-filtering.md). Navigation/read tools are hidden;
+// edits, state changes and MCP/custom tools are shown. pi's bash has no
+// hasSideEffect flag (kimaki: hasSideEffect !== false = shown), so read-
+// only bash is classified by command head. Conservative: anything
+// unrecognized counts as essential (shown), never hidden.
+const NON_ESSENTIAL_TOOLS = new Set([
+  "read",
+  "list",
+  "glob",
+  "grep",
+  "todoread",
+  "skill",
+  "question",
+  "webfetch",
+]);
+
+const READONLY_BASH_HEADS = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "less",
+  "more",
+  "grep",
+  "egrep",
+  "fgrep",
+  "rg",
+  "find",
+  "wc",
+  "file",
+  "stat",
+  "du",
+  "df",
+  "pwd",
+  "which",
+  "type",
+  "printenv",
+  "env",
+  "date",
+  "whoami",
+  "hostname",
+  "uname",
+  "realpath",
+  "basename",
+  "dirname",
+  "sort",
+  "uniq",
+  "diff",
+  "comm",
+  "tree",
+  "true",
+  "echo",
+  "ps",
+  "uptime",
+]);
+
+/** #10 level 1: read-only `git` subcommands (write commands are essential). */
+const GIT_READONLY_SUBS = new Set([
+  "log",
+  "status",
+  "diff",
+  "show",
+  "ls-files",
+  "describe",
+  "rev-parse",
+  "shortlog",
+]);
+
+function gitReadonly(sub: string, third: string | undefined): boolean {
+  if (GIT_READONLY_SUBS.has(sub)) return true;
+  if (sub === "branch") return !third; // bare list; `branch -d` etc. write
+  if (sub === "tag") return !third || third === "-l" || third === "--list";
+  if (sub === "stash") return third === "list" || third === "show";
+  return false;
+}
+
+/** #10: would a `bash` command only read? Redirects and unknown heads
+ *  count as side effects (shown). Segments are split on pipes, &&, ||, ;. */
+export function bashToolEssential(input: any): boolean {
+  const cmd = String(input?.command ?? "").trim();
+  if (!cmd) return false;
+  if (cmd.includes(">")) return true; // a redirect writes something
+  for (const seg of cmd.split(/\s*(?:\|\||&&|;|\|)\s*/)) {
+    const parts = seg.trim().split(/\s+/).filter(Boolean);
+    // skip env VAR=x prefixes on the first token(s)
+    while (parts.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[0]!))
+      parts.shift();
+    const head = parts[0] ?? "";
+    if (head === "git") {
+      const sub = parts[1] ?? "";
+      if (gitReadonly(sub, parts[2])) continue;
+      return true;
+    }
+    if (READONLY_BASH_HEADS.has(head)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** #10: would this tool call render at verbosity level 1? */
+export function isEssentialToolCall(toolName: string, input: any): boolean {
+  if (NON_ESSENTIAL_TOOLS.has(toolName)) return false;
+  if (toolName === "bash") return bashToolEssential(input);
+  return true; // edits, writes, tasks, MCP/custom: all essential
 }
 
 /**
@@ -1579,7 +1736,11 @@ export async function flushExpiredPendingBatches(
 export default function (pi: ExtensionAPI) {
   let channels: ChannelConfig[] = [];
   let workspaceRoot = "";
-  let toolCallsThisTurn: string[] = [];
+  let toolCallsThisTurn: {
+    name: string;
+    action: string;
+    essential: boolean;
+  }[] = [];
   // Live status line: one message per run, edited in place per tool call.
   let statusMsgId: string | null = null;
   let statusChannelId: string | null = null;
@@ -1948,12 +2109,22 @@ export default function (pi: ExtensionAPI) {
       }
     }
     runToolCount += 1;
-    lastToolAction = toolActionText(event.toolName, event.input);
+    const action = toolActionText(event.toolName, event.input);
+    // #10: record EVERY call (the done frame at run end filters to
+    // essentials at level 1); the live block renders per level.
+    toolCallsThisTurn.push({
+      name: event.toolName,
+      action,
+      essential: isEssentialToolCall(event.toolName, event.input),
+    });
+    lastToolAction = action;
     const line = statusLine(lastToolAction, runToolCount, runStartedAt);
-    toolCallsThisTurn.push(lastToolAction); // always recorded: done frame at run end
-    // Display gate (#38): the block renders only while verbose is on;
-    // with it off there is nothing to create or edit.
-    if (!isVerbose(ch)) return;
+    const rec = toolCallsThisTurn[toolCallsThisTurn.length - 1]!;
+    // Display gate (#38/#10): level 0 renders nothing; level 1 renders
+    // essential tools only (reads, read-only bash, ... stay hidden);
+    // level 2 renders every call.
+    const lvl = verboseLevel(ch);
+    if (lvl === 0 || (lvl === 1 && !rec.essential)) return;
     try {
       if (!statusMsgId) {
         const r = await sendDiscordMessage(ch, line);
@@ -2003,9 +2174,12 @@ export default function (pi: ExtensionAPI) {
         console.error("[undo] start failed:", sanitizeUnknownValue(e));
       }
       // fresh block per user message; previous blocks stay in history.
-      // Display gate (#38): render only while verbose is on — run state
-      // still tracks the run, so agent_end's done-line no-ops cleanly.
-      if (isVerbose(ch)) {
+      // Display gate (#38/#10): level 2 posts the placeholder up front;
+      // level 1 waits for the first essential call (tool_call creates the
+      // block) so a reads-only run shows nothing; level 0 shows nothing.
+      // Run state still tracks the run, so agent_end's done-line no-ops
+      // cleanly.
+      if (verboseLevel(ch) === 2) {
         const r = await sendDiscordMessage(ch, "┣ working…");
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
@@ -2245,7 +2419,15 @@ export default function (pi: ExtensionAPI) {
       statusChannelId === ch.id &&
       statusMsgAt >= runStartedAt
     ) {
-      if (runToolCount === 0) {
+      // #10: level 1 shows essential calls only; a run whose calls are all
+      // non-essential closes like a 0-call run (delete the block).
+      const lvl = verboseLevel(ch);
+      const shownActions = (
+        lvl === 1
+          ? toolCallsThisTurn.filter((c) => c.essential)
+          : toolCallsThisTurn
+      ).map((c) => c.action);
+      if (shownActions.length === 0) {
         await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
@@ -2255,7 +2437,7 @@ export default function (pi: ExtensionAPI) {
         await editDiscordMessage(
           ch,
           statusMsgId,
-          `\`\`\`bash\n${doneFrame(toolCallsThisTurn, runToolCount, secs, failed)}\n\`\`\``,
+          `\`\`\`bash\n${doneFrame(shownActions, shownActions.length, secs, failed)}\n\`\`\``,
         ).catch(() => {});
       }
     }
@@ -2348,7 +2530,7 @@ const HELP_TEXT = [
   "`/restart` - restart pi, resuming THIS session (owner)",
   "`/undo` - revert last assistant turn: files + conversation (owner)",
   "`/redo` - reapply an /undo (one level deep, owner)",
-  "`/verbose on|off` - forward tool calls to the channel (owner)",
+  "`/verbose [0|1|2|on|off]` - tool detail: 0 text, 1 essential, 2 all (owner)",
   "`/hold [on|off]` - buffer messages until released (owner)",
   "`/compact [instructions]` - compact session context (owner)",
   "`/model [name]` - switch or list models (owner)",
@@ -3216,17 +3398,24 @@ async function runChannelCommand(
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
-      const a = arg?.toLowerCase();
-      const prev = isVerbose(ch);
-      const next = a === undefined ? !prev : a === "on";
+      const a = (arg ?? "").trim().toLowerCase();
+      const prev = verboseLevel(ch);
+      // Bare command: show the current level (read-only, no change).
+      if (a === "")
+        return {
+          immediate: `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
+        };
+      const next = parseVerboseLevel(a);
+      if (next === null) return { immediate: "[!] usage: /verbose 0|1|2" };
       verboseOverride.set(ch.id, next);
-      // Live on->off transition: delete the in-flight block so it does
+      persistChannelRuntimeState(ch.id, { verbose: next });
+      // Live >0 -> 0 transition: delete the in-flight block so it does
       // not sit in history as a stale "working…" line. The closure-owned
       // hook is registered by the extension instance (module-level
       // command path, see onDeleteStatusBlock above).
-      if (prev && !next) await onDeleteStatusBlock?.(ch);
+      if (prev > 0 && next === 0) await onDeleteStatusBlock?.(ch);
       return {
-        immediate: `[ok] verbose ${next ? "on" : "off"} (until restart)`,
+        immediate: `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
       };
     }
     case "compact": {

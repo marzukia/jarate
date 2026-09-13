@@ -31,7 +31,7 @@ and untagged.
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
-| `/verbose on\|off` | `[ok] …` |
+| `/verbose [0\|1\|2\|on\|off]` | `[ok] verbose: 1 (essential)` |
 | `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
 | `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
@@ -229,12 +229,33 @@ context).
 ### /verbose
 
 ```
-/verbose on      # show tool calls in forwarded responses
-/verbose off     # hide them
-/verbose         # toggle
+/verbose           # show the current level (no change)
+/verbose 1         # text + essential tools (default: edits, side-effect bash, MCP)
+/verbose 2         # all tool calls
+/verbose 0         # text only (no tool calls)
+/verbose on        # legacy: same as /verbose 2
+/verbose off       # legacy: same as /verbose 0
 ```
 
-Owner only. Takes effect until the next pi restart.
+Owner only. Three levels (kimaki parity):
+
+| level | shown |
+| --- | --- |
+| `0` text | text responses only; no tool calls |
+| `1` essential | text + essential tools: edits/writes, side-effect bash, MCP/custom tools. Hidden: `read`, `list`, `glob`, `grep`, `todoread`, `skill`, `question`, `webfetch`, read-only bash |
+| `2` all | every tool call |
+
+Takes effect immediately, including a run in flight (the live block and
+the done frame re-filter on the next tool call), and **persists across
+restarts** in the bridge's per-channel state file (the same
+`channel-state.json` store as the Discord cursor and the `/hold` flag).
+The level-1 bash classifier is conservative: any redirect, unknown
+command head, or non-read-only `git` subcommand counts as a side effect
+and is shown. A run whose calls are all non-essential at level 1 closes
+with no done frame (the block is deleted, like a 0-call run).
+
+Without a `/verbose` override the channel falls back to its settings
+`forwardToolCalls` (`true` = level 2, unset = level 0).
 
 ### /compact
 
