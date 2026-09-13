@@ -44,8 +44,10 @@ import {
   getChannelCursor,
   getDiscordChannelId,
   getDiscordToken,
+  loadChannelStateFile,
   loadDiscordAttachment,
   MAX_ATTACHMENT_BYTES,
+  patchChannelState,
   registerDiscordCommands,
   respondToInteraction,
   sendDiscordMessage,
@@ -150,7 +152,103 @@ let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
 let pendingCompact: { ch: ChannelConfig; instructions?: string } | null = null;
 // /verbose per-channel override (until restart). Exported for tests and
 // for #10 (3-level display + persistence builds on this).
-export const verboseOverride = new Map<string, boolean>();
+// /verbose per-channel override (#10): 3-level tool-call display,
+// persisted in channel-state.json (survives restarts).
+//   0 = text only (no tool calls)
+//   1 = text + essential tools (edits, side-effect bash, MCP/custom)
+//   2 = all tool calls
+export type VerboseLevel = 0 | 1 | 2;
+export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
+  0: "text",
+  1: "essential",
+  2: "all",
+};
+export const verboseOverride = new Map<string, VerboseLevel>();
+
+/** #10: parse a /verbose arg into a level. on/2 = all, off/0 = text,
+ *  kimaki names (text/essential/all) accepted; null = not a level. */
+export function parseVerboseLevel(a: string): VerboseLevel | null {
+  switch (a.toLowerCase()) {
+    case "0":
+    case "off":
+    case "text":
+    case "text-only":
+      return 0;
+    case "1":
+    case "essential":
+    case "text-and-essential-tools":
+      return 1;
+    case "2":
+    case "on":
+    case "all":
+    case "tools":
+    case "tools-and-text":
+      return 2;
+    default:
+      return null;
+  }
+}
+// /hold per-channel flag (#39): while held, plain messages buffer in the
+// re-wake queue without starting a run; /hold off drains them in order.
+// Survives restarts via channel-state.json (persistChannelRuntimeState).
+export const heldChannels = new Set<string>();
+// Per-channel runtime state (hold flags, later #10 verbosity) lives in
+// <cwd>/.tmp/channel-state.json — the same store the Discord cursor uses
+// (discord.ts loadChannelStateFile / patchChannelState). runtimeStateDir
+// is set at session_start; ensureRuntimeStateLoaded re-reads the file at
+// most once per dir (a fresh process starts with a null guard, so boot
+// always loads; in-process re-starts reload via setRuntimeStateDir).
+let runtimeStateDir: string | null = null;
+let runtimeStateLoadedFor: string | null = null;
+/** Set the runtime-state dir + reset the load guard. Exported for tests. */
+export function setRuntimeStateDir(dir: string | null): void {
+  runtimeStateDir = dir;
+  runtimeStateLoadedFor = null;
+}
+/** Wipe in-memory runtime state (hold flags, verbose overrides, guard) —
+ *  a process-restart simulation. Exported for tests. */
+export function resetRuntimeStateForTest(): void {
+  runtimeStateLoadedFor = null;
+  heldChannels.clear();
+  verboseOverride.clear();
+}
+function ensureRuntimeStateLoaded(): void {
+  const dir = runtimeStateDir ?? "";
+  if (runtimeStateLoadedFor === dir) return;
+  runtimeStateLoadedFor = dir;
+  if (!dir) return;
+  try {
+    const { channels } = loadChannelStateFile(dir);
+    for (const [id, s] of Object.entries(channels)) {
+      if (s.hold === true) heldChannels.add(id);
+      // #10: persisted verbosity (valid levels only; garbage is dropped)
+      if (
+        typeof s.verbose === "number" &&
+        (s.verbose === 0 || s.verbose === 1 || s.verbose === 2)
+      )
+        verboseOverride.set(id, s.verbose as VerboseLevel);
+    }
+  } catch (e) {
+    console.error(
+      "[channel] runtime state load failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
+}
+/** Persist per-channel runtime flags to channel-state.json. Never throws. */
+export function persistChannelRuntimeState(
+  chId: string,
+  patch: { hold?: boolean; verbose?: number },
+): void {
+  try {
+    patchChannelState(runtimeStateDir, chId, patch);
+  } catch (e) {
+    console.error(
+      "[channel] runtime state persist failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
+}
 // Display gate (#38): the extension closure owns the live status-block
 // state; the module-level command paths reach it through this hook (one
 // extension instance per process, registered in the extension body).
@@ -246,17 +344,21 @@ export function queueMidTurnInbound(
   return q.length;
 }
 
-/** Pop the globally oldest queued inbound across all channels (FIFO). */
+/** Pop the globally oldest queued inbound across all channels (FIFO).
+ *  Held channels (#39) are skipped: their buffer drains on /hold off,
+ *  not at agent_end. */
 export function popOldestQueuedInbound(): {
   channelId: string;
   msg: ChannelMessage;
 } | null {
+  ensureRuntimeStateLoaded();
   let oldest: {
     channelId: string;
     msg: ChannelMessage;
     queuedAt: number;
   } | null = null;
   for (const [channelId, q] of midTurnQueues) {
+    if (heldChannels.has(channelId)) continue;
     const head = q[0];
     if (!head) continue;
     if (!oldest || head.queuedAt < oldest.queuedAt)
@@ -278,6 +380,19 @@ export function clearQueuedInbound(channelId: string): number {
   const n = q.length;
   midTurnQueues.delete(channelId);
   return n;
+}
+
+/** Pop the oldest queued inbound for ONE channel (#39 /hold off drain).
+ *  Returns null when the channel's line is empty. */
+export function popChannelQueuedInbound(
+  channelId: string,
+): QueuedInbound | null {
+  const q = midTurnQueues.get(channelId);
+  if (!q || q.length === 0) return null;
+  const e = q.shift()!;
+  if (q.length === 0) midTurnQueues.delete(channelId);
+  consumeQueuedAck(channelId, e.msg.messageId);
+  return e;
 }
 
 /** Remove one armed interrupt timer (the queue entry for it is gone).
@@ -880,8 +995,30 @@ export function resetFinalRepeats(channelId: string): void {
   finalReps.delete(channelId);
 }
 
+/** #10: the channel's effective verbosity level — the /verbose override,
+ *  else the settings default (forwardToolCalls true = 2, unset = 0). */
+export function verboseLevel(ch: ChannelConfig): VerboseLevel {
+  ensureRuntimeStateLoaded();
+  const o = verboseOverride.get(ch.id);
+  if (o !== undefined) return o;
+  return ch.forwardToolCalls ? 2 : 0;
+}
+
 export function isVerbose(ch: ChannelConfig): boolean {
-  return verboseOverride.get(ch.id) ?? ch.forwardToolCalls ?? false;
+  return verboseLevel(ch) > 0;
+}
+
+/** #39: is this channel held (plain messages buffer until /hold off)? */
+export function isHeld(ch: ChannelConfig): boolean {
+  ensureRuntimeStateLoaded();
+  return heldChannels.has(ch.id);
+}
+
+/** #39: set + persist the hold flag for a channel. */
+export function setHeld(chId: string, on: boolean): void {
+  if (on) heldChannels.add(chId);
+  else heldChannels.delete(chId);
+  persistChannelRuntimeState(chId, { hold: on });
 }
 
 /**
@@ -936,6 +1073,105 @@ export function toolActionText(toolName: string, input: any): string {
       return fit(`${toolName} ${esc(one(args))}`, 36);
     }
   }
+}
+
+// #10 level 1: essential-tool filter. Spec (mockup3 section 6): edits +
+// MCP/custom shown, reads/searches hidden. pi core tool names, verified
+// against pi dist core/tools (review M1: the first port used kimaki/
+// OpenCode names - list/glob/todoread/skill/question/webfetch are dead
+// in pi; its navigation tools are ls and find).
+const NON_ESSENTIAL_TOOLS = new Set(["read", "grep", "ls", "find"]);
+
+// L1 (review): recognized bash heads with write flags escape the head
+// check (find . -delete, sort -o out) - rare, accepted.
+const READONLY_BASH_HEADS = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "less",
+  "more",
+  "grep",
+  "egrep",
+  "fgrep",
+  "rg",
+  "find",
+  "wc",
+  "file",
+  "stat",
+  "du",
+  "df",
+  "pwd",
+  "which",
+  "type",
+  "printenv",
+  "env",
+  "date",
+  "whoami",
+  "hostname",
+  "uname",
+  "realpath",
+  "basename",
+  "dirname",
+  "sort",
+  "uniq",
+  "diff",
+  "comm",
+  "tree",
+  "true",
+  "echo",
+  "ps",
+  "uptime",
+]);
+
+/** #10 level 1: read-only `git` subcommands (write commands are essential). */
+const GIT_READONLY_SUBS = new Set([
+  "log",
+  "status",
+  "diff",
+  "show",
+  "ls-files",
+  "describe",
+  "rev-parse",
+  "shortlog",
+]);
+
+function gitReadonly(sub: string, third: string | undefined): boolean {
+  if (GIT_READONLY_SUBS.has(sub)) return true;
+  if (sub === "branch") return !third; // bare list; `branch -d` etc. write
+  if (sub === "tag") return !third || third === "-l" || third === "--list";
+  if (sub === "stash") return third === "list" || third === "show";
+  return false;
+}
+
+/** #10: would a `bash` command only read? Redirects and unknown heads
+ *  count as side effects (shown). Segments are split on pipes, &&, ||, ;. */
+export function bashToolEssential(input: any): boolean {
+  const cmd = String(input?.command ?? "").trim();
+  if (!cmd) return false;
+  if (cmd.includes(">")) return true; // a redirect writes something
+  for (const seg of cmd.split(/\s*(?:\|\||&&|;|\|)\s*/)) {
+    const parts = seg.trim().split(/\s+/).filter(Boolean);
+    // skip env VAR=x prefixes on the first token(s)
+    while (parts.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[0]!))
+      parts.shift();
+    const head = parts[0] ?? "";
+    if (head === "git") {
+      const sub = parts[1] ?? "";
+      if (gitReadonly(sub, parts[2])) continue;
+      return true;
+    }
+    if (READONLY_BASH_HEADS.has(head)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** #10: would this tool call render at verbosity level 1? */
+export function isEssentialToolCall(toolName: string, input: any): boolean {
+  if (NON_ESSENTIAL_TOOLS.has(toolName)) return false;
+  if (toolName === "bash") return bashToolEssential(input);
+  return true; // edits, writes, tasks, MCP/custom: all essential
 }
 
 /**
@@ -1241,7 +1477,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -1492,12 +1728,17 @@ export async function flushExpiredPendingBatches(
 export default function (pi: ExtensionAPI) {
   let channels: ChannelConfig[] = [];
   let workspaceRoot = "";
-  let toolCallsThisTurn: string[] = [];
+  let toolCallsThisTurn: {
+    name: string;
+    action: string;
+    essential: boolean;
+  }[] = [];
   // Live status line: one message per run, edited in place per tool call.
   let statusMsgId: string | null = null;
   let statusChannelId: string | null = null;
   let statusMsgAt = 0;
   let runToolCount = 0;
+  let runEssentialCount = 0; // #10 level 1: essentials only (review L2: live count must match the done frame count)
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -1560,6 +1801,11 @@ export default function (pi: ExtensionAPI) {
     workspaceRoot = ctx.cwd;
     configRoot = ctx.cwd;
     channels = loadChannelConfig(ctx.cwd);
+    // #39/#10: per-channel runtime state (hold flags, verbosity) reloads
+    // from <cwd>/.tmp/channel-state.json on every session start (the same
+    // file the Discord cursor persists to; see discord.ts).
+    setRuntimeStateDir(path.join(ctx.cwd, ".tmp"));
+    ensureRuntimeStateLoaded();
 
     const enabled = channels.filter((c) => c.enabled);
     if (enabled.length === 0) return;
@@ -1811,7 +2057,11 @@ export default function (pi: ExtensionAPI) {
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
       return lastToolAction
-        ? statusLine(lastToolAction, runToolCount, Date.now() - inc * 1000)
+        ? statusLine(
+            lastToolAction,
+            verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
+            Date.now() - inc * 1000,
+          )
         : `┣ working… ${inc}s`;
     });
   };
@@ -1843,6 +2093,7 @@ export default function (pi: ExtensionAPI) {
     if (!runOpen) {
       runOpen = true;
       runToolCount = 0;
+      runEssentialCount = 0;
       runStartedAt = Date.now();
       // reuse the line only while it is fresh; an old one is buried in
       // history — delete it and start near the current conversation
@@ -1856,12 +2107,27 @@ export default function (pi: ExtensionAPI) {
       }
     }
     runToolCount += 1;
-    lastToolAction = toolActionText(event.toolName, event.input);
-    const line = statusLine(lastToolAction, runToolCount, runStartedAt);
-    toolCallsThisTurn.push(lastToolAction); // always recorded: done frame at run end
-    // Display gate (#38): the block renders only while verbose is on;
-    // with it off there is nothing to create or edit.
-    if (!isVerbose(ch)) return;
+    const action = toolActionText(event.toolName, event.input);
+    // #10: record EVERY call (the done frame at run end filters to
+    // essentials at level 1); the live block renders per level.
+    const essential = isEssentialToolCall(event.toolName, event.input);
+    if (essential) runEssentialCount += 1; // review L2: live count == done frame count
+    toolCallsThisTurn.push({
+      name: event.toolName,
+      action,
+      essential,
+    });
+    lastToolAction = action;
+    // Display gate (#38/#10): level 0 renders nothing; level 1 renders
+    // essential tools only (reads, read-only bash, ... stay hidden);
+    // level 2 renders every call.
+    const lvl = verboseLevel(ch);
+    if (lvl === 0 || (lvl === 1 && !essential)) return;
+    const line = statusLine(
+      lastToolAction,
+      lvl === 1 ? runEssentialCount : runToolCount,
+      runStartedAt,
+    );
     try {
       if (!statusMsgId) {
         const r = await sendDiscordMessage(ch, line);
@@ -1894,6 +2160,7 @@ export default function (pi: ExtensionAPI) {
     if (!runOpen) {
       runOpen = true;
       runToolCount = 0;
+      runEssentialCount = 0;
       lastToolAction = null;
       runStartedAt = Date.now();
       // Reset the status pointer for every new run, gate or no gate: a
@@ -1911,9 +2178,12 @@ export default function (pi: ExtensionAPI) {
         console.error("[undo] start failed:", sanitizeUnknownValue(e));
       }
       // fresh block per user message; previous blocks stay in history.
-      // Display gate (#38): render only while verbose is on — run state
-      // still tracks the run, so agent_end's done-line no-ops cleanly.
-      if (isVerbose(ch)) {
+      // Display gate (#38/#10): level 2 posts the placeholder up front;
+      // level 1 waits for the first essential call (tool_call creates the
+      // block) so a reads-only run shows nothing; level 0 shows nothing.
+      // Run state still tracks the run, so agent_end's done-line no-ops
+      // cleanly.
+      if (verboseLevel(ch) === 2) {
         const r = await sendDiscordMessage(ch, "┣ working…");
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
@@ -2153,7 +2423,15 @@ export default function (pi: ExtensionAPI) {
       statusChannelId === ch.id &&
       statusMsgAt >= runStartedAt
     ) {
-      if (runToolCount === 0) {
+      // #10: level 1 shows essential calls only; a run whose calls are all
+      // non-essential closes like a 0-call run (delete the block).
+      const lvl = verboseLevel(ch);
+      const shownActions = (
+        lvl === 1
+          ? toolCallsThisTurn.filter((c) => c.essential)
+          : toolCallsThisTurn
+      ).map((c) => c.action);
+      if (shownActions.length === 0) {
         await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
@@ -2163,7 +2441,7 @@ export default function (pi: ExtensionAPI) {
         await editDiscordMessage(
           ch,
           statusMsgId,
-          `\`\`\`bash\n${doneFrame(toolCallsThisTurn, runToolCount, secs, failed)}\n\`\`\``,
+          `\`\`\`bash\n${doneFrame(shownActions, shownActions.length, secs, failed)}\n\`\`\``,
         ).catch(() => {});
       }
     }
@@ -2256,7 +2534,8 @@ const HELP_TEXT = [
   "`/restart` - restart pi, resuming THIS session (owner)",
   "`/undo` - revert last assistant turn: files + conversation (owner)",
   "`/redo` - reapply an /undo (one level deep, owner)",
-  "`/verbose on|off` - forward tool calls to the channel (owner)",
+  "`/verbose [0|1|2|on|off]` - tool detail: 0 text, 1 essential, 2 all (owner)",
+  "`/hold [on|off]` - buffer messages until released (owner)",
   "`/compact [instructions]` - compact session context (owner)",
   "`/model [name]` - switch or list models (owner)",
   "`/jobs` - list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
@@ -2877,7 +3156,12 @@ async function runChannelCommand(
       // so they land at the next run's first turn boundary.) Armed mid-run
       // interrupts are cleared too: a stopped run is not interrupted by a
       // stale message.
-      const dropped = clearQueuedInbound(ch.id);
+      // #39: a HELD channel's queue is the operator's buffer — /stop clears
+      // the run but NOT the buffer. The held queue persists: it drains on
+      // /hold off, or entries are deleted one by one. (Documented choice:
+      // persist, not clear.)
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
       clearInterrupts(ch.id);
       // Cancel an in-flight interrupt's pending send — but only when one is
       // actually in flight for this channel, so the flag never goes stale
@@ -2891,11 +3175,59 @@ async function runChannelCommand(
         userStoppedRun = true;
         ctx.abort();
       }
+      const heldDepth = held ? (midTurnQueues.get(ch.id)?.length ?? 0) : 0;
       return {
         immediate: restartCancelled
           ? "[-] stopped (restart cancelled)"
-          : "[-] stopped",
+          : heldDepth > 0
+            ? `[-] stopped - ${heldDepth} held in line`
+            : "[-] stopped",
       };
+    }
+    case "hold": {
+      if (!isOwner) return ownerOnly;
+      const a = (arg ?? "").trim().toLowerCase();
+      const on =
+        a === "" ? !isHeld(ch) : a === "on" || a === "1" || a === "yes";
+      if (a !== "" && !on && a !== "off" && a !== "0" && a !== "no")
+        return { immediate: "[!] usage: /hold on|off" };
+      const depth = midTurnQueues.get(ch.id)?.length ?? 0;
+      if (on === isHeld(ch))
+        return {
+          immediate: on ? `[ok] hold on - ${depth} in line` : "[ok] hold off",
+        };
+      setHeld(ch.id, on);
+      if (on) {
+        // Held messages wait their turn: disarm interrupts armed before
+        // the hold. (An in-flight interrupt runs to completion — its
+        // message was queued before the hold. agent_end skips held
+        // channels, so the buffer does not drain on its own.)
+        clearInterrupts(ch.id);
+        return {
+          immediate:
+            depth > 0
+              ? `[ok] hold on - ${depth} in line`
+              : "[ok] hold on - buffered until /hold off",
+        };
+      }
+      // off: drain — send the oldest now when idle; the existing re-wake
+      // loop (agent_end) chains the rest, one run each, in order.
+      if (depth === 0) return { immediate: "[ok] hold off" };
+      if (ctx.isIdle() && !isCompacting(ch.id)) {
+        const entry = popChannelQueuedInbound(ch.id);
+        // Awaits the drained inbound: its send must finish before this
+        // command's reply lands, or the in-flight drain can leak into the
+        // next message's turn (and the next test, in the suite).
+        if (entry)
+          await handleInbound(pi, entry.msg, ctx, true).catch((e) => {
+            console.error(
+              "[channel] hold drain failed:",
+              sanitizeUnknownValue(e),
+            );
+          });
+        return { immediate: `[ok] hold off - ${depth} in line, running` };
+      }
+      return { immediate: `[ok] hold off - ${depth} in line, will run` };
     }
     case "help":
       return { immediate: HELP_TEXT };
@@ -2939,10 +3271,16 @@ async function runChannelCommand(
           // Open op window (compaction OR a restart-class op) shows its
           // label; otherwise the honest idle/running state.
           opWindowLabel(ch.id) ?? (ctx.isIdle() ? "idle" : "running"),
-          // Tool-call display gate state (#38): verbose = block renders,
-          // quiet = tool calls hidden.
-          isVerbose(ch) ? "verbose" : "quiet",
-        ];
+          // Tool-call display level (#10): quiet = 0 (text only),
+          // verbose 1 = essential tools, verbose 2 = all.
+          verboseLevel(ch) === 0 ? "quiet" : `verbose ${verboseLevel(ch)}`,
+          // Channel hold (#39): plain messages buffer, runs don't start.
+          isHeld(ch) ? "hold on" : null,
+          // Queue depth (#47): mid-turn inbounds waiting for the run.
+          midTurnQueues.get(ch.id)?.length
+            ? `queue ${midTurnQueues.get(ch.id)!.length}`
+            : null,
+        ].filter(Boolean);
         // Interrupt state, honestly: in flight, or armed with time to fire.
         if (interruptingChannels.has(ch.id)) {
           parts.push("interrupting");
@@ -3070,17 +3408,24 @@ async function runChannelCommand(
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
-      const a = arg?.toLowerCase();
-      const prev = isVerbose(ch);
-      const next = a === undefined ? !prev : a === "on";
+      const a = (arg ?? "").trim().toLowerCase();
+      const prev = verboseLevel(ch);
+      // Bare command: show the current level (read-only, no change).
+      if (a === "")
+        return {
+          immediate: `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
+        };
+      const next = parseVerboseLevel(a);
+      if (next === null) return { immediate: "[!] usage: /verbose 0|1|2" };
       verboseOverride.set(ch.id, next);
-      // Live on->off transition: delete the in-flight block so it does
+      persistChannelRuntimeState(ch.id, { verbose: next });
+      // Live >0 -> 0 transition: delete the in-flight block so it does
       // not sit in history as a stale "working…" line. The closure-owned
       // hook is registered by the extension instance (module-level
       // command path, see onDeleteStatusBlock above).
-      if (prev && !next) await onDeleteStatusBlock?.(ch);
+      if (prev > 0 && next === 0) await onDeleteStatusBlock?.(ch);
       return {
-        immediate: `[ok] verbose ${next ? "on" : "off"} (until restart)`,
+        immediate: `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
       };
     }
     case "compact": {
@@ -3811,6 +4156,7 @@ export async function handleInbound(
       cmd.name === "sleep" ||
       cmd.name === "tasks" ||
       cmd.name === "stop" ||
+      cmd.name === "hold" ||
       cmd.name === "compact" ||
       cmd.name === "reset" ||
       cmd.name === "restart";
@@ -3936,6 +4282,11 @@ export async function handleInbound(
   const runActive = forceDirect
     ? false
     : !ctx.isIdle() || ctx.hasPendingMessages?.() || isCompacting(ch.id);
+  // #39: while held, EVERY plain message (attachments included) buffers in
+  // the re-wake queue without starting a run — even while idle. The buffer
+  // drains on /hold off. Held messages never arm the mid-run interrupt:
+  // they wait their turn (an interrupt would jump the buffer line).
+  const held = isHeld(ch);
   // Returns true (caller should `return`) when the inbound was queued for a
   // re-wake. Ownership is unambiguous: a message is either sent to pi now or
   // queued for a re-wake — never both. `armInterrupt` false = ". queue"-
@@ -3946,7 +4297,7 @@ export async function handleInbound(
     display: string,
     armInterrupt = true,
   ): boolean => {
-    if (!runActive) return false;
+    if (!held && !runActive) return false;
     // While compacting the message waits the line WITHOUT arming the
     // mid-run interrupt (an interrupt aborts the compaction). It drains
     // when the compaction settles (drainQueuedAfterCompact) or at the
@@ -3956,7 +4307,8 @@ export async function handleInbound(
     // compaction (agent-session.js abort() → abortCompaction). So suppress
     // arming for every channel while ANY window is open, not just the
     // compacting one — a ch2 interrupt would otherwise kill ch1's compact.
-    const arm = armInterrupt && compactingChannels.size === 0;
+    // #39: held messages wait their turn, interrupt or no interrupt.
+    const arm = armInterrupt && !held && compactingChannels.size === 0;
     const pos = queueMidTurnInbound(ch.id, msg, text, gateTitle, display, arm);
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.

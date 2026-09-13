@@ -25,12 +25,14 @@ and untagged.
 | command / output | tag |
 |---|---|
 | `/stop` | `[-] stopped` |
+| `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
 | `/usage [all\|session]` | `[usage] …` (error: `[!] usage: …`) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
-| `/verbose on\|off` | `[ok] …` |
+| `/verbose [0\|1\|2\|on\|off]` | `[ok] verbose: 1 (essential)` |
+| `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
 | `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
 | `/jobs` | `[jobs] …` |
@@ -62,9 +64,10 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
-| `/status` | owner | context-window usage, model, uptime |
+| `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
+| `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
 | `/model [name]` | owner | switch model, or list models when run bare |
@@ -82,6 +85,32 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 
 Aborts the current run immediately. The run's partial output stays in the
 channel (steered steps are already forwarded live).
+
+> **Held channels** (#39): when the channel is held, the re-wake queue is the
+> operator's buffer, and `/stop` does NOT clear it. The ack reports it:
+> `[-] stopped - 3 held in line`. The buffer drains on `/hold off` (or the
+> entries are deleted one by one).
+
+### /hold
+
+```
+/hold on        # buffer: no plain message starts a run until released
+/hold off       # release: the buffer drains, oldest first
+/hold           # toggle
+```
+
+Owner only. Channel-wide queue mode (#39). While held, **every** plain
+message is parked in the re-wake queue — even while idle — each one acked
+`[queued] N in line`, none of them starting a run and none arming the
+mid-run interrupt. Commands (`/stop`, `/verbose`, …) still work normally.
+
+`/hold off` drains the buffer in order: if the channel is idle the oldest
+entry runs immediately and the re-wake loop chains the rest, one run each;
+while a run is in flight the buffer drains at the next run end.
+
+The hold flag persists across restarts (bridge per-channel state file,
+same store as the Discord cursor and the `/verbose` level). `/status`
+reports it while on (`hold on`).
 
 ### mid-run interrupt (any plain message)
 
@@ -163,7 +192,16 @@ what's the webhook TTL? . btw
 /status
 ```
 
-Owner only. Reports context-window usage, active model, and uptime.
+Owner only. One line: context-window usage, active model, uptime, run
+state (idle/running/compacting/op label), the verbosity level (`quiet`
+= 0, `verbose 1`, `verbose 2`, see `/verbose`), `hold on` while the
+channel is held (see `/hold`), `queue N` for the depth of mid-turn
+inbounds waiting on the run, and interrupt state (`interrupting` or
+`interrupt in Ns`).
+
+```
+[status] ctx 41% · model qwen3.8-27b · up 3h12m · running · verbose 1 · queue 2
+```
 
 ### /usage
 
@@ -200,12 +238,33 @@ context).
 ### /verbose
 
 ```
-/verbose on      # show tool calls in forwarded responses
-/verbose off     # hide them
-/verbose         # toggle
+/verbose           # show the current level (no change)
+/verbose 1         # text + essential tools (default: edits, side-effect bash, MCP)
+/verbose 2         # all tool calls
+/verbose 0         # text only (no tool calls)
+/verbose on        # legacy: same as /verbose 2
+/verbose off       # legacy: same as /verbose 0
 ```
 
-Owner only. Takes effect until the next pi restart.
+Owner only. Three levels (kimaki parity):
+
+| level | shown |
+| --- | --- |
+| `0` text | text responses only; no tool calls |
+| `1` essential | text + essential tools: edits/writes, side-effect bash, MCP/custom tools. Hidden: `read`, `list`, `glob`, `grep`, `todoread`, `skill`, `question`, `webfetch`, read-only bash |
+| `2` all | every tool call |
+
+Takes effect immediately, including a run in flight (the live block and
+the done frame re-filter on the next tool call), and **persists across
+restarts** in the bridge's per-channel state file (the same
+`channel-state.json` store as the Discord cursor and the `/hold` flag).
+The level-1 bash classifier is conservative: any redirect, unknown
+command head, or non-read-only `git` subcommand counts as a side effect
+and is shown. A run whose calls are all non-essential at level 1 closes
+with no done frame (the block is deleted, like a 0-call run).
+
+Without a `/verbose` override the channel falls back to its settings
+`forwardToolCalls` (`true` = level 2, unset = level 0).
 
 ### /compact
 

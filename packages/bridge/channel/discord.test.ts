@@ -17,10 +17,13 @@ import {
   handleMessageDelete,
   handleMessageUpdate,
   isBgWebhook,
+  loadChannelStateFile,
   loadPersistedCursors,
   mimeForFile,
   POLL_BACKFILL_MS,
   POLL_INTERVAL_MS,
+  patchChannelState,
+  persistChannelCursor,
   pollDiscord,
   registerDiscordCommands,
   resolveChannelId,
@@ -582,14 +585,14 @@ test("cursor persists to channel-state.json and seeds the next connect (T4)", as
     await tick();
     expect(seen).toEqual(["701"]);
     expect(seeds).toEqual(["seed"]);
-    // Persisted to disk under the discord channel id.
+    // Persisted to disk under the discord channel id (cursors section).
     expect(loadPersistedCursors(dir)["999"]).toBe("701");
     // Atomic write left no temp file behind; the file itself is valid JSON.
     expect(fs.existsSync(path.join(dir, "channel-state.json.tmp"))).toBe(false);
     const onDisk = JSON.parse(
       fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
     );
-    expect(onDisk["999"]).toBe("701");
+    expect(onDisk.cursors["999"]).toBe("701");
     disconnectDiscord("c1");
 
     // Second run: cursor seeded from disk — no limit=1 reseed, and the
@@ -616,6 +619,55 @@ test("loadPersistedCursors: missing/corrupt file → {} (T4)", () => {
     fs.writeFileSync(path.join(dir, "channel-state.json"), "{not json");
     expect(loadPersistedCursors(dir)).toEqual({});
     expect(loadPersistedCursors(null)).toEqual({});
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── Per-channel state file: cursors + runtime flags share one store ───
+
+test("legacy flat cursor file still loads (T4 compat)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-cursor3-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "channel-state.json"),
+      JSON.stringify({ "999": "701", "888": "600" }),
+    );
+    const st = loadChannelStateFile(dir);
+    expect(st.cursors).toEqual({ "999": "701", "888": "600" });
+    expect(st.channels).toEqual({});
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("patchChannelState + persistChannelCursor preserve each other (T4)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-cursor4-"));
+  try {
+    // Flag first, then a cursor write must not clobber it.
+    patchChannelState(dir, "discord-monky", { hold: true });
+    patchChannelState(dir, "discord-monky", { hold: false });
+    patchChannelState(dir, "discord-monky", { verbose: 1 });
+    seedChannelStateForTest("c1", "999", dir);
+    const s: any = getDiscordStates().get("c1");
+    s.lastMessageId = "701";
+    persistChannelCursor(s);
+    const st = loadChannelStateFile(dir);
+    expect(st.cursors["999"]).toBe("701");
+    expect(st.channels["discord-monky"]).toEqual({ hold: false, verbose: 1 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("patchChannelState: corrupt file starts fresh, keeps nothing (T4)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-cursor5-"));
+  try {
+    fs.writeFileSync(path.join(dir, "channel-state.json"), "{not json");
+    patchChannelState(dir, "discord-monky", { hold: true });
+    const st = loadChannelStateFile(dir);
+    expect(st.channels["discord-monky"]?.hold).toBe(true);
+    expect(st.cursors).toEqual({});
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
