@@ -2548,20 +2548,11 @@ describe("#10 verbosity levels", () => {
   });
 
   test("isEssentialToolCall: non-essential set, MCP always shown", () => {
-    for (const n of [
-      "read",
-      "list",
-      "glob",
-      "grep",
-      "todoread",
-      "skill",
-      "question",
-      "webfetch",
-    ])
+    for (const n of ["read", "grep", "ls", "find"])
       expect(isEssentialToolCall(n, {})).toBe(false);
     expect(isEssentialToolCall("edit", {})).toBe(true);
     expect(isEssentialToolCall("write", {})).toBe(true);
-    expect(isEssentialToolCall("todowrite", {})).toBe(true);
+    expect(isEssentialToolCall("todo", {})).toBe(true);
     expect(isEssentialToolCall("tavily_tavily_search", {})).toBe(true);
     expect(isEssentialToolCall("jarate", {})).toBe(true);
     expect(isEssentialToolCall("bash", { command: "ls" })).toBe(false);
@@ -2588,12 +2579,15 @@ describe("#10 verbosity levels", () => {
       ctx,
     );
     expect(posts().some((p) => p.includes("┣ edit a.txt"))).toBe(true);
-    // a side-effect bash shows in the existing block
+    // a side-effect bash shows in the existing block; live count is the
+    // ESSENTIAL count (2: edit + bash), not the total 4 (review L2)
     await handlers.tool_call(
       { toolName: "bash", input: { command: "git push" } },
       ctx,
     );
-    expect(patches().some((p) => p.includes("┣ bash git push"))).toBe(true);
+    expect(patches().some((p) => p.includes("┣ bash git push · 2 calls"))).toBe(
+      true,
+    );
   });
 
   test("level 1 done frame lists essentials only; all-read run deletes the block", async () => {

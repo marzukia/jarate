@@ -1075,23 +1075,15 @@ export function toolActionText(toolName: string, input: any): string {
   }
 }
 
-// #10 level 1: essential-tool filter, ported from kimaki
-// (docs/essential-tools-filtering.md). Navigation/read tools are hidden;
-// edits, state changes and MCP/custom tools are shown. pi's bash has no
-// hasSideEffect flag (kimaki: hasSideEffect !== false = shown), so read-
-// only bash is classified by command head. Conservative: anything
-// unrecognized counts as essential (shown), never hidden.
-const NON_ESSENTIAL_TOOLS = new Set([
-  "read",
-  "list",
-  "glob",
-  "grep",
-  "todoread",
-  "skill",
-  "question",
-  "webfetch",
-]);
+// #10 level 1: essential-tool filter. Spec (mockup3 section 6): edits +
+// MCP/custom shown, reads/searches hidden. pi core tool names, verified
+// against pi dist core/tools (review M1: the first port used kimaki/
+// OpenCode names - list/glob/todoread/skill/question/webfetch are dead
+// in pi; its navigation tools are ls and find).
+const NON_ESSENTIAL_TOOLS = new Set(["read", "grep", "ls", "find"]);
 
+// L1 (review): recognized bash heads with write flags escape the head
+// check (find . -delete, sort -o out) - rare, accepted.
 const READONLY_BASH_HEADS = new Set([
   "ls",
   "cat",
@@ -1746,6 +1738,7 @@ export default function (pi: ExtensionAPI) {
   let statusChannelId: string | null = null;
   let statusMsgAt = 0;
   let runToolCount = 0;
+  let runEssentialCount = 0; // #10 level 1: essentials only (review L2: live count must match the done frame count)
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -2064,7 +2057,11 @@ export default function (pi: ExtensionAPI) {
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
       return lastToolAction
-        ? statusLine(lastToolAction, runToolCount, Date.now() - inc * 1000)
+        ? statusLine(
+            lastToolAction,
+            verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
+            Date.now() - inc * 1000,
+          )
         : `┣ working… ${inc}s`;
     });
   };
@@ -2096,6 +2093,7 @@ export default function (pi: ExtensionAPI) {
     if (!runOpen) {
       runOpen = true;
       runToolCount = 0;
+      runEssentialCount = 0;
       runStartedAt = Date.now();
       // reuse the line only while it is fresh; an old one is buried in
       // history — delete it and start near the current conversation
@@ -2112,19 +2110,24 @@ export default function (pi: ExtensionAPI) {
     const action = toolActionText(event.toolName, event.input);
     // #10: record EVERY call (the done frame at run end filters to
     // essentials at level 1); the live block renders per level.
+    const essential = isEssentialToolCall(event.toolName, event.input);
+    if (essential) runEssentialCount += 1; // review L2: live count == done frame count
     toolCallsThisTurn.push({
       name: event.toolName,
       action,
-      essential: isEssentialToolCall(event.toolName, event.input),
+      essential,
     });
     lastToolAction = action;
-    const line = statusLine(lastToolAction, runToolCount, runStartedAt);
-    const rec = toolCallsThisTurn[toolCallsThisTurn.length - 1]!;
     // Display gate (#38/#10): level 0 renders nothing; level 1 renders
     // essential tools only (reads, read-only bash, ... stay hidden);
     // level 2 renders every call.
     const lvl = verboseLevel(ch);
-    if (lvl === 0 || (lvl === 1 && !rec.essential)) return;
+    if (lvl === 0 || (lvl === 1 && !essential)) return;
+    const line = statusLine(
+      lastToolAction,
+      lvl === 1 ? runEssentialCount : runToolCount,
+      runStartedAt,
+    );
     try {
       if (!statusMsgId) {
         const r = await sendDiscordMessage(ch, line);
@@ -2157,6 +2160,7 @@ export default function (pi: ExtensionAPI) {
     if (!runOpen) {
       runOpen = true;
       runToolCount = 0;
+      runEssentialCount = 0;
       lastToolAction = null;
       runStartedAt = Date.now();
       // Reset the status pointer for every new run, gate or no gate: a
