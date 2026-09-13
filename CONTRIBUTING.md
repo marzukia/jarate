@@ -18,7 +18,7 @@ PR.
 bunx biome check .            # repo root: 0 diagnostics (pre-commit enforces staged files)
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit
-cd packages/bridge && bun x bun test  # 168 pass, 0 fail
+cd packages/bridge && bun x bun test  # 482 pass, 0 fail
 bash install.sh --dry-run     # if install.sh changed
 ```
 
@@ -48,7 +48,7 @@ See AGENTS.md § Style. (Andryo, 2026-09-10)
 ## Verification
 - biome: <result>
 - tsc: <result>
-- tests: <result, e.g. 168 pass / 0 fail>
+- tests: <result, e.g. 482 pass / 0 fail>
 - install.sh --dry-run: <if touched>
 - anything else you ran
 ```

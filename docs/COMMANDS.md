@@ -13,7 +13,7 @@ Every command / system output the user sees starts with ONE ASCII tag
 (kimaki style, no emoji). Bracketed state tags: `[ok]` applied / success,
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
 `[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
-bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`).
+bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`, `[tasks]`).
 Live run state uses the box-drawing family (`┣ working…`, `┗ done · N calls`),
 the todo board its glyph family (`⬦` pending, `⬥` in progress, `✓` done,
 `✕` cancelled, `▤` board header) — both families are exempt from the bracket
@@ -34,6 +34,8 @@ scheme. Webhook callback embeds are structured and untagged.
 | `/todos` | board as-is (`▤` header); empty: `[todos] no open todos` |
 | `/sleep list` | `[wake] …` |
 | `/sleep cancel` | `[ok] …` / `[!] …` |
+| `/tasks list` | `[tasks] …` |
+| `/tasks cancel` | `[ok] …` / `[!] …` |
 | `/btw` usage, other usage errors | `[!] usage: …` |
 | owner-only rejection | `[!] owner only` |
 | queue ack | `[queued] N in line` |
@@ -62,6 +64,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
 | `/model [name]` | owner | switch model, or list models when run bare |
 | `/sleep [list \| cancel <id>]` | owner | list or cancel pending session wakes |
+| `/tasks [list \| cancel <id>]` | owner | list or cancel scheduled prompt tasks (one-shot / cron) |
 | `! <command>` | owner | shell passthrough: run `bash -c "<command>"` in the working directory |
 
 ## Examples
@@ -290,6 +293,30 @@ delivered as a new message in the SAME session when the time comes — via a
 30s poller while the bridge is alive, or at `session_start` after a restart
 or reboot (due wakes are caught up; stale delivery claims > 10 min old are
 re-delivered, so a wake is lost only if the channel is disabled, not if the
+process dies).
+
+### /tasks
+
+```
+/tasks               # list scheduled tasks (same as /tasks list)
+/tasks list
+/tasks cancel <id>   # cancel one
+```
+
+Owner only. Lists the agent's scheduled prompt tasks — one-shot reminders
+(`minutes` or `at`) and recurring cron prompts — as id, channel, schedule,
+next fire, countdown and prompt excerpt, or cancels one by id. Tasks are
+created by the `task` LLM tool, not by a command.
+
+The `task` tool (agent-facing): `task(prompt="check the build", minutes=120)`
+or `task(prompt="...", at="2026-09-10T15:00:00Z")` or
+`task(prompt="run the fleet check", cron="0 6 * * *",
+tz="Australia/Melbourne")` records a task in `~/.pi/agent/tasks/tasks.json`.
+At fire time the prompt is injected as a channel-inbound message into the
+SAME session — via a 30s poller while the bridge is alive, or at
+`session_start` after a restart or reboot (due tasks are caught up; missed
+cron slots are skipped, not replayed; stale delivery claims > 10 min old are
+re-delivered, so a fire is lost only if the channel is disabled, not if the
 process dies).
 
 ### /help

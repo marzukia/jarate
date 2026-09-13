@@ -20,6 +20,7 @@ import extension, {
   clearQueuedInbound,
   collectFinals,
   deleteQueuedInbound,
+  deliverDueTasks,
   deliverDueWakes,
   earlySendText,
   failurePostText,
@@ -38,6 +39,7 @@ import extension, {
   queueMidTurnInbound,
   REPEAT_WARNING,
   registerSleepTool,
+  registerTaskTool,
   registerTodoTool,
   runMidRunInterrupt,
   runShellPassthrough,
@@ -49,6 +51,7 @@ import extension, {
   updateQueuedInbound,
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
+import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
 import {
   type ChannelMessage,
@@ -315,6 +318,12 @@ describe("matchCommand (A3)", () => {
     expect(matchCommand("/sleep list")).toEqual({ name: "sleep", arg: "list" });
     expect(matchCommand("/sleep cancel abc123")).toEqual({
       name: "sleep",
+      arg: "cancel abc123",
+    });
+    expect(matchCommand("/tasks")).toEqual({ name: "tasks", arg: undefined });
+    expect(matchCommand("/tasks list")).toEqual({ name: "tasks", arg: "list" });
+    expect(matchCommand("/tasks cancel abc123")).toEqual({
+      name: "tasks",
       arg: "cancel abc123",
     });
   });
@@ -3463,6 +3472,331 @@ describe("sleep (integration)", () => {
       expect(r.content[0].text).toContain("[!]");
     }
     expect(loadWakes(tmp)).toHaveLength(0);
+  });
+});
+
+describe("tasks (integration)", () => {
+  let tmp = "";
+  let realHome = "";
+  let pi: any;
+  let ctx: any;
+  let sent: { m: any; o?: any }[] = [];
+  let tools: Record<string, any> = {};
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const NOW = Date.parse("2026-09-10T12:00:00Z");
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const replyContent = (): string => {
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    return JSON.parse(posts.at(-1)!.body).content;
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-tasks-"));
+    realHome = process.env.HOME!;
+    process.env.HOME = tmp; // isolate ~/.pi/agent/tasks from the real home
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    sent = [];
+    tools = {};
+    fetchCalls = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: (t: any) => {
+        tools[t.name] = t;
+      },
+      on: () => {},
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    registerTaskTool(pi, loadChannelConfig(tmp));
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.env.HOME = realHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("/tasks with no tasks says 'no scheduled tasks'", async () => {
+    await handleInbound(pi, inbound("/tasks", "m1"), ctx);
+    expect(replyContent()).toBe("[tasks] no scheduled tasks");
+  });
+
+  test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {
+    const one = scheduleTask({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "check the build",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 2 * 3600000,
+        nextFireAt: Date.now() + 2 * 3600000,
+      },
+      home: tmp,
+    });
+    const rec = scheduleTask({
+      channelId: "ch1",
+      prompt: "run the fleet check",
+      spec: {
+        kind: "cron",
+        cron: "0 6 * * *",
+        tz: "UTC",
+        nextFireAt: Date.parse("2026-09-11T06:00:00Z"),
+      },
+      home: tmp,
+      now: NOW + 1,
+    });
+    await handleInbound(pi, inbound("/tasks list", "m1"), ctx);
+    const content = replyContent();
+    expect(content).toContain("2 pending tasks (of 2 total):");
+    expect(content).toContain(one.id);
+    expect(content).toContain("check the build");
+    expect(content).toContain("in 2h");
+    expect(content).toContain(rec.id);
+    expect(content).toContain('cron "0 6 * * *" (UTC)');
+    expect(content).toContain("2026-09-11T06:00:00.000Z");
+  });
+
+  test("/tasks cancel removes the task from disk", async () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "check the build",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 30 * 60000,
+        nextFireAt: Date.now() + 30 * 60000,
+      },
+      home: tmp,
+    });
+    await handleInbound(pi, inbound(`/tasks cancel ${t.id}`, "m1"), ctx);
+    expect(replyContent()).toBe(`[ok] cancelled task ${t.id}`);
+    expect(loadTasks(tmp)).toHaveLength(0);
+  });
+
+  test("/tasks cancel: unknown id, missing id, bogus subcommand", async () => {
+    await handleInbound(pi, inbound("/tasks cancel nope", "m1"), ctx);
+    expect(replyContent()).toBe("[!] no task with id nope");
+    await handleInbound(pi, inbound("/tasks cancel", "m2"), ctx);
+    expect(replyContent()).toBe("[!] usage: `/tasks cancel <id>`");
+    await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
+    expect(replyContent()).toBe("[!] usage: `/tasks [list | cancel <id>]`");
+  });
+
+  test("due-on-startup delivery: injects a channel-inbound task, completes it, no double delivery", () => {
+    scheduleTask({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "check the deploy",
+      spec: {
+        kind: "at",
+        atMs: NOW - 1000,
+        nextFireAt: NOW - 1000,
+      },
+      home: tmp,
+      now: NOW - 2000,
+    });
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueTasks(pi, channels, tmp, NOW)).toBe(1);
+    const s = sent.at(-1)!;
+    expect(s.o?.triggerTurn).toBe(true);
+    expect(s.m.customType).toBe("channel-inbound");
+    expect(s.m.content).toContain("[task] one-shot task due");
+    expect(s.m.content).toContain("check the deploy");
+    expect(s.m.details.title).toBe("discord/Test");
+    // completed on disk (removed) — a healthy process never re-delivers it
+    expect(loadTasks(tmp)).toHaveLength(0);
+    expect(deliverDueTasks(pi, channels, tmp, NOW)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("cron task delivery: survives, advances to the next slot, no immediate re-fire", () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "run the fleet check",
+      spec: {
+        kind: "cron",
+        cron: "0 6 * * *",
+        tz: "UTC",
+        nextFireAt: NOW - 1000, // missed slot (bridge was down)
+      },
+      home: tmp,
+      now: NOW - 2 * 86400000,
+    });
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueTasks(pi, channels, tmp, NOW)).toBe(1);
+    const s = sent.at(-1)!;
+    expect(s.m.content).toContain(
+      '[task] recurring task "0 6 * * *" (UTC) due',
+    );
+    expect(s.m.content).toContain("run the fleet check");
+    // still scheduled — next slot strictly after NOW, not replayed
+    const done = loadTasks(tmp).find((x) => x.id === t.id)!;
+    expect(done.status).toBe("pending");
+    expect(done.lastFiredAt).toBe(NOW - 1000);
+    expect(done.nextFireAt).toBe(Date.parse("2026-09-11T06:00:00Z"));
+    expect(deliverDueTasks(pi, channels, tmp, NOW)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("stale claim after PROCESS DEATH re-delivers once after CLAIM_TTL_MS", () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "check the deploy",
+      spec: {
+        kind: "at",
+        atMs: NOW - 1000,
+        nextFireAt: NOW - 1000,
+      },
+      home: tmp,
+      now: NOW - 2000,
+    });
+    // claim, then the process dies before completion (crash guard state)
+    markTaskClaimed(t.id, NOW, tmp);
+    expect(loadTasks(tmp)[0]).toMatchObject({
+      id: t.id,
+      status: "claimed",
+      claimedAt: NOW,
+    });
+    const channels = loadChannelConfig(tmp);
+    expect(deliverDueTasks(pi, channels, tmp, NOW + CLAIM_TTL_MS + 1)).toBe(1);
+    expect(sent).toHaveLength(1);
+    // that redelivery is also completed — the loop must end
+    expect(loadTasks(tmp)).toHaveLength(0);
+    expect(deliverDueTasks(pi, channels, tmp, NOW + 2 * CLAIM_TTL_MS + 2)).toBe(
+      0,
+    );
+    expect(sent).toHaveLength(1);
+  });
+
+  test("deliverDueTasks skips disabled channels (no claim, no injection)", () => {
+    scheduleTask({
+      channelId: "ch1",
+      prompt: "x",
+      spec: {
+        kind: "at",
+        atMs: NOW - 1000,
+        nextFireAt: NOW - 1000,
+      },
+      home: tmp,
+      now: NOW - 2000,
+    });
+    const channels = loadChannelConfig(tmp).map((c) => ({
+      ...c,
+      enabled: false,
+    }));
+    expect(deliverDueTasks(pi, channels, tmp, NOW)).toBe(0);
+    expect(sent).toHaveLength(0);
+    expect(loadTasks(tmp)[0].status).toBe("pending");
+  });
+
+  test("task tool: minutes -> one-shot scheduled in the channel", async () => {
+    await tools.task.execute(
+      "1",
+      { prompt: "check the build", minutes: 120 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const tasks = loadTasks(tmp);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "check the build",
+      kind: "at",
+    });
+    expect(tasks[0].atMs).toBeGreaterThanOrEqual(Date.now() + 119 * 60000);
+  });
+
+  test("task tool: cron + tz -> recurring with computed first fire", async () => {
+    const r = await tools.task.execute(
+      "1",
+      { prompt: "run the fleet check", cron: "0 6 * * *", tz: "UTC" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toContain("[ok] task");
+    expect(r.content[0].text).toContain('cron "0 6 * * *" (UTC)');
+    const t = loadTasks(tmp)[0];
+    expect(t.kind).toBe("cron");
+    // next 06:00 UTC is strictly in the future, within 24h (real clock)
+    expect(t.nextFireAt).toBeGreaterThan(Date.now());
+    expect(t.nextFireAt).toBeLessThanOrEqual(
+      Date.now() + 24 * 3600000 + 120000,
+    );
+  });
+
+  test("task tool: bad params -> error, nothing scheduled", async () => {
+    for (const params of [
+      {},
+      { prompt: "x", minutes: 5, cron: "0 6 * * *" },
+      { prompt: "x", cron: "99 * * * *" },
+      { prompt: "x", at: "yesterday" },
+      { prompt: "x", cron: "0 6 * * *", tz: "Not/AZone" },
+    ]) {
+      const r = await tools.task.execute(
+        "1",
+        params,
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(r.content[0].text).toContain("[!]");
+    }
+    expect(loadTasks(tmp)).toHaveLength(0);
   });
 });
 
