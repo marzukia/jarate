@@ -305,40 +305,113 @@ export async function connectDiscord(
   return true;
 }
 
-// ─── Cursor persistence ───────────────────────────────────────────
+// ─── Per-channel state file (cursors + runtime flags) ─────────────
 // Per-channel lastMessageId survives process restarts so messages sent
 // while pi was down are picked up (instead of the cursor re-seeding to
-// "now" and losing them).
+// "now" and losing them). The file is the bridge's per-channel state
+// store; the cursor section coexists with per-channel runtime flags
+// (#39 hold, #10 verbosity) without a second store.
+//
+// New format (two sections; the legacy flat cursor map still reads):
+//   { "cursors": { "<discordChannelId>": "<lastMessageId>" },
+//     "channels": { "<configId>": { "hold": true, "verbose": 1 } } }
+// Cursors are keyed by Discord channel id (numeric); channel flags by
+// config id (the settings.json "id") — separate key spaces, one file.
+
+export interface ChannelSettingsState {
+  /** #39: channel held — plain messages buffer in the re-wake queue. */
+  hold?: boolean;
+  /** #10: 3-level verbosity override (0 text / 1 essential / 2 all). */
+  verbose?: number;
+}
+
+export interface ChannelStateFile {
+  cursors: Record<string, string>;
+  channels: Record<string, ChannelSettingsState>;
+}
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+/** Read the per-channel state file. Missing/corrupt file → empty. */
+export function loadChannelStateFile(
+  stateDir: string | null | undefined,
+): ChannelStateFile {
+  const empty: ChannelStateFile = { cursors: {}, channels: {} };
+  if (!stateDir) return empty;
+  let data: unknown;
+  try {
+    data = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "channel-state.json"), "utf-8"),
+    );
+  } catch {
+    return empty;
+  }
+  if (!isObj(data)) return empty;
+  // Legacy format: a flat discordChannelId → lastMessageId map (no
+  // "cursors" section) — treat every string value as a cursor.
+  if (!isObj(data.cursors)) {
+    const cursors: Record<string, string> = {};
+    for (const [k, v] of Object.entries(data))
+      if (typeof v === "string") cursors[k] = v;
+    return { cursors, channels: {} };
+  }
+  const cursors: Record<string, string> = {};
+  for (const [k, v] of Object.entries(data.cursors))
+    if (typeof v === "string") cursors[k] = v;
+  const channels: Record<string, ChannelSettingsState> = {};
+  if (isObj(data.channels)) {
+    for (const [k, v] of Object.entries(data.channels)) {
+      if (!isObj(v)) continue;
+      channels[k] = {
+        hold: v.hold === true ? true : v.hold === false ? false : undefined,
+        verbose: typeof v.verbose === "number" ? v.verbose : undefined,
+      };
+    }
+  }
+  return { cursors, channels };
+}
+
+/** Persist the current cursor. No-op without a stateDir; never throws.
+ *  Preserves the sibling "channels" section. */
+export function persistChannelCursor(state: DiscordState): void {
+  if (!state.stateDir || !state.lastMessageId) return;
+  try {
+    const file = path.join(state.stateDir, "channel-state.json");
+    const data = loadChannelStateFile(state.stateDir);
+    data.cursors[state.channelId] = state.lastMessageId;
+    fs.mkdirSync(state.stateDir, { recursive: true });
+    // Atomic write: temp file + rename so a crash cannot leave a torn
+    // channel-state.json (the loader treats non-JSON as empty state,
+    // which would reseed and lose history).
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
+    fs.renameSync(`${file}.tmp`, file);
+  } catch {}
+}
+
+/** Merge per-channel runtime flags (hold / verbose) into the state
+ *  file. No-op without a stateDir; never throws. */
+export function patchChannelState(
+  stateDir: string | null | undefined,
+  configId: string,
+  patch: ChannelSettingsState,
+): void {
+  if (!stateDir) return;
+  const file = path.join(stateDir, "channel-state.json");
+  const data = loadChannelStateFile(stateDir);
+  const cur = data.channels[configId] ?? {};
+  data.channels[configId] = { ...cur, ...patch };
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
+  fs.renameSync(`${file}.tmp`, file);
+}
 
 /** Read persisted cursors (discord channel id → last message id). Corrupt file = empty. */
 export function loadPersistedCursors(
   stateDir: string | null | undefined,
 ): Record<string, string> {
-  if (!stateDir) return {};
-  try {
-    const data = JSON.parse(
-      fs.readFileSync(path.join(stateDir, "channel-state.json"), "utf-8"),
-    );
-    return typeof data === "object" && data ? data : {};
-  } catch {
-    return {};
-  }
-}
-
-/** Persist the current cursor. No-op without a stateDir; never throws. */
-export function persistChannelCursor(state: DiscordState): void {
-  if (!state.stateDir || !state.lastMessageId) return;
-  try {
-    const file = path.join(state.stateDir, "channel-state.json");
-    const data = loadPersistedCursors(state.stateDir);
-    data[state.channelId] = state.lastMessageId;
-    fs.mkdirSync(state.stateDir, { recursive: true });
-    // Atomic write: temp file + rename so a crash cannot leave a torn
-    // channel-state.json (the loader treats non-JSON as an empty cursor
-    // map, which would reseed and lose history).
-    fs.writeFileSync(`${file}.tmp`, JSON.stringify(data, null, 2));
-    fs.renameSync(`${file}.tmp`, file);
-  } catch {}
+  return loadChannelStateFile(stateDir).cursors;
 }
 
 /** Read the live in-memory cursor for a channel, or null. Exported for

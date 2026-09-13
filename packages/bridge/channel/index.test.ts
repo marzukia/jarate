@@ -28,8 +28,10 @@ import extension, {
   failurePostText,
   fileOnlyPrompt,
   handleInbound,
+  heldChannels,
   interruptStepTimeoutMs,
   isCompacting,
+  isHeld,
   isVerbose,
   matchCommand,
   midTurnQueues,
@@ -37,6 +39,7 @@ import extension, {
   parseReplyTo,
   pendingAttachments,
   pendingInterrupts,
+  popChannelQueuedInbound,
   prunePendingBatches,
   queuedAcks,
   queueMidTurnInbound,
@@ -44,9 +47,11 @@ import extension, {
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
+  resetRuntimeStateForTest,
   runMidRunInterrupt,
   runShellPassthrough,
   setInterruptCtx,
+  setRuntimeStateDir,
   setSystemdRestartHookForTest,
   statusLine,
   stopAllCompactTicks,
@@ -2060,6 +2065,277 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.session_start?.(null, ctx);
     process.env.HOME = oldHome;
     expect(sent.length).toBe(sentBefore);
+  });
+});
+
+// ─── #39 /hold: channel-wide queue mode ──────────────────────────────
+
+describe("#39 /hold", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const OWNER = "<user-id-1>";
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: OWNER,
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+  const otherInbound = (body: string, id: string): ChannelMessage => ({
+    ...inbound(body, id),
+    fromId: "someone-else",
+  });
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  };
+  const posts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => String(JSON.parse(c.body).content));
+  const mockBusy = (b: boolean) => {
+    ctx.isIdle = () => !b;
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-hold-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+            ownerUserId: OWNER,
+            forwardToolCalls: false,
+          },
+        ],
+      }),
+    );
+    handlers = {};
+    sent = [];
+    fetchCalls = [];
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    verboseOverride.clear();
+    heldChannels.clear();
+    setRuntimeStateDir(null);
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    setRuntimeStateDir(null);
+    await handlers.agent_end?.({ messages: [] }, ctx); // clears any typing interval
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("matchCommand: /hold variants", () => {
+    expect(matchCommand("/hold")!.name).toBe("hold");
+    expect(matchCommand("/hold on")!.arg).toBe("on");
+    expect(matchCommand("/hold OFF")!.arg).toBe("OFF");
+    expect(matchCommand("/holdup")).toBeNull();
+  });
+
+  test("popChannelQueuedInbound: FIFO per channel, rest stays", async () => {
+    mockBusy(true);
+    await handleInbound(pi, inbound("a", "m1"), ctx);
+    await handleInbound(pi, inbound("b", "m2"), ctx);
+    const e1 = popChannelQueuedInbound("ch1");
+    expect(e1?.msg.body).toBe("a");
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    const e2 = popChannelQueuedInbound("ch1");
+    expect(e2?.msg.body).toBe("b");
+    expect(popChannelQueuedInbound("ch1")).toBeNull();
+    expect(midTurnQueues.has("ch1")).toBe(false);
+  });
+
+  test("held + idle: plain message queues, no run, no interrupt armed", async () => {
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    expect(posts()).toContain("[ok] hold on - buffered until /hold off");
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(true);
+
+    await handleInbound(pi, inbound("hello there", "m2"), ctx);
+    await flush();
+    expect(sent).toHaveLength(0); // buffered, not sent to pi
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    expect(posts()).toContain("[queued] 1 in line");
+    expect(pendingInterrupts.get("ch1")).toBeUndefined(); // no armed interrupt
+
+    // second message stacks behind it
+    await handleInbound(pi, inbound("and this too", "m3"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+  });
+
+  test("agent_end skips a held channel; /hold off drains FIFO", async () => {
+    mockBusy(true);
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    await handleInbound(pi, inbound("first", "m2"), ctx);
+    await handleInbound(pi, inbound("second", "m3"), ctx);
+    // run ends while held: the buffer must NOT drain
+    await handlers.agent_end({ messages: [] }, ctx);
+    expect(sent).toHaveLength(0);
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+
+    // release while the channel is idle: oldest runs now
+    mockBusy(false);
+    await handleInbound(pi, inbound("/hold off", "m4"), ctx);
+    await flush();
+    expect(sent.map((s) => s.m.details.body)).toEqual(["first"]);
+    expect(sent[0].o.triggerTurn).toBe(true);
+    expect(posts()).toContain("[ok] hold off - 2 in line, running");
+
+    // that run ends: the re-wake loop chains the rest
+    await handlers.agent_end({ messages: [] }, ctx);
+    expect(sent.map((s) => s.m.details.body)).toEqual(["first", "second"]);
+    expect(midTurnQueues.has("ch1")).toBe(false);
+  });
+
+  test("/hold off while a run is in flight: no immediate send, drains at run end", async () => {
+    mockBusy(true);
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    await handleInbound(pi, inbound("first", "m2"), ctx);
+    await handleInbound(pi, inbound("second", "m3"), ctx);
+    await handleInbound(pi, inbound("/hold off", "m4"), ctx);
+    await flush();
+    expect(sent).toHaveLength(0); // still running: wait for agent_end
+    expect(posts()).toContain("[ok] hold off - 2 in line, will run");
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+
+    await handlers.agent_end({ messages: [] }, ctx);
+    expect(sent.map((s) => s.m.details.body)).toEqual(["first"]);
+    await handlers.agent_end({ messages: [] }, ctx);
+    expect(sent.map((s) => s.m.details.body)).toEqual(["first", "second"]);
+  });
+
+  test("/stop while held keeps the buffer and reports it", async () => {
+    mockBusy(true);
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    await handleInbound(pi, inbound("first", "m2"), ctx);
+    await handleInbound(pi, inbound("second", "m3"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+
+    await handleInbound(pi, inbound("/stop", "m4"), ctx);
+    expect(posts()).toContain("[-] stopped - 2 held in line");
+    expect(midTurnQueues.get("ch1")?.length).toBe(2); // buffer intact
+
+    // /stop on a NON-held channel still drains (regression guard)
+    heldChannels.clear();
+    await handleInbound(pi, inbound("/stop", "m5"), ctx);
+    expect(posts()).toContain("[-] stopped");
+    expect(midTurnQueues.has("ch1")).toBe(false);
+  });
+
+  test("/hold on preserves an existing (non-held) line; off drains it", async () => {
+    mockBusy(true);
+    await handleInbound(pi, inbound("early", "m1"), ctx); // queued, interrupt armed
+    expect(pendingInterrupts.get("ch1")?.length).toBe(1);
+    await handleInbound(pi, inbound("/hold on", "m2"), ctx);
+    // arming stopped + the pending interrupt disarmed
+    expect(pendingInterrupts.get("ch1")).toBeUndefined();
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    await handleInbound(pi, inbound("late", "m3"), ctx);
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+
+    mockBusy(false); // channel settles before the release
+    await handleInbound(pi, inbound("/hold off", "m4"), ctx);
+    await flush();
+    expect(sent.map((s) => s.m.details.body)).toEqual(["early"]);
+  });
+
+  test("commands still run while held", async () => {
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    await handleInbound(pi, inbound("/status", "m2"), ctx);
+    expect(posts().some((p) => p.startsWith("[status]"))).toBe(true);
+    expect(sent).toHaveLength(0); // status is not a pi run
+  });
+
+  test("bare /hold toggles; bad arg is a usage error; non-owner rejected", async () => {
+    await handleInbound(pi, inbound("/hold", "m1"), ctx);
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(true);
+    await handleInbound(pi, inbound("/hold", "m2"), ctx);
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
+
+    await handleInbound(pi, inbound("/hold maybe", "m3"), ctx);
+    expect(posts()).toContain("[!] usage: /hold on|off");
+
+    await handleInbound(pi, otherInbound("/hold on", "m4"), ctx);
+    // text-form command from a non-owner: not executed, falls through to
+    // pi as plain text (the "[!] owner only" ack is the native path)
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
+    expect(sent).toHaveLength(1);
+  });
+
+  test("hold flag persists to channel-state.json and reloads after restart", async () => {
+    const dir = path.join(tmp, ".tmp");
+    setRuntimeStateDir(dir);
+    await handleInbound(pi, inbound("/hold on", "m1"), ctx);
+    const onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.channels.ch1.hold).toBe(true);
+
+    // simulated process restart: in-memory wiped, file reloaded
+    resetRuntimeStateForTest();
+    setRuntimeStateDir(dir);
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(true);
+
+    // release: file updates, reload sees it off
+    await handleInbound(pi, inbound("/hold off", "m2"), ctx);
+    resetRuntimeStateForTest();
+    setRuntimeStateDir(dir);
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
   });
 });
 

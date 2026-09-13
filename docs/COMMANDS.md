@@ -25,12 +25,14 @@ and untagged.
 | command / output | tag |
 |---|---|
 | `/stop` | `[-] stopped` |
+| `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
 | `/usage [all\|session]` | `[usage] …` (error: `[!] usage: …`) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
 | `/verbose on\|off` | `[ok] …` |
+| `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
 | `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
 | `/jobs` | `[jobs] …` |
@@ -65,6 +67,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/status` | owner | context-window usage, model, uptime |
 | `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
+| `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
 | `/model [name]` | owner | switch model, or list models when run bare |
@@ -82,6 +85,32 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 
 Aborts the current run immediately. The run's partial output stays in the
 channel (steered steps are already forwarded live).
+
+> **Held channels** (#39): when the channel is held, the re-wake queue is the
+> operator's buffer, and `/stop` does NOT clear it. The ack reports it:
+> `[-] stopped - 3 held in line`. The buffer drains on `/hold off` (or the
+> entries are deleted one by one).
+
+### /hold
+
+```
+/hold on        # buffer: no plain message starts a run until released
+/hold off       # release: the buffer drains, oldest first
+/hold           # toggle
+```
+
+Owner only. Channel-wide queue mode (#39). While held, **every** plain
+message is parked in the re-wake queue — even while idle — each one acked
+`[queued] N in line`, none of them starting a run and none arming the
+mid-run interrupt. Commands (`/stop`, `/verbose`, …) still work normally.
+
+`/hold off` drains the buffer in order: if the channel is idle the oldest
+entry runs immediately and the re-wake loop chains the rest, one run each;
+while a run is in flight the buffer drains at the next run end.
+
+The hold flag persists across restarts (bridge per-channel state file,
+same store as the Discord cursor and the `/verbose` level). `/status`
+reports it while on (`hold on`).
 
 ### mid-run interrupt (any plain message)
 

@@ -44,8 +44,10 @@ import {
   getChannelCursor,
   getDiscordChannelId,
   getDiscordToken,
+  loadChannelStateFile,
   loadDiscordAttachment,
   MAX_ATTACHMENT_BYTES,
+  patchChannelState,
   registerDiscordCommands,
   respondToInteraction,
   sendDiscordMessage,
@@ -151,6 +153,61 @@ let pendingCompact: { ch: ChannelConfig; instructions?: string } | null = null;
 // /verbose per-channel override (until restart). Exported for tests and
 // for #10 (3-level display + persistence builds on this).
 export const verboseOverride = new Map<string, boolean>();
+// /hold per-channel flag (#39): while held, plain messages buffer in the
+// re-wake queue without starting a run; /hold off drains them in order.
+// Survives restarts via channel-state.json (persistChannelRuntimeState).
+export const heldChannels = new Set<string>();
+// Per-channel runtime state (hold flags, later #10 verbosity) lives in
+// <cwd>/.tmp/channel-state.json — the same store the Discord cursor uses
+// (discord.ts loadChannelStateFile / patchChannelState). runtimeStateDir
+// is set at session_start; ensureRuntimeStateLoaded re-reads the file at
+// most once per dir (a fresh process starts with a null guard, so boot
+// always loads; in-process re-starts reload via setRuntimeStateDir).
+let runtimeStateDir: string | null = null;
+let runtimeStateLoadedFor: string | null = null;
+/** Set the runtime-state dir + reset the load guard. Exported for tests. */
+export function setRuntimeStateDir(dir: string | null): void {
+  runtimeStateDir = dir;
+  runtimeStateLoadedFor = null;
+}
+/** Wipe in-memory runtime state (hold flags, verbose overrides, guard) —
+ *  a process-restart simulation. Exported for tests. */
+export function resetRuntimeStateForTest(): void {
+  runtimeStateLoadedFor = null;
+  heldChannels.clear();
+  verboseOverride.clear();
+}
+function ensureRuntimeStateLoaded(): void {
+  const dir = runtimeStateDir ?? "";
+  if (runtimeStateLoadedFor === dir) return;
+  runtimeStateLoadedFor = dir;
+  if (!dir) return;
+  try {
+    const { channels } = loadChannelStateFile(dir);
+    for (const [id, s] of Object.entries(channels)) {
+      if (s.hold === true) heldChannels.add(id);
+    }
+  } catch (e) {
+    console.error(
+      "[channel] runtime state load failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
+}
+/** Persist per-channel runtime flags to channel-state.json. Never throws. */
+export function persistChannelRuntimeState(
+  chId: string,
+  patch: { hold?: boolean; verbose?: number },
+): void {
+  try {
+    patchChannelState(runtimeStateDir, chId, patch);
+  } catch (e) {
+    console.error(
+      "[channel] runtime state persist failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
+}
 // Display gate (#38): the extension closure owns the live status-block
 // state; the module-level command paths reach it through this hook (one
 // extension instance per process, registered in the extension body).
@@ -246,17 +303,21 @@ export function queueMidTurnInbound(
   return q.length;
 }
 
-/** Pop the globally oldest queued inbound across all channels (FIFO). */
+/** Pop the globally oldest queued inbound across all channels (FIFO).
+ *  Held channels (#39) are skipped: their buffer drains on /hold off,
+ *  not at agent_end. */
 export function popOldestQueuedInbound(): {
   channelId: string;
   msg: ChannelMessage;
 } | null {
+  ensureRuntimeStateLoaded();
   let oldest: {
     channelId: string;
     msg: ChannelMessage;
     queuedAt: number;
   } | null = null;
   for (const [channelId, q] of midTurnQueues) {
+    if (heldChannels.has(channelId)) continue;
     const head = q[0];
     if (!head) continue;
     if (!oldest || head.queuedAt < oldest.queuedAt)
@@ -278,6 +339,19 @@ export function clearQueuedInbound(channelId: string): number {
   const n = q.length;
   midTurnQueues.delete(channelId);
   return n;
+}
+
+/** Pop the oldest queued inbound for ONE channel (#39 /hold off drain).
+ *  Returns null when the channel's line is empty. */
+export function popChannelQueuedInbound(
+  channelId: string,
+): QueuedInbound | null {
+  const q = midTurnQueues.get(channelId);
+  if (!q || q.length === 0) return null;
+  const e = q.shift()!;
+  if (q.length === 0) midTurnQueues.delete(channelId);
+  consumeQueuedAck(channelId, e.msg.messageId);
+  return e;
 }
 
 /** Remove one armed interrupt timer (the queue entry for it is gone).
@@ -884,6 +958,19 @@ export function isVerbose(ch: ChannelConfig): boolean {
   return verboseOverride.get(ch.id) ?? ch.forwardToolCalls ?? false;
 }
 
+/** #39: is this channel held (plain messages buffer until /hold off)? */
+export function isHeld(ch: ChannelConfig): boolean {
+  ensureRuntimeStateLoaded();
+  return heldChannels.has(ch.id);
+}
+
+/** #39: set + persist the hold flag for a channel. */
+export function setHeld(chId: string, on: boolean): void {
+  if (on) heldChannels.add(chId);
+  else heldChannels.delete(chId);
+  persistChannelRuntimeState(chId, { hold: on });
+}
+
 /**
  * v3 message style (mockup3, 2026-09-13): state glyphs ┘ ┣ ├ ┤, `·`
  * separators, ASCII words, no emoji/arrows/em-dashes/dingbats, and every
@@ -1241,7 +1328,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -1560,6 +1647,11 @@ export default function (pi: ExtensionAPI) {
     workspaceRoot = ctx.cwd;
     configRoot = ctx.cwd;
     channels = loadChannelConfig(ctx.cwd);
+    // #39/#10: per-channel runtime state (hold flags, verbosity) reloads
+    // from <cwd>/.tmp/channel-state.json on every session start (the same
+    // file the Discord cursor persists to; see discord.ts).
+    setRuntimeStateDir(path.join(ctx.cwd, ".tmp"));
+    ensureRuntimeStateLoaded();
 
     const enabled = channels.filter((c) => c.enabled);
     if (enabled.length === 0) return;
@@ -2257,6 +2349,7 @@ const HELP_TEXT = [
   "`/undo` - revert last assistant turn: files + conversation (owner)",
   "`/redo` - reapply an /undo (one level deep, owner)",
   "`/verbose on|off` - forward tool calls to the channel (owner)",
+  "`/hold [on|off]` - buffer messages until released (owner)",
   "`/compact [instructions]` - compact session context (owner)",
   "`/model [name]` - switch or list models (owner)",
   "`/jobs` - list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
@@ -2877,7 +2970,12 @@ async function runChannelCommand(
       // so they land at the next run's first turn boundary.) Armed mid-run
       // interrupts are cleared too: a stopped run is not interrupted by a
       // stale message.
-      const dropped = clearQueuedInbound(ch.id);
+      // #39: a HELD channel's queue is the operator's buffer — /stop clears
+      // the run but NOT the buffer. The held queue persists: it drains on
+      // /hold off, or entries are deleted one by one. (Documented choice:
+      // persist, not clear.)
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
       clearInterrupts(ch.id);
       // Cancel an in-flight interrupt's pending send — but only when one is
       // actually in flight for this channel, so the flag never goes stale
@@ -2891,11 +2989,59 @@ async function runChannelCommand(
         userStoppedRun = true;
         ctx.abort();
       }
+      const heldDepth = held ? (midTurnQueues.get(ch.id)?.length ?? 0) : 0;
       return {
         immediate: restartCancelled
           ? "[-] stopped (restart cancelled)"
-          : "[-] stopped",
+          : heldDepth > 0
+            ? `[-] stopped - ${heldDepth} held in line`
+            : "[-] stopped",
       };
+    }
+    case "hold": {
+      if (!isOwner) return ownerOnly;
+      const a = (arg ?? "").trim().toLowerCase();
+      const on =
+        a === "" ? !isHeld(ch) : a === "on" || a === "1" || a === "yes";
+      if (a !== "" && !on && a !== "off" && a !== "0" && a !== "no")
+        return { immediate: "[!] usage: /hold on|off" };
+      const depth = midTurnQueues.get(ch.id)?.length ?? 0;
+      if (on === isHeld(ch))
+        return {
+          immediate: on ? `[ok] hold on - ${depth} in line` : "[ok] hold off",
+        };
+      setHeld(ch.id, on);
+      if (on) {
+        // Held messages wait their turn: disarm interrupts armed before
+        // the hold. (An in-flight interrupt runs to completion — its
+        // message was queued before the hold. agent_end skips held
+        // channels, so the buffer does not drain on its own.)
+        clearInterrupts(ch.id);
+        return {
+          immediate:
+            depth > 0
+              ? `[ok] hold on - ${depth} in line`
+              : "[ok] hold on - buffered until /hold off",
+        };
+      }
+      // off: drain — send the oldest now when idle; the existing re-wake
+      // loop (agent_end) chains the rest, one run each, in order.
+      if (depth === 0) return { immediate: "[ok] hold off" };
+      if (ctx.isIdle() && !isCompacting(ch.id)) {
+        const entry = popChannelQueuedInbound(ch.id);
+        // Awaits the drained inbound: its send must finish before this
+        // command's reply lands, or the in-flight drain can leak into the
+        // next message's turn (and the next test, in the suite).
+        if (entry)
+          await handleInbound(pi, entry.msg, ctx, true).catch((e) => {
+            console.error(
+              "[channel] hold drain failed:",
+              sanitizeUnknownValue(e),
+            );
+          });
+        return { immediate: `[ok] hold off - ${depth} in line, running` };
+      }
+      return { immediate: `[ok] hold off - ${depth} in line, will run` };
     }
     case "help":
       return { immediate: HELP_TEXT };
@@ -3811,6 +3957,7 @@ export async function handleInbound(
       cmd.name === "sleep" ||
       cmd.name === "tasks" ||
       cmd.name === "stop" ||
+      cmd.name === "hold" ||
       cmd.name === "compact" ||
       cmd.name === "reset" ||
       cmd.name === "restart";
@@ -3936,6 +4083,11 @@ export async function handleInbound(
   const runActive = forceDirect
     ? false
     : !ctx.isIdle() || ctx.hasPendingMessages?.() || isCompacting(ch.id);
+  // #39: while held, EVERY plain message (attachments included) buffers in
+  // the re-wake queue without starting a run — even while idle. The buffer
+  // drains on /hold off. Held messages never arm the mid-run interrupt:
+  // they wait their turn (an interrupt would jump the buffer line).
+  const held = isHeld(ch);
   // Returns true (caller should `return`) when the inbound was queued for a
   // re-wake. Ownership is unambiguous: a message is either sent to pi now or
   // queued for a re-wake — never both. `armInterrupt` false = ". queue"-
@@ -3946,7 +4098,7 @@ export async function handleInbound(
     display: string,
     armInterrupt = true,
   ): boolean => {
-    if (!runActive) return false;
+    if (!held && !runActive) return false;
     // While compacting the message waits the line WITHOUT arming the
     // mid-run interrupt (an interrupt aborts the compaction). It drains
     // when the compaction settles (drainQueuedAfterCompact) or at the
@@ -3956,7 +4108,8 @@ export async function handleInbound(
     // compaction (agent-session.js abort() → abortCompaction). So suppress
     // arming for every channel while ANY window is open, not just the
     // compacting one — a ch2 interrupt would otherwise kill ch1's compact.
-    const arm = armInterrupt && compactingChannels.size === 0;
+    // #39: held messages wait their turn, interrupt or no interrupt.
+    const arm = armInterrupt && !held && compactingChannels.size === 0;
     const pos = queueMidTurnInbound(ch.id, msg, text, gateTitle, display, arm);
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
