@@ -5,6 +5,7 @@
  * asserts on loud failure / warning text and the run record.
  */
 import { describe, expect, test } from "bun:test";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -28,6 +29,14 @@ function fixture() {
     `#!/bin/sh\necho ran > "${path.join(tmp, "pi-ran")}"\necho pi-run-ok\n`,
   );
   fs.chmodSync(piPath, 0o755);
+  // stub webdrop: keep the run offline + deterministic (pi-bg uploads the
+  // full prompt/output when webdrop is on PATH)
+  const wdPath = path.join(bin, "webdrop");
+  fs.writeFileSync(
+    wdPath,
+    '#!/bin/sh\necho https://drop.test/$(basename "$1")\n',
+  );
+  fs.chmodSync(wdPath, 0o755);
 
   const env = { ...process.env } as Record<string, string>;
   env.HOME = home;
@@ -489,5 +498,110 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     const r = await runScript(TAIL, ["20991231-235958-3"], env, tmp);
     expect(r.code).toBe(2);
     expect(r.err).toContain("no live output");
+  });
+});
+
+describe("v3 embed style (mockup3): webhook payload shape", () => {
+  const capture = () => {
+    let body: { embeds: any[] } | null = null;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") body = (await req.json()) as any;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      getBody: () => body,
+      close: () => server.stop(true),
+    };
+  };
+
+  const assertFrame = (em: any, header: string) => {
+    // v3 charset: no dingbats, no arrows, no em dash
+    for (const ch of ["✓", "✗", "⚠", "⛔", "▤", "→", "—"]) {
+      expect(em.title + em.description).not.toContain(ch);
+    }
+    const lines = em.description.split("\n");
+    expect(lines[0]).toBe("```bash");
+    expect(lines[1]).toBe(header);
+    expect(lines.at(-2)).toBe("└");
+    expect(lines.at(-1)).toBe("```");
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+  };
+
+  test("worker OK + --worktree: framed description, 40-col budget", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    // git repo in the run cwd so --worktree works
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+    try {
+      const r = await fx.run(["worker", "--worktree", "v3 style check"]);
+      expect(r.code).toBe(0);
+      const runId = fx.records()[0].run;
+      const cap = hook.getBody();
+      if (!cap) throw new Error("webhook not captured");
+      const em = cap.embeds[0];
+      expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+      assertFrame(em, `┌ ok · ${runId}`);
+      expect(em.description).toContain("├ $ pi-bg worker --worktree");
+      expect(em.description).toContain(`├ branch : pi-bg/${runId}`);
+      expect(em.description).toContain("├ wt     : ");
+      // fields intact: task + result + webdrop links (stubbed on PATH)
+      const names = em.fields.map((f: { name: string }) => f.name);
+      expect(names).toEqual(
+        expect.arrayContaining(["task", "result", "prompt", "full output"]),
+      );
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "task").value,
+      ).toContain("v3 style check");
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "result").value,
+      ).toContain("pi-run-ok");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("worker FAIL: rc in title + frame header, 40-col budget", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      "#!/bin/sh\necho boom\nexit 3\n",
+    );
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "failing task"]);
+      expect(r.code).toBe(3); // pi-bg propagates pi's rc; status is in the embed
+      const runId = fx.records()[0].run;
+      const cap = hook.getBody();
+      if (!cap) throw new Error("webhook not captured");
+      const em = cap.embeds[0];
+      expect(em.title).toMatch(/^worker · FAIL \(rc=3\) · \d+m\d{2}s$/);
+      assertFrame(em, `┌ fail · ${runId} (rc=3)`);
+      expect(em.description).toContain("├ $ pi-bg worker");
+      expect(em.description).toContain("├ cwd    : ");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
   });
 });

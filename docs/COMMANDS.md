@@ -14,10 +14,12 @@ Every command / system output the user sees starts with ONE ASCII tag
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
 `[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
 bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`, `[tasks]`).
-Live run state uses the box-drawing family (`┣ working…`, `┗ done · N calls`),
-the todo board its glyph family (`⬦` pending, `⬥` in progress, `✓` done,
-`✕` cancelled, `▤` board header) — both families are exempt from the bracket
-scheme. Webhook callback embeds are structured and untagged.
+Live run state uses the box-drawing frame family (`┣` working, `┌ done` /
+`┤ failed` frame with `└` close), the todo board its state glyphs (`├`
+pending, `┣` in progress, `┘` done, `┤` cancelled, `┌` board header, `└`
+close) - both families are exempt from the bracket scheme and must stay
+<= 40 cols per line (mobile budget). Webhook callback embeds are framed
+and untagged.
 
 | command / output | tag |
 |---|---|
@@ -32,7 +34,7 @@ scheme. Webhook callback embeds are structured and untagged.
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
 | `/jobs` | `[jobs] …` |
 | `/diff [git-range \| file]` | `[ok] …` (errors: `[!] …`) |
-| `/todos` | board as-is (`▤` header); empty: `[todos] no open todos` |
+| `/todos` | board as-is (`┌` header, `└` close); empty: `[todos] no open todos` |
 | `/sleep list` | `[wake] …` |
 | `/sleep cancel` | `[ok] …` / `[!] …` |
 | `/tasks list` | `[tasks] …` |

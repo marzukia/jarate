@@ -79,6 +79,7 @@ set -- "${args[@]+"${args[@]}"}"
 
 wt_path=""
 wt_branch=""
+wt_repo=""
 if [ "$wt_mode" -eq 1 ]; then
   ref="${wt_ref:-HEAD}"
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
@@ -86,6 +87,7 @@ if [ "$wt_mode" -eq 1 ]; then
   id="$run_id"
   wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
   wt_branch="pi-bg/$id"
+  wt_repo="$(basename "$top")"
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
     echo "pi-bg: worktree add failed (ref=$ref path=$wt_path)" >&2; exit 3; fi
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) — kept after run"
@@ -273,43 +275,67 @@ bg_build() {
   BG_VERDICT="$verdict" BG_DUR="${SECONDS}" BG_TASK="$(bg_censor "${task:0:200}")" \
   BG_BRIEF="$(bg_censor "$brief")" \
   BG_WT="$wt_path" BG_BRANCH="$wt_branch" BG_CWD="$(pwd)" BG_RUN="$run_id" \
+  BG_WORKTREE="$wt_mode" BG_REPO="$wt_repo" \
   BG_PURL="$purl" BG_OURL="$ourl" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("BG_" + k, "")
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def clip_start(s, max):
+    s = str(s)
+    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
+def kv(key, val, width=6, vbudget=29, head=False):
+    cut = clip_start if head else clip_end
+    return "\u251c " + key.ljust(width) + " : " + cut(val, vbudget)
 prof, status, rc, verdict = E("PROFILE"), E("STATUS"), E("RC"), E("VERDICT")
 dur = int(E("DUR") or 0)
 dstr = f"{dur//60}m{dur%60:02d}s"
+rid = E("RUN")
 GREEN, RED, ORANGE = 3066993, 15158332, 15105570
+# v3 style (mockup3, 2026-09-13): no glyphs in titles; the description is a
+# framed block (box-drawing + ASCII + middle dot), every line <= 40 cols.
 if prof == "reviewer" and verdict:
     ok = verdict == "PASS"
-    title = ("\u2713 reviewer \u00b7 PASS" if ok else "\u2717 reviewer \u00b7 FAIL") + f" \u00b7 {dstr}"
+    title = f"reviewer \u00b7 {'PASS' if ok else 'FAIL'} \u00b7 {dstr}"
+    header = "\u250c " + ("pass" if ok else "fail") + " \u00b7 " + rid
     color = GREEN if ok else RED
 elif status == "OK":
-    title = f"\u2713 {prof} \u00b7 OK \u00b7 {dstr}"; color = GREEN
+    title = f"{prof} \u00b7 OK \u00b7 {dstr}"; header = f"\u250c ok \u00b7 {rid}"; color = GREEN
 elif status == "FAIL":
-    title = f"\u2717 {prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"; color = RED
+    title = f"{prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"; header = f"\u250c fail \u00b7 {rid} (rc={rc})"; color = RED
 elif status == "DIED":
-    title = f"\u26a0 {prof} \u00b7 DIED (no report) \u00b7 {dstr}"; color = ORANGE
+    title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = f"\u250c died \u00b7 {rid}"; color = ORANGE
 else:
-    title = f"\u26a0 {prof} \u00b7 EMPTY \u00b7 {dstr}"; color = ORANGE
-meta = ["$ pi-bg " + prof + (" --worktree" if E("WT") else ""),
-        f"status : {status}" + (f" (rc={rc})" if status in ("FAIL", "DIED") else "")]
-if E("WT"):
-    wtdir = os.path.dirname(E("WT").rstrip("/"))
-    meta += [f"repo   : {os.path.basename(wtdir) or '?'}",
-             f"wt     : {E('WT')}", f"branch : {E('BRANCH')}"]
+    title = f"{prof} \u00b7 EMPTY \u00b7 {dstr}"; header = f"\u250c empty \u00b7 {rid}"; color = RED
+desc_lines = [header, f"\u251c $ pi-bg {prof}{ ' --worktree' if E('WORKTREE') == '1' else ''}"]
+if E("WORKTREE") == "1":
+    desc_lines.append(kv("repo", E("REPO")))
+    desc_lines.append(kv("wt", E("WT"), head=True))
+    desc_lines.append(kv("branch", E("BRANCH")))
 else:
-    meta += [f"cwd    : {E('CWD')}"]
-embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('RUN')}"},
-         "color": color, "title": title,
-         "description": "```bash\n" + "\n".join(meta) + "```",
-         "fields": [{"name": "task", "value": E("TASK") or "-", "inline": False},
-                    {"name": "result", "value": E("BRIEF") or "-", "inline": False}],
-         "footer": {"text": "pi-bg"},
-         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-if E("PURL"):  embed["fields"].append({"name": "prompt", "value": f"[view]({E('PURL')})", "inline": True})
-if E("OURL"):  embed["fields"].append({"name": "full output", "value": f"[view]({E('OURL')})", "inline": True})
+    desc_lines.append(kv("cwd", E("CWD"), head=True))
+desc_lines.append("\u2514")
+desc = "```bash\n" + "\n".join(desc_lines) + "\n```"
+
+embed = {
+    "author": {"name": f"pi-bg ticket \u00b7 {rid}"},
+    "title": title,
+    "description": desc,
+    "color": color,
+}
+fields = []
+if E("TASK"):
+    fields.append({"name": "task", "value": E("TASK"), "inline": False})
+if E("BRIEF"):
+    fields.append({"name": "result", "value": E("BRIEF"), "inline": False})
+if E("PURL"):
+    fields.append({"name": "prompt", "value": "[view](" + E("PURL") + ")", "inline": True})
+if E("OURL"):
+    fields.append({"name": "full output", "value": "[view](" + E("OURL") + ")", "inline": True})
+if fields:
+    embed["fields"] = fields
 json.dump({"embeds": [embed]}, sys.stdout)
 PY
 }

@@ -144,9 +144,11 @@ On completion, `pi-bg` posts to the Discord webhook:
   `~/.config/pi-dispatch/webhook`. File absent = no callback (stdout is always
   printed).
 - **Embed callback (default):** a single embed with author
-  `pi-bg ticket · <run_id>`, title `✓ worker · OK · 3m12s` (or
-  `✓/✗ reviewer · PASS/FAIL`, `⚠ EMPTY`), code-block meta (status, repo,
-  worktree, branch, or cwd), and fields: `task` (first 200 chars),
+  `pi-bg ticket · <run_id>`, title `worker · OK · 12m43s` (or
+  `reviewer · PASS/FAIL`, `worker · DIED (no report)`, `worker · EMPTY`) -
+  no glyphs in titles. Description is a framed block (box-drawing,
+  <= 40 cols per line): `┌ ok · <run_id>` header + `├` meta lines
+  (repo/wt/branch, or cwd) + `└` close. Fields: `task` (first 200 chars),
   `result` (first 400 chars), plus `prompt` / `full output` links when
   `webdrop` is available (7d TTL).
 - **Status values:** `OK` (rc=0), `FAIL (rc=N)`, `EMPTY` (all attempts
@@ -183,7 +185,7 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 - `pi-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
   (`…/user@<uid>.service/pi-bg/<id>/`), dry-run prints the process tree,
   real kill sends SIGTERM to every member, waits `$PI_BG_KILL_WAIT` (10s),
-  then SIGKILL via `cgroup.kill` (per-pid fallback). Posts a `⛔ KILLED`
+  then SIGKILL via `cgroup.kill` (per-pid fallback). Posts a `KILLED`
   embed (same webhook URL source as pi-bg; dead letter on post failure).
   Precise by construction: only the run's cgroup subtree dies.
 
