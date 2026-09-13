@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # pi-bg-tail — read a pi-bg worker's live output without opening files (issue #16)
 #
-# pi-bg tees every run's live output to /tmp/pi-bg-<id>-raw.out, so an
+# pi-bg tees every run's live output to $HOME/.pi-bg-art/pi-bg-<id>-raw.out
+# (legacy /tmp for pre-upgrade runs; PI_BG_TMPDIR overrides), so an
 # in-flight run can be watched at any point (removes the blind spot where
 # only the webhook summary survived).
 # usage: pi-bg-tail <ticket-id> [lines] [-f]
@@ -11,7 +12,7 @@
 # exits: 0 = ok, 2 = bad usage / unknown ticket
 set -uo pipefail
 
-BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 id="" lines=40 follow=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +38,10 @@ if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
 fi
 
 rawf="$BG_TMP/pi-bg-${id}-raw.out"
+# pre-upgrade runs left raw.out in /tmp — fall back so old runs stay visible
+if [ ! -f "$rawf" ] && [ -f "/tmp/pi-bg-${id}-raw.out" ]; then
+  rawf="/tmp/pi-bg-${id}-raw.out"
+fi
 if [ ! -f "$rawf" ]; then
   echo "pi-bg-tail: no live output for ticket '$id' ($rawf missing) — unknown ticket, or the run never started" >&2
   exit 2

@@ -15,9 +15,11 @@
 #          cgroup-escape-unavailable fallback). A cmdline grep for the ticket
 #          id is deliberately NOT used: a live pi-bg whose TASK TEXT happens
 #          to mention the id would mask a dead ticket (false negative).
-#   3. skip tickets that completed normally: $PI_BG_TMPDIR/pi-bg-<ticket>-out.md
-#      exists and is non-empty (normal exit keeps the worktree BY DESIGN so
-#      the orchestrator can diff it; the callback was already posted)
+#   3. skip tickets that completed normally: out.md exists and is non-empty
+#      (default $HOME/.pi-bg-art — persistent; legacy /tmp is checked too,
+#      for one release, so runs started before the ~/.pi-bg-art upgrade are
+#      still recognized as completed). Normal exit keeps the worktree BY
+#      DESIGN so the orchestrator can diff it; the callback was posted
 #   4. if the dir mtime is older than 20 min and the ticket is not already
 #      in today's dead letter log -> post a DEAD webhook (same url source
 #      and embed format as pi-bg) and append ~/.pi-bg-deadlog
@@ -33,7 +35,12 @@
 set -uo pipefail
 
 WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
-BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+# persistent artifact dir (same default as pi-bg); /tmp is a tmpfs on the
+# hydrogen box and a reboot wipes it (2026-09-13 DEAD-flood). LEGACY_TMP is
+# checked as a fallback for one release (pre-upgrade runs).
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+LEGACY_TMP="/tmp"
+mkdir -p "$BG_TMP" 2>/dev/null
 DEADLOG="${HOME}/.pi-bg-deadlog"
 AGE_MIN=20
 QUIET=0
@@ -74,6 +81,20 @@ is_live() {
 already_dead() {
   local t="$1"
   grep -q "^${today} ${t} " "$DEADLOG" 2>/dev/null
+}
+
+# rule-3 lookups: persistent dir first, legacy /tmp for pre-upgrade runs
+has_out() {
+  local t="$1"
+  [ -s "$BG_TMP/pi-bg-${t}-out.md" ] || [ -s "$LEGACY_TMP/pi-bg-${t}-out.md" ]
+}
+has_killed() {
+  local t="$1"
+  [ -f "$BG_TMP/pi-bg-${t}-killed" ] || [ -f "$LEGACY_TMP/pi-bg-${t}-killed" ]
+}
+has_deadletter() {
+  local t="$1"
+  [ -f "$BG_TMP/pi-bg-${t}-webhook-failed" ] || [ -f "$LEGACY_TMP/pi-bg-${t}-webhook-failed" ]
 }
 
 # wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
@@ -124,8 +145,9 @@ for d in "$WT_DIR"/*/*/; do
   # 1) live dispatch -> leave alone
   if is_live "$t" "$d"; then continue; fi
   # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
-  #    killed on purpose (pi-bg-kill marker) -> not a lost callback
-  if [ -s "$BG_TMP/pi-bg-${t}-out.md" ] || [ -f "$BG_TMP/pi-bg-${t}-killed" ]; then continue; fi
+  #    killed on purpose (pi-bg-kill marker) -> not a lost callback. Both
+  #    checked in the persistent dir AND legacy /tmp (one release of overlap).
+  if has_out "$t" || has_killed "$t"; then continue; fi
   # 3) recent activity -> give it time
   mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
   [ $(( $(date +%s) - mtime )) -gt $((AGE_MIN * 60)) ] || continue
@@ -134,7 +156,7 @@ for d in "$WT_DIR"/*/*/; do
 
   found=$((found + 1))
   last="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)"
-  if [ -f "$BG_TMP/pi-bg-${t}-webhook-failed" ]; then
+  if has_deadletter "$t"; then
     reason="webhook dead letter exists (callback attempted, post failed)"
   else
     reason="no callback on record (SIGKILL/OOM suspected)"

@@ -117,6 +117,7 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
         |  role profiles            |  ~/.pi/agent-worker, ~/.pi/agent-reviewer
         |  cgroup escape            |  survives pi.service restart
         |  git worktrees            |  ~/.pi-bg-wt/<repo>/<id>, branch pi-bg/<id>
+        |  run artifacts            |  ~/.pi-bg-art/ (persistent, $PI_BG_TMPDIR)
         +-------------+-------------+
                       |  on exit: webhook embed (status/verdict, brief,
                       |             webdrop prompt+output links)

@@ -17,7 +17,7 @@
 # exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
 set -uo pipefail
 
-BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
