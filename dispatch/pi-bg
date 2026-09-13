@@ -68,8 +68,8 @@ while [ $# -gt 0 ]; do
   if [ "$1" = "--worktree" ]; then
     wt_mode=1
     shift
-    # ref is the next arg only if it is not another flag and something follows
-    if [ $# -ge 2 ] && [ "${1#-}" != "$1" ]; then wt_ref="$1"; shift; fi
+    # ref is the next arg only if something follows and it is not another flag
+    if [ $# -ge 2 ] && [ "${1#-}" = "$1" ]; then wt_ref="$1"; shift; fi
   else
     args+=("$1")
     shift
