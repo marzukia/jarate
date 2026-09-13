@@ -45,6 +45,10 @@ function fixture() {
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_SERVICE;
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
+  // cap off by default: ambient fleet traffic (real pi-bg runs of this
+  // user) must not make non-#41 tests hit "at cap"; #41 tests set
+  // PI_BG_MAX_CONCURRENT explicitly per spawn.
+  env.PI_BG_MAX_CONCURRENT = "0";
 
   const seedMainCreds = () => {
     fs.writeFileSync(
@@ -604,4 +608,280 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       hook.close();
     }
   });
+});
+
+/**
+ * #41: concurrency cap (PI_BG_MAX_CONCURRENT, default 3).
+ *
+ * pi-bg counts this uid's live "pi-bg worker|reviewer" processes before
+ * exec'ing the agent and refuses with a [!] line + exit 5 at the cap.
+ * Real traffic on the same uid (e.g. the dispatch running this suite)
+ * is counted too, so every assertion is made relative to a baseline
+ * captured immediately before spawning stubs.
+ */
+describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
+  // Mirror of the script's count: this uid's processes whose args contain
+  // "pi-bg worker" or "pi-bg reviewer", excluding the test process itself.
+  // A match whose parent has an identical cmdline is a fork-window
+  // phantom (a forked helper that has not exec'd yet keeps the parent's
+  // argv) and is skipped, same rule as the script.
+  const countLivePiBg = (): number => {
+    const out = execSync(`ps -U ${process.getuid()} -o pid=,ppid=,args=`, {
+      encoding: "utf8",
+    });
+    let n = 0;
+    for (const line of out.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid) continue;
+      const args = m[3];
+      if (!args.includes("pi-bg worker") && !args.includes("pi-bg reviewer"))
+        continue;
+      let identical = false;
+      try {
+        const a = fs
+          .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+          .split("\0")
+          .filter(Boolean)
+          .join(" ");
+        const p = fs
+          .readFileSync(`/proc/${m[2]}/cmdline`, "utf8")
+          .split("\0")
+          .filter(Boolean)
+          .join(" ");
+        identical = a === p;
+      } catch {
+        identical = false;
+      }
+      if (!identical) n++;
+    }
+    return n;
+  };
+
+  const sleepStubPi = (fx: { tmp: string }, seconds: number) => {
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(piBin, `#!/bin/sh\nsleep ${seconds}\necho pi-run-ok\n`);
+  };
+
+  const spawnStub = (
+    fx: {
+      tmp: string;
+      env: Record<string, string>;
+    },
+    task: string,
+    extraEnv: Record<string, string> = {},
+  ) =>
+    spawn(["bash", PI_BG, "worker", task], {
+      env: { ...fx.env, ...extraEnv },
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+  const waitFor = async (fn: () => boolean, ms = 15_000): Promise<boolean> => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (fn()) return true;
+      await Bun.sleep(100);
+    }
+    return fn();
+  };
+
+  const collected = new WeakMap<
+    ReturnType<typeof spawn>,
+    { code: number | null; out: string; err: string }
+  >();
+  const collect = async (p: ReturnType<typeof spawn>) => {
+    const prev = collected.get(p);
+    if (prev) {
+      const code = await p.exited;
+      return { code, out: prev.out, err: prev.err };
+    }
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    collected.set(p, { out, err });
+    return { code, out, err };
+  };
+
+  // Kill wrapper stubs + their orphaned sleeping pi children. The wrappers
+  // are killed by pid; the stub pi's are reaped by pkill on the UNIQUE
+  // mkdtemp dir, anchored on the shebang interpreter.
+  const killStubs = (stubs: ReturnType<typeof spawn>[], tmp: string) => {
+    for (const s of stubs) {
+      try {
+        s.kill("TERM");
+      } catch {
+        /* already dead */
+      }
+    }
+    try {
+      execSync(`pkill -f '^/bin/sh ${tmp}/bin/pi ' || true`, {
+        stdio: "ignore",
+      });
+    } catch {
+      /* pkill missing or nothing matched */
+    }
+  };
+
+  test("below cap: all stubs start and complete", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 3);
+    const base = countLivePiBg();
+    const max = base + 3;
+    const stubs = [1, 2, 3].map((i) =>
+      spawnStub(fx, `cap t1 stub ${i}`, { PI_BG_MAX_CONCURRENT: String(max) }),
+    );
+    try {
+      // all three wrappers in flight at once
+      expect(await waitFor(() => countLivePiBg() - base >= 3)).toBe(true);
+      const results = await Promise.all(stubs.map(collect));
+      for (const r of results) {
+        expect(r.code).toBe(0);
+        expect(r.out).toContain("pi-run-ok");
+        expect(r.err).not.toContain("at cap");
+      }
+    } finally {
+      killStubs(stubs, fx.tmp);
+    }
+  }, 30_000);
+
+  test("at cap: next dispatch refused (exit 5, cap line, no run record)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 3);
+    const base = countLivePiBg();
+    const max = base + 2;
+    const a = spawnStub(fx, "cap t2 stub a", {
+      PI_BG_MAX_CONCURRENT: String(max),
+    });
+    const b = spawnStub(fx, "cap t2 stub b", {
+      PI_BG_MAX_CONCURRENT: String(max),
+    });
+    let c: ReturnType<typeof spawn> | undefined;
+    try {
+      // two stubs in flight
+      expect(await waitFor(() => countLivePiBg() - base >= 2)).toBe(true);
+      c = spawnStub(fx, "cap t2 stub c", {
+        PI_BG_MAX_CONCURRENT: String(max),
+      });
+      const r = await collect(c);
+      expect(r.code).toBe(5);
+      expect(r.err).toMatch(
+        /\[!\] at cap \(\d+\/\d+\), try again later or pi-bg-kill a ticket/,
+      );
+      // a + b recorded their dispatch; the refused c left no record
+      expect(
+        await waitFor(() => {
+          try {
+            return fx.records().length === 2;
+          } catch {
+            return false; // record dir not created yet
+          }
+        }),
+      ).toBe(true);
+      expect(fx.records()).toHaveLength(2);
+    } finally {
+      killStubs([a, b, ...(c ? [c] : [])], fx.tmp);
+    }
+  }, 30_000);
+
+  test("self-exclusion: the counting wrapper is not counted against the cap", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // immediate stub pi: the wrapper is short-lived, so a self-count would
+    // refuse exactly this case (live = base + 1(self) >= max = base + 1)
+    const base = countLivePiBg();
+    const r = await collect(
+      spawnStub(fx, "cap t3 self", {
+        PI_BG_MAX_CONCURRENT: String(base + 1),
+      }),
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(r.err).not.toContain("at cap");
+  }, 15_000);
+
+  test("PI_BG_MAX_CONCURRENT=0: unlimited (4 in flight, above default 3)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 3);
+    const base = countLivePiBg();
+    const stubs = [1, 2, 3, 4].map((i) =>
+      spawnStub(fx, `cap t4 stub ${i}`, { PI_BG_MAX_CONCURRENT: "0" }),
+    );
+    try {
+      // 4 concurrent > the default cap of 3: only max=0 lets all start
+      expect(await waitFor(() => countLivePiBg() - base >= 4)).toBe(true);
+      const results = await Promise.all(stubs.map(collect));
+      for (const r of results) {
+        expect(r.code).toBe(0);
+        expect(r.err).not.toContain("at cap");
+      }
+    } finally {
+      killStubs(stubs, fx.tmp);
+    }
+  }, 30_000);
+
+  // Other-user exclusion needs root (spawn a matching process as nobody).
+  // Skipped - not root-testable - on unprivileged runners.
+  const hasSetpriv = (() => {
+    try {
+      execSync("command -v setpriv", { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  const otherUserIt = process.getuid?.() === 0 && hasSetpriv ? test : test.skip;
+
+  otherUserIt(
+    "other users' matching processes are not counted (root only)",
+    async () => {
+      const fx = fixture();
+      fx.seedMainCreds();
+      // a "pi-bg worker" process owned by uid 65534 (nobody): matches the
+      // fleet ps pattern but must not count against the root user's cap
+      const otherDir = path.join(fx.tmp, "other");
+      fs.mkdirSync(otherDir);
+      fs.chmodSync(fx.tmp, 0o755); // mkdtemp is 0700; nobody must traverse
+      const otherPiBg = path.join(otherDir, "pi-bg");
+      fs.writeFileSync(otherPiBg, "#!/bin/sh\nsleep 10\n");
+      fs.chmodSync(otherPiBg, 0o755);
+      const other = spawn(
+        [
+          "setpriv",
+          "--reuid=65534",
+          "--regid=65534",
+          "--clear-groups",
+          "bash",
+          otherPiBg,
+          "worker",
+        ],
+        { stdout: "ignore", stderr: "ignore" },
+      );
+      try {
+        await Bun.sleep(300); // let the nobody process appear in ps
+        const base = countLivePiBg(); // root-uid view: nobody excluded here too
+        const r = await collect(
+          spawnStub(fx, "cap t5 other", {
+            PI_BG_MAX_CONCURRENT: String(base + 1),
+          }),
+        );
+        expect(r.code).toBe(0);
+        expect(r.err).not.toContain("at cap");
+      } finally {
+        try {
+          other.kill("TERM");
+        } catch {
+          /* already dead */
+        }
+      }
+    },
+    30_000,
+  );
 });

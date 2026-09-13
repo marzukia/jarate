@@ -53,6 +53,13 @@ before dispatching:
 ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l
 ```
 
+Enforced in code since 2026-09-13 (issue #41): `pi-bg` counts this user's
+live `pi-bg worker|reviewer` processes before exec'ing the agent and
+refuses at the cap with
+`[!] at cap (N/M), try again later or pi-bg-kill a ticket` + exit 5.
+`PI_BG_MAX_CONCURRENT` sets the cap (default 3; 0 = unlimited, operator
+escape hatch). The ps count above stays the manual cross-check.
+
 ## The flow (default: fire-and-forget)
 
 Dispatch, confirm, end the turn. The callback wakes the orchestrator as a new

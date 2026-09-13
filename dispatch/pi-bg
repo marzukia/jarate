@@ -28,6 +28,21 @@
 #   with instructions — never a silent empty-completion retry loop.
 # No webhook (issue #30): loud warning at dispatch + a run record in
 #   ~/.pi-dispatch/runs/pi-bg-<id>.json marked "delivery":"none".
+# Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live pi-bg
+#   runs per user (default 3; 0 = unlimited, operator escape hatch). The
+#   fleet shares one vLLM endpoint; unbounded fan-out starved the prefix
+#   cache (2026-09-10 incident). The check runs BEFORE the agent's exec:
+#   count = this uid's live processes whose args contain "pi-bg worker" or
+#   "pi-bg reviewer" (the wrapper lives for the whole run: pi + callback),
+#   excluding this process ($$). pi-bg-kill/-tail/
+#   -watchdog, pi-wait and other users' processes never match. The count
+#   scans /proc/<pid>/status + cmdline in this shell (no ps/grep
+#   children): a forked helper keeps this wrapper's argv until it execs,
+#   and a wrapper checking at the same instant would count it as a
+#   phantom run. At cap: one stderr line + exit 5, with no
+#   worktree/cgroup/run-record side effects. Fails open if /proc is
+#   unreadable (a cap check must never block dispatch):
+#     [!] at cap (N/M), try again later or pi-bg-kill a ticket
 set -uo pipefail
 
 profile="${1:-worker}"
@@ -38,29 +53,10 @@ esac
 
 export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
 
-# repo root (script lives in <repo>/dispatch) - profile templates + censor.
-# Resolve symlinks first (issue #37): the normal launch is the
-# ~/scripts/pi-bg symlink install.sh creates, and with the unresolved link
-# path JB_ROOT would be $HOME, so the settings.json seed lookup at
-# $JB_ROOT/dispatch/profiles/<role>.json silently missed (fresh role got
-# auth+models but no settings.json -> pi fell back to its built-in
-# provider -> 402). Fallback keeps the old behavior if readlink fails.
-JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)"
-
-# --- per-run switchboard session id (unique ledger entry per dispatch) ---
-run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
-export PI_SESSION_ID="pi-${USER}-${profile}-${run_id}"
-
-# --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
-#     hydrogen box is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
-#     /tmp lost every out.md and the watchdog re-flagged finished tickets as
-#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
-#     and the bridge /jobs history — keep all per-run files in the same place
-#     so every tool finds them. ---
-BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
-mkdir -p "$BG_TMP" 2>/dev/null
-
 # --- optional --worktree [ref] (consumed before pi flags) ---
+# builtin-only on purpose: this zone must stay fork-free for the cap
+# check below (a forked child keeps this wrapper's argv until it execs;
+# a sibling wrapper scanning at the same instant would count it).
 wt_ref=""
 wt_mode=0
 args=()
@@ -76,6 +72,115 @@ while [ $# -gt 0 ]; do
   fi
 done
 set -- "${args[@]+"${args[@]}"}"
+
+# --- concurrency cap (issue #41): refuse to start when this user already
+#     has $PI_BG_MAX_CONCURRENT live pi-bg worker/reviewer runs (0 =
+#     unlimited). Counted via the fleet-rule arg pattern (args contain
+#     "pi-bg worker" or "pi-bg reviewer"), scoped to this uid, excluding
+#     this process (it has not exec'd the agent yet). pi-bg-kill/-tail/
+#     -watchdog, pi-wait and other users' processes never match. The
+#     scan reads /proc/<pid>/status + cmdline in this shell (no
+#     ps/grep children) and runs in the fork-free zone above: a forked
+#     helper keeps this wrapper's argv until it execs, and a wrapper
+#     checking at the same instant would count it as a phantom run. A
+#     match whose parent has the identical cmdline (forked helper of
+#     ANOTHER wrapper, mid-exec) is skipped the same way.
+#     Runs before the worktree add, cgroup escape and run record so a
+#     refused dispatch leaves no side effects. Fails open if /proc is
+#     unreadable (a cap check must never block dispatch).
+max_c="${PI_BG_MAX_CONCURRENT:-3}"
+case "$max_c" in
+  '' | *[!0-9]*)
+    echo "[!] PI_BG_MAX_CONCURRENT='$max_c' is not a non-negative integer, using 3" >&2
+    max_c=3
+    ;;
+esac
+if [ "$max_c" -gt 0 ]; then
+  # own uid from /proc/self/status ("Uid:\t<real>\t<eff>\t<saved>\t<fs>")
+  me_uid=""
+  while IFS= read -r _l; do
+    case "$_l" in
+      Uid:*) IFS=$' \t' read -r _u0 me_uid _ <<<"$_l"; break ;;
+    esac
+  done 2>/dev/null < /proc/self/status || true
+  live=0
+  if [ -n "$me_uid" ]; then
+    for d in /proc/[0-9]*; do
+      pid="${d#/proc/}"
+      [ "$pid" = "$$" ] && continue
+      # gate on the Uid line: as non-root, other users' status is
+      # usually unreadable (loop below simply skips it); as root the
+      # comparison filters explicitly
+      uid_ok=0
+      while IFS= read -r _l; do
+        case "$_l" in
+          Uid:*)
+            IFS=$' \t' read -r _u0 _u1 _ <<<"$_l"
+            [ "$_u1" = "$me_uid" ] && uid_ok=1
+            break
+            ;;
+        esac
+      done 2>/dev/null < "$d/status"
+      [ "$uid_ok" = 1 ] || continue
+      mapfile -d '' _argv 2>/dev/null < "$d/cmdline" || continue
+      # Match on argv ELEMENTS (review F1): a launcher "bash -c" carries
+      # "pi-bg worker" inside one -c string, so a substring test over the
+      # joined argv double-counted it. Require an element whose basename is
+      # pi-bg immediately followed by a worker|reviewer element.
+      _match=0
+      _n=${#_argv[@]}
+      for ((i = 0; i < _n; i++)); do
+        if [ "${_argv[i]##*/}" = "pi-bg" ] && [ $((i + 1)) -lt "$_n" ]; then
+          case "${_argv[i + 1]}" in
+            worker | reviewer) _match=1 ;;
+          esac
+        fi
+      done
+      [ "$_match" = 1 ] || continue
+      # fork-window phantom: a child of a process with the IDENTICAL
+      # cmdline is a forked helper that has not exec'd yet (it keeps
+      # the parent's argv); a real run's parent (launcher, bun,
+      # nohup) always has a different cmdline
+      _stat=$(<"$d/stat") 2>/dev/null || _stat=""
+      _ppid=""
+      if [ -n "$_stat" ]; then
+        _tail="${_stat##*) }"
+        read -r _ _ppid _ <<<"$_tail"
+      fi
+      _pargv=()
+      [ -n "$_ppid" ] && mapfile -d '' _pargv 2>/dev/null < "/proc/$_ppid/cmdline"
+      if [ "${_pargv[*]}" != "${_argv[*]}" ]; then
+        live=$((live + 1))
+      fi
+    done
+  fi
+  if [ "$live" -ge "$max_c" ]; then
+    echo "[!] at cap (${live}/${max_c}), try again later or pi-bg-kill a ticket" >&2
+    exit 5
+  fi
+fi
+
+# repo root (script lives in <repo>/dispatch) - profile templates + censor.
+# Resolve symlinks first (issue #37): the normal launch is the
+# ~/scripts/pi-bg symlink install.sh creates, and with the unresolved link
+# path JB_ROOT would be $HOME, so the settings.json seed lookup at
+# $JB_ROOT/dispatch/profiles/<role>.json silently missed (fresh role got
+# auth+models but no settings.json -> pi fell back to its built-in
+# provider -> 402). Fallback keeps the old behavior if readlink fails.
+JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)"
+
+# --- per-run switchboard session id (unique ledger entry per dispatch) ---
+run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
+export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
+
+# --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
+#     hydrogen box is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
+#     /tmp lost every out.md and the watchdog re-flagged finished tickets as
+#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
+#     and the bridge /jobs history — keep all per-run files in the same place
+#     so every tool finds them. ---
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+mkdir -p "$BG_TMP" 2>/dev/null
 
 wt_path=""
 wt_branch=""
