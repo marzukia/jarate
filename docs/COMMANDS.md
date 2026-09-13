@@ -64,7 +64,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
-| `/status` | owner | context-window usage, model, uptime |
+| `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
 | `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
@@ -192,7 +192,16 @@ what's the webhook TTL? . btw
 /status
 ```
 
-Owner only. Reports context-window usage, active model, and uptime.
+Owner only. One line: context-window usage, active model, uptime, run
+state (idle/running/compacting/op label), the verbosity level (`quiet`
+= 0, `verbose 1`, `verbose 2`, see `/verbose`), `hold on` while the
+channel is held (see `/hold`), `queue N` for the depth of mid-turn
+inbounds waiting on the run, and interrupt state (`interrupting` or
+`interrupt in Ns`).
+
+```
+[status] ctx 41% · model qwen3.8-27b · up 3h12m · running · verbose 1 · queue 2
+```
 
 ### /usage
 

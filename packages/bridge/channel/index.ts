@@ -3267,10 +3267,16 @@ async function runChannelCommand(
           // Open op window (compaction OR a restart-class op) shows its
           // label; otherwise the honest idle/running state.
           opWindowLabel(ch.id) ?? (ctx.isIdle() ? "idle" : "running"),
-          // Tool-call display gate state (#38): verbose = block renders,
-          // quiet = tool calls hidden.
-          isVerbose(ch) ? "verbose" : "quiet",
-        ];
+          // Tool-call display level (#10): quiet = 0 (text only),
+          // verbose 1 = essential tools, verbose 2 = all.
+          verboseLevel(ch) === 0 ? "quiet" : `verbose ${verboseLevel(ch)}`,
+          // Channel hold (#39): plain messages buffer, runs don't start.
+          isHeld(ch) ? "hold on" : null,
+          // Queue depth (#47): mid-turn inbounds waiting for the run.
+          midTurnQueues.get(ch.id)?.length
+            ? `queue ${midTurnQueues.get(ch.id)!.length}`
+            : null,
+        ].filter(Boolean);
         // Interrupt state, honestly: in flight, or armed with time to fire.
         if (interruptingChannels.has(ch.id)) {
           parts.push("interrupting");

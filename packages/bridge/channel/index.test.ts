@@ -999,7 +999,56 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handleInbound(pi, inbound("/status", "m3"), ctx);
     st = statusPost();
     expect(st).toBeDefined();
-    expect(st).toContain("verbose");
+    expect(st).toContain("verbose 2");
+
+    // #47: queue depth in the status line
+    queueMidTurnInbound(
+      "ch1",
+      inbound("queued q1", "m4"),
+      "text",
+      "discord/Test",
+      "text",
+      false,
+    );
+    queueMidTurnInbound(
+      "ch1",
+      inbound("queued q2", "m5"),
+      "text",
+      "discord/Test",
+      "text",
+      false,
+    );
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("/status", "m6"), ctx);
+    st = statusPost();
+    expect(st).toContain("queue 2");
+
+    // #47: hold state in the status line (queue survives the hold)
+    await handleInbound(pi, inbound("/hold on", "m7"), ctx);
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("/status", "m8"), ctx);
+    st = statusPost();
+    expect(st).toContain("hold on");
+    expect(st).toContain("queue 2");
+
+    // release: idle mock runs the oldest now; the rest chain via the
+    // re-wake loop (one run each) and stay queued until then
+    await handleInbound(pi, inbound("/hold off", "m9"), ctx);
+    await new Promise((r) => setImmediate(r));
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("/status", "m10"), ctx);
+    st = statusPost();
+    expect(st).not.toContain("hold on");
+    expect(st).toContain("queue 1");
+
+    // drain the last entry (the mock never fires agent_end, so no
+    // re-wake): status is back to a clean line
+    midTurnQueues.delete("ch1");
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("/status", "m11"), ctx);
+    st = statusPost();
+    expect(st).not.toContain("hold on");
+    expect(st).not.toContain("queue");
   });
 
   test("A4: /stop drains the channel's queued mid-turn inbounds", async () => {
