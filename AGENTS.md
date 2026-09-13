@@ -13,7 +13,7 @@ agent stack). Read this before touching anything.
 - `dispatch/` — `pi-bg`, `pi-wait` bash scripts (the orchestration machinery).
 - `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
-- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md.
+- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
 - `.githooks/pre-commit` — biome gate; `core.hooksPath` is set by install.sh.
 
 ## Commands
