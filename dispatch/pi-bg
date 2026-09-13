@@ -90,7 +90,7 @@ if [ "$wt_mode" -eq 1 ]; then
   wt_repo="$(basename "$top")"
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
     echo "pi-bg: worktree add failed (ref=$ref path=$wt_path)" >&2; exit 3; fi
-  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) — kept after run"
+  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run"
 fi
 
 # task = last positional arg (early: the exit trap needs it)
@@ -324,6 +324,8 @@ embed = {
     "title": title,
     "description": desc,
     "color": color,
+    "footer": {"text": "pi-bg"},
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 fields = []
 if E("TASK"):

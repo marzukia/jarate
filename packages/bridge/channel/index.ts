@@ -92,6 +92,7 @@ import {
 } from "./tasks";
 import {
   extractTodoLines,
+  fit,
   isBgCallbackBody,
   listBoards,
   loadBoard,
@@ -892,13 +893,6 @@ export function isVerbose(ch: ChannelConfig): boolean {
 /** Hard mobile budget for rendered frame lines (mockup3). */
 export const TOOL_LINE_MAX = 40;
 
-/** Clip to max code points, trailing ellipsis when cut. */
-function clipEnd(s: string, max: number): string {
-  if (s.length <= max) return s;
-  if (max <= 1) return "…";
-  return `${s.slice(0, max - 1)}…`;
-}
-
 /** Clip to max code points, leading ellipsis (keep the tail). */
 function clipStart(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -924,7 +918,7 @@ export function toolActionText(toolName: string, input: any): string {
           .split(/\s*(?:\||&&|;|>)\s*/)[0]
           .replace(/\s*2>&1\s*$/, ""),
       );
-      return `bash ${esc(clipEnd(seg, 31))}`;
+      return `bash ${esc(fit(seg, 31))}`;
     }
     case "read":
       return `read ${esc(clipStart(p, 31))}`;
@@ -939,7 +933,7 @@ export function toolActionText(toolName: string, input: any): string {
       } catch {
         args = String(input);
       }
-      return clipEnd(`${toolName} ${esc(one(args))}`, 36);
+      return fit(`${toolName} ${esc(one(args))}`, 36);
     }
   }
 }
@@ -955,11 +949,11 @@ export function statusLine(
 ): string {
   const secs = Math.round((Date.now() - t0) / 1000);
   const suffix = ` · ${n} call${n === 1 ? "" : "s"} · ${secs}s`;
-  return `┣ ${clipEnd(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
+  return `┣ ${fit(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
 }
 
 /** Max sub-step lines in a done frame (older calls overflow to the +N line). */
-export const DONE_FRAME_MAX_STEPS = 10;
+export const DONE_FRAME_MAX_STEPS = 8;
 
 /**
  * Done summary frame for a finished run (v3, mockup3):
@@ -988,7 +982,7 @@ export function doneFrame(
     lines.push(`├ … +${earlier} earlier call${earlier === 1 ? "" : "s"}`);
   shown.forEach((a, i) => {
     const prefix = i === shown.length - 1 ? "│ └ " : "│ ├ ";
-    lines.push(`${prefix}${clipEnd(a, TOOL_LINE_MAX - prefix.length)}`);
+    lines.push(`${prefix}${fit(a, TOOL_LINE_MAX - prefix.length)}`);
   });
   lines.push("└");
   return lines.join("\n");
@@ -2164,10 +2158,12 @@ export default function (pi: ExtensionAPI) {
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
         const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
+        // multi-line frame: code fence keeps the box glyphs monospace
+        // (mockup3: "frames live in code fences only")
         await editDiscordMessage(
           ch,
           statusMsgId,
-          doneFrame(toolCallsThisTurn, runToolCount, secs, failed),
+          `\`\`\`bash\n${doneFrame(toolCallsThisTurn, runToolCount, secs, failed)}\n\`\`\``,
         ).catch(() => {});
       }
     }
@@ -3202,10 +3198,16 @@ async function runChannelCommand(
         );
         const parts = listBoards()
           .filter((b) => b.todos.length > 0)
-          .map(
-            (b) =>
-              `┌ ${names.get(b.channelId) || b.channelId} · ${openCount(b.todos)} open\n${b.todos.map(todoLine).join("\n")}\n└`,
-          );
+          .map((b) => {
+            const name = names.get(b.channelId) || b.channelId;
+            const open = openCount(b.todos);
+            // header fits the 40-col budget: channel names run up to
+            // 100 chars, so clip the name (never the count or glyph)
+            const suffix = ` · ${open} open`;
+            return `┌ ${fit(name, 40 - 2 - suffix.length)}${suffix}\n${b.todos
+              .map(todoLine)
+              .join("\n")}\n└`;
+          });
         return {
           immediate:
             parts.length > 0 ? parts.join("\n\n") : "[todos] no open todos",

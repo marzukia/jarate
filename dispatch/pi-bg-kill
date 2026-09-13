@@ -43,7 +43,7 @@ fi
 
 CG="$CG_ROOT/pi-bg/$id"
 if [ ! -d "$CG" ]; then
-  echo "pi-bg-kill: no cgroup for ticket '$id' ($CG missing) — unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
+  echo "pi-bg-kill: no cgroup for ticket '$id' ($CG missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
   exit 2
 fi
 

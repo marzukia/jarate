@@ -59,7 +59,7 @@ import extension, {
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
-import { loadBoard, renderBoard, saveBoard } from "./todos";
+import { fit, loadBoard, renderBoard, saveBoard } from "./todos";
 import {
   type ChannelMessage,
   loadChannelConfig,
@@ -785,7 +785,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(doneEdit).toBeDefined(); // block stays, shows the finished run
     const doneBody = String(JSON.parse(doneEdit!.body).content);
     expect(doneBody).toContain("│ └ bash ls"); // sub-step, last = └
-    expect(doneBody.trimEnd().endsWith("└")).toBe(true); // closing bar
+    // multi-line frame lives in a code fence (mockup3)
+    expect(doneBody.startsWith("```bash\n")).toBe(true);
+    expect(doneBody.trimEnd()).toMatch(/\n└\n```$/); // closing bar, then fence
     const deleted = fetchCalls.find(
       (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
     );
@@ -3167,6 +3169,40 @@ describe("todo board (integration)", () => {
     expect(replyContent()).toBe("[todos] no open todos");
   });
 
+  test("/todos all clips a long channel name to the 40-col budget", async () => {
+    const longName = "a".repeat(90);
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: longName,
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "owner1",
+          },
+        ],
+      }),
+    );
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
+    await handleInbound(pi, inbound("/todos all", "m1"), ctx);
+    const header = replyContent().split("\n")[0];
+    // display width strips nothing here (no markdown in the header):
+    // raw length is the display length
+    expect(header.length).toBeLessThanOrEqual(40);
+    expect(header.startsWith("┌ ")).toBe(true);
+    expect(header.endsWith(" · 1 open")).toBe(true);
+    expect(header).toContain("…"); // clipped
+  });
+
   test("context injection: non-empty board appended after channel-ctx", async () => {
     saveBoard(
       {
@@ -4766,11 +4802,11 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
     const calls = Array.from({ length: 14 }, (_, i) => `bash step-${i} --flag`);
     const frame = doneFrame(calls, 14, 96, false).split("\n");
     expect(frame[0]).toBe("┌ done · 14 calls · 96s");
-    expect(frame[1]).toBe("├ … +4 earlier calls");
+    expect(frame[1]).toBe("├ … +6 earlier calls");
     expect(frame.length).toBe(2 + DONE_FRAME_MAX_STEPS + 1);
     expect(frame.at(-1)).toBe("└");
-    // last 10 calls, in order, last sub-step on └
-    expect(frame[2]).toBe("│ ├ bash step-4 --flag");
+    // last 8 calls, in order, last sub-step on └
+    expect(frame[2]).toBe("│ ├ bash step-6 --flag");
     expect(frame.at(-2)).toBe("│ └ bash step-13 --flag");
     for (const line of frame) {
       expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
@@ -4792,5 +4828,28 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
       expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
     }
     expect(frame.at(-2)).toBe("│ └ bash ok");
+  });
+
+  test("fit: a cut between a backslash and its escaped char shifts back one", () => {
+    // cut lands after a lone escape backslash (odd run) -> shift back,
+    // the dangling backslash drops, budget stays <= max
+    expect(fit(`${"a".repeat(14)}\\bc`, 16)).toBe(`${"a".repeat(14)}…`);
+    // even trailing run = complete escaped pair -> no shift
+    expect(fit(`${"a".repeat(13)}\\\\"b`, 16)).toBe(`${"a".repeat(13)}\\\\…`);
+    // no backslash at the cut -> unchanged behavior
+    expect(fit("abcdef", 4)).toBe("abc…");
+    // short strings pass through
+    expect(fit("ab", 4)).toBe("ab");
+  });
+
+  test("toolActionText: clipped escaped args never end in a dangling backslash", () => {
+    // 3-char key + 9 JSON quotes: the 36-col cut lands inside a
+    // 2-char escape unit (the old clip left a dangling `\` before …)
+    const action = toolActionText("t", { abc: `"`.repeat(9) });
+    expect(action.length).toBeLessThanOrEqual(36);
+    expect(action.endsWith("…")).toBe(true);
+    // backslash run right before the ellipsis must be even (paired)
+    const run = action.match(/(\\*)…$/)![1].length;
+    expect(run % 2).toBe(0);
   });
 });

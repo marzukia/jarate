@@ -177,11 +177,20 @@ export const TODO_LINE_MAX = 40;
 /** Content budget: glyph + space prefix (2) leaves 38 for the text. */
 const TODO_CONTENT_MAX = TODO_LINE_MAX - 2;
 
-/** Clip to max code points, trailing ellipsis when cut. */
+/**
+ * Clip to max code points, trailing ellipsis when cut. Shared end-clip
+ * helper (bridge index.ts uses it too). If the cut lands between a
+ * backslash and the char it escapes (escaped markdown), shift the cut
+ * back one so no dangling `\` sits before the ellipsis.
+ */
 export function fit(s: string, max: number): string {
   if (s.length <= max) return s;
   if (max <= 1) return "…";
-  return `${s.slice(0, max - 1)}…`;
+  let cut = max - 1;
+  let backslashes = 0;
+  while (backslashes < cut && s[cut - 1 - backslashes] === "\\") backslashes++;
+  if (backslashes % 2 === 1) cut--; // odd run: cut split a 2-char unit
+  return `${s.slice(0, cut)}…`;
 }
 
 export function renderBoardHeader(todos: Todo[]): string {
