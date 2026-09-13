@@ -407,55 +407,70 @@ describe("pi-bg-kill", () => {
     ...extra,
   });
 
-  test("--dry-run lists the tree, changes nothing", () => {
-    const r = run(KILL, [tid, "--dry-run"], env());
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("dry-run: no signal sent");
-    expect(r.out).toContain("999999999");
-    expect(r.out).toContain("(gone)"); // dummy pids are not real processes
-    expect(fs.readFileSync(path.join(cg, "cgroup.procs"), "utf8")).toBe(
-      "999999999\n999999998\n",
-    );
-    expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-killed`))).toBe(false);
-  });
+  // 30s timeout on the script-spawning tests: on a loaded machine the
+  // script's wall time can exceed bun's 5s default test timeout (the
+  // execFileSync budget below is already 30s).
+  test(
+    "--dry-run lists the tree, changes nothing",
+    () => {
+      const r = run(KILL, [tid, "--dry-run"], env());
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("dry-run: no signal sent");
+      expect(r.out).toContain("999999999");
+      expect(r.out).toContain("(gone)"); // dummy pids are not real processes
+      expect(fs.readFileSync(path.join(cg, "cgroup.procs"), "utf8")).toBe(
+        "999999999\n999999998\n",
+      );
+      expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-killed`))).toBe(false);
+    },
+    { timeout: 30_000 },
+  );
 
-  test("real kill: exits 0, writes killed marker, posts nothing without webhook", () => {
-    const r = run(KILL, [tid], env());
-    expect(r.code).toBe(0);
-    expect(r.out).toContain(`killed ${tid}`);
-    const marker = fs.readFileSync(
-      path.join(tmp, `pi-bg-${tid}-killed`),
-      "utf8",
-    );
-    expect(marker).toContain(tid);
-    expect(marker).toContain("killed");
-    // no webhook configured -> no body/dead-letter files
-    expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-body.json`))).toBe(
-      false,
-    );
-    expect(
-      fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-webhook-failed`)),
-    ).toBe(false);
-  });
+  test(
+    "real kill: exits 0, writes killed marker, posts nothing without webhook",
+    () => {
+      const r = run(KILL, [tid], env());
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`killed ${tid}`);
+      const marker = fs.readFileSync(
+        path.join(tmp, `pi-bg-${tid}-killed`),
+        "utf8",
+      );
+      expect(marker).toContain(tid);
+      expect(marker).toContain("killed");
+      // no webhook configured -> no body/dead-letter files
+      expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-body.json`))).toBe(
+        false,
+      );
+      expect(
+        fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-webhook-failed`)),
+      ).toBe(false);
+    },
+    { timeout: 30_000 },
+  );
 
-  test("webhook post failure -> dead letter, kill still exit 0", () => {
-    // port 9 = discard: connection refused on every attempt, backoff 0
-    const r = run(
-      KILL,
-      [tid],
-      env({ PI_DISPATCH_WEBHOOK: "http://127.0.0.1:9/" }),
-    );
-    expect(r.code).toBe(0);
-    const dl = fs.readFileSync(
-      path.join(tmp, `pi-bg-${tid}-kill-webhook-failed`),
-      "utf8",
-    );
-    expect(dl).toContain(tid);
-    expect(dl).toContain("event    : kill");
-    expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-body.json`))).toBe(
-      false,
-    );
-  });
+  test(
+    "webhook post failure -> dead letter, kill still exit 0",
+    () => {
+      // port 9 = discard: connection refused on every attempt, backoff 0
+      const r = run(
+        KILL,
+        [tid],
+        env({ PI_DISPATCH_WEBHOOK: "http://127.0.0.1:9/" }),
+      );
+      expect(r.code).toBe(0);
+      const dl = fs.readFileSync(
+        path.join(tmp, `pi-bg-${tid}-kill-webhook-failed`),
+        "utf8",
+      );
+      expect(dl).toContain(tid);
+      expect(dl).toContain("event    : kill");
+      expect(fs.existsSync(path.join(tmp, `pi-bg-${tid}-kill-body.json`))).toBe(
+        false,
+      );
+    },
+    { timeout: 30_000 },
+  );
 
   test("cgroup dir is reaped after it drains (no leaked empty dirs)", () => {
     // empty fake cgroup dir: no member files at all, so the drain check

@@ -31,6 +31,7 @@ scheme. Webhook callback embeds are structured and untagged.
 | `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
 | `/jobs` | `[jobs] …` |
+| `/diff [git-range \| file]` | `[ok] …` (errors: `[!] …`) |
 | `/todos` | board as-is (`▤` header); empty: `[todos] no open todos` |
 | `/sleep list` | `[wake] …` |
 | `/sleep cancel` | `[ok] …` / `[!] …` |
@@ -57,6 +58,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
 | `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
+| `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context-window usage, model, uptime |
 | `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
 | `/reset` | owner | abort the run and restart the pi session |
@@ -258,6 +260,36 @@ recent (newest first):
 Companion bins (installed like `pi-bg`): `pi-bg-tail <id> [lines] [-f]`
 reads a run's live output; `pi-bg-kill <id> [--dry-run]` cancels a run via
 its cgroup and posts a `KILLED` webhook event.
+
+### /diff
+
+```
+/diff                    # working tree diff (git diff HEAD)
+/diff main..HEAD          # git diff <range|rev>
+/diff path/to/patch.diff  # publish a local diff/patch file
+/diff ```diff ... ```     # publish a pasted diff (first fenced block)
+```
+
+Renders the diff into a self-contained dark mobile HTML page (syntax
+highlighted, no CDN, no external requests) and publishes it to the
+self-hosted webdrop shelf; the object key is a random 24-hex guid (96
+bits), so the URL is unguessable and is the access control. A 7-day TTL is
+stored on the drop; webdrop's purge job is phase 3, so the page stays
+fetchable until it is deleted. No third-party service sees the code
+(issue #7: critique.work rejected as code exfil). Input cap: 2 MB.
+`[!] diff too large (… MB, max 2 MB)` beyond that.
+
+```
+[ok] working tree · 2 files +12 -3 · ttl 7d
+https://drop.example.com/<id>.html
+```
+
+Agent-side CLI (same pipeline): `bun bin/jarate-diff [file|range|-]` from
+the repo root — stdin `-` for a diff piped in.
+
+`/diff` needs webdrop credentials: `WEBDROP_SERVER` + `WEBDROP_TOKEN` env,
+or `~/.config/webdrop/config.toml` (the same file the `webdrop` CLI reads).
+Missing config answers `[!] webdrop not configured (…)`.
 
 ### ! shell passthrough
 

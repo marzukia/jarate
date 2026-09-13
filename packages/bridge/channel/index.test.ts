@@ -326,6 +326,11 @@ describe("matchCommand (A3)", () => {
       name: "tasks",
       arg: "cancel abc123",
     });
+    expect(matchCommand("/diff")).toEqual({ name: "diff", arg: undefined });
+    expect(matchCommand("/diff main..HEAD")).toEqual({
+      name: "diff",
+      arg: "main..HEAD",
+    });
   });
 
   test("bare stop is exact-match only", () => {
@@ -4341,5 +4346,157 @@ describe("#28: systemd unit resolution (restart command)", () => {
       if (old !== undefined) process.env.PI_SERVICE = old;
       fs.rmSync(tmpdir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("/diff (issue #7)", () => {
+  let tmp: string;
+  let realHome: string;
+  let realFetch: typeof fetch;
+  let pi: any;
+  let ctx: any;
+  let fetchCalls: { url: string; method: string; body?: any }[];
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const replyContent = (): string => {
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    return JSON.parse(posts.at(-1)!.body).content;
+  };
+
+  beforeEach(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-diff-"));
+    realHome = process.env.HOME!;
+    process.env.HOME = tmp; // isolate webdrop config + .pi from the real home
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          { id: "ch1", name: "Test", type: "discord", botToken: "tok1" },
+        ],
+      }),
+    );
+    fs.mkdirSync(path.join(tmp, ".config", "webdrop"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".config", "webdrop", "config.toml"),
+      'server = "https://drop.test"\ntoken = "cfg-token"\n',
+    );
+    // real git repo with one uncommitted change
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@t",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@t",
+    };
+    const { spawnSync } = await import("node:child_process");
+    expect(spawnSync("git", ["init", "-q"], { cwd: tmp, env }).status).toBe(0);
+    fs.writeFileSync(path.join(tmp, "a.txt"), "one\ntwo\n");
+    spawnSync("git", ["add", "a.txt"], { cwd: tmp, env });
+    expect(
+      spawnSync("git", ["commit", "-q", "-m", "base"], { cwd: tmp, env })
+        .status,
+    ).toBe(0);
+    fs.writeFileSync(path.join(tmp, "a.txt"), "one\nTWO\n");
+
+    fetchCalls = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: () => {},
+      sendMessage: () => {},
+    };
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      fetchCalls.push({
+        url: u,
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      if (u.startsWith("https://drop.test/")) {
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({ url: "https://drop.test/feedd00d.html" }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ id: "out1" }) };
+    }) as any;
+  });
+
+  afterEach(() => {
+    clearDiscordStatesForTest();
+    globalThis.fetch = realFetch;
+    process.env.HOME = realHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("/diff publishes the working tree diff and replies with url + stats", async () => {
+    await handleInbound(pi, inbound("/diff", "dm1"), ctx);
+    expect(replyContent()).toBe(
+      "[ok] working tree · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+    );
+    const up = fetchCalls.find((c) =>
+      c.url.startsWith("https://drop.test/api/"),
+    );
+    expect(up).toBeTruthy();
+    // uploaded payload is the self-contained viewer page
+    const body = String(up!.body ?? "");
+    expect(body).toContain("<!DOCTYPE html>");
+    expect(body).toContain("working tree");
+    expect(body).toContain("#0d1117");
+    expect(body).toContain("TWO");
+    expect(body).toContain('"del"');
+  });
+
+  test("/diff with fenced paste publishes without touching git", async () => {
+    await handleInbound(
+      pi,
+      inbound(
+        "/diff ```diff\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n```",
+        "dm2",
+      ),
+      ctx,
+    );
+    expect(replyContent()).toBe(
+      "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+    );
+  });
+
+  test("/diff with unresolvable arg replies usage", async () => {
+    await handleInbound(pi, inbound("/diff hello\nworld", "dm3"), ctx);
+    expect(replyContent()).toBe(
+      "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
+    );
+  });
+
+  test("/diff without webdrop config reports the gap", async () => {
+    fs.rmSync(path.join(tmp, ".config"), { recursive: true, force: true });
+    await handleInbound(pi, inbound("/diff", "dm4"), ctx);
+    expect(replyContent()).toBe(
+      "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
+    );
   });
 });
