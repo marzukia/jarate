@@ -370,5 +370,12 @@ Lists the command set (the canonical list lives in
   burn a run; no echo loops).
 - **pi-bg webhooks are exempt** — the dispatch callback posts to the channel
   without triggering the bot.
-- **Mid-run messages are debounced** (2.5s quiet window) and delivered as one
-  steer at the next step boundary.
+- **Mid-run messages are queued, not debounced.** One message = one run: a
+  message that lands while a run is in flight waits in the re-wake queue
+  (acked `[queued] N in line`); it is delivered as a fresh run when the
+  current run ends. Each queued plain message also arms a mid-run interrupt:
+  if the current step is still in flight after the 3000 ms grace (env
+  `PISCORD_INTERRUPT_STEP_TIMEOUT_MS`), the step is aborted and the message
+  takes over as a fresh run. A `. queue` suffix opts out of the interrupt;
+  the message waits its turn. See "mid-run interrupt" and "queue control"
+  above.
