@@ -27,7 +27,7 @@
 #   JARATE_CTX_LIMIT    context limit fallback when models.json has none
 #   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
 #   JARATE_SSH_HOST     cross-user hop target (default andryo@127.0.0.1)
-#   JARATE_SUDO_PASS    password for the sudo -S hop (default [REDACTED-2026-09-13])
+#   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
 #   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
 
@@ -233,7 +233,11 @@ cmd_ctx_report() {
 # Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
 run_remote_probe() { # $1=name $2=uid $3=since
   local host="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
-  local pass="${JARATE_SUDO_PASS:-[REDACTED-2026-09-13]}"
+  local pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
+  if [ -z "$pass" ]; then
+    echo "[jarate:probe] no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
+    return 1
+  fi
   timeout "$TMO" sshpass -p "$pass" \
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
     "echo '$pass' | sudo -S -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'" 2>/dev/null

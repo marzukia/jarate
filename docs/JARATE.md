@@ -95,7 +95,8 @@ absolute UTC.
   (row `warnings` = `null` then).
 - `ok:false` when any agent row errored or no agents matched `--agent`.
 - Hop env: `JARATE_SSH_HOST` (default `andryo@127.0.0.1`),
-  `JARATE_SUDO_PASS` (default `[REDACTED-2026-09-13]`), `JARATE_AGENT_HOMES` (test
+  `JARATE_SUDO_PASS` (env, else `~/.config/sudo-pass` 0600 file - never a
+  literal in code), `JARATE_AGENT_HOMES` (test
   override: colon-separated home list).
 
 ### `memory-grep <query> [--root D] [--regex] [--case]`

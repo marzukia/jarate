@@ -28,7 +28,9 @@ echo <name>:<password> | chpasswd
 loginctl enable-linger <name>   # user units start at boot
 ```
 
-Fleet convention: password `[REDACTED-2026-09-13]` (same as the andryo sudo chain).
+Fleet convention: the andryo user password lives in `~/.config/sudo-pass`
+(0600) on each agent home - never in docs or code (a literal lived in
+public git history until the 2026-09-13 scrub + rotation).
 Note the uid - XDG_RUNTIME_DIR=/run/user/<uid> is needed for every
 `systemctl --user` call as another user.
 
