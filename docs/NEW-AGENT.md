@@ -43,10 +43,14 @@ VALUES ('sbk_<name>_<16 hex>', '<name>', <cap>, <budget>, true,
         EXTRACT(EPOCH FROM now())::bigint * 1000);
 ```
 
-Budget = ctx window in tokens (262144 = 262K, 405504 = 396K).
-`concurrency_cap` is enforced (402/503 on breach) - the header
-`X-Switchboard-Context` and the key budget must agree or you get surprise
-rejections.
+Budget = per-key aggregate KV headroom in tokens - headroom for the key's
+in-flight sessions at its concurrency cap. It does NOT have to equal the
+`X-Switchboard-Context` header (jimmy's live row: budget 405504, header
+262144, 53/53 requests 200). The per-key cap/budget gates are phase 0 =
+observe-only (they log `keycap-would-reject` kv_events, never deny).
+Actual rejections on the live server: 400 = context header is not an
+allocated chunk class, 429 = per-agent usage budget, 503 = global GPU-pool
+gate. There is no 402 on switchboard.
 
 ## 3. Toolchain (as the new user)
 
@@ -112,19 +116,26 @@ node is system-wide (/usr/bin/node) - no per-user step.
   "headers": {
     "X-Switchboard-Session": "pi-<name>",
     "X-Switchboard-Agent": "<name>",
-    "X-Switchboard-Context": "<budget>",
+    "X-Switchboard-Context": "<context-class>",
     "X-Switchboard-Project": "<name>",
     "X-Switchboard-Priority": "P1"
   },
   "models": [{ "id": "qwen3.8-27b", "name": "Qwen3.8 27B",
     "reasoning": true, "input": ["text", "image"],
-    "contextWindow": <budget>, "maxTokens": 16384,
+    "contextWindow": <context-class>, "maxTokens": 16384,
     "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
     "compat": { "thinkingFormat": "qwen-chat-template" } }]
 }}}
 ```
 
 Copy the model block verbatim from an existing agent's models.json.
+
+Gotcha (400 on first call): `X-Switchboard-Context` must be an ALLOCATED
+context class from the switchboard chunk table - live values when this was
+written: 65536, 98304, 131072, 262144, 524288. Set it and
+`contextWindow` to the same class (jimmy: 262144, i.e. 256K). Using the key
+budget here (e.g. 405504, 396K) is NOT a class and 400s with "not an
+allocated context class". The budget stays on the key row in the DB.
 
 ### pi.service
 
@@ -161,37 +172,48 @@ sudo -u <name> bash -lc '
   cd jarate && ./install.sh'
 ```
 
-install.sh (idempotent): `bun install` in the bridge, symlinks
-`~/scripts/pi-bg`, `~/scripts/pi-wait`, `~/bin/agent-say`,
-`~/projects/recall` into the checkout. The checkout IS the deployment -
-`git pull --ff-only` is the update procedure. Only bridge changes need a
-pi.service restart.
+install.sh (idempotent): `bun install` in the bridge, 8 pointer symlinks
+plus a conditional recall link - ~/scripts/{pi-bg, pi-wait, pi-bg-tail,
+pi-bg-kill, jarate}, ~/bin/{agent-say, jarate-diff, jarate}, and
+~/projects/recall (only if absent or already this symlink). The checkout IS
+the deployment - `git pull --ff-only` is the update procedure. Only bridge
+changes need a pi.service restart.
 
-## 6. Role profiles - THE TRAP (bites every new agent)
+## 6. Role profiles - the OpenRouter 402 trap
 
 pi-bg runs workers/reviewers under `PI_CODING_AGENT_DIR=~/.pi/agent-<role>`.
-On a fresh home it SEEDS that dir from the main profile - **auth.json and
-models.json only, NOT settings.json**. Without settings.json, pi falls back
-to its built-in OpenRouter default and the worker 402s on the (often $0)
-OpenRouter balance. Symptom: "worker died on a 402, thinking it's on
-OpenRouter" while the main agent's LLM is fine (different key, different
-path).
+Current code AUTO-SEEDS a missing role dir from the main profile: auth.json
+and models.json are copied, and a missing settings.json is generated from
+`dispatch/profiles/<role>.json` (thinking level, reserveTokens, keepRecentTokens)
+merged with the main agent's defaultProvider + defaultModel. Verified:
+running the repo's pi-bg with a fresh fake HOME seeds all three files
+provider included.
 
-Fix (do it BEFORE the first pi-bg dispatch):
+Known gap (this is how jimmy 402'd on 2026-09-13): `JB_ROOT` is computed as
+`$(dirname "${BASH_SOURCE[0]}")/..` WITHOUT symlink resolution. The normal
+launch path is the `~/scripts/pi-bg` symlink (install.sh), so JB_ROOT
+resolves to the home dir, the template lookup
+`$JB_ROOT/dispatch/profiles/<role>.json` silently misses, and the role ends
+up with auth+models but NO settings.json. pi then falls back to its built-in
+OpenRouter default and the worker 402s on the (often $0) OpenRouter balance
+- while the main agent's LLM is fine (different key, different path).
+Symptom: "worker died on a 402, thinking it's on OpenRouter". A bug is filed
+for the symlink fix; until it lands, write the role settings.json explicitly
+(safety net, content matches the auto-seed):
 
 ```bash
-# for role in worker reviewer:
-cat > ~/.pi/agent-<role>/settings.json <<EOF
+# worker (defaultThinkingLevel medium) and reviewer (xhigh) separately:
+cat > ~/.pi/agent-<role>/settings.json <<'EOF'
 { "defaultProvider": "hydrogen", "defaultModel": "qwen3.8-27b",
-  "defaultThinkingLevel": "<medium for worker, xhigh for reviewer>",
-  "reserveTokens": 13107, "keepRecentTokens": 20000 }
+  "defaultThinkingLevel": "medium", "reserveTokens": 13107,
+  "keepRecentTokens": 20000 }
 EOF
+# (reviewer: "defaultThinkingLevel": "xhigh")
 ```
 
 models.json in the role dir is already seeded from main (same switchboard
-key) - leave it. The repo's `dispatch/profiles/<role>.json` files are seed
-TEMPLATES (thinking + reserve tokens only, no provider) - that is why the
-seed misses the provider.
+key) - leave it. Verify before the first real dispatch: `ls ~/.pi/agent-worker/`
+must show settings.json with defaultProvider hydrogen.
 
 ## 7. Start + verify
 
