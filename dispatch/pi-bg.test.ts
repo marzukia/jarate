@@ -173,6 +173,39 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
   });
 });
 
+describe("#37: JB_ROOT resolves symlinks (normal launch is ~/scripts/pi-bg)", () => {
+  test("pi-bg launched via a symlink still seeds settings.json from the repo template", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // mimic install.sh: a bin dir under the fake HOME holding a symlink
+    // to the real script. BASH_SOURCE is the link path, so without
+    // readlink -f, JB_ROOT would be the fake HOME and the template lookup
+    // would silently miss.
+    const linkDir = path.join(fx.home, "scripts");
+    fs.mkdirSync(linkDir, { recursive: true });
+    const link = path.join(linkDir, "pi-bg");
+    fs.symlinkSync(PI_BG, link);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    const r = await runScript(
+      link,
+      ["worker", "symlink launch task"],
+      fx.env,
+      fx.tmp,
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    const prof = path.join(fx.home, ".pi", "agent-worker");
+    // the seed lookup must have found the template through the real path
+    expect(fs.existsSync(path.join(prof, "settings.json"))).toBe(true);
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(prof, "settings.json"), "utf-8"),
+    );
+    expect(settings.defaultThinkingLevel).toBe("medium"); // repo template
+    expect(settings.defaultProvider).toBe("hydrogen"); // merged from main settings
+    expect(settings.defaultModel).toBe("qwen-test"); // merged from main settings
+  });
+});
+
 describe("cgroup escape: self-drain + rmdir on exit; PI_BG_TMPDIR plumbing", () => {
   test("wrapper escapes into the test cgroup, drains itself, reaps the dir, writes artifacts to PI_BG_TMPDIR", async () => {
     const fx = fixture();

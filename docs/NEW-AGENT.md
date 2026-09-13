@@ -191,17 +191,17 @@ merged with the main agent's defaultProvider + defaultModel. Verified:
 running the repo's pi-bg with a fresh fake HOME seeds all three files
 provider included.
 
-Known gap (this is how jimmy 402'd on 2026-09-13): `JB_ROOT` is computed as
+History (how jimmy 402'd on 2026-09-13): `JB_ROOT` was computed as
 `$(dirname "${BASH_SOURCE[0]}")/..` WITHOUT symlink resolution. The normal
 launch path is the `~/scripts/pi-bg` symlink (install.sh), so JB_ROOT
-resolves to the home dir, the template lookup
-`$JB_ROOT/dispatch/profiles/<role>.json` silently misses, and the role ends
-up with auth+models but NO settings.json. pi then falls back to its built-in
-OpenRouter default and the worker 402s on the (often $0) OpenRouter balance
-- while the main agent's LLM is fine (different key, different path).
-Symptom: "worker died on a 402, thinking it's on OpenRouter". A bug is filed
-for the symlink fix; until it lands, write the role settings.json explicitly
-(safety net, content matches the auto-seed):
+resolved to the home dir, the template lookup
+`$JB_ROOT/dispatch/profiles/<role>.json` silently missed, and the role
+ended up with auth+models but NO settings.json. pi then fell back to its
+built-in OpenRouter default and the worker 402'd on the (often $0) OpenRouter
+balance - while the main agent's LLM was fine (different key, different
+path). FIXED in #37: JB_ROOT now resolves symlinks (readlink -f). The
+explicit settings.json below is kept as a reference for what the auto-seed
+produces (and as a manual safety net):
 
 ```bash
 # worker (defaultThinkingLevel medium) and reviewer (xhigh) separately:
