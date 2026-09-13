@@ -92,6 +92,7 @@ import {
 } from "./tasks";
 import {
   extractTodoLines,
+  fit,
   isBgCallbackBody,
   listBoards,
   loadBoard,
@@ -855,7 +856,7 @@ let userStoppedRun = false;
 // final or on a new inbound user message.
 const finalReps = new Map<string, string[]>();
 export const REPEAT_WARNING =
-  "[!] repetition loop detected — run stopped. Say /reset if it persists.";
+  "[!] repetition loop detected - run stopped. Say /reset if it persists.";
 
 /** Record a posted final; true on the third consecutive identical one. */
 export function recordFinalRepeat(channelId: string, text: string): boolean {
@@ -883,28 +884,48 @@ export function isVerbose(ch: ChannelConfig): boolean {
   return verboseOverride.get(ch.id) ?? ch.forwardToolCalls ?? false;
 }
 
-/** One-line tool summary with kimaki box glyphs (┣ call, ◼︎ file edit/write). */
-function formatToolCallLine(toolName: string, input: any): string {
+/**
+ * v3 message style (mockup3, 2026-09-13): state glyphs ┘ ┣ ├ ┤, `·`
+ * separators, ASCII words, no emoji/arrows/em-dashes/dingbats, and every
+ * rendered line fits the 40-col mobile budget.
+ */
+
+/** Hard mobile budget for rendered frame lines (mockup3). */
+export const TOOL_LINE_MAX = 40;
+
+/** Clip to max code points, leading ellipsis (keep the tail). */
+function clipStart(s: string, max: number): string {
+  if (s.length <= max) return s;
+  if (max <= 1) return "…";
+  return `…${s.slice(s.length - (max - 1))}`;
+}
+
+/**
+ * Bare action text for a tool call (no glyph, no counters). Capped at 36
+ * code points so a done-frame sub-step (`│ ├ <action>`) fits 40 cols.
+ * Paths clip the head (the filename is the useful tail); commands and arg
+ * dumps clip the tail (the verb is the useful head).
+ */
+export function toolActionText(toolName: string, input: any): string {
   const esc = (s: string) => s.replace(/([\\*_`])/g, "\\$1");
-  const one = (s: string, n: number) => {
-    s = s.replace(/\s*\n\s*/g, " ").trim();
-    return s.length > n ? `${s.slice(0, n)}…` : s;
-  };
-  const p = String(input?.path ?? "");
+  const one = (s: string) => s.replace(/\s*\n\s*/g, " ").trim();
+  const p = one(String(input?.path ?? ""));
   switch (toolName) {
     case "bash": {
       // first segment only: "bun run build 2>&1 | tail -4" -> "bun run build"
-      const seg = String(input?.command ?? "")
-        .split(/\s*(?:\||&&|;|>)\s*/)[0]
-        .replace(/\s*2>&1\s*$/, "");
-      return `┣ bash ${esc(one(seg, 80))}`;
+      const seg = one(
+        String(input?.command ?? "")
+          .split(/\s*(?:\||&&|;|>)\s*/)[0]
+          .replace(/\s*2>&1\s*$/, ""),
+      );
+      return `bash ${esc(fit(seg, 31))}`;
     }
     case "read":
-      return `┣ read ${esc(one(p, 80))}`;
+      return `read ${esc(clipStart(p, 31))}`;
     case "edit":
-      return `◼︎ edit ${esc(one(p, 80))}`;
+      return `edit ${esc(clipStart(p, 31))}`;
     case "write":
-      return `◼︎ write ${esc(one(p, 80))}`;
+      return `write ${esc(clipStart(p, 30))}`;
     default: {
       let args: string;
       try {
@@ -912,15 +933,59 @@ function formatToolCallLine(toolName: string, input: any): string {
       } catch {
         args = String(input);
       }
-      return `┣ ${toolName} ${esc(one(args, 60))}`;
+      return fit(`${toolName} ${esc(one(args))}`, 36);
     }
   }
 }
 
-/** Status line with running counter: "<action> · N calls · Xs". */
-function statusLine(action: string, n: number, t0: number): string {
+/**
+ * Live status line: `┣ <action> · N call(s) · Xs`, clipped to
+ * TOOL_LINE_MAX. Exported for the column-budget guard tests.
+ */
+export function statusLine(
+  lastToolAction: string,
+  n: number,
+  t0: number,
+): string {
   const secs = Math.round((Date.now() - t0) / 1000);
-  return `${action} · ${n} call${n === 1 ? "" : "s"} · ${secs}s`;
+  const suffix = ` · ${n} call${n === 1 ? "" : "s"} · ${secs}s`;
+  return `┣ ${fit(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
+}
+
+/** Max sub-step lines in a done frame (older calls overflow to the +N line). */
+export const DONE_FRAME_MAX_STEPS = 8;
+
+/**
+ * Done summary frame for a finished run (v3, mockup3):
+ *
+ *   ┌ done · 12 calls · 96s
+ *   │ ├ read /home/monky/…/index.ts
+ *   │ ├ edit /home/monky/…/index.ts
+ *   │ └ bash cargo test
+ *   └
+ *
+ * Failed runs swap the header for `┤ failed · …`. Shows the last
+ * DONE_FRAME_MAX_STEPS calls; earlier overflow lands right under the header
+ * as `├ … +N earlier calls`. Every line fits TOOL_LINE_MAX.
+ */
+export function doneFrame(
+  calls: string[],
+  count: number,
+  secs: number,
+  failed: boolean,
+): string {
+  const n = `${count} call${count === 1 ? "" : "s"} · ${secs}s`;
+  const lines: string[] = [failed ? `┤ failed · ${n}` : `┌ done · ${n}`];
+  const shown = calls.slice(-DONE_FRAME_MAX_STEPS);
+  const earlier = count - shown.length;
+  if (earlier > 0)
+    lines.push(`├ … +${earlier} earlier call${earlier === 1 ? "" : "s"}`);
+  shown.forEach((a, i) => {
+    const prefix = i === shown.length - 1 ? "│ └ " : "│ ├ ";
+    lines.push(`${prefix}${fit(a, TOOL_LINE_MAX - prefix.length)}`);
+  });
+  lines.push("└");
+  return lines.join("\n");
 }
 
 /** Local files referenced in final text (images + common docs). */
@@ -1746,7 +1811,7 @@ export default function (pi: ExtensionAPI) {
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
       return lastToolAction
-        ? `${lastToolAction} · ${runToolCount} call${runToolCount === 1 ? "" : "s"} · ${inc}s`
+        ? statusLine(lastToolAction, runToolCount, Date.now() - inc * 1000)
         : `┣ working… ${inc}s`;
     });
   };
@@ -1791,9 +1856,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
     runToolCount += 1;
-    lastToolAction = formatToolCallLine(event.toolName, event.input);
+    lastToolAction = toolActionText(event.toolName, event.input);
     const line = statusLine(lastToolAction, runToolCount, runStartedAt);
-    toolCallsThisTurn.push(line); // always recorded: data source for #10
+    toolCallsThisTurn.push(lastToolAction); // always recorded: done frame at run end
     // Display gate (#38): the block renders only while verbose is on;
     // with it off there is nothing to create or edit.
     if (!isVerbose(ch)) return;
@@ -1884,7 +1949,7 @@ export default function (pi: ExtensionAPI) {
         parts.push(`ctx ${Math.round(pct)}%`);
       if (model) parts.push(model);
       parts.push(agentBusy ? "working" : "idle");
-      const text = parts.join(" • ");
+      const text = parts.join(" · ");
       for (const ch of channels) {
         if (ch.type === "discord" && ch.botToken)
           setDiscordPresenceActivity(ch.botToken, text);
@@ -2092,10 +2157,13 @@ export default function (pi: ExtensionAPI) {
         await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
+        const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
+        // multi-line frame: code fence keeps the box glyphs monospace
+        // (mockup3: "frames live in code fences only")
         await editDiscordMessage(
           ch,
           statusMsgId,
-          `┗ done · ${runToolCount} call${runToolCount === 1 ? "" : "s"} · ${secs}s`,
+          `\`\`\`bash\n${doneFrame(toolCallsThisTurn, runToolCount, secs, failed)}\n\`\`\``,
         ).catch(() => {});
       }
     }
@@ -2179,24 +2247,24 @@ const CHANNEL_FORMAT_HINTS: Record<ChannelConfig["type"], string> = {
 
 const HELP_TEXT = [
   "**Commands**",
-  "`/stop` — stop the current run",
-  "plain message during a run — interrupts the step after ~3s, then takes over",
-  "`/btw <question>` — quick side question, answered briefly",
-  "`/status` — session stats (owner)",
-  "`/usage [all|session]` — token usage: current session, or all sessions",
+  "`/stop` - stop the current run",
+  "plain message during a run - interrupts the step after ~3s, then takes over",
+  "`/btw <question>` - quick side question, answered briefly",
+  "`/status` - session stats (owner)",
+  "`/usage [all|session]` - token usage: current session, or all sessions",
   "`/reset` - start a NEW session, clearing context (owner)",
   "`/restart` - restart pi, resuming THIS session (owner)",
-  "`/undo` — revert last assistant turn: files + conversation (owner)",
-  "`/redo` — reapply an /undo (one level deep, owner)",
-  "`/verbose on|off` — forward tool calls to the channel (owner)",
-  "`/compact [instructions]` — compact session context (owner)",
-  "`/model [name]` — switch or list models (owner)",
-  "`/jobs` — list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
-  "`/diff [git-range | file]` — publish a diff (default: working tree) to a shareable viewer URL",
-  "`/todos` — show the channel todo board (arg `all` for every channel)",
-  "`/sleep [list | cancel <id>]` — list or cancel pending session wakes (owner)",
-  "`/tasks [list | cancel <id>]` — list or cancel scheduled tasks (owner)",
-  "`/help` — this message",
+  "`/undo` - revert last assistant turn: files + conversation (owner)",
+  "`/redo` - reapply an /undo (one level deep, owner)",
+  "`/verbose on|off` - forward tool calls to the channel (owner)",
+  "`/compact [instructions]` - compact session context (owner)",
+  "`/model [name]` - switch or list models (owner)",
+  "`/jobs` - list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
+  "`/diff [git-range | file]` - publish a diff (default: working tree) to a shareable viewer URL",
+  "`/todos` - show the channel todo board (arg `all` for every channel)",
+  "`/sleep [list | cancel <id>]` - list or cancel pending session wakes (owner)",
+  "`/tasks [list | cancel <id>]` - list or cancel scheduled tasks (owner)",
+  "`/help` - this message",
 ].join("\n");
 
 function channelTitle(
@@ -2731,7 +2799,7 @@ function startCompact(
             : null;
         report(
           before != null && after != null
-            ? `[ok] compacted: ${before} → ${after} tokens`
+            ? `[ok] compacted: ${before} -> ${after} tokens`
             : "[ok] compacted",
         );
       },
@@ -2888,7 +2956,7 @@ async function runChannelCommand(
             parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
           }
         }
-        text = `[status] ${parts.join(" • ")}`;
+        text = `[status] ${parts.join(" · ")}`;
       } catch {
         text = "[!] status unavailable";
       }
@@ -3130,10 +3198,16 @@ async function runChannelCommand(
         );
         const parts = listBoards()
           .filter((b) => b.todos.length > 0)
-          .map(
-            (b) =>
-              `▤ ${names.get(b.channelId) || b.channelId} · ${openCount(b.todos)} open\n${b.todos.map(todoLine).join("\n")}`,
-          );
+          .map((b) => {
+            const name = names.get(b.channelId) || b.channelId;
+            const open = openCount(b.todos);
+            // header fits the 40-col budget: channel names run up to
+            // 100 chars, so clip the name (never the count or glyph)
+            const suffix = ` · ${open} open`;
+            return `┌ ${fit(name, 40 - 2 - suffix.length)}${suffix}\n${b.todos
+              .map(todoLine)
+              .join("\n")}\n└`;
+          });
         return {
           immediate:
             parts.length > 0 ? parts.join("\n\n") : "[todos] no open todos",

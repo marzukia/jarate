@@ -19,9 +19,11 @@ import extension, {
   clearAllInterrupts,
   clearQueuedInbound,
   collectFinals,
+  DONE_FRAME_MAX_STEPS,
   deleteQueuedInbound,
   deliverDueTasks,
   deliverDueWakes,
+  doneFrame,
   earlySendText,
   failurePostText,
   fileOnlyPrompt,
@@ -46,15 +48,18 @@ import extension, {
   runShellPassthrough,
   setInterruptCtx,
   setSystemdRestartHookForTest,
+  statusLine,
   stopAllCompactTicks,
   stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
+  TOOL_LINE_MAX,
+  toolActionText,
   updateQueuedInbound,
   verboseOverride,
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
-import { loadBoard, renderBoard, saveBoard } from "./todos";
+import { fit, loadBoard, renderBoard, saveBoard } from "./todos";
 import {
   type ChannelMessage,
   loadChannelConfig,
@@ -775,9 +780,14 @@ describe("extension handlers (A1/A2/A4)", () => {
     const doneEdit = fetchCalls.find(
       (c) =>
         c.method === "PATCH" &&
-        String(JSON.parse(c.body).content).includes("┗ done · 1 call"),
+        String(JSON.parse(c.body).content).includes("┌ done · 1 call"),
     );
     expect(doneEdit).toBeDefined(); // block stays, shows the finished run
+    const doneBody = String(JSON.parse(doneEdit!.body).content);
+    expect(doneBody).toContain("│ └ bash ls"); // sub-step, last = └
+    // multi-line frame lives in a code fence (mockup3)
+    expect(doneBody.startsWith("```bash\n")).toBe(true);
+    expect(doneBody.trimEnd()).toMatch(/\n└\n```$/); // closing bar, then fence
     const deleted = fetchCalls.find(
       (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
     );
@@ -838,9 +848,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.agent_end({ messages: [fin("one")] }, ctx);
     expect(
       fetchCalls.some(
-        (c) => c.method === "PATCH" && String(c.body).includes("┗ done"),
+        (c) => c.method === "PATCH" && String(c.body).includes("┌ done"),
       ),
-    ).toBe(true); // run 1's line closed
+    ).toBe(true); // run 1's frame closed
 
     // run 2: verbose off, no tool calls — statusMsgId still points at
     // run 1's line; agent_end must not delete or re-edit it
@@ -906,9 +916,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     );
     expect(
       fetchCalls.some(
-        (c) => c.method === "PATCH" && String(c.body).includes("┗ done"),
+        (c) => c.method === "PATCH" && String(c.body).includes("┌ done"),
       ),
-    ).toBe(false);
+    ).toBe(false); // no done frame after the live block was deleted
     expect(
       fetchCalls.some(
         (c) =>
@@ -2340,7 +2350,7 @@ describe("compact: defer mid-run + always report", () => {
     await tick();
     // The report REPLACES the ticking placeholder in place (PATCH), not a
     // fresh post — no double message when the compact lands.
-    const reportText = "[ok] compacted: 219997 → 35000 tokens";
+    const reportText = "[ok] compacted: 219997 -> 35000 tokens";
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
@@ -2394,7 +2404,7 @@ describe("compact: defer mid-run + always report", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe("[ok] compacted: 100 → 10 tokens");
+    expect(edits().at(-1)).toBe("[ok] compacted: 100 -> 10 tokens");
     jest.advanceTimersByTime(60000);
     expect(edits().length).toBe(4); // no further ticks after settle
     expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
@@ -3088,7 +3098,7 @@ describe("todo board (integration)", () => {
         { content: "tests", status: "pending" },
       ]),
     );
-    expect(content).toContain("▤ todos · 2 open");
+    expect(content).toContain("┌ todos · 2 open");
   });
 
   test("/todos with an empty board says 'no open todos'", async () => {
@@ -3120,7 +3130,7 @@ describe("todo board (integration)", () => {
       tmp,
     );
     await handleInbound(pi, inbound("/todos", "m1"), ctx); // fromId "uid" ≠ owner1
-    expect(replyContent()).toContain("⬦ x");
+    expect(replyContent()).toContain("├ x");
   });
 
   test("/todos all prints every channel's board", async () => {
@@ -3142,15 +3152,55 @@ describe("todo board (integration)", () => {
     );
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
     const content = replyContent();
-    expect(content).toContain("▤ Test · 1 open");
-    expect(content).toContain("⬦ a");
-    expect(content).toContain("▤ ch2 · 0 open");
-    expect(content).toContain("✓ ~~b~~");
+    expect(content).toContain("┌ Test · 1 open");
+    expect(content).toContain("├ a");
+    expect(content).toContain("┌ ch2 · 0 open");
+    expect(content).toContain("┘ ~~b~~");
+    // each board block is framed: opens with ┌, closes with └
+    expect(content.split("\n\n").length).toBe(2);
+    for (const block of content.split("\n\n")) {
+      expect(block.startsWith("┌ ")).toBe(true);
+      expect(block.trimEnd().endsWith("└")).toBe(true);
+    }
   });
 
   test("/todos all with no boards says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
     expect(replyContent()).toBe("[todos] no open todos");
+  });
+
+  test("/todos all clips a long channel name to the 40-col budget", async () => {
+    const longName = "a".repeat(90);
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: longName,
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "owner1",
+          },
+        ],
+      }),
+    );
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
+    await handleInbound(pi, inbound("/todos all", "m1"), ctx);
+    const header = replyContent().split("\n")[0];
+    // display width strips nothing here (no markdown in the header):
+    // raw length is the display length
+    expect(header.length).toBeLessThanOrEqual(40);
+    expect(header.startsWith("┌ ")).toBe(true);
+    expect(header.endsWith(" · 1 open")).toBe(true);
+    expect(header).toContain("…"); // clipped
   });
 
   test("context injection: non-empty board appended after channel-ctx", async () => {
@@ -3165,7 +3215,7 @@ describe("todo board (integration)", () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     const content = sent.at(-1)!.m.content;
     expect(content).toContain("</channel-ctx>");
-    expect(content).toContain("<todo-board>\n⬥ **fix bug**\n</todo-board>");
+    expect(content).toContain("<todo-board>\n┣ **fix bug**\n</todo-board>");
     expect(content.indexOf("</channel-ctx>")).toBeLessThan(
       content.indexOf("<todo-board>"),
     );
@@ -3206,7 +3256,7 @@ describe("todo board (integration)", () => {
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
     expect(posts.length).toBe(1);
-    expect(JSON.parse(posts[0].body).content).toContain("▤ todos · 2 open");
+    expect(JSON.parse(posts[0].body).content).toContain("┌ todos · 2 open");
 
     // 2) second call: edits the SAME message, no new post
     const r2 = await t.execute(
@@ -3221,7 +3271,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r2.content[0].text).toContain("✓ ~~a~~");
+    expect(r2.content[0].text).toContain("┘ ~~a~~");
     posts = fetchCalls.filter(
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
@@ -3231,8 +3281,8 @@ describe("todo board (integration)", () => {
         c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/out1"),
     );
     expect(patch).toBeDefined();
-    expect(JSON.parse(patch!.body).content).toContain("✓ ~~a~~");
-    expect(JSON.parse(patch!.body).content).toContain("▤ todos · 1 open");
+    expect(JSON.parse(patch!.body).content).toContain("┘ ~~a~~");
+    expect(JSON.parse(patch!.body).content).toContain("┌ todos · 1 open");
 
     // 3) empty list: deletes the board message, clears the state
     const r3 = await t.execute("3", { todos: [] }, undefined, undefined, ctx);
@@ -3281,7 +3331,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r.content[0].text).toContain("✓ ~~a~~");
+    expect(r.content[0].text).toContain("┘ ~~a~~");
     // state still updated; id kept so the next sync retries the edit
     const board = loadBoard("ch1", tmp);
     expect(board?.todos[0].status).toBe("completed");
@@ -3317,7 +3367,7 @@ describe("todo board (integration)", () => {
       tmp,
     );
     const body =
-      "[bg: worker OK · r1]\n\n<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
+      "[bg: worker OK · r1]\n\n<embed>\nAuthor: pi-bg ticket · r1\nTitle: worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
     await handleInbound(pi, inbound(body, "m1"), ctx);
 
     let board = loadBoard("ch1", tmp);
@@ -3332,8 +3382,8 @@ describe("todo board (integration)", () => {
         c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/board1"),
     );
     expect(patch).toBeDefined();
-    expect(JSON.parse(patch!.body).content).toContain("⬦ follow up on X");
-    expect(JSON.parse(patch!.body).content).toContain("⬥ **alpha**");
+    expect(JSON.parse(patch!.body).content).toContain("├ follow up on X");
+    expect(JSON.parse(patch!.body).content).toContain("┣ **alpha**");
     // the callback still woke the agent (run forwarded to pi)
     expect(sent.length).toBeGreaterThan(0);
 
@@ -4702,5 +4752,104 @@ describe("/diff (issue #7)", () => {
     expect(replyContent()).toBe(
       "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
     );
+  });
+});
+
+describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", () => {
+  const longAction =
+    "bash cargo build --release --features everything,extra,long-flags -p some-crate";
+  const longPath =
+    "/home/monky/.pi-bg-wt/jarate/20260913-091303-15761/packages/bridge/channel/index.ts";
+
+  test("statusLine fits the budget at any call count or elapsed time", () => {
+    const t0 = Date.now() - 125_000;
+    for (const n of [1, 3, 12, 99]) {
+      for (const t of [t0, Date.now() - 1000, Date.now() - 960_000]) {
+        const line = statusLine(longAction, n, t);
+        expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+        expect(line.startsWith("┣ ")).toBe(true);
+      }
+    }
+  });
+
+  test("toolActionText is frame-safe (<=36) and keeps verbs + filename tails", () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["bash", { command: "bun run build 2>&1 | tail -4 && echo done" }],
+      ["read", { path: longPath }],
+      ["edit", { path: longPath }],
+      ["write", { path: longPath }],
+      ["web_search", { query: "discord embed column budget mobile" }],
+      ["some_custom_tool", { a: "b".repeat(80) }],
+    ];
+    for (const [name, input] of cases) {
+      const action = toolActionText(name, input);
+      expect(action.length).toBeLessThanOrEqual(36);
+      // a done-frame sub-step always fits the mobile budget
+      expect(`│ ├ ${action}`.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+    }
+    // verb survives clipping; path clips the head so the filename survives
+    expect(toolActionText("edit", { path: longPath })).toBe(
+      "edit …ckages/bridge/channel/index.ts",
+    );
+    expect(
+      toolActionText("bash", {
+        command: "cargo test --features a,b,c --package some-long-crate-name",
+      }),
+    ).toBe("bash cargo test --features a,b,c --…");
+  });
+
+  test("doneFrame: header + capped sub-steps + overflow line, all <= 40 cols", () => {
+    const calls = Array.from({ length: 14 }, (_, i) => `bash step-${i} --flag`);
+    const frame = doneFrame(calls, 14, 96, false).split("\n");
+    expect(frame[0]).toBe("┌ done · 14 calls · 96s");
+    expect(frame[1]).toBe("├ … +6 earlier calls");
+    expect(frame.length).toBe(2 + DONE_FRAME_MAX_STEPS + 1);
+    expect(frame.at(-1)).toBe("└");
+    // last 8 calls, in order, last sub-step on └
+    expect(frame[2]).toBe("│ ├ bash step-6 --flag");
+    expect(frame.at(-2)).toBe("│ └ bash step-13 --flag");
+    for (const line of frame) {
+      expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+    }
+  });
+
+  test("doneFrame: failed runs swap the header to the ┤ failed glyph", () => {
+    const frame = doneFrame(["read x.ts"], 1, 5, true).split("\n");
+    expect(frame[0]).toBe("┤ failed · 1 call · 5s");
+    expect(frame.at(-1)).toBe("└");
+    for (const line of frame) {
+      expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+    }
+  });
+
+  test("doneFrame: very long actions clip at the line budget", () => {
+    const frame = doneFrame([longAction, "bash ok"], 2, 5, false).split("\n");
+    for (const line of frame) {
+      expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+    }
+    expect(frame.at(-2)).toBe("│ └ bash ok");
+  });
+
+  test("fit: a cut between a backslash and its escaped char shifts back one", () => {
+    // cut lands after a lone escape backslash (odd run) -> shift back,
+    // the dangling backslash drops, budget stays <= max
+    expect(fit(`${"a".repeat(14)}\\bc`, 16)).toBe(`${"a".repeat(14)}…`);
+    // even trailing run = complete escaped pair -> no shift
+    expect(fit(`${"a".repeat(13)}\\\\"b`, 16)).toBe(`${"a".repeat(13)}\\\\…`);
+    // no backslash at the cut -> unchanged behavior
+    expect(fit("abcdef", 4)).toBe("abc…");
+    // short strings pass through
+    expect(fit("ab", 4)).toBe("ab");
+  });
+
+  test("toolActionText: clipped escaped args never end in a dangling backslash", () => {
+    // 3-char key + 9 JSON quotes: the 36-col cut lands inside a
+    // 2-char escape unit (the old clip left a dangling `\` before …)
+    const action = toolActionText("t", { abc: `"`.repeat(9) });
+    expect(action.length).toBeLessThanOrEqual(36);
+    expect(action.endsWith("…")).toBe(true);
+    // backslash run right before the ellipsis must be even (paired)
+    const run = action.match(/(\\*)…$/)![1].length;
+    expect(run % 2).toBe(0);
   });
 });

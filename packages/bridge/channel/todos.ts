@@ -153,28 +153,55 @@ export function openCount(todos: Todo[]): number {
   ).length;
 }
 
-/** One line per item, glyph per status. */
+/**
+ * One line per item, v3 state glyph at column 1 (mockup3, 2026-09-13):
+ * ├ pending, ┣ in-progress (bold), ┘ done (strikethrough), ┤ cancelled.
+ * Content is clipped so the rendered line fits the 40-col mobile budget.
+ */
 export function todoLine(t: Todo): string {
+  const c = fit(t.content, TODO_CONTENT_MAX);
   switch (t.status) {
     case "pending":
-      return `⬦ ${t.content}`;
+      return `├ ${c}`;
     case "in_progress":
-      return `⬥ **${t.content}**`;
+      return `┣ **${c}**`;
     case "completed":
-      return `✓ ~~${t.content}~~`;
+      return `┘ ~~${c}~~`;
     case "cancelled":
-      return `✕ ${t.content}`;
+      return `┤ ${c}`;
   }
 }
 
-export function renderBoardHeader(todos: Todo[]): string {
-  return `▤ todos · ${openCount(todos)} open`;
+/** Hard mobile budget for rendered frame lines (mockup3). */
+export const TODO_LINE_MAX = 40;
+/** Content budget: glyph + space prefix (2) leaves 38 for the text. */
+const TODO_CONTENT_MAX = TODO_LINE_MAX - 2;
+
+/**
+ * Clip to max code points, trailing ellipsis when cut. Shared end-clip
+ * helper (bridge index.ts uses it too). If the cut lands between a
+ * backslash and the char it escapes (escaped markdown), shift the cut
+ * back one so no dangling `\` sits before the ellipsis.
+ */
+export function fit(s: string, max: number): string {
+  if (s.length <= max) return s;
+  if (max <= 1) return "…";
+  let cut = max - 1;
+  let backslashes = 0;
+  while (backslashes < cut && s[cut - 1 - backslashes] === "\\") backslashes++;
+  if (backslashes % 2 === 1) cut--; // odd run: cut split a 2-char unit
+  return `${s.slice(0, cut)}…`;
 }
 
-/** Full board text: header + one line per item. */
+export function renderBoardHeader(todos: Todo[]): string {
+  return `┌ todos · ${openCount(todos)} open`;
+}
+
+/** Full board text: header + one line per item + closing bar. */
 export function renderBoard(todos: Todo[]): string {
   const lines = [renderBoardHeader(todos)];
   for (const t of todos) lines.push(todoLine(t));
+  lines.push("└");
   return lines.join("\n");
 }
 

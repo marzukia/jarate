@@ -17,6 +17,7 @@ import {
   sanitizeStatus,
   sanitizeTodos,
   saveBoard,
+  TODO_LINE_MAX,
   type Todo,
   type TodoBoard,
   todoBoardContextBlock,
@@ -157,35 +158,67 @@ describe("todos: rendering", () => {
   ];
 
   test("header counts only pending + in_progress as open", () => {
-    expect(renderBoardHeader(all)).toBe("▤ todos · 2 open");
+    expect(renderBoardHeader(all)).toBe("┌ todos · 2 open");
     expect(openCount(all)).toBe(2);
     expect(openCount([])).toBe(0);
     expect(openCount([{ content: "x", status: "completed" }])).toBe(0);
   });
 
-  test("each status renders its glyph", () => {
-    expect(todoLine({ content: "a", status: "pending" })).toBe("⬦ a");
-    expect(todoLine({ content: "b", status: "in_progress" })).toBe("⬥ **b**");
-    expect(todoLine({ content: "c", status: "completed" })).toBe("✓ ~~c~~");
-    expect(todoLine({ content: "d", status: "cancelled" })).toBe("✕ d");
+  test("each status renders its v3 state glyph", () => {
+    expect(todoLine({ content: "a", status: "pending" })).toBe("├ a");
+    expect(todoLine({ content: "b", status: "in_progress" })).toBe("┣ **b**");
+    expect(todoLine({ content: "c", status: "completed" })).toBe("┘ ~~c~~");
+    expect(todoLine({ content: "d", status: "cancelled" })).toBe("┤ d");
   });
 
-  test("renderBoard is header + one line per item", () => {
+  test("renderBoard is header + one line per item + closing bar", () => {
     expect(renderBoard(all)).toBe(
       [
-        "▤ todos · 2 open",
-        "⬦ write tests",
-        "⬥ **fix the bug**",
-        "✓ ~~read the docs~~",
-        "✕ old idea",
+        "┌ todos · 2 open",
+        "├ write tests",
+        "┣ **fix the bug**",
+        "┘ ~~read the docs~~",
+        "┤ old idea",
+        "└",
       ].join("\n"),
     );
+  });
+
+  test("column budget: every rendered board line fits 40 cols (mockup3)", () => {
+    const long: Todo[] = [
+      {
+        content:
+          "ship the jarate v3 message style migration across the whole fleet tonight",
+        status: "pending",
+      },
+      {
+        content:
+          "a-very-long-in-progress-task-that-exceeds-the-mobile-column-budget-40",
+        status: "in_progress",
+      },
+      {
+        content:
+          "completed item with content long enough to be clipped at the budget",
+        status: "completed",
+      },
+      {
+        content:
+          "cancelled item with content long enough to be clipped at the budget",
+        status: "cancelled",
+      },
+    ];
+    const display = (line: string) => line.replace(/\*\*|~~/g, "");
+    for (const line of renderBoard(long).split("\n")) {
+      expect(display(line).length).toBeLessThanOrEqual(TODO_LINE_MAX);
+    }
+    // clipped content is lossy-marked, never hard-truncated
+    expect(todoLine(long[0])).toContain("…");
   });
 
   test("todoBoardContextBlock wraps items and is empty for an empty board", () => {
     expect(todoBoardContextBlock([])).toBe("");
     expect(todoBoardContextBlock([{ content: "a", status: "pending" }])).toBe(
-      "<todo-board>\n⬦ a\n</todo-board>",
+      "<todo-board>\n├ a\n</todo-board>",
     );
   });
 });
@@ -231,7 +264,7 @@ describe("todos: worker intake", () => {
     expect(isBgCallbackBody("[bg:worker:OK] legacy")).toBe(true);
     expect(
       isBgCallbackBody(
-        "<embed>\nAuthor: pi-bg ticket · r1\nTitle: ✓ worker · OK\n</embed>",
+        "<embed>\nAuthor: pi-bg ticket · r1\nTitle: worker · OK\n</embed>",
       ),
     ).toBe(true);
     expect(isBgCallbackBody("hello TODO: world")).toBe(false);
