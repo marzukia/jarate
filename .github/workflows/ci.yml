@@ -27,3 +27,33 @@ jobs:
         run: cd packages/bridge && bun x tsc --noEmit
       - name: Test
         run: cd packages/bridge && bun x bun test
+
+  recall:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install
+        run: cd packages/recall && bun install
+      - name: Typecheck
+        run: cd packages/recall && bun x tsc --noEmit
+      - name: Test
+        # integration tests skip when Postgres/Ollama are unreachable
+        run: cd packages/recall && bun test
+
+  bin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Test
+        # needs jq, rg, python3 (all in the ubuntu image)
+        run: cd bin && bun test
+
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Test
+        run: cd dispatch && bun test

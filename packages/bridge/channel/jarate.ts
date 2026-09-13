@@ -117,7 +117,7 @@ export function registerJarateTool(pi: ExtensionAPI): void {
     description:
       "Machine-ops helpers as JSON (ok:true|false + error, snake_case, read-only). " +
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
-      "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (default -1h). " +
+      "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
       "memory-grep <query> [--root D] [--regex]: search ~/memory, top-20 matches. " +
       "rag <question> [--project P]: RAG query over project knowledge (recall).",
     promptSnippet:

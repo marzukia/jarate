@@ -107,6 +107,18 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
     "# a\nneedle in a\nline two\n",
   );
   fs.writeFileSync(path.join(mem, "2026-01-02-b.md"), "# b\nNEEDLE in b\n");
+  // regex chars: prove fixed-string default (dot/paren are literal)
+  fs.writeFileSync(
+    path.join(mem, "2026-01-05-regex.md"),
+    [
+      "# regex chars",
+      "literal a.b line",
+      "regex axb line",
+      "a (unterminated paren",
+      "-1h window note",
+      "",
+    ].join("\n"),
+  );
 
   // stub recall CLI: one result, echoes RAG_PROJECT into source.
   // NOTE: bun pre-parses shebang'd scripts as JS (">&2" breaks), so the stub
@@ -161,6 +173,8 @@ describe("entrypoint", () => {
     const r = await f.run([]);
     const d = doc(r);
     expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(Object.keys(d)).toEqual(["ok", "ts", "error", "usage", "commands"]);
     expect(d.usage).toBe("jarate <cmd> [args]");
     expect(d.commands).toEqual([
       "ctx-report",
@@ -246,12 +260,53 @@ describe("ctx-report", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("unknown profile -> ok:false usage error", async () => {
+  test("unknown profile -> ok:false usage error, rc 2", async () => {
     const f = fixture();
     const r = await f.run(["ctx-report", "--profile", "bogus"]);
+    expect(r.code).toBe(2);
     const d = doc(r);
     expect(d.ok).toBe(false);
     expect(d.error).toContain("profile must be main or worker");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("missing flag value -> JSON error doc, empty stderr, rc 2", async () => {
+    const f = fixture();
+    const cases: Array<[string[], string]> = [
+      [["ctx-report", "--profile"], "--profile needs a value"],
+      [["journal-errors", "--since"], "--since needs a value"],
+      [["journal-errors", "--agent"], "--agent needs a value"],
+      [["memory-grep", "q", "--root"], "--root needs a value"],
+      [["rag", "q", "--project"], "--project needs a value"],
+    ];
+    for (const [args, msg] of cases) {
+      const r = await f.run(args);
+      expect(r.code).toBe(2);
+      expect(r.err).toBe("");
+      const d = doc(r);
+      expect(d.ok).toBe(false);
+      expect(d.error).toContain(msg);
+    }
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("session usage python is timeout-bounded", async () => {
+    const f = fixture();
+    const slowPy = path.join(f.tmp, "slow-py-bin");
+    fs.mkdirSync(slowPy, { recursive: true });
+    fs.writeFileSync(path.join(slowPy, "python3"), "#!/bin/sh\nsleep 5\n");
+    fs.chmodSync(path.join(slowPy, "python3"), 0o755);
+    const t0 = Date.now();
+    const r = await f.run(["ctx-report"], {
+      PATH: `${slowPy}:${f.env.PATH}`,
+      JARATE_TIMEOUT_S: "1",
+    });
+    const elapsed = (Date.now() - t0) / 1000;
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.context.tokens).toBeNull(); // usage scan timed out
+    expect(d.cost_error).toContain("timed out"); // ptc python timed out
+    expect(elapsed).toBeLessThan(8);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -263,7 +318,9 @@ describe("journal-errors", () => {
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
-    expect(d.since).toBe("-1h");
+    // default since = absolute UTC datetime, one hour back
+    expect(d.since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(Object.keys(d)).toEqual(["ok", "ts", "error", "since", "agents"]);
     expect(d.agents).toHaveLength(2);
     const [self, peer] = d.agents;
     expect(self.source).toBe("local");
@@ -319,6 +376,39 @@ describe("journal-errors", () => {
     expect(d.agents[0].source).toBe("local");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
+
+  test("--since: T-form and space-form accepted, relative rejected (rc 2)", async () => {
+    const f = fixture();
+    const r1 = await f.run([
+      "journal-errors",
+      "--since",
+      "2026-09-13T00:00:00Z",
+      "--agent",
+      "home",
+    ]);
+    expect(r1.code).toBe(0);
+    expect(doc(r1).since).toBe("2026-09-13T00:00:00Z");
+    const r2 = await f.run([
+      "journal-errors",
+      "--since",
+      "2026-09-13",
+      "00:00:00",
+      "--agent",
+      "home",
+    ]);
+    expect(r2.code).toBe(0);
+    expect(doc(r2).since).toBe("2026-09-13 00:00:00");
+    const r3 = await f.run([
+      "journal-errors",
+      "--since",
+      "-1h",
+      "--agent",
+      "home",
+    ]);
+    expect(r3.code).toBe(2);
+    expect(doc(r3).error).toContain("absolute datetime");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
 });
 
 describe("memory-grep", () => {
@@ -327,6 +417,17 @@ describe("memory-grep", () => {
     const r = await f.run(["memory-grep", "needle"]);
     const d = doc(r);
     expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(Object.keys(d)).toEqual([
+      "ok",
+      "ts",
+      "error",
+      "query",
+      "root",
+      "count",
+      "truncated",
+      "matches",
+    ]);
     expect(d.count).toBe(2);
     expect(d.truncated).toBe(false);
     expect(d.matches).toHaveLength(2);
@@ -370,17 +471,97 @@ describe("memory-grep", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("missing query / missing root -> ok:false", async () => {
+  test("default mode is fixed-string: regex chars match literally", async () => {
     const f = fixture();
-    const r1 = await f.run(["memory-grep"]);
-    expect(doc(r1).error).toContain("usage:");
-    const r2 = await f.run([
+    const r = await f.run(["memory-grep", "a.b"]);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    // only the literal "a.b" line; "axb" must NOT match (dot is not a regex)
+    expect(d.count).toBe(1);
+    expect(d.matches[0].text).toBe("literal a.b line");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("(unterminated is a literal match, not a regex error", async () => {
+    const f = fixture();
+    const r = await f.run(["memory-grep", "(unterminated"]);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.count).toBe(1);
+    expect(d.matches[0].text).toBe("a (unterminated paren");
+    // same query with --regex is a bad regex -> ok:false
+    const r2 = await f.run(["memory-grep", "(unterminated", "--regex"]);
+    const d2 = doc(r2);
+    expect(d2.ok).toBe(false);
+    expect(d2.error).toContain("rg failed");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("two identical runs -> identical match order (deterministic)", async () => {
+    const f = fixture();
+    const tree = path.join(f.tmp, "tree");
+    fs.mkdirSync(tree, { recursive: true });
+    for (let i = 1; i <= 400; i++) {
+      fs.writeFileSync(
+        path.join(tree, `f${String(i).padStart(3, "0")}.md`),
+        `matchline ${i}\nother\n`,
+      );
+    }
+    const r1 = await f.run(["memory-grep", "matchline", "--root", tree]);
+    const r2 = await f.run(["memory-grep", "matchline", "--root", tree]);
+    expect(doc(r1).count).toBe(400);
+    expect(JSON.stringify(doc(r1).matches)).toBe(
+      JSON.stringify(doc(r2).matches),
+    );
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("rg is timeout-bounded (JARATE_TIMEOUT_S honored)", async () => {
+    const f = fixture();
+    const slowRg = path.join(f.tmp, "slow-rg-bin");
+    fs.mkdirSync(slowRg, { recursive: true });
+    fs.writeFileSync(path.join(slowRg, "rg"), "#!/bin/sh\nsleep 5\nexit 0\n");
+    fs.chmodSync(path.join(slowRg, "rg"), 0o755);
+    const t0 = Date.now();
+    const r = await f.run(["memory-grep", "needle"], {
+      PATH: `${slowRg}:${f.env.PATH}`,
+      JARATE_TIMEOUT_S: "1",
+    });
+    const elapsed = (Date.now() - t0) / 1000;
+    const d = doc(r);
+    expect(d.ok).toBe(false);
+    expect(d.error).toContain("timed out");
+    expect(elapsed).toBeLessThan(4);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("-- terminator allows dash-leading queries", async () => {
+    const f = fixture();
+    const r = await f.run(["memory-grep", "--", "-1h window"]);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.query).toBe("-1h window");
+    expect(d.count).toBe(1);
+    expect(d.matches[0].text).toBe("-1h window note");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("unknown flag / missing query / missing root -> rc 2 usage errors", async () => {
+    const f = fixture();
+    const r1 = await f.run(["memory-grep", "x", "-wat"]);
+    expect(r1.code).toBe(2);
+    expect(doc(r1).error).toContain("unknown flag");
+    const r2 = await f.run(["memory-grep"]);
+    expect(r2.code).toBe(2);
+    expect(doc(r2).error).toContain("usage:");
+    const r3 = await f.run([
       "memory-grep",
       "x",
       "--root",
       path.join(f.tmp, "nope"),
     ]);
-    expect(doc(r2).error).toContain("root not found");
+    expect(r3.code).toBe(2);
+    expect(doc(r3).error).toContain("root not found");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -392,6 +573,7 @@ describe("rag", () => {
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
     expect(d.backend).toBe("recall");
     expect(d.question).toBe("what is dispatch");
     expect(d.project).toBeNull();
@@ -440,12 +622,50 @@ describe("rag", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("missing question -> ok:false usage error", async () => {
+  test("stderr noise does not fail a successful query", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.tmp, "recall-stub.js"),
+      [
+        'process.stderr.write("WARN: warmup\\n");',
+        'process.stdout.write(JSON.stringify([{source: "s", content: "c", score: 0.7}]));',
+        "",
+      ].join("\n"),
+    );
+    const r = await f.run(["rag", "q"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.count).toBe(1);
+    expect(d.results[0].content).toBe("c");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("missing question -> ok:false usage error, rc 2", async () => {
     const f = fixture();
     const r = await f.run(["rag"]);
+    expect(r.code).toBe(2);
     const d = doc(r);
     expect(d.ok).toBe(false);
     expect(d.error).toContain("usage: jarate rag");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("JARATE_ROOT env is honored for recall CLI resolution", async () => {
+    const f = fixture();
+    // bun shim: command -v bun finds it, execs the real bun binary
+    const bunStub = path.join(f.bin, "bun");
+    fs.writeFileSync(
+      bunStub,
+      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+    );
+    fs.chmodSync(bunStub, 0o755);
+    const r = await f.run(["rag", "q"], {
+      JARATE_RECALL_CLI: "",
+      JARATE_ROOT: path.join(f.tmp, "nope"),
+    });
+    expect(r.code).toBe(1);
+    expect(doc(r).error).toContain("recall CLI not found");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });

@@ -15,8 +15,9 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 - **snake_case** keys, deterministic field order (hand-built, not dict order).
 - Missing/unavailable fields are `null` — never dropped, never empty strings.
 - Timestamps are ISO-8601 UTC (`2026-09-13T05:00:00Z`).
-- Exit codes: `0` ok, `1` helper failed (JSON says why), `2` usage error
-  (unknown command / bad flags — JSON also says why).
+- Exit codes: `0` ok, `1` helper failed (runtime error — JSON says why),
+  `2` usage error (unknown command, unknown flag/arg, missing arg value —
+  JSON says why).
 - Helpers are **read-only**. Every external call is wrapped in `timeout`
   (default 25s, `JARATE_TIMEOUT_S`), so a hung dependency degrades to an
   `ok:false` field, never a hang.
@@ -26,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "error": "unknown command: bogus (usage: jarate <cmd> [args])", "commands": ["ctx-report", "journal-errors", "memory-grep", "rag"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["ctx-report", "journal-errors", "memory-grep", "rag"]}
 ```
 
 ## Commands
@@ -39,8 +40,9 @@ unavailable.
 
 ```json
 {
-  "ok": true, "ts": "...", "agent": "monky", "home": "/home/monky",
-  "profile": "main", "error": null,
+  "ok": true, "ts": "...", "error": null,
+  "agent": "monky", "home": "/home/monky",
+  "profile": "main",
   "context": {
     "session": "/home/monky/.pi/agent/sessions/.../xxx.jsonl",
     "age_s": 42, "tokens": 251000, "limit": 262144,
@@ -58,19 +60,23 @@ unavailable.
 - `context.pct` = floor(tokens/limit*100); `compact_recommended` when pct >= 80.
 - `context.limit` comes from the `X-Switchboard-Context` header in
   `~/.pi/agent/models.json` (or `JARATE_CTX_LIMIT`).
-- `cost` = sum of every agent block `pi-token-cost --json` reports (its JSON
-  is the source of truth; the CLI re-queries OpenRouter pricing).
+- `cost` = the first agent block (`agents[0]`) `pi-token-cost --json`
+  reports (its JSON is the source of truth; the CLI re-queries OpenRouter
+  pricing). A single-home call yields one block, so this is the full cost.
 - `pi-token-cost` is a machine-local script: resolved from `JARATE_TOKEN_COST`,
   `~/scripts/pi-token-cost.py`, or `<repo>/scripts/pi-token-cost.py`.
 
 ### `journal-errors [--since S] [--agent NAME]`
 
 `pi.service` warnings (journalctl `-p warning`) per agent on this host.
-Default `--since -1h` (journalctl relative form, not ISO).
+`--since` takes an absolute datetime only (relative forms like `-1h` are
+rejected, usage error): `2026-09-13T00:00:00Z`, `2026-09-13 00:00:00`
+(the space form is re-joined), or a bare date. Default: one hour back,
+absolute UTC.
 
 ```json
 {
-  "ok": true, "ts": "...", "since": "-1h", "error": null,
+  "ok": true, "ts": "...", "error": null, "since": "2026-09-13T03:00:00Z",
   "agents": [
     {"name": "monky", "source": "local", "count": 1,
      "warnings": ["..."], "truncated": false, "error": null},
@@ -94,19 +100,22 @@ Default `--since -1h` (journalctl relative form, not ISO).
 
 ### `memory-grep <query> [--root D] [--regex] [--case]`
 
-Fixed-string, case-INsensitive search over `~/memory` (default root) via
-ripgrep. Top-20 matches kept; total count always reported.
+Fixed-string (rg `-F`), case-INsensitive search over `~/memory` (default
+root) via ripgrep. Top-20 matches kept; `count` is capped at 1000 lines
+(`truncated` true when cut). `--` ends flag parsing so dash-leading
+queries work.
 
 ```json
 {
-  "ok": true, "ts": "...", "query": "dispatch", "root": "/home/monky/memory",
-  "error": null, "count": 16, "truncated": false,
+  "ok": true, "ts": "...", "error": null,
+  "query": "dispatch", "root": "/home/monky/memory",
+  "count": 16, "truncated": false,
   "matches": [{"file": "/home/monky/memory/2026-09-08-x.md", "line": 12, "text": "..."}]
 }
 ```
 
 - `--regex`: query is an ERE (bad regex -> `ok:false`, `rg failed ...`).
-- `--case`: case-sensitive. `count` > 20 sets `truncated: true`.
+- `--case`: case-sensitive. Match order is deterministic (`rg --sort path`).
 
 ### `rag <question> [--project P]`
 
@@ -116,16 +125,19 @@ One-call RAG query over project knowledge. Backend = the `recall` CLI
 
 ```json
 {
-  "ok": true, "ts": "...", "backend": "recall",
-  "question": "...", "project": "jarate", "error": null,
+  "ok": true, "ts": "...", "error": null,
+  "backend": "recall",
+  "question": "...", "project": "jarate",
   "count": 3,
   "results": [{"source": "/home/monky/memory/x.md", "content": "...", "score": 0.91}]
 }
 ```
 
 - `results` = recall's `SearchRow` array verbatim (may be empty).
+- `recall` stderr is captured separately: noise on stderr never fails a
+  successful query; on failure the first stderr line lands in `error`.
 - Any failure (CLI missing, Postgres/Ollama down, non-array output) is
-  `ok:false` with the first stderr line in `error` — never a crash.
+  `ok:false` — never a crash.
 
 ## Env overrides (tests + machines)
 

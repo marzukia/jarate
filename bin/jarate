@@ -3,11 +3,13 @@
 #
 #   in:  jarate <cmd> [args...]      (args may also arrive pre-joined; both work)
 #   out: ONE JSON doc on stdout: {"ok": true|false, "error": "...", ...}
+#   rc:  0 ok | 1 helper failed | 2 usage error (JSON doc says why, always)
 #
 # JSON discipline (stable across calls — agents rely on it):
 #   - snake_case keys, deterministic field order per subcommand
 #   - ok:false + "error" is the ONLY error shape; never throw, never mix
 #   - missing data = null, absent sections omitted
+#   - error is ALWAYS present (null on success)
 #   - ISO-8601 UTC timestamps, seconds for ages
 #   - no emoji
 #
@@ -31,7 +33,7 @@
 
 set -uo pipefail
 
-JARATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+JARATE_ROOT="${JARATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 TMO="${JARATE_TIMEOUT_S:-25}"
 WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
@@ -41,10 +43,23 @@ COMMANDS=("ctx-report" "journal-errors" "memory-grep" "rag")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# die <error> — emit ok:false JSON and exit 1.
+# die <error> — emit ok:false JSON and exit 1 (helper/runtime failure).
 die() {
   jq -cn --arg ts "$(ts_now)" --arg e "$1" '{ok: false, ts: $ts, error: $e}'
   exit 1
+}
+
+# die_usage <error> — emit ok:false JSON and exit 2 (usage error).
+die_usage() {
+  jq -cn --arg ts "$(ts_now)" --arg e "$1" '{ok: false, ts: $ts, error: $e}'
+  exit 2
+}
+
+# since_is_abs <value> — 0 if $1 is an absolute journalctl datetime.
+# Accepted: 2026-09-13, 2026-09-13T00:00:00, 2026-09-13 00:00:00,
+# optional Z / ±HH:MM offset. Relative forms (-1h) are rejected.
+since_is_abs() {
+  [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?)?$ ]]
 }
 
 # ─── ctx-report ─────────────────────────────────────────────────────────────
@@ -54,7 +69,7 @@ die() {
 # Print {"tokens": N|null} for the newest assistant usage in a session jsonl.
 # Same accounting as pi-token-cost.py: totalTokens == input+output+cacheRead.
 session_last_usage() {
-  python3 -c '
+  timeout "$TMO" python3 -c '
 import json, sys
 last = None
 try:
@@ -104,8 +119,8 @@ cmd_ctx_report() {
   local profile="main"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --profile) profile="${2:?--profile needs a value}"; shift ;;
-      *) die "ctx-report: unknown arg: $1" ;;
+      --profile) [ $# -ge 2 ] || die_usage "ctx-report: --profile needs a value"; profile="$2"; shift ;;
+      *) die_usage "ctx-report: unknown arg: $1" ;;
     esac
     shift
   done
@@ -115,7 +130,7 @@ cmd_ctx_report() {
   case "$profile" in
     main) prof_dir="$home/.pi/agent" ;;
     worker) prof_dir="$home/.pi/agent-worker" ;;
-    *) die "ctx-report: profile must be main or worker" ;;
+    *) die_usage "ctx-report: profile must be main or worker" ;;
   esac
 
   # context limit from the profile's models.json (switchboard header)
@@ -201,10 +216,10 @@ cmd_ctx_report() {
     --argjson cost "$cost" \
     --arg cost_error "${cost_error:-}" \
     --arg error "$error" \
-    '{ok: $ok, ts: $ts, agent: $agent, home: $home, profile: $profile,
+    '{ok: $ok, ts: $ts, error: (if $error == "" then null else $error end),
+      agent: $agent, home: $home, profile: $profile,
       context: $context, cost: $cost,
-      cost_error: (if $cost_error == "" then null else $cost_error end),
-      error: (if $error == "" then null else $error end)}' \
+      cost_error: (if $cost_error == "" then null else $cost_error end)}' \
     || die "ctx-report: json assembly failed"
   [ "$ok" = "true" ] || exit 1
 }
@@ -225,12 +240,26 @@ run_remote_probe() { # $1=name $2=uid $3=since
 }
 
 cmd_journal_errors() {
-  local since="-1h" agent_filter=""
+  local agent_filter=""
+  local since
+  since="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" # default: 1h back, absolute
   while [ $# -gt 0 ]; do
     case "$1" in
-      --since) since="${2:?--since needs a value}"; shift ;;
-      --agent) agent_filter="${2:?--agent needs a value}"; shift ;;
-      *) die "journal-errors: unknown arg: $1" ;;
+      --since)
+        [ $# -ge 2 ] || die_usage "journal-errors: --since needs a value"
+        local sv="$2"
+        # journalctl's canonical absolute form "YYYY-MM-DD HH:MM:SS" arrives
+        # as two words after arg re-join; re-join it here.
+        if [[ "$sv" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ $# -ge 3 ] \
+          && [[ "$3" =~ ^[0-9]{2}:[0-9]{2}(:[0-9]{2})?$ ]]; then
+          sv="$sv $3"; shift
+        fi
+        since_is_abs "$sv" || die_usage "journal-errors: --since must be an absolute datetime (YYYY-MM-DD[THH:MM:SS][Z]), got: $sv"
+        since="$sv"; shift ;;
+      --agent)
+        [ $# -ge 2 ] || die_usage "journal-errors: --agent needs a value"
+        agent_filter="$2"; shift ;;
+      *) die_usage "journal-errors: unknown arg: $1" ;;
     esac
     shift
   done
@@ -323,42 +352,51 @@ cmd_journal_errors() {
     --arg since "$since" \
     --arg error "$error" \
     --argjson agents "$rows" \
-    '{ok: $ok, ts: $ts, since: $since,
-      error: (if $error == "" then null else $error end),
-      agents: $agents}' \
+    '{ok: $ok, ts: $ts, error: (if $error == "" then null else $error end),
+      since: $since, agents: $agents}' \
     || die "journal-errors: json assembly failed"
   [ "$ok_all" = "true" ] || exit 1
 }
 
 # ─── memory-grep ────────────────────────────────────────────────────────────
 # Search ~/memory (file-based memory), top-20 matches. Fixed strings by
-# default; --regex for rg regex. Case-insensitive by default; --case to pin.
+# default (-F); --regex for rg regex. Case-insensitive by default; --case to
+# pin. `--` ends flag parsing so dash-leading queries work.
 
 cmd_memory_grep() {
   local root="$HOME/memory" mode="fixed" ci="-i"
   local -a qw=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --root) root="${2:?--root needs a value}"; shift ;;
+      --root) [ $# -ge 2 ] || die_usage "memory-grep: --root needs a value"; root="$2"; shift ;;
       --regex) mode="regex" ;;
       --case) ci="" ;;
-      -*) die "memory-grep: unknown flag: $1" ;;
+      --) shift; qw+=("$@"); break ;;
+      -*) die_usage "memory-grep: unknown flag: $1" ;;
       *) qw+=("$1") ;;
     esac
     shift
   done
   local query="${qw[*]:-}"
-  [ -n "$query" ] || die "memory-grep: usage: jarate memory-grep <query> [--root DIR] [--regex] [--case]"
-  [ -d "$root" ] || die "memory-grep: root not found: $root"
+  [ -n "$query" ] || die_usage "memory-grep: usage: jarate memory-grep <query> [--root DIR] [--regex] [--case]"
+  [ -d "$root" ] || die_usage "memory-grep: root not found: $root"
   command -v rg >/dev/null 2>&1 || die "memory-grep: rg not found on PATH"
+
+  local -a fm=()
+  [ "$mode" = "fixed" ] && fm+=(-F)
 
   # rg exit codes: 0 = matches, 1 = no matches, >1 = error.
   # Probe with -q first (cheap, no output), then read the lines.
   local rc=0
-  rg -q $ci -e "$query" "$root" 2>/dev/null || rc=$?
+  timeout "$TMO" rg -q ${fm[@]} $ci -e "$query" "$root" 2>/dev/null || rc=$?
+  [ "$rc" -eq 124 ] && die "memory-grep: rg timed out (${TMO}s)"
   [ "$rc" -le 1 ] || die "memory-grep: rg failed (rc=$rc)"
-  local out=""
-  [ "$rc" -eq 0 ] && out="$(rg -n --no-heading $ci -e "$query" "$root" 2>/dev/null | head -n "$PARSE_CAP")"
+  local out="" orcp=0
+  if [ "$rc" -eq 0 ]; then
+    out="$(timeout "$TMO" rg -n --no-heading --sort path ${fm[@]} $ci -e "$query" "$root" 2>/dev/null | head -n "$PARSE_CAP")"
+    orcp=$?
+    [ "$orcp" -eq 124 ] && die "memory-grep: rg timed out (${TMO}s)"
+  fi
 
   local rows="" truncated="false"
   local line file rest lineno text
@@ -394,8 +432,8 @@ cmd_memory_grep() {
     --argjson count "$count" \
     --argjson truncated "$truncated" \
     --argjson matches "$matches" \
-    '{ok: true, ts: $ts, query: $query, root: $root, count: $count,
-      truncated: $truncated, matches: $matches}' \
+    '{ok: true, ts: $ts, error: null, query: $query, root: $root,
+      count: $count, truncated: $truncated, matches: $matches}' \
     || die "memory-grep: json assembly failed"
 }
 
@@ -439,14 +477,14 @@ cmd_rag() {
   local -a qw=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      --project) project="${2:?--project needs a value}"; shift ;;
-      -*) die "rag: unknown flag: $1" ;;
+      --project) [ $# -ge 2 ] || die_usage "rag: --project needs a value"; project="$2"; shift ;;
+      -*) die_usage "rag: unknown flag: $1" ;;
       *) qw+=("$1") ;;
     esac
     shift
   done
   local question="${qw[*]:-}"
-  [ -n "$question" ] || die "rag: usage: jarate rag <question> [--project NAME]"
+  [ -n "$question" ] || die_usage "rag: usage: jarate rag <question> [--project NAME]"
 
   local bun
   bun="$(find_bun)" || true
@@ -455,16 +493,23 @@ cmd_rag() {
   cli="$(find_recall_cli)"
   [ -n "$cli" ] || die "rag: recall CLI not found (repo packages/recall, ~/projects/recall, PATH)"
 
-  local out rc
+  # stdout and stderr stay separate: stderr noise must not fail a
+  # successful query (F5).
+  local out rc errf err
+  errf="$(mktemp "${TMPDIR:-/tmp}/jarate-rag.XXXXXXXX")" || die "rag: mktemp failed"
   if [ -n "$project" ]; then
-    out="$(timeout "$TMO" env RAG_PROJECT="$project" "$bun" "$cli" query --json "$question" 2>&1)"
+    out="$(timeout "$TMO" env RAG_PROJECT="$project" "$bun" "$cli" query --json "$question" 2>"$errf")"
     rc=$?
   else
-    out="$(timeout "$TMO" "$bun" "$cli" query --json "$question" 2>&1)"
+    out="$(timeout "$TMO" "$bun" "$cli" query --json "$question" 2>"$errf")"
     rc=$?
   fi
-  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
-    die "rag: recall query failed (rc=$rc): $(head -1 <<<"$out")"
+  err="$(head -1 "$errf" 2>/dev/null)"
+  rm -f "$errf"
+  if [ "$rc" -eq 124 ]; then
+    die "rag: recall query timed out (${TMO}s)"
+  elif [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    die "rag: recall query failed (rc=$rc): ${err:-$(head -1 <<<"$out")}"
   fi
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out" \
     || die "rag: unexpected recall output (expected JSON array)"
@@ -477,7 +522,7 @@ cmd_rag() {
     --arg project "${project:-}" \
     --argjson count "$count" \
     --argjson results "$out" \
-    '{ok: true, ts: $ts, backend: "recall", question: $question,
+    '{ok: true, ts: $ts, error: null, backend: "recall", question: $question,
       project: (if $project == "" then null else $project end),
       count: $count, results: $results}' \
     || die "rag: json assembly failed"
@@ -494,7 +539,7 @@ main() {
   case "$cmd" in
     "" | help | -h | --help)
       jq -cn --arg ts "$(ts_now)" \
-        '{ok: true, ts: $ts, usage: "jarate <cmd> [args]",
+        '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
           commands: ["ctx-report", "journal-errors", "memory-grep", "rag"]}'
       ;;
     ctx-report) cmd_ctx_report "${args[@]}" ;;
