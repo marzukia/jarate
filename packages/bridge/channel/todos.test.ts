@@ -167,7 +167,7 @@ describe("todos: rendering", () => {
   test("each status renders its v3 state glyph", () => {
     expect(todoLine({ content: "a", status: "pending" })).toBe("├ a");
     expect(todoLine({ content: "b", status: "in_progress" })).toBe("┣ **b**");
-    expect(todoLine({ content: "c", status: "completed" })).toBe("┘ ~~c~~");
+    expect(todoLine({ content: "c", status: "completed" })).toBe("├ ~~c~~");
     expect(todoLine({ content: "d", status: "cancelled" })).toBe("┤ d");
   });
 
@@ -177,7 +177,7 @@ describe("todos: rendering", () => {
         "┌ todos · 2 open",
         "├ write tests",
         "┣ **fix the bug**",
-        "┘ ~~read the docs~~",
+        "├ ~~read the docs~~",
         "┤ old idea",
         "└",
       ].join("\n"),

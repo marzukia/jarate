@@ -3155,7 +3155,7 @@ describe("todo board (integration)", () => {
     expect(content).toContain("┌ Test · 1 open");
     expect(content).toContain("├ a");
     expect(content).toContain("┌ ch2 · 0 open");
-    expect(content).toContain("┘ ~~b~~");
+    expect(content).toContain("├ ~~b~~");
     // each board block is framed: opens with ┌, closes with └
     expect(content.split("\n\n").length).toBe(2);
     for (const block of content.split("\n\n")) {
@@ -3271,7 +3271,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r2.content[0].text).toContain("┘ ~~a~~");
+    expect(r2.content[0].text).toContain("├ ~~a~~");
     posts = fetchCalls.filter(
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
@@ -3281,7 +3281,7 @@ describe("todo board (integration)", () => {
         c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/out1"),
     );
     expect(patch).toBeDefined();
-    expect(JSON.parse(patch!.body).content).toContain("┘ ~~a~~");
+    expect(JSON.parse(patch!.body).content).toContain("├ ~~a~~");
     expect(JSON.parse(patch!.body).content).toContain("┌ todos · 1 open");
 
     // 3) empty list: deletes the board message, clears the state
@@ -3331,7 +3331,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r.content[0].text).toContain("┘ ~~a~~");
+    expect(r.content[0].text).toContain("├ ~~a~~");
     // state still updated; id kept so the next sync retries the edit
     const board = loadBoard("ch1", tmp);
     expect(board?.todos[0].status).toBe("completed");

@@ -16,7 +16,8 @@ Every command / system output the user sees starts with ONE ASCII tag
 bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`, `[tasks]`).
 Live run state uses the box-drawing frame family (`┣` working, `┌ done` /
 `┤ failed` frame with `└` close), the todo board its state glyphs (`├`
-pending, `┣` in progress, `┘` done, `┤` cancelled, `┌` board header, `└`
+pending, `┣` in progress, `├` done (strikethrough, pipe stays connected),
+`┤` cancelled, `┌` board header, `└`
 close) - both families are exempt from the bracket scheme and must stay
 <= 40 cols per line (mobile budget). Webhook callback embeds are framed
 and untagged.

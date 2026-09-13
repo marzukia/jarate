@@ -155,7 +155,9 @@ export function openCount(todos: Todo[]): number {
 
 /**
  * One line per item, v3 state glyph at column 1 (mockup3, 2026-09-13):
- * ├ pending, ┣ in-progress (bold), ┘ done (strikethrough), ┤ cancelled.
+ * ├ pending, ┣ in-progress (bold), ├ done (strikethrough), ┤ cancelled.
+ * Done keeps ├ (not ┘) so the vertical pipe stays connected through
+ * mid-list completed items; the frame closes on its own └ row.
  * Content is clipped so the rendered line fits the 40-col mobile budget.
  */
 export function todoLine(t: Todo): string {
@@ -166,7 +168,7 @@ export function todoLine(t: Todo): string {
     case "in_progress":
       return `┣ **${c}**`;
     case "completed":
-      return `┘ ~~${c}~~`;
+      return `├ ~~${c}~~`;
     case "cancelled":
       return `┤ ${c}`;
   }
