@@ -35,6 +35,7 @@ function fixture() {
   env.PI_DISPATCH_RECORD_DIR = path.join(tmp, "records");
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_SERVICE;
+  delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
 
   const seedMainCreds = () => {
     fs.writeFileSync(
@@ -274,4 +275,186 @@ describe("#30: no webhook => loud warning at dispatch + run record delivery=none
     expect(recs.length).toBe(1);
     expect(recs[0].delivery).toBe("webhook");
   }, 30_000);
+});
+
+function runScript(
+  script: string,
+  args: string[],
+  env: Record<string, string>,
+  cwd: string,
+): Promise<RunResult> {
+  const p = spawn(["bash", script, ...args], {
+    env,
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return (async () => {
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { code, out, err };
+  })();
+}
+
+describe("persistent artifact dir: ~/.pi-bg-art default (2026-09-13 reboot fix)", () => {
+  test("default BG_TMP is $HOME/.pi-bg-art (not /tmp); dir auto-created", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.home, ".pi-bg-art");
+    expect(fs.existsSync(art)).toBe(false); // not pre-created
+    const r = await fx.run(["worker", "tmpdir default task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(fs.existsSync(art)).toBe(true); // pi-bg created it
+    const outFiles = fs.readdirSync(art).filter((f) => f.endsWith("-out.md"));
+    expect(outFiles).toHaveLength(1);
+    const id = outFiles[0].replace(/^pi-bg-/, "").replace(/-out\.md$/, "");
+    expect(id).toMatch(/^\d{8}-\d{6}-\d+$/);
+    // prompt + output + raw + err all in the persistent dir
+    for (const name of [
+      `pi-bg-${id}-prompt.md`,
+      `pi-bg-${id}-out.md`,
+      `pi-bg-${id}-raw.out`,
+      `pi-bg-${id}-err.log`,
+    ]) {
+      expect(fs.existsSync(path.join(art, name))).toBe(true);
+    }
+    // ...and not in /tmp
+    expect(fs.existsSync(`/tmp/pi-bg-${id}-out.md`)).toBe(false);
+    expect(fs.existsSync(`/tmp/pi-bg-${id}-prompt.md`)).toBe(false);
+  });
+});
+
+const WD = path.join(import.meta.dir, "pi-bg-watchdog");
+
+describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
+  // fake ids in year 2099: never collide with real tickets in /tmp
+  const TID = (n: number) => `20991231-235959-${n}`;
+
+  function wdFixture(n: number) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-wd-"));
+    const home = path.join(tmp, "home");
+    const wtDir = path.join(tmp, "wt", "jarate", TID(n));
+    const art = path.join(tmp, "art");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(wtDir, { recursive: true });
+    fs.mkdirSync(art, { recursive: true });
+    // age the ticket dir past the 20-min sweep threshold
+    const old = new Date(Date.now() - 30 * 60 * 1000);
+    fs.utimesSync(wtDir, old, old);
+    const env = { ...process.env } as Record<string, string>;
+    env.HOME = home;
+    env.PI_BG_WT_DIR = path.join(tmp, "wt");
+    env.PI_BG_TMPDIR = art;
+    delete env.PI_DISPATCH_WEBHOOK;
+    const legacy = (suf: string) => `/tmp/pi-bg-${TID(n)}${suf}`;
+    const rmLegacy = () => {
+      for (const suf of ["-out.md", "-killed", "-webhook-failed"]) {
+        fs.rmSync(legacy(suf), { force: true });
+      }
+    };
+    const run = (args: string[] = ["--dry-run"]) =>
+      runScript(WD, args, env, tmp);
+    return { tmp, art, legacy, rmLegacy, run };
+  }
+
+  test("out.md in legacy /tmp only -> ticket skipped (pre-upgrade run)", async () => {
+    const fx = wdFixture(1);
+    fs.writeFileSync(fx.legacy("-out.md"), "done\n");
+    try {
+      const r = await fx.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("0 dead ticket(s) found");
+    } finally {
+      fx.rmLegacy();
+    }
+  }, 60_000);
+
+  test("out.md in persistent dir only -> ticket skipped", async () => {
+    const fx = wdFixture(2);
+    fs.writeFileSync(path.join(fx.art, `pi-bg-${TID(2)}-out.md`), "done\n");
+    const r = await fx.run();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("0 dead ticket(s) found");
+  }, 60_000);
+
+  test("killed marker in legacy /tmp only -> ticket skipped", async () => {
+    const fx = wdFixture(4);
+    fs.writeFileSync(fx.legacy("-killed"), "x\n");
+    try {
+      const r = await fx.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("0 dead ticket(s) found");
+    } finally {
+      fx.rmLegacy();
+    }
+  }, 60_000);
+
+  test("no artifacts anywhere -> flagged dead", async () => {
+    const fx = wdFixture(3);
+    const r = await fx.run();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("1 dead ticket(s) found");
+    expect(r.out).toContain(`DEAD jarate/${TID(3)}`);
+    expect(r.out).toContain("no callback on record");
+  }, 60_000);
+
+  test("empty (0-byte) out.md is NOT a completion -> flagged dead", async () => {
+    const fx = wdFixture(5);
+    fs.writeFileSync(path.join(fx.art, `pi-bg-${TID(5)}-out.md`), "");
+    const r = await fx.run();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("1 dead ticket(s) found");
+    expect(r.out).toContain(`DEAD jarate/${TID(5)}`);
+  }, 60_000);
+});
+
+const TAIL = path.join(import.meta.dir, "pi-bg-tail");
+
+describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
+  test("raw.out in PI_BG_TMPDIR -> shown", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    const art = path.join(tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    const id = "20991231-235958-1";
+    fs.writeFileSync(path.join(art, `pi-bg-${id}-raw.out`), "fresh line\n");
+    const env = { ...process.env } as Record<string, string>;
+    env.HOME = tmp;
+    env.PI_BG_TMPDIR = art;
+    const r = await runScript(TAIL, [id], env, tmp);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("fresh line");
+  });
+
+  test("raw.out in legacy /tmp only -> fallback finds it", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    const art = path.join(tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    const id = "20991231-235958-2";
+    const legacy = `/tmp/pi-bg-${id}-raw.out`;
+    fs.writeFileSync(legacy, "legacy line\n");
+    try {
+      const env = { ...process.env } as Record<string, string>;
+      env.HOME = tmp;
+      env.PI_BG_TMPDIR = art;
+      const r = await runScript(TAIL, [id], env, tmp);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("legacy line");
+    } finally {
+      fs.rmSync(legacy, { force: true });
+    }
+  });
+
+  test("no raw.out anywhere -> exit 2", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    const env = { ...process.env } as Record<string, string>;
+    env.HOME = tmp;
+    env.PI_BG_TMPDIR = path.join(tmp, "art");
+    const r = await runScript(TAIL, ["20991231-235958-3"], env, tmp);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("no live output");
+  });
 });

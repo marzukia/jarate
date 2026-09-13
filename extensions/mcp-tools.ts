@@ -53,7 +53,7 @@ interface McpClient {
 }
 
 async function parseMcpResponse(resp: Response): Promise<any> {
-  const ct = resp.headers.get("content-type") || "";
+  const _ct = resp.headers.get("content-type") || "";
   const text = await resp.text();
   const sessionId = resp.headers.get("mcp-session-id");
   return { body: extractJsonRpc(text), sessionId };

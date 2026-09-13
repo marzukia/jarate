@@ -21,7 +21,7 @@
 #     callback so a killed worker still wakes the orchestrator
 #     (SIGKILL cannot be trapped - see DISPATCH.md recommendations)
 #   - dead letter: final post failure writes $PI_BG_TMPDIR/pi-bg-<id>-webhook-failed
-#     (PI_BG_TMPDIR default /tmp; honored by pi-bg-tail/-kill/-watchdog//jobs)
+#     (PI_BG_TMPDIR default ~/.pi-bg-art; honored by pi-bg-tail/-kill/-watchdog//jobs)
 # Fresh machine (issue #29): a missing/empty role profile is seeded from the
 #   main agent's ~/.pi/agent/{auth,models}.json + the repo template
 #   dispatch/profiles/<role>.json (settings). Still no provider => exit 4
@@ -45,10 +45,13 @@ JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
 run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
 export PI_SESSION_ID="pi-${USER}-${profile}-${run_id}"
 
-# --- per-run artifact dir: PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill,
-#     pi-bg-watchdog and the bridge /jobs history — keep all per-run files in
-#     the same place so every tool finds them. ---
-BG_TMP="${PI_BG_TMPDIR:-/tmp}"
+# --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
+#     hydrogen box is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
+#     /tmp lost every out.md and the watchdog re-flagged finished tickets as
+#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
+#     and the bridge /jobs history — keep all per-run files in the same place
+#     so every tool finds them. ---
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 
 # --- optional --worktree [ref] (consumed before pi flags) ---

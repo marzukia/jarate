@@ -160,7 +160,13 @@ On completion, `pi-bg` posts to the Discord webhook:
 
 ### Webhook delivery audit
 
-Per-run artifacts in `/tmp` (the data source for `/jobs` history):
+Per-run artifacts in `~/.pi-bg-art/` — persistent, survives reboot (`/tmp`
+on the hydrogen box is a tmpfs that a reboot wipes; 2026-09-13: a wiped
+`/tmp` lost every `out.md` and the watchdog re-flagged ~15 finished tickets
+as DEAD). `$PI_BG_TMPDIR` still overrides the dir. For one release,
+`pi-bg-watchdog` and `pi-bg-tail` also check the legacy `/tmp` location so
+runs started before the upgrade still resolve. Data source for `/jobs`
+history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 
 - `pi-bg-<id>-raw.out` — live output (tee'd from the first attempt on)
 - `pi-bg-<id>-out.md` — final output (non-empty = run completed)
@@ -172,7 +178,8 @@ Per-run artifacts in `/tmp` (the data source for `/jobs` history):
 ### tail / kill (in-flight control)
 
 - `pi-bg-tail <id> [lines] [-f]` — last N lines (default 40) of
-  `/tmp/pi-bg-<id>-raw.out`, optional follow. No live output = exit 2.
+  `~/.pi-bg-art/pi-bg-<id>-raw.out` (legacy `/tmp` for pre-upgrade runs),
+  optional follow. No live output = exit 2.
 - `pi-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
   (`…/user@<uid>.service/pi-bg/<id>/`), dry-run prints the process tree,
   real kill sends SIGTERM to every member, waits `$PI_BG_KILL_WAIT` (10s),
