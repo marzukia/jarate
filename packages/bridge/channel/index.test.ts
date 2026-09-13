@@ -28,6 +28,7 @@ import extension, {
   handleInbound,
   interruptStepTimeoutMs,
   isCompacting,
+  isVerbose,
   matchCommand,
   midTurnQueues,
   opWindowLabel,
@@ -49,6 +50,7 @@ import extension, {
   stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
   updateQueuedInbound,
+  verboseOverride,
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
@@ -558,6 +560,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     sent = [];
     midTurnQueues.clear();
     pendingAttachments.clear();
+    verboseOverride.clear();
     fetchCalls = [];
     pi = {
       registerMessageRenderer: () => {},
@@ -726,6 +729,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("activity block: 0 tool calls -> deleted at agent_end (no done line)", async () => {
+    verboseOverride.set("ch1", true); // display gate: block renders only when verbose
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     const pureTextFinal = {
@@ -752,6 +756,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   test("activity block: 1+ tool calls -> closed with done line (regression)", async () => {
+    verboseOverride.set("ch1", true); // display gate: block renders only when verbose
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.tool_call(
@@ -777,6 +782,205 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
     );
     expect(deleted).toBeUndefined();
+  });
+
+  test("verbose off: no tool-call block created, sent, or edited (#38)", async () => {
+    // ch1 has no forwardToolCalls and no override -> verbose off
+    expect(isVerbose(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "/tmp/a.md" } },
+      ctx,
+    );
+    const pureTextFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "hi there" }],
+    };
+    await handlers.agent_end({ messages: [pureTextFinal] }, ctx);
+
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(
+      posts.filter((c) => String(JSON.parse(c.body).content).includes("┣"))
+        .length,
+    ).toBe(0); // no "┣ working…" placeholder, no tool line
+    const edits = fetchCalls.filter((c) => c.method === "PATCH");
+    expect(edits.length).toBe(0); // nothing to edit, no done line either
+    const deleted = fetchCalls.filter((c) => c.method === "DELETE");
+    expect(deleted.length).toBe(0); // no block to delete at run end
+    // the final still lands
+    expect(
+      posts.some((c) =>
+        String(JSON.parse(c.body).content).includes("hi there"),
+      ),
+    ).toBe(true);
+  });
+
+  test("verbose-off run leaves the previous run's done line untouched (#38)", async () => {
+    // run 1: verbose on — block created, closed with a done line
+    verboseOverride.set("ch1", true);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    const fin = (t: string) => ({
+      role: "assistant",
+      content: [{ type: "text", text: t }],
+    });
+    await handlers.agent_end({ messages: [fin("one")] }, ctx);
+    expect(
+      fetchCalls.some(
+        (c) => c.method === "PATCH" && String(c.body).includes("┗ done"),
+      ),
+    ).toBe(true); // run 1's line closed
+
+    // run 2: verbose off, no tool calls — statusMsgId still points at
+    // run 1's line; agent_end must not delete or re-edit it
+    verboseOverride.set("ch1", false);
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("again", "m2"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.agent_end({ messages: [fin("two")] }, ctx);
+    expect(fetchCalls.some((c) => c.method === "PATCH")).toBe(false); // no done line (nothing to close)
+    expect(fetchCalls.some((c) => c.method === "DELETE")).toBe(false);
+    // run 2's final still posts
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("two"),
+      ),
+    ).toBe(true);
+  });
+
+  test("verbose on->off mid-run deletes the live block (#38)", async () => {
+    verboseOverride.set("ch1", true);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).startsWith("┣ working"),
+      ),
+    ).toBe(true); // live block exists (mock id out1)
+
+    // flip verbose off while the run is in flight
+    await handleInbound(pi, inbound("/verbose off", "m2"), ctx);
+    const del = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" && c.url.includes("/channels/ch1/messages/out1"),
+    );
+    expect(del).toBeDefined(); // live block deleted on the transition
+
+    // next tool call: no edit (no block to update)
+    fetchCalls.length = 0;
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "pwd" } },
+      ctx,
+    );
+    expect(fetchCalls.some((c) => c.method === "PATCH")).toBe(false);
+
+    // run end: done line no-ops, final still posts
+    await handlers.agent_end(
+      {
+        messages: [
+          { role: "assistant", content: [{ type: "text", text: "done" }] },
+        ],
+      },
+      ctx,
+    );
+    expect(
+      fetchCalls.some(
+        (c) => c.method === "PATCH" && String(c.body).includes("┗ done"),
+      ),
+    ).toBe(false);
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("done"),
+      ),
+    ).toBe(true);
+  });
+
+  test("verbose off->on mid-run re-arms the block on the next tool call (#38)", async () => {
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(
+      fetchCalls
+        .filter(
+          (c) =>
+            c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+        )
+        .filter((c) => String(JSON.parse(c.body).content).includes("┣")),
+    ).toHaveLength(0); // quiet run so far
+
+    verboseOverride.set("ch1", true);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "pwd" } },
+      ctx,
+    );
+    // fresh block created by the next tool call (no stale placeholder to edit)
+    const toolPost = fetchCalls.find(
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch1/messages") &&
+        String(JSON.parse(c.body).content).includes("┣ bash pwd"),
+    );
+    expect(toolPost).toBeDefined();
+  });
+
+  test("/status reflects the verbose state (#38)", async () => {
+    const statusPost = () => {
+      const posts = fetchCalls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      );
+      return posts
+        .map((p) => String(JSON.parse(p.body).content))
+        .find((t) => t.startsWith("[status]"));
+    };
+    // off by default: quiet
+    await handleInbound(pi, inbound("/status", "m1"), ctx);
+    let st = statusPost();
+    expect(st).toBeDefined();
+    expect(st).toContain("quiet");
+    expect(st).not.toContain("verbose");
+
+    // /verbose on: the next /status says verbose
+    await handleInbound(pi, inbound("/verbose on", "m2"), ctx);
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("[ok] verbose on"),
+      ),
+    ).toBe(true);
+    fetchCalls.length = 0;
+    await handleInbound(pi, inbound("/status", "m3"), ctx);
+    st = statusPost();
+    expect(st).toBeDefined();
+    expect(st).toContain("verbose");
   });
 
   test("A4: /stop drains the channel's queued mid-turn inbounds", async () => {

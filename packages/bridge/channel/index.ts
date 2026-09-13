@@ -147,7 +147,13 @@ let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
 // compaction settles (session_compact / session_compact_failed — an
 // in-flight compaction never triggers agent_end on its own).
 let pendingCompact: { ch: ChannelConfig; instructions?: string } | null = null;
-const verboseOverride = new Map<string, boolean>();
+// /verbose per-channel override (until restart). Exported for tests and
+// for #10 (3-level display + persistence builds on this).
+export const verboseOverride = new Map<string, boolean>();
+// Display gate (#38): the extension closure owns the live status-block
+// state; the module-level command paths reach it through this hook (one
+// extension instance per process, registered in the extension body).
+let onDeleteStatusBlock: ((ch: ChannelConfig) => Promise<void>) | null = null;
 // ─── Mid-turn re-wake queue ─────────────────────────────────────────────
 // An inbound that arrives while a run is in flight is NOT steered into the
 // in-flight run (pi's deliverAs:"steer" folds it in, and if the run ends
@@ -873,7 +879,7 @@ export function resetFinalRepeats(channelId: string): void {
   finalReps.delete(channelId);
 }
 
-function isVerbose(ch: ChannelConfig): boolean {
+export function isVerbose(ch: ChannelConfig): boolean {
   return verboseOverride.get(ch.id) ?? ch.forwardToolCalls ?? false;
 }
 
@@ -1745,6 +1751,21 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // Display gate (#38): called on a live /verbose on->off transition —
+  // deletes the in-flight block so it does not sit in history as a stale
+  // "working…" line. The next tool call re-arms a fresh block only if
+  // verbose comes back on. runChannelCommand is module-level, so the
+  // closure hands this in instead of reaching for the state directly.
+  const deleteLiveStatusBlock = async (ch: ChannelConfig) => {
+    if (statusMsgId && statusChannelId === ch.id) {
+      await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
+      statusMsgId = null;
+      statusMsgAt = 0;
+      stopOpTick(`working:${ch.id}`);
+    }
+  };
+  onDeleteStatusBlock = deleteLiveStatusBlock;
+
   pi.on("tool_call", async (event) => {
     if (!lastActiveChannel) return;
     const ch = lastActiveChannel;
@@ -1772,7 +1793,10 @@ export default function (pi: ExtensionAPI) {
     runToolCount += 1;
     lastToolAction = formatToolCallLine(event.toolName, event.input);
     const line = statusLine(lastToolAction, runToolCount, runStartedAt);
-    toolCallsThisTurn.push(line);
+    toolCallsThisTurn.push(line); // always recorded: data source for #10
+    // Display gate (#38): the block renders only while verbose is on;
+    // with it off there is nothing to create or edit.
+    if (!isVerbose(ch)) return;
     try {
       if (!statusMsgId) {
         const r = await sendDiscordMessage(ch, line);
@@ -1807,6 +1831,12 @@ export default function (pi: ExtensionAPI) {
       runToolCount = 0;
       lastToolAction = null;
       runStartedAt = Date.now();
+      // Reset the status pointer for every new run, gate or no gate: a
+      // verbose-off run must not leave the previous run's block addressable
+      // to a mid-run on->off->on re-edit (review finding, #38 merge round).
+      statusMsgId = null;
+      statusChannelId = null;
+      statusMsgAt = 0;
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
       try {
@@ -1815,13 +1845,17 @@ export default function (pi: ExtensionAPI) {
         undoRun = null;
         console.error("[undo] start failed:", sanitizeUnknownValue(e));
       }
-      // fresh block per user message; previous blocks stay in history
-      const r = await sendDiscordMessage(ch, "┣ working…");
-      if (r.success && r.messageId) {
-        statusMsgId = r.messageId;
-        statusChannelId = ch.id;
-        statusMsgAt = Date.now();
-        armWorkingTick();
+      // fresh block per user message; previous blocks stay in history.
+      // Display gate (#38): render only while verbose is on — run state
+      // still tracks the run, so agent_end's done-line no-ops cleanly.
+      if (isVerbose(ch)) {
+        const r = await sendDiscordMessage(ch, "┣ working…");
+        if (r.success && r.messageId) {
+          statusMsgId = r.messageId;
+          statusChannelId = ch.id;
+          statusMsgAt = Date.now();
+          armWorkingTick();
+        }
       }
     }
     console.log("[channel] typing indicator started");
@@ -2046,7 +2080,14 @@ export default function (pi: ExtensionAPI) {
 
     // close the activity block: 0 tool calls -> delete it (a leftover
     // "done · 0 calls" box is noise); otherwise it stays up showing the run.
-    if (statusMsgId && statusChannelId === ch.id) {
+    // Only close a block created by THIS run (statusMsgAt >= runStartedAt):
+    // a verbose-off run leaves statusMsgId pointing at the previous run's
+    // line, which history keeps as-is (#38).
+    if (
+      statusMsgId &&
+      statusChannelId === ch.id &&
+      statusMsgAt >= runStartedAt
+    ) {
       if (runToolCount === 0) {
         await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
       } else {
@@ -2830,6 +2871,9 @@ async function runChannelCommand(
           // Open op window (compaction OR a restart-class op) shows its
           // label; otherwise the honest idle/running state.
           opWindowLabel(ch.id) ?? (ctx.isIdle() ? "idle" : "running"),
+          // Tool-call display gate state (#38): verbose = block renders,
+          // quiet = tool calls hidden.
+          isVerbose(ch) ? "verbose" : "quiet",
         ];
         // Interrupt state, honestly: in flight, or armed with time to fire.
         if (interruptingChannels.has(ch.id)) {
@@ -2959,8 +3003,14 @@ async function runChannelCommand(
     case "verbose": {
       if (!isOwner) return ownerOnly;
       const a = arg?.toLowerCase();
-      const next = a === undefined ? !isVerbose(ch) : a === "on";
+      const prev = isVerbose(ch);
+      const next = a === undefined ? !prev : a === "on";
       verboseOverride.set(ch.id, next);
+      // Live on->off transition: delete the in-flight block so it does
+      // not sit in history as a stale "working…" line. The closure-owned
+      // hook is registered by the extension instance (module-level
+      // command path, see onDeleteStatusBlock above).
+      if (prev && !next) await onDeleteStatusBlock?.(ch);
       return {
         immediate: `[ok] verbose ${next ? "on" : "off"} (until restart)`,
       };
