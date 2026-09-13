@@ -1831,6 +1831,12 @@ export default function (pi: ExtensionAPI) {
       runToolCount = 0;
       lastToolAction = null;
       runStartedAt = Date.now();
+      // Reset the status pointer for every new run, gate or no gate: a
+      // verbose-off run must not leave the previous run's block addressable
+      // to a mid-run on->off->on re-edit (review finding, #38 merge round).
+      statusMsgId = null;
+      statusChannelId = null;
+      statusMsgAt = 0;
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
       try {
