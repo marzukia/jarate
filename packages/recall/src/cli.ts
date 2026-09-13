@@ -13,7 +13,7 @@ export const USAGE = `recall - shared project knowledge RAG (Postgres + pgvector
 Usage:
   recall ingest [ROOT ...] [--no-prune]   # default roots: ~/memory ~/projects
                                            # prune on by default
-  recall query "your question"
+  recall query "your question" [--json]   # --json: one SearchRow array on stdout
 
 Env:
   RAG_PROJECT     optional filter to one project (query only)
@@ -48,10 +48,28 @@ export function parseIngestArgs(
   return { roots, noPrune };
 }
 
-export function parseQueryArgs(args: string[]): string {
-  const question = args.join(" ");
+export interface QueryArgs {
+  question: string;
+  /** Emit a SearchRow JSON array on stdout instead of formatted text. */
+  json: boolean;
+}
+
+/** Parse `query` args: free words joined into one question, optional --json. */
+export function parseQueryArgs(args: string[]): QueryArgs {
+  const words: string[] = [];
+  let json = false;
+  for (const a of args) {
+    if (a === "--json") {
+      json = true;
+    } else if (a.startsWith("-") && a.length > 1) {
+      throw new Error(`unknown flag: ${a}\n\n${USAGE}`);
+    } else {
+      words.push(a);
+    }
+  }
+  const question = words.join(" ");
   if (!question.trim()) throw new Error(USAGE);
-  return question;
+  return { question, json };
 }
 
 async function cmdIngest(args: string[]): Promise<number> {
@@ -72,9 +90,13 @@ async function cmdIngest(args: string[]): Promise<number> {
 }
 
 async function cmdQuery(args: string[]): Promise<number> {
-  const question = parseQueryArgs(args);
+  const { question, json } = parseQueryArgs(args);
   const config = envConfig();
   const rows = await runQuery(config, question);
+  if (json) {
+    console.log(JSON.stringify(rows));
+    return 0;
+  }
   if (rows.length === 0) {
     console.log("no results");
     return 0;

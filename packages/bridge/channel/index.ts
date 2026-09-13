@@ -60,6 +60,7 @@ import {
   unreactMessage,
 } from "./discord";
 import { mdToDiscord } from "./format";
+import { registerJarateTool } from "./jarate";
 import { jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { extractQueueSuffix } from "./queue";
@@ -1610,6 +1611,7 @@ export default function (pi: ExtensionAPI) {
       registerTodoTool(pi, channels);
       registerSleepTool(pi, channels);
       registerTaskTool(pi, channels);
+      registerJarateTool(pi);
     }
 
     // Sleep wakes + scheduled tasks: deliver anything due NOW (the pending

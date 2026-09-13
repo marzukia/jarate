@@ -29,14 +29,25 @@ describe("parseIngestArgs", () => {
 
 describe("parseQueryArgs", () => {
   test("joins all args with spaces", () => {
-    expect(parseQueryArgs(["what", "does", "search()", "do"])).toBe(
-      "what does search() do",
-    );
+    const r = parseQueryArgs(["what", "does", "search()", "do"]);
+    expect(r.question).toBe("what does search() do");
+    expect(r.json).toBe(false);
+  });
+
+  test("--json sets the flag, question words around it are joined", () => {
+    const r = parseQueryArgs(["--json", "what", "is", "dispatch"]);
+    expect(r.question).toBe("what is dispatch");
+    expect(r.json).toBe(true);
   });
 
   test("empty question throws", () => {
     expect(() => parseQueryArgs([])).toThrow();
     expect(() => parseQueryArgs(["   "])).toThrow();
+    expect(() => parseQueryArgs(["--json"])).toThrow();
+  });
+
+  test("unknown flag throws", () => {
+    expect(() => parseQueryArgs(["--wat", "q"])).toThrow(/unknown flag/);
   });
 });
 
