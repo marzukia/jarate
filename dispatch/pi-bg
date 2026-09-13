@@ -123,25 +123,35 @@ if [ "$max_c" -gt 0 ]; then
       done 2>/dev/null < "$d/status"
       [ "$uid_ok" = 1 ] || continue
       mapfile -d '' _argv 2>/dev/null < "$d/cmdline" || continue
-      case "${_argv[*]}" in
-        *pi-bg\ worker* | *pi-bg\ reviewer*)
-          # fork-window phantom: a child of a process with the IDENTICAL
-          # cmdline is a forked helper that has not exec'd yet (it keeps
-          # the parent's argv); a real run's parent (launcher, bun,
-          # nohup) always has a different cmdline
-          _stat=$(<"$d/stat") 2>/dev/null || _stat=""
-          _ppid=""
-          if [ -n "$_stat" ]; then
-            _tail="${_stat##*) }"
-            read -r _ _ppid _ <<<"$_tail"
-          fi
-          _pargv=()
-          [ -n "$_ppid" ] && mapfile -d '' _pargv 2>/dev/null < "/proc/$_ppid/cmdline"
-          if [ "${_pargv[*]}" != "${_argv[*]}" ]; then
-            live=$((live + 1))
-          fi
-          ;;
-      esac
+      # Match on argv ELEMENTS (review F1): a launcher "bash -c" carries
+      # "pi-bg worker" inside one -c string, so a substring test over the
+      # joined argv double-counted it. Require an element whose basename is
+      # pi-bg immediately followed by a worker|reviewer element.
+      _match=0
+      _n=${#_argv[@]}
+      for ((i = 0; i < _n; i++)); do
+        if [ "${_argv[i]##*/}" = "pi-bg" ] && [ $((i + 1)) -lt "$_n" ]; then
+          case "${_argv[i + 1]}" in
+            worker | reviewer) _match=1 ;;
+          esac
+        fi
+      done
+      [ "$_match" = 1 ] || continue
+      # fork-window phantom: a child of a process with the IDENTICAL
+      # cmdline is a forked helper that has not exec'd yet (it keeps
+      # the parent's argv); a real run's parent (launcher, bun,
+      # nohup) always has a different cmdline
+      _stat=$(<"$d/stat") 2>/dev/null || _stat=""
+      _ppid=""
+      if [ -n "$_stat" ]; then
+        _tail="${_stat##*) }"
+        read -r _ _ppid _ <<<"$_tail"
+      fi
+      _pargv=()
+      [ -n "$_ppid" ] && mapfile -d '' _pargv 2>/dev/null < "/proc/$_ppid/cmdline"
+      if [ "${_pargv[*]}" != "${_argv[*]}" ]; then
+        live=$((live + 1))
+      fi
     done
   fi
   if [ "$live" -ge "$max_c" ]; then
