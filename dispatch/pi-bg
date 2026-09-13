@@ -38,8 +38,14 @@ esac
 
 export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
 
-# repo root (script lives in <repo>/dispatch) - profile templates + censor
-JB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+# repo root (script lives in <repo>/dispatch) - profile templates + censor.
+# Resolve symlinks first (issue #37): the normal launch is the
+# ~/scripts/pi-bg symlink install.sh creates, and with the unresolved link
+# path JB_ROOT would be $HOME, so the settings.json seed lookup at
+# $JB_ROOT/dispatch/profiles/<role>.json silently missed (fresh role got
+# auth+models but no settings.json -> pi fell back to its built-in
+# provider -> 402). Fallback keeps the old behavior if readlink fails.
+JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)"
 
 # --- per-run switchboard session id (unique ledger entry per dispatch) ---
 run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
