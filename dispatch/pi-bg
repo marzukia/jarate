@@ -346,6 +346,10 @@ BG_CB_DONE=0
 BG_DEAD="$BG_TMP/pi-bg-${run_id}-webhook-failed"
 BG_WB_RESP="$BG_TMP/pi-bg-${run_id}-wb-resp.txt"
 BG_WB_STATUS="$BG_TMP/pi-bg-${run_id}-wb-status"
+# started marker: exists while the ticket is alive/unfinalized; the watchdog
+# uses it to say "started, callback lost" instead of "no callback on record".
+# Removed in bg_on_exit. A ticket that SIGKILLs keeps it (that is the point).
+touch "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
 
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
@@ -474,6 +478,7 @@ bg_on_exit() {
     rm -f "$ESCAPE_CG/cgroup.procs" 2>/dev/null || true
     rmdir "$ESCAPE_CG" 2>/dev/null || true
   fi
+  rm -f "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
 }
 trap bg_on_exit EXIT
 trap 'exit 130' INT

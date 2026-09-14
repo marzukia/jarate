@@ -45,6 +45,9 @@ DEADLOG="${HOME}/.pi-bg-deadlog"
 AGE_MIN=20
 QUIET=0
 DRY=0
+# auto-prune: worktrees carrying a killed marker older than N days are
+# removed (0 = off). 2026-09-14: Frank's box had 146 worktrees, 125 dead.
+PRUNE_DAYS="${PI_BG_WT_PRUNE_DAYS:-7}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -96,6 +99,12 @@ has_deadletter() {
   local t="$1"
   [ -f "$BG_TMP/pi-bg-${t}-webhook-failed" ] || [ -f "$LEGACY_TMP/pi-bg-${t}-webhook-failed" ]
 }
+# started marker (pi-bg writes it at ticket creation, removes on exit):
+# distinguishes "ran and was lost" from "never actually started"
+has_started() {
+  local t="$1"
+  [ -f "$BG_TMP/pi-bg-${t}-started" ]
+}
 
 # wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
 wd_post() {
@@ -135,6 +144,7 @@ PY
 }
 
 found=0
+DT=(); DREPO=(); DP=(); DLAST=(); DREAS=()
 for d in "$WT_DIR"/*/*/; do
   d="${d%/}"
   [ -d "$d" ] || continue
@@ -158,23 +168,73 @@ for d in "$WT_DIR"/*/*/; do
   last="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)"
   if has_deadletter "$t"; then
     reason="webhook dead letter exists (callback attempted, post failed)"
+  elif has_started "$t"; then
+    reason="started, no completion marker (callback lost - SIGKILL/OOM)"
   else
     reason="no callback on record (SIGKILL/OOM suspected)"
   fi
 
   echo "[pi-bg-watchdog] DEAD $repo/$t (last activity $last, $reason)"
-  if [ "$DRY" -eq 1 ]; then continue; fi
-
-  if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
-    bodyf="$BG_TMP/pi-bg-watchdog-${t}-body.json"
-    wd_build "$bodyf" "$t" "$repo" "$d" "$last" "$reason"
-    if [ -s "$bodyf" ]; then
-      wd_post "$bodyf" || echo "[pi-bg-watchdog] DEAD post failed for $t (dead log still updated)" >&2
-      rm -f "$bodyf"
-    fi
-  fi
+  DT+=("$t"); DREPO+=("$repo"); DP+=("$d"); DLAST+=("$last"); DREAS+=("$reason")
   printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
 done
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found (quiet=$QUIET dry=$DRY)"
+# Post (flood guard, 2026-09-14): 1-3 dead tickets = one embed each (as
+# before); 4+ = ONE digest embed. A mass-death event (reboot tmpfs wipe,
+# OOM storm) must never spam the channel one embed per corpse.
+if [ "$found" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq 0 ]; then
+  bodyf="$BG_TMP/pi-bg-watchdog-digest-body.json"
+  if [ "$found" -le 3 ]; then
+    for i in "${!DT[@]}"; do
+      wd_build "$bodyf" "${DT[$i]}" "${DREPO[$i]}" "${DP[$i]}" "${DLAST[$i]}" "${DREAS[$i]}"
+      if [ -s "$bodyf" ]; then
+        wd_post "$bodyf" || echo "[pi-bg-watchdog] DEAD post failed for ${DT[$i]} (dead log still updated)" >&2
+      fi
+    done
+  else
+    WD_N="$found" WD_LIST="$(for i in "${!DT[@]}"; do
+      [ "$i" -ge 10 ] && break
+      printf '%s/%s | last %s\n' "${DREPO[$i]}" "${DT[$i]}" "${DLAST[$i]}"
+    done)" WD_EXTRA=$((found - 10)) python3 - > "$bodyf" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+count = int(os.environ.get("WD_N", "0"))
+lines = os.environ.get("WD_LIST", "").splitlines()
+extra = int(os.environ.get("WD_EXTRA", "0"))
+if extra > 0:
+    lines.append(f"... {extra} more (full list: ~/.pi-bg-deadlog)")
+lines.append("worktrees kept under ~/.pi-bg-wt (killed-marker set; auto-prune after 7d)")
+embed = {"author": {"name": "pi-bg watchdog"},
+         "color": 15105570,
+         "title": f"pi-bg \u00b7 {count} dead tickets swept",
+         "description": "```bash\n" + "\n".join(lines) + "```",
+         "footer": {"text": "pi-bg watchdog (digest)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+    if [ -s "$bodyf" ]; then
+      wd_post "$bodyf" || echo "[pi-bg-watchdog] digest post failed (dead log still updated)" >&2
+    fi
+  fi
+  rm -f "$bodyf"
+fi
+
+# auto-prune: killed-marked worktrees older than PRUNE_DAYS (0 = off)
+if [ "$PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
+  pruned=0
+  for d in "$WT_DIR"/*/*/; do
+    d="${d%/}"
+    [ -d "$d" ] || continue
+    t="$(basename "$d")"
+    has_killed "$t" || continue
+    mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
+    [ $(( $(date +%s) - mtime )) -gt $((PRUNE_DAYS * 86400)) ] || continue
+    if git -C "$d" worktree remove --force "$d" 2>/dev/null || rmdir "$d" 2>/dev/null; then
+      echo "[pi-bg-watchdog] pruned $d"
+      pruned=$((pruned + 1))
+    fi
+  done
+  [ "$pruned" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned worktree(s)"
+fi
+
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found (quiet=$QUIET dry=$DRY prune_days=$PRUNE_DAYS)"
 exit 0
