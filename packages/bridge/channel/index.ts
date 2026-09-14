@@ -1644,6 +1644,27 @@ export function finalText(message: unknown): string | null {
   return cleanThinking(text.trim()) || null;
 }
 
+// ─── Live intermediate text (SPEC B) ────────────────────────────────────
+// The operator watches the agent think: intermediate (non-final) text
+// appears as ONE ephemeral message below the tool-call block, edited in
+// place as new segments arrive, deleted when the final is sent or the
+// run ends. Gated on tool-call forwarding (verbose > 0).
+/** Tail budget for the live-text message: keep the last N chars, prepend
+ *  an ellipsis when cut (900 + ellipsis stays well under Discord's 2000
+ *  char limit after markdown conversion). */
+export const LIVE_TEXT_TAIL = 900;
+/** Minimum gap between live-text edits (Discord edit-rate headroom). */
+export const LIVE_TEXT_THROTTLE_MS = 1500;
+/** Shown once a tool call has fired but no intermediate text yet. */
+export const LIVE_TEXT_PLACEHOLDER = "[..]";
+
+/** Keep the TAIL of the text; prepend an ellipsis when cut.
+ *  Exported for tests. */
+export function truncateLiveText(text: string, tail = LIVE_TEXT_TAIL): string {
+  if (text.length <= tail) return text;
+  return `…${text.slice(-tail)}`;
+}
+
 /** Messages already forwarded by the message_end path — agent_end skips them. */
 const earlySent = new WeakSet<object>();
 
@@ -1783,6 +1804,15 @@ export default function (pi: ExtensionAPI) {
   let statusMsgId: string | null = null;
   let statusChannelId: string | null = null;
   let statusMsgAt = 0;
+  // Live intermediate text (SPEC B): one ephemeral message per run —
+  // posted on the first tool call (below the tool-call block), edited in
+  // place with the latest intermediate assistant text, deleted when the
+  // final is sent or the run ends. See updateLiveText / deleteLiveText.
+  let liveTextMsgId: string | null = null;
+  let liveTextChannelId: string | null = null;
+  let liveTextAt = 0; // last post/edit time (edit throttle)
+  let liveTextShown: string | null = null; // last posted content (skip-unchanged)
+  let liveTextLatest: string | null = null; // latest intermediate text this run
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -2118,6 +2148,88 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // ─── Live intermediate text (SPEC B) ──────────────────────────────────
+  // Post only on a tool_call event (first call of the run) so the message
+  // always lands BELOW the tool-call block; message_end only edits an
+  // already-posted message. Throttle: LIVE_TEXT_THROTTLE_MS between edits;
+  // skip when the content is unchanged. Every network path is best-effort
+  // — logged, never breaks the run.
+  const isLiveTextChannel = (ch: ChannelConfig): boolean =>
+    ch.type === "discord" && verboseLevel(ch) > 0;
+
+  const updateLiveText = async (ch: ChannelConfig, mayPost: boolean) => {
+    if (!isLiveTextChannel(ch)) return;
+    const next =
+      liveTextLatest !== null
+        ? truncateLiveText(liveTextLatest)
+        : LIVE_TEXT_PLACEHOLDER;
+    if (liveTextMsgId && next === liveTextShown) return; // unchanged
+    const now = Date.now();
+    if (liveTextMsgId && now - liveTextAt < LIVE_TEXT_THROTTLE_MS) return;
+    try {
+      if (liveTextMsgId && liveTextChannelId === ch.id) {
+        const r = await editDiscordMessage(
+          ch,
+          liveTextMsgId,
+          mdToDiscord(next),
+        );
+        if (r.success) {
+          liveTextShown = next;
+          liveTextAt = now;
+        } else
+          console.error(
+            `[channel] live-text edit failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
+      } else {
+        if (!mayPost) return; // the post happens on the first tool call
+        if (liveTextMsgId) {
+          // channel switched mid-run: clear the old channel's ephemeral
+          // block before re-posting on the new one
+          const old = channels.find((c) => c.id === liveTextChannelId);
+          if (old)
+            await deleteDiscordMessage(old, liveTextMsgId).catch(() => {});
+        }
+        const r = await sendDiscordMessage(ch, mdToDiscord(next));
+        if (r.success && r.messageId) {
+          liveTextMsgId = r.messageId;
+          liveTextChannelId = ch.id;
+          liveTextAt = now;
+          liveTextShown = next;
+        } else if (!r.success)
+          console.error(
+            `[channel] live-text post failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
+      }
+    } catch (e) {
+      console.error(
+        "[channel] live-text update failed:",
+        sanitizeUnknownValue(e),
+      );
+    }
+  };
+
+  const deleteLiveText = async (ch: ChannelConfig) => {
+    if (!liveTextMsgId || liveTextChannelId !== ch.id) return;
+    const id = liveTextMsgId;
+    liveTextMsgId = null;
+    liveTextChannelId = null;
+    liveTextAt = 0;
+    liveTextShown = null;
+    liveTextLatest = null;
+    try {
+      const r = await deleteDiscordMessage(ch, id);
+      if (!r.success)
+        console.error(
+          `[channel] live-text delete failed: ${sanitizeSensitiveText(r.error || "")}`,
+        );
+    } catch (e) {
+      console.error(
+        "[channel] live-text delete failed:",
+        sanitizeUnknownValue(e),
+      );
+    }
+  };
+
   // Display gate (#38): called on a live /verbose on->off transition —
   // deletes the in-flight block so it does not sit in history as a stale
   // "working…" line. The next tool call re-arms a fresh block only if
@@ -2130,6 +2242,8 @@ export default function (pi: ExtensionAPI) {
       statusMsgAt = 0;
       stopOpTick(`working:${ch.id}`);
     }
+    // SPEC B: the ephemeral live-text message goes with the block.
+    await deleteLiveText(ch);
   };
   onDeleteStatusBlock = deleteLiveStatusBlock;
 
@@ -2169,30 +2283,37 @@ export default function (pi: ExtensionAPI) {
     // level 2 renders every call. The edit renders the FULL working frame
     // (live-frame unification) — same builder as the end-of-run morph.
     const lvl = verboseLevel(ch);
-    if (lvl === 0 || (lvl === 1 && !essential)) return;
-    const frame = workingFrame(
-      ch,
-      Math.round((Date.now() - runStartedAt) / 1000),
-    );
-    try {
-      if (!statusMsgId) {
-        const r = await sendDiscordMessage(ch, frame);
-        if (r.success && r.messageId) {
-          statusMsgId = r.messageId;
-          statusMsgAt = Date.now();
-          armWorkingTick();
-        } else if (!r.success)
-          console.error(
-            `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
-          );
-      } else {
-        const r = await editDiscordMessage(ch, statusMsgId, frame);
-        if (!r.success)
-          console.error(
-            `[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`,
-          );
-      }
-    } catch {}
+    if (lvl > 0 && (lvl === 2 || essential)) {
+      const frame = workingFrame(
+        ch,
+        Math.round((Date.now() - runStartedAt) / 1000),
+      );
+      try {
+        if (!statusMsgId) {
+          const r = await sendDiscordMessage(ch, frame);
+          if (r.success && r.messageId) {
+            statusMsgId = r.messageId;
+            statusMsgAt = Date.now();
+            armWorkingTick();
+          } else if (!r.success)
+            console.error(
+              `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
+            );
+        } else {
+          const r = await editDiscordMessage(ch, statusMsgId, frame);
+          if (!r.success)
+            console.error(
+              `[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`,
+            );
+        }
+      } catch {}
+    }
+    // SPEC B: live intermediate text. The FIRST tool call of the run posts
+    // the ephemeral message (below the tool-call block, latest text or
+    // placeholder); each later tool call re-edits it in place (throttled,
+    // skip-unchanged). No-op at level 0; a run with zero tool calls never
+    // posts one.
+    await updateLiveText(ch, lvl > 0);
   });
 
   // ─── Typing indicator while working ────────────────────────────────────
@@ -2212,6 +2333,16 @@ export default function (pi: ExtensionAPI) {
       statusMsgId = null;
       statusChannelId = null;
       statusMsgAt = 0;
+      // SPEC B: fresh run, fresh ephemeral text slot. A leftover message
+      // from an abnormal run end is deleted here (agent_end normally
+      // already did); the pointers are cleared either way.
+      if (liveTextMsgId && liveTextChannelId === ch.id)
+        deleteDiscordMessage(ch, liveTextMsgId).catch(() => {});
+      liveTextMsgId = null;
+      liveTextChannelId = null;
+      liveTextAt = 0;
+      liveTextShown = null;
+      liveTextLatest = null;
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
       try {
@@ -2295,38 +2426,52 @@ export default function (pi: ExtensionAPI) {
     const text = early ?? finalText(msg);
     if (!text) return;
     earlySent.add(msg);
-    if (early === null && recordFinalRepeat(ch.id, text)) {
-      // Third consecutive identical final — a stuck loop. Drop the
-      // repeated final, abort the run, post one warning line instead.
-      userStoppedRun = true;
-      if (ch.type === "discord")
-        sendDiscordMessage(ch, fence(REPEAT_WARNING)).catch(() => {});
-      try {
-        ctx.abort();
-      } catch {}
-      return;
-    }
-    const rt = parseReplyTo(text);
-    const allowed = runInboundIds.get(ch.id);
-    const tagged =
-      rt.replyTo && allowed?.includes(rt.replyTo) ? rt.replyTo : undefined;
-    const replyTo =
-      tagged ?? (early === null ? lastInboundIds.get(ch.id) : undefined);
-    const chunks = chunkText(rt.text, 1900);
-    const files = detectAttachmentFiles(rt.text);
-    for (let i = 0; i < chunks.length; i++) {
-      try {
-        const r = await sendFinalWithFiles(
-          ch,
-          chunks[i],
-          i === 0 ? files : [],
-          i === 0 ? replyTo : undefined,
-        );
-        if (!r.success)
-          console.error(
-            `[channel] early send failed: ${sanitizeSensitiveText(r.error || "")}`,
+    if (early !== null && isLiveTextChannel(ch)) {
+      // SPEC B: intermediate text (text + toolCall) with forwarding on
+      // lands in the ONE ephemeral live-text message — edited in place
+      // here (posted on the first tool call, below the tool-call block)
+      // instead of a separate early-sent message. The <reply-to> tag is
+      // stripped; threading applies only to standalone messages.
+      liveTextLatest = parseReplyTo(early).text;
+      await updateLiveText(ch, false);
+    } else {
+      if (early === null && recordFinalRepeat(ch.id, text)) {
+        // Third consecutive identical final — a stuck loop. Drop the
+        // repeated final, abort the run, post one warning line instead.
+        userStoppedRun = true;
+        if (ch.type === "discord")
+          sendDiscordMessage(ch, fence(REPEAT_WARNING)).catch(() => {});
+        try {
+          ctx.abort();
+        } catch {}
+        return;
+      }
+      const rt = parseReplyTo(text);
+      const allowed = runInboundIds.get(ch.id);
+      const tagged =
+        rt.replyTo && allowed?.includes(rt.replyTo) ? rt.replyTo : undefined;
+      const replyTo =
+        tagged ?? (early === null ? lastInboundIds.get(ch.id) : undefined);
+      const chunks = chunkText(rt.text, 1900);
+      const files = detectAttachmentFiles(rt.text);
+      for (let i = 0; i < chunks.length; i++) {
+        try {
+          const r = await sendFinalWithFiles(
+            ch,
+            chunks[i],
+            i === 0 ? files : [],
+            i === 0 ? replyTo : undefined,
           );
-      } catch {}
+          if (!r.success)
+            console.error(
+              `[channel] early send failed: ${sanitizeSensitiveText(r.error || "")}`,
+            );
+        } catch {}
+      }
+      // SPEC B: the final is out — delete the ephemeral live-text message
+      // (best effort; the agent_end delete is the safety net for runs
+      // whose final never reaches this path).
+      if (isLiveTextChannel(ch)) await deleteLiveText(ch);
     }
     // Unreact the 👀 ack on this channel's last inbound message (A1):
     // the final lands on this path, so the ack is cleared here too.
@@ -2439,6 +2584,13 @@ export default function (pi: ExtensionAPI) {
     // finals. The re-wake message's own run will get a fresh agent_end with
     // its own captured channel.
     const ch = lastActiveChannel;
+
+    // SPEC B: clear the ephemeral live-text message on run end — error,
+    // stop, timeout, or a final delivered on this path instead of
+    // message_end. Before the re-wake below: the next run's turn_start
+    // would otherwise reset the pointers and orphan this run's message.
+    // Best effort — logged, never breaks the run.
+    if (ch) await deleteLiveText(ch);
 
     // #40: keep the last completed run's usage for /usage last. Any run
     // with billable tokens, done or failed (the synthetic failure message
