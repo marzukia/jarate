@@ -18,6 +18,9 @@
 #        ~/bin/jarate        -> <jarate>/bin/jarate
 #        ~/projects/recall   -> <jarate>/packages/recall   (only if the dest
 #                               is absent or already this symlink)
+#   5. seeds ~/.config/agent-fleet/peers.json (agent-say peer-name
+#      resolution) from dispatch/peers.json + this agent's own channel.
+#      One-time write: an existing file is never clobbered.
 #
 # Deploy after a git pull = nothing. Code is live at the checkout; restart pi
 # only to pick up bridge (channel/) changes.
@@ -33,6 +36,7 @@
 #   - never touches ~/.pi/agent/settings.json (prints the line to set)
 #   - never restarts or kills pi processes; prints a restart reminder
 #   - never rsyncs or copies repo files; only symlinks + package installs
+#     (+ the one-time peers.json seed, which never clobbers)
 #   - machine-local state (node_modules, .venv, __pycache__, sessions) lives
 #     in the checkout and is gitignored
 #
@@ -125,6 +129,35 @@ if [ ! -e "$RECALL_DEST" ] || { [ -L "$RECALL_DEST" ] && [ "$(readlink "$RECALL_
   link_into "$RECALL_DEST" "$JARATE_DIR/packages/recall"
 else
   echo "  recall: $RECALL_DEST exists (not this symlink); left untouched"
+fi
+
+# --- 3b. agent-fleet peers seed (agent-say peer names) ----------------------
+# One-time: the peers file is machine state (operators add peers), so an
+# existing file is never clobbered. Seed = the repo default roster PLUS
+# this agent's own channel (name = $USER, id from settings.json — the
+# file is never written, only read).
+PEERS_DEST="$HOME/.config/agent-fleet/peers.json"
+if [ -f "$PEERS_DEST" ]; then
+  echo "  peers: $PEERS_DEST (exists, unchanged)"
+else
+  self=""
+  if command -v jq >/dev/null 2>&1 && [ -f "$HOME/.pi/agent/settings.json" ]; then
+    self="$(jq -r '[.channels[]? | select(.type == "discord") | .id // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json" 2>/dev/null || true)"
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "  peers: [dry-run] would seed $PEERS_DEST (repo default + own channel)"
+  else
+    mkdir -p "$(dirname "$PEERS_DEST")"
+    if [ -n "$self" ] && command -v jq >/dev/null 2>&1 && [ -f "$JARATE_DIR/dispatch/peers.json" ]; then
+      jq --arg u "${USER:-agent}" --arg c "$self" '. + {($u): $c}' \
+        "$JARATE_DIR/dispatch/peers.json" > "$PEERS_DEST"
+    elif [ -f "$JARATE_DIR/dispatch/peers.json" ]; then
+      cp "$JARATE_DIR/dispatch/peers.json" "$PEERS_DEST"
+    else
+      echo '{}' > "$PEERS_DEST"
+    fi
+    echo "  peers: seeded $PEERS_DEST"
+  fi
 fi
 
 # --- 4. finish ---------------------------------------------------------------

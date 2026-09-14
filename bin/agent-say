@@ -2,8 +2,12 @@
 # agent-say: send a message to a Discord channel as the calling user's pi bot.
 #
 # Usage:
-#   agent-say <channel-id> "message"
-#   echo "message" | agent-say <channel-id> -
+#   agent-say <channel-id|peer> "message"
+#   echo "message" | agent-say <channel-id|peer> -
+#
+# Target: a numeric Discord channel id, or a fleet peer name resolved via
+# ~/.config/agent-fleet/peers.json (seeded by install.sh from the repo
+# default dispatch/peers.json + your own channel; operators add peers).
 #
 # Token resolution: $PI_BOT_TOKEN, else first discord botToken in
 # ~/.pi/agent/settings.json.
@@ -13,10 +17,27 @@
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
-  echo "usage: agent-say <channel-id> <message|->" >&2
+  echo "usage: agent-say <channel-id|peer> <message|->" >&2
   exit 2
 fi
 channel="$1"
+
+# Peer name resolution (#45): a non-numeric target must exist in the
+# peers file or the command fails loudly (a typo'd channel id would
+# otherwise 404 deep in curl). Numeric targets pass through untouched.
+if ! [[ "$channel" =~ ^[0-9]+$ ]]; then
+  peers="$HOME/.config/agent-fleet/peers.json"
+  resolved=""
+  if [ -f "$peers" ] && command -v jq >/dev/null 2>&1; then
+    resolved="$(jq -r --arg p "$channel" '.[$p] // empty' "$peers" 2>/dev/null || true)"
+  fi
+  if [[ "$resolved" =~ ^[0-9]+$ ]]; then
+    channel="$resolved"
+  else
+    echo "agent-say: unknown peer '$1' (add it to $peers)" >&2
+    exit 2
+  fi
+fi
 msg="$2"
 if [ "$msg" = "-" ]; then msg="$(cat)"; fi
 if [ -z "$msg" ]; then

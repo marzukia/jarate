@@ -29,7 +29,12 @@ Webhook callback embeds are framed and untagged.
 | `/stop` | `[-] stopped` |
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
-| `/usage [all\|session]` | `[usage] …` (error: `[!] usage: …`) |
+| `/usage [all\|session\|last]` | `[usage] …` (error: `[!] usage: …`) |
+| `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
+| `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
+| `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
+| `/jobs tail <id> [--n N]` | fenced tail output (`[..] N earlier lines` when capped) |
+| ctx boundary notice (auto) | `[ctx] N% (tok/window)` (fenced) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
@@ -67,7 +72,11 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
-| `/usage [all\|session]` | anyone | token usage: current session (default) or lifetime across all session files |
+| `/usage [all\|session\|last]` | anyone | token usage: current session (default), lifetime across all session files, or the last completed run |
+| `/new-worktree [ref]` | owner | create a git worktree for this session's repo at `$PI_BG_WT_DIR/<repo>/<ticket>` (branch `pi-bg/<ticket>`), one at a time |
+| `/merge-worktree [squash]` | owner | merge the active worktree's branch into the live checkout's current branch, then remove worktree + branch; `squash` = one commit |
+| `/jobs kill <id>` | owner | kill an in-flight `pi-bg` run (wraps `pi-bg-kill`) |
+| `/jobs tail <id> [--n N]` | owner | tail a run's live output (wraps `pi-bg-tail`; N capped at 200, shown lines at 40) |
 | `/reset` | owner | abort the run and restart the pi session |
 | `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
@@ -211,6 +220,7 @@ inbounds waiting on the run, and interrupt state (`interrupting` or
 /usage             # current session (same as /usage session)
 /usage session     # current session
 /usage all         # lifetime, every session file in the agent home
+/usage last        # the last COMPLETED run (per-run tokens + cost)
 ```
 
 Reads pi's session store (`~/.pi/agent/sessions/*/*.jsonl`), sums assistant
@@ -227,6 +237,41 @@ cacheRead 0.085/1M). One compact line, no emoji:
 
 `cacheRead` is shown on the session line as-is (0 on our vLLM); the lifetime
 line shows it only when nonzero.
+
+`/usage last` reports the most recent completed run (recorded on
+`agent_end`, assistant `usage` summed over the run's messages): same line
+shape, label `last run`, completion time (HH:MM:SS) in the date field. It
+is in-memory — a bridge restart clears it. Before any run completes it
+answers `[!] no completed run yet (run one first)`. The same numbers
+land as the trailing line of the done/failed run frame (see below).
+
+### run frame usage line + [ctx] boundary notices
+
+The done/failed frame carries one trailing line with the run's tokens and
+estimated cost (same OpenRouter list rates as `/usage`):
+
+```
+┌ done · 2 calls · 12s
+│ ├ edit a.ts
+│ └ bash bun test
+│ ~219.4k tok · ~$0.096
+└
+```
+
+Runs with no `usage` data (all-zero) get no trailing line.
+
+Separately, the bridge watches the context window during a run: each time
+the usage crosses an upward 10% boundary it posts ONE fenced notice
+(per boundary, per session — a restart or `/reset` re-arms, a `/compact`
+drop re-arms nothing, so a re-crossing below the last announced boundary
+is silent):
+
+```
+[ctx] 41% (108k/262k)
+```
+
+No command stands behind this; it is the operator's early warning that the
+session is filling up.
 
 ### /reset
 
@@ -303,8 +348,10 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 ### /jobs
 
 ```
-/jobs           # text: in-flight + last 5 completed
-/jobs json      # machine-readable: {inflight, history(10)}
+/jobs                        # text: in-flight + last 5 completed
+/jobs json                   # machine-readable: {inflight, history(10)}
+/jobs kill <id>              # kill an in-flight run (owner)
+/jobs tail <id> [--n N]      # tail a run's live output (owner)
 ```
 
 In-flight via the process table (the `pi-bg` wrapper process exists only
@@ -321,9 +368,50 @@ recent (newest first):
 - 20260910-131200-77319 webhook-failed · webhook 502 · 54m ago
 ```
 
+`kill` and `tail` wrap the dispatch scripts (`pi-bg-kill <id>`,
+`pi-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
+and the tail file is owned by the dispatch user. Output is fenced; tail
+shows the last N lines (default 40, cap 200), notes dropped lines
+(`[..] 60 earlier lines`), and hard-wraps lines to the 40-col budget.
+
 Companion bins (installed like `pi-bg`): `pi-bg-tail <id> [lines] [-f]`
 reads a run's live output; `pi-bg-kill <id> [--dry-run]` cancels a run via
 its cgroup and posts a `KILLED` webhook event.
+
+### /new-worktree + /merge-worktree
+
+```
+/new-worktree [ref]        # default ref: HEAD
+/merge-worktree            # plain merge, keep the branch history
+/merge-worktree squash     # one commit on the live branch
+```
+
+Owner only. Gives the MAIN interactive session the same worktree flow the
+dispatch workers get (`--worktree`): the worktree lands at
+`$PI_BG_WT_DIR/<repo>/<ticket>` (default `~/.pi-bg-wt`), branch
+`pi-bg/<ticket>`, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, same shape as
+`pi-bg`). One worktree per repo at a time; state in `<repo>/.tmp/worktree.json`.
+
+- `new-worktree` refuses when one is already active, and answers `[!]` when
+  the cwd is not a git repo.
+- `merge-worktree` merges the branch into the live checkout's CURRENT
+  branch (the bridge never checks out another branch in the live repo),
+  then removes the worktree and deletes the branch (`squash` force-deletes
+  after `git commit -m "squash-merge <branch>"`).
+- Uncommitted changes in the worktree block the REMOVAL, not the merge:
+  the branch is merged, the worktree stays for a commit + retry, and the
+  `[!]` line names the path.
+- A conflicted merge leaves the merge in flight on the live repo:
+  resolve the files, `git add`, then `/merge-worktree` again to finalize.
+
+### agent-say peer names
+
+`agent-say <target> "msg"` accepts a peer NAME instead of a channel id:
+the name is resolved through `~/.config/agent-fleet/peers.json` (seeded by
+`install.sh` from the repo's `dispatch/peers.json` plus the agent's own
+channel). Unknown names fail with `agent-say: unknown peer 'x'` and exit 2;
+numeric targets pass through untouched. Keep the peers file current when
+the fleet roster changes.
 
 ### /diff
 

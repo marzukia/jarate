@@ -31,6 +31,7 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import { newCtxWatch, observeCtx } from "./ctxwatch";
 import { publishDiff } from "./diff";
 import {
   connectDiscord,
@@ -63,7 +64,7 @@ import {
 } from "./discord";
 import { mdToDiscord } from "./format";
 import { registerJarateTool } from "./jarate";
-import { jobsView } from "./jobs";
+import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { extractQueueSuffix } from "./queue";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
@@ -126,8 +127,16 @@ import {
   startRun,
   type UndoRun,
 } from "./undo";
-import { renderUsage } from "./usage";
+import {
+  estimateCost,
+  hasUsage,
+  renderUsage,
+  sumRunUsage,
+  type UsageStats,
+  usageLine,
+} from "./usage";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
+import { mergeWorktree, newWorktree } from "./worktree";
 
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
@@ -164,6 +173,18 @@ export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
   2: "all",
 };
 export const verboseOverride = new Map<string, VerboseLevel>();
+
+// #13: per-session context-boundary trackers, keyed by session file path.
+// One pi process = one session file; /reset moves the file aside and
+// starts a new one, so a reset is a fresh key (fresh baseline). /compact
+// drops the pct, and only upward crossings fire — no special handling.
+export const ctxWatchers = new Map<string, ReturnType<typeof newCtxWatch>>();
+
+// #40: the last completed run's usage (tokens + est. cost), for
+// `/usage last`. Set at agent_end; null until the first run completes.
+export const lastRunUsage: {
+  value: { stats: UsageStats; at: Date } | null;
+} = { value: null };
 
 /** #10: parse a /verbose arg into a level. on/2 = all, off/0 = text,
  *  kimaki names (text/essential/all) accepted; null = not a level. */
@@ -1213,6 +1234,7 @@ export function runFrame(
   calls: string[],
   count: number,
   secs: number,
+  trailing?: string,
 ): string {
   const n = `${count} call${count === 1 ? "" : "s"} · ${secs}s`;
   const lines: string[] = [
@@ -1226,8 +1248,26 @@ export function runFrame(
     const prefix = i === shown.length - 1 ? "│ └ " : "│ ├ ";
     lines.push(`${prefix}${fit(a, TOOL_LINE_MAX - prefix.length)}`);
   });
+  // #40: run usage trailing line — append-only, right before the closing
+  // bar, same budget as every other frame line.
+  if (trailing) lines.push(fit(trailing, TOOL_LINE_MAX));
   lines.push("└");
   return lines.join("\n");
+}
+
+/** #40: the run-usage trailing line for the done/failed frame.
+ *  `│ ~219.9k tok · ~$0.042` (lowercase k, 3-decimal est. cost, same
+ *  pricing as ~/scripts/pi-token-cost.py). null when the run carried no
+ *  billable usage. Already carries the `│ ` prefix; the frame clips it
+ *  to the 40-col budget. */
+export function runUsageLine(s: UsageStats): string | null {
+  const total = s.input + s.output + s.cacheRead + s.cacheWrite;
+  if (total <= 0) return null;
+  const tok =
+    total >= 1_000_000
+      ? `${(total / 1_000_000).toFixed(1)}m`
+      : `${(total / 1000).toFixed(1)}k`;
+  return `│ ~${tok} tok · ~$${estimateCost(s).toFixed(3)}`;
 }
 
 /** Local files referenced in final text (images + common docs). */
@@ -1483,7 +1523,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2245,6 +2285,11 @@ export default function (pi: ExtensionAPI) {
     // this run's triggering ids) or, untagged, to the last inbound.
     const ch = lastActiveChannel;
     if (!ch || !agentBusy) return;
+    // #13: automatic context-boundary notice — one fenced line per 10%
+    // boundary crossed per session, upward crossings only. Posted before
+    // the run's own text so it reads as context, not reply.
+    const note = ctxBoundaryNotice(ctx);
+    if (note) sendDiscordMessage(ch, fence(note)).catch(() => {});
     const msg = event.message;
     const early = earlySendText(msg);
     const text = early ?? finalText(msg);
@@ -2395,6 +2440,13 @@ export default function (pi: ExtensionAPI) {
     // its own captured channel.
     const ch = lastActiveChannel;
 
+    // #40: keep the last completed run's usage for /usage last. Any run
+    // with billable tokens, done or failed (the synthetic failure message
+    // carries empty usage, so a hard-failed run keeps the previous value).
+    const runStats = sumRunUsage(event.messages ?? []);
+    if (hasUsage(runStats))
+      lastRunUsage.value = { stats: runStats, at: new Date() };
+
     // Re-wake: inbounds that arrived while this run was in flight were queued
     // (not steered into it) so they cannot be swallowed. Start a fresh run for
     // the oldest queued one now. Awaiting it guarantees the message is handed
@@ -2440,6 +2492,9 @@ export default function (pi: ExtensionAPI) {
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
         const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
+        // #40: run usage as the trailing frame line (append-only, before
+        // the closing bar; same 40-col budget as every other line).
+        const trailing = runUsageLine(runStats) ?? undefined;
         // live-frame unification: the morph edits the SAME working message
         // in place — only the header flips. fence() keeps the box glyphs
         // monospace (mockup3: "frames live in code fences only").
@@ -2452,6 +2507,7 @@ export default function (pi: ExtensionAPI) {
               shownActions,
               shownActions.length,
               secs,
+              trailing,
             ),
           ),
         ).catch(() => {});
@@ -2541,7 +2597,7 @@ const HELP_TEXT = [
   "plain message during a run - interrupts the step after ~3s, then takes over",
   "`/btw <question>` - quick side question, answered briefly",
   "`/status` - session stats (owner)",
-  "`/usage [all|session]` - token usage: current session, or all sessions",
+  "`/usage [all|session|last]` - token usage: current session, all, or last run",
   "`/reset` - start a NEW session, clearing context (owner)",
   "`/restart` - restart pi, resuming THIS session (owner)",
   "`/undo` - revert last assistant turn: files + conversation (owner)",
@@ -2551,6 +2607,10 @@ const HELP_TEXT = [
   "`/compact [instructions]` - compact session context (owner)",
   "`/model [name]` - switch or list models (owner)",
   "`/jobs` - list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
+  "`/jobs kill <id>` - kill an in-flight pi-bg run (owner)",
+  "`/jobs tail <id> [--n N]` - tail a run's live output (owner)",
+  "`/new-worktree [ref]` - worktree for this session's repo (owner)",
+  "`/merge-worktree [squash]` - merge worktree back, keep or squash (owner)",
   "`/diff [git-range | file]` - publish a diff (default: working tree) to a shareable viewer URL",
   "`/todos` - show the channel todo board (arg `all` for every channel)",
   "`/sleep [list | cancel <id>]` - list or cancel pending session wakes (owner)",
@@ -2702,6 +2762,25 @@ function safeSessionFile(ctx: ExtensionContext): string | null {
   } catch {
     return null;
   }
+}
+
+/** #13: automatic context-boundary notice. Keyed by session file so a
+ *  /reset (new file) starts a fresh, silent baseline. Returns the notice
+ *  line or null; mutates the per-session tracker in ctxWatchers. */
+export function ctxBoundaryNotice(ctx: ExtensionContext): string | null {
+  const u = ctx.getContextUsage?.();
+  if (!u || typeof u.tokens !== "number" || !u.contextWindow) return null;
+  const pct =
+    typeof u.percent === "number"
+      ? u.percent
+      : (u.tokens / u.contextWindow) * 100;
+  const key = safeSessionFile(ctx) ?? "?";
+  let st = ctxWatchers.get(key);
+  if (!st) {
+    st = newCtxWatch();
+    ctxWatchers.set(key, st);
+  }
+  return observeCtx(st, pct, u.tokens, u.contextWindow);
 }
 
 // ─── Restart-class ops: /reset /restart /undo /redo ────────────────────
@@ -3317,6 +3396,16 @@ async function runChannelCommand(
       return { immediate: text };
     }
     case "usage": {
+      // #40: /usage last — the last completed run's tokens + est. cost
+      // (in-memory; reset on bridge restart, like the rest of run state).
+      const scope = (arg ?? "").trim().toLowerCase();
+      if (scope === "last") {
+        const lu = lastRunUsage.value;
+        if (!lu)
+          return { immediate: "[!] no completed run yet (run one first)" };
+        const at = lu.at.toISOString().slice(11, 19);
+        return { immediate: usageLine("last run", at, lu.stats) };
+      }
       // Read-only token stats from the session store. Session discovery
       // reuses the /undo path: active ctx session file, else newest .jsonl
       // under cwd's session dir (findSessionFile fallback).
@@ -3490,9 +3579,60 @@ async function runChannelCommand(
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
+      // #44: /jobs kill <id> + /jobs tail <id> [--n N] wrap the dispatch
+      // scripts (owner-only — kill is a state change, tail reads a file
+      // only the dispatch user owns). /jobs [json] stays open to all.
+      const argText = (arg || "").trim();
+      const parts = argText ? argText.split(/\s+/) : [];
+      const sub = (parts[0] ?? "").toLowerCase();
+      if (sub === "kill" || sub === "tail") {
+        if (!isOwner) return ownerOnly;
+        const id = (parts[1] ?? "").trim();
+        if (!id || id.startsWith("-"))
+          return {
+            immediate: fence(
+              `[!] usage: /jobs ${sub} <id>${sub === "tail" ? " [--n N]" : ""}`,
+            ),
+          };
+        if (sub === "kill") return { immediate: await jobsKill(id) };
+        let n = 40;
+        const ni = parts.indexOf("--n");
+        if (ni !== -1) {
+          const v = Number.parseInt(parts[ni + 1] ?? "", 10);
+          if (!Number.isFinite(v) || v < 1)
+            return { immediate: fence("[!] usage: /jobs tail <id> [--n N]") };
+          n = Math.min(v, 200);
+        }
+        return { immediate: await jobsTail(id, n) };
+      }
       // Informational, open to all channel members (private channel).
-      const sub = (arg || "").trim().toLowerCase();
       return { immediate: jobsView(sub === "json" ? "json" : "text") };
+    }
+    case "new-worktree": {
+      // #12: create the interactive session's worktree (owner-only).
+      if (!isOwner) return ownerOnly;
+      const ref = (arg ?? "").trim() || undefined;
+      try {
+        return { immediate: fence(newWorktree(ctx.cwd, ref)) };
+      } catch (e) {
+        return {
+          immediate: fence(`[!] worktree failed: ${sanitizeUnknownValue(e)}`),
+        };
+      }
+    }
+    case "merge-worktree": {
+      // #12: merge the worktree branch back into the live checkout
+      // (owner-only; optional arg `squash` = squash merge).
+      if (!isOwner) return ownerOnly;
+      const mode =
+        (arg ?? "").trim().toLowerCase() === "squash" ? "squash" : "keep";
+      try {
+        return { immediate: fence(mergeWorktree(ctx.cwd, mode)) };
+      } catch (e) {
+        return {
+          immediate: fence(`[!] merge failed: ${sanitizeUnknownValue(e)}`),
+        };
+      }
     }
     case "sleep": {
       if (!isOwner) return ownerOnly;

@@ -7,6 +7,8 @@ import {
   formatJobsView,
   type InflightJob,
   type JobHistoryEntry,
+  jobsKill,
+  jobsTail,
   parseJobsFromPs,
   scanJobHistory,
   ticketIdFromPid,
@@ -502,5 +504,96 @@ describe("pi-bg-kill", () => {
     const r = run(KILL, [], env());
     expect(r.code).toBe(2);
     expect(r.err).toContain("usage: pi-bg-kill");
+  });
+});
+
+// ─── /jobs kill | tail wrappers (#44) ────────────────────────────────────
+
+describe("jobsKill / jobsTail wrappers (#44)", () => {
+  let tmp: string;
+  let scriptsDir: string;
+  const env: Record<string, string> = {};
+
+  function stub(name: string, body: string): void {
+    const p = path.join(scriptsDir, name);
+    fs.writeFileSync(p, body);
+    fs.chmodSync(p, 0o755);
+  }
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jobs-44-"));
+    scriptsDir = path.join(tmp, "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const ID = "20260914-091714-3097";
+
+  test("bad id -> usage line, script never spawned", async () => {
+    stub("pi-bg-kill", "#!/bin/sh\necho should-not-run\n");
+    expect(await jobsKill("nope", env, scriptsDir)).toContain(
+      "[!] usage: /jobs kill <id>",
+    );
+    expect(await jobsTail("nope", 40, env, scriptsDir)).toContain(
+      "[!] usage: /jobs tail <id>",
+    );
+  });
+
+  test("kill: script exit 0 -> [ok] killed <id>, fenced", async () => {
+    stub("pi-bg-kill", "#!/bin/sh\nexit 0\n");
+    const r = await jobsKill(ID, env, scriptsDir);
+    expect(r).toContain(`[ok] killed ${ID}`);
+    expect(r.startsWith("```")).toBe(true);
+  });
+
+  test("kill: script exit 2 (unknown ticket) -> [!] with the script's reason", async () => {
+    stub(
+      "pi-bg-kill",
+      "#!/bin/sh\necho \"pi-bg-kill: no cgroup for ticket 'X'\" >&2\nexit 2\n",
+    );
+    const r = await jobsKill("20260910-120000-999", env, scriptsDir);
+    expect(r).toContain("[!] pi-bg-kill: no cgroup");
+  });
+
+  test("kill: missing script -> not-found line, no throw", async () => {
+    const r = await jobsKill(ID, env, scriptsDir);
+    expect(r).toContain("pi-bg-kill not found at");
+    expect(r).toContain(scriptsDir);
+  });
+
+  test("tail: output is fenced, capped to the last 40 lines, dropped count noted", async () => {
+    let body = "#!/bin/sh\n";
+    for (let i = 1; i <= 100; i++) body += `echo "line ${i}"\n`;
+    stub("pi-bg-tail", body);
+    const r = await jobsTail(ID, 100, env, scriptsDir);
+    const inner = r.slice(4, -4).split("\n");
+    expect(inner[0]).toBe("[..] 60 earlier lines");
+    expect(inner[1]).toBe("line 61");
+    expect(inner.at(-1)).toBe("line 100");
+    expect(inner.length).toBe(1 + 40);
+  });
+
+  test("tail: overlong lines are hard-wrapped at 40 cols (mobile budget)", async () => {
+    const long = "x".repeat(120);
+    stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
+    const r = await jobsTail(ID, 40, env, scriptsDir);
+    const lines = r.split("\n");
+    // fence + 3 wrapped + "ok" + fence
+    expect(lines.length).toBe(6);
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(41);
+    expect(lines[1] + lines[2] + lines[3]).toBe(long);
+  });
+
+  test("tail: --n is clamped to [1, 200] and passed to the script", async () => {
+    stub("pi-bg-tail", '#!/bin/sh\necho "n=$2"\n');
+    expect(await jobsTail(ID, 500, env, scriptsDir)).toContain("n=200");
+    expect(await jobsTail(ID, 12, env, scriptsDir)).toContain("n=12");
+    expect(await jobsTail(ID, 0, env, scriptsDir)).toContain("n=40");
+  });
+
+  test("tail: empty output -> [!] no output", async () => {
+    stub("pi-bg-tail", "#!/bin/sh\nexit 0\n");
+    const r = await jobsTail(ID, 40, env, scriptsDir);
+    expect(r).toContain(`[!] no output for ${ID}`);
   });
 });

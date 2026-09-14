@@ -11,7 +11,7 @@
 // per run — raw.out (run started), out.md (run completed, non-empty),
 // webhook-failed (callback dead letter), killed (pi-bg-kill marker),
 // wb-status (success-path webhook HTTP code, recorded at post time).
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -229,4 +229,160 @@ export function formatJobsView(
 /** /jobs entry point: in-flight (ps) + history (/tmp artifacts). */
 export function jobsView(format: "text" | "json" = "text"): string {
   return formatJobsView(collectInflightJobs(), scanJobHistory(), format);
+}
+
+// ─── /jobs kill | tail (#44) ─────────────────────────────────────────────
+// Thin wrappers over the dispatch scripts pi-bg-kill / pi-bg-tail
+// (resolved under <scriptsDir>, default $HOME/scripts — the symlinks
+// install.sh creates). Async spawn: a real kill can wait up to ~10s for
+// the SIGTERM drain, so the event loop must not block. Output is capped
+// the same way as runShellPassthrough (20k chars, hard timeout).
+
+export const JOB_TICKET_ID_RE = /^\d{8}-\d{6}-\d+$/;
+
+const JOB_SCRIPT_TIMEOUT_MS = 20_000;
+const JOB_SCRIPT_OUT_CAP = 20_000;
+
+export function piBgScriptPath(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  scriptsDir?: string,
+): string {
+  const dir = scriptsDir ?? path.join(env.HOME ?? "", "scripts");
+  return path.join(dir, name);
+}
+
+export function runPiBgScript(
+  name: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  scriptsDir?: string,
+): Promise<{ out: string; code: number; timedOut: boolean }> {
+  const script = piBgScriptPath(name, env, scriptsDir);
+  return new Promise((resolve) => {
+    if (!fs.existsSync(script)) {
+      resolve({
+        out: `${name} not found at ${script} (install.sh link missing)`,
+        code: 127,
+        timedOut: false,
+      });
+      return;
+    }
+    let p: ReturnType<typeof spawn>;
+    try {
+      p = spawn(script, args, { env });
+    } catch (e) {
+      resolve({
+        out: `spawn failed: ${e instanceof Error ? e.message : String(e)}`,
+        code: 1,
+        timedOut: false,
+      });
+      return;
+    }
+    let out = "";
+    let timedOut = false;
+    const cap = (s: string) => {
+      if (out.length < JOB_SCRIPT_OUT_CAP)
+        out += s.slice(0, JOB_SCRIPT_OUT_CAP - out.length);
+    };
+    const t = setTimeout(() => {
+      timedOut = true;
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }, JOB_SCRIPT_TIMEOUT_MS);
+    p.stdout?.on("data", (d) => cap(String(d)));
+    p.stderr?.on("data", (d) => cap(String(d)));
+    p.on("error", (e) => {
+      clearTimeout(t);
+      resolve({ out: `spawn failed: ${e.message}`, code: 1, timedOut: false });
+    });
+    p.on("close", (code) => {
+      clearTimeout(t);
+      resolve({ out, code: code ?? 1, timedOut });
+    });
+  });
+}
+
+/** Fenced code block sized to the content's backtick runs (tail output
+ *  regularly contains code fences of its own). */
+function jobWrapFence(t: string): string {
+  const n = (t.match(/`+/g) || ["`"]).reduce(
+    (m, r) => Math.max(m, r.length),
+    0,
+  );
+  const f = "`".repeat(Math.max(3, n + 1));
+  return `${f}\n${t}\n${f}`;
+}
+
+const TAIL_MAX_LINES = 40;
+const TAIL_LINE_MAX = 40; // mobile budget, same as the run frames
+
+/** Cap + hard-wrap tail output and fence it. Keeps the LAST TAIL_MAX_LINES
+ *  lines (a tail is about the newest output) and splits overlong lines. */
+export function formatTail(out: string): string {
+  let lines = out.replace(/\n$/, "").split("\n");
+  const dropped = Math.max(0, lines.length - TAIL_MAX_LINES);
+  if (dropped > 0) lines = lines.slice(-TAIL_MAX_LINES);
+  const wrapped: string[] = [];
+  for (const l of lines) {
+    if (l.length <= TAIL_LINE_MAX) {
+      wrapped.push(l);
+      continue;
+    }
+    for (let i = 0; i < l.length; i += TAIL_LINE_MAX)
+      wrapped.push(l.slice(i, i + TAIL_LINE_MAX));
+  }
+  const head = dropped > 0 ? `[..] ${dropped} earlier lines\n` : "";
+  return jobWrapFence(`${head}${wrapped.join("\n")}`);
+}
+
+/** /jobs kill <id>: cancel an in-flight run via its cgroup. Channel line
+ *  comes back fenced and ready to post. */
+export async function jobsKill(
+  id: string,
+  env: NodeJS.ProcessEnv = process.env,
+  scriptsDir?: string,
+): Promise<string> {
+  if (!JOB_TICKET_ID_RE.test(id))
+    return jobWrapFence(
+      `[!] usage: /jobs kill <id> (ticket id, e.g. 20260910-135501-48211)`,
+    );
+  const r = await runPiBgScript("pi-bg-kill", [id], env, scriptsDir);
+  if (r.timedOut) return jobWrapFence(`[!] pi-bg-kill timed out for ${id}`);
+  if (r.code === 0) return jobWrapFence(`[ok] killed ${id}`);
+  const detail =
+    r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
+  return jobWrapFence(`[!] ${detail}`);
+}
+
+/** /jobs tail <id> [--n N]: a run's live output, capped to the last
+ *  TAIL_MAX_LINES lines, wrapped at TAIL_LINE_MAX, fenced. */
+export async function jobsTail(
+  id: string,
+  n: number,
+  env: NodeJS.ProcessEnv = process.env,
+  scriptsDir?: string,
+): Promise<string> {
+  if (!JOB_TICKET_ID_RE.test(id))
+    return jobWrapFence(
+      `[!] usage: /jobs tail <id> [--n N] (ticket id, e.g. 20260910-135501-48211)`,
+    );
+  const lines = Math.max(1, Math.min(200, Math.floor(n) || 40));
+  const r = await runPiBgScript(
+    "pi-bg-tail",
+    [id, String(lines)],
+    env,
+    scriptsDir,
+  );
+  if (r.timedOut) return jobWrapFence(`[!] pi-bg-tail timed out for ${id}`);
+  if (r.code !== 0) {
+    const detail =
+      r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
+    return jobWrapFence(`[!] ${detail}`);
+  }
+  if (r.out.trim() === "") return jobWrapFence(`[!] no output for ${id}`);
+  return formatTail(r.out);
 }

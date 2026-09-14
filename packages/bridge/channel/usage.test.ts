@@ -6,8 +6,10 @@ import { matchCommand } from "./index";
 import {
   estimateCost,
   fmtTokens,
+  hasUsage,
   renderUsage,
   summarizeSessionFile,
+  sumRunUsage,
 } from "./usage";
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -118,6 +120,66 @@ describe("estimateCost (OpenRouter list rates, pi-token-cost.py)", () => {
 });
 
 // ─── summarizeSessionFile ──────────────────────────────────────────────────
+
+describe("sumRunUsage (#40)", () => {
+  test("sums assistant usage across the run's steps", () => {
+    // agent_end carries every step of the run; each assistant reply has
+    // its own usage
+    const msgs = [
+      { role: "user", content: [] },
+      { role: "assistant", usage: A(1000, 100, 500) },
+      { role: "toolResult", content: [] },
+      { role: "assistant", usage: A(2000, 200, 700, 50) },
+      { role: "assistant", usage: A(3000, 300, 900) },
+    ];
+    const s = sumRunUsage(msgs);
+    expect(s.turns).toBe(3);
+    expect(s.input).toBe(6000);
+    expect(s.output).toBe(600);
+    expect(s.cacheRead).toBe(2100);
+    expect(s.cacheWrite).toBe(50);
+    expect(hasUsage(s)).toBe(true);
+  });
+
+  test("ignores non-assistant roles, missing usage, and zero usage", () => {
+    const s = sumRunUsage([
+      { role: "user", usage: A(999, 999) }, // wrong role: skipped
+      { role: "assistant" }, // no usage: skipped
+      { role: "assistant", usage: A(0, 0, 0, 0) }, // zero: skipped
+      { role: "assistant", usage: { input: 10, output: 5 } },
+    ]);
+    expect(s.turns).toBe(1);
+    expect(s.input).toBe(10);
+    expect(s.output).toBe(5);
+  });
+
+  test("partial usage objects (vLLM: no cacheWrite) and bad numbers tolerated", () => {
+    const s = sumRunUsage([
+      { role: "assistant", usage: { input: 100, output: 10 } },
+      {
+        role: "assistant",
+        usage: { input: "x", output: 20, cacheRead: NaN, cacheWrite: -5 },
+      },
+    ]);
+    expect(s.turns).toBe(2);
+    expect(s.input).toBe(100); // "x" and NaN count as 0
+    expect(s.output).toBe(30);
+    expect(s.cacheRead).toBe(0);
+    expect(s.cacheWrite).toBe(0); // negative counts as 0
+  });
+
+  test("empty run (failed before any step) -> zeros, hasUsage false", () => {
+    const s = sumRunUsage([]);
+    expect(s).toEqual({
+      turns: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    expect(hasUsage(s)).toBe(false);
+  });
+});
 
 describe("summarizeSessionFile", () => {
   test("sums assistant usage; skips deltas, users, missing + zero usage", async () => {
@@ -231,7 +293,7 @@ describe("renderUsage", () => {
   test("unknown arg -> usage error; missing session file handled", async () => {
     setHome("h-empty");
     expect(await renderUsage("bogus", "/cwd", null)).toBe(
-      "[!] usage: /usage [all|session]",
+      "[!] usage: /usage [all|session|last]",
     );
     expect(await renderUsage(undefined, "/cwd", null)).toBe(
       "[!] no session file found",

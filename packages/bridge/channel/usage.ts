@@ -61,6 +61,44 @@ export function fmtTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
+/**
+ * Sum assistant `usage` across the messages of ONE run — the agent_end
+ * `event.messages`, i.e. every step's assistant reply of THIS run (pi's
+ * run loop accumulates all steps there; a failed run's synthetic failure
+ * message carries EMPTY_USAGE and sums to zero). Same four fields as the
+ * session-file parser (input/output/cacheRead/cacheWrite); in-memory run
+ * messages are unique, so no id dedup is needed.
+ */
+export function sumRunUsage(messages: unknown[]): UsageStats {
+  const s: UsageStats = { ...EMPTY };
+  for (const m of messages) {
+    const msg = m as { role?: unknown; usage?: unknown } | null | undefined;
+    if (msg?.role !== "assistant") continue;
+    const u = msg.usage;
+    if (typeof u !== "object" || u === null) continue;
+    const num = (k: string): number => {
+      const v = (u as Record<string, unknown>)[k];
+      return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+    };
+    const input = num("input");
+    const output = num("output");
+    const cacheRead = num("cacheRead");
+    const cacheWrite = num("cacheWrite");
+    if (input + output + cacheRead + cacheWrite === 0) continue;
+    s.turns += 1;
+    s.input += input;
+    s.output += output;
+    s.cacheRead += cacheRead;
+    s.cacheWrite += cacheWrite;
+  }
+  return s;
+}
+
+/** True when the stats carry any billable tokens at all. */
+export function hasUsage(s: UsageStats): boolean {
+  return s.input + s.output + s.cacheRead + s.cacheWrite > 0;
+}
+
 function addEntry(s: UsageStats, entry: unknown, seen: Set<string>): void {
   const o = entry as {
     type?: unknown;
@@ -155,8 +193,8 @@ function dateFromMtime(file: string): string {
   }
 }
 
-function usageLine(
-  label: "session" | "lifetime",
+export function usageLine(
+  label: string,
   dateStr: string,
   s: UsageStats,
 ): string {
@@ -180,8 +218,13 @@ export async function renderUsage(
   sessionFile: string | null,
 ): Promise<string> {
   const scope = (arg ?? "").trim().toLowerCase();
-  if (scope !== "" && scope !== "session" && scope !== "all")
-    return "[!] usage: /usage [all|session]";
+  if (
+    scope !== "" &&
+    scope !== "session" &&
+    scope !== "all" &&
+    scope !== "last"
+  )
+    return "[!] usage: /usage [all|session|last]";
 
   if (scope === "all") {
     const base = sessionsBaseDir();

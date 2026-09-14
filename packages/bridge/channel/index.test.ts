@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,8 @@ import extension, {
   clearAllInterrupts,
   clearQueuedInbound,
   collectFinals,
+  ctxBoundaryNotice,
+  ctxWatchers,
   deleteQueuedInbound,
   deliverDueTasks,
   deliverDueWakes,
@@ -34,6 +37,7 @@ import extension, {
   isEssentialToolCall,
   isHeld,
   isVerbose,
+  lastRunUsage,
   matchCommand,
   midTurnQueues,
   opWindowLabel,
@@ -54,6 +58,7 @@ import extension, {
   runFrame,
   runMidRunInterrupt,
   runShellPassthrough,
+  runUsageLine,
   setInterruptCtx,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
@@ -5771,4 +5776,430 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
     const run = action.match(/(\\*)…$/)![1].length;
     expect(run % 2).toBe(0);
   });
+});
+
+// ─── wave 2c: #12 worktree, #13 ctx watch, #40 run usage, #44 jobs ──
+
+describe("wave 2c bridge commands", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+  const oldWtDir = process.env.PI_BG_WT_DIR;
+  const oldGitEnv: Record<string, string | undefined> = {};
+
+  const OWNER = "<user-id-1>";
+  const base = (body: string, id: string, fromId: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: fromId,
+    fromId,
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+  const inbound = (body: string, id: string) => base(body, id, OWNER);
+  const otherInbound = (body: string, id: string) => base(body, id, "other");
+  const posts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+      )
+      .map((c) => String(JSON.parse(c.body).content));
+  const patches = () =>
+    fetchCalls.filter((c) => c.method === "PATCH").map((c) => String(c.body));
+
+  const setup = () => {
+    handlers = {};
+    sent = [];
+    fetchCalls = [];
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    verboseOverride.clear();
+    ctxWatchers.clear();
+    lastRunUsage.value = null;
+    setRuntimeStateDir(null);
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ack: true,
+            ownerUserId: OWNER,
+            forwardToolCalls: false,
+          },
+        ],
+      }),
+    );
+  };
+
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, {
+      cwd,
+      env: process.env,
+      encoding: "utf8",
+    }).trim();
+
+  const initRepo = (dir: string) => {
+    git(dir, "init", "-b", "main");
+    fs.writeFileSync(path.join(dir, "base.txt"), "base\n");
+    git(dir, "add", "base.txt");
+    git(dir, "commit", "-m", "base commit");
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-2c-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    setup();
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+    oldGitEnv.GIT_AUTHOR_NAME = process.env.GIT_AUTHOR_NAME;
+    oldGitEnv.GIT_AUTHOR_EMAIL = process.env.GIT_AUTHOR_EMAIL;
+    oldGitEnv.GIT_COMMITTER_NAME = process.env.GIT_COMMITTER_NAME;
+    oldGitEnv.GIT_COMMITTER_EMAIL = process.env.GIT_COMMITTER_EMAIL;
+    process.env.GIT_AUTHOR_NAME = "t";
+    process.env.GIT_AUTHOR_EMAIL = "t@t";
+    process.env.GIT_COMMITTER_NAME = "t";
+    process.env.GIT_COMMITTER_EMAIL = "t@t";
+    process.env.PI_BG_WT_DIR = path.join(tmp, "wt");
+  });
+
+  afterEach(async () => {
+    jest.useRealTimers();
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    setRuntimeStateDir(null);
+    await handlers.agent_end?.({ messages: [] }, ctx);
+    globalThis.fetch = realFetch;
+    process.env.GIT_AUTHOR_NAME = oldGitEnv.GIT_AUTHOR_NAME;
+    process.env.GIT_AUTHOR_EMAIL = oldGitEnv.GIT_AUTHOR_EMAIL;
+    process.env.GIT_COMMITTER_NAME = oldGitEnv.GIT_COMMITTER_NAME;
+    process.env.GIT_COMMITTER_EMAIL = oldGitEnv.GIT_COMMITTER_EMAIL;
+    process.env.PI_BG_WT_DIR = oldWtDir;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("matchCommand: new 2c commands parse", () => {
+    expect(matchCommand("/new-worktree")?.name).toBe("new-worktree");
+    expect(matchCommand("/new-worktree main")?.arg).toBe("main");
+    expect(matchCommand("/merge-worktree")?.name).toBe("merge-worktree");
+    expect(matchCommand("/merge-worktree --squash")?.arg).toBe("--squash");
+    expect(matchCommand("/usage last")?.arg).toBe("last");
+    expect(matchCommand("/jobs kill 20260914-091714-3097")?.arg).toBe(
+      "kill 20260914-091714-3097",
+    );
+    expect(matchCommand("/jobs tail 20260914-091714-3097 --n 5")?.arg).toBe(
+      "tail 20260914-091714-3097 --n 5",
+    );
+    expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined }); // bare /jobs: view, no arg
+  });
+
+  test("runUsageLine: pricing matches pi-token-cost.py (#40)", () => {
+    expect(
+      runUsageLine({
+        turns: 1,
+        input: 215_000,
+        output: 1_800,
+        cacheRead: 2_600,
+        cacheWrite: 0,
+      }),
+    ).toBe("│ ~219.4k tok · ~$0.096");
+    expect(
+      runUsageLine({
+        turns: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      }),
+    ).toBeNull();
+  });
+
+  test("runFrame: trailing line sits before the closing bar, <= 40 cols", () => {
+    const frame = runFrame(
+      "done",
+      ["bash bun test"],
+      1,
+      0,
+      "│ ~219.4k tok · ~$0.096",
+    );
+    const lines = frame.split("\n");
+    expect(lines[0]).toBe("┌ done · 1 call · 0s");
+    expect(lines[1]).toBe("│ └ bash bun test");
+    expect(lines[2]).toBe("│ ~219.4k tok · ~$0.096");
+    expect(lines[3]).toBe("└");
+    for (const l of lines) expect([...l].length).toBeLessThanOrEqual(40);
+  });
+
+  test("message_end posts the [ctx] boundary notice, once per 10% step (#13)", async () => {
+    const ctxAt = (p: number) => ({
+      ...ctx,
+      getContextUsage: () => ({
+        tokens: Math.round((p / 100) * 262144),
+        contextWindow: 262144,
+        percent: p,
+      }),
+    });
+    const tc = {
+      role: "assistant",
+      content: [{ type: "toolCall", toolName: "read", arguments: {} }],
+    } as any;
+    await handleInbound(pi, inbound("hello", "m1"), ctxAt(38));
+    await handlers.turn_start(null, ctxAt(38));
+    // baseline: silent
+    await handlers.message_end({ message: tc }, ctxAt(38));
+    expect(posts().some((t) => t.includes("[ctx]"))).toBe(false);
+    // crosses 40: one fenced notice
+    await handlers.message_end({ message: tc }, ctxAt(41.2));
+    let ctxPosts = posts().filter((t) => t.includes("[ctx]"));
+    expect(ctxPosts).toHaveLength(1);
+    expect(ctxPosts[0]).toContain("[ctx] 41% (108k/262k)");
+    expect(ctxPosts[0].startsWith("```")).toBe(true);
+    // same step: silent
+    await handlers.message_end({ message: tc }, ctxAt(45));
+    expect(posts().filter((t) => t.includes("[ctx]"))).toHaveLength(1);
+    // /compact-style drop: silent; a new step above the baseline fires
+    await handlers.message_end({ message: tc }, ctxAt(20));
+    await handlers.message_end({ message: tc }, ctxAt(91));
+    ctxPosts = posts().filter((t) => t.includes("[ctx]"));
+    expect(ctxPosts).toHaveLength(2);
+    expect(ctxPosts[1]).toContain("[ctx] 91% (239k/262k)");
+  });
+
+  test("ctxBoundaryNotice: no getContextUsage / null / bad shape are silent", () => {
+    expect(ctxBoundaryNotice({} as any)).toBeNull();
+    expect(
+      ctxBoundaryNotice({
+        getContextUsage: () => null,
+      } as any),
+    ).toBeNull();
+    expect(
+      ctxBoundaryNotice({
+        getContextUsage: () => ({ percent: "x" }),
+      } as any),
+    ).toBeNull();
+  });
+
+  test("agent_end done frame carries the run usage line (#40)", async () => {
+    verboseOverride.set("ch1", 1);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "bun test" } },
+      ctx,
+    );
+    const fin = {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      usage: { input: 215_000, output: 1_800, cacheRead: 2_600, cacheWrite: 0 },
+    } as any;
+    await handlers.agent_end({ messages: [fin] }, ctx);
+    const patch = patches().find((p) => p.includes("┌ done"));
+    expect(patch).toBeDefined();
+    const lines = String(JSON.parse(patch!).content).split("\n");
+    // fenced frame: ``` / lines / ``` with the trailing usage line
+    // right before the closing bar
+    expect(lines.at(-2)).toBe("└");
+    expect(lines.at(-3)).toBe("│ ~219.4k tok · ~$0.096");
+    for (const l of lines.slice(1, -1))
+      expect([...l].length).toBeLessThanOrEqual(40);
+  });
+
+  test("/usage last: empty before any run, then the last run's line (#40)", async () => {
+    await handleInbound(pi, inbound("/usage last", "m1"), ctx);
+    expect(posts().some((t) => t.includes("[!] no completed run yet"))).toBe(
+      true,
+    );
+    await handleInbound(pi, inbound("hello", "m2"), ctx);
+    await handlers.turn_start(null, ctx);
+    await handlers.agent_end(
+      {
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "hi" }],
+            usage: { input: 1_000, output: 100, cacheRead: 0, cacheWrite: 0 },
+          },
+        ],
+      },
+      ctx,
+    );
+    await handleInbound(pi, inbound("/usage last", "m3"), ctx);
+    const last = posts().find((t) => t.includes("[usage] last run"));
+    expect(last).toBeDefined();
+    expect(last).toContain("| in 1K | out 100 |");
+    expect(last).toContain("est $0.00");
+    // unfenced, like the rest of the /usage family
+    expect(last!.startsWith("```")).toBe(false);
+  });
+
+  test("/jobs kill + tail: owner-only wrappers around pi-bg-kill/-tail (#44)", async () => {
+    const home = path.join(tmp, "home");
+    const scripts = path.join(home, "scripts");
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, "pi-bg-kill"), "#!/bin/sh\nexit 0\n");
+    fs.writeFileSync(
+      path.join(scripts, "pi-bg-tail"),
+      "#!/bin/sh\necho 'line one'\necho 'line two'\n",
+    );
+    fs.chmodSync(path.join(scripts, "pi-bg-kill"), 0o755);
+    fs.chmodSync(path.join(scripts, "pi-bg-tail"), 0o755);
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      // non-owner: falls through to pi as plain text
+      await handleInbound(
+        pi,
+        otherInbound("/jobs kill 20260914-091714-3097", "m1"),
+        ctx,
+      );
+      expect(sent).toHaveLength(1);
+      expect(posts().some((t) => t.includes("killed"))).toBe(false);
+      // owner kill
+      await handleInbound(
+        pi,
+        inbound("/jobs kill 20260914-091714-3097", "m2"),
+        ctx,
+      );
+      expect(
+        posts().some((t) => t.includes("[ok] killed 20260914-091714-3097")),
+      ).toBe(true);
+      // owner tail: fenced output
+      await handleInbound(
+        pi,
+        inbound("/jobs tail 20260914-091714-3097", "m3"),
+        ctx,
+      );
+      const tailPost = posts().find((t) => t.includes("line one"));
+      expect(tailPost).toBeDefined();
+      expect(tailPost).toContain("line two");
+      expect(tailPost!.startsWith("```")).toBe(true);
+      // missing id -> usage line
+      await handleInbound(pi, inbound("/jobs kill", "m4"), ctx);
+      expect(
+        posts().some((t) => t.includes("[!] usage: /jobs kill <id>")),
+      ).toBe(true);
+      await handleInbound(pi, inbound("/jobs tail", "m5"), ctx);
+      expect(
+        posts().some((t) => t.includes("[!] usage: /jobs tail <id> [--n N]")),
+      ).toBe(true);
+      // --n accepted; bad --n is a usage error
+      await handleInbound(
+        pi,
+        inbound("/jobs tail 20260914-091714-3097 --n 5", "m6"),
+        ctx,
+      );
+      expect(posts().filter((t) => t.includes("line one")).length).toBe(2);
+      await handleInbound(
+        pi,
+        inbound("/jobs tail 20260914-091714-3097 --n x", "m7"),
+        ctx,
+      );
+      expect(
+        posts().filter((t) => t.includes("usage: /jobs tail")).length,
+      ).toBe(2);
+      // bare /jobs: view path unchanged
+      await handleInbound(pi, inbound("/jobs", "m8"), ctx);
+      expect(posts().some((t) => t.includes("[jobs]"))).toBe(true);
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+
+  test("/new-worktree + /merge-worktree: owner-only full cycle (#12)", async () => {
+    initRepo(tmp);
+    // non-owner: falls through as plain text
+    await handleInbound(pi, otherInbound("/new-worktree", "m1"), ctx);
+    expect(sent).toHaveLength(1);
+    expect(loadWorktreeStateFile()).toBeNull();
+    // owner: creates the worktree
+    await handleInbound(pi, inbound("/new-worktree", "m2"), ctx);
+    const ok = posts().find((t) => t.includes("[ok] worktree "));
+    expect(ok).toBeDefined();
+    expect(ok!.startsWith("```")).toBe(true);
+    expect(ok).toContain("branch pi-bg/");
+    expect(ok).toContain(path.join(tmp, "wt"));
+    const st = loadWorktreeStateFile();
+    expect(st).not.toBeNull();
+    expect(st!.branch).toMatch(/^pi-bg\/\d{8}-\d{6}-\d{4}$/);
+    expect(st!.path).toBe(path.join(tmp, "wt", path.basename(tmp), st!.id));
+    // a second /new-worktree while one is active: refused
+    await handleInbound(pi, inbound("/new-worktree", "m3"), ctx);
+    expect(posts().some((t) => t.includes("[!] worktree already active"))).toBe(
+      true,
+    );
+    // work on the worktree, then merge
+    fs.writeFileSync(path.join(st!.path, "feature.txt"), "x\n");
+    git(st!.path, "add", "feature.txt");
+    git(st!.path, "commit", "-m", "feat");
+    await handleInbound(pi, inbound("/merge-worktree", "m4"), ctx);
+    const merged = posts().find((t) => t.includes("[ok] merged "));
+    expect(merged).toBeDefined();
+    expect(merged).toContain("into main (merge)");
+    expect(fs.existsSync(path.join(tmp, "feature.txt"))).toBe(true);
+    expect(fs.existsSync(st!.path)).toBe(false);
+    expect(git(tmp, "branch", "--list", st!.branch)).toBe("");
+    expect(loadWorktreeStateFile()).toBeNull();
+  });
+
+  test("/new-worktree: non-git repo is a [!] line; /merge-worktree with no state", async () => {
+    // no git repo in tmp
+    await handleInbound(pi, inbound("/new-worktree", "m1"), ctx);
+    expect(posts().some((t) => t.includes("[!] not a git repo"))).toBe(true);
+    await handleInbound(pi, inbound("/merge-worktree", "m2"), ctx);
+    expect(posts().some((t) => t.includes("[!] no active worktree"))).toBe(
+      true,
+    );
+  });
+
+  function loadWorktreeStateFile() {
+    const p = path.join(tmp, ".tmp", "worktree.json");
+    if (!fs.existsSync(p)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch {
+      return null;
+    }
+  }
 });
