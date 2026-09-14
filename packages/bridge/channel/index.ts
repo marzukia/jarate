@@ -1860,6 +1860,7 @@ export default function (pi: ExtensionAPI) {
   let liveTextAt = 0; // last post/edit time (edit throttle)
   let liveTextShown: string | null = null; // last posted content (skip-unchanged)
   let liveTextLatest: string | null = null; // latest intermediate text this run
+  let liveTextArmed = false; // a tool call has fired this run (post gate)
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
@@ -2206,10 +2207,10 @@ export default function (pi: ExtensionAPI) {
 
   const updateLiveText = async (ch: ChannelConfig, mayPost: boolean) => {
     if (!isLiveTextChannel(ch)) return;
-    const next =
-      liveTextLatest !== null
-        ? truncateLiveText(liveTextLatest)
-        : LIVE_TEXT_PLACEHOLDER;
+    // No placeholder: the message only ever carries real intermediate text.
+    // First post happens on the first text that arrives after a tool call.
+    if (liveTextLatest === null) return;
+    const next = truncateLiveText(liveTextLatest);
     if (liveTextMsgId && next === liveTextShown) return; // unchanged
     const now = Date.now();
     if (liveTextMsgId && now - liveTextAt < LIVE_TEXT_THROTTLE_MS) return;
@@ -2263,6 +2264,7 @@ export default function (pi: ExtensionAPI) {
     liveTextAt = 0;
     liveTextShown = null;
     liveTextLatest = null;
+    liveTextArmed = false;
     try {
       const r = await deleteDiscordMessage(ch, id);
       if (!r.success)
@@ -2355,11 +2357,12 @@ export default function (pi: ExtensionAPI) {
         }
       } catch {}
     }
-    // SPEC B: live intermediate text. The FIRST tool call of the run posts
-    // the ephemeral message (below the tool-call block, latest text or
-    // placeholder); each later tool call re-edits it in place (throttled,
-    // skip-unchanged). No-op at level 0; a run with zero tool calls never
-    // posts one.
+    // SPEC B: live intermediate text. A tool call ARMS the ephemeral
+    // message; it is posted on the first real intermediate text at or
+    // after that point (never a placeholder), then edited in place
+    // (throttled, skip-unchanged). No-op at level 0; a run with zero tool
+    // calls or zero intermediate text never posts one.
+    liveTextArmed = true;
     await updateLiveText(ch, lvl > 0);
   });
 
@@ -2390,6 +2393,7 @@ export default function (pi: ExtensionAPI) {
       liveTextAt = 0;
       liveTextShown = null;
       liveTextLatest = null;
+      liveTextArmed = false;
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
       try {
@@ -2480,7 +2484,7 @@ export default function (pi: ExtensionAPI) {
       // instead of a separate early-sent message. The <reply-to> tag is
       // stripped; threading applies only to standalone messages.
       liveTextLatest = parseReplyTo(early).text;
-      await updateLiveText(ch, false);
+      await updateLiveText(ch, liveTextArmed);
     } else {
       if (early === null && recordFinalRepeat(ch.id, text)) {
         // Third consecutive identical final — a stuck loop. Drop the

@@ -3208,18 +3208,24 @@ describe("live intermediate text (SPEC B)", () => {
     expect(deletes(tId!)).toHaveLength(0);
   });
 
-  test("post-on-first-tool: placeholder while no intermediate text, edited in place once text arrives", async () => {
+  test("post-on-first-text-after-tool: no placeholder, posted once real text arrives, edited in place", async () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await tc("bash", { command: "ls" });
-    const tId = idOf(LIVE_TEXT_PLACEHOLDER);
-    expect(tId).toBeDefined(); // placeholder posted on the first tool call
-    // text arrives after the edit throttle window: same message edited
-    jest.advanceTimersByTime(LIVE_TEXT_THROTTLE_MS + 100);
+    // tool call with no text yet: no live-text message posted (only the
+    // working frame from turn_start exists)
+    expect(posted.some((p) => p.content === "now I will edit it")).toBe(false);
+    // text arrives after the tool: posts the live message
     await handlers.message_end({ message: inter("now I will edit it") }, ctx);
-    expect(patches(tId)).toContain("now I will edit it");
-    // one message total: no second post
-    expect(posts().filter((p) => p === "now I will edit it")).toHaveLength(0);
+    const tId = idOf("now I will edit it");
+    expect(tId).toBeDefined();
+    // later text: same message edited in place, no second post
+    jest.advanceTimersByTime(LIVE_TEXT_THROTTLE_MS + 100);
+    await handlers.message_end({ message: inter("second thought") }, ctx);
+    expect(patches(tId)).toContain("second thought");
+    expect(
+      posted.filter((p) => p.content === "now I will edit it"),
+    ).toHaveLength(1);
   });
 
   test("edit-with-intermediate-text: segments edit the SAME message in place", async () => {
