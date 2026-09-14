@@ -2,6 +2,8 @@
 # pi-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
 # usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] "task"
+#   (workdir must be a git repo for --worktree; plain runs work anywhere)
+#   pi-bg --help prints this header.
 #
 # --worktree [ref]: run the agent in a fresh git worktree instead of the live
 #   checkout. ref defaults to HEAD (only consumed as ref when more args
@@ -43,7 +45,46 @@
 #   worktree/cgroup/run-record side effects. Fails open if /proc is
 #   unreadable (a cap check must never block dispatch):
 #     [!] at cap (N/M), try again later or pi-bg-kill a ticket
+#
+# Session isolation (issue #56): the ticket runs in its OWN session +
+#   process group (a guarded setsid re-exec at the top of the script).
+#   The launcher's tool call runs `nohup pi-bg ... &` from a bash the
+#   harness spawned DETACHED (own session + PGID); without setsid the
+#   ticket's pi child stays in the LAUNCHER's PGID, so a harness
+#   bash-tool timeout that signals that PG kills a still-starting ticket
+#   (2026-09-13: nested tickets died rc=143 inside `git worktree add`).
+#   Blessed launch form (stays; now safe even if the tool call blocks in
+#   wait4() on the ticket until the harness timeout):
+#     cd <workdir> && nohup ~/scripts/pi-bg worker "task" > log 2>&1 & \
+#     sleep 4; head -1 log
+#   pi-bg-kill compensates: it signals the ticket's process group in
+#   addition to the per-pid cgroup walk, so the whole session dies
+#   together and no pi child orphans.
+#
+# Belt (issue #56): the ticket id line is printed BEFORE the slow
+#   `git worktree add` (big repos: >60s), so the launcher's `head -1 log`
+#   returns immediately and a dead ticket leaves an identifiable first
+#   log line.
+
 set -uo pipefail
+
+# -h/--help: print this header
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,/^set -uo pipefail$/{ /^set -uo pipefail$/d; p }' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+# --- session isolation (issue #56): own session + PGID via setsid -------
+# Re-exec ONCE under setsid: this process becomes a new session leader and
+# process-group leader; the pi child inherits both. A signal aimed at the
+# launcher's PGID (harness bash-tool timeout/abort) can no longer reach
+# the ticket. Cgroup escape below already isolated the cgroup axis; this
+# isolates the PGID axis. Guard: $PI_BG_SETSID (set for the re-exec so it
+# happens once). A box without a setsid binary keeps the legacy behavior
+# instead of breaking dispatch entirely.
+if [ "${PI_BG_SETSID:-0}" != "1" ] && command -v setsid >/dev/null 2>&1; then
+  PI_BG_SETSID=1 exec setsid bash "$0" "$@"
+fi
 
 profile="${1:-worker}"
 case "$profile" in
@@ -189,6 +230,12 @@ export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 #     so every tool finds them. ---
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
+
+# issue #56 belt: ticket id line BEFORE the slow `git worktree add` /
+# cgroup escape, so the launcher's `head -1 log` returns immediately and a
+# dead ticket leaves an identifiable first log line (pre-fix: >60s silence
+# on big repos, and a TERM'd startup printed nothing).
+echo "[pi-bg] ticket $run_id profile=$profile"
 
 wt_path=""
 wt_branch=""

@@ -963,3 +963,169 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     30_000,
   );
 });
+
+/**
+ * #56: session isolation (setsid at launch). A nested dispatch's launcher
+ * tool call can block in wait4() on the ticket; the harness bash-tool
+ * timeout then signals the LAUNCHER's process group (kill to -pgid).
+ * Pre-fix the ticket's pi child sat in that PG and died rc=143.
+ */
+describe("#56: session isolation (setsid at launch)", () => {
+  // /proc/<pid>/stat -> [state, ppid, pgrp, session, ...] (fields 3-5 here)
+  const statFields = (pid: number | string) => {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return raw
+      .slice(raw.lastIndexOf(")") + 2)
+      .trim()
+      .split(/\s+/);
+  };
+
+  test("wrapper is the session leader; pi shares the wrapper's session, not the launcher's", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // fake cgroup root: no real cgroup dirs leak from the suite
+    const cgParent = path.join(fx.tmp, "cg", "user@1.service");
+    fs.mkdirSync(cgParent, { recursive: true });
+    fs.writeFileSync(path.join(cgParent, "cgroup.procs"), "");
+    fx.env.PI_BG_CG_ROOT = cgParent;
+
+    const report = path.join(fx.tmp, "sess-report");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        `printf 'pi_pgrp=%s pi_sid=%s\\n' "$(ps -o pgid= -p $$ | tr -d ' ')" "$(ps -o sid= -p $$ | tr -d ' ')" > ${report}`,
+        "sleep 2",
+        "echo pi-run-ok",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+
+    const p = spawn(["bash", PI_BG, "worker", "session task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // while pi runs: wrapper pid == spawned pid (setsid re-exec does not
+      // fork: the spawned bash is not a group leader)
+      const t0 = Date.now();
+      while (!fs.existsSync(report) && Date.now() - t0 < 8000) {
+        await Bun.sleep(50);
+      }
+      expect(fs.existsSync(report)).toBe(true);
+      const wr = statFields(p.pid);
+      const wrapperPid = String(p.pid);
+      // the wrapper is a session + group leader
+      expect(wr[2]).toBe(wrapperPid); // pgrp == pid
+      expect(wr[3]).toBe(wrapperPid); // sid == pid
+      // pi shares the wrapper's session, not the launcher's (bun) session
+      const rep = Object.fromEntries(
+        fs
+          .readFileSync(report, "utf8")
+          .trim()
+          .split(" ")
+          .map((kv) => kv.split("=")),
+      );
+      expect(rep.pi_pgrp).toBe(wrapperPid);
+      expect(rep.pi_sid).toBe(wrapperPid);
+      expect(rep.pi_sid).not.toBe(statFields(process.pid)[3]);
+
+      const [out] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      expect(code).toBe(0);
+      expect(out).toContain("pi-run-ok");
+      expect(out).toContain(`[pi-bg] ticket `);
+    } finally {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 30_000);
+
+  test("TERM to the launcher's PG does not kill the ticket (nested repro)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const cgParent = path.join(fx.tmp, "cg", "user@1.service");
+    fs.mkdirSync(cgParent, { recursive: true });
+    fs.writeFileSync(path.join(cgParent, "cgroup.procs"), "");
+    fx.env.PI_BG_CG_ROOT = cgParent;
+    const tmpdir = path.join(fx.tmp, "artifacts");
+    fx.env.PI_BG_TMPDIR = tmpdir;
+    // the ticket is still in flight when the launcher PG is TERMed
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      "#!/bin/sh\nsleep 3\necho pi-run-ok\n",
+    );
+
+    const log = path.join(fx.tmp, "nested.log");
+    // harness-shaped launcher: DETACHED bash (own session + PGID) that
+    // backgrounds the ticket the bare way (blocking launch, no return
+    // pattern) and stays alive in the launcher PG
+    const launcher = spawn(
+      [
+        "bash",
+        "-c",
+        `bash ${PI_BG} worker "nested task" > ${log} 2>&1 & sleep 60`,
+      ],
+      {
+        env: fx.env,
+        cwd: fx.tmp,
+        detached: true,
+        stdout: "ignore",
+        stderr: "ignore",
+        stdin: "ignore",
+      },
+    );
+    try {
+      // wait for the ticket's belt line: it is up and past the re-exec
+      const t0 = Date.now();
+      while (Date.now() - t0 < 10_000) {
+        const c = fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "";
+        if (c.includes("[pi-bg] ticket ")) break;
+        await Bun.sleep(100);
+      }
+      expect(fs.readFileSync(log, "utf8")).toContain("[pi-bg] ticket ");
+      const m = fs.readFileSync(log, "utf8").match(/\[pi-bg\] ticket (\S+)/);
+      if (!m) throw new Error("ticket line vanished from launcher log");
+      const runId = m[1];
+
+      // sabotage: the harness timeout signals the launcher's process group
+      process.kill(-launcher.pid, "SIGTERM");
+      const lcode = await launcher.exited;
+      expect(lcode).not.toBe(0); // the launcher itself died
+
+      // the ticket must survive to completion (pre-fix: rc=143, no out.md)
+      const outf = path.join(tmpdir, `pi-bg-${runId}-out.md`);
+      const rawf = path.join(tmpdir, `pi-bg-${runId}-raw.out`);
+      const t1 = Date.now();
+      while (!fs.existsSync(outf) && Date.now() - t1 < 20_000) {
+        await Bun.sleep(200);
+      }
+      expect(fs.existsSync(outf)).toBe(true);
+      expect(fs.readFileSync(rawf, "utf8")).toContain("pi-run-ok");
+      expect(fs.readFileSync(outf, "utf8")).not.toBe("");
+      // the -started marker was cleared: clean exit, not a kill marker
+      expect(fs.existsSync(path.join(tmpdir, `pi-bg-${runId}-killed`))).toBe(
+        false,
+      );
+    } finally {
+      try {
+        process.kill(-launcher.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      // sweep any ticket leftover (unique tmp path; [p]i avoids pkill's
+      // own command line self-matching)
+      execSync(`pkill -f "${fx.tmp}/bin/[p]i" 2>/dev/null || true`);
+    }
+  }, 40_000);
+});

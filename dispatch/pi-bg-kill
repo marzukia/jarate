@@ -7,11 +7,15 @@
 # run's process tree dies, nothing else.
 # usage: pi-bg-kill <ticket-id> [--dry-run]
 #   --dry-run  print the process tree that WOULD be killed; change nothing
-# real kill: SIGTERM to every member, wait $PI_BG_KILL_WAIT (default 10s)
-# polling every 0.5s, then SIGKILL the cgroup (cgroup.kill, per-pid
-# fallback). Posts a kind=kill webhook event (same URL source as pi-bg) so
-# the dispatch channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed
-# (the watchdog skips tickets with a killed marker).
+# real kill: SIGTERM to every member AND the ticket's process group (issue
+# #56: pi-bg runs under setsid - the wrapper is the session leader, the pi
+# child shares its PGID; signaling a group-leader member's -pgid covers
+# session processes that escaped the cgroup walk and keeps the pi child
+# from orphaning), wait $PI_BG_KILL_WAIT (default 10s) polling every 0.5s,
+# then SIGKILL (cgroup.kill + per-pid + per-group fallback). Posts a
+# kind=kill webhook event (same URL source as pi-bg) so the dispatch
+# channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed (the watchdog
+# skips killed tickets).
 # env: PI_BG_CG_ROOT (cgroup base, test override), PI_BG_KILL_WAIT,
 #      PI_BG_TMPDIR, PI_DISPATCH_WEBHOOK, PI_BG_WB_BACKOFF (test: 0 = no backoff)
 # exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
@@ -26,7 +30,7 @@ id="" dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown arg: $1 (want <ticket-id> [--dry-run])" >&2; exit 2 ;;
     *)
       if [ -z "$id" ]; then id="$1";
@@ -57,8 +61,12 @@ if [ ! -d "$CG" ]; then
   exit 2
 fi
 
-# --- cgroup members (procs + threads) ---
-cg_procs() { cat "$CG/cgroup.procs" "$CG/cgroup.threads" 2>/dev/null | sort -un; }
+# --- cgroup members (processes only).
+# cgroup.threads is deliberately excluded: per-pid signaling of thread IDs
+# can hit a recycled PID (a brand-new subshell of the dying wrapper, a fresh
+# bun worker thread) and corrupt the wrapper's exit-trap cleanup. Every thread
+# dies with its process, and the KILL phase's cgroup.kill is the backstop.
+cg_procs() { cat "$CG/cgroup.procs" 2>/dev/null | sort -un; }
 
 # pids whose /proc/<pid>/stat ppid is $1
 children_of() {
@@ -70,6 +78,16 @@ children_of() {
     set -- $s
     [ "$2" = "$want" ] && basename "$c"
   done
+}
+
+# 0 when /proc/<pid>/stat says the process is a group leader (pgrp == pid).
+# stat fields after 'pid (comm)': state ppid pgrp session ...
+is_group_leader() {
+  local want="$1" s
+  s="$( { tr -d '\n' < "/proc/$want/stat"; } 2>/dev/null )" || return 1
+  s="${s#*) }"
+  set -- $s
+  [ "${3:-}" = "$want" ]
 }
 
 # cgroup members plus every descendant (the cgroup v2 move carries the whole
@@ -116,7 +134,19 @@ fi
 t0="$(date +%s)"
 pids0="$(list_tree | sort -un | tr '\n' ' ')"
 [ -n "$pids0" ] || pids0="(none in cgroup)"
+
+# issue #56: pi-bg runs under setsid, so a group-leader member of the tree
+# leads the ticket's session (pgid == sid == its pid). Signal those process
+# groups too, so every session process dies with the ticket even if it
+# escaped the cgroup walk - a wrapper-only kill would orphan the pi child.
+gl=""
+for p in $pids0; do
+  case "$p" in *[!0-9]*) continue ;; esac
+  is_group_leader "$p" && gl="$gl $p"
+done
+
 for p in $pids0; do kill -TERM "$p" 2>/dev/null; done
+for g in $gl; do kill -TERM "-$g" 2>/dev/null; done
 
 gone=0
 while :; do
@@ -127,6 +157,7 @@ done
 if [ "$gone" -eq 0 ]; then
   echo 1 > "$CG/cgroup.kill" 2>/dev/null || true
   for p in $pids0; do kill -KILL "$p" 2>/dev/null; done
+  for g in $gl; do kill -KILL "-$g" 2>/dev/null; done
 fi
 dur=$(( $(date +%s) - t0 ))
 

@@ -68,7 +68,7 @@ turn — no polling, no held turn.
 ```bash
 # 1. dispatch (background; posts a webhook callback on exit)
 cd /path/to/workdir
-nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 &
+nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
 
 # 2. reply to the human: "dispatched, I'll report when it lands" — end turn
 ```
@@ -85,7 +85,7 @@ BASE=$(curl -s ".../channels/$CH/messages?limit=1" -H "Authorization: Bot $TOKEN
   | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
 
 # 2. dispatch
-nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 &
+nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
 
 # 3. wait in-turn (quiet poll, 5s interval)
 ~/scripts/pi-wait --since "$BASE" --timeout 240
@@ -125,6 +125,30 @@ the later webhook post) into:
   (escape unavailable, printed to stdout).
 - Practical effect: `systemctl --user restart pi.service` is safe while jobs
   are in flight.
+
+### Session isolation (issue #56, 2026-09-14)
+
+A dispatch launched from INSIDE another ticket (nested dispatch) can die when
+the launcher's tool call blocks: without session isolation the ticket's pi
+child sat in the LAUNCHER's process group, and a harness bash-tool timeout
+signals that group (`kill -TERM/-KILL -pgid`). The 2026-09-13 incident: nested
+tickets died rc=143 inside `git worktree add`.
+
+`pi-bg` now re-execs itself once under `setsid` (guarded by `$PI_BG_SETSID`):
+the wrapper becomes session + process-group leader and the pi child inherits
+both, so no signal aimed at the launcher's PGID can reach the ticket. The
+cgroup escape above isolates the cgroup axis; setsid isolates the PGID axis.
+
+- **Blessed launch form** (stays; now safe even if the tool call blocks in
+  `wait4()` on the ticket until the harness timeout):
+  `cd <workdir> && nohup ~/scripts/pi-bg worker "task" > log 2>&1 & sleep 4; head -1 log`
+- **Belt**: `pi-bg` prints the ticket id line BEFORE the slow
+  `git worktree add` / cgroup escape, so `head -1 log` returns immediately
+  and a dead ticket leaves an identifiable first log line.
+- **Kill compensation**: `pi-bg-kill` signals the ticket's process group in
+  addition to the per-pid cgroup walk, so the whole session dies together and
+  no pi child orphans.
+- `pi-bg --help` prints the header with this guidance.
 
 ### Worktrees (isolated runs)
 
@@ -191,8 +215,11 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
   optional follow. No live output = exit 2.
 - `pi-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
   (`…/user@<uid>.service/pi-bg/<id>/`), dry-run prints the process tree,
-  real kill sends SIGTERM to every member, waits `$PI_BG_KILL_WAIT` (10s),
-  then SIGKILL via `cgroup.kill` (per-pid fallback). Posts a `KILLED`
+  real kill sends SIGTERM to every member AND the ticket's process group
+  (issue #56: pi-bg runs under setsid; the wrapper leads the ticket session,
+  so `-pgid` covers session processes that escaped the cgroup walk), waits
+  `$PI_BG_KILL_WAIT` (10s), then SIGKILL via `cgroup.kill` (per-pid +
+  per-group fallback). Posts a `KILLED`
   embed (same webhook URL source as pi-bg; dead letter on post failure).
   Precise by construction: only the run's cgroup subtree dies.
 
