@@ -95,7 +95,8 @@ agent box must still run with pattern-only redaction.
 
 | class | pattern (abridged) | tag |
 |---|---|---|
-| github | `ghp_/gho_/ghu_/ghs_/ghr_` + 16 alnum, `github_pat_` | `[REDACTED:github]` |
+| github | `ghp_/gho_/ghu_/ghs_/ghr_` + exactly 36 alnum, `github_pat_` + 22..255 word chars | `[REDACTED:github]` |
+| switchboard | `sbk_<name>_<16 hex>` house key (sbk_ + 8+ word chars) | `[REDACTED:switchboard]` |
 | gitlab | `glpat-` | `[REDACTED:gitlab]` |
 | anthropic | `sk-ant-` | `[REDACTED:anthropic]` |
 | openai | `sk-or-`, generic `sk-` + 20 alnum | `[REDACTED:openai]` |
