@@ -20,11 +20,9 @@ import extension, {
   clearAllInterrupts,
   clearQueuedInbound,
   collectFinals,
-  DONE_FRAME_MAX_STEPS,
   deleteQueuedInbound,
   deliverDueTasks,
   deliverDueWakes,
-  doneFrame,
   earlySendText,
   failurePostText,
   fence,
@@ -48,16 +46,17 @@ import extension, {
   queuedAcks,
   queueMidTurnInbound,
   REPEAT_WARNING,
+  RUN_FRAME_MAX_STEPS,
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
   resetRuntimeStateForTest,
+  runFrame,
   runMidRunInterrupt,
   runShellPassthrough,
   setInterruptCtx,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
-  statusLine,
   stopAllCompactTicks,
   stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
@@ -757,7 +756,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) =>
         c.method === "POST" &&
         c.url.endsWith("/channels/ch1/messages") &&
-        String(JSON.parse(c.body).content).includes("┣ working"), // fenced placeholder (style guide v3)
+        String(JSON.parse(c.body).content).includes("┌ working"), // fenced working frame (live-frame unification)
     );
     expect(placeholder).toBeDefined(); // live block existed during the run
     const deleted = fetchCalls.find(
@@ -793,15 +792,95 @@ describe("extension handlers (A1/A2/A4)", () => {
         String(JSON.parse(c.body).content).includes("┌ done · 1 call"),
     );
     expect(doneEdit).toBeDefined(); // block stays, shows the finished run
+    // live-frame unification: the morph is an edit of the SAME placeholder
+    // message (mock id out1), not a fresh post at run end
+    expect(doneEdit!.url).toContain("/channels/ch1/messages/out1");
+    expect(
+      fetchCalls.some(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body ?? "{}").content ?? "").includes("┌ done"),
+      ),
+    ).toBe(false);
     const doneBody = String(JSON.parse(doneEdit!.body).content);
     expect(doneBody).toContain("│ └ bash ls"); // sub-step, last = └
-    // multi-line frame lives in a code fence (mockup3)
-    expect(doneBody.startsWith("```bash\n")).toBe(true);
+    // multi-line frame lives in a code fence (mockup3), same fence() as
+    // every other machine line
+    expect(doneBody.startsWith("```\n")).toBe(true);
     expect(doneBody.trimEnd()).toMatch(/\n└\n```$/); // closing bar, then fence
     const deleted = fetchCalls.find(
       (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
     );
     expect(deleted).toBeUndefined();
+  });
+
+  test("live tick re-renders the full working frame in place (same message)", async () => {
+    jest.useFakeTimers();
+    verboseOverride.set("ch1", 2);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    // level-2 placeholder IS the 0-call working frame (live-frame unification)
+    const placeholder = fetchCalls.find(
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch1/messages") &&
+        String(JSON.parse(c.body).content).includes("┌ working · 0 calls"),
+    );
+    expect(placeholder).toBeDefined();
+
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map((c) =>
+          String(
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+          ),
+        );
+
+    // a tool call edits the SAME message with the full working frame
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "git push" } },
+      ctx,
+    );
+    let last = edits().at(-1)!;
+    expect(last).toContain("┌ working · 1 call");
+    expect(last).toContain("│ └ bash git push");
+    expect(last.trimEnd()).toMatch(/\n└\n```$/); // full frame, fenced
+
+    // 5s-step tick: still the full frame (not a one-line status), same
+    // message id, elapsed stepped to 5s
+    jest.advanceTimersByTime(5001);
+    last = edits().at(-1)!;
+    expect(last).toContain("┌ working · 1 call · 5s");
+    expect(last).toContain("│ └ bash git push");
+    const tickEdit = fetchCalls
+      .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+      .at(-1);
+    expect(tickEdit!.url).toContain("/channels/ch1/messages/out1");
+    // the tick never posts a fresh working message
+    expect(
+      fetchCalls.filter(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("┌ working"),
+      ).length,
+    ).toBe(1);
+
+    // a second call grows the frame in place; the tick keeps the shape
+    await handlers.tool_call(
+      { toolName: "edit", input: { path: "a.txt" } },
+      ctx,
+    );
+    jest.advanceTimersByTime(5000);
+    last = edits().at(-1)!;
+    expect(last).toContain("┌ working · 2 calls · 10s");
+    expect(last).toContain("│ ├ bash git push");
+    expect(last).toContain("│ └ edit a.txt");
   });
 
   test("verbose off: no tool-call block created, sent, or edited (#38)", async () => {
@@ -827,9 +906,10 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
     expect(
-      posts.filter((c) => String(JSON.parse(c.body).content).includes("┣"))
-        .length,
-    ).toBe(0); // no "┣ working…" placeholder, no tool line
+      posts.filter((c) =>
+        String(JSON.parse(c.body).content).includes("┌ working"),
+      ).length,
+    ).toBe(0); // no working frame placeholder, no tool frame
     const edits = fetchCalls.filter((c) => c.method === "PATCH");
     expect(edits.length).toBe(0); // nothing to edit, no done line either
     const deleted = fetchCalls.filter((c) => c.method === "DELETE");
@@ -895,7 +975,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "POST" &&
           c.url.endsWith("/channels/ch1/messages") &&
-          String(JSON.parse(c.body).content).includes("┣ working"), // fenced (style guide v3)
+          String(JSON.parse(c.body).content).includes("┌ working"), // fenced working frame (live-frame unification)
       ),
     ).toBe(true); // live block exists (mock id out1)
 
@@ -952,7 +1032,9 @@ describe("extension handlers (A1/A2/A4)", () => {
           (c) =>
             c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
         )
-        .filter((c) => String(JSON.parse(c.body).content).includes("┣")),
+        .filter((c) =>
+          String(JSON.parse(c.body).content).includes("┌ working"),
+        ),
     ).toHaveLength(0); // quiet run so far
 
     verboseOverride.set("ch1", 2);
@@ -965,7 +1047,8 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) =>
         c.method === "POST" &&
         c.url.endsWith("/channels/ch1/messages") &&
-        String(JSON.parse(c.body).content).includes("┣ bash pwd"),
+        String(JSON.parse(c.body).content).includes("┌ working") &&
+        String(JSON.parse(c.body).content).includes("bash pwd"),
     );
     expect(toolPost).toBeDefined();
   });
@@ -2576,7 +2659,7 @@ describe("#10 verbosity levels", () => {
     verboseOverride.set("ch1", 1);
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
-    // reads + read-only bash: no block created, no line edited
+    // reads + read-only bash: no block created, no frame edited
     await handlers.tool_call(
       { toolName: "read", input: { path: "a.txt" } },
       ctx,
@@ -2585,22 +2668,26 @@ describe("#10 verbosity levels", () => {
       { toolName: "bash", input: { command: "ls" } },
       ctx,
     );
-    expect(posts().some((p) => p.includes("┣"))).toBe(false);
-    // an edit shows up (fresh block)
+    expect(posts().some((p) => p.includes("┌ working"))).toBe(false);
+    // an edit shows up (fresh working frame)
     await handlers.tool_call(
       { toolName: "edit", input: { path: "a.txt" } },
       ctx,
     );
-    expect(posts().some((p) => p.includes("┣ edit a.txt"))).toBe(true);
-    // a side-effect bash shows in the existing block; live count is the
-    // ESSENTIAL count (2: edit + bash), not the total 4 (review L2)
+    expect(
+      posts().some((p) => p.includes("┌ working") && p.includes("edit a.txt")),
+    ).toBe(true);
+    // a side-effect bash shows in the existing frame; the header count is
+    // the ESSENTIAL count (2: edit + bash), not the total 4 (review L2)
     await handlers.tool_call(
       { toolName: "bash", input: { command: "git push" } },
       ctx,
     );
-    expect(patches().some((p) => p.includes("┣ bash git push · 2 calls"))).toBe(
-      true,
-    );
+    expect(
+      patches().some(
+        (p) => p.includes("┌ working · 2 calls") && p.includes("bash git push"),
+      ),
+    ).toBe(true);
   });
 
   test("level 1 done frame lists essentials only; all-read run deletes the block", async () => {
@@ -2742,7 +2829,7 @@ describe("#10 verbosity levels", () => {
       { toolName: "read", input: { path: "a.txt" } },
       ctx,
     );
-    expect(posts().some((p) => p.includes("┣"))).toBe(false); // read hidden at 1
+    expect(posts().some((p) => p.includes("┌ working"))).toBe(false); // read hidden at 1
   });
 
   test("forwardToolCalls=true defaults to level 2; override wins", async () => {
@@ -2763,7 +2850,7 @@ describe("#10 verbosity levels", () => {
       { toolName: "read", input: { path: "a.txt" } },
       ctx,
     );
-    expect(posts().some((p) => p.includes("┣"))).toBe(true); // block at level 2
+    expect(posts().some((p) => p.includes("┌ working"))).toBe(true); // block at level 2
 
     // 2 -> 1: block stays (still verbose); reads stop rendering
     await handleInbound(pi, inbound("/verbose 1", "m2"), ctx);
@@ -3501,7 +3588,13 @@ describe("compaction-queue guard", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     jest.advanceTimersByTime(10 * 60 * 1000); // fallback: clear + drain (idle)
     jest.useRealTimers(); // let the async re-wake run on real timers
-    await tick();
+    // the drain's handleInbound has its own awaits (memory toc readFile is
+    // scheduled mid-advanceTimersByTime, so its completion can land late
+    // under load); poll instead of a single tick
+    for (let i = 0; i < 200; i++) {
+      if (piSends().some((s) => s.m.details?.body === "late msg")) break;
+      await tick();
+    }
     expect(piSends().some((s) => s.m.details?.body === "late msg")).toBe(true);
     expect(isCompacting("ch1")).toBe(false);
   });
@@ -5294,10 +5387,24 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     jest.advanceTimersByTime(2);
     await flush(10);
     // the drained inbound's fs I/O (memory toc) needs real event-loop
-    // turns, which microtask flushing alone never yields
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-    await flush(20);
+    // turns, which microtask flushing alone never yields. The readFile is
+    // scheduled mid-advanceTimersByTime, so its completion can also ride a
+    // 0ms timer that only fires on a further clock advance (or on
+    // useRealTimers in afterEach). A fixed flush/immediate budget is
+    // load-sensitive and flaked under box load; poll instead, alternating
+    // real yields and small clock nudges (bounded; the next armed timer is
+    // 5s away, so +1ms steps cannot trip anything else).
+    for (let i = 0; i < 200; i++) {
+      const drainedNow = sent.find(
+        (s) =>
+          s.m.customType === "channel-inbound" &&
+          s.m.details?.body?.includes("hello"),
+      );
+      if (drainedNow) break;
+      await new Promise((r) => setImmediate(r));
+      jest.advanceTimersByTime(1);
+      await flush(5);
+    }
     expect(isCompacting("ch1")).toBe(false); // op window closed
     expect(
       channelPosts().some((t) =>
@@ -5537,13 +5644,26 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
   const longPath =
     "/home/monky/.pi-bg-wt/jarate/20260913-091303-15761/packages/bridge/channel/index.ts";
 
-  test("statusLine fits the budget at any call count or elapsed time", () => {
-    const t0 = Date.now() - 125_000;
-    for (const n of [1, 3, 12, 99]) {
-      for (const t of [t0, Date.now() - 1000, Date.now() - 960_000]) {
-        const line = statusLine(longAction, n, t);
-        expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
-        expect(line.startsWith("┣ ")).toBe(true);
+  test("runFrame(working) fits the budget at any call count or elapsed time", () => {
+    const calls = Array.from(
+      { length: 999 },
+      (_, i) => `bash step-${i} --flag`,
+    );
+    for (const count of [0, 1, 9, 99, 999]) {
+      for (const secs of [0, 5, 96, 9999]) {
+        const frame = runFrame(
+          "working",
+          calls.slice(0, count),
+          count,
+          secs,
+        ).split("\n");
+        expect(frame[0]).toBe(
+          `┌ working · ${count} call${count === 1 ? "" : "s"} · ${secs}s`,
+        );
+        expect(frame.at(-1)).toBe("└");
+        for (const line of frame) {
+          expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+        }
       }
     }
   });
@@ -5574,12 +5694,12 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
     ).toBe("bash cargo test --features a,b,c --…");
   });
 
-  test("doneFrame: header + capped sub-steps + overflow line, all <= 40 cols", () => {
+  test("runFrame(done): header + capped sub-steps + overflow line, all <= 40 cols", () => {
     const calls = Array.from({ length: 14 }, (_, i) => `bash step-${i} --flag`);
-    const frame = doneFrame(calls, 14, 96, false).split("\n");
+    const frame = runFrame("done", calls, 14, 96).split("\n");
     expect(frame[0]).toBe("┌ done · 14 calls · 96s");
     expect(frame[1]).toBe("├ … +6 earlier calls");
-    expect(frame.length).toBe(2 + DONE_FRAME_MAX_STEPS + 1);
+    expect(frame.length).toBe(2 + RUN_FRAME_MAX_STEPS + 1);
     expect(frame.at(-1)).toBe("└");
     // last 8 calls, in order, last sub-step on └
     expect(frame[2]).toBe("│ ├ bash step-6 --flag");
@@ -5589,8 +5709,8 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
     }
   });
 
-  test("doneFrame: failed runs swap the header to the ┤ failed glyph", () => {
-    const frame = doneFrame(["read x.ts"], 1, 5, true).split("\n");
+  test("runFrame(failed): failed runs swap the header to the ┤ failed glyph", () => {
+    const frame = runFrame("failed", ["read x.ts"], 1, 5).split("\n");
     expect(frame[0]).toBe("┤ failed · 1 call · 5s");
     expect(frame.at(-1)).toBe("└");
     for (const line of frame) {
@@ -5598,8 +5718,29 @@ describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", (
     }
   });
 
-  test("doneFrame: very long actions clip at the line budget", () => {
-    const frame = doneFrame([longAction, "bash ok"], 2, 5, false).split("\n");
+  test("runFrame: working/done/failed share the body; only the header flips", () => {
+    const calls = ["edit a.txt", "bash git push"];
+    const w = runFrame("working", calls, 2, 7).split("\n");
+    const d = runFrame("done", calls, 2, 96).split("\n");
+    const f = runFrame("failed", calls, 2, 96).split("\n");
+    expect(w[0]).toBe("┌ working · 2 calls · 7s");
+    expect(d[0]).toBe("┌ done · 2 calls · 96s");
+    expect(f[0]).toBe("┤ failed · 2 calls · 96s");
+    // live-frame unification: sub-steps + closing bar are identical across
+    // states — the done/failed morph changes the header line only
+    expect(w.slice(1)).toEqual(d.slice(1));
+    expect(w.slice(1)).toEqual(f.slice(1));
+    expect(w[1]).toBe("│ ├ edit a.txt");
+    expect(w[2]).toBe("│ └ bash git push");
+  });
+
+  test("runFrame(working): 0 calls renders header + closing bar only", () => {
+    const frame = runFrame("working", [], 0, 10).split("\n");
+    expect(frame).toEqual(["┌ working · 0 calls · 10s", "└"]);
+  });
+
+  test("runFrame(done): very long actions clip at the line budget", () => {
+    const frame = runFrame("done", [longAction, "bash ok"], 2, 5).split("\n");
     for (const line of frame) {
       expect(line.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
     }
