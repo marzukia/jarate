@@ -172,7 +172,7 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
 const doc = (r: RunResult) => JSON.parse(r.out);
 
 describe("entrypoint", () => {
-  test("no args -> help doc with the four commands", async () => {
+  test("no args -> help doc with the full command list", async () => {
     const f = fixture();
     const r = await f.run([]);
     const d = doc(r);
