@@ -421,7 +421,11 @@ if prof == "reviewer" and verdict:
 elif status == "OK":
     title = f"{prof} \u00b7 OK \u00b7 {dstr}"; header = f"\u250c ok \u00b7 {rid}"; color = GREEN
 elif status == "FAIL":
-    title = f"{prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"; header = f"\u250c fail \u00b7 {rid} (rc={rc})"; color = RED
+    title = f"{prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"
+    header = f"\u250c fail \u00b7 {rid} (rc={rc})"
+    if len(header) > 40:  # 7-digit pid + 3-digit rc breaks the 40-col mobile budget; rc stays in the title (#60 F2)
+        header = f"\u250c fail \u00b7 {rid}"
+    color = RED
 elif status == "DIED":
     title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = f"\u250c died \u00b7 {rid}"; color = ORANGE
 else:
