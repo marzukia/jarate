@@ -123,8 +123,8 @@ output, and it is why the censor is idempotent (see below).
   constant string that matches no later rule, so a second pass is a no-op.
   This is what makes tick-line re-censoring on every edit safe.
 - **Pass-through.** Prose containing the *word* "password" (no
-  `=`/`:`-separated value) is untouched, as are tick placeholders like
-  `┣ working…`.
+  `=`/`:`-separated value) is untouched, as are tick frames like
+  `┌ working · 3 calls · 10s`.
 
 ## Rollout
 

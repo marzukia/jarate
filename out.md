@@ -1,90 +1,115 @@
-# out — AGENTS.md change guard (alert-only tripwire)
+# out — live-frame unification
 
-Branch: `pi-bg/20260914-075236-522`. Andryo rule 2026-09-14: AGENTS.md changes
-require his explicit approval — now mechanical. Alert-only: never revert,
-never block.
+Branch: `pi-bg/20260914-075031-30907`. The in-run "working" status is now a
+LIVE version of the end-of-run done frame: same builder, same fence. The
+header flips working -> done/failed on the SAME Discord message
+(edit-in-place).
 
-## Where each piece landed
+## What changed
 
-| Piece | Location |
-| --- | --- |
-| Manifest format | `~/.pi/agent/.agents-md-hash` (fixed path), one line: `<sha256>  <UTC ts>  <note>` (note `-` when empty) |
-| Target resolution | `JARATE_AGENTS_MD` if set, else `~/.pi/agent/AGENTS.md` if present, else `~/AGENTS.md`. Live boxes keep the main profile's law in `~/AGENTS.md` (verified on this host: `~/.pi/agent/AGENTS.md` does not exist) — the fallback arms the tripwire there; the manifest stays at the fixed design path. |
-| `jarate agents-check` | `bin/jarate` (bash entrypoint, next to ctx-report/journal-errors/memory-grep/rag). Output: `{"ok":true,"ts","error":null,"hash","expected","drift"}`. `drift:true` = manifest missing OR hash mismatch. `ok:true` even on drift; `ok:false` rc 1 only when AGENTS.md is unreadable/missing. |
-| `jarate agents-bless [note]` | `bin/jarate`. Rewrites the manifest with the current hash + ts + note (atomic tmp+mv). `ok:false` rc 1 if AGENTS.md missing (nothing written). |
-| Watchdog tripwire | `dispatch/pi-bg-watchdog`, new section after the DEAD-sweep posts, reuses the existing channel path (`wd_post` + python embed builder via new `wd_build_drift`). |
-| CLI tests | `bin/jarate.test.ts` — new `agents-check / agents-bless` describe (fake HOME, temp AGENTS.md): no-manifest drift, bless+check in-sync, edit->drift->re-bless, no-note `-`, missing file rc 1 for both, `JARATE_AGENTS_MD` override, `~/AGENTS.md` fallback (manifest stays in `~/.pi/agent`). |
-| Watchdog tests | `dispatch/pi-bg-watchdog.test.ts` (new) — real watchdog + real jarate against fake HOME, webhook captured via Bun.serve: warn-once, no re-post, re-bless clears, new hash re-warns, mtime-ts fallback (never blessed), `~/AGENTS.md` fallback layout, jarate-missing silent skip, no-webhook no-state, `--quiet`/`--dry-run`, check-fail silent. |
-| Docs | `docs/JARATE.md` (both commands + `JARATE_AGENTS_MD` env + consumer note), `docs/DISPATCH.md` (tripwire section). |
+`packages/bridge/channel/index.ts`:
 
-No new files to deploy: install.sh already symlinks `~/bin/jarate` and
-`~/scripts/pi-bg-watchdog` into the checkout — a `git pull` on a live box is
-the whole deployment. `install.sh --dry-run` re-verified clean (fake HOME).
+- `statusLine()` + `doneFrame()` replaced by ONE builder:
+  `runFrame(state: "working" | "done" | "failed", calls, count, secs)`.
+  Same body in every state (`│ ├` / `│ └` sub-steps, `└` close, overflow
+  line); only the header differs: `┌ working · N calls · Ts` vs
+  `┌ done · …` / `┤ failed · …`. `DONE_FRAME_MAX_STEPS` renamed to
+  `RUN_FRAME_MAX_STEPS`.
+- New closure `workingFrame(ch, secs)` in the extension scope: filters
+  `toolCallsThisTurn` to essentials at level 1 (same filter the done
+  frame applies at run end), returns `fence(runFrame("working", …))`.
+- Live ticker (shared op tick, 5s cadence unchanged, elapsed stepped in
+  5s) re-renders the FULL working frame from calls so far — was the
+  one-line `┣ <action> · N calls · Ts`.
+- `tool_call` handler: the existing send-or-edit path now carries the
+  full working frame. NO new per-tool-call edits — same gate (level 0:
+  nothing; level 1: essentials only; level 2: every call).
+- Level-2 `turn_start` placeholder: `workingFrame(ch, 0)` — the
+  0-call working frame — was `fence("┣ working…")`.
+- `agent_end` morph unchanged in structure (edit the same message);
+  payload is now `fence(runFrame(failed ? "failed" : "done", …))` — the
+  hand-rolled ```` ```bash ```` fence is gone, one fence per machine
+  message in every state.
+- Dead locals removed: `lastToolAction`, `runToolCount`,
+  `runEssentialCount`.
 
-## Watchdog diff summary (short)
+`packages/bridge/channel/index.test.ts`:
 
-- `wd_build_drift <bodyfile> <hash8> <ts>`: orange embed (same color/format
-  family as the DEAD sweep), title `AGENTS.md drift`, description exactly
-  `AGENTS.md drift: <hash8> since <ts> — review + re-bless: jarate agents-bless "note"`.
-- New section (after DEAD posts, before auto-prune): runs
-  `timeout 30 $HOME/bin/jarate agents-check`; on `ok:true && drift:true` with
-  a hash, compares the full hash against `~/.pi/agent/.agents-md-drift-warned`;
-  if different: `<ts>` = manifest blessing ts (fallback: AGENTS.md mtime,
-  fallback: `unknown`); `--dry-run` prints would-post; otherwise posts via
-  `wd_post` (3 retries). State file written ONLY after a successful post, so a
-  dead webhook retries next sweep.
-- Backward compatible: jarate missing/unreadable, jq/python missing, no
-  webhook, `--quiet`, non-drift result — all skip silently; sweep still exits 0.
-  Existing `--quiet`/`--dry-run` semantics apply to the drift post too.
+- All one-line `┣ working` / `statusLine` / `doneFrame` assertions
+  rewritten to the frame shape (`┌ working`, `│ ├` / `│ └` sub-steps).
+- New test: live tick re-renders the full working frame in place (same
+  message id; 5s-step elapsed; tool call -> full frame; tick -> full
+  frame).
+- Done/failed morph assertions now prove it is a PATCH of the SAME
+  messageId with no fresh done POST, and that the fence is bare ` ``` `.
+- New column-budget tests: `runFrame(working)` at any count/elapsed,
+  working/done/failed share the body (header-only flip), 0-call frame.
+- Flake fixes (pre-existing, test-only): see "Judgment calls" 3.
 
-## Re-bless procedure (after Andryo approves an AGENTS.md change)
+Docs: `docs/COMMANDS.md` (output-tags paragraph),
+`docs/secret-censor.md` (tick-frame example).
 
-1. Verify the diff is what was approved: `jarate-diff` or plain `git diff`.
-2. `jarate agents-bless "<who approved, what changed>"` — e.g.
-   `jarate agents-bless "andryo ok, fleet section"`
-3. Confirm: `jarate agents-check` -> `"drift":false`.
-4. The next watchdog sweep is quiet (no warning). If the file changes again
-   without blessing, the new hash differs from the state file -> one fresh
-   warning within 15 min.
-5. First-ever blessing on a box (no manifest): same command; until then the
-   watchdog warns once for the live hash (never-blessed = drift).
+## Tests
 
-## Verification
+- `bun test`: **574 pass / 0 fail** (main was 571; +3 net: 1 new
+  live-tick test, 2 new frame budget tests, others rewritten in place).
+- `bun x tsc --noEmit`: clean.
+- `bunx biome check packages/bridge/channel/`: clean.
+- `bash install.sh --dry-run`: clean.
+- Stability: 25+ full-suite runs, several under box load 12–21
+  (vLLM + postgres + 8 other workers): 0 failures.
 
-- `cd bin && bun test`: 38 pass, 0 fail (incl. 7 new).
-- `cd dispatch && bun test`: 34 pass, 1 skip, 1 fail — the fail is the
-  PRE-EXISTING `#41 at cap` test, reproduced on clean main in this same env
-  (ambient live pi-bg workers on this host are counted by the /proc cap scan);
-  green in CI where no ambient workers exist. All 10 new watchdog tests pass.
-- `cd packages/bridge && bun x tsc --noEmit` clean, `bun test` 571 pass 0 fail
-  (untouched, run for gate completeness). `packages/recall` tsc clean.
-- `bunx biome check .` at repo root: 0 diagnostics.
-- Manual smoke (fake HOME + live HTTP server): warn-once per hash, message
-  format byte-exact vs spec, state gating, silent skip with jarate removed,
-  no-state without webhook, dry-run/quiet honored. Real-HOME dry-run sweep:
-  quiet (drift=false after arming).
+## Behavior deltas (what the user sees)
 
-## Armed on monky (this box)
+- In-run message is now the full frame, edited in place:
 
-- Blessed the live law file with the branch's jarate:
-  `~/.pi/agent/.agents-md-hash` =
-  `c7589777...  2026-09-14T08:20:03Z  initial bless 2026-09-14 (tripwire arm,
-  pi-bg/20260914-075236-522)` — resolved via the `~/AGENTS.md` fallback
-  (no `~/.pi/agent/AGENTS.md` on this host). `agents-check` -> `drift:false`.
-- frank/jimmy: not blessed (monky has no read access to their homes). After
-  the merge + their next `git pull`, the first watchdog sweep will warn once
-  (never-blessed = drift) — bless on each box when Andryo confirms, or accept
-  the single startup warning as the arm signal.
+  ```
+  ┌ working · 2 calls · 10s
+  │ ├ read /home/…/index.ts
+  │ └ bash git push
+  └
+  ```
 
-## Follow-ups (out of scope, not touched)
+- Level 2: turn start posts the 0-call frame immediately (was the
+  `┣ working…` one-liner); it morphs as calls fire.
+- Run end: header flips to `┌ done` / `┤ failed` on that same message.
+  No new post at run end (already true; now asserted).
+- Fence normalized from ` ```bash ` to bare ` ``` ` for the done/failed
+  morph — same fence as every other machine line.
+- Level 1: live frame lists essentials only; header count = essential
+  count (live count == done-frame count, as before).
+- Level 0: nothing, unchanged.
+- Todo board + agent prose: untouched.
+- All frame lines fit the 40-col budget (guarded by tests).
 
-- `packages/bridge/channel/jarate.ts` (owned by another worker): the LLM tool
-  enum `JARATE_COMMANDS` should gain `agents-check`/`agents-bless` + a doc
-  line so the agent can self-check/re-bless from the tool. The tripwire
-  itself does not depend on this (watchdog calls `~/bin/jarate` directly).
-- Pre-existing: `bin` CI job red on main — ubuntu-latest runners no longer
-  ship `rg` (all memory-grep tests fail there; local hosts fine). Needs a CI
-  fix (e.g. install ripgrep in the job) separate from this change.
-- First deployment per agent: bless the current AGENTS.md once
-  (`jarate agents-bless "initial bless 2026-09-14"`) so the tripwire starts
-  armed from a known-blessed state.
+## Judgment calls
+
+1. `doneFrame` -> `runFrame` (exported; all test imports updated). The
+   builder is no longer done-only; the name should say it covers all
+   three states. `RunFrameState` type added for the state param.
+2. The done/failed morph's ` ```bash ` fence normalized to `fence()`
+   (bare). The mockup3 rule is "frames live in code fences only" — the
+   bash label was never required and broke the one-fence-style
+   invariant; content is box glyphs, not shell.
+3. Two PRE-EXISTING load-sensitive test flakes fixed (test-only, no
+   behavior change): the `#28 partial` watchdog test and the compaction
+   "fallback timer drains" test. Root cause (caught with instrumentation):
+   the drain chain's real `readFile` (memoryToc) is scheduled
+   MID-`jest.advanceTimersByTime`; under load its completion can ride a
+   0ms timer that only fires on a further clock advance or on
+   `useRealTimers` in afterEach — the fixed flush/immediate budgets
+   (2 setImmediates + microtasks / 1 tick) lost that race. Confirmed the
+   same failures on main code under load before touching the tests.
+   Replaced the fixed budgets with bounded polls (200x yield + 1ms
+   clock nudge for the fake-timer test; 200x real tick for the other;
+   the next armed timer is 5s away, so the nudges trip nothing).
+4. The ticker keeps its 5s STEP for elapsed (existing spec), only the
+   payload changed from one line to the full frame.
+
+## Files
+
+- `packages/bridge/channel/index.ts`
+- `packages/bridge/channel/index.test.ts`
+- `docs/COMMANDS.md`
+- `docs/secret-censor.md`
+- `out.md` (this file)

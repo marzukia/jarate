@@ -631,7 +631,8 @@ function beginCompacting(
 // (statusTick), and mid-run interrupts. `render` returns the next line
 // or null to pause (window closed — the entry is KEPT so a settle can
 // still replace the message in place). Same ASCII style as before:
-// `[..] compacting… 5s` / `┣ working… 10s`.
+// `[..] compacting… 5s` / the live working frame (each tick re-renders
+// the full frame, header `┌ working · N calls · 10s`).
 interface OpTickEntry {
   ch: ChannelConfig;
   msgId: string;
@@ -1181,45 +1182,43 @@ export function isEssentialToolCall(toolName: string, input: any): boolean {
   return true; // edits, writes, tasks, MCP/custom: all essential
 }
 
-/**
- * Live status line: `┣ <action> · N call(s) · Xs`, clipped to
- * TOOL_LINE_MAX. Exported for the column-budget guard tests.
- */
-export function statusLine(
-  lastToolAction: string,
-  n: number,
-  t0: number,
-): string {
-  const secs = Math.round((Date.now() - t0) / 1000);
-  const suffix = ` · ${n} call${n === 1 ? "" : "s"} · ${secs}s`;
-  return `┣ ${fit(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
-}
+/** Run-frame header state (live-frame unification, Andryo 2026-09-13):
+ *  the in-run "working" message and the end-of-run message are the SAME
+ *  frame; only the header flips working -> done/failed in place. */
+export type RunFrameState = "working" | "done" | "failed";
 
-/** Max sub-step lines in a done frame (older calls overflow to the +N line). */
-export const DONE_FRAME_MAX_STEPS = 8;
+/** Max sub-step lines in the run frame (older calls overflow to the +N line). */
+export const RUN_FRAME_MAX_STEPS = 8;
 
 /**
- * Done summary frame for a finished run (v3, mockup3):
+ * Unified run frame (v3, mockup3 + live-frame unification): ONE builder
+ * for the live "working" status and the end-of-run done/failed summary —
+ * same shape, same fence, same Discord message; only the header changes
+ * state:
  *
- *   ┌ done · 12 calls · 96s
+ *   ┌ working · 12 calls · 96s
+ *   ├ … +9 earlier calls
  *   │ ├ read /home/monky/…/index.ts
  *   │ ├ edit /home/monky/…/index.ts
  *   │ └ bash cargo test
  *   └
  *
- * Failed runs swap the header for `┤ failed · …`. Shows the last
- * DONE_FRAME_MAX_STEPS calls; earlier overflow lands right under the header
- * as `├ … +N earlier calls`. Every line fits TOOL_LINE_MAX.
+ * Sub-steps are the last RUN_FRAME_MAX_STEPS shown calls; earlier overflow
+ * lands right under the header as `├ … +N earlier calls`. `calls` is the
+ * shown list (level 1 pre-filters to essentials), `count` its length.
+ * Every line fits TOOL_LINE_MAX.
  */
-export function doneFrame(
+export function runFrame(
+  state: RunFrameState,
   calls: string[],
   count: number,
   secs: number,
-  failed: boolean,
 ): string {
   const n = `${count} call${count === 1 ? "" : "s"} · ${secs}s`;
-  const lines: string[] = [failed ? `┤ failed · ${n}` : `┌ done · ${n}`];
-  const shown = calls.slice(-DONE_FRAME_MAX_STEPS);
+  const lines: string[] = [
+    state === "failed" ? `┤ failed · ${n}` : `┌ ${state} · ${n}`,
+  ];
+  const shown = calls.slice(-RUN_FRAME_MAX_STEPS);
   const earlier = count - shown.length;
   if (earlier > 0)
     lines.push(`├ … +${earlier} earlier call${earlier === 1 ? "" : "s"}`);
@@ -1744,12 +1743,9 @@ export default function (pi: ExtensionAPI) {
   let statusMsgId: string | null = null;
   let statusChannelId: string | null = null;
   let statusMsgAt = 0;
-  let runToolCount = 0;
-  let runEssentialCount = 0; // #10 level 1: essentials only (review L2: live count must match the done frame count)
   let runStartedAt = 0;
   let runOpen = false;
   let typingTimer: ReturnType<typeof setInterval> | null = null;
-  let lastToolAction: string | null = null;
 
   // Mid-run interrupt: when an armed timer fires, abort the in-flight step
   // and, once the session settles, send the queued message as a fresh run
@@ -2049,11 +2045,26 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ─── Live status line (edit-in-place, deleted at run end) ───
-  // Shared op-tick (5s): the block shows elapsed time (5s, 10s, 15s, ...)
-  // even while no tool call has fired yet (model thinking) —
-  // "┣ working… 10s". (Andryo 2026-09-10.) Render returns null when the
-  // run closes or the block is gone; the entry stops at agent_end.
+  // ─── Live status frame (edit-in-place, deleted at run end) ───
+  // Shared op-tick (5s): the block re-renders the FULL working frame —
+  // same builder and fence as the end-of-run done frame (live-frame
+  // unification 2026-09-13), 5s-step elapsed, even while no tool call has
+  // fired yet (model thinking: `┌ working · 0 calls · 10s`). Render
+  // returns null when the run closes or the block is gone; the entry stops
+  // at agent_end.
+  /** Current live working frame for ch, fenced: sub-steps = calls so far
+   *  (level 1: essentials only). count = shown length, so the live header
+   *  matches the done frame that morphs this message at run end. */
+  const workingFrameBody = (ch: ChannelConfig, secs: number): string => {
+    const shown = (
+      verboseLevel(ch) === 1
+        ? toolCallsThisTurn.filter((c) => c.essential)
+        : toolCallsThisTurn
+    ).map((c) => c.action);
+    return runFrame("working", shown, shown.length, secs);
+  };
+  const workingFrame = (ch: ChannelConfig, secs: number): string =>
+    fence(workingFrameBody(ch, secs));
   const armWorkingTick = () => {
     const ch = lastActiveChannel;
     if (!ch || !statusMsgId) return;
@@ -2062,14 +2073,8 @@ export default function (pi: ExtensionAPI) {
       const wch = lastActiveChannel;
       if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
-      const inc = Math.floor(secs / 5) * 5;
-      return lastToolAction
-        ? statusLine(
-            lastToolAction,
-            verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
-            Date.now() - inc * 1000,
-          )
-        : `┣ working… ${inc}s`;
+      // UNFENCED body: armOpTick fences exactly once (review F1).
+      return workingFrameBody(wch, Math.floor(secs / 5) * 5);
     });
   };
 
@@ -2092,15 +2097,12 @@ export default function (pi: ExtensionAPI) {
     if (!lastActiveChannel) return;
     const ch = lastActiveChannel;
     if (statusChannelId !== ch.id) {
-      // new channel: this channel gets its own line (old channel's line stays)
+      // new channel: this channel gets its own block (old channel's stays)
       statusMsgId = null;
       statusChannelId = ch.id;
-      lastToolAction = null;
     }
     if (!runOpen) {
       runOpen = true;
-      runToolCount = 0;
-      runEssentialCount = 0;
       runStartedAt = Date.now();
       // reuse the line only while it is fresh; an old one is buried in
       // history — delete it and start near the current conversation
@@ -2113,33 +2115,28 @@ export default function (pi: ExtensionAPI) {
         statusMsgId = null;
       }
     }
-    runToolCount += 1;
     const action = toolActionText(event.toolName, event.input);
-    // #10: record EVERY call (the done frame at run end filters to
-    // essentials at level 1); the live block renders per level.
+    // #10: record EVERY call (the live frame and the done frame at run end
+    // both filter to essentials at level 1 from this same list).
     const essential = isEssentialToolCall(event.toolName, event.input);
-    if (essential) runEssentialCount += 1; // review L2: live count == done frame count
     toolCallsThisTurn.push({
       name: event.toolName,
       action,
       essential,
     });
-    lastToolAction = action;
     // Display gate (#38/#10): level 0 renders nothing; level 1 renders
     // essential tools only (reads, read-only bash, ... stay hidden);
-    // level 2 renders every call.
+    // level 2 renders every call. The edit renders the FULL working frame
+    // (live-frame unification) — same builder as the end-of-run morph.
     const lvl = verboseLevel(ch);
     if (lvl === 0 || (lvl === 1 && !essential)) return;
-    const line = fence(
-      statusLine(
-        lastToolAction,
-        lvl === 1 ? runEssentialCount : runToolCount,
-        runStartedAt,
-      ),
+    const frame = workingFrame(
+      ch,
+      Math.round((Date.now() - runStartedAt) / 1000),
     );
     try {
       if (!statusMsgId) {
-        const r = await sendDiscordMessage(ch, line);
+        const r = await sendDiscordMessage(ch, frame);
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
           statusMsgAt = Date.now();
@@ -2149,7 +2146,7 @@ export default function (pi: ExtensionAPI) {
             `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
           );
       } else {
-        const r = await editDiscordMessage(ch, statusMsgId, line);
+        const r = await editDiscordMessage(ch, statusMsgId, frame);
         if (!r.success)
           console.error(
             `[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -2168,9 +2165,6 @@ export default function (pi: ExtensionAPI) {
     // so the runOpen gate makes this once-per-run.
     if (!runOpen) {
       runOpen = true;
-      runToolCount = 0;
-      runEssentialCount = 0;
-      lastToolAction = null;
       runStartedAt = Date.now();
       // Reset the status pointer for every new run, gate or no gate: a
       // verbose-off run must not leave the previous run's block addressable
@@ -2193,7 +2187,9 @@ export default function (pi: ExtensionAPI) {
       // Run state still tracks the run, so agent_end's done-line no-ops
       // cleanly.
       if (verboseLevel(ch) === 2) {
-        const r = await sendDiscordMessage(ch, fence("┣ working…"));
+        // live-frame unification: the placeholder IS the working frame
+        // (0 calls); every later state edits the same message in place.
+        const r = await sendDiscordMessage(ch, workingFrame(ch, 0));
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
           statusChannelId = ch.id;
@@ -2357,7 +2353,6 @@ export default function (pi: ExtensionAPI) {
       typingTimer = null;
     }
     stopOpTickPrefix("working:");
-    lastToolAction = null;
     agentBusy = false;
     refreshActivity(ctx);
     // /undo store: finalize THIS run's snapshot before the re-wake below
@@ -2445,12 +2440,20 @@ export default function (pi: ExtensionAPI) {
       } else {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
         const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
-        // multi-line frame: code fence keeps the box glyphs monospace
-        // (mockup3: "frames live in code fences only")
+        // live-frame unification: the morph edits the SAME working message
+        // in place — only the header flips. fence() keeps the box glyphs
+        // monospace (mockup3: "frames live in code fences only").
         await editDiscordMessage(
           ch,
           statusMsgId,
-          `\`\`\`bash\n${doneFrame(shownActions, shownActions.length, secs, failed)}\n\`\`\``,
+          fence(
+            runFrame(
+              failed ? "failed" : "done",
+              shownActions,
+              shownActions.length,
+              secs,
+            ),
+          ),
         ).catch(() => {});
       }
     }

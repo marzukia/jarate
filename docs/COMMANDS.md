@@ -14,13 +14,15 @@ Every command / system output the user sees starts with ONE ASCII tag
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
 `[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
 bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`, `[tasks]`).
-Live run state uses the box-drawing frame family (`┣` working, `┌ done` /
-`┤ failed` frame with `└` close), the todo board its state glyphs (`├`
+Live run state is ONE box-drawing frame in every state (live-frame unification,
+2026-09-13): `┌ working · N calls · Ts` with `│ ├` / `│ └` sub-steps while
+the run is active (the same Discord message is edited in place as calls fire
+and on a 5s tick); at run end the header flips to `┌ done` / `┤ failed` on
+that same message, `└` close. The todo board uses its own state glyphs: `├`
 pending, `┣` in progress, `├` done (strikethrough, pipe stays connected),
-`┤` cancelled, `┌` board header, `└`
-close) - both families are exempt from the bracket scheme and must stay
-<= 40 cols per line (mobile budget). Webhook callback embeds are framed
-and untagged.
+`┤` cancelled, `┌` board header, `└` close. Both families are exempt from
+the bracket scheme and must stay <= 40 cols per line (mobile budget).
+Webhook callback embeds are framed and untagged.
 
 | command / output | tag |
 |---|---|
