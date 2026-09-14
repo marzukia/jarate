@@ -250,11 +250,18 @@ fi
 # missing/unreadable, jq/python missing, or a non-drift check -> skip
 # silently, sweep still exits 0.
 JARATE_BIN="${HOME}/bin/jarate"
-# same resolution as jarate agents-check: canonical path, else ~/AGENTS.md
-AGENTS_MD="${HOME}/.pi/agent/AGENTS.md"
-[ -f "$AGENTS_MD" ] || AGENTS_MD="${HOME}/AGENTS.md"
 DRIFT_STATE="${HOME}/.pi/agent/.agents-md-drift-warned"
-MANIFEST="${HOME}/.pi/agent/.agents-md-hash"
+# same resolution as jarate agents-check: JARATE_AGENTS_MD override first,
+# then canonical ~/.pi/agent/AGENTS.md, else ~/AGENTS.md. The manifest sits at
+# the fixed path unless the override moves it next to the checked file.
+if [ -n "${JARATE_AGENTS_MD:-}" ]; then
+  AGENTS_MD="$JARATE_AGENTS_MD"
+  MANIFEST="$(dirname "$JARATE_AGENTS_MD")/.agents-md-hash"
+else
+  AGENTS_MD="${HOME}/.pi/agent/AGENTS.md"
+  [ -f "$AGENTS_MD" ] || AGENTS_MD="${HOME}/AGENTS.md"
+  MANIFEST="${HOME}/.pi/agent/.agents-md-hash"
+fi
 if [ -x "$JARATE_BIN" ]; then
   check_json="$(timeout 30 "$JARATE_BIN" agents-check 2>/dev/null)" || check_json=""
   if [ -n "$check_json" ]; then
