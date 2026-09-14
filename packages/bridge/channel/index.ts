@@ -1576,11 +1576,56 @@ function wrapFence(t: string): string {
 }
 
 /**
+ * Error -> short channel-safe text. The single funnel for error text
+ * posted to Discord (run failures, command catches): known error classes
+ * map to consistent markers (timeout -> "timed out", rate limit ->
+ * "rate limited, retrying", ENOSPC -> "disk full"); aborts return null —
+ * suppressed, because an abort is self-evident (the human message landed
+ * and the turn continued); everything else is trimmed to its first line,
+ * capped at 200 chars, sensitive-text redacted. No raw DOMException/JS
+ * message string reaches the send layer. Exported for tests.
+ */
+export function channelError(e: unknown): string | null {
+  if (e === null || e === undefined) return null;
+  const obj = (typeof e === "object" ? e : {}) as Record<string, unknown>;
+  const name = typeof obj.name === "string" ? obj.name : "";
+  const code = String(obj.code ?? obj.status ?? obj.statusCode ?? "");
+  const msg =
+    typeof e === "string"
+      ? e
+      : typeof (e as Error).message === "string" && (e as Error).message !== ""
+        ? (e as Error).message
+        : String(e);
+  const hay = `${name}\n${code}\n${msg}`;
+  // Aborted: DOMException "AbortError", the pi stream layer's "This
+  // operation was aborted", the bash tool's "Command aborted".
+  if (name === "AbortError" || /abort/i.test(hay)) return null;
+  if (
+    name === "TimeoutError" ||
+    code === "ETIMEDOUT" ||
+    code === "ESOCKETTIMEDOUT" ||
+    /timed? ?out/i.test(hay)
+  )
+    return "timed out";
+  if (code === "429" || /rate.?limit|too many requests|overloaded/i.test(hay))
+    return "rate limited, retrying";
+  if (code === "ENOSPC" || /no space left on device/i.test(hay))
+    return "disk full";
+  const line = msg.split(/\r?\n/, 1)[0].trim();
+  if (line.length === 0) return "";
+  const capped = line.length > 200 ? `${line.slice(0, 197)}...` : line;
+  return sanitizeSensitiveText(capped, { redactPaths: true });
+}
+
+/**
  * Silent-run-failure check (A2): pi's handleRunFailure emits agent_end
  * with a fresh empty-text failure message that yields no finals and no
  * tool block. If the last message has stopReason "error" — or "aborted"
- * with an errorMessage when the run was NOT user-stopped — return the
- * post text; null otherwise. Exported for tests.
+ * with an errorMessage — return the post text (via channelError); null
+ * otherwise. Aborts are suppressed unconditionally: a mid-run interrupt
+ * is self-evident, and the user-stopped flag can race a re-wake's
+ * turn_start reset (the aborted run's agent_end then runs with the flag
+ * already cleared). Exported for tests.
  */
 export function failurePostText(
   messages: unknown[],
@@ -1590,15 +1635,17 @@ export function failurePostText(
   if (last?.role !== "assistant") return null;
   const err = typeof last.errorMessage === "string" ? last.errorMessage : "";
   // An abort surfaces as stopReason "error" + errorMessage "This operation
-  // was aborted" (pi stream layer), or stopReason "aborted". Suppress the
-  // failure post for both shapes when the user stopped the run (/stop,
-  // /reset, or a mid-run interrupt) — it is expected, not a model/API failure.
+  // was aborted" (pi stream layer), or stopReason "aborted". /stop,
+  // /reset and the mid-run interrupt set the user-stopped flag;
+  // channelError suppresses the abort markers even when the flag raced.
   const isAbort =
     last.stopReason === "aborted" ||
     (last.stopReason === "error" && /abort/i.test(err));
   if (userStopped && isAbort) return null;
   if (last.stopReason === "error" || (last.stopReason === "aborted" && err)) {
-    return `[!] ${err || "run failed"}`;
+    const t = channelError(err);
+    if (t === null) return null;
+    return `[!] ${t || "run failed"}`;
   }
   return null;
 }
@@ -2350,8 +2397,11 @@ export default function (pi: ExtensionAPI) {
     const pc = pendingCompact;
     pendingCompact = null;
     const err = startCompact(pi, pc, ctx, true);
-    if (err !== null)
-      sendDiscordMessage(pc.ch, `[!] compact failed: ${err}`).catch(() => {});
+    if (err !== null) {
+      const t = channelError(err);
+      if (t !== null)
+        sendDiscordMessage(pc.ch, `[!] compact failed: ${t}`).catch(() => {});
+    }
     return err === null;
   };
   // A compaction settled (success or failure): close the window, then
@@ -2741,8 +2791,8 @@ export function buildInteractionHandler(
         ? undefined
         : (r.immediate ?? (r.consumed ? undefined : "ok"));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      text = `[!] command failed: ${sanitizeSensitiveText(msg)}`;
+      const t = channelError(e);
+      if (t !== null) text = `[!] command failed: ${t}`;
     }
     if (text !== undefined) await editInteractionMessage(botToken, d, text);
   };
@@ -3174,9 +3224,8 @@ function startCompact(
         );
       },
       onError: (err) => {
-        const msg =
-          err instanceof Error && err.message ? err.message : String(err);
-        report(`[!] compact failed: ${sanitizeSensitiveText(msg)}`);
+        const t = channelError(err);
+        if (t !== null) report(`[!] compact failed: ${t}`);
         clearCompacting(pending.ch.id);
       },
     });
@@ -3574,8 +3623,10 @@ async function runChannelCommand(
       // tick) and reports settle-in-place. Native: the deferred interaction
       // shows the placeholder instead; the report posts fresh.
       const err = startCompact(pi, { ch, instructions }, ctx, !native);
-      if (err !== null)
-        return { immediate: fence(`[!] compact failed: ${err}`) };
+      if (err !== null) {
+        const t = channelError(err);
+        if (t !== null) return { immediate: fence(`[!] compact failed: ${t}`) };
+      }
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
@@ -3616,7 +3667,9 @@ async function runChannelCommand(
         return { immediate: fence(newWorktree(ctx.cwd, ref)) };
       } catch (e) {
         return {
-          immediate: fence(`[!] worktree failed: ${sanitizeUnknownValue(e)}`),
+          immediate: fence(
+            `[!] worktree failed: ${channelError(e) ?? "error"}`,
+          ),
         };
       }
     }
@@ -3630,7 +3683,7 @@ async function runChannelCommand(
         return { immediate: fence(mergeWorktree(ctx.cwd, mode)) };
       } catch (e) {
         return {
-          immediate: fence(`[!] merge failed: ${sanitizeUnknownValue(e)}`),
+          immediate: fence(`[!] merge failed: ${channelError(e) ?? "error"}`),
         };
       }
     }
@@ -4028,7 +4081,7 @@ export function registerTodoTool(
       } catch (e) {
         // State write failed — report it but still echo the list so the
         // model keeps its copy.
-        stateNote = `\n\n[!] board save failed: ${sanitizeUnknownValue(e)}`;
+        stateNote = `\n\n[!] board save failed: ${channelError(e) ?? "error"}`;
       }
       await syncTodoBoard(ch, board);
       const text =

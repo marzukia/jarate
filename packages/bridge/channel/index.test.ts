@@ -16,6 +16,7 @@ import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
   buildRestartCommand,
+  channelError,
   chunkText,
   clearAllCompacting,
   clearAllInterrupts,
@@ -435,10 +436,37 @@ describe("failurePostText (A2)", () => {
     ).toBeNull();
   });
 
-  test("error run shaped stopReason=error still posts when NOT user-stopped", () => {
+  test("aborted run shaped stopReason=error is suppressed even when NOT user-stopped", () => {
+    // The user-stopped flag can race a re-wake's turn_start reset (the
+    // aborted run's agent_end runs AFTER the fresh run started). The
+    // abort marker itself is the signal — suppress unconditionally.
     expect(
       failurePostText([failure("error", "This operation was aborted")], false),
-    ).toBe("[!] This operation was aborted");
+    ).toBeNull();
+  });
+
+  test("genuine error is trimmed to its first line, no stack", () => {
+    expect(
+      failurePostText(
+        [failure("error", "boom line1\n    at stack frame (x.js:1:1)")],
+        false,
+      ),
+    ).toBe("[!] boom line1");
+  });
+
+  test("run-level timeout posts the short marker", () => {
+    expect(
+      failurePostText(
+        [failure("error", "request timed out after 30000ms")],
+        false,
+      ),
+    ).toBe("[!] timed out");
+  });
+
+  test("run-level rate limit posts the short marker", () => {
+    expect(
+      failurePostText([failure("error", "429 Too Many Requests")], false),
+    ).toBe("[!] rate limited, retrying");
   });
 
   test("aborted with errorMessage is silent when the user stopped the run", () => {
@@ -458,6 +486,69 @@ describe("failurePostText (A2)", () => {
   test("no messages or non-assistant last message is silent", () => {
     expect(failurePostText([], false)).toBeNull();
     expect(failurePostText([{ role: "user", content: [] }], false)).toBeNull();
+  });
+});
+
+describe("channelError", () => {
+  test("abort strings are suppressed (null)", () => {
+    expect(channelError("This operation was aborted")).toBeNull();
+    expect(channelError("Command aborted")).toBeNull();
+    expect(
+      channelError(
+        new DOMException("This operation was aborted", "AbortError"),
+      ),
+    ).toBeNull();
+  });
+
+  test("genuine error: first line only, no stack, capped at 200 chars", () => {
+    expect(
+      channelError(
+        new Error(
+          "first line of failure\n    at foo (bar.js:1:1)\n    at main",
+        ),
+      ),
+    ).toBe("first line of failure");
+    expect(channelError(new Error("x".repeat(500)))).toHaveLength(200);
+    expect(channelError(new Error("x".repeat(100)))).toHaveLength(100);
+  });
+
+  test("timeout markers", () => {
+    expect(channelError(new Error("request timed out after 30000ms"))).toBe(
+      "timed out",
+    );
+    const e = new Error("connect");
+    (e as any).code = "ETIMEDOUT";
+    expect(channelError(e)).toBe("timed out");
+    expect(
+      channelError(new DOMException("The operation timed out", "TimeoutError")),
+    ).toBe("timed out");
+  });
+
+  test("rate limit markers", () => {
+    const e = new Error("response error");
+    (e as any).status = 429;
+    expect(channelError(e)).toBe("rate limited, retrying");
+    expect(channelError(new Error("rate limit exceeded"))).toBe(
+      "rate limited, retrying",
+    );
+  });
+
+  test("ENOSPC marker", () => {
+    const e = new Error("write /tmp/x: no space left on device");
+    (e as any).code = "ENOSPC";
+    expect(channelError(e)).toBe("disk full");
+  });
+
+  test("empty input yields empty string (fallback), null/undefined suppressed", () => {
+    expect(channelError("")).toBe("");
+    expect(channelError(null)).toBeNull();
+    expect(channelError(undefined)).toBeNull();
+  });
+
+  test("sensitive text is redacted in the fallback line", () => {
+    expect(
+      channelError(new Error("fetch failed: Bearer sk-abcdefghijklmnop1234")),
+    ).toBe("fetch failed: Bearer [REDACTED]");
   });
 });
 
@@ -1311,6 +1402,59 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(
         posts.every(
           (p) => !String(JSON.parse(p.body).content).startsWith("[!]"),
+        ),
+      ).toBe(true);
+    });
+
+    test("no raw abort string reaches the send mock when the user-stopped flag raced", async () => {
+      // The race: the interrupt sets the flag, then the re-wake's fresh
+      // run starts (turn_start resets the flag) BEFORE the aborted run's
+      // agent_end runs its failure check. The abort marker must still
+      // suppress the post.
+      await handleInbound(pi, inbound("redirect", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(1);
+      // The fresh run's turn_start reset the flag (mock pi never fires
+      // it, so drive it here, in the real pi's ordering).
+      await handlers.turn_start(null, ctx);
+
+      const fail = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "error",
+        errorMessage: "This operation was aborted",
+      };
+      await handlers.agent_end({ messages: [fail] }, ctx);
+      const posts = fetchCalls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/messages"),
+      );
+      expect(
+        posts.every(
+          (p) => !String(JSON.parse(p.body).content).includes("aborted"),
+        ),
+      ).toBe(true);
+    });
+
+    test("aborted run with a genuine API error still posts the short marker", async () => {
+      await handleInbound(pi, inbound("redirect", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      expect(abortCount).toBe(1);
+      await handlers.turn_start(null, ctx); // flag raced to false
+
+      const fail = {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+        stopReason: "error",
+        errorMessage: "429 Too Many Requests",
+      };
+      await handlers.agent_end({ messages: [fail] }, ctx);
+      const posts = fetchCalls.filter(
+        (c) => c.method === "POST" && c.url.endsWith("/messages"),
+      );
+      expect(
+        posts.some(
+          (p) =>
+            String(JSON.parse(p.body).content) === "[!] rate limited, retrying",
         ),
       ).toBe(true);
     });
