@@ -7,6 +7,7 @@
  * snake_case keys, no partial output.
  */
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -141,6 +142,9 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.XDG_RUNTIME_DIR = path.join(tmp, "xdg");
   env.JARATE_AGENT_HOMES = `${home}:${peerHome}`;
+  // peer hop stub: run_remote_probe needs a sudo password before it even
+  // execs sshpass (2026-09-14: fixture was missing this -> red on main)
+  env.JARATE_SUDO_PASS = "test-pass";
   env.JARATE_RECALL_CLI = recallStub;
   fs.mkdirSync(env.XDG_RUNTIME_DIR, { recursive: true });
 
@@ -181,6 +185,8 @@ describe("entrypoint", () => {
       "journal-errors",
       "memory-grep",
       "rag",
+      "agents-check",
+      "agents-bless",
     ]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
@@ -666,6 +672,144 @@ describe("rag", () => {
     });
     expect(r.code).toBe(1);
     expect(doc(r).error).toContain("recall CLI not found");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+});
+
+describe("agents-check / agents-bless", () => {
+  // AGENTS.md is prompt-level law; the manifest makes the approval rule
+  // mechanical. Manifest format: <sha256>  <UTC ts>  <note> (one line).
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+  const AGENTS = (f: Fixture) => path.join(f.home, ".pi", "agent", "AGENTS.md");
+  const MANIFEST = (f: Fixture) =>
+    path.join(f.home, ".pi", "agent", ".agents-md-hash");
+
+  test("no manifest -> ok:true, drift:true, expected null", async () => {
+    const f = fixture();
+    fs.writeFileSync(AGENTS(f), "# law v1\n");
+    const r = await f.run(["agents-check"]);
+    expect(r.code).toBe(0);
+    expect(r.err).toBe("");
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(Object.keys(d)).toEqual([
+      "ok",
+      "ts",
+      "error",
+      "hash",
+      "expected",
+      "drift",
+    ]);
+    expect(d.hash).toBe(sha("# law v1\n"));
+    expect(d.expected).toBeNull();
+    expect(d.drift).toBe(true);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("bless writes one-line manifest; check -> drift:false", async () => {
+    const f = fixture();
+    fs.writeFileSync(AGENTS(f), "# law v1\n");
+    const r = await f.run(["agents-bless", "blessed by andryo"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(d.hash).toBe(sha("# law v1\n"));
+    expect(d.note).toBe("blessed by andryo");
+    // manifest: exactly one line, <sha256>  <ts>  <note>
+    const lines = fs.readFileSync(MANIFEST(f), "utf8").split("\n");
+    expect(lines).toHaveLength(2); // trailing newline -> last element ""
+    const [mh, mts, ...mnote] = lines[0].split("  ");
+    expect(mh).toBe(sha("# law v1\n"));
+    expect(mts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(mnote.join("  ")).toBe("blessed by andryo");
+    const r2 = await f.run(["agents-check"]);
+    const d2 = doc(r2);
+    expect(d2.drift).toBe(false);
+    expect(d2.expected).toBe(sha("# law v1\n"));
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("edit -> drift:true (expected = old hash); re-bless -> drift:false", async () => {
+    const f = fixture();
+    fs.writeFileSync(AGENTS(f), "# law v1\n");
+    await f.run(["agents-bless", "v1"]);
+    fs.appendFileSync(AGENTS(f), "# amendment\n");
+    const r = await f.run(["agents-check"]);
+    const d = doc(r);
+    expect(d.ok).toBe(true); // drift is not an error
+    expect(d.drift).toBe(true);
+    expect(d.expected).toBe(sha("# law v1\n"));
+    expect(d.hash).toBe(sha("# law v1\n# amendment\n"));
+    // re-bless the approved change
+    const r2 = await f.run(["agents-bless", "amendment approved"]);
+    expect(doc(r2).hash).toBe(sha("# law v1\n# amendment\n"));
+    expect(doc(r2).note).toBe("amendment approved");
+    const r3 = await f.run(["agents-check"]);
+    expect(doc(r3).drift).toBe(false);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("bless with no note -> manifest note field is '-'", async () => {
+    const f = fixture();
+    fs.writeFileSync(AGENTS(f), "# law\n");
+    const r = await f.run(["agents-bless"]);
+    expect(r.code).toBe(0);
+    expect(doc(r).note).toBe("-");
+    const line = fs.readFileSync(MANIFEST(f), "utf8").split("\n")[0];
+    expect(line.split("  ")[2]).toBe("-");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("AGENTS.md missing -> ok:false rc 1 for check AND bless", async () => {
+    const f = fixture();
+    const rc = await f.run(["agents-check"]);
+    expect(rc.code).toBe(1);
+    const dc = doc(rc);
+    expect(dc.ok).toBe(false);
+    expect(dc.error).toContain("unreadable or missing");
+    const rb = await f.run(["agents-bless", "x"]);
+    expect(rb.code).toBe(1);
+    expect(doc(rb).ok).toBe(false);
+    expect(doc(rb).error).toContain("unreadable or missing");
+    // no manifest was written by the failed bless
+    expect(fs.existsSync(MANIFEST(f))).toBe(false);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("fallback: law file in ~/AGENTS.md (live-box layout) is resolved; manifest stays in ~/.pi/agent", async () => {
+    const f = fixture();
+    // fixture home has ~/.pi/agent/ but no AGENTS.md there; live boxes keep
+    // the main profile's law in ~/AGENTS.md
+    fs.writeFileSync(path.join(f.home, "AGENTS.md"), "# law at home\n");
+    const r = await f.run(["agents-check"]);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.hash).toBe(sha("# law at home\n"));
+    expect(d.drift).toBe(true); // never blessed
+    const rb = await f.run(["agents-bless", "home layout"]);
+    expect(doc(rb).ok).toBe(true);
+    // manifest in the FIXED design path, not next to ~/AGENTS.md
+    expect(fs.existsSync(MANIFEST(f))).toBe(true);
+    expect(fs.existsSync(path.join(f.home, ".agents-md-hash"))).toBe(false);
+    const r2 = await f.run(["agents-check"]);
+    expect(doc(r2).drift).toBe(false);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("JARATE_AGENTS_MD override points at a different file", async () => {
+    const f = fixture();
+    const alt = path.join(f.tmp, "worker-AGENTS.md");
+    fs.writeFileSync(alt, "# worker law\n");
+    const r = await f.run(["agents-check"], { JARATE_AGENTS_MD: alt });
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.hash).toBe(sha("# worker law\n"));
+    // manifest lands next to the overridden file
+    expect(fs.existsSync(path.join(f.tmp, ".agents-md-hash"))).toBe(false);
+    await f.run(["agents-bless", "w"], { JARATE_AGENTS_MD: alt });
+    expect(fs.existsSync(path.join(f.tmp, ".agents-md-hash"))).toBe(true);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });

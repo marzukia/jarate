@@ -196,6 +196,26 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
   embed (same webhook URL source as pi-bg; dead letter on post failure).
   Precise by construction: only the run's cgroup subtree dies.
 
+### AGENTS.md drift tripwire (watchdog, alert-only)
+
+`~/.pi/agent/AGENTS.md` is prompt-level law: changes require Andryo's
+explicit approval (2026-09-14). The rule is mechanical now — the watchdog
+sweep (every 15 min) runs `jarate agents-check` and compares the live file
+(`~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md` — live boxes keep the law
+in `~/AGENTS.md`) against the hash manifest `~/.pi/agent/.agents-md-hash`
+(`<sha256>  <UTC ts>  <note>`).
+
+- Drift = manifest missing OR hash mismatch. On drift the watchdog posts
+  ONE warning per drifted hash: `AGENTS.md drift: <hash8> since <ts> —
+  review + re-bless: jarate agents-bless "note"` (dedupe state:
+  `~/.pi/agent/.agents-md-drift-warned`, written only after a successful
+  post, so a dead webhook retries next sweep).
+- ALERT-ONLY: never reverts, never blocks, sweep always exits 0. jarate
+  missing/unreadable -> the tripwire skips silently (backward compatible).
+- Approved change -> re-bless: `jarate agents-bless "<who/what approved>"`.
+  New content, new hash, drift clears; a further unapproved edit warns
+  again (different hash).
+
 ## pi-wait internals
 
 `pi-wait --since <message-id> [--timeout 300] [--check 5]` polls

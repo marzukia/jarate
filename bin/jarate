@@ -13,11 +13,13 @@
 #   - ISO-8601 UTC timestamps, seconds for ages
 #   - no emoji
 #
-# Commands (first group, all read-only):
+# Commands:
 #   ctx-report                    context % + token cost (reuses pi-token-cost.py --json)
 #   journal-errors [--since S]    per-agent pi.service warnings (journalctl -p warning)
 #   memory-grep <query>           search ~/memory, top-20 matches
 #   rag <question> [--project P]  RAG one-call over project knowledge (recall --json)
+#   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
+#   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
 #
 # Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
 # Callers use $HOME/bin/jarate — do not rely on PATH.
@@ -29,6 +31,9 @@
 #   JARATE_SSH_HOST     cross-user hop target (default andryo@127.0.0.1)
 #   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
 #   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
+#   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
+#                       falling back to ~/AGENTS.md when that is absent — the
+#                       live boxes keep the main profile's law in ~/AGENTS.md)
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
 
 set -uo pipefail
@@ -39,7 +44,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("ctx-report" "journal-errors" "memory-grep" "rag")
+COMMANDS=("ctx-report" "journal-errors" "memory-grep" "rag" "agents-check" "agents-bless")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -532,6 +537,93 @@ cmd_rag() {
     || die "rag: json assembly failed"
 }
 
+# ─── agents-check / agents-bless ───────────────────────────────────────────
+# AGENTS.md is prompt-level law: changes require Andryo's explicit approval
+# (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
+# check never reverts, never blocks; the watchdog (pi-bg-watchdog) posts one
+# warning per drifted hash. Manifest: <sha256>  <UTC timestamp>  <note>.
+
+agents_md_path() {
+  if [ -n "${JARATE_AGENTS_MD:-}" ]; then
+    printf '%s' "$JARATE_AGENTS_MD"
+    return
+  fi
+  # live boxes keep the main profile's law in ~/AGENTS.md; prefer the
+  # canonical ~/.pi/agent/AGENTS.md when it exists
+  if [ -f "$HOME/.pi/agent/AGENTS.md" ]; then
+    printf '%s' "$HOME/.pi/agent/AGENTS.md"
+  else
+    printf '%s' "$HOME/AGENTS.md"
+  fi
+}
+
+agents_manifest_path() {
+  # fixed design path; only an explicit JARATE_AGENTS_MD moves it (next to
+  # the checked file)
+  if [ -n "${JARATE_AGENTS_MD:-}" ]; then
+    printf '%s' "$(dirname "$JARATE_AGENTS_MD")/.agents-md-hash"
+  else
+    printf '%s' "$HOME/.pi/agent/.agents-md-hash"
+  fi
+}
+
+agents_hash() { # $1=md path -> sha256 on stdout, rc!=0 on failure
+  sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+cmd_agents_check() {
+  local md man hash expected="" drift
+  md="$(agents_md_path)"
+  man="$(agents_manifest_path)"
+  [ -r "$md" ] || die "agents-check: AGENTS.md unreadable or missing: $md"
+  hash="$(agents_hash "$md")" || die "agents-check: sha256 failed: $md"
+  [ -n "$hash" ] || die "agents-check: sha256 failed: $md"
+  if [ -r "$man" ]; then
+    expected="$(awk 'NR==1 {print $1; exit}' "$man" 2>/dev/null)"
+  fi
+  if [ -z "$expected" ]; then
+    drift="true" # manifest missing (or unparseable)
+  elif [ "$expected" = "$hash" ]; then
+    drift="false"
+  else
+    drift="true" # hash mismatch
+  fi
+  jq -cn \
+    --arg ts "$(ts_now)" \
+    --arg hash "$hash" \
+    --arg expected "$expected" \
+    --argjson drift "$drift" \
+    '{ok: true, ts: $ts, error: null, hash: $hash,
+      expected: (if $expected == "" then null else $expected end),
+      drift: $drift}' \
+    || die "agents-check: json assembly failed"
+}
+
+cmd_agents_bless() {
+  local md man hash ts note tmpf
+  md="$(agents_md_path)"
+  man="$(agents_manifest_path)"
+  [ -r "$md" ] || die "agents-bless: AGENTS.md unreadable or missing: $md"
+  hash="$(agents_hash "$md")" || die "agents-bless: sha256 failed: $md"
+  [ -n "$hash" ] || die "agents-bless: sha256 failed: $md"
+  ts="$(ts_now)"
+  note="$*"
+  [ -n "$note" ] || note="-"
+  mkdir -p "$(dirname "$man")" 2>/dev/null \
+    || die "agents-bless: cannot create $(dirname "$man")"
+  tmpf="$(mktemp "$(dirname "$man")"/.agents-md-hash.XXXXXX)" \
+    || die "agents-bless: mktemp failed"
+  printf '%s  %s  %s\n' "$hash" "$ts" "$note" > "$tmpf" \
+    && mv "$tmpf" "$man" \
+    || { rm -f "$tmpf"; die "agents-bless: manifest write failed: $man"; }
+  jq -cn \
+    --arg ts "$ts" \
+    --arg hash "$hash" \
+    --arg note "$note" \
+    '{ok: true, ts: $ts, error: null, hash: $hash, note: $note}' \
+    || die "agents-bless: json assembly failed"
+}
+
 # ─── dispatch ───────────────────────────────────────────────────────────────
 
 main() {
@@ -544,17 +636,21 @@ main() {
     "" | help | -h | --help)
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
-          commands: ["ctx-report", "journal-errors", "memory-grep", "rag"]}'
+          commands: ["ctx-report", "journal-errors", "memory-grep", "rag",
+                     "agents-check", "agents-bless"]}'
       ;;
     ctx-report) cmd_ctx_report "${args[@]}" ;;
     journal-errors) cmd_journal_errors "${args[@]}" ;;
     memory-grep) cmd_memory_grep "${args[@]}" ;;
     rag) cmd_rag "${args[@]}" ;;
+    agents-check) cmd_agents_check "${args[@]}" ;;
+    agents-bless) cmd_agents_bless "${args[@]}" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
-          commands: ["ctx-report", "journal-errors", "memory-grep", "rag"]}'
+          commands: ["ctx-report", "journal-errors", "memory-grep", "rag",
+                     "agents-check", "agents-bless"]}'
       exit 2
       ;;
   esac
