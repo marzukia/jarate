@@ -1191,7 +1191,9 @@ export function statusLine(
 /** Live status frames render inside a code fence (style guide v3):
  * box-drawing chars stay aligned on mobile, no markdown mangling.
  * Andryo 2026-09-14. */
-export const fence = (s: string): string => "```\n" + s + "\n```";
+export const fence = (s: string): string => `\`\`\`
+${s}
+\`\`\``;
 
 /** Max sub-step lines in a done frame (older calls overflow to the +N line). */
 export const DONE_FRAME_MAX_STEPS = 8;
