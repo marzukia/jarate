@@ -30,6 +30,7 @@ Webhook callback embeds are framed and untagged.
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
 | `/usage [all\|session\|last]` | `[usage] …` (error: `[!] usage: …`) |
+| `/context [N]` | fenced frame (40-col box-drawing, `[context]` tag, est tokens char/4; error: `[!] no session file found` / `[!] session file unreadable`) |
 | `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
 | `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
@@ -73,6 +74,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session\|last]` | anyone | token usage: current session (default), lifetime across all session files, or the last completed run |
+| `/context [N]` | anyone | what is eating the window: top-N items by token ESTIMATE (char/4, no model, no pricing) + category totals (user/assistant/tool) + biggest eater; N default 10, max 40 |
 | `/new-worktree [ref]` | owner | create a git worktree for this session's repo at `$PI_BG_WT_DIR/<repo>/<ticket>` (branch `pi-bg/<ticket>`), one at a time |
 | `/merge-worktree [squash]` | owner | merge the active worktree's branch into the live checkout's current branch, then remove worktree + branch; `squash` = one commit |
 | `/jobs kill <id>` | owner | kill an in-flight `pi-bg` run (wraps `pi-bg-kill`) |

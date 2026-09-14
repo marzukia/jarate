@@ -129,8 +129,9 @@ function addEntry(s: UsageStats, entry: unknown, seen: Set<string>): void {
   s.cacheWrite += cacheWrite;
 }
 
-/** Stream a file line by line (never loaded whole); yields a torn last line. */
-async function* linesOf(file: string): AsyncGenerator<string> {
+/** Stream a file line by line (never loaded whole); yields a torn last line.
+ *  Shared scanner for /usage and /context — do not duplicate. */
+export async function* linesOf(file: string): AsyncGenerator<string> {
   // NOTE: must be runtime-agnostic - the bridge runs inside pi (node), not
   // bun. Bun.file() threw ReferenceError in production and the caller's
   // catch turned it into all-zero stats (2026-09-10 /usage incident).

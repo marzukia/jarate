@@ -31,6 +31,7 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import { renderContext } from "./context";
 import { newCtxWatch, observeCtx } from "./ctxwatch";
 import { publishDiff } from "./diff";
 import {
@@ -1523,7 +1524,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2804,6 +2805,7 @@ const HELP_TEXT = [
   "`/btw <question>` - quick side question, answered briefly",
   "`/status` - session stats (owner)",
   "`/usage [all|session|last]` - token usage: current session, all, or last run",
+  "`/context [N]` - what's eating the window: top-N + category totals (est)",
   "`/reset` - start a NEW session, clearing context (owner)",
   "`/restart` - restart pi, resuming THIS session (owner)",
   "`/undo` - revert last assistant turn: files + conversation (owner)",
@@ -3619,6 +3621,21 @@ async function runChannelCommand(
         return { immediate: text };
       } catch {
         return { immediate: fence("[!] usage stats unavailable") };
+      }
+    }
+    case "context": {
+      // #48: what is eating the window: top-N items by token ESTIMATE
+      // (char/4, no model, no pricing) + category totals. Read-only, open
+      // to all like /usage. Session discovery is the same /undo path;
+      // frame (40-col budget) is built by renderContext, errors are one
+      // [!] line, no stack.
+      try {
+        const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
+        // Error paths return a bare [!] line (no fence), success returns
+        // the framed block (fenced here, per the style guide).
+        return { immediate: text.startsWith("[!]") ? text : fence(text) };
+      } catch {
+        return { immediate: "[!] context stats unavailable" };
       }
     }
     case "diff": {
@@ -4542,6 +4559,7 @@ export async function handleInbound(
     const allowedWhileCompacting =
       cmd.name === "status" ||
       cmd.name === "usage" ||
+      cmd.name === "context" ||
       cmd.name === "jobs" ||
       cmd.name === "diff" ||
       cmd.name === "sleep" ||
