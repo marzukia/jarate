@@ -756,7 +756,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) =>
         c.method === "POST" &&
         c.url.endsWith("/channels/ch1/messages") &&
-        String(JSON.parse(c.body).content).startsWith("┣ working"),
+        String(JSON.parse(c.body).content).includes("┣ working"), // fenced placeholder (style guide v3)
     );
     expect(placeholder).toBeDefined(); // live block existed during the run
     const deleted = fetchCalls.find(
@@ -894,7 +894,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "POST" &&
           c.url.endsWith("/channels/ch1/messages") &&
-          String(JSON.parse(c.body).content).startsWith("┣ working"),
+          String(JSON.parse(c.body).content).includes("┣ working"), // fenced (style guide v3)
       ),
     ).toBe(true); // live block exists (mock id out1)
 

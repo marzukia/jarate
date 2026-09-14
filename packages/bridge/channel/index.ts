@@ -1188,6 +1188,11 @@ export function statusLine(
   return `┣ ${fit(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
 }
 
+/** Live status frames render inside a code fence (style guide v3):
+ * box-drawing chars stay aligned on mobile, no markdown mangling.
+ * Andryo 2026-09-14. */
+export const fence = (s: string): string => "```\n" + s + "\n```";
+
 /** Max sub-step lines in a done frame (older calls overflow to the +N line). */
 export const DONE_FRAME_MAX_STEPS = 8;
 
@@ -2056,13 +2061,15 @@ export default function (pi: ExtensionAPI) {
       if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
-      return lastToolAction
-        ? statusLine(
-            lastToolAction,
-            verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
-            Date.now() - inc * 1000,
-          )
-        : `┣ working… ${inc}s`;
+      return fence(
+        lastToolAction
+          ? statusLine(
+              lastToolAction,
+              verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
+              Date.now() - inc * 1000,
+            )
+          : `┣ working… ${inc}s`,
+      );
     });
   };
 
@@ -2123,10 +2130,12 @@ export default function (pi: ExtensionAPI) {
     // level 2 renders every call.
     const lvl = verboseLevel(ch);
     if (lvl === 0 || (lvl === 1 && !essential)) return;
-    const line = statusLine(
-      lastToolAction,
-      lvl === 1 ? runEssentialCount : runToolCount,
-      runStartedAt,
+    const line = fence(
+      statusLine(
+        lastToolAction,
+        lvl === 1 ? runEssentialCount : runToolCount,
+        runStartedAt,
+      ),
     );
     try {
       if (!statusMsgId) {
@@ -2184,7 +2193,7 @@ export default function (pi: ExtensionAPI) {
       // Run state still tracks the run, so agent_end's done-line no-ops
       // cleanly.
       if (verboseLevel(ch) === 2) {
-        const r = await sendDiscordMessage(ch, "┣ working…");
+        const r = await sendDiscordMessage(ch, fence("┣ working…"));
         if (r.success && r.messageId) {
           statusMsgId = r.messageId;
           statusChannelId = ch.id;
