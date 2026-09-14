@@ -319,6 +319,26 @@ describe("formatContext", () => {
       expect(line.length).toBeLessThanOrEqual(40);
   });
 
+  test("biggest line worst case: assistant toolCall + tool name stays <= 40", () => {
+    const s: CtxScan = {
+      items: [
+        {
+          role: "assistant",
+          type: "toolCall",
+          chars: 92000,
+          ts: 0,
+          tool: "bash",
+        },
+      ],
+      totalChars: 92000,
+      baseTs: 0,
+    };
+    const text = formatContext(s, 10, Date.parse(T0));
+    const biggest = text.split("\n").pop()!;
+    expect(biggest).toBe("└ biggest: asst toolCall     23K (bash)");
+    expect(biggest.length).toBeLessThanOrEqual(40);
+  });
+
   test("empty scan: (no sized items), no biggest line", () => {
     expect(
       formatContext(
@@ -336,6 +356,7 @@ describe("formatContext", () => {
         "│ user          0  (0)",
         "│ assistant     0  (0)",
         "│ tool          0  (0)",
+        "└ no entries",
       ].join("\n"),
     );
   });

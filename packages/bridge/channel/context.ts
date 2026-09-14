@@ -265,9 +265,13 @@ export function formatContext(
   if (shown > 0) {
     const top = items[0];
     const name = top.tool ? ` (${top.tool.slice(0, 4)})` : "";
+    // "asst" keeps the worst case (assistant + toolCall + tool name) at 40
     L.push(
-      `└ biggest: ${top.role} ${top.type.padEnd(10)} ${fmtTokens(estTokens(top.chars)).padStart(5)}${name}`,
+      `└ biggest: ${top.role === "assistant" ? "asst" : top.role} ${top.type.padEnd(10)} ${fmtTokens(estTokens(top.chars)).padStart(5)}${name}`,
     );
+  } else {
+    // empty scan still closes the frame (STYLE 2.2: never ship open)
+    L.push("└ no entries");
   }
   return L.join("\n");
 }
