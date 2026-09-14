@@ -333,9 +333,9 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
     expect(r.out).toContain("cgroup escape active"); // escape ran, in the fake root
     const runId = fx.records()[0].run;
     // the ticket dir lived under the fixture root and was reaped on exit
-    expect(
-      fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId)),
-    ).toBe(false);
+    expect(fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId))).toBe(
+      false,
+    );
     // ...and NOT under the real user cgroup root
     expect(fs.existsSync(path.join(realCgRoot, runId))).toBe(false);
   });
