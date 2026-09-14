@@ -6,8 +6,9 @@
  *   (a) REGISTRY: exact literals from ~/.pi/agent/secrets.txt
  *       ($JARATE_SECRETS_FILE overrides), longest first.
  *       → [REDACTED:secret#N]
- *   (b) PATTERN: built-in classes (GitHub/GitLab/Anthropic/OpenAI/AWS/
- *       Google/Slack/Bearer/DSN/sshpass/key-value). → [REDACTED:<class>]
+ *   (b) PATTERN: built-in classes (GitHub/Switchboard/GitLab/Anthropic/
+ *       OpenAI/AWS/Google/Slack/Bearer/DSN/sshpass/key-value).
+ *       → [REDACTED:<class>]
  *
  * Guarantees:
  *   - the raw value never appears in the output
@@ -103,9 +104,22 @@ interface PatternRule {
  */
 const RULES: PatternRule[] = [
   {
+    // Classic PAT: ghp_/gho_/ghu_/ghs_/ghr_ + exactly 36 alnum.
+    // Fine-grained: github_pat_ + 22..255 word chars. Short/partial runs
+    // are not token-shaped and must not trigger (issue #54).
     cls: "github",
-    re: /\b(?:github_pat_[A-Za-z0-9_]{22,}|gh[pousr]_[A-Za-z0-9]{16,})\b/g,
+    re: /\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})\b/g,
     sub: () => "[REDACTED:github]",
+  },
+  {
+    // Switchboard house key: sbk_<name>_<16 hex> (docs/NEW-AGENT.md).
+    // The tool-line renderer escapes underscores for markdown (sbk\_jimmy\_),
+    // and a 26-char key fits the 31-col bash clip — so the pattern must
+    // accept the escaped form too. The classic/fine-grained GitHub shapes
+    // are longer than any tool-line clip and reach the censor unescaped.
+    cls: "switchboard",
+    re: /\bsbk\\?_[A-Za-z0-9\\_]{8,}\b/g,
+    sub: () => "[REDACTED:switchboard]",
   },
   {
     cls: "gitlab",

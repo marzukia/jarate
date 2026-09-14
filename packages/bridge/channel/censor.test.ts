@@ -9,6 +9,7 @@ import {
   clearRegistryCache,
   loadRegistry,
 } from "./censor";
+import { toolActionText } from "./index";
 
 let tmp: string;
 let registryFile: string;
@@ -31,14 +32,26 @@ const reg = (lines: string[]) => {
   clearRegistryCache();
 };
 
+// Realistic token shapes (classic PAT = prefix + exactly 36 alnum;
+// switchboard key = sbk_<name>_<16 hex>).
+const T36 = "aB3".repeat(12); // 36 alnum
+const GHP = `ghp_${T36}`;
+const GHO = `gho_${T36}`;
+const SBK = "sbk_<agent>_<hex>";
+
 describe("pattern classes", () => {
-  test("github classic token ghp_", () => {
-    const out = censor(
-      `url: https://ghp_aBc123D456eF78901234567890123456@github.com/x/y.git`,
-      { file: R },
-    );
-    expect(out).toContain("[REDACTED:github]");
-    expect(out).not.toContain("ghp_aBc123");
+  test("github classic token ghp_ (36 alnum)", () => {
+    const out = censor(`url: https://${GHP}@github.com/x/y.git`, { file: R });
+    expect(out).toBe(`url: https://[REDACTED:github]@github.com/x/y.git`);
+    expect(out).not.toContain(T36);
+  });
+
+  test("github: every classic prefix form (36 alnum)", () => {
+    for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]) {
+      expect(censor(`x ${prefix}${T36} y`, { file: R })).toBe(
+        "x [REDACTED:github] y",
+      );
+    }
   });
 
   test("github fine-grained token github_pat_", () => {
@@ -49,13 +62,73 @@ describe("pattern classes", () => {
   });
 
   test("github read-only token gho_ (x-access-token)", () => {
-    const out = censor(
-      "https://x-access-token:gho_Xy9876543210AbCdEfGhIjKl@h",
-      {
-        file: R,
-      },
-    );
+    const out = censor(`https://x-access-token:${GHO}@h`, { file: R });
     expect(out).toContain("x-access-token:[REDACTED:github]@h");
+  });
+
+  test("github_pat_: 22 and 255 word chars redact; 21 and 256 stay", () => {
+    const min = `github_pat_${"a1".repeat(11)}`; // 22
+    const max = `github_pat_${"b2c".repeat(85)}`; // 255
+    expect(censor(min, { file: R })).toBe("[REDACTED:github]");
+    expect(censor(max, { file: R })).toBe("[REDACTED:github]");
+    const short = `github_pat_${"a".repeat(21)}`;
+    const long = `github_pat_${"b".repeat(256)}`;
+    expect(censor(short, { file: R })).toBe(short);
+    expect(censor(long, { file: R })).toBe(long);
+  });
+
+  test("github: short/partial runs do not trigger (no false positives)", () => {
+    const s35 = `ghp_${"c".repeat(35)}`; // one short of a real token
+    const s37 = `ghp_${"d".repeat(37)}`; // one long: not a token shape
+    expect(censor(s35, { file: R })).toBe(s35);
+    expect(censor(s37, { file: R })).toBe(s37);
+    expect(censor("ghp_ and ghp_abc are not tokens", { file: R })).toBe(
+      "ghp_ and ghp_abc are not tokens",
+    );
+    // no word boundary before the prefix: not token-shaped
+    expect(censor(`xghp_${T36}`, { file: R })).toBe(`xghp_${T36}`);
+  });
+
+  test("switchboard house key sbk_ (issue #54)", () => {
+    expect(censor(SBK, { file: R })).toBe("[REDACTED:switchboard]");
+    expect(censor(`apiKey ${SBK}`, { file: R })).toBe(
+      "apiKey [REDACTED:switchboard]",
+    );
+    // rendered tool-line form: markdown-escaped underscores
+    expect(
+      censor(`bash echo sbk\\_jimmy\\_56659a2ca404b4a6`, { file: R }),
+    ).toBe("bash echo [REDACTED:switchboard]");
+    // short tails and the bare prefix stay
+    expect(censor("the sbk_ key and sbk_abc", { file: R })).toBe(
+      "the sbk_ key and sbk_abc",
+    );
+  });
+
+  test("forwarded tool-call line: inline GH_TOKEN redacts (issue #54 leak shape)", () => {
+    const line = `┣ bash python3 -c "import os" GH_TOKEN=${GHP} SHARD=1`;
+    const out = censor(line, { file: R });
+    expect(out).toBe(
+      `┣ bash python3 -c "import os" GH_TOKEN=[REDACTED:github] SHARD=1`,
+    );
+    expect(out).not.toContain(T36);
+  });
+
+  test("render path: toolActionText line censored at the choke point", () => {
+    // The 26-char switchboard key fits the 31-col bash clip, so a rendered
+    // tool line can carry the FULL key — markdown-escaped (sbk\_jimmy\_),
+    // and the censor must take it out.
+    const action = toolActionText("bash", { command: `echo ${SBK}` });
+    expect(action).toBe(`bash echo sbk\\_jimmy\\_56659a2ca404b4a6`);
+    expect(censor(action, { file: R })).toBe(
+      "bash echo [REDACTED:switchboard]",
+    );
+    // A classic token (40 chars) can never survive the 31-col clip whole;
+    // whatever fragment remains is not a working token, and the full value
+    // must not appear.
+    const clipped = toolActionText("bash", {
+      command: `GH_TOKEN=${GHP} python -c 'print(1)'`,
+    });
+    expect(censor(clipped, { file: R })).not.toContain(GHP);
   });
 
   test("gitlab glpat-", () => {
@@ -181,14 +254,8 @@ describe("registry", () => {
   });
 
   test("missing file = patterns only, never an error", () => {
-    expect(() =>
-      censor("testpass and ghp_aBc123D456eF78901234567890123456", {
-        file: R,
-      }),
-    ).not.toThrow();
-    const out = censor("testpass and ghp_aBc123D456eF78901234567890123456", {
-      file: R,
-    });
+    expect(() => censor(`testpass and ${GHP}`, { file: R })).not.toThrow();
+    const out = censor(`testpass and ${GHP}`, { file: R });
     expect(out).toContain("testpass"); // no registry → literal survives
     expect(out).toContain("[REDACTED:github]"); // patterns still fire
   });
@@ -230,7 +297,7 @@ describe("behavior", () => {
 
   test("idempotent: censor(censor(x)) === censor(x)", () => {
     const x = [
-      "ghp_aBc123D456eF78901234567890123456",
+      GHP,
       "postgres://u:p@h:5432/d",
       "sshpass -p pw cmd",
       '```password=x\ntoken: "abcdef123"```',
@@ -279,19 +346,19 @@ describe("behavior", () => {
 
   test("pattern match logs WARN with class only", () => {
     const lines: string[] = [];
-    censor("ghp_aBc123D456eF78901234567890123456", {
+    censor(GHP, {
       file: R,
       log: (l) => lines.push(l),
     });
     expect(lines.some((l) => l.includes("class=github"))).toBe(true);
-    expect(lines.join(" ")).not.toContain("ghp_aBc123");
+    expect(lines.join(" ")).not.toContain("ghp_aB3");
   });
 
   test("WARN fires once per fingerprint (tick-edit spam guard)", () => {
     const lines: string[] = [];
     const opts = { file: R, log: (l: string) => lines.push(l) };
-    censor("ghp_aBc123D456eF78901234567890123456", opts);
-    censor("ghp_aBc123D456eF78901234567890123456", opts);
+    censor(GHP, opts);
+    censor(GHP, opts);
     expect(lines).toHaveLength(1);
   });
 });
@@ -307,15 +374,12 @@ describe("jarate-censor CLI (bin/jarate-censor: stdin -> censor -> stdout)", () 
 
   test("redacts with the same registry the bridge uses", () => {
     reg(["trailsecret"]);
-    const out = run(
-      "here is trailsecret and ghp_aBc123D456eF78901234567890123456\n",
-      registryFile,
-    );
+    const out = run(`here is trailsecret and ${GHP}\n`, registryFile);
     expect(out).toBe("here is [REDACTED:secret#1] and [REDACTED:github]\n");
   });
 
   test("missing registry = patterns only, never fails the caller", () => {
-    const out = run("ghp_aBc123D456eF78901234567890123456", R);
+    const out = run(GHP, R);
     expect(out).toBe("[REDACTED:github]");
   });
 
