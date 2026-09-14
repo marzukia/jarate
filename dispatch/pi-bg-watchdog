@@ -23,6 +23,10 @@
 #   4. if the dir mtime is older than 20 min and the ticket is not already
 #      in today's dead letter log -> post a DEAD webhook (same url source
 #      and embed format as pi-bg) and append ~/.pi-bg-deadlog
+#   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
+#      `jarate agents-check`; on drift post ONE warning per drifted hash
+#      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
+#      never blocks. jarate missing/unreadable -> skip silently.
 #
 # config (same source as pi-bg):
 #   $PI_DISPATCH_WEBHOOK or first line of ~/.config/pi-dispatch/webhook
@@ -143,6 +147,25 @@ json.dump({"embeds": [embed]}, sys.stdout)
 PY
 }
 
+# wd_build_drift <body-file> <hash8> <ts>
+# AGENTS.md drift warning (alert-only tripwire). Message format is fixed:
+#   AGENTS.md drift: <hash8> since <ts> — review + re-bless: jarate agents-bless "note"
+wd_build_drift() {
+  local bodyfile="$1" h8="$2" ts="$3"
+  WD_H8="$h8" WD_TS="$ts" python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+h8 = os.environ.get("WD_H8", "")
+ts = os.environ.get("WD_TS", "unknown")
+embed = {"author": {"name": "pi-bg watchdog"},
+         "color": 15105570,  # orange, same as the DEAD sweep
+         "title": "AGENTS.md drift",
+         "description": f'AGENTS.md drift: {h8} since {ts} \u2014 review + re-bless: jarate agents-bless "note"',
+         "footer": {"text": "pi-bg watchdog"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+}
+
 found=0
 DT=(); DREPO=(); DP=(); DLAST=(); DREAS=()
 for d in "$WT_DIR"/*/*/; do
@@ -216,6 +239,62 @@ PY
     fi
   fi
   rm -f "$bodyf"
+fi
+
+# ─── AGENTS.md drift tripwire (2026-09-14, alert-only) ────────────────────────
+# Manifest: ~/.pi/agent/.agents-md-hash (<sha256>  <ts>  <note>). The check
+# itself never blocks; this section only decides whether to post. One warning
+# per drifted hash: the full drifted hash is remembered in
+# ~/.pi/agent/.agents-md-drift-warned (written only after a successful post,
+# so a dead webhook retries on the next sweep). Backward compatible: jarate
+# missing/unreadable, jq/python missing, or a non-drift check -> skip
+# silently, sweep still exits 0.
+JARATE_BIN="${HOME}/bin/jarate"
+DRIFT_STATE="${HOME}/.pi/agent/.agents-md-drift-warned"
+# same resolution as jarate agents-check: JARATE_AGENTS_MD override first,
+# then canonical ~/.pi/agent/AGENTS.md, else ~/AGENTS.md. The manifest sits at
+# the fixed path unless the override moves it next to the checked file.
+if [ -n "${JARATE_AGENTS_MD:-}" ]; then
+  AGENTS_MD="$JARATE_AGENTS_MD"
+  MANIFEST="$(dirname "$JARATE_AGENTS_MD")/.agents-md-hash"
+else
+  AGENTS_MD="${HOME}/.pi/agent/AGENTS.md"
+  [ -f "$AGENTS_MD" ] || AGENTS_MD="${HOME}/AGENTS.md"
+  MANIFEST="${HOME}/.pi/agent/.agents-md-hash"
+fi
+if [ -x "$JARATE_BIN" ]; then
+  check_json="$(timeout 30 "$JARATE_BIN" agents-check 2>/dev/null)" || check_json=""
+  if [ -n "$check_json" ]; then
+    c_ok="$(jq -r '.ok // false' <<<"$check_json" 2>/dev/null)"
+    c_drift="$(jq -r '.drift // false' <<<"$check_json" 2>/dev/null)"
+    c_hash="$(jq -r '.hash // empty' <<<"$check_json" 2>/dev/null)"
+    if [ "$c_ok" = "true" ] && [ "$c_drift" = "true" ] && [ -n "$c_hash" ]; then
+      prev_warned="$(cat "$DRIFT_STATE" 2>/dev/null)"
+      if [ "$prev_warned" != "$c_hash" ]; then
+        # <ts>: the manifest's blessing timestamp; if the manifest is
+        # missing (never blessed), the AGENTS.md mtime; else unknown.
+        c_ts="$(awk 'NR==1 {print $2; exit}' "$MANIFEST" 2>/dev/null)"
+        if [ -z "$c_ts" ] && [ -f "$AGENTS_MD" ]; then
+          c_ts="$(date -u -d "@$(stat -c %Y "$AGENTS_MD" 2>/dev/null)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        fi
+        [ -n "$c_ts" ] || c_ts="unknown"
+        echo "[pi-bg-watchdog] AGENTS.md drift: ${c_hash:0:8} since $c_ts"
+        if [ "$DRY" -eq 1 ]; then
+          echo "[pi-bg-watchdog] dry-run: would post AGENTS.md drift warning (${c_hash:0:8})"
+        elif [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
+          bodyf="$BG_TMP/pi-bg-watchdog-drift-body.json"
+          wd_build_drift "$bodyf" "${c_hash:0:8}" "$c_ts"
+          if [ -s "$bodyf" ]; then
+            if wd_post "$bodyf"; then
+              mkdir -p "$(dirname "$DRIFT_STATE")" 2>/dev/null
+              printf '%s\n' "$c_hash" > "$DRIFT_STATE"
+            fi
+          fi
+          rm -f "$bodyf"
+        fi
+      fi
+    fi
+  fi
 fi
 
 # auto-prune: killed-marked worktrees older than PRUNE_DAYS (0 = off)
