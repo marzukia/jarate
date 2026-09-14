@@ -30,6 +30,12 @@
 #   with instructions — never a silent empty-completion retry loop.
 # No webhook (issue #30): loud warning at dispatch + a run record in
 #   ~/.pi-dispatch/runs/pi-bg-<id>.json marked "delivery":"none".
+# Heartbeat (issue #52): $PI_BG_TMPDIR/pi-bg-<id>-hb is touched by a
+#   background child every 30s ($PI_BG_HB_INTERVAL test override); the
+#   exit trap kills it so it never outlives the run. The watchdog: live
+#   process + hb stale > 10 min = STALLED (a hung run, distinct from DEAD).
+# Run record state (issue #51): "running" at dispatch, "done" on every
+#   trapped exit, "killed" when pi-bg-kill finalizes the ticket.
 # Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live pi-bg
 #   runs per user (default 3; 0 = unlimited, operator escape hatch). The
 #   fleet shares one vLLM endpoint; unbounded fan-out starved the prefix
@@ -300,6 +306,7 @@ rec = {
     "cwd": os.environ["PI_BG_REC_CWD"],
     "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "delivery": os.environ["PI_BG_REC_DELIVERY"],
+    "state": "running",
 }
 with open(sys.argv[1], "w") as fh:
     json.dump(rec, fh, indent=2)
@@ -510,6 +517,26 @@ json.dump({"embeds": [embed]}, sys.stdout)
 PY
 }
 
+# bg_mark_record <state>: terminal state for the run record (issue #51):
+# one-shot runs (task/cron/sleep wakes) must not accumulate "running"
+# records. Audit-only: a missing/corrupt record is skipped silently (the
+# watchdog's age-based prune is the backstop).
+bg_mark_record() {
+  local f="$rec_dir/pi-bg-${run_id}.json"
+  [ -f "$f" ] || return 0
+  PI_BG_REC_STATE="$1" python3 - "$f" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = os.environ.get("PI_BG_REC_STATE", "done")
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+}
+
 # bg_on_exit: cgroup cleanup + the 'died without report' fallback + per-run
 # temp-file cleanup. If we exit with no out.md and no posted callback, post
 # DIED so the orchestrator wakes. (covers TERM/INT/normal-exit paths; SIGKILL
@@ -524,6 +551,18 @@ PY
 # can't run this at all — pi-bg-kill reaps the drained cgroup dir itself.
 bg_on_exit() {
   local ec=$?
+  # heartbeat child (issue #52): stop it FIRST so its in-flight sleep can't
+  # hold a member in the ticket cgroup during the drain/rmdir below
+  if [ -n "${hb_pid:-}" ]; then
+    kill "$hb_pid" 2>/dev/null
+    wait "$hb_pid" 2>/dev/null
+    hb_pid=""
+  fi
+  # run record: terminal state (issue #51). Written BEFORE the cgroup drain
+  # on purpose: pi-bg-kill only finalizes "killed" after the drain confirms
+  # empty, so "done" is guaranteed first and an operator kill ends up
+  # "killed". (SIGKILL skips this whole trap; the watchdog prunes by age.)
+  bg_mark_record "done"
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
      [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
@@ -561,7 +600,37 @@ bg_on_exit() {
         "$BG_TMP/pi-bg-${run_id}-prompt.md" \
         "$BG_TMP/pi-bg-${run_id}-wb-resp.txt" 2>/dev/null || true
   rm -f "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
+  rm -f "$hb_f" 2>/dev/null || true
 }
+
+# --- heartbeat (issue #52): long workers emit no signal between dispatch
+#     and completion; the watchdog tells dead-from-alive only by process
+#     existence, so a stalled-but-alive run (hung tool, wedged model call)
+#     looks healthy until it dies. A background child touches <id>-hb
+#     every ${HB_INTERVAL}s; bg_on_exit kills it (and its in-flight sleep)
+#     so it never outlives the run. The child also self-terminates when the
+#     wrapper dies untrappably (SIGKILL): the loop checks the wrapper's pid
+#     ($$ inside a subshell is the parent's) each tick. Forked AFTER the
+#     cgroup escape so it lands in the ticket cgroup (pi-bg-kill signals it
+#     with the rest of the tree). Started right before the EXIT trap is
+#     registered below, so every exit from this point on is trapped;
+#     hb_pid="" guards bg_on_exit either way.
+HB_INTERVAL="${PI_BG_HB_INTERVAL:-30}"
+hb_f="$BG_TMP/pi-bg-${run_id}-hb"
+touch "$hb_f" 2>/dev/null || true
+hb_pid=""
+(
+  trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 143' TERM INT
+  s=""
+  while kill -0 "$$" 2>/dev/null; do
+    touch "$hb_f" 2>/dev/null
+    sleep "$HB_INTERVAL" &
+    s=$!
+    wait "$s" 2>/dev/null
+  done
+) &
+hb_pid=$!
+
 trap bg_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM

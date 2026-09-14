@@ -56,6 +56,10 @@ function fixture() {
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_SERVICE;
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
+  // issue #56: pi-bg workers re-export PI_BG_SETSID=1 into their own session
+  // (the setsid re-exec prefix); a suite run inside such a worker would hit
+  // the re-exec guard and skip setsid. Isolate like the vars above.
+  delete env.PI_BG_SETSID;
   // cap off by default: ambient fleet traffic (real pi-bg runs of this
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
   // PI_BG_MAX_CONCURRENT explicitly per spawn.
@@ -429,11 +433,56 @@ describe("persistent artifact dir: ~/.pi-bg-art default (2026-09-13 reboot fix)"
 });
 
 const WD = path.join(import.meta.dir, "pi-bg-watchdog");
+const KILL = path.join(import.meta.dir, "pi-bg-kill");
+
+// fake ids in year 2099: never collide with real tickets in /tmp
+const TID = (n: number) => `20991231-235959-${n}`;
+
+/** True when any live process's cmdline contains needle (orphan probe). */
+function liveProcWith(needle: string): boolean {
+  for (const d of fs.readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
+    try {
+      if (fs.readFileSync(`/proc/${d}/cmdline`, "utf8").includes(needle)) return true;
+    } catch {
+      /* vanished */
+    }
+  }
+  return false;
+}
+
+/**
+ * Watchdog fixture for the STALLED / run-state-prune tests (issues #51, #52):
+ * same shape as the rule-3 wdFixture below + an env-overrides map for run()
+ * (webhook capture, PI_DISPATCH_RECORD_DIR, PI_BG_STALL_MIN, ...).
+ */
+function wdFixtureX(n: number) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-wd-"));
+  tmpDirs.push(tmp);
+  const home = path.join(tmp, "home");
+  const wtDir = path.join(tmp, "wt", "jarate", TID(n));
+  const art = path.join(tmp, "art");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(wtDir, { recursive: true });
+  fs.mkdirSync(art, { recursive: true });
+  // age the ticket dir past the 20-min sweep threshold (dead-ticket cases)
+  const old = new Date(Date.now() - 30 * 60 * 1000);
+  fs.utimesSync(wtDir, old, old);
+  const env = { ...process.env } as Record<string, string>;
+  env.HOME = home;
+  env.PI_BG_WT_DIR = path.join(tmp, "wt");
+  env.PI_BG_TMPDIR = art;
+  // keep the sweep (incl. the empty-cgroup reaper) off the real cgroup fs
+  env.PI_BG_CG_ROOT = path.join(tmp, "cg");
+  delete env.PI_DISPATCH_WEBHOOK;
+  delete env.PI_BG_SETSID;
+  const run = (
+    args: string[] = ["--dry-run"],
+    overrides?: Record<string, string>,
+  ) => runScript(WD, args, { ...env, ...overrides }, tmp);
+  return { tmp, art, run };
+}
 
 describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
-  // fake ids in year 2099: never collide with real tickets in /tmp
-  const TID = (n: number) => `20991231-235959-${n}`;
-
   function wdFixture(n: number) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-wd-"));
     tmpDirs.push(tmp);
@@ -1128,4 +1177,347 @@ describe("#56: session isolation (setsid at launch)", () => {
       execSync(`pkill -f "${fx.tmp}/bin/[p]i" 2>/dev/null || true`);
     }
   }, 40_000);
+});
+
+describe("#52: heartbeat (hb artifact, created at dispatch, gone on exit)", () => {
+  test("hb file exists mid-run, ticks, and is removed on exit; no orphan child", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_HB_INTERVAL = "1"; // fast ticks for the test
+    fs.mkdirSync(art, { recursive: true });
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      "#!/bin/sh\nsleep 3\necho pi-run-ok\n",
+    );
+    const p = spawn(["bash", PI_BG, "worker", "heartbeat probe task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // hb file appears while the run is in flight
+      let hb = "";
+      const t0 = Date.now();
+      while (!hb && Date.now() - t0 < 8000) {
+        const c = fs.readdirSync(art).filter((f) => f.endsWith("-hb"));
+        if (c.length === 1) hb = path.join(art, c[0]);
+        await Bun.sleep(100);
+      }
+      expect(hb).toMatch(/pi-bg-\d{8}-\d{6}-\d+-hb$/);
+      // it ticks: mtime advances within two intervals
+      const m1 = fs.statSync(hb).mtimeMs;
+      await Bun.sleep(2300);
+      const m2 = fs.statSync(hb).mtimeMs;
+      expect(m2).toBeGreaterThan(m1);
+      const [out, err] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      expect(code).toBe(0);
+      expect(out).toContain("pi-run-ok");
+      expect(err).not.toContain("traceback");
+      // exit trap removed the hb file...
+      expect(fs.existsSync(hb)).toBe(false);
+      // ...and there is no orphan hb child left (a live child would re-touch
+      // the file within its 1s interval and show up in /proc)
+      await Bun.sleep(1500);
+      expect(fs.existsSync(hb)).toBe(false);
+      expect(liveProcWith("heartbeat probe task")).toBe(false);
+    } finally {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 40_000);
+});
+
+describe("#52: watchdog STALLED classification (live + stale heartbeat)", () => {
+  const capturePosts = () => {
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      posts,
+      close: () => server.stop(true),
+    };
+  };
+
+  // fake liveness: put this test process into the ticket's (fake) cgroup
+  const makeLive = (fx: ReturnType<typeof wdFixtureX>, t: string) => {
+    const cg = path.join(fx.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+  };
+
+  const plantHb = (
+    fx: ReturnType<typeof wdFixtureX>,
+    t: string,
+    minsAgo: number,
+  ) => {
+    const hb = path.join(fx.art, `pi-bg-${t}-hb`);
+    fs.writeFileSync(hb, "");
+    const old = new Date(Date.now() - minsAgo * 60 * 1000);
+    fs.utimesSync(hb, old, old);
+  };
+
+  test("live + stale hb: STALLED line + embed post, deduped on the next sweep", async () => {
+    const fx = wdFixtureX(10);
+    const t = TID(10);
+    makeLive(fx, t);
+    plantHb(fx, t, 11); // past the default 10-min threshold
+    const hook = capturePosts();
+    try {
+      const r1 = await fx.run([], { PI_DISPATCH_WEBHOOK: hook.url });
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`STALLED jarate/${t}`);
+      expect(r1.out).not.toContain(`DEAD jarate/${t}`);
+      expect(hook.posts.length).toBe(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toContain("1 stalled ticket");
+      expect(em.title).not.toContain("dead");
+      expect(em.description).toContain(`jarate/${t}`);
+      expect(em.color).toBe(15158332);
+      // the ticket is NOT marked dead: no cgroup reap, no deadlog DEAD entry
+      expect(fs.existsSync(path.join(fx.tmp, "cg", "pi-bg", t))).toBe(true);
+      // second sweep: same ticket already in today's dead log -> no re-post
+      const r2 = await fx.run([], { PI_DISPATCH_WEBHOOK: hook.url });
+      expect(r2.out).not.toContain(`STALLED jarate/${t}`);
+      expect(hook.posts.length).toBe(1);
+    } finally {
+      hook.close();
+      fs.rmSync(path.join(fx.tmp, "home", ".pi-bg-deadlog"), { force: true });
+    }
+  }, 60_000);
+
+  test("live + fresh hb: healthy run stays silent", async () => {
+    const fx = wdFixtureX(11);
+    const t = TID(11);
+    makeLive(fx, t);
+    plantHb(fx, t, 0);
+    const hook = capturePosts();
+    try {
+      const r = await fx.run([], { PI_DISPATCH_WEBHOOK: hook.url });
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("STALLED");
+      expect(hook.posts.length).toBe(0);
+    } finally {
+      hook.close();
+    }
+  }, 60_000);
+
+  test("live + no hb file (pre-upgrade run): no behavior change, silent", async () => {
+    const fx = wdFixtureX(12);
+    const t = TID(12);
+    makeLive(fx, t);
+    const hook = capturePosts();
+    try {
+      const r = await fx.run([], { PI_DISPATCH_WEBHOOK: hook.url });
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("STALLED");
+      expect(hook.posts.length).toBe(0);
+    } finally {
+      hook.close();
+    }
+  }, 60_000);
+
+  test("dead ticket with stale hb: DEAD wins (process gone, not stalled)", async () => {
+    const fx = wdFixtureX(13);
+    const t = TID(13);
+    plantHb(fx, t, 11);
+    const hook = capturePosts();
+    try {
+      const r = await fx.run([], { PI_DISPATCH_WEBHOOK: hook.url });
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`DEAD jarate/${t}`);
+      expect(r.out).not.toContain("STALLED");
+      expect(hook.posts[0].embeds[0].title).toContain("DEAD");
+    } finally {
+      hook.close();
+    }
+  }, 60_000);
+
+  test("PI_BG_STALL_MIN override: 11-min-old hb is fresh at 20 min", async () => {
+    const fx = wdFixtureX(14);
+    const t = TID(14);
+    makeLive(fx, t);
+    plantHb(fx, t, 11);
+    const hook = capturePosts();
+    try {
+      const r = await fx.run([], {
+        PI_DISPATCH_WEBHOOK: hook.url,
+        PI_BG_STALL_MIN: "20",
+      });
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("STALLED");
+      expect(hook.posts.length).toBe(0);
+    } finally {
+      hook.close();
+    }
+  }, 60_000);
+});
+
+describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
+  test("completed run: record marked done with finished ts; initial fields intact", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "record done task"]);
+    expect(r.code).toBe(0);
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].state).toBe("done");
+    expect(recs[0].finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(recs[0].started).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(recs[0].profile).toBe("worker");
+    expect(recs[0].delivery).toBe("none");
+  });
+
+  test("killed run: wrapper traps done, pi-bg-kill finalizes state=killed", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_HB_INTERVAL = "1";
+    fs.mkdirSync(art, { recursive: true });
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      "#!/bin/sh\nsleep 30\necho pi-run-ok\n",
+    );
+    const p = spawn(["bash", PI_BG, "worker", "kill record task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
+      let rec: any = null;
+      const t0 = Date.now();
+      while (!rec && Date.now() - t0 < 15000) {
+        let c: string[] = [];
+        try {
+          c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+        } catch {
+          c = []; // the record dir is created by pi-bg after spawn
+        }
+        if (c.length === 1)
+          rec = JSON.parse(fs.readFileSync(path.join(recDir, c[0]), "utf8"));
+        await Bun.sleep(100);
+      }
+      expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
+      const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<string, string>;
+      const k = await runScript(KILL, [rec.run], kenv, fx.tmp);
+      expect(k.code).toBe(0);
+      expect(k.out).toContain(`killed ${rec.run} after`);
+      const code = await p.exited;
+      expect(code).toBe(143);
+      const rec2 = JSON.parse(
+        fs.readFileSync(path.join(recDir, `pi-bg-${rec.run}.json`), "utf8"),
+      );
+      expect(rec2.state).toBe("killed");
+      expect(rec2.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      // kill marker present (the watchdog skips this ticket)
+      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(true);
+      // hb child cleaned up by the wrapper trap (no orphan re-touching it)
+      await Bun.sleep(1500);
+      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-hb`))).toBe(false);
+    } finally {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 40_000);
+
+  // ── watchdog prune of aged run records ─────────────────────────────────────
+
+  const plantRecord = (
+    fx: ReturnType<typeof wdFixtureX>,
+    t: string,
+    daysAgo: number,
+  ): string => {
+    const recDir = path.join(fx.tmp, "rec");
+    fs.mkdirSync(recDir, { recursive: true });
+    const rf = path.join(recDir, `pi-bg-${t}.json`);
+    fs.writeFileSync(
+      rf,
+      JSON.stringify({ run: t, profile: "worker", state: "done" }),
+    );
+    const old = new Date(Date.now() - daysAgo * 86400 * 1000);
+    fs.utimesSync(rf, old, old);
+    for (const suf of ["-raw.out", "-hb", "-killed"]) {
+      fs.writeFileSync(path.join(fx.art, `pi-bg-${t}${suf}`), "x");
+    }
+    return recDir;
+  };
+
+  test("aged record (dead ticket): record + artifact files deleted", async () => {
+    const fx = wdFixtureX(20);
+    const t = TID(20);
+    const recDir = plantRecord(fx, t, 8); // past the default 7 days
+    const r = await fx.run([], { PI_DISPATCH_RECORD_DIR: recDir });
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`pruned run state ${t}`);
+    expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(false);
+    for (const suf of ["-raw.out", "-hb", "-killed"]) {
+      expect(fs.existsSync(path.join(fx.art, `pi-bg-${t}${suf}`))).toBe(false);
+    }
+  }, 60_000);
+
+  test("aged record, LIVE ticket: kept (record + artifacts)", async () => {
+    const fx = wdFixtureX(21);
+    const t = TID(21);
+    const recDir = plantRecord(fx, t, 8);
+    const cg = path.join(fx.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+    const r = await fx.run([], { PI_DISPATCH_RECORD_DIR: recDir });
+    expect(r.out).not.toContain(`pruned run state ${t}`);
+    expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(fx.art, `pi-bg-${t}-raw.out`))).toBe(true);
+  }, 60_000);
+
+  test("fresh record (dead ticket): kept", async () => {
+    const fx = wdFixtureX(22);
+    const t = TID(22);
+    const recDir = plantRecord(fx, t, 0.1); // ~2.4 h old
+    const r = await fx.run([], { PI_DISPATCH_RECORD_DIR: recDir });
+    expect(r.out).not.toContain(`pruned run state ${t}`);
+    expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(true);
+  }, 60_000);
+
+  test("PI_BG_PRUNE_DAYS=14: 8-day-old record kept", async () => {
+    const fx = wdFixtureX(23);
+    const t = TID(23);
+    const recDir = plantRecord(fx, t, 8);
+    const r = await fx.run([], {
+      PI_DISPATCH_RECORD_DIR: recDir,
+      PI_BG_PRUNE_DAYS: "14",
+    });
+    expect(r.out).not.toContain(`pruned run state ${t}`);
+    expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(true);
+  }, 60_000);
+
+  test("--dry-run: would-prune reported, files stay", async () => {
+    const fx = wdFixtureX(24);
+    const t = TID(24);
+    const recDir = plantRecord(fx, t, 8);
+    const r = await fx.run(["--dry-run"], { PI_DISPATCH_RECORD_DIR: recDir });
+    expect(r.out).toContain(`would prune run state ${t}`);
+    expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(fx.art, `pi-bg-${t}-raw.out`))).toBe(true);
+  }, 60_000);
 });

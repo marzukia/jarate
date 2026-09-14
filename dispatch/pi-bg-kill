@@ -15,7 +15,8 @@
 # then SIGKILL (cgroup.kill + per-pid + per-group fallback). Posts a
 # kind=kill webhook event (same URL source as pi-bg) so the dispatch
 # channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed (the watchdog
-# skips killed tickets).
+# skips killed tickets) + the run record ($PI_DISPATCH_RECORD_DIR,
+# default ~/.pi-dispatch/runs) is marked state=killed (issue #51).
 # env: PI_BG_CG_ROOT (cgroup base, test override), PI_BG_KILL_WAIT,
 #      PI_BG_TMPDIR, PI_DISPATCH_WEBHOOK, PI_BG_WB_BACKOFF (test: 0 = no backoff)
 # exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
@@ -72,7 +73,10 @@ cg_procs() { cat "$CG/cgroup.procs" 2>/dev/null | sort -un; }
 children_of() {
   local want="$1" c s
   for c in /proc/[0-9]*; do
-    s="$( { tr -d '\n' < "$c/stat"; } 2>/dev/null )" || continue
+    # read builtin, no fork: a tr-per-pid subshell made a full /proc scan
+    # ~5s on a 1k-process host (2026-09-15), which consumed the KILL_WAIT
+    # grace before any signal was sent
+    IFS= read -r s 2>/dev/null < "$c/stat" || continue
     s="${s#*) }"  # drop 'pid (comm)' — comm may contain spaces
     [ "${s#* }" = "${s}" ] && continue
     set -- $s
@@ -131,9 +135,15 @@ if [ "$dry" -eq 1 ]; then
 fi
 
 # --- SIGTERM, wait, escalate to SIGKILL ---
-t0="$(date +%s)"
 pids0="$(list_tree | sort -un | tr '\n' ' ')"
 [ -n "$pids0" ] || pids0="(none in cgroup)"
+# t0 AFTER list_tree: KILL_WAIT is the grace window after the TERM, not
+# after script start. list_tree scans /proc and can take seconds on a
+# loaded host; timing from start expired the grace before the TERM was
+# even sent, so the KILL escalation landed milliseconds after the TERM
+# and beat the wrapper's exit trap (left its hb/started files behind,
+# 2026-09-15 incident).
+t0="$(date +%s)"
 
 # issue #56: pi-bg runs under setsid, so a group-leader member of the tree
 # leads the ticket's session (pgid == sid == its pid). Signal those process
@@ -165,11 +175,38 @@ dur=$(( $(date +%s) - t0 ))
 # is alive rmdir fails, and SIGKILLed wrappers can't clean up themselves,
 # so this is where the empty pi-bg/<ticket> dirs get reaped (348 leaked,
 # 2026-09-11). Guarded: never break the kill path over a stubborn dir.
+# A SIGKILLed wrapper leaves its fake cgroup.procs file behind (real
+# cgroupfs auto-removes the entry when the last member dies) and the
+# escalation write above leaves a cgroup.kill file on non-cgroupfs roots -
+# clear both so rmdir works. Drop the heartbeat as well: a killed run must
+# not keep advertising liveness (issue #52).
+rm -f "$CG/cgroup.procs" 2>/dev/null
+rm -f "$CG/cgroup.kill" 2>/dev/null
+rm -f "$BG_TMP/pi-bg-${id}-hb" 2>/dev/null
 [ -d "$CG" ] && rmdir "$CG" 2>/dev/null
 
 printf '%s killed %s by %s after %ss; pids: %s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(id -un)" "$dur" "$pids0" \
   > "$BG_TMP/pi-bg-${id}-killed"
+
+# mark the run record killed (issue #51): the wrapper's exit trap has
+# already marked it "done" (its trap runs before the drain confirms); for
+# an operator kill "killed" is the final state. Same audit-only posture
+# as pi-bg: a missing/corrupt record never breaks the kill path.
+REC_DIR="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+if [ -f "$REC_DIR/pi-bg-${id}.json" ]; then
+  PI_BG_REC_STATE="killed" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+fi
 
 # --- kind=kill webhook event (same URL source + embed shape as pi-bg) ---
 webhook="${PI_DISPATCH_WEBHOOK:-}"
