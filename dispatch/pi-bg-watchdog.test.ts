@@ -46,6 +46,8 @@ function fixture() {
   env.HOME = home;
   env.PI_BG_WT_DIR = path.join(tmp, "wt"); // keep the sweep off real worktrees
   env.PI_BG_TMPDIR = path.join(tmp, "art");
+  // keep the sweep (incl. the empty-cgroup reaper) off the real cgroup fs
+  env.PI_BG_CG_ROOT = path.join(tmp, "cg");
   env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
   delete env.PI_SERVICE;
   delete env.JARATE_AGENTS_MD;
@@ -271,6 +273,83 @@ describe("watchdog AGENTS.md drift tripwire (alert-only, one warn per hash)", ()
       expect(r.code).toBe(0);
       expect(f.posts).toHaveLength(0);
       expect(fs.existsSync(f.state())).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+/**
+ * Empty-cgroup reaper (2026-09-14, pi-bg cgroup-dir leak): the sweep rmdirs
+ * ticket dirs under $PI_BG_CG_ROOT/pi-bg that hold no process (no pids in
+ * cgroup.procs AND no count in cgroup.threads). Non-empty dirs - live run,
+ * or a plain-file test root with a leftover fake procs file - are untouched.
+ */
+describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
+  const TID = (n: number) => `20991231-235959-${900 + n}`;
+  const plant = (f: { tmp: string }, n: number): string => {
+    const d = path.join(f.tmp, "cg", "pi-bg", TID(n));
+    fs.mkdirSync(d, { recursive: true });
+    return d; // mkdirSync(recursive) returns a created ANCESTOR, not the target
+  };
+
+  test("empty dirs reaped; dirs with members (procs or threads) untouched", async () => {
+    const f = fixture();
+    try {
+      // bless the manifest for the current content: this test asserts on
+      // posts, and an unblessed fixture would add one drift warning
+      fs.writeFileSync(
+        f.manifest(),
+        `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  reaper test\n`,
+      );
+      const e1 = plant(f, 1);
+      const e2 = plant(f, 2);
+      const e3 = plant(f, 3);
+      // non-empty: live pid in cgroup.procs (fake root: plain file)
+      const live = plant(f, 4);
+      fs.writeFileSync(path.join(live, "cgroup.procs"), `${process.pid}\n`);
+      // non-empty: threaded mode (count in cgroup.threads only)
+      const threaded = plant(f, 5);
+      fs.writeFileSync(path.join(threaded, "cgroup.threads"), `${process.pid}\n`);
+
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      for (const d of [e1, e2, e3]) {
+        expect(r.out).toContain(`reaped empty cgroup ${d}`);
+        expect(fs.existsSync(d)).toBe(false);
+      }
+      expect(r.out).toContain("reaped 3 empty cgroup dir(s)");
+      expect(fs.existsSync(live)).toBe(true); // members -> untouched
+      expect(fs.existsSync(threaded)).toBe(true); // members -> untouched
+      // reaping is fs cleanup, not webhook alerting
+      expect(f.posts).toHaveLength(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--dry-run: would-reap lines, dirs stay", async () => {
+    const f = fixture();
+    try {
+      const e1 = plant(f, 6);
+      const e2 = plant(f, 7);
+      const r = await f.run(["--dry-run"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dry-run: would reap empty cgroup ${e1}`);
+      expect(r.out).toContain(`dry-run: would reap empty cgroup ${e2}`);
+      expect(fs.existsSync(e1)).toBe(true);
+      expect(fs.existsSync(e2)).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("no pi-bg dirs at all -> sweep exits 0, reaps nothing", async () => {
+    const f = fixture();
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("sweep done: 0 dead ticket(s) found, 0 cgroup dir(s) reaped");
     } finally {
       f.close();
     }

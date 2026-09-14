@@ -60,6 +60,15 @@ function fixture() {
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
   // PI_BG_MAX_CONCURRENT explicitly per spawn.
   env.PI_BG_MAX_CONCURRENT = "0";
+  // cgroup escape into a per-run temp dir, not the REAL user cgroup root
+  // (issue: pi-bg cgroup-dir leak, 2026-09-14): every fixture spawn escaped
+  // into /sys/fs/cgroup/.../user@N.service/pi-bg/, and an interrupted bun
+  // run (SIGKILL, timeout, pi.service restart) left one empty ticket dir
+  // per spawn - 33k of them in 2 days on Monky's box, periodically tripping
+  // the concurrency cap. Pointing ALL spawns at this tmp dir bounds any
+  // leak to the fixture dir. The "cgroup escape" test below still sets its
+  // own PI_BG_CG_ROOT to inspect the escape mid-run.
+  env.PI_BG_CG_ROOT = path.join(tmp, "cg");
 
   const seedMainCreds = () => {
     fs.writeFileSync(
@@ -286,9 +295,12 @@ describe("cgroup escape: self-drain + rmdir on exit; PI_BG_TMPDIR plumbing", () 
     // the wrapper's pid was moved into the escape cgroup at dispatch
     expect(sawEscapePid).toBe(true);
 
-    // on exit the wrapper moved itself back into the parent cgroup (drain)
+    // on exit the wrapper moved itself out of the ticket cgroup (drain);
+    // the drain target is the pi-bg level (a plain file on a fake root),
+    // not cgParent itself (the slice root is EBUSY for that write on real
+    // cgroupfs - see the drain comment in pi-bg)
     const parentProcs = fs
-      .readFileSync(path.join(cgParent, "cgroup.procs"), "utf8")
+      .readFileSync(path.join(cgParent, "pi-bg", "cgroup.procs"), "utf8")
       .split("\n");
     expect(parentProcs.filter((l) => l.trim() === String(p.pid))).toHaveLength(
       1,
@@ -302,6 +314,31 @@ describe("cgroup escape: self-drain + rmdir on exit; PI_BG_TMPDIR plumbing", () 
     expect(files).toContain(`pi-bg-${runId}-out.md`);
     expect(files).toContain(`pi-bg-${runId}-raw.out`);
   }, 30_000);
+});
+
+describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgroup root", () => {
+  // The real root this uid would escape into without the PI_BG_CG_ROOT
+  // override. The regression: before the fix, EVERY fixture spawn created a
+  // ticket dir here, and an interrupted run (bun SIGKILL/timeout, pi.service
+  // restart) left the empty dir behind - 33k dirs in 2 days on Monky's box.
+  const realCgRoot = `/sys/fs/cgroup/user.slice/user-${process.getuid()}.slice/user@${process.getuid()}.service/pi-bg`;
+
+  test("fixture root is a per-run tmp dir; the ticket dir never lands in the real root", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // the override points inside this fixture's tmp dir (all spawns use it)
+    expect(fx.env.PI_BG_CG_ROOT).toContain(fx.tmp);
+    const r = await fx.run(["worker", "cgroup leak regression task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("cgroup escape active"); // escape ran, in the fake root
+    const runId = fx.records()[0].run;
+    // the ticket dir lived under the fixture root and was reaped on exit
+    expect(
+      fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId)),
+    ).toBe(false);
+    // ...and NOT under the real user cgroup root
+    expect(fs.existsSync(path.join(realCgRoot, runId))).toBe(false);
+  });
 });
 
 describe("#30: no webhook => loud warning at dispatch + run record delivery=none", () => {
@@ -413,6 +450,8 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
     env.HOME = home;
     env.PI_BG_WT_DIR = path.join(tmp, "wt");
     env.PI_BG_TMPDIR = art;
+    // keep the sweep (incl. the empty-cgroup reaper) off the real cgroup fs
+    env.PI_BG_CG_ROOT = path.join(tmp, "cg");
     delete env.PI_DISPATCH_WEBHOOK;
     const legacy = (suf: string) => `/tmp/pi-bg-${TID(n)}${suf}`;
     const rmLegacy = () => {

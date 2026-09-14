@@ -62,7 +62,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-CG_DIR="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/pi-bg"
+# PI_BG_CG_ROOT overrides the cgroup base (same hook as pi-bg + pi-bg-kill);
+# tests point the sweep at a per-run fake root instead of the real user slice.
+CG_DIR="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg"
 today="$(date -u +%Y-%m-%d)"
 
 webhook="${PI_DISPATCH_WEBHOOK:-}"
@@ -70,12 +72,23 @@ if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
 fi
 
+# cg_has_members <cgroup-dir>: 0 while the cgroup still holds a process.
+# cgroupfs files ALWAYS report size 0 to stat, so test -s is useless on
+# real cgroups (it silently read "empty" for a live ticket and the cgroup
+# leg of is_live never fired, 2026-09-14); the content must be read.
+# cgroup.threads is checked too: threaded cgroups have no cgroup.procs.
+cg_has_members() {
+  local d="$1"
+  [ -n "$(tr -d '[:space:]' 2>/dev/null < "$d/cgroup.procs")" ] && return 0
+  [ -n "$(tr -d '[:space:]' 2>/dev/null < "$d/cgroup.threads")" ] && return 0
+  return 1
+}
+
 # is_live <ticket> <wt-path>: 0 if a process still matches this ticket
 is_live() {
   local t="$1" d="$2" p cwd me
   me="$(id -un)"
-  [ -s "$CG_DIR/$t/cgroup.procs" ] && return 0
-  [ -s "$CG_DIR/$t/cgroup.threads" ] && return 0
+  cg_has_members "$CG_DIR/$t" && return 0
   for p in /proc/[0-9]*; do
     [ "$(stat -c %U "$p" 2>/dev/null)" = "$me" ] || continue
     cwd="$(readlink "$p/cwd" 2>/dev/null)" || continue
@@ -202,6 +215,28 @@ for d in "$WT_DIR"/*/*/; do
   printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
 done
 
+# ─── empty cgroup reaper (2026-09-14, issue: pi-bg cgroup-dir leak) ─────────
+# A ticket dir that holds no process is a leak: a live run always keeps at
+# least the wrapper shell in its escape cgroup. Untrappable deaths (bun
+# test SIGKILL/timeout, pi.service restart, OOM) kill the wrapper before
+# its exit-trap self-drain; the kernel then drops the cgroup files when the
+# last member dies, leaving an empty dir that accumulates in $CG_DIR.
+# rmdir them: members present -> untouched; rmdir failing (busy race, or a
+# plain-file test root with a leftover fake procs file) -> skip silently.
+reaped=0
+for cg in "$CG_DIR"/*/; do
+  cg="${cg%/}"
+  [ -d "$cg" ] || continue
+  cg_has_members "$cg" && continue
+  if [ "$DRY" -eq 1 ]; then
+    echo "[pi-bg-watchdog] dry-run: would reap empty cgroup $cg"
+  elif rmdir "$cg" 2>/dev/null; then
+    echo "[pi-bg-watchdog] reaped empty cgroup $cg"
+    reaped=$((reaped + 1))
+  fi
+done
+[ "$reaped" -gt 0 ] && echo "[pi-bg-watchdog] reaped $reaped empty cgroup dir(s)"
+
 # Post (flood guard, 2026-09-14): 1-3 dead tickets = one embed each (as
 # before); 4+ = ONE digest embed. A mass-death event (reboot tmpfs wipe,
 # OOM storm) must never spam the channel one embed per corpse.
@@ -315,5 +350,5 @@ if [ "$PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
   [ "$pruned" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned worktree(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found (quiet=$QUIET dry=$DRY prune_days=$PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped (quiet=$QUIET dry=$DRY prune_days=$PRUNE_DAYS)"
 exit 0

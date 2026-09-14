@@ -485,7 +485,16 @@ bg_on_exit() {
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
   fi
   if [ "$ESCAPE_ACTIVE" -eq 1 ]; then
-    echo $$ > "$CG_PARENT/cgroup.procs" 2>/dev/null || true
+    # Drain target is the pi-bg level, NOT $CG_PARENT: the slice root is a
+    # cgroup v2 domain (subtree_control populated) and the no-internal-
+    # process rule makes the write back into it fail EBUSY while ANY
+    # descendant holds a process - which is this shell, until the write
+    # succeeds. So the old write to $CG_PARENT/cgroup.procs always failed
+    # on real cgroupfs, the shell stayed in the ticket cgroup, and the
+    # rmdir below always failed (every run leaked its dir, 2026-09-14).
+    # $CG_PARENT/pi-bg has no controllers enabled, so the write there
+    # always works; the wrapper exits right after, so nothing lingers.
+    echo $$ > "$CG_PARENT/pi-bg/cgroup.procs" 2>/dev/null || true
     # real cgroup v2 auto-removes its files when the last member leaves;
     # on a plain test root the fake file must be removed for rmdir to work
     rm -f "$ESCAPE_CG/cgroup.procs" 2>/dev/null || true
