@@ -27,6 +27,7 @@ import extension, {
   doneFrame,
   earlySendText,
   failurePostText,
+  fence,
   fileOnlyPrompt,
   handleInbound,
   heldChannels,
@@ -976,7 +977,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       );
       return posts
         .map((p) => String(JSON.parse(p.body).content))
-        .find((t) => t.startsWith("[status]"));
+        .find((t) => t.includes("[status]"));
     };
     // off by default: quiet
     await handleInbound(pi, inbound("/status", "m1"), ctx);
@@ -1443,7 +1444,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const ack1 = fetchCalls.find(
         (c) =>
           c.method === "POST" &&
-          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+          String(JSON.parse(c.body).content).includes("[queued] 1 in line"),
       );
       expect(ack1).toBeDefined();
       expect(JSON.parse(ack1!.body).message_reference?.message_id).toBe("m1");
@@ -1454,7 +1455,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const ack2 = fetchCalls.find(
         (c) =>
           c.method === "POST" &&
-          String(JSON.parse(c.body).content) === "[queued] 2 in line",
+          String(JSON.parse(c.body).content).includes("[queued] 2 in line"),
       );
       expect(ack2).toBeDefined();
 
@@ -1476,7 +1477,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const ack = fetchCalls.find(
         (c) =>
           c.method === "POST" &&
-          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+          String(JSON.parse(c.body).content).includes("[queued] 1 in line"),
       );
       expect(ack).toBeDefined();
       jest.advanceTimersByTime(interruptStepTimeoutMs() + 1000);
@@ -1520,7 +1521,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const ack = fetchCalls.find(
         (c) =>
           c.method === "POST" &&
-          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+          String(JSON.parse(c.body).content).includes("[queued] 1 in line"),
       );
       expect(ack).toBeDefined();
     });
@@ -1627,7 +1628,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const patch = fetchCalls.find(
         (c) =>
           c.method === "PATCH" &&
-          String(JSON.parse(c.body).content) === "[queued] 1 in line",
+          String(JSON.parse(c.body).content).includes("[queued] 1 in line"),
       );
       expect(patch).toBeDefined();
     });
@@ -1812,7 +1813,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     const bufferedAck = fetchCalls.find(
       (c) =>
         c.method === "POST" &&
-        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+        String(JSON.parse(c.body).content).includes("[buffered]"),
     );
     expect(bufferedAck).toBeUndefined();
   });
@@ -1845,10 +1846,10 @@ describe("extension handlers (A1/A2/A4)", () => {
     const acks = fetchCalls.filter(
       (c) =>
         c.method === "POST" &&
-        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+        String(JSON.parse(c.body).content).includes("[buffered]"),
     );
     expect(acks.length).toBe(1);
-    expect(JSON.parse(acks[0].body).content).toBe(
+    expect(JSON.parse(acks[0].body).content).toContain(
       "[buffered] 2 files - send text to attach them",
     );
     // No regression: text after buffer consumes the batch with file context.
@@ -1863,7 +1864,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     const acks2 = fetchCalls.filter(
       (c) =>
         c.method === "POST" &&
-        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+        String(JSON.parse(c.body).content).includes("[buffered]"),
     );
     expect(acks2.length).toBe(0);
   });
@@ -1951,7 +1952,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     const acks = fetchCalls.filter(
       (c) =>
         c.method === "POST" &&
-        String(JSON.parse(c.body).content).startsWith("[buffered]"),
+        String(JSON.parse(c.body).content).includes("[buffered]"),
     );
     expect(acks.length).toBe(0);
   });
@@ -1978,7 +1979,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       )
       .map((c) => JSON.parse(c.body).content);
     expect(contents.filter((t) => t === "same").length).toBe(2); // 3rd dropped
-    expect(contents.filter((t) => t === REPEAT_WARNING).length).toBe(1);
+    expect(contents.filter((t) => t.includes(REPEAT_WARNING)).length).toBe(1);
 
     // 4th identical does not re-warn (counter reset after the trip).
     await handlers.message_end({ message: fin("same") }, ctx);
@@ -1988,7 +1989,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
       )
       .map((c) => JSON.parse(c.body).content);
-    expect(after.filter((t) => t === REPEAT_WARNING).length).toBe(1);
+    expect(after.filter((t) => t.includes(REPEAT_WARNING)).length).toBe(1);
   });
 
   test("repetition: a different final resets the counter", async () => {
@@ -2046,7 +2047,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
       )
       .map((c) => JSON.parse(c.body).content);
-    expect(contents.filter((t) => t === REPEAT_WARNING).length).toBe(1);
+    expect(contents.filter((t) => t.includes(REPEAT_WARNING)).length).toBe(1);
   });
 
   test("F1: /undo re-run — session_start re-sends the parked trigger after the undo-restart", async () => {
@@ -2256,14 +2257,18 @@ describe("#39 /hold", () => {
 
   test("held + idle: plain message queues, no run, no interrupt armed", async () => {
     await handleInbound(pi, inbound("/hold on", "m1"), ctx);
-    expect(posts()).toContain("[ok] hold on - buffered until /hold off");
+    expect(
+      posts().some((t) =>
+        t.includes("[ok] hold on - buffered until /hold off"),
+      ),
+    ).toBe(true);
     expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(true);
 
     await handleInbound(pi, inbound("hello there", "m2"), ctx);
     await flush();
     expect(sent).toHaveLength(0); // buffered, not sent to pi
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
-    expect(posts()).toContain("[queued] 1 in line");
+    expect(posts().some((t) => t.includes("[queued] 1 in line"))).toBe(true);
     expect(pendingInterrupts.get("ch1")).toBeUndefined(); // no armed interrupt
 
     // second message stacks behind it
@@ -2287,7 +2292,9 @@ describe("#39 /hold", () => {
     await flush();
     expect(sent.map((s) => s.m.details.body)).toEqual(["first"]);
     expect(sent[0].o.triggerTurn).toBe(true);
-    expect(posts()).toContain("[ok] hold off - 2 in line, running");
+    expect(
+      posts().some((t) => t.includes("[ok] hold off - 2 in line, running")),
+    ).toBe(true);
 
     // that run ends: the re-wake loop chains the rest
     await handlers.agent_end({ messages: [] }, ctx);
@@ -2303,7 +2310,9 @@ describe("#39 /hold", () => {
     await handleInbound(pi, inbound("/hold off", "m4"), ctx);
     await flush();
     expect(sent).toHaveLength(0); // still running: wait for agent_end
-    expect(posts()).toContain("[ok] hold off - 2 in line, will run");
+    expect(
+      posts().some((t) => t.includes("[ok] hold off - 2 in line, will run")),
+    ).toBe(true);
     expect(midTurnQueues.get("ch1")?.length).toBe(2);
 
     await handlers.agent_end({ messages: [] }, ctx);
@@ -2320,13 +2329,15 @@ describe("#39 /hold", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(2);
 
     await handleInbound(pi, inbound("/stop", "m4"), ctx);
-    expect(posts()).toContain("[-] stopped - 2 held in line");
+    expect(
+      posts().some((t) => t.includes("[-] stopped - 2 held in line")),
+    ).toBe(true);
     expect(midTurnQueues.get("ch1")?.length).toBe(2); // buffer intact
 
     // /stop on a NON-held channel still drains (regression guard)
     heldChannels.clear();
     await handleInbound(pi, inbound("/stop", "m5"), ctx);
-    expect(posts()).toContain("[-] stopped");
+    expect(posts().some((t) => t.includes("[-] stopped"))).toBe(true);
     expect(midTurnQueues.has("ch1")).toBe(false);
   });
 
@@ -2350,7 +2361,7 @@ describe("#39 /hold", () => {
   test("commands still run while held", async () => {
     await handleInbound(pi, inbound("/hold on", "m1"), ctx);
     await handleInbound(pi, inbound("/status", "m2"), ctx);
-    expect(posts().some((p) => p.startsWith("[status]"))).toBe(true);
+    expect(posts().some((p) => p.includes("[status]"))).toBe(true);
     expect(sent).toHaveLength(0); // status is not a pi run
   });
 
@@ -2361,7 +2372,9 @@ describe("#39 /hold", () => {
     expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
 
     await handleInbound(pi, inbound("/hold maybe", "m3"), ctx);
-    expect(posts()).toContain("[!] usage: /hold on|off");
+    expect(posts().some((t) => t.includes("[!] usage: /hold on|off"))).toBe(
+      true,
+    );
 
     await handleInbound(pi, otherInbound("/hold on", "m4"), ctx);
     // text-form command from a non-owner: not executed, falls through to
@@ -2672,7 +2685,9 @@ describe("#10 verbosity levels", () => {
     setRuntimeStateDir(path.join(tmp, ".tmp"));
     const dir = path.join(tmp, ".tmp");
     await handleInbound(pi, inbound("/verbose 1", "m1"), ctx);
-    expect(posts()).toContain("[ok] verbose: 1 (essential)");
+    expect(posts().some((t) => t.includes("[ok] verbose: 1 (essential)"))).toBe(
+      true,
+    );
     let onDisk = JSON.parse(
       fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
     );
@@ -2680,7 +2695,9 @@ describe("#10 verbosity levels", () => {
 
     // bare /verbose shows the current level and changes nothing
     await handleInbound(pi, inbound("/verbose", "m2"), ctx);
-    expect(posts()).toContain("[ok] verbose: 1 (essential)");
+    expect(posts().some((t) => t.includes("[ok] verbose: 1 (essential)"))).toBe(
+      true,
+    );
     onDisk = JSON.parse(
       fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
     );
@@ -2688,9 +2705,11 @@ describe("#10 verbosity levels", () => {
 
     // legacy on/off still accepted
     await handleInbound(pi, inbound("/verbose on", "m3"), ctx);
-    expect(posts()).toContain("[ok] verbose: 2 (all)");
+    expect(posts().some((t) => t.includes("[ok] verbose: 2 (all)"))).toBe(true);
     await handleInbound(pi, inbound("/verbose off", "m4"), ctx);
-    expect(posts()).toContain("[ok] verbose: 0 (text)");
+    expect(posts().some((t) => t.includes("[ok] verbose: 0 (text)"))).toBe(
+      true,
+    );
     onDisk = JSON.parse(
       fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
     );
@@ -2698,7 +2717,9 @@ describe("#10 verbosity levels", () => {
 
     // bad arg: usage error, no change
     await handleInbound(pi, inbound("/verbose 3", "m5"), ctx);
-    expect(posts()).toContain("[!] usage: /verbose 0|1|2");
+    expect(posts().some((t) => t.includes("[!] usage: /verbose 0|1|2"))).toBe(
+      true,
+    );
     onDisk = JSON.parse(
       fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
     );
@@ -3045,7 +3066,9 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
     await tick();
-    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
     opts.onComplete({
       summary: "s",
       firstKeptEntryId: "e",
@@ -3063,7 +3086,7 @@ describe("compact: defer mid-run + always report", () => {
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          reportText,
+          fence(reportText),
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === reportText)).toBe(false);
@@ -3087,21 +3110,26 @@ describe("compact: defer mid-run + always report", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
 
     // No edit before the first 5s tick
     jest.advanceTimersByTime(4999);
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1);
-    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    expect(edits()).toEqual([fence("[..] compacting… 5s")]);
     // subsequent ticks keep updating the SAME message in place
     jest.advanceTimersByTime(5000);
-    expect(edits()).toEqual(["[..] compacting… 5s", "[..] compacting… 10s"]);
+    expect(edits()).toEqual([
+      fence("[..] compacting… 5s"),
+      fence("[..] compacting… 10s"),
+    ]);
     jest.advanceTimersByTime(5000);
     expect(edits()).toEqual([
-      "[..] compacting… 5s",
-      "[..] compacting… 10s",
-      "[..] compacting… 15s",
+      fence("[..] compacting… 5s"),
+      fence("[..] compacting… 10s"),
+      fence("[..] compacting… 15s"),
     ]);
 
     // Settle: the report replaces the placeholder in place, tick stops
@@ -3109,7 +3137,7 @@ describe("compact: defer mid-run + always report", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe("[ok] compacted: 100 -> 10 tokens");
+    expect(edits().at(-1)).toBe(fence("[ok] compacted: 100 -> 10 tokens"));
     jest.advanceTimersByTime(60000);
     expect(edits().length).toBe(4); // no further ticks after settle
     expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
@@ -3122,7 +3150,9 @@ describe("compact: defer mid-run + always report", () => {
     };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
     opts.onError(new Error("model down"));
     await tick();
     const failText = "[!] compact failed: model down";
@@ -3133,7 +3163,7 @@ describe("compact: defer mid-run + always report", () => {
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          failText,
+          fence(failText),
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === failText)).toBe(false);
@@ -3158,9 +3188,10 @@ describe("compact: defer mid-run + always report", () => {
     opts.onError(new Error("Nothing to compact (session too small)"));
     await tick();
     expect(
-      channelPosts().some(
-        (t) =>
-          t === "[!] compact failed: Nothing to compact (session too small)",
+      channelPosts().some((t) =>
+        t.includes(
+          "[!] compact failed: Nothing to compact (session too small)",
+        ),
       ),
     ).toBe(true);
   });
@@ -3172,9 +3203,11 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
     expect(
-      channelPosts().some((t) => t === "[!] compact failed: boom-ctx"),
+      channelPosts().some((t) => t.includes("[!] compact failed: boom-ctx")),
     ).toBe(true);
-    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(false);
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      false,
+    );
   });
 
   test("mid-run /compact defers; agent_end flushes it with the stored instructions", async () => {
@@ -3191,14 +3224,16 @@ describe("compact: defer mid-run + always report", () => {
     expect(opts).toBeNull(); // not started yet — the run would be aborted
     expect(
       channelPosts().some((t) =>
-        t.startsWith("[queued] compact (run in progress)"),
+        t.includes("[queued] compact (run in progress)"),
       ),
     ).toBe(true);
     // run ends → flush (flushed compact posts its own ticking placeholder)
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
     await tick();
-    expect(channelPosts().some((t) => t === "[..] compacting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
   });
 
   test("mid-run: a later /compact replaces the earlier pending one", async () => {
@@ -3213,7 +3248,7 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
     expect(
       channelPosts().some((t) =>
-        t.startsWith("[queued] compact (run in progress), replaces earlier"),
+        t.includes("[queued] compact (run in progress), replaces earlier"),
       ),
     ).toBe(true);
     await handlers.agent_end({ messages: [] }, ctx);
@@ -3230,7 +3265,7 @@ describe("compact: defer mid-run + always report", () => {
     expect(opts).toBeNull();
     expect(
       channelPosts().some((t) =>
-        t.startsWith("[queued] compact (compact already in progress)"),
+        t.includes("[queued] compact (compact already in progress)"),
       ),
     ).toBe(true);
     handlers.session_compact?.(
@@ -3481,7 +3516,9 @@ describe("compaction-queue guard", () => {
     await tick();
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     expect(pendingInterrupts.has("ch1")).toBe(false); // no interrupt armed
-    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[queued] 1 in line"))).toBe(
+      true,
+    );
     expect(piSends().length).toBe(0); // not sent to pi yet
   });
 
@@ -3547,7 +3584,7 @@ describe("compaction-queue guard", () => {
     ctx.isIdle = () => false;
     await handleInbound(pi, inbound("/status", "m2"), ctx);
     await tick();
-    const st = channelPosts().find((t) => t.startsWith("[status]"));
+    const st = channelPosts().find((t) => t.includes("[status]"));
     expect(st).toBeDefined();
     expect(st).toContain("compacting");
     expect(midTurnQueues.has("ch1")).toBe(false); // consumed, not queued
@@ -3569,7 +3606,7 @@ describe("compaction-queue guard", () => {
     expect(isCompacting("ch1")).toBe(false);
     expect(aborted).toBe(1);
     expect(midTurnQueues.has("ch1")).toBe(false); // /stop drained the queue
-    expect(channelPosts().some((t) => t === "[-] stopped")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[-] stopped"))).toBe(true);
   });
 
   test("/stop while compacting is owner-only: non-owner gets an immediate reply, nothing queued, window stays", async () => {
@@ -3579,7 +3616,7 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/stop", "m2", "ch1", "other"), ctx);
     await tick();
     expect(isCompacting("ch1")).toBe(true); // window untouched
-    expect(channelPosts().some((t) => t === "[!] owner only")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[!] owner only"))).toBe(true);
     // Not queued: a queued /stop would re-run ungated after the window
     // closes and drop the channel's re-wake queue + abort the next run.
     expect(midTurnQueues.has("ch1")).toBe(false);
@@ -3597,9 +3634,9 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact again", "m2"), ctx);
     await tick();
     expect(compacts).toBe(1);
-    expect(channelPosts().some((t) => t === "[!] already compacting")).toBe(
-      true,
-    );
+    expect(
+      channelPosts().some((t) => t.includes("[!] already compacting")),
+    ).toBe(true);
     expect(isCompacting("ch1")).toBe(true); // window unchanged
   });
 
@@ -3611,9 +3648,9 @@ describe("compaction-queue guard", () => {
     // (F5: names the ACTIVE op — compaction, not a restart)
     await handleInbound(pi, inbound("/reset", "m2"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[!] already compacting")).toBe(
-      true,
-    );
+    expect(
+      channelPosts().some((t) => t.includes("[!] already compacting")),
+    ).toBe(true);
     // a queued-eligible command (/undo) still waits like a plain message
     await handleInbound(pi, inbound("/undo", "m3"), ctx);
     await tick();
@@ -3646,7 +3683,7 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact", "m4", "ch2"), ctx);
     expect(
       channelPosts("ch2").some((t) =>
-        t.startsWith("[queued] compact (compact already in progress)"),
+        t.includes("[queued] compact (compact already in progress)"),
       ),
     ).toBe(true);
     jest.useRealTimers();
@@ -3798,17 +3835,19 @@ describe("todo board (integration)", () => {
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
     const content = replyContent();
     expect(content).toBe(
-      renderBoard([
-        { content: "fix bug", status: "in_progress" },
-        { content: "tests", status: "pending" },
-      ]),
+      fence(
+        renderBoard([
+          { content: "fix bug", status: "in_progress" },
+          { content: "tests", status: "pending" },
+        ]),
+      ),
     );
     expect(content).toContain("┌ todos · 2 open");
   });
 
   test("/todos with an empty board says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
-    expect(replyContent()).toBe("[todos] no open todos");
+    expect(replyContent()).toBe(fence("[todos] no open todos"));
   });
 
   test("/todos needs no owner", async () => {
@@ -3856,7 +3895,10 @@ describe("todo board (integration)", () => {
       tmp,
     );
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    const content = replyContent();
+    // strip the code fence (machine frames are fenced) before block checks
+    const content = replyContent()
+      .replace(/^```\n/, "")
+      .replace(/\n```$/, "");
     expect(content).toContain("┌ Test · 1 open");
     expect(content).toContain("├ a");
     expect(content).toContain("┌ ch2 · 0 open");
@@ -3871,7 +3913,7 @@ describe("todo board (integration)", () => {
 
   test("/todos all with no boards says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    expect(replyContent()).toBe("[todos] no open todos");
+    expect(replyContent()).toBe(fence("[todos] no open todos"));
   });
 
   test("/todos all clips a long channel name to the 40-col budget", async () => {
@@ -3899,7 +3941,9 @@ describe("todo board (integration)", () => {
       tmp,
     );
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    const header = replyContent().split("\n")[0];
+    const header = replyContent()
+      .split("\n")
+      .find((l) => l.startsWith("┌ "))!;
     // display width strips nothing here (no markdown in the header):
     // raw length is the display length
     expect(header.length).toBeLessThanOrEqual(40);
@@ -4204,7 +4248,7 @@ describe("sleep (integration)", () => {
 
   test("/sleep with no wakes says 'no pending wakes'", async () => {
     await handleInbound(pi, inbound("/sleep", "m1"), ctx);
-    expect(replyContent()).toBe("[wake] no pending wakes");
+    expect(replyContent()).toBe(fence("[wake] no pending wakes"));
   });
 
   test("/sleep list shows pending wakes with id, channel, time, note", async () => {
@@ -4240,9 +4284,11 @@ describe("sleep (integration)", () => {
     await handleInbound(pi, inbound("/sleep cancel nope", "m1"), ctx);
     expect(replyContent()).toBe("[!] no wake with id nope");
     await handleInbound(pi, inbound("/sleep cancel", "m2"), ctx);
-    expect(replyContent()).toBe("[!] usage: `/sleep cancel <id>`");
+    expect(replyContent()).toBe(fence("[!] usage: /sleep cancel <id>"));
     await handleInbound(pi, inbound("/sleep xyz", "m3"), ctx);
-    expect(replyContent()).toBe("[!] usage: `/sleep [list | cancel <id>]`");
+    expect(replyContent()).toBe(
+      fence("[!] usage: /sleep [list | cancel <id>]"),
+    );
   });
 
   test("due-on-startup delivery: injects a channel-inbound wake, completes it, no double delivery", () => {
@@ -4534,7 +4580,7 @@ describe("tasks (integration)", () => {
 
   test("/tasks with no tasks says 'no scheduled tasks'", async () => {
     await handleInbound(pi, inbound("/tasks", "m1"), ctx);
-    expect(replyContent()).toBe("[tasks] no scheduled tasks");
+    expect(replyContent()).toBe(fence("[tasks] no scheduled tasks"));
   });
 
   test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {
@@ -4592,9 +4638,11 @@ describe("tasks (integration)", () => {
     await handleInbound(pi, inbound("/tasks cancel nope", "m1"), ctx);
     expect(replyContent()).toBe("[!] no task with id nope");
     await handleInbound(pi, inbound("/tasks cancel", "m2"), ctx);
-    expect(replyContent()).toBe("[!] usage: `/tasks cancel <id>`");
+    expect(replyContent()).toBe(fence("[!] usage: /tasks cancel <id>"));
     await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
-    expect(replyContent()).toBe("[!] usage: `/tasks [list | cancel <id>]`");
+    expect(replyContent()).toBe(
+      fence("[!] usage: /tasks [list | cancel <id>]"),
+    );
   });
 
   test("due-on-startup delivery: injects a channel-inbound task, completes it, no double delivery", () => {
@@ -4915,7 +4963,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
 
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[..] resetting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] resetting..."))).toBe(
+      true,
+    );
     expect(isCompacting("ch1")).toBe(true);
     expect(opWindowLabel("ch1")).toBe("resetting");
 
@@ -4947,7 +4997,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
 
     await handleInbound(pi, inbound("/restart", "m1"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[..] restarting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] restarting..."))).toBe(
+      true,
+    );
     expect(opWindowLabel("ch1")).toBe("restarting");
     await waitOpShutdown();
     expect(shutdowns).toBe(1);
@@ -4961,7 +5013,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(channelPosts().some((t) => t === "[..] resetting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] resetting..."))).toBe(
+      true,
+    );
 
     // the bounded op shutdown lands at +300ms (isIdle is immediate here)
     jest.advanceTimersByTime(300);
@@ -4973,9 +5027,12 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     jest.advanceTimersByTime(4699); // t=4999
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1); // t=5000
-    expect(edits()).toEqual(["[..] resetting… 5s"]);
+    expect(edits()).toEqual([fence("[..] resetting… 5s")]);
     jest.advanceTimersByTime(5000); // t=10000
-    expect(edits()).toEqual(["[..] resetting… 5s", "[..] resetting… 10s"]);
+    expect(edits()).toEqual([
+      fence("[..] resetting… 5s"),
+      fence("[..] resetting… 10s"),
+    ]);
 
     // respawn clears the window -> ticks stop
     clearAllCompacting();
@@ -4990,7 +5047,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
 
     await handleInbound(pi, inbound("hello", "m2"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[queued] 1 in line"))).toBe(
+      true,
+    );
     expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("m2");
     expect(pendingInterrupts.get("ch1")).toBeUndefined();
     await waitOpShutdown();
@@ -5073,7 +5132,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(isCompacting("ch1")).toBe(false);
     expect(getChannelCursor("ch1")).toBe("1000"); // cursor restored
     expect(
-      channelPosts().some((t) => t === "[-] stopped (restart cancelled)"),
+      channelPosts().some((t) => t.includes("[-] stopped (restart cancelled)")),
     ).toBe(true);
     // the marker goes with the cancelled op — no stale settle on next boot
     expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
@@ -5111,13 +5170,13 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handleInbound(pi, inbound("/reset", "m4"), ctx);
     await tick();
     expect(
-      channelPosts().filter((t) => t === "[!] already restarting").length,
+      channelPosts().filter((t) => t.includes("[!] already restarting")).length,
     ).toBe(1);
     // F5: /compact while resetting names the ACTIVE op, not itself
     await handleInbound(pi, inbound("/compact", "m4b"), ctx);
     await tick();
     expect(
-      channelPosts().filter((t) => t === "[!] already restarting").length,
+      channelPosts().filter((t) => t.includes("[!] already restarting")).length,
     ).toBe(2);
 
     await handleInbound(pi, inbound("/status", "m5"), ctx);
@@ -5148,7 +5207,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     });
     // abort fired, settle-wait running, tick armed on the queued ack
     jest.advanceTimersByTime(5000);
-    expect(ackEdits()).toEqual(["[..] interrupting… 5s"]);
+    expect(ackEdits()).toEqual([fence("[..] interrupting… 5s")]);
 
     ctx.isIdle = () => true;
     jest.advanceTimersByTime(50);
@@ -5207,12 +5266,16 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
 
     await handleInbound(pi, inbound("/restart", "m1"), ctx);
     await flush(10);
-    expect(channelPosts().some((t) => t === "[..] restarting...")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[..] restarting..."))).toBe(
+      true,
+    );
 
     // an inbound lands during the op -> queued behind the window
     await handleInbound(pi, inbound("hello", "m2"), ctx);
     await flush(10);
-    expect(channelPosts().some((t) => t === "[queued] 1 in line")).toBe(true);
+    expect(channelPosts().some((t) => t.includes("[queued] 1 in line"))).toBe(
+      true,
+    );
 
     // op shutdown chain at +300ms: restart requested, watchdog armed
     jest.advanceTimersByTime(300);
@@ -5223,7 +5286,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     // 14.9s later: the failure is not yet declared
     jest.advanceTimersByTime(14_999);
     expect(isCompacting("ch1")).toBe(true);
-    expect(channelPosts().some((t) => t.startsWith("[!] restart failed"))).toBe(
+    expect(channelPosts().some((t) => t.includes("[!] restart failed"))).toBe(
       false,
     );
 
@@ -5237,8 +5300,8 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await flush(20);
     expect(isCompacting("ch1")).toBe(false); // op window closed
     expect(
-      channelPosts().some(
-        (t) => t === "[!] restart failed - check unit pi.service",
+      channelPosts().some((t) =>
+        t.includes("[!] restart failed - check unit pi.service"),
       ),
     ).toBe(true); // RESOLVED unit name in the channel
     // queued inbound drained through pi (replay, not re-queue)
@@ -5415,7 +5478,9 @@ describe("/diff (issue #7)", () => {
   test("/diff publishes the working tree diff and replies with url + stats", async () => {
     await handleInbound(pi, inbound("/diff", "dm1"), ctx);
     expect(replyContent()).toBe(
-      "[ok] working tree · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+      fence(
+        "[ok] working tree · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+      ),
     );
     const up = fetchCalls.find((c) =>
       c.url.startsWith("https://drop.test/api/"),
@@ -5440,14 +5505,18 @@ describe("/diff (issue #7)", () => {
       ctx,
     );
     expect(replyContent()).toBe(
-      "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+      fence(
+        "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
+      ),
     );
   });
 
   test("/diff with unresolvable arg replies usage", async () => {
     await handleInbound(pi, inbound("/diff hello\nworld", "dm3"), ctx);
     expect(replyContent()).toBe(
-      "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
+      fence(
+        "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
+      ),
     );
   });
 
@@ -5455,7 +5524,9 @@ describe("/diff (issue #7)", () => {
     fs.rmSync(path.join(tmp, ".config"), { recursive: true, force: true });
     await handleInbound(pi, inbound("/diff", "dm4"), ctx);
     expect(replyContent()).toBe(
-      "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
+      fence(
+        "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
+      ),
     );
   });
 });

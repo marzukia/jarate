@@ -313,7 +313,7 @@ function renumberQueuedAcks(channelId: string): void {
     const ack = queuedAcks.get(e.msg.messageId);
     if (!ack || ack.pos === i + 1) return;
     ack.pos = i + 1;
-    editDiscordMessage(ch, ack.ackId, `[queued] ${i + 1} in line`).catch(
+    editDiscordMessage(ch, ack.ackId, fence(`[queued] ${i + 1} in line`)).catch(
       () => {},
     );
   });
@@ -572,8 +572,8 @@ export function opWindowLabel(channelId: string): OpLabel | null {
  *  window says "already restarting". */
 function opBusyRefusal(channelId: string): string {
   return opWindowLabel(channelId) === "compacting"
-    ? "[!] already compacting"
-    : "[!] already restarting";
+    ? fence("[!] already compacting")
+    : fence("[!] already restarting");
 }
 
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
@@ -647,6 +647,13 @@ export function opTickLine(label: string, secs: number): string {
   return `[..] ${label}… ${inc}s`;
 }
 
+/** Live status frames render inside a code fence (style guide v3):
+ * box-drawing chars stay aligned on mobile, no markdown mangling.
+ * Andryo 2026-09-14. */
+export const fence = (s: string): string => `\`\`\`
+${s}
+\`\`\``;
+
 /** Arm (or re-arm, same key) a live tick on a placeholder message. */
 export function armOpTick(
   key: string,
@@ -665,7 +672,7 @@ export function armOpTick(
       clearInterval(entry.timer); // paused; entry kept for the settle
       return;
     }
-    editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
+    editDiscordMessage(entry.ch, entry.msgId, fence(text)).catch(() => {});
   }, 5000);
   (timer as any).unref?.();
   opTicks.set(key, { ch, msgId, since, timer, render });
@@ -679,7 +686,7 @@ export function settleOpTick(key: string, text: string): boolean {
   if (!entry) return false;
   clearInterval(entry.timer);
   opTicks.delete(key);
-  editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
+  editDiscordMessage(entry.ch, entry.msgId, fence(text)).catch(() => {});
   return true;
 }
 
@@ -702,7 +709,7 @@ export function stopAllOpTicks(): void {
 }
 
 // ─── Compact placeholder (built on the shared op-tick) ──────────────
-export const COMPACT_PLACEHOLDER = "[..] compacting...";
+export const COMPACT_PLACEHOLDER = fence("[..] compacting...");
 
 export function armCompactTick(ch: ChannelConfig, msgId: string): void {
   armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>
@@ -1187,13 +1194,6 @@ export function statusLine(
   const suffix = ` · ${n} call${n === 1 ? "" : "s"} · ${secs}s`;
   return `┣ ${fit(lastToolAction, TOOL_LINE_MAX - 2 - suffix.length)}${suffix}`;
 }
-
-/** Live status frames render inside a code fence (style guide v3):
- * box-drawing chars stay aligned on mobile, no markdown mangling.
- * Andryo 2026-09-14. */
-export const fence = (s: string): string => `\`\`\`
-${s}
-\`\`\``;
 
 /** Max sub-step lines in a done frame (older calls overflow to the +N line). */
 export const DONE_FRAME_MAX_STEPS = 8;
@@ -2063,15 +2063,13 @@ export default function (pi: ExtensionAPI) {
       if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
       const inc = Math.floor(secs / 5) * 5;
-      return fence(
-        lastToolAction
-          ? statusLine(
-              lastToolAction,
-              verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
-              Date.now() - inc * 1000,
-            )
-          : `┣ working… ${inc}s`,
-      );
+      return lastToolAction
+        ? statusLine(
+            lastToolAction,
+            verboseLevel(wch) === 1 ? runEssentialCount : runToolCount,
+            Date.now() - inc * 1000,
+          )
+        : `┣ working… ${inc}s`;
     });
   };
 
@@ -2261,7 +2259,7 @@ export default function (pi: ExtensionAPI) {
       // repeated final, abort the run, post one warning line instead.
       userStoppedRun = true;
       if (ch.type === "discord")
-        sendDiscordMessage(ch, REPEAT_WARNING).catch(() => {});
+        sendDiscordMessage(ch, fence(REPEAT_WARNING)).catch(() => {});
       try {
         ctx.abort();
       } catch {}
@@ -2879,7 +2877,7 @@ function beginRestartOp(
   });
   writeOpMarker(ctx, ch, op, finalText);
   if (ch.type !== "discord") return Promise.resolve(null);
-  return sendDiscordMessage(ch, `[..] ${label}...`)
+  return sendDiscordMessage(ch, fence(`[..] ${label}...`))
     .then((r) => {
       if (r.success && r.messageId) {
         updateOpMarkerMsgId(ctx, ch.id, r.messageId);
@@ -2925,7 +2923,7 @@ function armRestartWatchdog(
     clearOpMarker(ctx); // the respawn that would settle it never came
     clearCompacting(ch.id); // also drops the pending op-shutdown timer
     drainQueuedAfterCompact(pi, ctx);
-    const line = `[!] restart failed - check unit ${unit}`;
+    const line = fence(`[!] restart failed - check unit ${unit}`);
     if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
   }, RESTART_WATCHDOG_MS);
   t.unref?.();
@@ -3133,7 +3131,7 @@ async function runChannelCommand(
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
   const isOwner = !ch.ownerUserId || fromId === ch.ownerUserId;
   const ownerOnly = !isOwner
-    ? { immediate: native ? "[!] owner only" : undefined }
+    ? { immediate: native ? fence("[!] owner only") : undefined }
     : {};
   switch (name.toLowerCase()) {
     case "stop": {
@@ -3143,7 +3141,7 @@ async function runChannelCommand(
       // re-run ungated after the window closes and drop the channel's
       // re-wake queue (including owner messages) + abort the next run.
       if (isCompacting(ch.id) && !isOwner)
-        return { immediate: "[!] owner only" };
+        return { immediate: fence("[!] owner only") };
       // A restart-class op captured its Discord cursor at window open;
       // /stop clears the window AND restores that cursor so inbounds
       // delivered during the op replay on the next boot instead of being
@@ -3189,10 +3187,10 @@ async function runChannelCommand(
       const heldDepth = held ? (midTurnQueues.get(ch.id)?.length ?? 0) : 0;
       return {
         immediate: restartCancelled
-          ? "[-] stopped (restart cancelled)"
+          ? fence("[-] stopped (restart cancelled)")
           : heldDepth > 0
-            ? `[-] stopped - ${heldDepth} held in line`
-            : "[-] stopped",
+            ? fence(`[-] stopped - ${heldDepth} held in line`)
+            : fence("[-] stopped"),
       };
     }
     case "hold": {
@@ -3201,11 +3199,13 @@ async function runChannelCommand(
       const on =
         a === "" ? !isHeld(ch) : a === "on" || a === "1" || a === "yes";
       if (a !== "" && !on && a !== "off" && a !== "0" && a !== "no")
-        return { immediate: "[!] usage: /hold on|off" };
+        return { immediate: fence("[!] usage: /hold on|off") };
       const depth = midTurnQueues.get(ch.id)?.length ?? 0;
       if (on === isHeld(ch))
         return {
-          immediate: on ? `[ok] hold on - ${depth} in line` : "[ok] hold off",
+          immediate: on
+            ? fence(`[ok] hold on - ${depth} in line`)
+            : fence("[ok] hold off"),
         };
       setHeld(ch.id, on);
       if (on) {
@@ -3217,13 +3217,13 @@ async function runChannelCommand(
         return {
           immediate:
             depth > 0
-              ? `[ok] hold on - ${depth} in line`
-              : "[ok] hold on - buffered until /hold off",
+              ? fence(`[ok] hold on - ${depth} in line`)
+              : fence("[ok] hold on - buffered until /hold off"),
         };
       }
       // off: drain — send the oldest now when idle; the existing re-wake
       // loop (agent_end) chains the rest, one run each, in order.
-      if (depth === 0) return { immediate: "[ok] hold off" };
+      if (depth === 0) return { immediate: fence("[ok] hold off") };
       if (ctx.isIdle() && !isCompacting(ch.id)) {
         const entry = popChannelQueuedInbound(ch.id);
         // Awaits the drained inbound: its send must finish before this
@@ -3236,15 +3236,17 @@ async function runChannelCommand(
               sanitizeUnknownValue(e),
             );
           });
-        return { immediate: `[ok] hold off - ${depth} in line, running` };
+        return {
+          immediate: fence(`[ok] hold off - ${depth} in line, running`),
+        };
       }
-      return { immediate: `[ok] hold off - ${depth} in line, will run` };
+      return { immediate: fence(`[ok] hold off - ${depth} in line, will run`) };
     }
     case "help":
       return { immediate: HELP_TEXT };
     case "btw": {
       const question = (arg || "").trim();
-      if (!question) return { immediate: "[!] usage: `/btw <question>`" };
+      if (!question) return { immediate: fence("[!] usage: /btw <question>") };
       const msg: ChannelMessage = {
         channelId: ch.id,
         channelName: ch.name,
@@ -3305,9 +3307,9 @@ async function runChannelCommand(
             parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
           }
         }
-        text = `[status] ${parts.join(" · ")}`;
+        text = fence(`[status] ${parts.join(" · ")}`);
       } catch {
-        text = "[!] status unavailable";
+        text = fence("[!] status unavailable");
       }
       return { immediate: text };
     }
@@ -3319,7 +3321,7 @@ async function runChannelCommand(
         const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
         return { immediate: text };
       } catch {
-        return { immediate: "[!] usage stats unavailable" };
+        return { immediate: fence("[!] usage stats unavailable") };
       }
     }
     case "diff": {
@@ -3327,9 +3329,9 @@ async function runChannelCommand(
       // channel members, like /jobs.
       try {
         const text = await publishDiff(ctx.cwd, arg);
-        return { immediate: text };
+        return { immediate: fence(text) };
       } catch {
-        return { immediate: "[!] diff publish failed" };
+        return { immediate: fence("[!] diff publish failed") };
       }
     }
     case "reset": {
@@ -3356,7 +3358,9 @@ async function runChannelCommand(
       scheduleOpShutdown(pi, ctx, ch, placeholderP, () =>
         moveSessionFileAside(ctx),
       );
-      return native ? { immediate: "[..] resetting..." } : { consumed: true };
+      return native
+        ? { immediate: fence("[..] resetting...") }
+        : { consumed: true };
     }
     case "restart": {
       if (!isOwner) return ownerOnly;
@@ -3380,13 +3384,15 @@ async function runChannelCommand(
         "[ok] restarted - session resumed",
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native ? { immediate: "[..] restarting..." } : { consumed: true };
+      return native
+        ? { immediate: fence("[..] restarting...") }
+        : { consumed: true };
     }
     case "undo": {
       if (!isOwner) return ownerOnly;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runUndo(ctx);
-      if (!r.restarted) return { immediate: r.text };
+      if (!r.restarted) return { immediate: fence(r.text) };
       // performUndo already truncated the session file + parked the re-run
       // trigger (F1); the respawn resumes the pre-turn state. Block + tick
       // + cursor replay across the respawn, like /reset.
@@ -3399,13 +3405,15 @@ async function runChannelCommand(
         r.text,
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native ? { immediate: "[..] undoing..." } : { consumed: true };
+      return native
+        ? { immediate: fence("[..] undoing...") }
+        : { consumed: true };
     }
     case "redo": {
       if (!isOwner) return ownerOnly;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runRedo(ctx);
-      if (!r.restarted) return { immediate: r.text };
+      if (!r.restarted) return { immediate: fence(r.text) };
       const placeholderP = beginRestartOp(
         pi,
         ctx,
@@ -3415,7 +3423,9 @@ async function runChannelCommand(
         r.text,
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native ? { immediate: "[..] redoing..." } : { consumed: true };
+      return native
+        ? { immediate: fence("[..] redoing...") }
+        : { consumed: true };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
@@ -3424,10 +3434,13 @@ async function runChannelCommand(
       // Bare command: show the current level (read-only, no change).
       if (a === "")
         return {
-          immediate: `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
+          immediate: fence(
+            `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
+          ),
         };
       const next = parseVerboseLevel(a);
-      if (next === null) return { immediate: "[!] usage: /verbose 0|1|2" };
+      if (next === null)
+        return { immediate: fence("[!] usage: /verbose 0|1|2") };
       verboseOverride.set(ch.id, next);
       persistChannelRuntimeState(ch.id, { verbose: next });
       // Live >0 -> 0 transition: delete the in-flight block so it does
@@ -3436,7 +3449,9 @@ async function runChannelCommand(
       // command path, see onDeleteStatusBlock above).
       if (prev > 0 && next === 0) await onDeleteStatusBlock?.(ch);
       return {
-        immediate: `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
+        immediate: fence(
+          `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
+        ),
       };
     }
     case "compact": {
@@ -3458,14 +3473,17 @@ async function runChannelCommand(
           ? "run in progress"
           : "compact already in progress";
         return {
-          immediate: `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
+          immediate: fence(
+            `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
+          ),
         };
       }
       // Text path: startCompact posts the placeholder (armed with its live
       // tick) and reports settle-in-place. Native: the deferred interaction
       // shows the placeholder instead; the report posts fresh.
       const err = startCompact(pi, { ch, instructions }, ctx, !native);
-      if (err !== null) return { immediate: `[!] compact failed: ${err}` };
+      if (err !== null)
+        return { immediate: fence(`[!] compact failed: ${err}`) };
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
@@ -3482,7 +3500,8 @@ async function runChannelCommand(
           loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
         );
         const wakes = loadWakes();
-        if (wakes.length === 0) return { immediate: "[wake] no pending wakes" };
+        if (wakes.length === 0)
+          return { immediate: fence("[wake] no pending wakes") };
         const pending = wakes.filter((w) => w.status === "pending").length;
         const lines = wakes.map((w) => {
           const chName = names.get(w.channelId) || w.channelName || w.channelId;
@@ -3498,12 +3517,14 @@ async function runChannelCommand(
           return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
         });
         return {
-          immediate: `[wake] ${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}`,
+          immediate: fence(
+            `[wake] ${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}`,
+          ),
         };
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: "[!] usage: `/sleep cancel <id>`" };
+        if (!id) return { immediate: fence("[!] usage: /sleep cancel <id>") };
         const ok = cancelWake(id);
         return {
           immediate: ok
@@ -3511,7 +3532,7 @@ async function runChannelCommand(
             : `[!] no wake with id ${id}`,
         };
       }
-      return { immediate: "[!] usage: `/sleep [list | cancel <id>]`" };
+      return { immediate: fence("[!] usage: /sleep [list | cancel <id>]") };
     }
     case "tasks": {
       if (!isOwner) return ownerOnly;
@@ -3523,20 +3544,22 @@ async function runChannelCommand(
         );
         const tasks = loadTasks();
         if (tasks.length === 0)
-          return { immediate: "[tasks] no scheduled tasks" };
+          return { immediate: fence("[tasks] no scheduled tasks") };
         const pending = tasks.filter((t) => t.status === "pending").length;
         const lines = tasks.map((t) =>
           formatTaskLine(t, names.get(t.channelId) || t.channelName),
         );
         return {
-          immediate: `[tasks] ${pending} pending task${
-            pending > 1 ? "s" : ""
-          } (of ${tasks.length} total):\n${lines.join("\n")}`,
+          immediate: fence(
+            `[tasks] ${pending} pending task${
+              pending > 1 ? "s" : ""
+            } (of ${tasks.length} total):\n${lines.join("\n")}`,
+          ),
         };
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: "[!] usage: `/tasks cancel <id>`" };
+        if (!id) return { immediate: fence("[!] usage: /tasks cancel <id>") };
         const ok = cancelTask(id);
         return {
           immediate: ok
@@ -3544,7 +3567,7 @@ async function runChannelCommand(
             : `[!] no task with id ${id}`,
         };
       }
-      return { immediate: "[!] usage: `/tasks [list | cancel <id>]`" };
+      return { immediate: fence("[!] usage: /tasks [list | cancel <id>]") };
     }
     case "todos": {
       // Informational, open to all channel members (private channel).
@@ -3565,14 +3588,15 @@ async function runChannelCommand(
               .join("\n")}\n└`;
           });
         return {
-          immediate:
+          immediate: fence(
             parts.length > 0 ? parts.join("\n\n") : "[todos] no open todos",
+          ),
         };
       }
       const board = loadBoard(ch.id);
       if (!board || board.todos.length === 0)
-        return { immediate: "[todos] no open todos" };
-      return { immediate: renderBoard(board.todos) };
+        return { immediate: fence("[todos] no open todos") };
+      return { immediate: fence(renderBoard(board.todos)) };
     }
     case "model": {
       if (!isOwner) return ownerOnly;
@@ -3583,12 +3607,14 @@ async function runChannelCommand(
       } catch {}
       if (!req) {
         if (models.length === 0)
-          return { immediate: "[model] no models available" };
+          return { immediate: fence("[model] no models available") };
         const names = models
           .slice(0, 20)
           .map((m: any) => `${m.provider}/${m.id}`);
         return {
-          immediate: `[model] ${models.length} available:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
+          immediate: fence(
+            `[model] ${models.length} available:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
+          ),
         };
       }
       const lower = req.toLowerCase();
@@ -3612,11 +3638,13 @@ async function runChannelCommand(
             .map((m: any) => `${m.provider}/${m.id}`)
             .join(", ");
           return {
-            immediate: `[!] ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
+            immediate: fence(
+              `[!] ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
+            ),
           };
         }
       }
-      if (!found) return { immediate: `[!] model not found: ${req}` };
+      if (!found) return { immediate: fence(`[!] model not found: ${req}`) };
       const ok = await pi.setModel(found);
       return {
         immediate: ok
@@ -4244,7 +4272,7 @@ export async function handleInbound(
   if (bang && ch) {
     noAck();
     if (ch.ownerUserId && msg.fromId !== ch.ownerUserId) {
-      replyCmd("[!] `!` shell is owner-only");
+      replyCmd(fence("[!] ! shell is owner-only"));
       return;
     }
     const shellCmd = bang[1].trim();
@@ -4324,7 +4352,7 @@ export async function handleInbound(
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
     noAck();
-    sendDiscordMessage(ch, `[queued] ${pos} in line`, msg.messageId)
+    sendDiscordMessage(ch, fence(`[queued] ${pos} in line`), msg.messageId)
       .then((res) => {
         if (res.success && res.messageId)
           queuedAcks.set(msg.messageId, {
@@ -4412,7 +4440,9 @@ export async function handleInbound(
         const n = msg.attachments.length;
         sendDiscordMessage(
           ch,
-          `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
+          fence(
+            `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
+          ),
           msg.messageId,
         ).catch(() => {});
         return;
