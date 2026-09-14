@@ -850,6 +850,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(last).toContain("┌ working · 1 call");
     expect(last).toContain("│ └ bash git push");
     expect(last.trimEnd()).toMatch(/\n└\n```$/); // full frame, fenced
+    expect((last.match(/^```/gm) ?? []).length).toBe(2); // exactly one fence
 
     // 5s-step tick: still the full frame (not a one-line status), same
     // message id, elapsed stepped to 5s
@@ -857,6 +858,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     last = edits().at(-1)!;
     expect(last).toContain("┌ working · 1 call · 5s");
     expect(last).toContain("│ └ bash git push");
+    expect((last.match(/^```/gm) ?? []).length).toBe(2); // exactly one fence (F1)
     const tickEdit = fetchCalls
       .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
       .at(-1);

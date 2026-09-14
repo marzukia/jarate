@@ -2055,14 +2055,16 @@ export default function (pi: ExtensionAPI) {
   /** Current live working frame for ch, fenced: sub-steps = calls so far
    *  (level 1: essentials only). count = shown length, so the live header
    *  matches the done frame that morphs this message at run end. */
-  const workingFrame = (ch: ChannelConfig, secs: number): string => {
+  const workingFrameBody = (ch: ChannelConfig, secs: number): string => {
     const shown = (
       verboseLevel(ch) === 1
         ? toolCallsThisTurn.filter((c) => c.essential)
         : toolCallsThisTurn
     ).map((c) => c.action);
-    return fence(runFrame("working", shown, shown.length, secs));
+    return runFrame("working", shown, shown.length, secs);
   };
+  const workingFrame = (ch: ChannelConfig, secs: number): string =>
+    fence(workingFrameBody(ch, secs));
   const armWorkingTick = () => {
     const ch = lastActiveChannel;
     if (!ch || !statusMsgId) return;
@@ -2071,7 +2073,8 @@ export default function (pi: ExtensionAPI) {
       const wch = lastActiveChannel;
       if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
-      return workingFrame(wch, Math.floor(secs / 5) * 5);
+      // UNFENCED body: armOpTick fences exactly once (review F1).
+      return workingFrameBody(wch, Math.floor(secs / 5) * 5);
     });
   };
 
