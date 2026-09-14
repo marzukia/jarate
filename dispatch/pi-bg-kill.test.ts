@@ -5,7 +5,7 @@
  * with a real sleeping victim, captures the webhook payload, and asserts
  * the framed description stays inside the 40-col mobile budget.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,9 +13,20 @@ import { spawn } from "bun";
 
 const KILL = path.join(import.meta.dir, "pi-bg-kill");
 
+// Leak guard (issue: /tmp inode exhaustion, 2026-09-14): safety net for the
+// pibgkill-* fixture dir (the test's try/finally already removes it; this
+// covers a throw before the try block enters).
+const tmpDirs: string[] = [];
+afterEach(() => {
+  for (const d of tmpDirs.splice(0)) {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
   test("kill posts a framed embed (no dingbat), pids + wait lines, <= 40 cols", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill-"));
+    tmpDirs.push(tmp);
     const home = path.join(tmp, "home");
     fs.mkdirSync(home, { recursive: true });
     const cgRoot = path.join(tmp, "cg");

@@ -170,7 +170,15 @@ fi
 JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)"
 
 # --- per-run switchboard session id (unique ledger entry per dispatch) ---
-run_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
+# Unique per run: second-precision timestamp + this wrapper's own pid ($$).
+# Concurrent wrappers always have different pids, so per-run temp file
+# names (pi-bg-<run_id>*) can never collide. Shape constraint: the v3
+# embed headers carry the full rid inside a 40-col mobile budget
+# ("┌ fail · <rid> (rc=N)" is the longest), so the pid must stay <= 8
+# digits - $$ does (pid_max on these boxes is 4194304, 6-7 digits live).
+# The 3-group numeric shape is preserved: the ticket validators in
+# pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
+run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
 export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 
 # --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
@@ -451,9 +459,10 @@ json.dump({"embeds": [embed]}, sys.stdout)
 PY
 }
 
-# bg_on_exit: cgroup cleanup + the 'died without report' fallback. If we exit
-# with no out.md and no posted callback, post DIED so the orchestrator wakes.
-# (covers TERM/INT/normal-exit paths; SIGKILL cannot be trapped)
+# bg_on_exit: cgroup cleanup + the 'died without report' fallback + per-run
+# temp-file cleanup. If we exit with no out.md and no posted callback, post
+# DIED so the orchestrator wakes. (covers TERM/INT/normal-exit paths; SIGKILL
+# cannot be trapped)
 # cgroup drain: by the time this trap runs, every child is gone — the pi loop
 # uses wait, webdrop/webhook post are synchronous — so the ONLY member left
 # is this shell. Move it back into the parent cgroup (it exits right after),
@@ -478,6 +487,19 @@ bg_on_exit() {
     rm -f "$ESCAPE_CG/cgroup.procs" 2>/dev/null || true
     rmdir "$ESCAPE_CG" 2>/dev/null || true
   fi
+  # temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the run's
+  # scratch files are unlinked on every trapped exit path (normal, error,
+  # INT, TERM - the INT/TERM traps funnel into this EXIT trap). Kept:
+  # out.md (completion marker: watchdog + /jobs), raw.out (pi-bg-tail spool
+  # + /jobs "run started"), wb-status (webhook audit: /jobs),
+  # webhook-failed (dead letter: watchdog + /jobs). A SIGKILLed wrapper
+  # cannot run this trap - its files stay for forensics (the watchdog flags
+  # the ticket DEAD instead).
+  rm -f "$BG_TMP/pi-bg-${run_id}-body.json" \
+        "$BG_TMP/pi-bg-${run_id}-body-plain.json" \
+        "$BG_TMP/pi-bg-${run_id}-err.log" \
+        "$BG_TMP/pi-bg-${run_id}-prompt.md" \
+        "$BG_TMP/pi-bg-${run_id}-wb-resp.txt" 2>/dev/null || true
   rm -f "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
 }
 trap bg_on_exit EXIT

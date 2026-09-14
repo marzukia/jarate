@@ -41,6 +41,16 @@ if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
   exit 2
 fi
 
+# temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the
+# kill-body.json webhook payload is scratch. The EXIT trap unlinks it on
+# every trapped exit path (normal, error, INT, TERM - the INT/TERM traps
+# funnel into this EXIT trap), so a failing or killed pi-bg-kill leaves no
+# payload behind. Kept: the -killed marker and the kill-webhook-failed dead
+# letter (the watchdog and /jobs history read them).
+trap 'rm -f "$BG_TMP/pi-bg-${id:-}-kill-body.json" 2>/dev/null' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 CG="$CG_ROOT/pi-bg/$id"
 if [ ! -d "$CG" ]; then
   echo "pi-bg-kill: no cgroup for ticket '$id' ($CG missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2

@@ -4,7 +4,7 @@
  * Runs the real bash script against a fake HOME + a fake `pi` on PATH and
  * asserts on loud failure / warning text and the run record.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13,10 +13,21 @@ import { spawn } from "bun";
 
 const PI_BG = path.join(import.meta.dir, "pi-bg");
 
+// Leak guard (issue: /tmp inode exhaustion, 2026-09-14): every fixture
+// mkdtemp dir is tracked and force-removed in a file-level afterEach, so a
+// failed or aborted test can no longer leave pibg-* dirs behind in /tmp.
+const tmpDirs: string[] = [];
+afterEach(() => {
+  for (const d of tmpDirs.splice(0)) {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
 type RunResult = { code: number; out: string; err: string };
 
 function fixture() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-test-"));
+  tmpDirs.push(tmp);
   const home = path.join(tmp, "home");
   const bin = path.join(tmp, "bin");
   const mainAgent = path.join(home, ".pi", "agent");
@@ -359,16 +370,22 @@ describe("persistent artifact dir: ~/.pi-bg-art default (2026-09-13 reboot fix)"
     expect(outFiles).toHaveLength(1);
     const id = outFiles[0].replace(/^pi-bg-/, "").replace(/-out\.md$/, "");
     expect(id).toMatch(/^\d{8}-\d{6}-\d+$/);
-    // prompt + output + raw + err all in the persistent dir
-    for (const name of [
-      `pi-bg-${id}-prompt.md`,
-      `pi-bg-${id}-out.md`,
-      `pi-bg-${id}-raw.out`,
-      `pi-bg-${id}-err.log`,
-    ]) {
+    // kept artifacts: the output report + the tail spool (the watchdog,
+    // /jobs and pi-bg-tail read them after the run)
+    for (const name of [`pi-bg-${id}-out.md`, `pi-bg-${id}-raw.out`]) {
       expect(fs.existsSync(path.join(art, name))).toBe(true);
     }
-    // ...and not in /tmp
+    // temp scratch is unlinked on exit (issue: /tmp inode leak, 2026-09-14)
+    for (const name of [
+      `pi-bg-${id}-prompt.md`,
+      `pi-bg-${id}-err.log`,
+      `pi-bg-${id}-body.json`,
+      `pi-bg-${id}-wb-resp.txt`,
+      `pi-bg-${id}-started`,
+    ]) {
+      expect(fs.existsSync(path.join(art, name))).toBe(false);
+    }
+    // ...and nothing in /tmp
     expect(fs.existsSync(`/tmp/pi-bg-${id}-out.md`)).toBe(false);
     expect(fs.existsSync(`/tmp/pi-bg-${id}-prompt.md`)).toBe(false);
   });
@@ -382,6 +399,7 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
 
   function wdFixture(n: number) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-wd-"));
+    tmpDirs.push(tmp);
     const home = path.join(tmp, "home");
     const wtDir = path.join(tmp, "wt", "jarate", TID(n));
     const art = path.join(tmp, "art");
@@ -463,6 +481,7 @@ const TAIL = path.join(import.meta.dir, "pi-bg-tail");
 describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
   test("raw.out in PI_BG_TMPDIR -> shown", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
     const id = "20991231-235958-1";
@@ -477,6 +496,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
 
   test("raw.out in legacy /tmp only -> fallback finds it", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
     const id = "20991231-235958-2";
@@ -496,6 +516,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
 
   test("no raw.out anywhere -> exit 2", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
+    tmpDirs.push(tmp);
     const env = { ...process.env } as Record<string, string>;
     env.HOME = tmp;
     env.PI_BG_TMPDIR = path.join(tmp, "art");
@@ -620,11 +641,16 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
  * captured immediately before spawning stubs.
  */
 describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
-  // Mirror of the script's count: this uid's processes whose args contain
-  // "pi-bg worker" or "pi-bg reviewer", excluding the test process itself.
-  // A match whose parent has an identical cmdline is a fork-window
-  // phantom (a forked helper that has not exec'd yet keeps the parent's
-  // argv) and is skipped, same rule as the script.
+  // Mirror of the script's count: this uid's processes whose /proc cmdline
+  // carries an argv element whose basename is pi-bg immediately followed by
+  // a worker|reviewer element (the script's review F1 rule), excluding the
+  // test process itself. A match whose parent has an identical cmdline is a
+  // fork-window phantom (a forked helper that has not exec'd yet keeps the
+  // parent's argv) and is skipped, same rule as the script. The element
+  // match matters: a launcher "bash -c" carries "pi-bg worker" inside one
+  // -c string, so a substring test over the ps line double-counted it while
+  // the script's element scan did not (deterministic at-cap fail while any
+  // fleet launcher is alive, 2026-09-14 baseline).
   const countLivePiBg = (): number => {
     const out = execSync(`ps -U ${process.getuid()} -o pid=,ppid=,args=`, {
       encoding: "utf8",
@@ -635,22 +661,35 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       if (!m) continue;
       const pid = Number(m[1]);
       if (pid === process.pid) continue;
-      const args = m[3];
-      if (!args.includes("pi-bg worker") && !args.includes("pi-bg reviewer"))
-        continue;
-      let identical = false;
+      let argv: string[];
       try {
-        const a = fs
+        argv = fs
           .readFileSync(`/proc/${pid}/cmdline`, "utf8")
           .split("\0")
-          .filter(Boolean)
-          .join(" ");
+          .filter(Boolean);
+      } catch {
+        continue; // unreadable (other user / zombie) - the script skips too
+      }
+      let match = false;
+      for (let i = 0; i < argv.length; i++) {
+        if (
+          argv[i].split("/").pop() === "pi-bg" &&
+          i + 1 < argv.length &&
+          (argv[i + 1] === "worker" || argv[i + 1] === "reviewer")
+        ) {
+          match = true;
+          break;
+        }
+      }
+      if (!match) continue;
+      let identical = false;
+      try {
         const p = fs
           .readFileSync(`/proc/${m[2]}/cmdline`, "utf8")
           .split("\0")
           .filter(Boolean)
           .join(" ");
-        identical = a === p;
+        identical = argv.join(" ") === p;
       } catch {
         identical = false;
       }
