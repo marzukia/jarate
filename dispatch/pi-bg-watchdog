@@ -23,6 +23,17 @@
 #   4. if the dir mtime is older than 20 min and the ticket is not already
 #      in today's dead letter log -> post a DEAD webhook (same url source
 #      and embed format as pi-bg) and append ~/.pi-bg-deadlog
+#   4a. STALLED (issue #52): a LIVE ticket whose heartbeat file
+#       ($PI_BG_TMPDIR/pi-bg-<id>-hb, touched every 30s by the pi-bg
+#       wrapper) is stale > PI_BG_STALL_MIN (default 10) min -> post a
+#       STALLED webhook + dead log line. Distinct from DEAD: the process
+#       exists, the run is hung (hung tool, wedged model call). One alert
+#       per ticket per day (same dead log dedupe as DEAD).
+#   4b. run-state prune (issue #51): one-shot runs (task/cron/sleep wakes)
+#       leave run records that are never cleared. Records untouched for
+#       > PI_BG_PRUNE_DAYS (default 7) are pruned: the ticket's artifact
+#       files (persistent dir + legacy /tmp) and the record itself are
+#       deleted. Live tickets (cgroup member / worktree cwd) keep theirs.
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -31,6 +42,10 @@
 # config (same source as pi-bg):
 #   $PI_DISPATCH_WEBHOOK or first line of ~/.config/pi-dispatch/webhook
 #   (no webhook configured = sweep still runs, posts skipped)
+# env:
+#   PI_BG_STALL_MIN    stale-heartbeat threshold, min (default 10, issue #52)
+#   PI_BG_PRUNE_DAYS   run-record prune age, days (default 7, 0 = off, #51)
+#   PI_BG_WT_PRUNE_DAYS killed-worktree prune age, days (default 7, 0 = off)
 # args:
 #   --quiet   log-only mode: append to dead log, post no webhooks
 #             (use for the first run after install to baseline existing debris)
@@ -49,9 +64,15 @@ DEADLOG="${HOME}/.pi-bg-deadlog"
 AGE_MIN=20
 QUIET=0
 DRY=0
+# heartbeat staleness threshold (issue #52): a live process whose hb file
+# is older than this is STALLED (the process exists; the run is hung)
+STALL_MIN="${PI_BG_STALL_MIN:-10}"
+# run-record prune age (issue #51): one-shot runs leave records that are
+# never cleared; records untouched for this many days are pruned (0 = off)
+PRUNE_DAYS="${PI_BG_PRUNE_DAYS:-7}"
 # auto-prune: worktrees carrying a killed marker older than N days are
 # removed (0 = off). 2026-09-14: Frank's box had 146 worktrees, 125 dead.
-PRUNE_DAYS="${PI_BG_WT_PRUNE_DAYS:-7}"
+WT_PRUNE_DAYS="${PI_BG_WT_PRUNE_DAYS:-7}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -123,6 +144,33 @@ has_started() {
   [ -f "$BG_TMP/pi-bg-${t}-started" ]
 }
 
+# hb_stale <ticket>: 0 when a heartbeat file exists and is older than
+# STALL_MIN min (live process + this = STALLED, issue #52). A fresh hb =
+# healthy; no hb at all (pre-upgrade run) = not judgeable -> never stale.
+hb_stale() {
+  local t="$1" f m now
+  now="$(date +%s)"
+  for f in "$BG_TMP/pi-bg-${t}-hb" "$LEGACY_TMP/pi-bg-${t}-hb"; do
+    [ -f "$f" ] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+    [ $(( now - m )) -gt $(( STALL_MIN * 60 )) ] && return 0
+    return 1
+  done
+  return 1
+}
+
+# prune_live <ticket>: liveness for the run-state prune (issue #51) - the
+# sweep's liveness scoped to the ticket: a cgroup member, or a same-user
+# process sitting in the ticket's worktree dir when one exists.
+prune_live() {
+  local t="$1" wt
+  for wt in "$WT_DIR"/*/"$t"; do
+    [ -d "$wt" ] || continue
+    is_live "$t" "$wt" && return 0
+  done
+  cg_has_members "$CG_DIR/$t"
+}
+
 # wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
 wd_post() {
   local body="$1" code i
@@ -181,6 +229,7 @@ PY
 
 found=0
 DT=(); DREPO=(); DP=(); DLAST=(); DREAS=()
+ST=(); STREPO=(); STL=()
 for d in "$WT_DIR"/*/*/; do
   d="${d%/}"
   [ -d "$d" ] || continue
@@ -188,8 +237,21 @@ for d in "$WT_DIR"/*/*/; do
   repo="$(basename "$(dirname "$d")")"
   # sanity: ticket ids are YYYYMMDD-HHMMSS-NNNNN
   [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
-  # 1) live dispatch -> leave alone
-  if is_live "$t" "$d"; then continue; fi
+  # 1) live dispatch -> leave alone; STALLED check (issue #52): a live
+  #    process whose heartbeat is stale > STALL_MIN min is hung (DEAD needs
+  #    the process gone, so without the hb this state was invisible)
+  if is_live "$t" "$d"; then
+    if hb_stale "$t" && ! already_dead "$t"; then
+      hb_f="$BG_TMP/pi-bg-${t}-hb"
+      [ -f "$hb_f" ] || hb_f="$LEGACY_TMP/pi-bg-${t}-hb"
+      hbm="$(stat -c %Y "$hb_f" 2>/dev/null)" || hbm=""
+      stall_last="$(date -u -d "@${hbm:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || stall_last="unknown"
+      echo "[pi-bg-watchdog] STALLED $repo/$t (hb last $stall_last, > ${STALL_MIN} min stale)"
+      ST+=("$t"); STREPO+=("$repo"); STL+=("$stall_last")
+      printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "stalled: live process, heartbeat stale > ${STALL_MIN} min" >> "$DEADLOG"
+    fi
+    continue
+  fi
   # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
   #    killed on purpose (pi-bg-kill marker) -> not a lost callback. Both
   #    checked in the persistent dir AND legacy /tmp (one release of overlap).
@@ -276,6 +338,36 @@ PY
   rm -f "$bodyf"
 fi
 
+# Post STALLED (issue #52): ONE embed listing up to 10 tickets. A stalled
+# run is alive-but-hung (red), distinct from DEAD (orange, process gone).
+if [ "${#ST[@]}" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq 0 ]; then
+  bodyf="$BG_TMP/pi-bg-watchdog-stalled-body.json"
+  WD_N="${#ST[@]}" WD_MIN="$STALL_MIN" WD_LIST="$(for i in "${!ST[@]}"; do
+    [ "$i" -ge 10 ] && break
+    printf '%s/%s | hb last %s\n' "${STREPO[$i]}" "${ST[$i]}" "${STL[$i]}"
+  done)" python3 - > "$bodyf" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+count = int(os.environ.get("WD_N", "0"))
+mins = os.environ.get("WD_MIN", "10")
+lines = os.environ.get("WD_LIST", "").splitlines()
+if count > 10:
+    lines.append(f"... {count - 10} more (full list: ~/.pi-bg-deadlog)")
+lines.append(f"process alive, heartbeat stale > {mins} min - hung run suspected")
+lines.append("pi-bg-kill <ticket> to cancel")
+embed = {"author": {"name": "pi-bg watchdog"},
+         "color": 15158332,  # red: alive but stuck (DEAD is orange)
+         "title": f"pi-bg \u00b7 {count} stalled ticket{'s' if count != 1 else ''} (watchdog sweep)",
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg watchdog (stalled)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+  if [ -s "$bodyf" ]; then
+    wd_post "$bodyf" || echo "[pi-bg-watchdog] stalled post failed (dead log still updated)" >&2
+  fi
+  rm -f "$bodyf"
+fi
+
 # ─── AGENTS.md drift tripwire (2026-09-14, alert-only) ────────────────────────
 # Manifest: ~/.pi/agent/.agents-md-hash (<sha256>  <ts>  <note>). The check
 # itself never blocks; this section only decides whether to post. One warning
@@ -332,8 +424,8 @@ if [ -x "$JARATE_BIN" ]; then
   fi
 fi
 
-# auto-prune: killed-marked worktrees older than PRUNE_DAYS (0 = off)
-if [ "$PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
+# auto-prune: killed-marked worktrees older than WT_PRUNE_DAYS (0 = off)
+if [ "$WT_PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
   pruned=0
   for d in "$WT_DIR"/*/*/; do
     d="${d%/}"
@@ -341,7 +433,7 @@ if [ "$PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
     t="$(basename "$d")"
     has_killed "$t" || continue
     mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
-    [ $(( $(date +%s) - mtime )) -gt $((PRUNE_DAYS * 86400)) ] || continue
+    [ $(( $(date +%s) - mtime )) -gt $((WT_PRUNE_DAYS * 86400)) ] || continue
     if git -C "$d" worktree remove --force "$d" 2>/dev/null || rmdir "$d" 2>/dev/null; then
       echo "[pi-bg-watchdog] pruned $d"
       pruned=$((pruned + 1))
@@ -350,5 +442,37 @@ if [ "$PRUNE_DAYS" -gt 0 ] && [ "$DRY" -eq 0 ]; then
   [ "$pruned" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned worktree(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped (quiet=$QUIET dry=$DRY prune_days=$PRUNE_DAYS)"
+# ─── run-state prune (issue #51): one-shot runs (task/cron/sleep wakes)
+#     leave run records + artifacts that are never cleared. Records
+#     untouched for > PRUNE_DAYS are pruned: the ticket's artifact files
+#     (persistent dir + legacy /tmp) and the record itself are deleted.
+#     The record mtime is the age clock: pi-bg marks state=done on every
+#     trapped exit and pi-bg-kill marks state=killed (both refresh the
+#     mtime), so a stale mtime means an untrappable death or a record that
+#     was never closed. Live tickets keep theirs (prune_live above).
+pruned_state=0
+if [ "$PRUNE_DAYS" -gt 0 ]; then
+  rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+  for rf in "$rec_dir"/pi-bg-*.json; do
+    [ -f "$rf" ] || continue
+    t="${rf##*/pi-bg-}"
+    t="${t%.json}"
+    [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    mtime="$(stat -c %Y "$rf" 2>/dev/null)" || continue
+    [ $(( $(date +%s) - mtime )) -gt $((PRUNE_DAYS * 86400)) ] || continue
+    prune_live "$t" && continue
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would prune run state $t"
+      continue
+    fi
+    rm -f "$BG_TMP"/pi-bg-"$t"-* 2>/dev/null
+    rm -f "$LEGACY_TMP"/pi-bg-"$t"-* 2>/dev/null
+    rm -f "$rf"
+    echo "[pi-bg-watchdog] pruned run state $t"
+    pruned_state=$((pruned_state + 1))
+  done
+  [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
+fi
+
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, ${#ST[@]} stalled, $pruned_state run record(s) pruned (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0
