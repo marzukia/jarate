@@ -25,9 +25,14 @@ interface EmbedResponse {
   data: EmbedDatum[];
 }
 
+// Per-batch callback: lets the caller upsert each batch as it lands, so a
+// late timeout never loses earlier batches' work (2026-09-15: a single
+// all-or-nothing upsert after all embeds meant one slow batch killed the
+// whole ingest on the 120s timeout).
 export async function embedBatched(
   opts: EmbedOpts,
   texts: string[],
+  onBatch?: (start: number, batchVecs: number[][]) => Promise<void> | void,
 ): Promise<number[][]> {
   const vecs: number[][] = [];
   for (let i = 0; i < texts.length; i += EMBED_BATCH) {
@@ -46,7 +51,9 @@ export async function embedBatched(
     }
     const json = (await res.json()) as EmbedResponse;
     const data = [...json.data].sort((a, b) => a.index - b.index);
-    vecs.push(...data.map((d) => d.embedding));
+    const batchVecs = data.map((d) => d.embedding);
+    vecs.push(...batchVecs);
+    if (onBatch) await onBatch(i, batchVecs);
   }
   return vecs;
 }
