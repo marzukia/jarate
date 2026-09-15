@@ -288,10 +288,22 @@ describe("wrapFenceLines", () => {
   test("43-col frame line wraps to <=32 with 2-space continuation", () => {
     const line43 = "├ frank : active, 418a56c2, restarted 17:43";
     expect(line43.length).toBe(43);
-    const input = `\`\`\`bash\n${line43}\n└\n\`\`\``;
+    // frames ship UNtagged (fence() = bare ```); tagged = code, not wrapped
+    const input = `\`\`\`\n${line43}\n└\n\`\`\``;
     expect(wrapFenceLines(input)).toBe(
-      "```bash\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```",
+      "```\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```",
     );
+  });
+
+  test("language-tagged fences (code) are never wrapped", () => {
+    // 2026-09-15 incident: a 54-col python snippet got frame-style wrapping
+    // (mangled indentation) + mid-identifier client splits on mobile.
+    const py = "        cached_tokens=num_cached_tokens,"; // 38 cols, one 30-char token
+    const input = `\`\`\`python\ndef f(\n    enable_prompt_tokens_details: bool, ...):\n    if not enable_prompt_tokens_details:\n${py}\n\`\`\``;
+    expect(
+      input.split("\n").filter((l) => l.length > 32).length,
+    ).toBeGreaterThan(0);
+    expect(wrapFenceLines(input)).toBe(input);
   });
 
   test("fence lines at or under 32 are untouched", () => {
@@ -359,8 +371,7 @@ describe("wrapFenceLines", () => {
   });
 
   test("idempotent: an already-wrapped fence is unchanged", () => {
-    const input =
-      "```bash\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```";
+    const input = "```\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```";
     expect(wrapFenceLines(input)).toBe(input);
   });
 });

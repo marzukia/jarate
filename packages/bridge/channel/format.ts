@@ -378,11 +378,14 @@ export function collapseFenceTrailingBlankLines(md: string): string {
 }
 
 /**
- * STYLE.md 2.3 width pass: word-wrap fence lines longer than FRAME_COL_MAX
- * (continuation indent 2 spaces). Prose OUTSIDE fences is untouched —
- * Discord wraps it natively; only monospace fence lines overflow. A word
- * with no space in budget hard-breaks at the budget. Same fence toggle
- * as collapseFenceTrailingBlankLines. Exported for tests.
+ * STYLE.md 2.3 width pass: word-wrap UNtagged fence lines longer than
+ * FRAME_COL_MAX (continuation indent 2 spaces). Prose OUTSIDE fences is
+ * untouched — Discord wraps it natively; only monospace fence lines
+ * overflow. A word with no space in budget hard-breaks at the budget.
+ * LANGUAGE-TAGGED fences (```python, ```bash, ...) are never wrapped: the
+ * continuation indent breaks code semantics (2026-09-15: a 54-col python
+ * snippet shipped with mangled indentation + mid-identifier client splits).
+ * Same fence toggle as collapseFenceTrailingBlankLines. Exported for tests.
  */
 export function wrapFenceLines(
   md: string,
@@ -391,13 +394,20 @@ export function wrapFenceLines(
   const lines = md.split("\n");
   const out: string[] = [];
   let inFence = false;
+  let fenceLang: string | null = null;
   for (const line of lines) {
     if (line.trimStart().startsWith("```")) {
-      inFence = !inFence;
+      if (!inFence) {
+        inFence = true;
+        fenceLang = line.trimStart().slice(3).trim().split(/\s+/)[0] || null;
+      } else {
+        inFence = false;
+        fenceLang = null;
+      }
       out.push(line);
       continue;
     }
-    if (!inFence || line.length <= max) {
+    if (!inFence || fenceLang !== null || line.length <= max) {
       out.push(line);
       continue;
     }
