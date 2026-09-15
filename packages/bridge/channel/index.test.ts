@@ -7298,12 +7298,13 @@ describe("wave 2c bridge commands", () => {
       ctx,
     );
     await handleInbound(pi, inbound("/usage last", "m3"), ctx);
-    const last = posts().find((t) => t.includes("[usage] last run"));
+    const last = posts().find((t) => t.includes("usage · last run"));
     expect(last).toBeDefined();
-    expect(last).toContain("| in 1K | out 100 |");
-    expect(last).toContain("est $0.00");
-    // unfenced, like the rest of the /usage family
-    expect(last!.startsWith("```")).toBe(false);
+    expect(last).toContain("├ in     : 1K");
+    expect(last).toContain("├ out    : 100");
+    expect(last).toContain("└ est    : $0.00");
+    // fenced frame, like the rest of the /usage family (2026-09-16 restyle)
+    expect(last!.startsWith("```")).toBe(true);
   });
 
   test("/jobs kill + tail: owner-only wrappers around pi-bg-kill/-tail (#44)", async () => {

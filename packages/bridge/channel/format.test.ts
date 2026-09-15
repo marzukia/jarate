@@ -285,14 +285,29 @@ describe("collapseFenceTrailingBlankLines", () => {
 // ─── wrapFenceLines (STYLE.md 2.3, 40-col budget) ───────────────────────────
 
 describe("wrapFenceLines", () => {
-  test("43-col frame line wraps to <=40 with 2-space continuation", () => {
+  test("43-col frame line wraps to <=40 with pipe gutter continuation", () => {
     const line43 = "├ frank : active, 418a56c2, restarted 17:43";
     expect(line43.length).toBe(43);
     // frames ship UNtagged (fence() = bare ```); tagged = code, not wrapped
     const input = `\`\`\`\n${line43}\n└\n\`\`\``;
     expect(wrapFenceLines(input)).toBe(
-      "```\n├ frank : active, 418a56c2, restarted\n  17:43\n└\n```",
+      "```\n├ frank : active, 418a56c2, restarted\n│ 17:43\n└\n```",
     );
+  });
+
+  test("continuation gutter: ├/┣/│ rows keep the pipe, ┌/└/plain get 2 spaces", () => {
+    const mk = (l: string) => `\`\`\`\n${l}\n└\n\`\`\``;
+    for (const lead of ["├ x : ", "┣ x : ", "│ ├ "]) {
+      const out = wrapFenceLines(mk(lead + "y".repeat(50))).split("\n");
+      // first continuation line (out[2]) must carry the pipe gutter
+      expect(out[2].startsWith("│ ")).toBe(true);
+      expect(out[2].length).toBeLessThanOrEqual(40);
+    }
+    for (const lead of ["┌ x : ", "└ x : ", "plain "]) {
+      const out = wrapFenceLines(mk(lead + "y".repeat(50))).split("\n");
+      expect(out[2].startsWith("  ")).toBe(true);
+      expect(out[2].startsWith("│ ")).toBe(false);
+    }
   });
 
   test("language-tagged fences (code) are never wrapped", () => {

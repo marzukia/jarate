@@ -198,14 +198,24 @@ function dateFromMtime(file: string): string {
   }
 }
 
-export function usageLine(
-  label: string,
-  dateStr: string,
-  s: UsageStats,
-): string {
-  const cacheReadPart =
-    label === "session" || s.cacheRead > 0 ? ` | cacheRead ${s.cacheRead}` : "";
-  return `[usage] ${label.padEnd(10)}${dateStr.padEnd(17)} | ${s.turns.toLocaleString("en-US")} turns | in ${fmtTokens(s.input)} | out ${fmtTokens(s.output)}${cacheReadPart} | est $${estimateCost(s).toFixed(2)}`;
+/**
+ * Build the /usage reply frame (v3 style, 40-col budget). Framed, not
+ * fenced - the caller fences it (like /context).
+ */
+export function usageFrame(label: string, span: string, s: UsageStats): string {
+  // share of the TOTAL prompt (new + cached) served from cache - the
+  // number Andryo watches; cacheRead can exceed the new-input count.
+  const total = s.input + s.cacheRead;
+  const pct = total > 0 ? Math.round((s.cacheRead / total) * 100) : 0;
+  return [
+    `┌ usage · ${label}`,
+    `├ span   : ${span}`,
+    `├ turns  : ${s.turns.toLocaleString("en-US")}`,
+    `├ in     : ${fmtTokens(s.input)}`,
+    `├ out    : ${fmtTokens(s.output)}`,
+    `├ cached : ${fmtTokens(s.cacheRead)} (${pct}%)`,
+    `└ est    : $${estimateCost(s).toFixed(2)}`,
+  ].join("\n");
 }
 
 /**
@@ -264,12 +274,12 @@ export async function renderUsage(
       if (d && (!earliest || d < earliest)) earliest = d;
     }
     const span = `${earliest ?? dateFromMtime(files[0])}..now`;
-    return usageLine("lifetime", span, s);
+    return usageFrame("lifetime", span, s);
   }
 
   // default + "session": the current session file
   const file = sessionFile ?? findSessionFile(cwd);
   if (!file) return "[!] no session file found";
   const s = await summarizeSessionFile(file);
-  return usageLine("session", dateFromName(file) ?? dateFromMtime(file), s);
+  return usageFrame("session", dateFromName(file) ?? dateFromMtime(file), s);
 }

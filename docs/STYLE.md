@@ -14,7 +14,10 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 ## 2 Chat frames (machine state in Discord)
 2.1 Machine state goes in a code fence, rendered as a box-drawing frame.
 2.2 Full border: `┌` top, `├`/`┣` rows, `└` bottom. Never ship an open
-    frame.
+    frame. Wrapped continuations keep the pipe: a row on the gutter
+    (`├`/`┣`/`│`) continues with `│ ` (pipe + space); `┌`/`└`/plain lines
+    continue with two spaces. Both gutters are 2 cols. (Andryo 2026-09-16,
+    screenshot: bare 2-space wraps under ├ read as detached.)
 2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on Andryo's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
 2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra
     context goes before the frame.

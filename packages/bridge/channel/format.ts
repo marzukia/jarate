@@ -417,7 +417,14 @@ export function wrapFenceLines(
 }
 
 function wrapFenceLine(line: string, max: number): string[] {
-  const cont = "  ";
+  // Continuation gutter (STYLE.md 2.2, Andryo 2026-09-16 screenshot):
+  // rows that sit on the frame pipe (├/┣/│) keep the pipe on their wrap
+  // continuations; everything else (┌/└/plain) falls back to two spaces.
+  // Both gutters are 2 cols, so the line budget is unchanged.
+  const cont =
+    line.startsWith("├") || line.startsWith("┣") || line.startsWith("│")
+      ? "│ "
+      : "  ";
   const out: string[] = [];
   let rest = line;
   let first = true;

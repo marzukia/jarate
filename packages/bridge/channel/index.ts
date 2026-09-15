@@ -138,7 +138,7 @@ import {
   renderUsage,
   sumRunUsage,
   type UsageStats,
-  usageLine,
+  usageFrame,
 } from "./usage";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
@@ -3680,14 +3680,16 @@ async function runChannelCommand(
         if (!lu)
           return { immediate: "[!] no completed run yet (run one first)" };
         const at = lu.at.toISOString().slice(11, 19);
-        return { immediate: usageLine("last run", at, lu.stats) };
+        return { immediate: fence(usageFrame("last run", at, lu.stats)) };
       }
       // Read-only token stats from the session store. Session discovery
       // reuses the /undo path: active ctx session file, else newest .jsonl
       // under cwd's session dir (findSessionFile fallback).
       try {
         const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
-        return { immediate: text };
+        return {
+          immediate: text.startsWith("[!]") ? text : fence(text),
+        };
       } catch {
         return { immediate: fence("[!] usage stats unavailable") };
       }

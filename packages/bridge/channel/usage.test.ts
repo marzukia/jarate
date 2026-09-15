@@ -238,7 +238,15 @@ describe("renderUsage", () => {
     const text = await renderUsage(undefined, "/cwd", f);
     // in 8.2M @0.42 = 3.444 ; out 61K @3.00 = 0.183 ; est 3.627 -> 3.63
     expect(text).toBe(
-      "[usage] session   2026-09-10        | 3 turns | in 8.2M | out 61K | cacheRead 0 | est $3.63",
+      [
+        "┌ usage · session",
+        "├ span   : 2026-09-10",
+        "├ turns  : 3",
+        "├ in     : 8.2M",
+        "├ out    : 61K",
+        "├ cached : 0 (0%)",
+        "└ est    : $3.63",
+      ].join("\n"),
     );
     expect(text).toBe(await renderUsage("session", "/cwd", f));
   });
@@ -252,8 +260,17 @@ describe("renderUsage", () => {
     );
     const text = await renderUsage(undefined, "/cwd", f);
     // 1000*0.42 + 100*3.0 + 4000*0.085 = 1060 /1e6 -> $0.00
+    // cached share = 4000/(1000+4000) = 80%
     expect(text).toBe(
-      "[usage] session   2026-09-09        | 1 turns | in 1K | out 100 | cacheRead 4000 | est $0.00",
+      [
+        "┌ usage · session",
+        "├ span   : 2026-09-09",
+        "├ turns  : 1",
+        "├ in     : 1K",
+        "├ out    : 100",
+        "├ cached : 4K (80%)",
+        "└ est    : $0.00",
+      ].join("\n"),
     );
   });
 
@@ -280,7 +297,15 @@ describe("renderUsage", () => {
     // turns: t1..t3 + shared once = 4 ; in 8400 ; out 650
     // cost: 8400*0.42/1e6 + 650*3.00/1e6 = 0.005478 -> $0.01
     expect(text).toBe(
-      "[usage] lifetime  2026-08-01..now   | 4 turns | in 8K | out 650 | est $0.01",
+      [
+        "┌ usage · lifetime",
+        "├ span   : 2026-08-01..now",
+        "├ turns  : 4",
+        "├ in     : 8K",
+        "├ out    : 650",
+        "├ cached : 0 (0%)",
+        "└ est    : $0.01",
+      ].join("\n"),
     );
   });
 
@@ -292,7 +317,8 @@ describe("renderUsage", () => {
       [asst("c1", A(1_000, 100, 2_500))],
     );
     const text = await renderUsage("all", "/cwd", null);
-    expect(text).toContain("| cacheRead 2500 |");
+    // 2500 -> "3K" ; cached share = 2500/(1000+2500) = 71%
+    expect(text).toContain("├ cached : 3K (71%)");
   });
 
   test("unknown arg -> usage error; missing session file handled", async () => {
