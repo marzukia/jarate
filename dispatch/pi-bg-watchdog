@@ -171,6 +171,18 @@ prune_live() {
   cg_has_members "$CG_DIR/$t"
 }
 
+# issue #57 artifacts (written by the pi-bg wrapper): -rc holds the final
+# exit code (EXIT trap), -retry1 marks the one silent-death relaunch (kept
+# when the retry did not recover, removed when it did). The watchdog uses
+# both to split DEAD into DEAD (generic: SIGKILL/OOM/...) and SILENT
+# (rc=1 + no output + unconsumed retry1 = the #57 idle-timeout mode).
+has_retry1() {
+  [ -f "$BG_TMP/pi-bg-${1}-retry1" ]
+}
+rc_of() {
+  tr -d '[:space:]' < "$BG_TMP/pi-bg-${1}-rc" 2>/dev/null
+}
+
 # wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
 wd_post() {
   local body="$1" code i
@@ -185,22 +197,27 @@ wd_post() {
   return 1
 }
 
-# wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason>
+# wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason> <kind>
+# kind: DEAD (generic) or SILENT (issue #57 idle-timeout death)
 # embed format mirrors pi-bg bg_build (author header, bash meta block, footer)
 wd_build() {
-  local bodyfile="$1" t="$2" repo="$3" path="$4" last="$5" reason="$6"
-  WD_T="$t" WD_REPO="$repo" WD_PATH="$path" WD_LAST="$last" WD_REASON="$reason" \
+  local bodyfile="$1" t="$2" repo="$3" path="$4" last="$5" reason="$6" kind="${7:-DEAD}"
+  WD_T="$t" WD_REPO="$repo" WD_PATH="$path" WD_LAST="$last" WD_REASON="$reason" WD_KIND="$kind" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("WD_" + k, "")
+kind = E('KIND') or 'DEAD'
+note = ("silent death (issue #57): rc=1, no output, retry1 did not recover"
+        if kind == 'SILENT' else
+        "no live pi-bg process, no completion report - callback lost (SIGKILL/OOM)")
 meta = [f"repo   : {E('REPO')}",
         f"wt     : {E('PATH')}",
         f"last   : {E('LAST')}",
         f"reason : {E('REASON')}",
-        "note   : no live pi-bg process, no completion report - callback lost (SIGKILL/OOM)"]
+        f"note   : {note}"]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('T')}"},
          "color": 15105570,  # orange, same as pi-bg DIED
-         "title": f"pi-bg {E('T')} \u00b7 DEAD (watchdog sweep)",
+         "title": f"pi-bg {E('T')} \u00b7 {kind} (watchdog sweep)",
          "description": "```bash\n" + "\n".join(meta) + "```",
          "footer": {"text": "pi-bg watchdog"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -228,7 +245,7 @@ PY
 }
 
 found=0
-DT=(); DREPO=(); DP=(); DLAST=(); DREAS=()
+DT=(); DREPO=(); DP=(); DLAST=(); DREAS=(); DTYPE=()
 ST=(); STREPO=(); STL=()
 for d in "$WT_DIR"/*/*/; do
   d="${d%/}"
@@ -264,16 +281,26 @@ for d in "$WT_DIR"/*/*/; do
 
   found=$((found + 1))
   last="$(date -u -d "@$mtime" +%Y-%m-%dT%H:%M:%SZ)"
+  # SILENT (issue #57): the wrapper recorded exit 1, never produced output,
+  # and its one silent-death relaunch (retry1) did not recover. Distinct
+  # from generic DEAD: the process path was healthy, the model stream
+  # idle-timed-out. rc + retry1 alone prove the run started (retry1 is only
+  # touched inside the run loop), so no started-marker requirement. Only
+  # claimed when no stronger artifact explains it.
+  kind="DEAD"
   if has_deadletter "$t"; then
     reason="webhook dead letter exists (callback attempted, post failed)"
+  elif [ "$(rc_of "$t")" = "1" ] && has_retry1 "$t"; then
+    kind="SILENT"
+    reason="silent death: rc=1, no output, retry1 did not recover (issue #57)"
   elif has_started "$t"; then
     reason="started, no completion marker (callback lost - SIGKILL/OOM)"
   else
     reason="no callback on record (SIGKILL/OOM suspected)"
   fi
 
-  echo "[pi-bg-watchdog] DEAD $repo/$t (last activity $last, $reason)"
-  DT+=("$t"); DREPO+=("$repo"); DP+=("$d"); DLAST+=("$last"); DREAS+=("$reason")
+  echo "[pi-bg-watchdog] $kind $repo/$t (last activity $last, $reason)"
+  DT+=("$t"); DREPO+=("$repo"); DP+=("$d"); DLAST+=("$last"); DREAS+=("$reason"); DTYPE+=("$kind")
   printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
 done
 
@@ -306,7 +333,7 @@ if [ "$found" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq
   bodyf="$BG_TMP/pi-bg-watchdog-digest-body.json"
   if [ "$found" -le 3 ]; then
     for i in "${!DT[@]}"; do
-      wd_build "$bodyf" "${DT[$i]}" "${DREPO[$i]}" "${DP[$i]}" "${DLAST[$i]}" "${DREAS[$i]}"
+      wd_build "$bodyf" "${DT[$i]}" "${DREPO[$i]}" "${DP[$i]}" "${DLAST[$i]}" "${DREAS[$i]}" "${DTYPE[$i]}"
       if [ -s "$bodyf" ]; then
         wd_post "$bodyf" || echo "[pi-bg-watchdog] DEAD post failed for ${DT[$i]} (dead log still updated)" >&2
       fi
@@ -314,7 +341,7 @@ if [ "$found" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq
   else
     WD_N="$found" WD_LIST="$(for i in "${!DT[@]}"; do
       [ "$i" -ge 10 ] && break
-      printf '%s/%s | last %s\n' "${DREPO[$i]}" "${DT[$i]}" "${DLAST[$i]}"
+      printf '%s/%s | %s | last %s\n' "${DREPO[$i]}" "${DT[$i]}" "${DTYPE[$i]}" "${DLAST[$i]}"
     done)" WD_EXTRA=$((found - 10)) python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 count = int(os.environ.get("WD_N", "0"))

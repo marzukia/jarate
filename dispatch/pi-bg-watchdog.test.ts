@@ -74,6 +74,7 @@ function fixture() {
     tmp,
     home,
     agentDir,
+    art: path.join(tmp, "art"),
     agentsMd: () => path.join(agentDir, "AGENTS.md"),
     manifest: () => path.join(agentDir, ".agents-md-hash"),
     state: () => path.join(agentDir, ".agents-md-drift-warned"),
@@ -359,4 +360,125 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
       f.close();
     }
   });
+});
+
+/**
+ * #57: SILENT classification. The pi-bg wrapper records its final exit
+ * code (-rc, EXIT trap) and its one silent-death relaunch (-retry1, kept
+ * when the retry did not recover). rc=1 + no out.md + unconsumed retry1
+ * = the #57 idle-timeout failure mode, reported distinctly from generic
+ * DEAD (SIGKILL/OOM) in the sweep line, the embed, and the digest.
+ */
+describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => {
+  const TID = (n: number) => `20991231-235959-${700 + n}`;
+
+  /** Plant a dead ticket (no out.md, 30-min-old dir) + wrapper artifacts. */
+  const plantDead = (
+    f: { tmp: string; art: string },
+    n: number,
+    files: Record<string, string>,
+  ): string => {
+    const t = TID(n);
+    const d = path.join(f.tmp, "wt", "jarate", t);
+    fs.mkdirSync(d, { recursive: true });
+    const old = new Date(Date.now() - 30 * 60 * 1000);
+    fs.utimesSync(d, old, old);
+    for (const [name, content] of Object.entries(files)) {
+      fs.writeFileSync(path.join(f.art, name), content);
+    }
+    return t;
+  };
+
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  silent test\n`,
+    );
+
+  test("rc=1 + retry1 + no out.md -> SILENT (distinct embed, deduped, deadlogged)", async () => {
+    const f = fixture();
+    try {
+      bless(f); // keep the drift warning out of posts
+      const t = TID(1);
+      plantDead(f, 1, {
+        [`pi-bg-${t}-rc`]: "1\n",
+        [`pi-bg-${t}-retry1`]: "",
+        [`pi-bg-${t}-started`]: "",
+      });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`SILENT jarate/${t}`);
+      expect(r.out).toContain(
+        "silent death: rc=1, no output, retry1 did not recover",
+      );
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe(`pi-bg ${t} \u00b7 SILENT (watchdog sweep)`);
+      expect(em.description).toContain(
+        "silent death (issue #57): rc=1, no output, retry1 did not recover",
+      );
+      // deadlog carries the SILENT reason
+      const deadlog = path.join(f.home, ".pi-bg-deadlog");
+      expect(fs.readFileSync(deadlog, "utf8")).toContain(`jarate`); // repo
+      expect(fs.readFileSync(deadlog, "utf8")).toContain(
+        `silent death: rc=1, no output, retry1 did not recover (issue #57)`,
+      );
+      // second sweep: deduped, no re-post
+      const r2 = await f.run();
+      expect(f.posts).toHaveLength(1);
+      expect(r2.out).not.toContain(`SILENT jarate/${t}`);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("controls: rc=1 without retry1 -> DEAD; retry1 with rc=143 -> DEAD", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t1 = TID(2);
+      plantDead(f, 2, { [`pi-bg-${t1}-rc`]: "1\n" });
+      const t2 = TID(3);
+      plantDead(f, 3, {
+        [`pi-bg-${t2}-rc`]: "143\n",
+        [`pi-bg-${t2}-retry1`]: "",
+      });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`DEAD jarate/${t1}`);
+      expect(r.out).toContain(`DEAD jarate/${t2}`);
+      expect(r.out).not.toContain("SILENT jarate/");
+      expect(f.posts).toHaveLength(2);
+      for (const em of f.posts.map((p) => p.embeds[0])) {
+        expect(em.title).toMatch(/\u00b7 DEAD \(watchdog sweep\)$/);
+        expect(em.description).toContain("callback lost (SIGKILL/OOM)");
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("4+ SILENT tickets -> one digest embed, kind visible per line", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      for (const n of [4, 5, 6, 7]) {
+        const t = TID(n);
+        plantDead(f, n, {
+          [`pi-bg-${t}-rc`]: "1\n",
+          [`pi-bg-${t}-retry1`]: "",
+        });
+      }
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe("pi-bg \u00b7 4 dead tickets swept");
+      for (const n of [4, 5, 6, 7]) {
+        expect(em.description).toContain(`${TID(n)} | SILENT |`);
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
 });
