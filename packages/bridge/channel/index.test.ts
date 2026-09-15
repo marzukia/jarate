@@ -3976,7 +3976,7 @@ describe("compact: defer mid-run + always report", () => {
     await tick();
     // The report REPLACES the ticking placeholder in place (PATCH), not a
     // fresh post — no double message when the compact lands. k/m form
-    // (fmtTokensLC) so the line fits the 32-col budget even at 9-digit
+    // (fmtTokensLC) so the line fits the 40-col budget even at 9-digit
     // token counts.
     const reportText = "[ok] compacted: 220k -> 35k";
     const edits = fetchCalls.filter(
@@ -4824,7 +4824,7 @@ describe("todo board (integration)", () => {
     expect(replyContent()).toBe(fence("[todos] no open todos"));
   });
 
-  test("/todos all clips a long channel name to the 32-col budget", async () => {
+  test("/todos all clips a long channel name to the 40-col budget", async () => {
     const longName = "a".repeat(90);
     fs.writeFileSync(
       path.join(tmp, ".pi", "settings.json"),
@@ -4854,7 +4854,7 @@ describe("todo board (integration)", () => {
       .find((l) => l.startsWith("┌ "))!;
     // display width strips nothing here (no markdown in the header):
     // raw length is the display length
-    expect(header.length).toBeLessThanOrEqual(32);
+    expect(header.length).toBeLessThanOrEqual(40);
     expect(header.startsWith("┌ ")).toBe(true);
     expect(header.endsWith(" · 1 open")).toBe(true);
     expect(header).toContain("…"); // clipped
@@ -6846,19 +6846,19 @@ describe("/diff (issue #7)", () => {
   });
 });
 
-describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", () => {
+describe("v3 column budget (mockup3): every rendered frame line fits 40 cols", () => {
   const longAction =
     "bash cargo build --release --features everything,extra,long-flags -p some-crate";
   const longPath =
     "/home/monky/.pi-bg-wt/jarate/20260913-091303-15761/packages/bridge/channel/index.ts";
 
   // one constant per language: the TS fit budgets derive from the shared
-  // 32-col law (frame.ts), never a local re-hardcode
-  test("fit budgets derive from FRAME_COL_MAX (the 32-col law)", () => {
-    expect(FRAME_COL_MAX).toBe(32);
+  // 40-col law (frame.ts), never a local re-hardcode
+  test("fit budgets derive from FRAME_COL_MAX (the 40-col law)", () => {
+    expect(FRAME_COL_MAX).toBe(40);
     expect(TOOL_LINE_MAX).toBe(FRAME_COL_MAX);
     expect(TOOL_TEXT_MAX).toBe(FRAME_COL_MAX - "│ ├ ".length);
-    expect(TOOL_TEXT_MAX).toBe(28);
+    expect(TOOL_TEXT_MAX).toBe(36);
   });
 
   test("runFrame(working) fits the budget at any call count or elapsed time", () => {
@@ -6887,7 +6887,7 @@ describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", (
     }
   });
 
-  test("runFrame header: 6-digit count/secs compact, never > 32 cols (PR #64 review P3)", () => {
+  test("runFrame header: 6-digit count/secs compact, never > 40 cols (PR #64 review P3)", () => {
     // the review probe: `┌ working · 123456 calls · 999999s` = 34 cols
     for (const count of [1000, 9999, 123456, 999999]) {
       for (const secs of [1000, 9999, 123456, 999999]) {
@@ -6906,7 +6906,7 @@ describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", (
     );
   });
 
-  test("toolActionText is frame-safe (<=28) and keeps verbs + filename tails", () => {
+  test("toolActionText is frame-safe (<=36) and keeps verbs + filename tails", () => {
     const cases: Array<[string, Record<string, unknown>]> = [
       ["bash", { command: "bun run build 2>&1 | tail -4 && echo done" }],
       ["read", { path: longPath }],
@@ -6923,16 +6923,16 @@ describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", (
     }
     // verb survives clipping; path clips the head so the filename survives
     expect(toolActionText("edit", { path: longPath })).toBe(
-      "edit …ridge/channel/index.ts",
+      "edit …ckages/bridge/channel/index.ts",
     );
     expect(
       toolActionText("bash", {
         command: "cargo test --features a,b,c --package some-long-crate-name",
       }),
-    ).toBe("bash cargo test --features …");
+    ).toBe("bash cargo test --features a,b,c --…");
   });
 
-  test("runFrame(done): header + capped sub-steps + overflow line, all <= 32 cols", () => {
+  test("runFrame(done): header + capped sub-steps + overflow line, all <= 40 cols", () => {
     const calls = Array.from({ length: 14 }, (_, i) => `bash step-${i} --flag`);
     const frame = runFrame("done", calls, 14, 96).split("\n");
     expect(frame[0]).toBe("┌ done · 14 calls · 96s");

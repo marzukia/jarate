@@ -219,7 +219,7 @@ if [ -n "$webhook" ]; then
   python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("KILL_" + k, "")
-FRAME_W = 32  # mobile budget (docs/STYLE.md 2.3): every frame line <= 32
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15): every frame line <= 40
 def clip_end(s, max):
     s = str(s)
     return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")

@@ -681,10 +681,10 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
     expect(lines[1]).toBe(header);
     expect(lines.at(-2)).toBe("└");
     expect(lines.at(-1)).toBe("```");
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(32);
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
   };
 
-  test("worker OK + --worktree: framed description, 32-col budget", async () => {
+  test("worker OK + --worktree: framed description, 40-col budget", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const hook = capture();
@@ -709,11 +709,9 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
       assertFrame(em, `┌ ok · ${runId}`);
       expect(em.description).toContain("├ $ pi-bg worker --worktree");
-      // branch = "pi-bg/<rid>" is 28 cols; the kv vbudget is 21, so the
-      // tail of the pid clips (the branch prefix stays verbatim)
-      expect(em.description).toContain(
-        `├ branch : pi-bg/${runId.slice(0, 14)}…`,
-      );
+      // branch = "pi-bg/<rid>" is 25 cols; at the 40-col budget the kv
+      // vbudget (29) fits it whole - no clip
+      expect(em.description).toContain(`├ branch : pi-bg/${runId}`);
       expect(em.description).toContain("├ wt     : ");
       // fields intact: task + result + webdrop links (stubbed on PATH)
       const names = em.fields.map((f: { name: string }) => f.name);
@@ -733,7 +731,7 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
     }
   });
 
-  test("worker FAIL: rc in title + frame header, 32-col budget", async () => {
+  test("worker FAIL: rc in title + frame header, 40-col budget", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     fs.writeFileSync(
@@ -751,9 +749,9 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       if (!cap) throw new Error("webhook not captured");
       const em = cap.embeds[0];
       expect(em.title).toMatch(/^worker · FAIL \(rc=3\) · \d+m\d{2}s$/);
-      // the rc never fits the 32-col header (rid alone is 32): it stays
-      // in the title, the header carries the bare rid
-      assertFrame(em, `┌ fail · ${runId}`);
+      // at 40 the rc DOES fit the header (9 + 19 + 7 = 35): it ships
+      // in the header AND the title
+      assertFrame(em, `┌ fail · ${runId} (rc=3)`);
       expect(em.description).toContain("├ $ pi-bg worker");
       expect(em.description).toContain("├ cwd    : ");
     } finally {
@@ -1704,7 +1702,7 @@ describe("#52: watchdog STALLED classification (live + stale heartbeat)", () => 
       expect(r1.out).not.toContain(`DEAD jarate/${t}`);
       expect(hook.posts.length).toBe(1);
       const em = hook.posts[0].embeds[0];
-      // title is width-bounded (32): the full ticket lives in the
+      // title is width-bounded (40): the full ticket lives in the
       // description, not the title (PR #64 review P3)
       expect(em.title).toBe("1 stalled \u00b7 watchdog sweep");
       expect(em.title).not.toContain("dead");

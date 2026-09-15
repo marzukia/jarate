@@ -282,16 +282,16 @@ describe("collapseFenceTrailingBlankLines", () => {
   });
 });
 
-// ─── wrapFenceLines (STYLE.md 2.3, 32-col budget) ───────────────────────────
+// ─── wrapFenceLines (STYLE.md 2.3, 40-col budget) ───────────────────────────
 
 describe("wrapFenceLines", () => {
-  test("43-col frame line wraps to <=32 with 2-space continuation", () => {
+  test("43-col frame line wraps to <=40 with 2-space continuation", () => {
     const line43 = "├ frank : active, 418a56c2, restarted 17:43";
     expect(line43.length).toBe(43);
     // frames ship UNtagged (fence() = bare ```); tagged = code, not wrapped
     const input = `\`\`\`\n${line43}\n└\n\`\`\``;
     expect(wrapFenceLines(input)).toBe(
-      "```\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```",
+      "```\n├ frank : active, 418a56c2, restarted\n  17:43\n└\n```",
     );
   });
 
@@ -301,28 +301,28 @@ describe("wrapFenceLines", () => {
     const py = "        cached_tokens=num_cached_tokens,"; // 38 cols, one 30-char token
     const input = `\`\`\`python\ndef f(\n    enable_prompt_tokens_details: bool, ...):\n    if not enable_prompt_tokens_details:\n${py}\n\`\`\``;
     expect(
-      input.split("\n").filter((l) => l.length > 32).length,
+      input.split("\n").filter((l) => l.length > 40).length,
     ).toBeGreaterThan(0);
     expect(wrapFenceLines(input)).toBe(input);
   });
 
-  test("fence lines at or under 32 are untouched", () => {
-    const line32 = `┌ ok · ${"1".repeat(25)}`;
-    expect(line32.length).toBe(32);
-    const input = `\`\`\`\n${line32}\nshort\n\`\`\``;
+  test("fence lines at or under 40 are untouched", () => {
+    const line40 = `┌ ok · ${"1".repeat(33)}`;
+    expect(line40.length).toBe(40);
+    const input = `\`\`\`\n${line40}\nshort\n\`\`\``;
     expect(wrapFenceLines(input)).toBe(input);
   });
 
   test("prose outside fences is never wrapped", () => {
     const prose =
-      "this is a plain prose line that is definitely longer than 32";
-    expect(prose.length).toBeGreaterThan(32);
+      "this is a plain prose line that is definitely longer than 40";
+    expect(prose.length).toBeGreaterThan(40);
     const input = `${prose}\n\`\`\`\n${prose}\n\`\`\`\n${prose}`;
     expect(wrapFenceLines(input)).toBe(
       prose +
         "\n```\n" +
-        "this is a plain prose line that\n" +
-        "  is definitely longer than 32\n" +
+        "this is a plain prose line that is\n" +
+        "  definitely longer than 40\n" +
         "```\n" +
         prose,
     );
@@ -334,13 +334,13 @@ describe("wrapFenceLines", () => {
     const lines = wrapFenceLines(input).split("\n");
     expect(lines).toEqual([
       "```",
-      "x".repeat(32),
-      `  ${"x".repeat(18)}`,
+      "x".repeat(40),
+      `  ${"x".repeat(10)}`,
       "```",
     ]);
   });
 
-  test("multi-wrap: a 92-col line takes four fence lines, all <= 32", () => {
+  test("multi-wrap: a 92-col line takes three fence lines, all <= 40", () => {
     const line =
       "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiii";
     expect(line.length).toBe(92);
@@ -350,28 +350,27 @@ describe("wrapFenceLines", () => {
     const body = lines.slice(1, -1);
     expect(body).toEqual([
       "aaaaaaaaaa bbbbbbbbbb cccccccccc",
-      "  dddddddddd eeeeeeeeee",
-      "  ffffffffff gggggggggg",
-      "  hhhhhhhhhh iiii",
+      "  dddddddddd eeeeeeeeee ffffffffff",
+      "  gggggggggg hhhhhhhhhh iiii",
     ]);
-    for (const l of body) expect(l.length).toBeLessThanOrEqual(32);
+    for (const l of body) expect(l.length).toBeLessThanOrEqual(40);
     // no chars lost: unwrapping (drop indent + join) gives the original
     expect(body.map((l, i) => (i === 0 ? l : l.slice(2))).join(" ")).toBe(line);
   });
 
   test("mdToDiscord end-to-end: long fence line wraps, prose survives", () => {
     const prose =
-      "a prose sentence that runs well past the thirty two col budget";
-    const md = `\`\`\`\n┌ fail · ${"9".repeat(30)}\n\`\`\`\n\n${prose}`;
+      "a prose sentence that runs well past the forty col budget now";
+    const md = `\`\`\`\n├ frank : active, 418a56c2, restarted 17:43\n\`\`\`\n\n${prose}`;
     const out = mdToDiscord(md).split("\n");
-    // prose line intact, single line, still over 32 (Discord wraps it)
+    // prose line intact, single line, still over 40 (Discord wraps it)
     expect(out).toContain(prose);
     for (const l of out.slice(1, out.length - 2))
-      expect(l.length).toBeLessThanOrEqual(32);
+      expect(l.length).toBeLessThanOrEqual(40);
   });
 
   test("idempotent: an already-wrapped fence is unchanged", () => {
-    const input = "```\n├ frank : active, 418a56c2,\n  restarted 17:43\n└\n```";
+    const input = "```\n├ frank : active, 418a56c2, restarted\n  17:43\n└\n```";
     expect(wrapFenceLines(input)).toBe(input);
   });
 });

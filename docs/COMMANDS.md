@@ -21,7 +21,7 @@ and on a 5s tick); at run end the header flips to `┌ done` / `┤ failed` on
 that same message, `└` close. The todo board uses its own state glyphs: `├`
 pending, `┣` in progress, `├` done (strikethrough, pipe stays connected),
 `┤` cancelled, `┌` board header, `└` close. Both families are exempt from
-the bracket scheme and must stay <= 32 cols per line (mobile budget).
+the bracket scheme and must stay <= 40 cols per line (mobile budget, measured 2026-09-15).
 Webhook callback embeds are framed and untagged.
 
 | command / output | tag |
@@ -30,7 +30,7 @@ Webhook callback embeds are framed and untagged.
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
 | `/usage [all\|session\|last]` | `[usage] …` (error: `[!] usage: …`) |
-| `/context [N]` | fenced frame (32-col box-drawing, `[context]` tag, est tokens char/4; error: `[!] no session file found` / `[!] session file unreadable`) |
+| `/context [N]` | fenced frame (40-col box-drawing, `[context]` tag, est tokens char/4; error: `[!] no session file found` / `[!] session file unreadable`) |
 | `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
 | `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
@@ -376,7 +376,7 @@ recent (newest first):
 `pi-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
 and the tail file is owned by the dispatch user. Output is fenced; tail
 shows the last N lines (default 40, cap 200), notes dropped lines
-(`[..] 60 earlier lines`), and hard-wraps lines to the 32-col budget.
+(`[..] 60 earlier lines`), and hard-wraps lines to the 40-col budget.
 
 Companion bins (installed like `pi-bg`): `pi-bg-tail <id> [lines] [-f]`
 reads a run's live output; `pi-bg-kill <id> [--dry-run]` cancels a run via

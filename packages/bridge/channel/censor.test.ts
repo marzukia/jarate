@@ -116,16 +116,16 @@ describe("pattern classes", () => {
   });
 
   test("render path: toolActionText censors BEFORE the frame clip", () => {
-    // The 26-char switchboard key is longer than the 23-col bash text
-    // budget, so censor runs first (audit 2026-09-15, aesthetics #2):
-    // the key is redacted whole, then the [REDACTED:...] marker itself is
-    // what the clip trims - no raw key can reach the frame. (The
-    // final-send censor still sees the escaped + clipped form, so its
-    // pattern keeps the sbk\_ shape - see censor.ts.)
+    // The 26-char switchboard key is redacted whole BEFORE any clip can
+    // touch it (audit 2026-09-15, aesthetics #2): no raw key can reach
+    // the frame. At the 36-col bash budget the marker survives unclipped;
+    // the clip-first regression is covered by the 40-char token case
+    // below. (The final-send censor still sees the escaped + clipped
+    // form, so its pattern keeps the sbk\_ shape - see censor.ts.)
     const action = toolActionText("bash", { command: `echo ${SBK}` });
-    expect(action).toBe("bash echo [REDACTED:switchb…");
+    expect(action).toBe("bash echo [REDACTED:switchboard]");
     expect(action).not.toContain(SBK);
-    expect(`│ ├ ${action}`.length).toBeLessThanOrEqual(32);
+    expect(`│ ├ ${action}`.length).toBeLessThanOrEqual(40);
     expect(censor(action, { file: R })).not.toContain(SBK);
     // A classic token (40 chars) can never survive the clip whole; the
     // censor takes it out before the clip, and the full value must not
@@ -232,7 +232,7 @@ describe("pattern classes", () => {
 });
 
 describe("egress width (PR #64 review P2: clipped markers must not re-expand)", () => {
-  // toolActionText censors BEFORE the clip, so the shipped 32-col frame
+  // toolActionText censors BEFORE the clip, so the shipped 40-col frame
   // line carries a CLIPPED marker fragment (as short as `token=[…`). The
   // egress pass (egressText, discord.ts — literally `censor(text)`) re-runs
   // the full censor on that line: the sshpass and kv-`=` value classes
@@ -248,8 +248,8 @@ describe("egress width (PR #64 review P2: clipped markers must not re-expand)", 
   ];
 
   for (const [name, cmd, secret] of cases) {
-    test(`${name}: frame line <= 32 BEFORE and AFTER the egress censor`, () => {
-      // the shipped line: runFrame sub-step `│ ├ ` + toolActionText (28)
+    test(`${name}: frame line <= 40 BEFORE and AFTER the egress censor`, () => {
+      // the shipped line: runFrame sub-step `│ ├ ` + toolActionText (36)
       const action = toolActionText("bash", { command: cmd });
       const pre = `│ ├ ${fit(action, FRAME_COL_MAX - 4)}`;
       expect(pre.length).toBeLessThanOrEqual(FRAME_COL_MAX);
@@ -265,9 +265,9 @@ describe("egress width (PR #64 review P2: clipped markers must not re-expand)", 
     });
   }
 
-  test("32-col clip of the censored command: egress stays <= 32", () => {
+  test("40-col clip of the censored command: egress stays <= 40", () => {
     // task probe shape: censor the raw command, fit the full line to the
-    // 32-col budget, then run the egress censor on the result.
+    // 40-col budget, then run the egress censor on the result.
     for (const cmd of [
       `sshpass -p ${PW} scp x@h:file /tmp/y`,
       `export A=1 B=2 token=${TK}`,

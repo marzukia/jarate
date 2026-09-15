@@ -585,15 +585,15 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
     expect(inner.length).toBe(1 + 40);
   });
 
-  test("tail: overlong lines are hard-wrapped at 32 cols (mobile budget)", async () => {
+  test("tail: overlong lines are hard-wrapped at 40 cols (mobile budget)", async () => {
     const long = "x".repeat(120);
     stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
     const r = await jobsTail(ID, 40, env, scriptsDir);
     const lines = r.split("\n");
-    // fence + 4 wrapped (32*3 + 24) + "ok" + fence
-    expect(lines.length).toBe(7);
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(32);
-    expect(lines[1] + lines[2] + lines[3] + lines[4]).toBe(long);
+    // fence + 3 wrapped (40*3) + "ok" + fence
+    expect(lines.length).toBe(6);
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+    expect(lines[1] + lines[2] + lines[3]).toBe(long);
   });
 
   test("tail: --n is clamped to [1, 200] and passed to the script", async () => {

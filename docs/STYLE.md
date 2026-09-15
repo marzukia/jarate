@@ -15,7 +15,7 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 2.1 Machine state goes in a code fence, rendered as a box-drawing frame.
 2.2 Full border: `┌` top, `├`/`┣` rows, `└` bottom. Never ship an open
     frame.
-2.3 <= 32 cols per line (mobile budget; 40 still wrapped on Andryo's phone 2026-09-15). Wrap or shorten, never overflow.
+2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on Andryo's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
 2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra
     context goes before the frame.
 2.5 Blank line before a fence: yes. Blank line after a fence: only if the
@@ -34,7 +34,7 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
     (docs/JARATE.md)
 4.2 Slash commands: bracketed tag + one line, fenced only when the
     content is multi-line. (docs/COMMANDS.md tag table)
-4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 32 cols.
+4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
     (docs/DISPATCH.md)
 4.4 Machine output posted to Discord (script errors, command output,
     logs, JSON, paths) goes in a code fence - never bare prose. One-line
