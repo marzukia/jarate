@@ -91,6 +91,7 @@ export async function ingest(opts: IngestOptions): Promise<IngestStats> {
       pruned = await pruneOrphans(
         sql,
         chunks.map((c) => c.hash),
+        Array.from(new Set(files.map((f) => f.source))),
         config.embedModel,
         INGEST_VERSION,
       );

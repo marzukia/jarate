@@ -126,12 +126,18 @@ export async function upsertChunks(
 export async function pruneOrphans(
   sql: Sql,
   hashes: string[],
+  sources: string[],
   embedModel: string,
   ingestVersion: string,
 ): Promise<number> {
+  // Scoped to this run's source files: a partial ingest (one docs dir)
+  // must not delete other projects' chunks (2026-09-15: the table-wide
+  // version would have nuked 1345 foreign chunks on a 45-chunk run).
   const res = await sql.unsafe(
-    "DELETE FROM chunks WHERE embed_model = $1 AND ingest_version = $2 AND NOT (content_hash = ANY($3))",
-    [embedModel, ingestVersion, hashes] as Array<string | null>,
+    "DELETE FROM chunks WHERE embed_model = $1 AND ingest_version = $2 AND source = ANY($3) AND NOT (content_hash = ANY($4))",
+    [embedModel, ingestVersion, sources, hashes] as Array<
+      string | string[] | null
+    >,
   );
   return res.length;
 }
