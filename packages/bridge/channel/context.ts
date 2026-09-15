@@ -7,7 +7,7 @@
  *
  * /context parses the channel's ACTIVE session file (same discovery as
  * /usage: caller-resolved ctx session file, else findSessionFile(cwd)) and
- * reports, in one 40-col framed block:
+ * reports, in one 32-col framed block:
  *   - top-N items by token ESTIMATE (default 10, `/context 20` accepts a
  *     count, capped at 40 to stay under Discord's 2000-char message limit)
  *   - totals by category (user / assistant / tool)
@@ -22,10 +22,11 @@
  * entry id, the same guard as /usage's assistant dedup. Non-conversation
  * entries (session, compaction, model_change, ...) are not counted.
  *
- * The frame obeys the 40-col mobile budget (docs/COMMANDS.md): box-drawing,
+ * The frame obeys the 32-col mobile budget (FRAME_COL_MAX): box-drawing,
  * ASCII tags, no emoji.
  */
 
+import { FRAME_COL_MAX } from "./frame";
 import { findSessionFile } from "./undo";
 import { fmtTokens, linesOf } from "./usage";
 
@@ -54,7 +55,23 @@ export function estTokens(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
-/** Compact age: 45s / 12m / 3h12m / 1d3h (max 6 chars, 40-col budget).
+/** Row role abbreviation: 4 chars max so the item row stays on 32.
+ *  (user/asst/tool — "assistant" is the 9-char outlier.) */
+function ctxRole4(role: CtxRole): string {
+  return role === "assistant" ? "asst" : role;
+}
+
+/** Header line: "top N/M · total X" fits FRAME_COL_MAX even for huge M
+ *  (clip M, keep its tail — the count is the interesting part). */
+function ctxHeader(shown: number, total: number, tok: string): string {
+  const fixed = `┌ top ${shown}/`.length + ` · total ${tok}`.length;
+  const m = String(total);
+  const keep = Math.max(1, FRAME_COL_MAX - fixed);
+  const mm = m.length > keep ? `…${m.slice(m.length - (keep - 1))}` : m;
+  return `┌ top ${shown}/${mm} · total ${tok}`;
+}
+
+/** Compact age: 45s / 12m / 3h12m / 1d3h (max 6 chars, 32-col budget).
  *  Zero sub-units drop: 1h not 1h0m. */
 export function fmtAge(ms: number): string {
   let s = Math.floor(ms / 1000);
@@ -220,7 +237,7 @@ export async function scanContextFile(file: string): Promise<CtxScan> {
 
 /**
  * Build the /context frame (WITHOUT the outer code fence — the caller
- * wraps it). Every line stays within the 40-col mobile budget.
+ * wraps it). Every line stays within the 32-col mobile budget.
  *
  * @param scan    parsed session items
  * @param n       requested top-N (already validated)
@@ -235,17 +252,19 @@ export function formatContext(
   const shown = Math.min(n, items.length);
   const L: string[] = [];
   L.push("[context] est tokens (char/4)");
-  L.push(
-    `┌ top ${shown} of ${items.length} items · total ${fmtTokens(estTokens(totalChars))}`,
-  );
+  // header re-layout (32-col budget): "top 5/5" + k-form total; the
+  // old "top 5 of 1234 items" breached 32 with M in the thousands
+  L.push(ctxHeader(shown, items.length, fmtTokens(estTokens(totalChars))));
   const date =
     baseTs > 0 ? new Date(baseTs).toISOString().slice(0, 10) : "unknown";
-  L.push(`│ session ${date} · age ${baseTs > 0 ? fmtAge(now - baseTs) : "?"}`);
+  L.push(`│ ${date} · age ${baseTs > 0 ? fmtAge(now - baseTs) : "?"}`);
   for (let i = 0; i < shown; i++) {
     const it = items[i];
     const age = it.ts > 0 && baseTs > 0 ? fmtAge(it.ts - baseTs) : "?";
+    // row: │ <idx> <role4> <type10> <tok4> <age> — worst case
+    // (idx 40, toolResult, 999K, 23h59m) lands exactly on 32
     L.push(
-      `│ ${String(i + 1).padStart(2)} ${it.role.padEnd(9)} ${it.type.padEnd(10)} ${fmtTokens(estTokens(it.chars)).padStart(5)} ${age}`,
+      `│ ${String(i + 1).padStart(2)} ${ctxRole4(it.role).padEnd(4)} ${it.type.padEnd(10)} ${fmtTokens(estTokens(it.chars)).padStart(4)} ${age}`,
     );
   }
   if (shown === 0) L.push("│ (no sized items)");
@@ -264,10 +283,11 @@ export function formatContext(
   }
   if (shown > 0) {
     const top = items[0];
-    const name = top.tool ? ` (${top.tool.slice(0, 4)})` : "";
-    // "asst" keeps the worst case (assistant + toolCall + tool name) at 40
+    // "asst" + unpadded tok keep the worst case (assistant + toolResult +
+    // 999K) at 31. The tool name drops: row 1 already carries the top
+    // item's type + tokens, and the name was the overflow.
     L.push(
-      `└ biggest: ${top.role === "assistant" ? "asst" : top.role} ${top.type.padEnd(10)} ${fmtTokens(estTokens(top.chars)).padStart(5)}${name}`,
+      `└ biggest: ${ctxRole4(top.role)} ${top.type.padEnd(10)} ${fmtTokens(estTokens(top.chars)).padStart(4)}`,
     );
   } else {
     // empty scan still closes the frame (STYLE 2.2: never ship open)

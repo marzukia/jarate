@@ -3,7 +3,7 @@
  *
  * Runs the real bash script against a fake cgroup (PI_BG_CG_ROOT override)
  * with a real sleeping victim, captures the webhook payload, and asserts
- * the framed description stays inside the 40-col mobile budget.
+ * the framed description stays inside the 32-col mobile budget.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -23,8 +23,8 @@ afterEach(() => {
   }
 });
 
-describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
-  test("kill posts a framed embed (no dingbat), pids + wait lines, <= 40 cols", async () => {
+describe("pi-bg-kill v3 embed: framed payload, 32-col budget", () => {
+  test("kill posts a framed embed (no dingbat), pids + wait lines, <= 32 cols", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill-"));
     tmpDirs.push(tmp);
     const home = path.join(tmp, "home");
@@ -89,13 +89,15 @@ describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
       const lines = em.description.split("\n");
       expect(lines[0]).toBe("```bash");
       expect(lines[1]).toBe(`┌ killed · ${id}`);
-      expect(lines[2]).toBe(`├ $ pi-bg-kill ${id}`);
+      // the "$ pi-bg-kill <rid>" line is 36 cols for this id: the rid head
+      // clips (tail kept - the pid end is the discriminator)
+      expect(lines[2]).toBe(`├ $ pi-bg-kill …${id.slice(id.length - 16)}`);
       expect(lines.at(-2)).toBe("└");
       expect(lines.at(-1)).toBe("```");
-      for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+      for (const l of lines) expect(l.length).toBeLessThanOrEqual(32);
       expect(em.description).toContain("├ pids  : ");
       // wait seconds include list_tree's /proc scan time -> match shape only
-      expect(em.description).toMatch(/├ wait {2}: \d+s \(SIGTERM->SIGKILL\)/);
+      expect(em.description).toMatch(/├ wait {2}: \d+s \(TERM->KILL\)/);
       expect(em.description).toContain("├ state : killed on request");
     } finally {
       victim.kill("SIGKILL");

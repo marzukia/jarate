@@ -7,13 +7,17 @@
 // /proc/<pid>/cgroup (the escape cgroup path ends in the run_id pi-bg
 // prints as the escape path). Unresolvable pid => id:null, never a crash.
 //
-// History: assembled from the /tmp/pi-bg-<ticket>-* artifacts pi-bg leaves
-// per run — raw.out (run started), out.md (run completed, non-empty),
-// webhook-failed (callback dead letter), killed (pi-bg-kill marker),
-// wb-status (success-path webhook HTTP code, recorded at post time).
+// History: assembled from the pi-bg-<ticket>-* artifacts pi-bg leaves
+// per run (in ~/.pi-bg-art, or $PI_BG_TMPDIR; legacy runs in /tmp are
+// still scanned) — raw.out (run started), out.md (run completed,
+// non-empty), webhook-failed (callback dead letter), killed (pi-bg-kill
+// marker), wb-status (success-path webhook HTTP code, recorded at post
+// time).
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { FRAME_COL_MAX } from "./frame";
 
 export interface InflightJob {
   /** ticket id (run_id) via /proc/<pid>/cgroup, or null when unresolved */
@@ -49,14 +53,17 @@ export function ticketIdFromPid(
   return null;
 }
 
-// Match the wrapper line shape: <pid> <etime> <bash> <...>scripts/pi-bg <profile> <task>
+// Match the wrapper line shape: <pid> <etime> <bash> <script-path> <profile> <task>
+// The script path is EITHER the installed symlink (.../scripts/pi-bg)
+// OR the per-run snapshot (.../.pi-bg-art/snap-<run_id>/pi-bg — the
+// deploy-swap guard re-execs from a hard-linked copy, 2026-09-15).
 export function parseJobsFromPs(psOut: string): InflightJob[] {
   const out: InflightJob[] = [];
   for (const line of psOut.split("\n")) {
     const m = line
       .trim()
       .match(
-        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*scripts\/pi-bg\s+(worker|reviewer)\s+(.+)$/,
+        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/pi-bg|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)\s+(.+)$/,
       );
     if (!m) continue;
     const task = m[4]
@@ -78,8 +85,10 @@ export function collectInflightJobs(): InflightJob[] {
   let raw = "";
   try {
     const uid = process.getuid?.();
+    // [s]/(s) tricks keep grep itself out of its own match; the second
+    // arm catches the per-run snapshot path (deploy-swap guard).
     raw = execSync(
-      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep '[s]cripts/pi-bg'`,
+      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep -E '(s)cripts/pi-bg|snap-[0-9]{8}-[0-9]{6}-[0-9]+/pi-bg'`,
       { encoding: "utf8", timeout: 5000 },
     );
   } catch {
@@ -101,11 +110,38 @@ export interface JobHistoryEntry {
 
 const TICKET_RE = /^pi-bg-(\d{8}-\d{6}-\d+)-/;
 
+/** pi-bg artifact dir: $PI_BG_TMPDIR or ~/.pi-bg-art (pi-bg's own
+ *  BG_TMP default). Runs dispatched before the 2026-09-15 default flip
+ *  left artifacts in /tmp — the legacy fallback keeps them visible. */
+export const JOB_TMP_LEGACY = "/tmp";
+
 export function jobTmpDir(): string {
-  return process.env.PI_BG_TMPDIR || "/tmp";
+  return process.env.PI_BG_TMPDIR || path.join(os.homedir(), ".pi-bg-art");
 }
 
-export function scanJobHistory(tmpDir = jobTmpDir()): JobHistoryEntry[] {
+/** Default scan set: the current pi-bg tmp dir, then the legacy /tmp. */
+export function jobTmpDirs(): string[] {
+  return [jobTmpDir(), JOB_TMP_LEGACY];
+}
+
+export function scanJobHistory(
+  tmpDir: string | string[] = jobTmpDirs(),
+): JobHistoryEntry[] {
+  const dirs = Array.isArray(tmpDir) ? tmpDir : [tmpDir];
+  // merge across dirs (a ticket lives in exactly one of them; the
+  // newer entry wins if an old copy lingers in the legacy dir)
+  const byId = new Map<string, JobHistoryEntry>();
+  for (const d of dirs)
+    for (const e of scanJobHistoryDir(d)) {
+      const prev = byId.get(e.id);
+      if (!prev || e.mtime > prev.mtime) byId.set(e.id, e);
+    }
+  const out = [...byId.values()];
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out;
+}
+
+function scanJobHistoryDir(tmpDir: string): JobHistoryEntry[] {
   let names: string[] = [];
   try {
     names = fs.readdirSync(tmpDir);
@@ -318,7 +354,7 @@ function jobWrapFence(t: string): string {
 }
 
 const TAIL_MAX_LINES = 40;
-const TAIL_LINE_MAX = 40; // mobile budget, same as the run frames
+const TAIL_LINE_MAX = FRAME_COL_MAX; // mobile budget, same as the run frames
 
 /** Cap + hard-wrap tail output and fence it. Keeps the LAST TAIL_MAX_LINES
  *  lines (a tail is about the newest output) and splits overlong lines. */

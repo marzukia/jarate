@@ -192,7 +192,7 @@ On completion, `pi-bg` posts to the Discord webhook:
   `pi-bg ticket · <run_id>`, title `worker · OK · 12m43s` (or
   `reviewer · PASS/FAIL`, `worker · DIED (no report)`, `worker · EMPTY`) -
   no glyphs in titles. Description is a framed block (box-drawing,
-  <= 40 cols per line): `┌ ok · <run_id>` header + `├` meta lines
+  <= 32 cols per line): `┌ ok · <run_id>` header + `├` meta lines
   (repo/wt/branch, or cwd) + `└` close. Fields: `task` (first 200 chars),
   `result` (first 400 chars), plus `prompt` / `full output` links when
   `webdrop` is available (7d TTL).

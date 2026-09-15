@@ -57,9 +57,13 @@ function fixture() {
   delete env.PI_SERVICE;
   // running inside a pi-bg ticket (the #56 tests run there all the time
   // when a worker dispatches the suite) leaks PI_BG_SETSID=1 and would
-  // skip the setsid re-exec under test - hermeticize
+  // skip the setsid re-exec under test - hermeticize. The snapshot re-exec
+  // (deploy-swap guard) additionally exports PI_BG_SNAP=1 + PI_BG_RUN_ID,
+  // which leak the same way and make children look like snapshot runs.
   delete env.PI_BG_SETSID;
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
+  delete env.PI_BG_RUN_ID;
+  delete env.PI_BG_SNAP;
   // cap off by default: ambient fleet traffic (real pi-bg runs of this
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
   // PI_BG_MAX_CONCURRENT explicitly per spawn.
@@ -477,6 +481,9 @@ function wdFixtureX(n: number) {
   env.PI_BG_CG_ROOT = path.join(tmp, "cg");
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_BG_SETSID;
+  // same hermeticity as fixture() above: a ticket run leaks SNAP + RUN_ID
+  delete env.PI_BG_RUN_ID;
+  delete env.PI_BG_SNAP;
   const run = (
     args: string[] = ["--dry-run"],
     overrides?: Record<string, string>,
@@ -674,10 +681,10 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
     expect(lines[1]).toBe(header);
     expect(lines.at(-2)).toBe("└");
     expect(lines.at(-1)).toBe("```");
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(32);
   };
 
-  test("worker OK + --worktree: framed description, 40-col budget", async () => {
+  test("worker OK + --worktree: framed description, 32-col budget", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const hook = capture();
@@ -702,7 +709,11 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
       assertFrame(em, `┌ ok · ${runId}`);
       expect(em.description).toContain("├ $ pi-bg worker --worktree");
-      expect(em.description).toContain(`├ branch : pi-bg/${runId}`);
+      // branch = "pi-bg/<rid>" is 28 cols; the kv vbudget is 21, so the
+      // tail of the pid clips (the branch prefix stays verbatim)
+      expect(em.description).toContain(
+        `├ branch : pi-bg/${runId.slice(0, 14)}…`,
+      );
       expect(em.description).toContain("├ wt     : ");
       // fields intact: task + result + webdrop links (stubbed on PATH)
       const names = em.fields.map((f: { name: string }) => f.name);
@@ -722,7 +733,7 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
     }
   });
 
-  test("worker FAIL: rc in title + frame header, 40-col budget", async () => {
+  test("worker FAIL: rc in title + frame header, 32-col budget", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     fs.writeFileSync(
@@ -740,7 +751,9 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       if (!cap) throw new Error("webhook not captured");
       const em = cap.embeds[0];
       expect(em.title).toMatch(/^worker · FAIL \(rc=3\) · \d+m\d{2}s$/);
-      assertFrame(em, `┌ fail · ${runId} (rc=3)`);
+      // the rc never fits the 32-col header (rid alone is 32): it stays
+      // in the title, the header carries the bare rid
+      assertFrame(em, `┌ fail · ${runId}`);
       expect(em.description).toContain("├ $ pi-bg worker");
       expect(em.description).toContain("├ cwd    : ");
     } finally {
@@ -1981,7 +1994,7 @@ describe("deploy-swap guard (2026-09-15): wrapper survives a script swap mid-run
       "# shifted 3",
       "# shifted 4",
     );
-    const tmpf = real + ".new";
+    const tmpf = `${real}.new`;
     fs.writeFileSync(tmpf, src.join("\n"));
     fs.renameSync(tmpf, real);
   };
@@ -2044,7 +2057,7 @@ describe("deploy-swap guard (2026-09-15): wrapper survives a script swap mid-run
       const mid = Math.floor(c.length / 2);
       fs.writeFileSync(
         real,
-        c.slice(0, mid) + "\n# in-place shifted\n" + c.slice(mid),
+        `${c.slice(0, mid)}\n# in-place shifted\n${c.slice(mid)}`,
       );
       const r = await collect1(s);
       expect(r.code).toBe(0);

@@ -113,21 +113,25 @@ describe("pattern classes", () => {
     expect(out).not.toContain(T36);
   });
 
-  test("render path: toolActionText line censored at the choke point", () => {
-    // The 26-char switchboard key fits the 31-col bash clip, so a rendered
-    // tool line can carry the FULL key — markdown-escaped (sbk\_jimmy\_),
-    // and the censor must take it out.
+  test("render path: toolActionText censors BEFORE the frame clip", () => {
+    // The 26-char switchboard key is longer than the 23-col bash text
+    // budget, so censor runs first (audit 2026-09-15, aesthetics #2):
+    // the key is redacted whole, then the [REDACTED:...] marker itself is
+    // what the clip trims - no raw key can reach the frame. (The
+    // final-send censor still sees the escaped + clipped form, so its
+    // pattern keeps the sbk\_ shape - see censor.ts.)
     const action = toolActionText("bash", { command: `echo ${SBK}` });
-    expect(action).toBe(`bash echo sbk\\_jimmy\\_56659a2ca404b4a6`);
-    expect(censor(action, { file: R })).toBe(
-      "bash echo [REDACTED:switchboard]",
-    );
-    // A classic token (40 chars) can never survive the 31-col clip whole;
-    // whatever fragment remains is not a working token, and the full value
-    // must not appear.
+    expect(action).toBe("bash echo [REDACTED:switchb…");
+    expect(action).not.toContain(SBK);
+    expect(`│ ├ ${action}`.length).toBeLessThanOrEqual(32);
+    expect(censor(action, { file: R })).not.toContain(SBK);
+    // A classic token (40 chars) can never survive the clip whole; the
+    // censor takes it out before the clip, and the full value must not
+    // appear in the rendered line.
     const clipped = toolActionText("bash", {
       command: `GH_TOKEN=${GHP} python -c 'print(1)'`,
     });
+    expect(clipped).not.toContain(GHP);
     expect(censor(clipped, { file: R })).not.toContain(GHP);
   });
 

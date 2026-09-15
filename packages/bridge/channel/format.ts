@@ -13,6 +13,7 @@
  *   5. convertInlineForDiscord  — headings → bold, [text](url) → text (<url>)
  */
 import { Lexer, type Token, type Tokens } from "marked";
+import { FRAME_COL_MAX } from "./frame";
 import type { DiscordEmbed } from "./types";
 
 // ─── Heading depth ─────────────────────────────────────────────────────────
@@ -377,6 +378,56 @@ export function collapseFenceTrailingBlankLines(md: string): string {
 }
 
 /**
+ * STYLE.md 2.3 width pass: word-wrap fence lines longer than FRAME_COL_MAX
+ * (continuation indent 2 spaces). Prose OUTSIDE fences is untouched —
+ * Discord wraps it natively; only monospace fence lines overflow. A word
+ * with no space in budget hard-breaks at the budget. Same fence toggle
+ * as collapseFenceTrailingBlankLines. Exported for tests.
+ */
+export function wrapFenceLines(
+  md: string,
+  max: number = FRAME_COL_MAX,
+): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  for (const line of lines) {
+    if (line.trimStart().startsWith("```")) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (!inFence || line.length <= max) {
+      out.push(line);
+      continue;
+    }
+    out.push(...wrapFenceLine(line, max));
+  }
+  return out.join("\n");
+}
+
+function wrapFenceLine(line: string, max: number): string[] {
+  const cont = "  ";
+  const out: string[] = [];
+  let rest = line;
+  let first = true;
+  while (rest.length > 0) {
+    const budget = first ? max : max - cont.length;
+    if (rest.length <= budget) {
+      out.push((first ? "" : cont) + rest);
+      break;
+    }
+    // break at the last word boundary in budget; hard-break when absent
+    let cut = rest.lastIndexOf(" ", budget);
+    if (cut <= 0) cut = budget;
+    out.push((first ? "" : cont) + rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^ +/, "");
+    first = false;
+  }
+  return out;
+}
+
+/**
  * Escape triple backticks in free text so it doesn't open a code block
  * when inserted into a Discord message.
  */
@@ -477,5 +528,6 @@ export function mdToDiscord(md: string): string {
   out = escapeBackticksInCodeBlocks(out);
   out = convertInlineForDiscord(out);
   out = collapseFenceTrailingBlankLines(out);
+  out = wrapFenceLines(out);
   return out;
 }
