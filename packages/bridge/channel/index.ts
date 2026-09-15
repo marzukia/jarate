@@ -110,6 +110,7 @@ import {
   todoBoardContextBlock,
   todoLine,
 } from "./todos";
+import { isVoiceAudio, transcribeVoice } from "./transcribe";
 import {
   type AttachmentRef,
   type ChannelConfig,
@@ -4873,8 +4874,10 @@ export async function handleInbound(
     fs.mkdirSync(batchFolderAbs, { recursive: true });
 
     // Eager download; record why a file was not saved (skipped/failed)
-    // so the LLM is not pointed at a missing file.
+    // so the LLM is not pointed at a missing file. Also record where a
+    // file WAS saved so voice notes can be transcribed after download.
     const notes = new Map<string, string>();
+    const savedPaths = new Map<string, string>();
     if (ch?.type === "discord") {
       const token = getDiscordToken(ch.id) || ch.botToken;
       if (token) {
@@ -4886,7 +4889,9 @@ export async function handleInbound(
                 att,
                 batchFolderAbs,
               );
-              if (!content) {
+              if (content) {
+                savedPaths.set(att.id, content.path);
+              } else {
                 const reason =
                   att.size > MAX_ATTACHMENT_BYTES
                     ? `skipped, larger than ${formatBytes(MAX_ATTACHMENT_BYTES)} cap`
@@ -4911,9 +4916,29 @@ export async function handleInbound(
       return `  ${a.filename} (${a.contentType}, ${formatBytes(a.size)})${note ? ` — ${note}` : ""}`;
     };
 
+    // #42: transcribe voice notes so the agent sees words, not a marker.
+    // Channel opt-out: transcribe: false. A null result (failure/timeout,
+    // missing file, missing binary) keeps the [voice note: …] marker line.
+    const transcripts = new Map<string, string>();
+    if (ch.transcribe !== false) {
+      for (const att of msg.attachments) {
+        if (!isVoiceAudio(att)) continue;
+        const p = savedPaths.get(att.id);
+        if (!p) continue;
+        try {
+          const text = await transcribeVoice(p, { mime: att.contentType });
+          if (text) transcripts.set(att.id, text);
+        } catch (e) {
+          console.error(
+            `[channel] transcribe failed: ${sanitizeSensitiveText(String(e))}`,
+          );
+        }
+      }
+    }
+
     const voiceLines = msg.attachments
       .filter((a) => isVoiceAttachment(a))
-      .map((a) => voiceNoteText(a));
+      .map((a) => transcripts.get(a.id) ?? voiceNoteText(a));
 
     // No text and no voice note
     let prompt = body;
