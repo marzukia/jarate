@@ -65,6 +65,18 @@ describe("parseJobsFromPs (/jobs)", () => {
     ]);
   });
 
+  test("parses snapshot-path wrapper lines (deploy-swap guard re-exec)", () => {
+    // the wrapper execs a per-run copy under ~/.pi-bg-art/snap-<rid>/pi-bg;
+    // the old scripts/pi-bg-only regex missed every post-swap run
+    const ps = [
+      "12345 02:03 /bin/bash /home/monky/.pi-bg-art/snap-20260915-104204-1233380/pi-bg worker echo done",
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps)).toEqual([
+      { id: null, age: "02:03", profile: "worker", task: "echo done" },
+    ]);
+  });
+
   test("ignores non-wrapper lines (pi child mentioning the script path)", () => {
     const ps = [
       "4194010 pi -p --no-extensions the task mentions ~/scripts/pi-bg inside its text",
@@ -573,15 +585,15 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
     expect(inner.length).toBe(1 + 40);
   });
 
-  test("tail: overlong lines are hard-wrapped at 40 cols (mobile budget)", async () => {
+  test("tail: overlong lines are hard-wrapped at 32 cols (mobile budget)", async () => {
     const long = "x".repeat(120);
     stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
     const r = await jobsTail(ID, 40, env, scriptsDir);
     const lines = r.split("\n");
-    // fence + 3 wrapped + "ok" + fence
-    expect(lines.length).toBe(6);
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(41);
-    expect(lines[1] + lines[2] + lines[3]).toBe(long);
+    // fence + 4 wrapped (32*3 + 24) + "ok" + fence
+    expect(lines.length).toBe(7);
+    for (const l of lines) expect(l.length).toBeLessThanOrEqual(32);
+    expect(lines[1] + lines[2] + lines[3] + lines[4]).toBe(long);
   });
 
   test("tail: --n is clamped to [1, 200] and passed to the script", async () => {

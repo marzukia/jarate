@@ -184,7 +184,7 @@ describe("todos: rendering", () => {
     );
   });
 
-  test("column budget: every rendered board line fits 40 cols (mockup3)", () => {
+  test("column budget: every rendered board line fits 32 cols (mockup3)", () => {
     const long: Todo[] = [
       {
         content:

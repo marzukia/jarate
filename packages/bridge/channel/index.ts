@@ -31,8 +31,9 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
+import { censor } from "./censor";
 import { renderContext } from "./context";
-import { newCtxWatch, observeCtx } from "./ctxwatch";
+import { fmtTokensLC, newCtxWatch, observeCtx } from "./ctxwatch";
 import { publishDiff } from "./diff";
 import {
   connectDiscord,
@@ -64,6 +65,7 @@ import {
   unreactMessage,
 } from "./discord";
 import { mdToDiscord } from "./format";
+import { FRAME_COL_MAX } from "./frame";
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
@@ -1056,11 +1058,14 @@ export function setHeld(chId: string, on: boolean): void {
 /**
  * v3 message style (mockup3, 2026-09-13): state glyphs ┘ ┣ ├ ┤, `·`
  * separators, ASCII words, no emoji/arrows/em-dashes/dingbats, and every
- * rendered line fits the 40-col mobile budget.
+ * rendered line fits the 32-col mobile budget (FRAME_COL_MAX).
  */
 
 /** Hard mobile budget for rendered frame lines (mockup3). */
-export const TOOL_LINE_MAX = 40;
+export const TOOL_LINE_MAX = FRAME_COL_MAX;
+
+/** Max action text on a sub-step line: `│ ├ <text>` fits FRAME_COL_MAX. */
+export const TOOL_TEXT_MAX = FRAME_COL_MAX - "│ ├ ".length; // 28
 
 /** Clip to max code points, leading ellipsis (keep the tail). */
 function clipStart(s: string, max: number): string {
@@ -1070,14 +1075,19 @@ function clipStart(s: string, max: number): string {
 }
 
 /**
- * Bare action text for a tool call (no glyph, no counters). Capped at 36
- * code points so a done-frame sub-step (`│ ├ <action>`) fits 40 cols.
+ * Bare action text for a tool call (no glyph, no counters). Capped at
+ * TOOL_TEXT_MAX (28) code points so a done-frame sub-step
+ * (`│ ├ <action>`) fits FRAME_COL_MAX (32).
  * Paths clip the head (the filename is the useful tail); commands and arg
  * dumps clip the tail (the verb is the useful head).
+ * Censor runs BEFORE the clip: [REDACTED:...] must respect the frame
+ * budget, not expand a 28-col line to 52 after the fact (audit 2026-09-15,
+ * aesthetics #2).
  */
 export function toolActionText(toolName: string, input: any): string {
   const esc = (s: string) => s.replace(/([\\*_`])/g, "\\$1");
   const one = (s: string) => s.replace(/\s*\n\s*/g, " ").trim();
+  const censored = (s: string) => esc(censor(s));
   const p = one(String(input?.path ?? ""));
   switch (toolName) {
     case "bash": {
@@ -1087,14 +1097,14 @@ export function toolActionText(toolName: string, input: any): string {
           .split(/\s*(?:\||&&|;|>)\s*/)[0]
           .replace(/\s*2>&1\s*$/, ""),
       );
-      return `bash ${esc(fit(seg, 31))}`;
+      return `bash ${fit(censored(seg), TOOL_TEXT_MAX - 5)}`;
     }
     case "read":
-      return `read ${esc(clipStart(p, 31))}`;
+      return `read ${clipStart(censored(p), TOOL_TEXT_MAX - 5)}`;
     case "edit":
-      return `edit ${esc(clipStart(p, 31))}`;
+      return `edit ${clipStart(censored(p), TOOL_TEXT_MAX - 5)}`;
     case "write":
-      return `write ${esc(clipStart(p, 30))}`;
+      return `write ${clipStart(censored(p), TOOL_TEXT_MAX - 6)}`;
     default: {
       let args: string;
       try {
@@ -1102,7 +1112,7 @@ export function toolActionText(toolName: string, input: any): string {
       } catch {
         args = String(input);
       }
-      return fit(`${toolName} ${esc(one(args))}`, 36);
+      return fit(censored(`${toolName} ${one(args)}`), TOOL_TEXT_MAX);
     }
   }
 }
@@ -1262,7 +1272,7 @@ export function runFrame(
  *  `│ ~219.9k tok · ~$0.042` (lowercase k, 3-decimal est. cost, same
  *  pricing as ~/scripts/pi-token-cost.py). null when the run carried no
  *  billable usage. Already carries the `│ ` prefix; the frame clips it
- *  to the 40-col budget. */
+ *  to the 32-col budget. */
 export function runUsageLine(s: UsageStats): string | null {
   const total = s.input + s.output + s.cacheRead + s.cacheWrite;
   if (total <= 0) return null;
@@ -2702,7 +2712,7 @@ export default function (pi: ExtensionAPI) {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
         const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
         // #40: run usage as the trailing frame line (append-only, before
-        // the closing bar; same 40-col budget as every other line).
+        // the closing bar; same 32-col budget as every other line).
         const trailing = runUsageLine(runStats) ?? undefined;
         // live-frame unification: the morph edits the SAME working message
         // in place — only the header flips. fence() keeps the box glyphs
@@ -3395,7 +3405,7 @@ function startCompact(
             : null;
         report(
           before != null && after != null
-            ? `[ok] compacted: ${before} -> ${after} tokens`
+            ? `[ok] compacted: ${fmtTokensLC(before)} -> ${fmtTokensLC(after)}`
             : "[ok] compacted",
         );
       },
@@ -3681,7 +3691,7 @@ async function runChannelCommand(
       // #48: what is eating the window: top-N items by token ESTIMATE
       // (char/4, no model, no pricing) + category totals. Read-only, open
       // to all like /usage. Session discovery is the same /undo path;
-      // frame (40-col budget) is built by renderContext, errors are one
+      // frame (32-col budget) is built by renderContext, errors are one
       // [!] line, no stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
@@ -4076,10 +4086,10 @@ async function runChannelCommand(
           .map((b) => {
             const name = names.get(b.channelId) || b.channelId;
             const open = openCount(b.todos);
-            // header fits the 40-col budget: channel names run up to
+            // header fits the 32-col budget: channel names run up to
             // 100 chars, so clip the name (never the count or glyph)
             const suffix = ` · ${open} open`;
-            return `┌ ${fit(name, 40 - 2 - suffix.length)}${suffix}\n${b.todos
+            return `┌ ${fit(name, FRAME_COL_MAX - 2 - suffix.length)}${suffix}\n${b.todos
               .map(todoLine)
               .join("\n")}\n└`;
           });

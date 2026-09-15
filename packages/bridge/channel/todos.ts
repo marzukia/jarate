@@ -12,6 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { FRAME_COL_MAX } from "./frame";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -158,7 +159,7 @@ export function openCount(todos: Todo[]): number {
  * ├ pending, ┣ in-progress (bold), ├ done (strikethrough), ┤ cancelled.
  * Done keeps ├ (not ┘) so the vertical pipe stays connected through
  * mid-list completed items; the frame closes on its own └ row.
- * Content is clipped so the rendered line fits the 40-col mobile budget.
+ * Content is clipped so the rendered line fits the 32-col mobile budget.
  */
 export function todoLine(t: Todo): string {
   const c = fit(t.content, TODO_CONTENT_MAX);
@@ -175,8 +176,8 @@ export function todoLine(t: Todo): string {
 }
 
 /** Hard mobile budget for rendered frame lines (mockup3). */
-export const TODO_LINE_MAX = 40;
-/** Content budget: glyph + space prefix (2) leaves 38 for the text. */
+export const TODO_LINE_MAX = FRAME_COL_MAX;
+/** Content budget: glyph + space prefix (2) leaves 30 for the text. */
 const TODO_CONTENT_MAX = TODO_LINE_MAX - 2;
 
 /**

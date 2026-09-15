@@ -19,6 +19,14 @@
 #   - Real ready signal: "[interactions] registered N slash commands in
 #     guild ..." — logged by the bridge at Discord connect on every pi boot.
 #
+# Backoff (2026-09-15): 3+ consecutive failed attempts on the SAME commit
+# stop the tick (one log line) until the commit changes or --force — a
+# broken commit otherwise re-deploys, re-rolls-back and re-restarts
+# pi.service every timer tick.
+#
+# .deploy-state: line 1 = deployed commit, line 2 (optional) =
+# "<failed-commit> <consecutive-fails>".
+#
 # Only bash + git + bun + systemctl/journalctl (user) are required.
 
 set -euo pipefail
@@ -44,6 +52,24 @@ GATE_REASON=""
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "DEPLOY FAIL: $*"; exit 1; }
+
+# state helpers: line 1 = deployed commit, line 2 = "<commit> <fails>"
+state_deployed() { sed -n 1p "$STATE_FILE" 2>/dev/null | tr -d '[:space:]'; }
+state_fail_commit() { sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $1}'; }
+state_fail_count() {
+  local n
+  n="$(sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $2}')"
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '0'
+}
+
+# record_fail <tried-commit> <deployed-after>: bump the same-commit
+# fail counter (line 2) and record what is actually deployed (line 1).
+record_fail() {
+  local tried="$1" deployed_after="$2"
+  local cur=0
+  [[ "$(state_fail_commit)" == "$tried" ]] && cur="$(state_fail_count)"
+  printf '%s\n%s %s\n' "$deployed_after" "$tried" "$((cur + 1))" >"$STATE_FILE"
+}
 
 # --- health gate -------------------------------------------------------------
 
@@ -140,9 +166,15 @@ main() {
   local new_commit
   new_commit="$(git rev-parse origin/main)"
 
-  local deployed=""
+  # Log hygiene: prune deploy logs older than 3 days (each tick tees a
+  # fresh one; the live one is minutes old and survives the find).
+  find "$LOG_DIR" -type f -mtime +3 -delete 2>/dev/null || true
+
+  local deployed="" fail_commit="" fails=0
   if [[ -f "$STATE_FILE" ]]; then
-    deployed="$(tr -d '[:space:]' <"$STATE_FILE" || true)"
+    deployed="$(state_deployed)"
+    fail_commit="$(state_fail_commit)"
+    fails="$(state_fail_count)"
   fi
   local prev_commit
   if [[ -n "$deployed" ]]; then
@@ -152,12 +184,37 @@ main() {
     log "no $STATE_FILE yet; assuming current HEAD ($prev_commit) is deployed"
   fi
 
+  # Backoff: 3+ consecutive fails on the SAME commit -> skip the tick
+  # (single log line) until the commit changes or --force.
+  if [[ $FORCE -eq 0 && "$fail_commit" == "$new_commit" && $fails -ge 3 ]]; then
+    log "backoff: $fails consecutive fails on $new_commit; skipping tick (deploy --force to override)"
+    exit 0
+  fi
+
+  # A non-zero exit records the failed attempt (backoff counter) and
+  # what is actually deployed afterwards (rollback restores prev_commit;
+  # a pre-restart die never left the old commit). Success rewrites line 1
+  # and drops the counter. Globals (no local): the EXIT trap fires after
+  # main has returned.
+  DEPLOY_TRIED=""
+  DEPLOY_PREV="$prev_commit"
+  on_exit() {
+    local ec=$?
+    if [[ $ec -ne 0 && -n "$DEPLOY_TRIED" ]]; then
+      record_fail "$DEPLOY_TRIED" "$DEPLOY_PREV"
+      log "recorded fail #$(state_fail_count) on $DEPLOY_TRIED (backoff after 3)"
+    fi
+    return 0
+  }
+  trap on_exit EXIT
+
   if [[ $FORCE -eq 0 && "$deployed" == "$new_commit" ]]; then
     log "up to date ($deployed)"
     exit 0
   fi
 
   log "deploying $deployed -> $new_commit (log: $LOG_FILE)"
+  DEPLOY_TRIED="$new_commit"
   git pull --ff-only origin main || die "git pull --ff-only origin main failed"
 
   # Machine-local deps (node_modules is gitignored). Matches install.sh.

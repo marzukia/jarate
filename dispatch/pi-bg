@@ -246,10 +246,12 @@ JB_ROOT="${JB_ROOT_SNAPPED:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2
 # Unique per run: second-precision timestamp + this wrapper's own pid ($$).
 # Concurrent wrappers always have different pids, so per-run temp file
 # names (pi-bg-<run_id>*) can never collide. Shape constraint: the v3
-# embed headers carry the full rid inside a 40-col mobile budget
-# ("┌ fail · <rid> (rc=N)" is the longest), so the pid must stay <= 8
-# digits - $$ does (pid_max on these boxes is 4194304, 6-7 digits live).
-# The 3-group numeric shape is preserved: the ticket validators in
+# embed headers carry the full rid inside the 32-col mobile budget
+# ("┌ fail · <rid>" is the longest header shape; the rc never fits and
+# stays in the title), so the pid must stay <= 7 digits - $$ does
+# (pid_max on these boxes is 4194304, 6-7 digits live). A hypothetical
+# 8-digit pid loses the rid head to the header clip (tail kept). The
+# 3-group numeric shape is preserved: the ticket validators in
 # pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
 run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
 export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
@@ -538,33 +540,44 @@ def clip_end(s, max):
 def clip_start(s, max):
     s = str(s)
     return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
-def kv(key, val, width=6, vbudget=29, head=False):
+def kv(key, val, width=6, vbudget=21, head=False):
     cut = clip_start if head else clip_end
     return "\u251c " + key.ljust(width) + " : " + cut(val, vbudget)
+FRAME_W = 32  # mobile budget (docs/STYLE.md 2.3): every frame line <= 32
+def hdr(word, rid, rc=None):
+    h = f"\u250c {word} \u00b7 {rid}"
+    if rc is not None:
+        h += f" (rc={rc})"
+    if len(h) > FRAME_W:
+        h = f"\u250c {word} \u00b7 {rid}"  # rc never fits at 32; it stays in the title
+    if len(h) > FRAME_W:
+        # 8-digit pid: clip the rid head, keep the tail (the pid end is
+        # the discriminator)
+        keep = FRAME_W - len(f"\u250c {word} \u00b7 ")
+        h = f"\u250c {word} \u00b7 {clip_start(rid, keep)}"
+    return h
 prof, status, rc, verdict = E("PROFILE"), E("STATUS"), E("RC"), E("VERDICT")
 dur = int(E("DUR") or 0)
 dstr = f"{dur//60}m{dur%60:02d}s"
 rid = E("RUN")
 GREEN, RED, ORANGE = 3066993, 15158332, 15105570
 # v3 style (mockup3, 2026-09-13): no glyphs in titles; the description is a
-# framed block (box-drawing + ASCII + middle dot), every line <= 40 cols.
+# framed block (box-drawing + ASCII + middle dot), every line <= FRAME_W.
 if prof == "reviewer" and verdict:
     ok = verdict == "PASS"
     title = f"reviewer \u00b7 {'PASS' if ok else 'FAIL'} \u00b7 {dstr}"
-    header = "\u250c " + ("pass" if ok else "fail") + " \u00b7 " + rid
+    header = hdr("pass" if ok else "fail", rid)
     color = GREEN if ok else RED
 elif status == "OK":
-    title = f"{prof} \u00b7 OK \u00b7 {dstr}"; header = f"\u250c ok \u00b7 {rid}"; color = GREEN
+    title = f"{prof} \u00b7 OK \u00b7 {dstr}"; header = hdr("ok", rid); color = GREEN
 elif status == "FAIL":
     title = f"{prof} \u00b7 FAIL (rc={rc}) \u00b7 {dstr}"
-    header = f"\u250c fail \u00b7 {rid} (rc={rc})"
-    if len(header) > 40:  # 7-digit pid + 3-digit rc breaks the 40-col mobile budget; rc stays in the title (#60 F2)
-        header = f"\u250c fail \u00b7 {rid}"
+    header = hdr("fail", rid, rc)
     color = RED
 elif status == "DIED":
-    title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = f"\u250c died \u00b7 {rid}"; color = ORANGE
+    title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = hdr("died", rid); color = ORANGE
 else:
-    title = f"{prof} \u00b7 EMPTY \u00b7 {dstr}"; header = f"\u250c empty \u00b7 {rid}"; color = RED
+    title = f"{prof} \u00b7 EMPTY \u00b7 {dstr}"; header = hdr("empty", rid); color = RED
 desc_lines = [header, f"\u251c $ pi-bg {prof}{ ' --worktree' if E('WORKTREE') == '1' else ''}"]
 if E("WORKTREE") == "1":
     desc_lines.append(kv("repo", E("REPO")))
