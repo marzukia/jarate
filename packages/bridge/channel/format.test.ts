@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  collapseFenceTrailingBlankLines,
   convertInlineForDiscord,
   escapeBackticksInCodeBlocks,
   escapeDiscordFormatting,
@@ -236,5 +237,46 @@ describe("mdToDiscord", () => {
     // marked parses "42." as an ordered list with an empty item; the list
     // branch used to render empty segments and the whole text vanished.
     expect(mdToDiscord("42.")).toBe("42.");
+  });
+});
+
+// ─── collapseFenceTrailingBlankLines (STYLE.md 2.5) ────────────────────────
+
+describe("collapseFenceTrailingBlankLines", () => {
+  test("2 blank lines after closing fence + trailing text -> 0", () => {
+    const input =
+      "text:\n\n```\n┌ fleet\n└ monky : active\n```\n\n\nAll three on the new jarate.";
+    expect(collapseFenceTrailingBlankLines(input)).toBe(
+      "text:\n\n```\n┌ fleet\n└ monky : active\n```\nAll three on the new jarate.",
+    );
+  });
+
+  test("message ending in a fence -> trailing newlines trimmed", () => {
+    expect(collapseFenceTrailingBlankLines("```\nbox\n```\n\n")).toBe(
+      "```\nbox\n```",
+    );
+  });
+
+  test("blank lines INSIDE a fence are untouched", () => {
+    const input = "```\na\n\nb\n```\n\ntext";
+    expect(collapseFenceTrailingBlankLines(input)).toBe(
+      "```\na\n\nb\n```\ntext",
+    );
+  });
+
+  test("fenced block with lang tag toggles correctly", () => {
+    const input = "```bash\necho hi\n```\n\n\nnext";
+    expect(collapseFenceTrailingBlankLines(input)).toBe(
+      "```bash\necho hi\n```\nnext",
+    );
+  });
+
+  test("blank line between fence and following fence is kept (two blocks)", () => {
+    const input = "```\na\n```\n\n```\nb\n```";
+    // second block: its opening fence is NOT blank-line-separated anymore,
+    // but both blocks stay intact
+    expect(collapseFenceTrailingBlankLines(input)).toBe(
+      "```\na\n```\n```\nb\n```",
+    );
   });
 });

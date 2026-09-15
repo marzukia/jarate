@@ -346,6 +346,37 @@ export function escapeBackticksInCodeBlocks(markdown: string): string {
 }
 
 /**
+ * STYLE.md 2.5: a blank line after a closing fence renders as a visible
+ * gap in Discord. Collapse ALL blank lines directly after a closing fence
+ * (the agent habit is markdown-standard "blank line after code blocks" -
+ * 2026-09-15 fleet-summary incident: '```\\n\\n\\nAll three...').
+ * Toggles on ```-prefixed lines (real markdown fence semantics); blank
+ * lines INSIDE a fence are untouched. Exported for tests.
+ */
+export function collapseFenceTrailingBlankLines(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trimStart().startsWith("```")) {
+      const closing = inFence;
+      inFence = !inFence;
+      out.push(line);
+      i++;
+      if (closing) {
+        while (i < lines.length && lines[i].trim() === "") i++;
+      }
+    } else {
+      out.push(line);
+      i++;
+    }
+  }
+  return out.join("\n").replace(/\n+$/, "");
+}
+
+/**
  * Escape triple backticks in free text so it doesn't open a code block
  * when inserted into a Discord message.
  */
@@ -445,5 +476,6 @@ export function mdToDiscord(md: string): string {
   out = formatMarkdownTables(out);
   out = escapeBackticksInCodeBlocks(out);
   out = convertInlineForDiscord(out);
+  out = collapseFenceTrailingBlankLines(out);
   return out;
 }
