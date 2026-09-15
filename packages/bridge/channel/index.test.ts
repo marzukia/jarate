@@ -5269,8 +5269,233 @@ describe("tasks (integration)", () => {
     expect(replyContent()).toBe(fence("[!] usage: /tasks cancel <id>"));
     await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
     expect(replyContent()).toBe(
-      fence("[!] usage: /tasks [list | cancel <id>]"),
+      fence("[!] usage: /tasks [list | add | reschedule | cancel]"),
     );
+  });
+
+  test("/tasks add: one-shot minutes -> scheduled in this channel", async () => {
+    await handleInbound(
+      pi,
+      inbound('/tasks add "check the build" 30', "m1"),
+      ctx,
+    );
+    expect(replyContent()).toContain("[ok] task");
+    expect(replyContent()).toContain("cancel with /tasks cancel");
+    const tasks = loadTasks(tmp);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0]).toMatchObject({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "check the build",
+      kind: "at",
+    });
+    expect(tasks[0].atMs).toBeGreaterThanOrEqual(Date.now() + 29 * 60000);
+    expect(tasks[0].atMs).toBeLessThanOrEqual(Date.now() + 31 * 60000);
+  });
+
+  test("/tasks add: one-shot ISO time -> exact fire time", async () => {
+    const iso = new Date(Date.now() + 3600000).toISOString();
+    await handleInbound(
+      pi,
+      inbound(`/tasks add "iso check" ${iso}`, "m1"),
+      ctx,
+    );
+    expect(replyContent()).toContain("[ok] task");
+    const t = loadTasks(tmp)[0];
+    expect(t).toMatchObject({
+      channelId: "ch1",
+      prompt: "iso check",
+      kind: "at",
+      atMs: Date.parse(iso),
+    });
+  });
+
+  test("/tasks add: cron + tz -> recurring with computed first fire", async () => {
+    await handleInbound(
+      pi,
+      inbound('/tasks add "run the fleet check" 0 6 * * * UTC', "m1"),
+      ctx,
+    );
+    expect(replyContent()).toContain('cron "0 6 * * *" (UTC)');
+    const t = loadTasks(tmp)[0];
+    expect(t).toMatchObject({
+      channelId: "ch1",
+      prompt: "run the fleet check",
+      kind: "cron",
+      cron: "0 6 * * *",
+      tz: "UTC",
+    });
+    // next 06:00 UTC strictly in the future, within 24h (real clock)
+    expect(t.nextFireAt).toBeGreaterThan(Date.now());
+    expect(t.nextFireAt).toBeLessThanOrEqual(
+      Date.now() + 24 * 3600000 + 120000,
+    );
+  });
+
+  test("/tasks reschedule: swaps the spec, keeps id + prompt", async () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      channelName: "Test",
+      prompt: "check the build",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 30 * 60000,
+        nextFireAt: Date.now() + 30 * 60000,
+      },
+      home: tmp,
+    });
+    await handleInbound(
+      pi,
+      inbound(
+        `/tasks reschedule ${t.id} 0 9 * * 1-5 Australia/Melbourne`,
+        "m1",
+      ),
+      ctx,
+    );
+    expect(replyContent()).toContain("[ok] rescheduled");
+    expect(replyContent()).toContain(
+      'cron "0 9 * * 1-5" (Australia/Melbourne)',
+    );
+    const after = loadTasks(tmp)[0];
+    expect(after).toMatchObject({
+      id: t.id,
+      prompt: "check the build",
+      channelId: "ch1",
+      kind: "cron",
+      cron: "0 9 * * 1-5",
+      tz: "Australia/Melbourne",
+      status: "pending",
+    });
+    expect(after.atMs).toBeUndefined();
+    expect(after.nextFireAt).toBeGreaterThan(Date.now());
+  });
+
+  test("/tasks reschedule: unknown id or other channel -> one [!] line, nothing changes", async () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "check the build",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 30 * 60000,
+        nextFireAt: Date.now() + 30 * 60000,
+      },
+      home: tmp,
+    });
+    const other = scheduleTask({
+      channelId: "ch2",
+      prompt: "other channel task",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 30 * 60000,
+        nextFireAt: Date.now() + 30 * 60000,
+      },
+      home: tmp,
+    });
+    await handleInbound(pi, inbound("/tasks reschedule nope 30", "m1"), ctx);
+    expect(replyContent()).toBe("[!] no task with id nope");
+    // same id shape on another channel is not THIS session's task
+    await handleInbound(
+      pi,
+      inbound(`/tasks reschedule ${other.id} 30`, "m2"),
+      ctx,
+    );
+    expect(replyContent()).toBe(`[!] no task with id ${other.id}`);
+    // untouched
+    expect(
+      loadTasks(tmp).find((x) => x.id === t.id)!.nextFireAt,
+    ).toBeGreaterThan(Date.now());
+    expect(loadTasks(tmp)).toHaveLength(2);
+  });
+
+  test("/tasks add + reschedule: bad-arg paths -> one [!] line each, nothing scheduled", async () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "seed",
+      spec: {
+        kind: "at",
+        atMs: Date.now() + 30 * 60000,
+        nextFireAt: Date.now() + 30 * 60000,
+      },
+      home: tmp,
+    });
+    const addUsage = fence(
+      '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
+    );
+    const resUsage = fence(
+      "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
+    );
+    // form errors -> usage line
+    await handleInbound(pi, inbound("/tasks add", "m1"), ctx);
+    expect(replyContent()).toBe(addUsage);
+    await handleInbound(
+      pi,
+      inbound("/tasks add check the build 30", "m2"), // unquoted prompt
+      ctx,
+    );
+    expect(replyContent()).toBe(addUsage);
+    await handleInbound(pi, inbound('/tasks add "x"', "m3"), ctx); // no spec
+    expect(replyContent()).toBe(addUsage);
+    await handleInbound(pi, inbound('/tasks add "x" 30 UTC', "m4"), ctx);
+    expect(replyContent()).toBe(addUsage); // 2 tokens: not any form
+    await handleInbound(pi, inbound("/tasks reschedule", "m5"), ctx);
+    expect(replyContent()).toBe(resUsage);
+    await handleInbound(pi, inbound(`/tasks reschedule ${t.id}`, "m6"), ctx);
+    expect(replyContent()).toBe(resUsage); // missing spec
+    // content errors -> one [!] line (from parseTaskSpec / rescheduleTask)
+    await handleInbound(pi, inbound('/tasks add "" 30', "m7"), ctx);
+    expect(replyContent()).toBe("[!] prompt is required");
+    await handleInbound(pi, inbound('/tasks add "x" 0', "m8"), ctx);
+    expect(replyContent()).toBe("[!] minutes must be greater than 0");
+    await handleInbound(pi, inbound('/tasks add "x" 99999', "m9"), ctx);
+    expect(replyContent()).toBe("[!] minutes too large (max 43200 = 30d)");
+    await handleInbound(pi, inbound('/tasks add "x" yesterday', "m10"), ctx);
+    expect(replyContent()).toBe(
+      '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
+    );
+    await handleInbound(pi, inbound('/tasks add "x" 99 * * * *', "m11"), ctx);
+    expect(replyContent()).toBe(
+      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
+    );
+    await handleInbound(
+      pi,
+      inbound('/tasks add "x" 0 6 * * * Not/AZone', "m12"),
+      ctx,
+    );
+    expect(replyContent()).toBe(
+      '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
+    );
+    await handleInbound(
+      pi,
+      inbound(`/tasks reschedule ${t.id} 99 * * * *`, "m13"),
+      ctx,
+    );
+    expect(replyContent()).toBe(
+      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
+    );
+    // seed untouched, nothing scheduled on any path above
+    expect(loadTasks(tmp).map((x) => x.id)).toEqual([t.id]);
+  });
+
+  test("/tasks list reflects add + reschedule", async () => {
+    await handleInbound(
+      pi,
+      inbound('/tasks add "check the build" 120', "m1"),
+      ctx,
+    );
+    const t = loadTasks(tmp)[0];
+    const iso = new Date(Date.now() + 3600000).toISOString();
+    await handleInbound(
+      pi,
+      inbound(`/tasks reschedule ${t.id} ${iso}`, "m2"),
+      ctx,
+    );
+    await handleInbound(pi, inbound("/tasks list", "m3"), ctx);
+    const content = replyContent();
+    expect(content).toContain("1 pending task (of 1 total):");
+    expect(content).toContain(t.id);
+    expect(content).toContain("check the build");
+    expect(content).toContain(iso);
+    expect(content).toContain("in 1h");
   });
 
   test("due-on-startup delivery: injects a channel-inbound task, completes it, no double delivery", () => {

@@ -16,6 +16,7 @@ import {
   nextCronFire,
   parseCron,
   parseTaskSpec,
+  rescheduleTask,
   scheduleTask,
   tasksPath,
 } from "./tasks";
@@ -355,6 +356,91 @@ describe("tasks: state file + lifecycle (fake clock, tmp home)", () => {
     expect(cancelTask(t.id, tmp)).toBe(true);
     expect(loadTasks(tmp)).toHaveLength(0);
     expect(cancelTask(t.id, tmp)).toBe(false);
+  });
+
+  test("rescheduleTask swaps the spec, keeps id + prompt, scoping + claim rules", () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "check the build",
+      spec: {
+        kind: "at",
+        atMs: NOW + 120 * 60000,
+        nextFireAt: NOW + 120 * 60000,
+      },
+      home: tmp,
+      now: NOW,
+    });
+    // unknown id, or an id on ANOTHER channel: not this session's task
+    expect(
+      rescheduleTask(
+        "nope",
+        { kind: "at", atMs: NOW + 60000, nextFireAt: NOW + 60000 },
+        "ch1",
+        tmp,
+      ).error,
+    ).toContain("no task");
+    expect(
+      rescheduleTask(
+        t.id,
+        { kind: "at", atMs: NOW + 60000, nextFireAt: NOW + 60000 },
+        "ch2",
+        tmp,
+      ).error,
+    ).toContain("no task");
+    expect(loadTasks(tmp)).toHaveLength(1);
+    // at -> cron with tz: old fields gone, prompt + id kept
+    const r = rescheduleTask(
+      t.id,
+      {
+        kind: "cron",
+        cron: "0 6 * * *",
+        tz: "UTC",
+        nextFireAt: Date.parse("2026-09-11T06:00:00Z"),
+      },
+      "ch1",
+      tmp,
+    );
+    expect(r.error).toBeUndefined();
+    const after = loadTasks(tmp)[0];
+    expect(after).toMatchObject({
+      id: t.id,
+      prompt: "check the build",
+      channelId: "ch1",
+      kind: "cron",
+      cron: "0 6 * * *",
+      tz: "UTC",
+      nextFireAt: Date.parse("2026-09-11T06:00:00Z"),
+      status: "pending",
+    });
+    expect(after.atMs).toBeUndefined();
+    // cron -> at: tz + cron gone, atMs set
+    const r2 = rescheduleTask(
+      t.id,
+      { kind: "at", atMs: NOW + 30 * 60000, nextFireAt: NOW + 30 * 60000 },
+      "ch1",
+      tmp,
+    );
+    expect(r2.error).toBeUndefined();
+    const after2 = loadTasks(tmp)[0];
+    expect(after2).toMatchObject({
+      id: t.id,
+      kind: "at",
+      atMs: NOW + 30 * 60000,
+      nextFireAt: NOW + 30 * 60000,
+    });
+    expect(after2.cron).toBeUndefined();
+    expect(after2.tz).toBeUndefined();
+    // claimed (firing now) -> refused, record untouched
+    markTaskClaimed(t.id, NOW, tmp);
+    expect(
+      rescheduleTask(
+        t.id,
+        { kind: "at", atMs: NOW + 60000, nextFireAt: NOW + 60000 },
+        "ch1",
+        tmp,
+      ).error,
+    ).toContain("claimed");
+    expect(loadTasks(tmp)[0].atMs).toBe(NOW + 30 * 60000);
   });
 
   test("markTaskClaimed; claimed task is not due until stale", () => {

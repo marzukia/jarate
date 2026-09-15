@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   CONTEXT_MAX_N,
-  CtxScan,
+  type CtxScan,
   estTokens,
   fmtAge,
   formatContext,

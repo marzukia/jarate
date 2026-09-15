@@ -489,6 +489,44 @@ export function cancelTask(id: string, home = defaultHome()): boolean {
   return true;
 }
 
+/**
+ * Replace a task's schedule, keeping its id and prompt. `spec` must come
+ * from parseTaskSpec. Scoped to one channel's session (channelId). A
+ * claimed task (firing right now) is refused — cancel it first, the claim
+ * completion would then drop or advance the swapped record.
+ */
+export function rescheduleTask(
+  id: string,
+  spec: TaskSpec,
+  channelId: string,
+  home = defaultHome(),
+): { task?: ScheduledTask; error?: string } {
+  const tasks = loadTasks(home);
+  const t = tasks.find((x) => x.id === id && x.channelId === channelId);
+  if (!t) return { error: `no task with id ${id}` };
+  if (t.status === "claimed")
+    return { error: `task ${id} is firing now (claimed) — cancel it first` };
+  const updated: ScheduledTask = {
+    ...t,
+    kind: spec.kind,
+    status: "pending",
+    nextFireAt: spec.nextFireAt,
+    atMs: undefined,
+    cron: undefined,
+    tz: undefined,
+    claimedAt: undefined,
+    lastFiredAt: undefined,
+  };
+  if (spec.kind === "at" && spec.atMs !== undefined) updated.atMs = spec.atMs;
+  if (spec.kind === "cron" && spec.cron) updated.cron = spec.cron;
+  if (spec.kind === "cron" && spec.tz) updated.tz = spec.tz;
+  saveTasks(
+    tasks.map((x) => (x.id === id ? updated : x)),
+    home,
+  );
+  return { task: updated };
+}
+
 /** Mark a task claimed (before injection). No-op when the id is gone. */
 export function markTaskClaimed(
   id: string,
