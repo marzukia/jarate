@@ -2,26 +2,29 @@
 
 11 open issues. Ordering minimizes same-file merge conflicts + puts security first.
 
-## Wave A (dispatched 07:5x)
-| ticket | issues | area | notes |
-|---|---|---|---|
-| A1 | #54 | bridge censor | PAT leak, security-adjacent, small |
-| A2 | #52+#51 | dispatch | heartbeat + one-shot lifecycle |
-| A3 | #57 | dispatch | silent exit=1, RCA exists (rca-57-silent-deaths.md) |
+## Wave A
+| ticket | issues | status |
+|---|---|---|
+| A1 | #54 | MERGED 5ae9c6b8 (censor: github shapes + sbk_ class) |
+| A2 | #52+#51 | MERGED 8399493a (heartbeat + one-shot lifecycle + DEAD dedupe) |
+| A3 | #57 | reviewer 1279583 running (worker 37cbee3e: retry1 on silent exit 1) |
 
-A2+A3 both touch dispatch/ → merge A2 first, A3 second (resolve conflicts inline if small).
-
-## Wave B (as slots free)
-| order | issues | area | why this order |
-|---|---|---|---|
-| B1 | #50 | dispatch | DEAD-embed dedup — same files as A2/A3, needs them landed |
-| B2 | #37 | dispatch | JB_ROOT symlinks — dispatch, last dispatch item |
-| B3 | #48 | bridge | /context digest — index.ts, start bridge queue |
-| B4 | #46 | bridge | /undo N — index.ts, after B3 (same file) |
-| B5 | #43 | bridge | /tasks add|reschedule — index.ts, after B4 |
-| B6 | #42 | bridge | voice-note transcription — index.ts + audio path, last; worker scouts whisper options in-task |
-
-Each: worker → reviewer (PASS) → merge → next slot. Callbacks drive it.
+## Wave B
+| order | issues | status |
+|---|---|---|
+| B1 | #50 | CLOSED - satisfied by A2 (8399493a, deadlog dedupe) |
+| B2 | #37 | CLOSED - already fixed on main (pi-bg:217 readlink -f + test) |
+| B3 | #48 | MERGED e14149ee+ffc63e90/4d60ab29 (/context digest + STYLE nits) |
+| B4 | #46 | worker 1556660 running (/undo N multi-turn) |
+| B5 | #43 | waiting - bridge serial after #46 |
+| B6 | #42 | waiting - bridge serial last (voice-note, whisper scout in-task) |
 
 ## Done this session (closed stale)
-#12 #13 #38 #40 #44 #45 (wave 2c) · #56 (#62)
+#12 #13 #38 #40 #44 #45 (wave 2c) · #56 (#62) · #37 · #50
+
+## Notes
+- Deployed head tracks main via 30s poller (gate: typecheck + tests).
+- Deploy test spawns briefly count toward the pi-bg cap (false "at cap").
+- Reviewer FAIL loop = one fix round, then decide.
+- /var/tmp/reviews is frank-owned (no group write) - monky review outputs
+  land in /var/tmp/ flat or the worktree.

@@ -151,6 +151,9 @@ max_c="${PI_BG_MAX_CONCURRENT:-}"
 if [ -z "$max_c" ] && [ -f "${HOME}/.config/pi-dispatch/max-concurrent" ]; then
   max_c="$(tr -d '[:space:]' < "${HOME}/.config/pi-dispatch/max-concurrent" 2>/dev/null)"
 fi
+# env unset + no cap file (or empty file) = fleet default, no warning;
+# the validation below only fires on a NON-EMPTY invalid value.
+[ -z "$max_c" ] && max_c=3
 case "$max_c" in
   '' | *[!0-9]*)
     echo "[!] PI_BG_MAX_CONCURRENT='$max_c' is not a non-negative integer, using 3" >&2

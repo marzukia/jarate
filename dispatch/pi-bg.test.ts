@@ -443,7 +443,8 @@ const TID = (n: number) => `20991231-235959-${n}`;
 function liveProcWith(needle: string): boolean {
   for (const d of fs.readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
     try {
-      if (fs.readFileSync(`/proc/${d}/cmdline`, "utf8").includes(needle)) return true;
+      if (fs.readFileSync(`/proc/${d}/cmdline`, "utf8").includes(needle))
+        return true;
     } catch {
       /* vanished */
     }
@@ -483,9 +484,7 @@ function wdFixtureX(n: number) {
   return { tmp, art, run };
 }
 
-
 describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
-
   function wdFixture(n: number) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-wd-"));
     tmpDirs.push(tmp);
@@ -920,6 +919,53 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     }
   }, 30_000);
 
+  test("cap env unset + no cap file: fleet default 3, no warning line", async () => {
+    // RCA #57 fix 2 added the ~/.config/pi-dispatch/max-concurrent file;
+    // with env unset AND no file (fresh fixture HOME), the default must
+    // apply silently - the validation warning is for NON-EMPTY invalid
+    // values only (2026-09-15: every dispatch warned on the empty).
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 2);
+    const envNoCap: Record<string, string> = { ...fx.env };
+    delete envNoCap.PI_BG_MAX_CONCURRENT;
+    // settle: the previous test's killed wrappers may still be draining
+    // their cgroups; the default cap (3) would count them. Wait until the
+    // live count stops changing (two equal samples 100ms apart).
+    let prev = countLivePiBg();
+    expect(
+      await waitFor(() => {
+        const cur = countLivePiBg();
+        if (cur === prev) return true;
+        prev = cur;
+        return false;
+      }, 10_000),
+    ).toBe(true);
+    const s = spawn(["bash", PI_BG, "worker", "cap t3b no-env stub"], {
+      env: envNoCap,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const r = await collect(s);
+      // the no-warning line is the regression; the cap outcome depends on
+      // fleet load (a live review or a deploy test suite holds slots).
+      expect(r.err).not.toMatch(/not a non-negative integer/);
+      if (r.code === 0) {
+        expect(r.out).toContain("pi-run-ok");
+        expect(r.err).not.toContain("at cap");
+      } else {
+        // rejected -> the message must show the DEFAULT cap (3), proving
+        // the unset-env path fell through to the fleet default
+        expect(r.code).toBe(5);
+        expect(r.err).toMatch(/at cap \(\d+\/3\)/);
+      }
+    } finally {
+      killStubs([s], fx.tmp);
+    }
+  }, 30_000);
+
   test("self-exclusion: the counting wrapper is not counted against the cap", async () => {
     const fx = fixture();
     fx.seedMainCreds();
@@ -1306,7 +1352,9 @@ describe("#57: silent-death retry + RCA config fixes", () => {
       ).toBe(false);
       // rc artifact records the final (healthy) exit
       expect(
-        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
       ).toBe("0");
       // the retry is logged in the run record
       const rec = fx.records()[0];
@@ -1344,7 +1392,9 @@ describe("#57: silent-death retry + RCA config fixes", () => {
         fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-retry1`)),
       ).toBe(true);
       expect(
-        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
       ).toBe("1");
       const rec = fx.records()[0];
       expect(rec.retries).toHaveLength(1);
@@ -1503,7 +1553,6 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     }
   }, 30_000);
 });
-
 
 describe("#52: heartbeat (hb artifact, created at dispatch, gone on exit)", () => {
   test("hb file exists mid-run, ticks, and is removed on exit; no orphan child", async () => {
@@ -1743,7 +1792,10 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
         await Bun.sleep(100);
       }
       expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
-      const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<string, string>;
+      const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<
+        string,
+        string
+      >;
       const k = await runScript(KILL, [rec.run], kenv, fx.tmp);
       expect(k.code).toBe(0);
       expect(k.out).toContain(`killed ${rec.run} after`);
@@ -1755,7 +1807,9 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
       expect(rec2.state).toBe("killed");
       expect(rec2.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
       // kill marker present (the watchdog skips this ticket)
-      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(true);
+      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(
+        true,
+      );
       // hb child cleaned up by the wrapper trap (no orphan re-touching it)
       await Bun.sleep(1500);
       expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-hb`))).toBe(false);
