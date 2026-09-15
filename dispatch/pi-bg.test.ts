@@ -337,9 +337,9 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
     expect(r.out).toContain("cgroup escape active"); // escape ran, in the fake root
     const runId = fx.records()[0].run;
     // the ticket dir lived under the fixture root and was reaped on exit
-    expect(
-      fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId)),
-    ).toBe(false);
+    expect(fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId))).toBe(
+      false,
+    );
     // ...and NOT under the real user cgroup root
     expect(fs.existsSync(path.join(realCgRoot, runId))).toBe(false);
   });
@@ -442,7 +442,8 @@ const TID = (n: number) => `20991231-235959-${n}`;
 function liveProcWith(needle: string): boolean {
   for (const d of fs.readdirSync("/proc").filter((x) => /^\d+$/.test(x))) {
     try {
-      if (fs.readFileSync(`/proc/${d}/cmdline`, "utf8").includes(needle)) return true;
+      if (fs.readFileSync(`/proc/${d}/cmdline`, "utf8").includes(needle))
+        return true;
     } catch {
       /* vanished */
     }
@@ -1417,7 +1418,10 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
         await Bun.sleep(100);
       }
       expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
-      const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<string, string>;
+      const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<
+        string,
+        string
+      >;
       const k = await runScript(KILL, [rec.run], kenv, fx.tmp);
       expect(k.code).toBe(0);
       expect(k.out).toContain(`killed ${rec.run} after`);
@@ -1429,7 +1433,9 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
       expect(rec2.state).toBe("killed");
       expect(rec2.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
       // kill marker present (the watchdog skips this ticket)
-      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(true);
+      expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(
+        true,
+      );
       // hb child cleaned up by the wrapper trap (no orphan re-touching it)
       await Bun.sleep(1500);
       expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-hb`))).toBe(false);
