@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   consumeRerun,
+  countTurns,
   encPath,
   findSessionFile,
   finishRun,
@@ -15,6 +16,7 @@ import {
   pruneRuns,
   RERUN_TTL_MS,
   reappendSession,
+  runAtRank,
   stageFileTouch,
   startRun,
   storeRoot,
@@ -815,5 +817,302 @@ describe("cap and exclusion hardening (F7/F10)", () => {
       .split("\n")
       .map((l) => JSON.parse(l).id);
     expect(kept).toEqual(["s1", "tA"]);
+  });
+});
+
+// ─── #46 /undo N: multi-turn rollback ─────────────────────────────────
+
+describe("#46 /undo N (multi-turn rollback)", () => {
+  const header = {
+    type: "session",
+    version: 3,
+    id: "s1",
+    timestamp: "t",
+    cwd: "/x",
+  };
+  // 3 complete turns: T1 A1 T2 A2 T3 A3
+  const T1 = {
+    type: "custom_message",
+    id: "T1",
+    parentId: null,
+    customType: "channel-inbound",
+    content: "q1",
+    details: { body: "q1" },
+  };
+  const A1 = {
+    type: "message",
+    id: "A1",
+    parentId: "T1",
+    message: { role: "assistant", content: [{ type: "text", text: "r1" }] },
+  };
+  const T2 = {
+    type: "custom_message",
+    id: "T2",
+    parentId: "A1",
+    customType: "channel-inbound",
+    content: "q2",
+    details: { body: "q2" },
+  };
+  const A2 = {
+    type: "message",
+    id: "A2",
+    parentId: "T2",
+    message: { role: "assistant", content: [{ type: "text", text: "r2" }] },
+  };
+  const T3 = {
+    type: "custom_message",
+    id: "T3",
+    parentId: "A2",
+    customType: "channel-inbound",
+    content: "q3",
+    details: { body: "q3" },
+  };
+  const A3 = {
+    type: "message",
+    id: "A3",
+    parentId: "T3",
+    message: { role: "assistant", content: [{ type: "text", text: "r3" }] },
+  };
+  const chain = [header, T1, A1, T2, A2, T3, A3];
+  const ids = (f: string) =>
+    fs
+      .readFileSync(f, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l).id);
+  const dir = (sub: string) => {
+    const d = path.join(tmp, sub);
+    fs.mkdirSync(d, { recursive: true });
+    return d;
+  };
+
+  test("truncateSession: N=2 keeps through T2, N=3 through T1, N=4 null + unchanged", () => {
+    const f1 = makeSession(dir("t2"), chain);
+    const removed2 = truncateSession(f1, 2)!;
+    expect(removed2.map((l) => JSON.parse(l).id)).toEqual(["A2", "T3", "A3"]);
+    expect(ids(f1)).toEqual(["s1", "T1", "A1", "T2"]);
+
+    const f2 = makeSession(dir("t3"), chain);
+    const removed3 = truncateSession(f2, 3)!;
+    expect(removed3.map((l) => JSON.parse(l).id)).toEqual([
+      "A1",
+      "T2",
+      "A2",
+      "T3",
+      "A3",
+    ]);
+    expect(ids(f2)).toEqual(["s1", "T1"]);
+
+    const f3 = makeSession(dir("t4"), chain);
+    expect(truncateSession(f3, 4)).toBeNull();
+    expect(ids(f3)).toEqual(chain.map((c) => c.id)); // file untouched
+  });
+
+  test("N=1 is the original cut point (default and explicit are identical)", () => {
+    const f1 = makeSession(dir("n1a"), chain);
+    const removed = truncateSession(f1)!; // default n
+    expect(removed.map((l) => JSON.parse(l).id)).toEqual(["A3"]);
+    const f2 = makeSession(dir("n1b"), chain);
+    const removed2 = truncateSession(f2, 1)!;
+    expect(removed2.map((l) => JSON.parse(l).id)).toEqual(["A3"]);
+    expect(ids(f1)).toEqual(ids(f2));
+  });
+
+  test("countTurns: 3 on the chain; 0 for missing/null/trigger-only files", () => {
+    const f = makeSession(dir("ct"), chain);
+    expect(countTurns(f)).toBe(3);
+    expect(countTurns(path.join(tmp, "absent.jsonl"))).toBe(0);
+    expect(countTurns(null)).toBe(0);
+    // T2's parentId (A1) dangles: the walk still resolves the leaf, no
+    // assistant on the path -> 0 turns
+    expect(countTurns(makeSession(dir("ct2"), [header, T1, T2]))).toBe(0);
+  });
+
+  test("runAtRank: 2nd/3rd newest run; F3 skip; null past the store", () => {
+    const cwd = path.join(tmp, "rank");
+    fs.mkdirSync(cwd, { recursive: true });
+    const sess = path.join(cwd, "s.jsonl");
+    fs.writeFileSync(sess, "{}\n");
+    const r1 = startRun(cwd)!;
+    finishRun(r1, cwd, sess, true);
+    const r2 = startRun(cwd)!;
+    finishRun(r2, cwd, sess, true);
+    const r3 = startRun(cwd)!;
+    finishRun(r3, cwd, sess, true);
+
+    expect(runAtRank(sess, 1)?.dir).toBe(r3.dir); // = legacy latestRun
+    expect(runAtRank(sess, 2)?.dir).toBe(r2.dir);
+    expect(runAtRank(sess, 3)?.dir).toBe(r1.dir);
+    expect(runAtRank(sess, 4)).toBeNull();
+    expect(runAtRank(sess, 0)).toBeNull();
+    expect(runAtRank(null, 2)?.dir).toBe(r2.dir); // no session filter
+  });
+
+  test("/undo 2 (git): one restart, pre-2nd-run file state, redo one level", () => {
+    const cwd = makeRepo(path.join(tmp, "gitn"));
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a0");
+    fs.writeFileSync(path.join(cwd, "b.txt"), "b0");
+    fs.writeFileSync(path.join(cwd, "c.txt"), "c0");
+    commit(cwd, "base");
+    const sess = makeSession(cwd, chain);
+
+    const r1 = startRun(cwd)!;
+    fs.writeFileSync(path.join(cwd, "a.txt"), "a1");
+    finishRun(r1, cwd, sess, true);
+    const r2 = startRun(cwd)!;
+    fs.writeFileSync(path.join(cwd, "b.txt"), "b2");
+    finishRun(r2, cwd, sess, true);
+    const r3 = startRun(cwd)!;
+    fs.writeFileSync(path.join(cwd, "c.txt"), "c3");
+    finishRun(r3, cwd, sess, true);
+
+    // ONE /undo 2 covers both bad turns
+    const undo = performUndo(sess, 2);
+    expect(undo.restarted).toBe(true);
+    expect(undo.reRun).toBe(true);
+    expect(undo.text).toBe("[ok] undone: 3 files + conversation (re-running)");
+    // session: back to pre-2nd-turn state (through T2)
+    expect(ids(sess)).toEqual(["s1", "T1", "A1", "T2"]);
+    // re-run target is the 2nd trigger
+    expect(consumeRerun(sess)).toBe("q2");
+    // files: run 2's pre-snapshot = the whole tree as run 2 found it:
+    // a keeps run 1's change (pre-cut, kept turn); b/c back to base.
+    expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("a1");
+    expect(fs.readFileSync(path.join(cwd, "b.txt"), "utf8")).toBe("b0");
+    expect(fs.readFileSync(path.join(cwd, "c.txt"), "utf8")).toBe("c0");
+
+    // redo is ONE level: back to the state AFTER run 2 (pre-run-3)
+    const redo = performRedo();
+    expect(redo.text).toBe("[ok] redone: 2 files + conversation");
+    expect(ids(sess)).toEqual(chain.map((c) => c.id));
+    expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("a1");
+    expect(fs.readFileSync(path.join(cwd, "b.txt"), "utf8")).toBe("b2");
+    expect(fs.readFileSync(path.join(cwd, "c.txt"), "utf8")).toBe("c0");
+    expect(performRedo().text).toBe("[!] nothing to redo");
+  });
+
+  test("/undo 2 (non-git): restores the selected run's files only (documented limit)", () => {
+    const cwd = path.join(tmp, "plainn");
+    fs.mkdirSync(cwd, { recursive: true });
+    const a = path.join(cwd, "a.txt");
+    const b = path.join(cwd, "b.txt");
+    const c = path.join(cwd, "c.txt");
+    fs.writeFileSync(a, "a0");
+    fs.writeFileSync(b, "b0");
+    fs.writeFileSync(c, "c0");
+    const sess = makeSession(cwd, chain);
+
+    const r1 = startRun(cwd)!;
+    stageFileTouch(r1, cwd, a);
+    fs.writeFileSync(a, "a1");
+    finishRun(r1, cwd, sess, true);
+    const r2 = startRun(cwd)!;
+    stageFileTouch(r2, cwd, b);
+    fs.writeFileSync(b, "b2");
+    finishRun(r2, cwd, sess, true);
+    const r3 = startRun(cwd)!;
+    stageFileTouch(r3, cwd, c);
+    fs.writeFileSync(c, "c3");
+    finishRun(r3, cwd, sess, true);
+
+    const undo = performUndo(sess, 2);
+    expect(undo.restarted).toBe(true);
+    // run 2's snapshot knows only b.txt (stageFileTouch is first-touch,
+    // finishRun stores run.preFiles only): b -> b0 restored; a keeps run 1
+    // (pre-cut, kept turn); c stays c3 — run 3's change is NOT in run 2's
+    // snapshot (the documented N>1 files-mode limit).
+    expect(undo.text).toBe("[ok] undone: 1 file + conversation (re-running)");
+    expect(fs.readFileSync(a, "utf8")).toBe("a1");
+    expect(fs.readFileSync(b, "utf8")).toBe("b0");
+    expect(fs.readFileSync(c, "utf8")).toBe("c3");
+    expect(ids(sess)).toEqual(["s1", "T1", "A1", "T2"]);
+
+    const redo = performRedo();
+    expect(redo.text).toBe("[ok] redone: 1 file + conversation");
+    expect(fs.readFileSync(b, "utf8")).toBe("b2");
+    expect(fs.readFileSync(c, "utf8")).toBe("c3"); // still run 3's file
+    expect(performRedo().text).toBe("[!] nothing to redo");
+  });
+
+  test("N > chain length: one [!] line, no action", () => {
+    const cwd = path.join(tmp, "chainlen");
+    fs.mkdirSync(cwd, { recursive: true });
+    const f = path.join(cwd, "f.txt");
+    fs.writeFileSync(f, "v0");
+    const sess = makeSession(cwd, chain);
+    const r1 = startRun(cwd)!;
+    stageFileTouch(r1, cwd, f);
+    fs.writeFileSync(f, "v1");
+    finishRun(r1, cwd, sess, true);
+
+    const before = fs.readFileSync(sess, "utf8");
+    const r = performUndo(sess, 4);
+    expect(r.text).toBe("[!] nothing to undo: only 3 turns back");
+    expect(r.restarted).toBe(false);
+    expect(r.reRun).toBe(false);
+    expect(fs.readFileSync(sess, "utf8")).toBe(before); // session untouched
+    expect(fs.readFileSync(f, "utf8")).toBe("v1"); // files untouched
+    expect(fs.existsSync(path.join(storeRoot(), "redo.json"))).toBe(false);
+    expect(fs.existsSync(path.join(storeRoot(), "rerun.json"))).toBe(false);
+    expect(performRedo().text).toBe("[!] nothing to redo");
+
+    // no session at all: 0 turns back
+    expect(performUndo(null, 2).text).toBe(
+      "[!] nothing to undo: only 0 turns back",
+    );
+  });
+
+  test("N=1 keeps the legacy file-only undo when the session has no complete turn", () => {
+    const cwd = path.join(tmp, "legacy1");
+    fs.mkdirSync(cwd, { recursive: true });
+    const f = path.join(cwd, "f.txt");
+    fs.writeFileSync(f, "v0");
+    const sess = makeSession(cwd, [header, T1]);
+    const r1 = startRun(cwd)!;
+    stageFileTouch(r1, cwd, f);
+    fs.writeFileSync(f, "v1");
+    finishRun(r1, cwd, sess, true);
+
+    const r = performUndo(sess, 1);
+    expect(r.text).toBe("[ok] undone: 1 file");
+    expect(r.restarted).toBe(false);
+    expect(fs.readFileSync(f, "utf8")).toBe("v0");
+
+    // the same session with N>1: validated against the chain, no action
+    const cwd2 = path.join(tmp, "legacy2");
+    fs.mkdirSync(cwd2, { recursive: true });
+    const f2 = path.join(cwd2, "f.txt");
+    fs.writeFileSync(f2, "v0");
+    const sess2 = makeSession(cwd2, [header, T1]);
+    const r2 = startRun(cwd2)!;
+    stageFileTouch(r2, cwd2, f2);
+    fs.writeFileSync(f2, "v1");
+    finishRun(r2, cwd2, sess2, true);
+    const r2res = performUndo(sess2, 2);
+    expect(r2res.text).toBe("[!] nothing to undo: only 0 turns back");
+    expect(fs.readFileSync(f2, "utf8")).toBe("v1"); // untouched
+  });
+
+  test("redo right after /undo 2 is NOT stale (coveredSeq: F4 counts only post-undo runs)", () => {
+    const cwd = path.join(tmp, "stale2");
+    fs.mkdirSync(cwd, { recursive: true });
+    const sess = makeSession(cwd, chain);
+    const r1 = startRun(cwd)!;
+    finishRun(r1, cwd, sess, true);
+    const r2 = startRun(cwd)!;
+    finishRun(r2, cwd, sess, true);
+    const r3 = startRun(cwd)!;
+    finishRun(r3, cwd, sess, true);
+
+    performUndo(sess, 2);
+    // the undone runs include r3 (seq 3) = the newest: an immediate redo
+    // must not treat it as "newer" (legacy check compared against r2's seq)
+    expect(performRedo().text).toBe("[ok] redone: conversation");
+
+    // a NEW run after the undo still makes the (kept) record stale
+    performUndo(sess, 1);
+    const r4 = startRun(cwd)!;
+    finishRun(r4, cwd, sess, true);
+    expect(performRedo().text).toBe("[!] redo stale: newer run completed");
   });
 });

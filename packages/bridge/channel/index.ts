@@ -2808,7 +2808,7 @@ const HELP_TEXT = [
   "`/context [N]` - what's eating the window: top-N + category totals (est)",
   "`/reset` - start a NEW session, clearing context (owner)",
   "`/restart` - restart pi, resuming THIS session (owner)",
-  "`/undo` - revert last assistant turn: files + conversation (owner)",
+  "`/undo [N]` - revert last N assistant turns (default 1): files + conversation (owner)",
   "`/redo` - reapply an /undo (one level deep, owner)",
   "`/verbose [0|1|2|on|off]` - tool detail: 0 text, 1 essential, 2 all (owner)",
   "`/hold [on|off]` - buffer messages until released (owner)",
@@ -3324,14 +3324,30 @@ async function waitIdle(ctx: ExtensionContext, label: string): Promise<void> {
   while (!ctx.isIdle() && Date.now() - t0 < 3000) await sleep(100);
 }
 
+/**
+ * /undo arg (issue #46): N = how many assistant turns to revert, 1 or
+ * more. Bare /undo = 1 (legacy behavior). 0 / negative / non-numeric ->
+ * null: the command case answers one [!] usage line, no action.
+ * Exported for tests.
+ */
+export function parseUndoCount(arg: string | undefined): number | null {
+  const s = (arg ?? "").trim();
+  if (s === "") return 1;
+  if (!/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  return n >= 1 && Number.isSafeInteger(n) ? n : null;
+}
+
 async function runUndo(
   ctx: ExtensionContext,
+  n = 1,
 ): Promise<{ text: string; restarted: boolean }> {
   await waitIdle(ctx, "undo");
   const sessionFile = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
   // The /undo command case owns the block + tick + op shutdown when the
   // restart actually happens (see beginRestartOp / scheduleOpShutdown).
-  return performUndo(sessionFile);
+  // #46: N>1 reverts several turns in this ONE restart-class op.
+  return performUndo(sessionFile, n);
 }
 
 async function runRedo(
@@ -3705,11 +3721,15 @@ async function runChannelCommand(
     case "undo": {
       if (!isOwner) return ownerOnly;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      const r = await runUndo(ctx);
+      const n = parseUndoCount(arg);
+      if (n === null)
+        return { immediate: fence("[!] usage: /undo [N] (N is 1 or more)") };
+      const r = await runUndo(ctx, n);
       if (!r.restarted) return { immediate: fence(r.text) };
       // performUndo already truncated the session file + parked the re-run
-      // trigger (F1); the respawn resumes the pre-turn state. Block + tick
-      // + cursor replay across the respawn, like /reset.
+      // trigger (F1); the respawn resumes the pre-turn state. #46: N>1
+      // removed every turn back to the Nth trigger in this ONE restart.
+      // Block + tick + cursor replay across the respawn, like /reset.
       const placeholderP = beginRestartOp(
         pi,
         ctx,
