@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fmtTokensLC } from "./ctxwatch";
 import {
   clearDiscordStatesForTest,
   getChannelCursor,
@@ -6873,8 +6874,10 @@ describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", (
           count,
           secs,
         ).split("\n");
+        // header uses the k/m compact form (fmtTokensLC): raw 9999 secs
+        // would be `9999s` (5 cols), the compact form is `10ks` (4 cols)
         expect(frame[0]).toBe(
-          `┌ working · ${count} call${count === 1 ? "" : "s"} · ${secs}s`,
+          `┌ working · ${fmtTokensLC(count)} call${count === 1 ? "" : "s"} · ${fmtTokensLC(secs)}s`,
         );
         expect(frame.at(-1)).toBe("└");
         for (const line of frame) {
@@ -6882,6 +6885,25 @@ describe("v3 column budget (mockup3): every rendered frame line fits 32 cols", (
         }
       }
     }
+  });
+
+  test("runFrame header: 6-digit count/secs compact, never > 32 cols (PR #64 review P3)", () => {
+    // the review probe: `┌ working · 123456 calls · 999999s` = 34 cols
+    for (const count of [1000, 9999, 123456, 999999]) {
+      for (const secs of [1000, 9999, 123456, 999999]) {
+        const header = runFrame("working", [], count, secs).split("\n")[0];
+        expect(header.length).toBeLessThanOrEqual(TOOL_LINE_MAX);
+      }
+    }
+    expect(runFrame("working", [], 123456, 999999).split("\n")[0]).toBe(
+      "┌ working · 123k calls · 1000ks",
+    );
+    expect(runFrame("failed", [], 999999, 999999).split("\n")[0]).toBe(
+      "┤ failed · 1000k calls · 1000ks",
+    );
+    expect(runFrame("done", [], 1000, 999).split("\n")[0]).toBe(
+      "┌ done · 1k calls · 999s",
+    );
   });
 
   test("toolActionText is frame-safe (<=28) and keeps verbs + filename tails", () => {

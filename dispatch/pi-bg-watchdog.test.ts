@@ -19,6 +19,12 @@ const JARATE = path.join(import.meta.dir, "..", "bin", "jarate");
 
 type Post = { embeds: Array<{ title: string; description: string }> };
 
+/** Code lines of an embed's ```bash description block (the frame body). */
+function codeLines(em: { description: string }): string[] {
+  const m = em.description.match(/```bash\n([\s\S]*?)\n?```/);
+  return m ? m[1].split("\n") : [];
+}
+
 function fixture() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgwd-drift-"));
   const home = path.join(tmp, "home");
@@ -413,10 +419,18 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       );
       expect(f.posts).toHaveLength(1);
       const em = f.posts[0].embeds[0];
-      expect(em.title).toBe(`pi-bg ${t} \u00b7 SILENT (watchdog sweep)`);
-      expect(em.description).toContain(
-        "silent death (issue #57): rc=1, no output, retry1 did not recover",
-      );
+      // title drops the rid (24 chars cannot fit in 32 with the kind);
+      // the full ticket stays in the author name (pi-bg convention)
+      expect(em.title).toBe("SILENT \u00b7 watchdog sweep");
+      // note tail-clips to the 23-col value budget (head kept)
+      expect(em.description).toContain("note   : silent death (issue");
+      // 32-col law: every code line of the embed fits the mobile budget
+      for (const line of codeLines(em)) {
+        expect(line.length).toBeLessThanOrEqual(32);
+      }
+      // closing fence on its own line: the last content line is exactly
+      // the 32-col line measured above (not content + "```")
+      expect(em.description.endsWith("\n```")).toBe(true);
       // deadlog carries the SILENT reason
       const deadlog = path.join(f.home, ".pi-bg-deadlog");
       expect(fs.readFileSync(deadlog, "utf8")).toContain(`jarate`); // repo
@@ -450,8 +464,13 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       expect(r.out).not.toContain("SILENT jarate/");
       expect(f.posts).toHaveLength(2);
       for (const em of f.posts.map((p) => p.embeds[0])) {
-        expect(em.title).toMatch(/\u00b7 DEAD \(watchdog sweep\)$/);
-        expect(em.description).toContain("callback lost (SIGKILL/OOM)");
+        expect(em.title).toBe("DEAD \u00b7 watchdog sweep");
+        // note tail-clips; the head (classification) survives
+        expect(em.description).toContain("no live pi-bg process");
+        for (const line of codeLines(em)) {
+          expect(line.length).toBeLessThanOrEqual(32);
+        }
+        expect(em.description.endsWith("\n```")).toBe(true);
       }
     } finally {
       f.close();
@@ -475,8 +494,14 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       const em = f.posts[0].embeds[0];
       expect(em.title).toBe("pi-bg \u00b7 4 dead tickets swept");
       for (const n of [4, 5, 6, 7]) {
-        expect(em.description).toContain(`${TID(n)} | SILENT |`);
+        // two lines per ticket: full ticket (head-clipped to 32) + kind
+        expect(em.description).toContain(`${TID(n)}`);
       }
+      expect(em.description).toContain("  SILENT \u00b7 last ");
+      for (const line of codeLines(em)) {
+        expect(line.length).toBeLessThanOrEqual(32);
+      }
+      expect(em.description.endsWith("\n```")).toBe(true);
     } finally {
       f.close();
     }

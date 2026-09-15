@@ -211,26 +211,42 @@ wd_post() {
 
 # wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason> <kind>
 # kind: DEAD (generic) or SILENT (issue #57 idle-timeout death)
-# embed format mirrors pi-bg bg_build (author header, bash meta block, footer)
+# embed format mirrors pi-bg bg_build (author header, bash meta block,
+# footer). Code lines are clipped to FRAME_W (32, docs/STYLE.md 2.3):
+# the wt path head-clips (the ticket at the path tail is the discriminator),
+# reason/note tail-clip (the classification leads). The full ticket stays
+# in the author name; the title drops it (it cannot fit in 32 with the
+# kind) - PR #64 review P3.
 wd_build() {
   local bodyfile="$1" t="$2" repo="$3" path="$4" last="$5" reason="$6" kind="${7:-DEAD}"
   WD_T="$t" WD_REPO="$repo" WD_PATH="$path" WD_LAST="$last" WD_REASON="$reason" WD_KIND="$kind" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("WD_" + k, "")
+FRAME_W = 32  # mobile budget (docs/STYLE.md 2.3): every code line <= 32
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def clip_start(s, max):
+    s = str(s)
+    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
+def kv(key, val, width=6, vbudget=23, head=False):
+    # 9-col label + 23-col value = FRAME_W
+    cut = clip_start if head else clip_end
+    return key.ljust(width) + " : " + cut(val, vbudget)
 kind = E('KIND') or 'DEAD'
 note = ("silent death (issue #57): rc=1, no output, retry1 did not recover"
         if kind == 'SILENT' else
         "no live pi-bg process, no completion report - callback lost (SIGKILL/OOM)")
-meta = [f"repo   : {E('REPO')}",
-        f"wt     : {E('PATH')}",
-        f"last   : {E('LAST')}",
-        f"reason : {E('REASON')}",
-        f"note   : {note}"]
+meta = [kv("repo", E('REPO')),
+        kv("wt", E('PATH'), head=True),
+        kv("last", E('LAST')),
+        kv("reason", E('REASON')),
+        kv("note", note)]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('T')}"},
          "color": 15105570,  # orange, same as pi-bg DIED
-         "title": f"pi-bg {E('T')} \u00b7 {kind} (watchdog sweep)",
-         "description": "```bash\n" + "\n".join(meta) + "```",
+         "title": f"{kind} \u00b7 watchdog sweep",
+         "description": "```bash\n" + "\n".join(meta) + "\n```",  # fence on its own line (pi-bg pattern)
          "footer": {"text": "pi-bg watchdog"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 json.dump({"embeds": [embed]}, sys.stdout)
@@ -356,16 +372,28 @@ if [ "$found" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq
       printf '%s/%s | %s | last %s\n' "${DREPO[$i]}" "${DT[$i]}" "${DTYPE[$i]}" "${DLAST[$i]}"
     done)" WD_EXTRA=$((found - 10)) python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+FRAME_W = 32  # mobile budget (docs/STYLE.md 2.3): every code line <= 32
+def clip_start(s, max):
+    s = str(s)
+    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
 count = int(os.environ.get("WD_N", "0"))
-lines = os.environ.get("WD_LIST", "").splitlines()
 extra = int(os.environ.get("WD_EXTRA", "0"))
+lines = []
+for r in os.environ.get("WD_LIST", "").splitlines():
+    # "repo/ticket | KIND | last ts" -> two lines: the ticket head-clips
+    # to FRAME_W (a long repo name must not eat the ticket), kind +
+    # minuted ts on line 2. Full precision stays in the dead log.
+    parts = r.split(" | ")
+    lines.append(clip_start(parts[0], FRAME_W))
+    ts = parts[2][len("last "):] if len(parts) > 2 else ""
+    lines.append(f"  {parts[1] if len(parts) > 1 else ''} \u00b7 last {ts[:16].replace('T', ' ')}")
 if extra > 0:
-    lines.append(f"... {extra} more (full list: ~/.pi-bg-deadlog)")
-lines.append("worktrees kept under ~/.pi-bg-wt (killed-marker set; auto-prune after 7d)")
+    lines.append(f"... {extra} more: ~/.pi-bg-deadlog")
+lines.append("wt kept: ~/.pi-bg-wt (prune 7d)")
 embed = {"author": {"name": "pi-bg watchdog"},
          "color": 15105570,
          "title": f"pi-bg \u00b7 {count} dead tickets swept",
-         "description": "```bash\n" + "\n".join(lines) + "```",
+         "description": "```bash\n" + "\n".join(lines) + "\n```",  # fence on its own line (pi-bg pattern)
          "footer": {"text": "pi-bg watchdog (digest)"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 json.dump({"embeds": [embed]}, sys.stdout)
@@ -386,16 +414,29 @@ if [ "${#ST[@]}" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" 
     printf '%s/%s | hb last %s\n' "${STREPO[$i]}" "${ST[$i]}" "${STL[$i]}"
   done)" python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+FRAME_W = 32  # mobile budget (docs/STYLE.md 2.3): every code line <= 32
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def clip_start(s, max):
+    s = str(s)
+    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
 count = int(os.environ.get("WD_N", "0"))
 mins = os.environ.get("WD_MIN", "10")
-lines = os.environ.get("WD_LIST", "").splitlines()
+lines = []
+for r in os.environ.get("WD_LIST", "").splitlines():
+    # "repo/ticket | hb last ts" -> two lines (same shape as the digest)
+    parts = r.split(" | ")
+    lines.append(clip_start(parts[0], FRAME_W))
+    ts = parts[1][len("hb last "):] if len(parts) > 1 else ""
+    lines.append(f"  hb last {ts[:16].replace('T', ' ')}")
 if count > 10:
-    lines.append(f"... {count - 10} more (full list: ~/.pi-bg-deadlog)")
-lines.append(f"process alive, heartbeat stale > {mins} min - hung run suspected")
+    lines.append(f"... {count - 10} more: ~/.pi-bg-deadlog")
+lines.append(clip_end(f"process alive; hb stale >{mins} min", FRAME_W))
 lines.append("pi-bg-kill <ticket> to cancel")
 embed = {"author": {"name": "pi-bg watchdog"},
          "color": 15158332,  # red: alive but stuck (DEAD is orange)
-         "title": f"pi-bg \u00b7 {count} stalled ticket{'s' if count != 1 else ''} (watchdog sweep)",
+         "title": f"{count} stalled \u00b7 watchdog sweep",
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg watchdog (stalled)"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}

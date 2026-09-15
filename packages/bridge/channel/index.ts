@@ -1240,7 +1240,9 @@ export const RUN_FRAME_MAX_STEPS = 8;
  * Sub-steps are the last RUN_FRAME_MAX_STEPS shown calls; earlier overflow
  * lands right under the header as `├ … +N earlier calls`. `calls` is the
  * shown list (level 1 pre-filters to essentials), `count` its length.
- * Every line fits TOOL_LINE_MAX.
+ * Every line fits TOOL_LINE_MAX. The header formats count/secs with the
+ * k/m compact form (fmtTokensLC): raw `123456 calls · 999999s` is 34 cols;
+ * the compact form bounds the header at 32 (PR #64 review P3).
  */
 export function runFrame(
   state: RunFrameState,
@@ -1249,10 +1251,13 @@ export function runFrame(
   secs: number,
   trailing?: string,
 ): string {
-  const n = `${count} call${count === 1 ? "" : "s"} · ${secs}s`;
-  const lines: string[] = [
-    state === "failed" ? `┤ failed · ${n}` : `┌ ${state} · ${n}`,
-  ];
+  // k/m compact form: the raw `123456 calls · 999999s` shape breached 32
+  // (PR #64 review P3); fmtTokensLC bounds count/secs at 5 cols for any
+  // value under ~1e10 (1e10 secs = 317 years). The fit is the hard
+  // guarantee: the header can never exceed TOOL_LINE_MAX, however big.
+  const n = `${fmtTokensLC(count)} call${count === 1 ? "" : "s"} · ${fmtTokensLC(secs)}s`;
+  const header = state === "failed" ? `┤ failed · ${n}` : `┌ ${state} · ${n}`;
+  const lines: string[] = [fit(header, TOOL_LINE_MAX)];
   const shown = calls.slice(-RUN_FRAME_MAX_STEPS);
   const earlier = count - shown.length;
   if (earlier > 0)

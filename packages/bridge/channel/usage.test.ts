@@ -100,6 +100,11 @@ describe("fmtTokens", () => {
     expect(fmtTokens(8_200_000)).toBe("8.2M");
     expect(fmtTokens(627_600_000)).toBe("627.6M");
     expect(fmtTokens(6_400_000)).toBe("6.4M");
+    // B for >= 1e9: keeps the /context footer at 31 cols (1000.0M was 34,
+    // PR #64 review P3)
+    expect(fmtTokens(1_000_000_000)).toBe("1.0B");
+    expect(fmtTokens(2_500_000_000)).toBe("2.5B");
+    expect(fmtTokens(999_999_999)).toBe("1000.0M");
   });
 });
 

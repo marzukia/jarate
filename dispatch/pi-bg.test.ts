@@ -1704,7 +1704,9 @@ describe("#52: watchdog STALLED classification (live + stale heartbeat)", () => 
       expect(r1.out).not.toContain(`DEAD jarate/${t}`);
       expect(hook.posts.length).toBe(1);
       const em = hook.posts[0].embeds[0];
-      expect(em.title).toContain("1 stalled ticket");
+      // title is width-bounded (32): the full ticket lives in the
+      // description, not the title (PR #64 review P3)
+      expect(em.title).toBe("1 stalled \u00b7 watchdog sweep");
       expect(em.title).not.toContain("dead");
       expect(em.description).toContain(`jarate/${t}`);
       expect(em.color).toBe(15158332);

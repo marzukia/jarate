@@ -166,14 +166,23 @@ const RULES: PatternRule[] = [
     sub: (_m, scheme) => `${scheme.toLowerCase()}://[REDACTED:dsn]@`,
   },
   {
+    // The unquoted value class must not match an already-redacted marker
+    // fragment: toolActionText censors BEFORE it clips, so the egress
+    // censor re-sees `sshpass -p [REDACTED:s…` — the fit can leave as few
+    // as ONE marker char (`sshpass -p […]`, the kv line's fragment is even
+    // shorter). Any value starting `[` here is a marker fragment, never a
+    // raw secret; re-expanding it ships a 38-col line (PR #64 review P2).
     cls: "sshpass",
-    re: /\bsshpass\s+-p\s+\S+/g,
+    re: /\bsshpass\s+-p\s+(?!\[)\S+/g,
     sub: () => "sshpass -p [REDACTED:sshpass]",
   },
   {
-    // key = value (any context) — the strongest leak signal.
+    // key = value (any context) — the strongest leak signal. Same
+    // self-exclusion as sshpass: the unquoted value class skips marker
+    // fragments (`token=[…` after a 23-col fit) so the egress pass is a
+    // no-op on already-clipped frames (PR #64 review P2).
     cls: "kv",
-    re: /(?<![\w-])\b(password|passwd|secret|token|api[_-]?key)\b\s*=\s*("[^"]*"|'[^']*'|\S+)/gi,
+    re: /(?<![\w-])\b(password|passwd|secret|token|api[_-]?key)\b\s*=\s*("[^"]*"|'[^']*'|(?!\[)\S+)/gi,
     sub: (_m, key) => `${key.toLowerCase()}=[REDACTED:kv]`,
   },
   {

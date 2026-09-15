@@ -54,11 +54,15 @@ export function estimateCost(s: UsageStats): number {
   );
 }
 
-/** Human-readable token count: 999 -> "999", 61000 -> "61K", 8.2e6 -> "8.2M". */
+/** Human-readable token count: 999 -> "999", 61000 -> "61K", 8.2e6 ->
+ *  "8.2M", 1e9 -> "1.0B". B (not a wider M) keeps the /context frame rows
+ *  at 4 cols: `1000.0M` would push `└ biggest: ...` to 34 cols
+ *  (PR #64 review P3). */
 export function fmtTokens(n: number): string {
   if (n < 1000) return String(n);
   if (n < 1_000_000) return `${Math.round(n / 1000)}K`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  return `${(n / 1_000_000_000).toFixed(1)}B`;
 }
 
 /**

@@ -9,7 +9,9 @@ import {
   clearRegistryCache,
   loadRegistry,
 } from "./censor";
+import { FRAME_COL_MAX } from "./frame";
 import { toolActionText } from "./index";
+import { fit } from "./todos";
 
 let tmp: string;
 let registryFile: string;
@@ -226,6 +228,58 @@ describe("pattern classes", () => {
     );
     // the = rule is unchanged (strongest leak signal, any value)
     expect(censor("password=x", { file: R })).toBe("password=[REDACTED:kv]");
+  });
+});
+
+describe("egress width (PR #64 review P2: clipped markers must not re-expand)", () => {
+  // toolActionText censors BEFORE the clip, so the shipped 32-col frame
+  // line carries a CLIPPED marker fragment (as short as `token=[…`). The
+  // egress pass (egressText, discord.ts — literally `censor(text)`) re-runs
+  // the full censor on that line: the sshpass and kv-`=` value classes
+  // must not match the fragment, or the line re-expands to 38/43 cols
+  // (the review probes). A bare `(?![REDACTED)` lookahead is too long:
+  // the fit can leave a 1-char `[` fragment, so the class excludes any
+  // value starting `[`.
+  const PW = "P".repeat(40); // 40-char password (review probe)
+  const TK = "x".repeat(12); // 12-char token (review probe)
+  const cases: Array<[string, string, string]> = [
+    ["sshpass", `sshpass -p ${PW} scp x@h:file /tmp/y`, PW],
+    ["kv =", `export A=1 B=2 token=${TK}`, TK],
+  ];
+
+  for (const [name, cmd, secret] of cases) {
+    test(`${name}: frame line <= 32 BEFORE and AFTER the egress censor`, () => {
+      // the shipped line: runFrame sub-step `│ ├ ` + toolActionText (28)
+      const action = toolActionText("bash", { command: cmd });
+      const pre = `│ ├ ${fit(action, FRAME_COL_MAX - 4)}`;
+      expect(pre.length).toBeLessThanOrEqual(FRAME_COL_MAX);
+      expect(pre).not.toContain(secret);
+      // full egress pass (hermetic: patterns only; the registry adds
+      // redactions, never width back)
+      const shipped = censor(pre, { file: R });
+      expect(shipped.length).toBeLessThanOrEqual(FRAME_COL_MAX);
+      expect(shipped).not.toContain(secret);
+      // no double-censor: egress may never ADD a marker (a clipped
+      // fragment can carry at most the one original marker)
+      expect(shipped.match(/\[REDACTED/g)?.length ?? 0).toBeLessThanOrEqual(1);
+    });
+  }
+
+  test("32-col clip of the censored command: egress stays <= 32", () => {
+    // task probe shape: censor the raw command, fit the full line to the
+    // 32-col budget, then run the egress censor on the result.
+    for (const cmd of [
+      `sshpass -p ${PW} scp x@h:file /tmp/y`,
+      `export A=1 B=2 token=${TK}`,
+    ]) {
+      const pre = fit(`bash ${censor(cmd, { file: R })}`, FRAME_COL_MAX);
+      expect(pre.length).toBeLessThanOrEqual(FRAME_COL_MAX);
+      const shipped = censor(pre, { file: R });
+      expect(shipped.length).toBeLessThanOrEqual(FRAME_COL_MAX);
+      expect(shipped).not.toContain(PW);
+      expect(shipped).not.toContain(TK);
+      expect(shipped.match(/\[REDACTED/g)?.length ?? 0).toBeLessThanOrEqual(1);
+    }
   });
 });
 
