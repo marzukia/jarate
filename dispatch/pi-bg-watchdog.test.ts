@@ -311,7 +311,10 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
       fs.writeFileSync(path.join(live, "cgroup.procs"), `${process.pid}\n`);
       // non-empty: threaded mode (count in cgroup.threads only)
       const threaded = plant(f, 5);
-      fs.writeFileSync(path.join(threaded, "cgroup.threads"), `${process.pid}\n`);
+      fs.writeFileSync(
+        path.join(threaded, "cgroup.threads"),
+        `${process.pid}\n`,
+      );
 
       const r = await f.run();
       expect(r.code).toBe(0);
@@ -350,7 +353,9 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
     try {
       const r = await f.run();
       expect(r.code).toBe(0);
-      expect(r.out).toContain("sweep done: 0 dead ticket(s) found, 0 cgroup dir(s) reaped");
+      expect(r.out).toContain(
+        "sweep done: 0 dead ticket(s) found, 0 cgroup dir(s) reaped",
+      );
     } finally {
       f.close();
     }
@@ -403,7 +408,9 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       const r = await f.run();
       expect(r.code).toBe(0);
       expect(r.out).toContain(`SILENT jarate/${t}`);
-      expect(r.out).toContain("silent death: rc=1, no output, retry1 did not recover");
+      expect(r.out).toContain(
+        "silent death: rc=1, no output, retry1 did not recover",
+      );
       expect(f.posts).toHaveLength(1);
       const em = f.posts[0].embeds[0];
       expect(em.title).toBe(`pi-bg ${t} \u00b7 SILENT (watchdog sweep)`);

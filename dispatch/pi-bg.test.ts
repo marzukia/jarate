@@ -337,9 +337,9 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
     expect(r.out).toContain("cgroup escape active"); // escape ran, in the fake root
     const runId = fx.records()[0].run;
     // the ticket dir lived under the fixture root and was reaped on exit
-    expect(
-      fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId)),
-    ).toBe(false);
+    expect(fs.existsSync(path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", runId))).toBe(
+      false,
+    );
     // ...and NOT under the real user cgroup root
     expect(fs.existsSync(path.join(realCgRoot, runId))).toBe(false);
   });
@@ -1258,7 +1258,9 @@ describe("#57: silent-death retry + RCA config fixes", () => {
       ).toBe(false);
       // rc artifact records the final (healthy) exit
       expect(
-        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
       ).toBe("0");
       // the retry is logged in the run record
       const rec = fx.records()[0];
@@ -1296,7 +1298,9 @@ describe("#57: silent-death retry + RCA config fixes", () => {
         fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-retry1`)),
       ).toBe(true);
       expect(
-        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
       ).toBe("1");
       const rec = fx.records()[0];
       expect(rec.retries).toHaveLength(1);
