@@ -2034,10 +2034,18 @@ describe("deploy-swap guard (2026-09-15): wrapper survives a script swap mid-run
         await Bun.sleep(100);
       }
       expect(scriptArg(s.pid)).toMatch(/\/(snap-[^/]+\/pi-bg)$/);
-      // deploy: replace the checkout-side target while the wrapper is
-      // parked in its `wait` (pi stub sleeping)
+      // deploy: replace the checkout-side target (git style, new inode)
+      // AND rewrite it in place with a mid-file insert (editor style,
+      // same inode - the 1769153 killer) while the wrapper is parked in
+      // its `wait` (pi stub sleeping)
       await Bun.sleep(1000);
       swapScript(real);
+      const c = fs.readFileSync(real, "utf8");
+      const mid = Math.floor(c.length / 2);
+      fs.writeFileSync(
+        real,
+        c.slice(0, mid) + "\n# in-place shifted\n" + c.slice(mid),
+      );
       const r = await collect1(s);
       expect(r.code).toBe(0);
       expect(r.out).toContain("pi-run-ok");

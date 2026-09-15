@@ -278,16 +278,18 @@ if [ -z "${PI_BG_SNAP:-}" ]; then echo "[pi-bg] ticket $run_id profile=$profile"
 # and dies mid-run (bash syntax error, exit 2) - the review was complete
 # (report + PASS on disk) but the wrapper never posted its callback and
 # the watchdog re-flagged the ticket DEAD. Each run now execs a per-run
-# HARD LINK to the startup inode: git replaces the checkout path (new
-# inode) but this link keeps the original file alive for the whole run.
-# Basename stays "pi-bg" so the concurrency cap still counts us; the
-# snapshot is cleaned in the exit trap. Fails open (continue on $0) when
-# the link cannot be made.
+# COPY of the startup script: git pull REPLACES the checkout path (new
+# inode) and editors/biome write IN PLACE (same inode) - a hard link only
+# survives the former (1769153 died to my own in-place edits), a copy
+# survives both. Basename stays "pi-bg" so the concurrency cap still
+# counts us; the snapshot is cleaned in the exit trap. Fails open
+# (continue on $0) when the copy cannot be made.
 SNAP_DIR="${SNAP_DIR:-}"
 if [ -z "${PI_BG_SNAP:-}" ] && [ "${PI_BG_NOSNAP:-0}" != "1" ]; then
   _snapdir="$BG_TMP/snap-$run_id"
   if mkdir -p "$_snapdir" 2>/dev/null && \
-     ln "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" "$_snapdir/pi-bg" 2>/dev/null; then
+     cp -f "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" "$_snapdir/pi-bg" 2>/dev/null && \
+     chmod 755 "$_snapdir/pi-bg" 2>/dev/null; then
     SNAP_DIR="$_snapdir"
     PI_BG_SNAP=1 PI_BG_RUN_ID="$run_id" JB_ROOT_SNAPPED="$JB_ROOT" SNAP_DIR="$_snapdir" exec bash "$_snapdir/pi-bg" "${PI_BG_ORIG_ARGS[@]+"${PI_BG_ORIG_ARGS[@]}"}"
   fi
