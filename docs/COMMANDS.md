@@ -49,6 +49,8 @@ Webhook callback embeds are framed and untagged.
 | `/sleep list` | `[wake] …` |
 | `/sleep cancel` | `[ok] …` / `[!] …` |
 | `/tasks list` | `[tasks] …` |
+| `/tasks add` | `[ok] …` / `[!] …` |
+| `/tasks reschedule` | `[ok] …` / `[!] …` |
 | `/tasks cancel` | `[ok] …` / `[!] …` |
 | `/btw` usage, other usage errors | `[!] usage: …` |
 | owner-only rejection | `[!] owner only` |
@@ -85,7 +87,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | `/compact [instructions]` | owner | compact the session context (optionally with custom instructions) |
 | `/model [name]` | owner | switch model, or list models when run bare |
 | `/sleep [list \| cancel <id>]` | owner | list or cancel pending session wakes |
-| `/tasks [list \| cancel <id>]` | owner | list or cancel scheduled prompt tasks (one-shot / cron) |
+| `/tasks [list \| add \| reschedule \| cancel]` | owner | schedule, change or cancel prompt tasks (one-shot / cron) |
 | `! <command>` | owner | shell passthrough: run `bash -c "<command>"` in the working directory |
 
 ## Examples
@@ -484,15 +486,22 @@ process dies).
 ### /tasks
 
 ```
-/tasks               # list scheduled tasks (same as /tasks list)
+/tasks                        # list scheduled tasks (same as /tasks list)
 /tasks list
-/tasks cancel <id>   # cancel one
+/tasks add "<prompt>" <spec>   # spec: minutes | ISO time | 5-field cron [tz]
+/tasks reschedule <id> <spec>  # new spec for an existing task, same prompt
+/tasks cancel <id>             # cancel one
 ```
 
 Owner only. Lists the agent's scheduled prompt tasks — one-shot reminders
-(`minutes` or `at`) and recurring cron prompts — as id, channel, schedule,
-next fire, countdown and prompt excerpt, or cancels one by id. Tasks are
-created by the `task` LLM tool, not by a command.
+(`minutes` or ISO time) and recurring cron prompts — as id, channel,
+schedule, next fire, countdown and prompt excerpt. `/tasks add` schedules a
+task in THIS session (same store and fire path as the `task` tool); a
+cron spec may take an IANA timezone as its 6th token. `/tasks reschedule`
+validates the id against this session's tasks, replaces the schedule and
+keeps the prompt (unknown id -> one `[!]` line). `/tasks cancel` removes
+one by id. Bad spec, missing prompt or bad tz -> one `[!]` line each,
+nothing scheduled.
 
 The `task` tool (agent-facing): `task(prompt="check the build", minutes=120)`
 or `task(prompt="...", at="2026-09-10T15:00:00Z")` or

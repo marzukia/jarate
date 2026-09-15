@@ -92,6 +92,7 @@ import {
   loadTasks,
   markTaskClaimed,
   parseTaskSpec,
+  rescheduleTask,
   scheduleTask,
 } from "./tasks";
 import {
@@ -2822,7 +2823,7 @@ const HELP_TEXT = [
   "`/diff [git-range | file]` - publish a diff (default: working tree) to a shareable viewer URL",
   "`/todos` - show the channel todo board (arg `all` for every channel)",
   "`/sleep [list | cancel <id>]` - list or cancel pending session wakes (owner)",
-  "`/tasks [list | cancel <id>]` - list or cancel scheduled tasks (owner)",
+  "`/tasks [list | add | reschedule | cancel]` - schedule, change or cancel prompt tasks (owner)",
   "`/help` - this message",
 ].join("\n");
 
@@ -3419,6 +3420,42 @@ function startCompact(
   }
 }
 
+// ─── /tasks spec-string adapter ────────────────────────────────────────────
+// Turns the raw schedule text of /tasks add|reschedule into parseTaskSpec
+// params (the SAME validator the task LLM tool uses — no second parser):
+//   1 token: all digits = minutes, otherwise an ISO time
+//   5 tokens: 5-field cron
+//   6 tokens: 5-field cron + IANA timezone
+// Anything else is a form error (the command prints its usage line).
+function specStringParams(
+  raw: string,
+): { at?: string; minutes?: number; cron?: string; tz?: string } | undefined {
+  const s = raw.trim();
+  if (!s) return undefined;
+  const tokens = s.split(/\s+/);
+  if (tokens.length === 1) {
+    const t0 = tokens[0]!;
+    if (/^\d+$/.test(t0)) return { minutes: Number(t0) };
+    return { at: t0 };
+  }
+  if (tokens.length === 5) return { cron: tokens.join(" ") };
+  if (tokens.length === 6)
+    return { cron: tokens.slice(0, 5).join(" "), tz: tokens[5] };
+  return undefined;
+}
+
+/** Schedule label for [ok] lines (same wording as the task tool ack). */
+function taskWhenLabel(task: {
+  kind: string;
+  cron?: string;
+  tz?: string;
+  atMs?: number;
+}): string {
+  return task.kind === "cron"
+    ? `cron "${task.cron}"${task.tz ? ` (${task.tz})` : " (system tz)"}`
+    : `at ${new Date(task.atMs!).toISOString()}`;
+}
+
 // ─── Shared command execution ─────────────────────────────────────────────
 // Used by both text messages and native slash commands (INTERACTIONS_CREATE).
 // `native` = came from a Discord interaction: non-owners get a reply instead
@@ -3956,7 +3993,76 @@ async function runChannelCommand(
             : `[!] no task with id ${id}`,
         };
       }
-      return { immediate: fence("[!] usage: /tasks [list | cancel <id>]") };
+      if (sub === "add") {
+        const rest = argText.slice("add".length).trim();
+        const m = rest.match(/^"([^"]*)"\s*([\s\S]*)$/);
+        if (!m)
+          return {
+            immediate: fence(
+              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
+            ),
+          };
+        const prompt = m[1]!.trim();
+        const spec = specStringParams(m[2] ?? "");
+        if (!spec)
+          return {
+            immediate: fence(
+              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
+            ),
+          };
+        const res = parseTaskSpec({ prompt, ...spec });
+        if (!res.spec || res.error)
+          return { immediate: `[!] ${res.error ?? "invalid task spec"}` };
+        const task = scheduleTask({
+          channelId: ch.id,
+          channelName: ch.name,
+          prompt,
+          spec: res.spec,
+        });
+        return {
+          immediate:
+            `[ok] task ${task.id} scheduled: ${taskWhenLabel(task)}, next fire ` +
+            `${new Date(task.nextFireAt).toISOString()} — ` +
+            `cancel with /tasks cancel ${task.id}`,
+        };
+      }
+      if (sub === "reschedule") {
+        const rest = argText.slice("reschedule".length).trim();
+        const parts = rest.split(/\s+/).filter(Boolean);
+        const id = parts[0] ?? "";
+        if (!id)
+          return {
+            immediate: fence(
+              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
+            ),
+          };
+        // validate the id against THIS session's tasks before touching the spec
+        const t = loadTasks().find((x) => x.id === id && x.channelId === ch.id);
+        if (!t) return { immediate: `[!] no task with id ${id}` };
+        const spec = specStringParams(parts.slice(1).join(" "));
+        if (!spec)
+          return {
+            immediate: fence(
+              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
+            ),
+          };
+        const res = parseTaskSpec({ prompt: t.prompt, ...spec });
+        if (!res.spec || res.error)
+          return { immediate: `[!] ${res.error ?? "invalid task spec"}` };
+        const r = rescheduleTask(id, res.spec, ch.id);
+        if (!r.task || r.error)
+          return { immediate: `[!] ${r.error ?? "reschedule failed"}` };
+        return {
+          immediate:
+            `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(r.task)}, ` +
+            `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
+        };
+      }
+      return {
+        immediate: fence(
+          "[!] usage: /tasks [list | add | reschedule | cancel]",
+        ),
+      };
     }
     case "todos": {
       // Informational, open to all channel members (private channel).
