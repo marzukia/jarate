@@ -42,6 +42,10 @@ export interface ChannelConfig {
    *  messages fire a turn immediately by default). Set true to buffer;
    *  buffered batches are auto-flushed as a file-only turn at 10 minutes. */
   bufferFileOnly?: boolean;
+  /** Transcribe incoming voice notes to text before the LLM sees them
+   *  (default true). Set false to keep the [voice note: …] marker line
+   *  instead of the transcript. (#42) */
+  transcribe?: boolean;
   /** Message posted when a channel connects. Unset or empty = no message. */
   startupMessage?: string | null;
   /** Bot user IDs exempt from the other-bot filter — peer agents posting
@@ -178,6 +182,7 @@ function normalizeChannel(raw: any): ChannelConfig {
     ownerUserId: raw.ownerUserId,
     forwardToolCalls: raw.forwardToolCalls === true,
     bufferFileOnly: raw.bufferFileOnly === true,
+    transcribe: raw.transcribe !== false,
     startupMessage: raw.startupMessage,
     peerBotIds: Array.isArray(raw.peerBotIds)
       ? raw.peerBotIds.filter((x: any) => typeof x === "string")

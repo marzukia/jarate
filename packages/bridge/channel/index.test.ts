@@ -741,6 +741,7 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     // Drop leftover re-wake state BEFORE the cleanup agent_end, or it would
     // start an in-flight re-wake whose sendToPi continuation leaks into the
@@ -1372,6 +1373,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     afterEach(() => {
+      clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
@@ -1698,6 +1700,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     afterEach(() => {
+      clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
@@ -2391,6 +2394,271 @@ describe("extension handlers (A1/A2/A4)", () => {
   });
 });
 
+// ─── #42 voice-note transcription: wiring in the attachment branch ──────
+// Stub convention (jobs.test.ts): sh scripts in a temp dir, prepended to
+// PATH. The whisper-cli stub echoes a fixed transcript; the ffmpeg stub
+// stands in for the m4a -> 16 kHz wav conversion (it writes the output
+// file whisper-cli would read).
+
+describe("voice transcription (#42)", () => {
+  let tmp = "";
+  let scriptsDir = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+  const savedEnv: Record<string, string | undefined> = {};
+  const ENV_KEYS = [
+    "PATH",
+    "JB_TRANSCRIBE_BIN",
+    "JB_TRANSCRIBE_MODEL",
+    "JB_TRANSCRIBE_FFMPEG",
+    "JB_TRANSCRIBE_TIMEOUT_S",
+    "JB_TRANSCRIBE_THREADS",
+  ];
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const voiceAtt = (over: Partial<any> = {}): any => ({
+    id: "v1",
+    filename: "recording.m4a",
+    contentType: "audio/mp4",
+    size: 1000,
+    duration: 12,
+    url: "https://files.example/recording.m4a",
+    ...over,
+  });
+
+  function stub(name: string, body: string): void {
+    const p = path.join(scriptsDir, name);
+    fs.writeFileSync(p, body);
+    fs.chmodSync(p, 0o755);
+  }
+
+  function writeSettings(channels: any[]): void {
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels }),
+    );
+  }
+
+  const FFMPEG_OK = `#!/bin/sh
+out=""
+for a in "$@"; do out="$a"; done
+printf RIFF > "$out"
+exit 0
+`;
+  const WHISPER_OK = (sentinel?: string) =>
+    `#!/bin/sh\n` +
+    (sentinel ? `echo x >> ${sentinel}\n` : "") +
+    `echo "hello transcript words"\n`;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "voice-42-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    scriptsDir = path.join(tmp, "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    writeSettings([
+      { id: "ch1", name: "Test", type: "discord", botToken: "tok1" },
+    ]);
+    handlers = {};
+    sent = [];
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    verboseOverride.clear();
+    fetchCalls = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    // fetch mock: audio URLs serve a small buffer, everything else is the
+    // plain REST stub (message posts return { id }).
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      fetchCalls.push({
+        url: u,
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      if (u.startsWith("https://files.example/")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: {
+            get: (h: string) =>
+              h.toLowerCase() === "content-length" ? "1000" : null,
+          },
+          arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out" }),
+        text: async () => "",
+      };
+    }) as any;
+    // PATH: stub dir first; drop JB_TRANSCRIBE_* so defaults apply, then
+    // point JB_TRANSCRIBE_MODEL at a fake model in tmp so the existsSync
+    // gate passes on fresh HOMEs (CI runners without the real
+    // ggml-base.bin). The stub whisper-cli never parses it.
+    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
+    process.env.PATH = `${scriptsDir}${path.delimiter}${savedEnv.PATH ?? ""}`;
+    for (const k of ENV_KEYS.slice(1)) delete process.env[k];
+    const fakeModel = path.join(tmp, "ggml-fake.bin");
+    fs.writeFileSync(fakeModel, "FAKE-WHISPER-MODEL\n");
+    process.env.JB_TRANSCRIBE_MODEL = fakeModel;
+  });
+
+  afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    await handlers.agent_end?.({ messages: [] }, ctx);
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("m4a + working stubs -> transcript inlined, marker gone", async () => {
+    stub("ffmpeg", FFMPEG_OK);
+    stub("whisper-cli", WHISPER_OK());
+    const v = inbound("", "m42a");
+    v.attachments = [voiceAtt()];
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("hello transcript words");
+    expect(sent[0].m.content).not.toContain("[voice note:");
+    // the agent sees the words as plain message text (display body too)
+    expect(sent[0].m.details.body).toContain("hello transcript words");
+  });
+
+  test("stub exits 1 -> marker fallback kept", async () => {
+    stub("ffmpeg", FFMPEG_OK);
+    stub("whisper-cli", "#!/bin/sh\nexit 1\n");
+    const v = inbound("", "m42b");
+    v.attachments = [voiceAtt()];
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("[voice note: recording.m4a (12s)]");
+    expect(sent[0].m.content).not.toContain("hello transcript words");
+  });
+
+  test("opt-out channel (transcribe: false) -> no transcribe call", async () => {
+    const sentinel = path.join(tmp, "whisper-called");
+    writeSettings([
+      {
+        id: "ch1",
+        name: "Test",
+        type: "discord",
+        botToken: "tok1",
+        transcribe: false,
+      },
+    ]);
+    stub("ffmpeg", FFMPEG_OK);
+    stub("whisper-cli", WHISPER_OK(sentinel));
+    const v = inbound("", "m42c");
+    v.attachments = [voiceAtt()];
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("[voice note: recording.m4a (12s)]");
+    expect(sent[0].m.content).not.toContain("hello transcript words");
+    expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
+  test("non-audio attachment -> no transcribe call", async () => {
+    const sentinel = path.join(tmp, "whisper-called");
+    stub("whisper-cli", WHISPER_OK(sentinel));
+    const m = inbound("read this", "m42d");
+    m.attachments = [
+      {
+        id: "t1",
+        filename: "notes.txt",
+        contentType: "text/plain",
+        size: 30,
+        url: "https://files.example/notes.txt",
+      },
+    ];
+    await handleInbound(pi, m, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("notes.txt");
+    expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
+  test("voice note with failed download -> marker, no transcribe call", async () => {
+    const sentinel = path.join(tmp, "whisper-called");
+    stub("ffmpeg", FFMPEG_OK);
+    stub("whisper-cli", WHISPER_OK(sentinel));
+    const v = inbound("", "m42e");
+    v.attachments = [voiceAtt({ url: undefined })]; // download fails
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("[voice note: recording.m4a (12s)]");
+    expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
+  test("wav voice note -> native path, no ffmpeg needed", async () => {
+    stub("whisper-cli", WHISPER_OK());
+    const v = inbound("", "m42f");
+    v.attachments = [
+      voiceAtt({
+        id: "v2",
+        filename: "tone.wav",
+        contentType: "audio/wav",
+        url: "https://files.example/tone.wav",
+      }),
+    ];
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("hello transcript words");
+    expect(sent[0].m.content).not.toContain("[voice note:");
+  });
+
+  test("voice note + text -> transcript replaces marker, text kept", async () => {
+    stub("ffmpeg", FFMPEG_OK);
+    stub("whisper-cli", WHISPER_OK());
+    const v = inbound("what did I just say?", "m42g");
+    v.attachments = [voiceAtt()];
+    await handleInbound(pi, v, ctx);
+    expect(sent.length).toBe(1);
+    expect(sent[0].m.content).toContain("what did I just say?");
+    expect(sent[0].m.content).toContain("hello transcript words");
+    expect(sent[0].m.content).not.toContain("[voice note:");
+  });
+});
+
 // ─── #39 /hold: channel-wide queue mode ──────────────────────────────
 
 describe("#39 /hold", () => {
@@ -2493,6 +2761,7 @@ describe("#39 /hold", () => {
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     midTurnQueues.clear();
     pendingAttachments.clear();
@@ -2773,6 +3042,7 @@ describe("#10 verbosity levels", () => {
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     midTurnQueues.clear();
     pendingAttachments.clear();
@@ -3195,6 +3465,7 @@ describe("live intermediate text (SPEC B)", () => {
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     midTurnQueues.clear();
     pendingAttachments.clear();
     clearAllInterrupts();
@@ -3463,6 +3734,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     globalThis.fetch = realFetch;
   });
 
@@ -3667,6 +3939,7 @@ describe("compact: defer mid-run + always report", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     stopAllCompactTicks();
     clearAllCompacting();
@@ -4047,6 +4320,7 @@ describe("compaction-queue guard", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     clearAllCompacting();
     for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
@@ -4443,6 +4717,7 @@ describe("todo board (integration)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     globalThis.fetch = realFetch;
     process.env.HOME = realHome;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -4869,6 +5144,7 @@ describe("sleep (integration)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     globalThis.fetch = realFetch;
     process.env.HOME = realHome;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -5201,6 +5477,7 @@ describe("tasks (integration)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     globalThis.fetch = realFetch;
     process.env.HOME = realHome;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -5784,6 +6061,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     stopAllOpTicks();
     clearAllCompacting();
@@ -6500,6 +6778,7 @@ describe("/diff (issue #7)", () => {
   });
 
   afterEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     clearDiscordStatesForTest();
     globalThis.fetch = realFetch;
     process.env.HOME = realHome;
@@ -6821,6 +7100,7 @@ describe("wave 2c bridge commands", () => {
   });
 
   afterEach(async () => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     midTurnQueues.clear();
     pendingAttachments.clear();
