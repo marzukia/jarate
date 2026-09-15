@@ -45,6 +45,7 @@ import extension, {
   midTurnQueues,
   opWindowLabel,
   parseReplyTo,
+  parseUndoCount,
   parseVerboseLevel,
   pendingAttachments,
   pendingInterrupts,
@@ -384,6 +385,27 @@ describe("matchCommand (A3)", () => {
     expect(matchCommand("/sleepx")).toBeNull();
     expect(matchCommand(" stop")).toBeNull();
     expect(matchCommand("/ /stop")).toBeNull();
+  });
+});
+
+describe("parseUndoCount (#46 /undo N)", () => {
+  test("bare / whitespace = 1; positive integers pass through", () => {
+    expect(parseUndoCount(undefined)).toBe(1);
+    expect(parseUndoCount("")).toBe(1);
+    expect(parseUndoCount("   ")).toBe(1);
+    expect(parseUndoCount("1")).toBe(1);
+    expect(parseUndoCount(" 2 ")).toBe(2);
+    expect(parseUndoCount("10")).toBe(10);
+    expect(parseUndoCount("007")).toBe(7);
+  });
+
+  test("0, negative, non-numeric -> null (one [!] line, no action)", () => {
+    expect(parseUndoCount("0")).toBeNull();
+    expect(parseUndoCount("-1")).toBeNull();
+    expect(parseUndoCount("abc")).toBeNull();
+    expect(parseUndoCount("1.5")).toBeNull();
+    expect(parseUndoCount("1x")).toBeNull();
+    expect(parseUndoCount("2 turns")).toBeNull();
   });
 });
 
@@ -5711,6 +5733,170 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(channelPosts().some((t) => t === "[new] stale")).toBe(false);
     expect(edits().some((t) => t === "[new] stale")).toBe(false);
     expect(fs.existsSync(p)).toBe(false); // consumed either way
+  });
+
+  test("/undo 0 and /undo abc: one [!] usage line, no action, no op window", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.mkdirSync(sessDir, { recursive: true });
+    const mk = (id: string, parentId: string | null, body: string) => ({
+      type: "custom_message",
+      id,
+      parentId,
+      customType: "channel-inbound",
+      content: body,
+      details: { body },
+    });
+    const asst = (id: string, parentId: string) => ({
+      type: "message",
+      id,
+      parentId,
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    });
+    fs.writeFileSync(
+      sess,
+      `${[
+        { type: "session", version: 3, id: "s1", timestamp: "t", cwd: tmp },
+        mk("T1", null, "q1"),
+        asst("A1", "T1"),
+      ]
+        .map((l) => JSON.stringify(l))
+        .join("\n")}\n`,
+    );
+    const before = fs.readFileSync(sess, "utf8");
+
+    await handleInbound(pi, inbound("/undo 0", "m1"), ctx);
+    await tick();
+    await handleInbound(pi, inbound("/undo abc", "m2"), ctx);
+    await tick();
+    expect(
+      channelPosts().filter((t) =>
+        t.includes("[!] usage: /undo [N] (N is 1 or more)"),
+      ),
+    ).toHaveLength(2);
+    expect(isCompacting("ch1")).toBe(false); // no op window opened
+    expect(fs.readFileSync(sess, "utf8")).toBe(before); // session untouched
+    expect(shutdowns).toBe(0);
+  });
+
+  test("/undo 99 (N > chain length): one [!] line, no restart", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.mkdirSync(sessDir, { recursive: true });
+    const mk = (id: string, parentId: string | null, body: string) => ({
+      type: "custom_message",
+      id,
+      parentId,
+      customType: "channel-inbound",
+      content: body,
+      details: { body },
+    });
+    const asst = (id: string, parentId: string) => ({
+      type: "message",
+      id,
+      parentId,
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    });
+    fs.writeFileSync(
+      sess,
+      `${[
+        { type: "session", version: 3, id: "s1", timestamp: "t", cwd: tmp },
+        mk("T1", null, "q1"),
+        asst("A1", "T1"),
+      ]
+        .map((l) => JSON.stringify(l))
+        .join("\n")}\n`,
+    );
+    const before = fs.readFileSync(sess, "utf8");
+
+    await handleInbound(pi, inbound("/undo 99", "m1"), ctx);
+    await tick();
+    expect(
+      channelPosts().some((t) =>
+        t.includes("[!] nothing to undo: only 1 turn back"),
+      ),
+    ).toBe(true);
+    expect(isCompacting("ch1")).toBe(false);
+    expect(fs.readFileSync(sess, "utf8")).toBe(before);
+    expect(shutdowns).toBe(0);
+  });
+
+  test("/undo 2: ONE restart-class op reverts both turns (issue #46)", async () => {
+    const sessDir = path.join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `-${String(tmp).replace(/\//g, "-")}-`,
+    );
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.mkdirSync(sessDir, { recursive: true });
+    const mk = (id: string, parentId: string | null, body: string) => ({
+      type: "custom_message",
+      id,
+      parentId,
+      customType: "channel-inbound",
+      content: body,
+      details: { body },
+    });
+    const asst = (id: string, parentId: string) => ({
+      type: "message",
+      id,
+      parentId,
+      message: { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    });
+    const lines = [
+      { type: "session", version: 3, id: "s1", timestamp: "t", cwd: tmp },
+      mk("T1", null, "q1"),
+      asst("A1", "T1"),
+      mk("T2", "A1", "q2"),
+      asst("A2", "T2"),
+      mk("T3", "A2", "q3"),
+      asst("A3", "T3"),
+    ];
+    fs.writeFileSync(
+      sess,
+      `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
+    );
+
+    await handleInbound(pi, inbound("/undo 2", "m1"), ctx);
+    await tick();
+    // the restart-class op is armed (block + tick), same as /reset
+    expect(channelPosts().some((t) => t.includes("[..] undoing..."))).toBe(
+      true,
+    );
+    expect(isCompacting("ch1")).toBe(true);
+    expect(opWindowLabel("ch1")).toBe("undoing");
+    // BOTH turns are cut in ONE pass: session is at pre-2nd-turn state
+    const ids = fs
+      .readFileSync(sess, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l).id);
+    expect(ids).toEqual(["s1", "T1", "A1", "T2"]);
+
+    await waitOpShutdown();
+    expect(shutdowns).toBe(1); // ONE restart for two turns
+    // the op marker carries the final ack the respawn settles
+    const marker = JSON.parse(
+      fs.readFileSync(path.join(tmp, ".tmp", "op-marker.json"), "utf8"),
+    );
+    expect(marker.op).toBe("undo");
+    expect(marker.finalText).toContain(
+      "[ok] undone: conversation (re-running)",
+    );
   });
 
   test("/stop during an op CANCELS it: no shutdown, no systemd restart, session file kept", async () => {

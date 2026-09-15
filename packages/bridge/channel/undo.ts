@@ -1,12 +1,14 @@
 /**
- * /undo + /redo — revert the last completed assistant run, including the
- * file changes it made (and reapply on /redo, one level deep).
+ * /undo [N] + /redo — revert the last N completed assistant runs (N
+ * default 1), including the file changes they made (and reapply on /redo,
+ * one level deep).
  *
  * Conversation: a pi session is JSONL; on resume the leaf is the LAST line
- * of the file. /undo truncates the file at the trigger message of the last
- * assistant turn (keeping the trigger) and parks the removed lines for /redo,
- * then the caller restarts pi (same mechanism as /reset) so the new leaf
- * takes effect.
+ * of the file. /undo N walks the leaf->root parentId chain to the Nth
+ * trigger (user inbound) and truncates the file there (keeping that
+ * trigger), parks the removed lines for /redo, then the caller restarts
+ * pi (same mechanism as /reset) so the new leaf takes effect. ONE restart
+ * covers all N turns; N=1 is the original cut point (byte-identical).
  *
  * Files: one store entry per run under ~/.pi/agent/undo/runs/ (pruned to
  * the last 10):
@@ -17,6 +19,18 @@
  *    (captured before the first write; files the run created restore as
  *    absent). bash-modified files are not tracked (best-effort, like the
  *    kimaki reference).
+ *
+ * N>1 file-state limit (documented, issue #46): each run's pre-snapshot is
+ * captured at ITS OWN start (startRun, called on turn_start in index.ts),
+ * so the Nth-from-last run's "pre" snapshot IS the pre-Nth-run state.
+ * git mode restores the whole tree to it (applyGitSnap). Non-git mode
+ * restores only the files that selected run touched (stageFileTouch is
+ * first-touch; finishRun stores run.preFiles only) — a later run's change
+ * to a file the selected run never touched stays as-is. pruneRuns keeps
+ * the last MAX_RUNS (10) entries, so if the Nth-from-last run dir was
+ * pruned (or was recorded for a different session file) runAtRank returns
+ * null and /undo N is conversation-only. The transcript rollback is the
+ * core win; N>1 file restore is best-effort as bounded here.
  */
 
 import { execFileSync } from "node:child_process";
@@ -550,6 +564,45 @@ export function latestRun(
   return pass(true) ?? pass(false);
 }
 
+/**
+ * Rank-Nth newest completed run for this session file (1 = latestRun, the
+ * legacy /undo target). Same F3 semantics: runs with assistant output
+ * first, output-less runs only when no output run exists (no mixing).
+ * Null when the store holds fewer than N matching runs — e.g. pruned by
+ * pruneRuns (MAX_RUNS), or recorded for a different session file; /undo N
+ * is then conversation-only (see the file-header limit).
+ */
+export function runAtRank(
+  sessionFile: string | null,
+  rank: number,
+): { dir: string; meta: RunMeta } | null {
+  if (!Number.isInteger(rank) || rank < 1) return null;
+  if (rank === 1) return latestRun(sessionFile);
+  const rd = runsDir();
+  if (!fs.existsSync(rd)) return null;
+  const dirs = fs
+    .readdirSync(rd)
+    .filter((d) => /^\d+_\d+$/.test(d))
+    .sort()
+    .reverse();
+  const collect = (withOutput: boolean) => {
+    const out: Array<{ dir: string; meta: RunMeta }> = [];
+    for (const d of dirs) {
+      const meta = readRunMeta(path.join(rd, d));
+      if (!meta) continue;
+      if (sessionFile && meta.sessionFile && meta.sessionFile !== sessionFile)
+        continue;
+      const has = meta.assistantOutput !== false;
+      if (withOutput ? !has : has) continue;
+      out.push({ dir: path.join(rd, d), meta });
+    }
+    return out;
+  };
+  const withOut = collect(true);
+  const list = withOut.length > 0 ? withOut : collect(false);
+  return list[rank - 1] ?? null;
+}
+
 /** Apply a run's stored snapshot ("pre" = revert, "post" = reapply). */
 function applyRunSnapshot(
   runDir: string,
@@ -628,19 +681,20 @@ function pruneUndoBackups(sessionFile: string): void {
   } catch {}
 }
 
-/**
- * Truncate the session to the state before the last assistant turn:
- * find the last assistant message on the active path (leaf = last line,
- * walk parentId to root), find the closest trigger (user message or
- * channel custom message) before it, keep the file through that trigger.
- * Returns the removed lines (for /redo) or null when there is nothing to
- * revert. The file is rewritten atomically.
- */
-export function truncateSession(sessionFile: string): string[] | null {
-  const raw = fs.readFileSync(sessionFile, "utf8");
-  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return null;
+/** One entry of the session's active path (leaf -> root). */
+interface PathEntry {
+  /** line index in the file (0-based; the header is line 0) */
+  idx: number;
+  entry: any;
+}
 
+/**
+ * The active path of a session: leaf (last line) walked root-ward over
+ * parentId links. Null when the file is too short, the leaf is
+ * unparseable / id-less, or no entry resolves.
+ */
+function activePath(lines: string[]): PathEntry[] | null {
+  if (lines.length < 2) return null;
   const byId = new Map<string, number>();
   for (let i = 1; i < lines.length; i++) {
     try {
@@ -648,47 +702,70 @@ export function truncateSession(sessionFile: string): string[] | null {
       if (e?.id) byId.set(e.id, i);
     } catch {}
   }
-  // active path: last line (leaf) up to the root entry
-  const pathIdx: number[] = [];
   let leafId: string | null = null;
   try {
     leafId = JSON.parse(lines[lines.length - 1])?.id ?? null;
   } catch {
     return null;
   }
+  const path: PathEntry[] = [];
   let cur: string | null = leafId;
   while (cur !== null && byId.has(cur)) {
-    pathIdx.push(byId.get(cur)!);
-    cur = (JSON.parse(lines[byId.get(cur)!]) as any)?.parentId ?? null;
+    const idx = byId.get(cur)!;
+    const entry = JSON.parse(lines[idx]);
+    path.push({ idx, entry });
+    cur = entry?.parentId ?? null;
   }
-  // last assistant on the path (closest to the leaf)
-  let assistantPos = -1;
-  for (let i = 0; i < pathIdx.length; i++) {
-    try {
-      const e = JSON.parse(lines[pathIdx[i]]);
-      if (e?.type === "message" && e.message?.role === "assistant") {
-        assistantPos = i;
+  return path.length > 0 ? path : null;
+}
+
+/**
+ * Line index of the kept trigger for an N-turn revert. Walks the active
+ * path (leaf -> root); each complete turn = one assistant message plus
+ * the closest trigger (user inbound) strictly root-ward of it. N=1 is
+ * exactly the original /undo cut point. Null when the path holds fewer
+ * than N complete turns (no assistant left, or F8: a turn with no trigger
+ * root-ward of it — cutting to the header would drop the whole
+ * conversation for no reason).
+ */
+function turnKeepIdx(path: PathEntry[], n: number): number | null {
+  let i = 0;
+  for (let turn = 1; turn <= n; turn++) {
+    while (i < path.length) {
+      const e = path[i].entry;
+      if (e?.type === "message" && e.message?.role === "assistant") break;
+      i += 1;
+    }
+    if (i >= path.length) return null; // no assistant turn left
+    const assistantI = i;
+    let keepI = -1;
+    for (let j = assistantI + 1; j < path.length; j++) {
+      if (isTrigger(path[j].entry)) {
+        keepI = j;
         break;
       }
-    } catch {}
+    }
+    if (keepI === -1) return null; // F8
+    i = keepI; // the next turn starts root-ward of this trigger
+    if (turn === n) return path[keepI].idx;
   }
-  if (assistantPos === -1) return null;
-  // closest trigger strictly before the assistant = root-ward of it in
-  // pathIdx (which runs leaf -> root)
-  let keepIdx = -1;
-  for (let i = assistantPos + 1; i < pathIdx.length; i++) {
-    try {
-      if (isTrigger(JSON.parse(lines[pathIdx[i]]))) {
-        keepIdx = pathIdx[i];
-        break;
-      }
-    } catch {}
-  }
-  if (keepIdx === -1) {
-    // F8: no trigger root-ward of the last assistant — cutting to the
-    // header would drop the whole conversation for no reason. Abort.
-    return null;
-  }
+  return null;
+}
+
+/**
+ * Truncate the session to the state before the Nth-from-last assistant
+ * turn (N default 1 = the last turn): walk the active path to the Nth
+ * trigger and keep the file through that trigger. Returns the removed
+ * lines (for /redo) or null when there is nothing to revert. The file is
+ * rewritten atomically.
+ */
+export function truncateSession(sessionFile: string, n = 1): string[] | null {
+  const raw = fs.readFileSync(sessionFile, "utf8");
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  const path = activePath(lines);
+  if (!path) return null;
+  const keepIdx = turnKeepIdx(path, n);
+  if (keepIdx === null) return null;
   const kept = lines.slice(0, keepIdx + 1);
   const removed = lines.slice(keepIdx + 1);
   if (removed.length === 0) return null;
@@ -703,6 +780,43 @@ export function truncateSession(sessionFile: string): string[] | null {
   fs.writeFileSync(tmp, `${kept.join("\n")}\n`);
   fs.renameSync(tmp, sessionFile);
   return removed;
+}
+
+/**
+ * Number of complete turns on the session's active path (a turn = an
+ * assistant message with a trigger strictly root-ward of it). 0 when the
+ * file is missing, unreadable, or holds no complete turn. Used to
+ * validate /undo N BEFORE any state changes (N > chain length = one [!]
+ * line, no action). The walk is lockstep with turnKeepIdx: countTurns >= n
+ * iff truncateSession(file, n) would cut.
+ */
+export function countTurns(sessionFile: string | null): number {
+  if (!sessionFile) return 0;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sessionFile, "utf8");
+  } catch {
+    return 0;
+  }
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  const path = activePath(lines);
+  if (!path) return 0;
+  let turns = 0;
+  let i = 0;
+  while (i < path.length) {
+    const e = path[i].entry;
+    if (e?.type === "message" && e.message?.role === "assistant") {
+      for (let j = i + 1; j < path.length; j++) {
+        if (isTrigger(path[j].entry)) {
+          turns += 1;
+          i = j;
+          break;
+        }
+      }
+    }
+    i += 1;
+  }
+  return turns;
 }
 
 /** Re-append lines removed by truncateSession (for /redo). */
@@ -801,6 +915,11 @@ interface RedoRecord {
   run: string | null;
   sessionFile: string | null;
   removed: string[];
+  /** #46: seq of the NEWEST run the undo covered (/undo N covers ranks
+   * 1..N, i.e. the Nth-from-last up to the newest). F4's stale check
+   * compares against this, not rec.run's seq. Legacy records lack it and
+   * fall back to rec.run's seq (identical behavior for /undo 1). */
+  coveredSeq?: number;
 }
 
 function readRedo(): RedoRecord | null {
@@ -842,17 +961,33 @@ function undoAck(
 }
 
 /**
- * /undo: revert the last completed run for this session.
- * Restores the run's pre-run file state (applied to the snapshot's own cwd)
- * and truncates the session at the run's trigger. Parks a redo record for
- * /redo.
+ * /undo [N]: revert the last N completed runs for this session (N
+ * default 1 = the legacy single-turn revert, byte-identical). Restores
+ * the Nth-from-last run's pre-run file state — that snapshot was captured
+ * at that run's own start (startRun on turn_start), so it IS the
+ * pre-Nth-run state — and truncates the session at that run's trigger.
+ * ONE restart covers all N turns. Parks a one-level redo record.
+ * N > chain length -> one [!] line, no action (validated before any
+ * state changes).
  */
-export function performUndo(sessionFile: string | null): UndoResult {
-  const run = latestRun(sessionFile);
+export function performUndo(sessionFile: string | null, n = 1): UndoResult {
+  if (n > 1) {
+    const turns = countTurns(sessionFile);
+    if (n > turns)
+      return {
+        text: `[!] nothing to undo: only ${turns} turn${
+          turns === 1 ? "" : "s"
+        } back`,
+        restarted: false,
+        reRun: false,
+      };
+  }
+  const newest = latestRun(sessionFile);
+  const run = n === 1 ? newest : runAtRank(sessionFile, n);
   let removed: string[] | null = null;
   if (sessionFile && fs.existsSync(sessionFile)) {
     try {
-      removed = truncateSession(sessionFile);
+      removed = truncateSession(sessionFile, n);
     } catch (e) {
       console.error(
         `[undo] truncate failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -912,6 +1047,9 @@ export function performUndo(sessionFile: string | null): UndoResult {
     run: run ? path.basename(run.dir) : null,
     sessionFile,
     removed: removed ?? [],
+    // #46: the undo covered every run from the Nth up to the newest —
+    // /redo must not treat those (already undone) as "newer" (F4).
+    coveredSeq: newest ? Number(newest.meta.seq ?? 0) : 0,
   };
   try {
     fs.mkdirSync(storeRoot(), { recursive: true });
@@ -935,10 +1073,13 @@ export function performRedo(): UndoResult {
   // F4: if a NEWER run completed after this undo, the session has lines
   // appended past our cut point; re-appending the removed tail would strand
   // the new turn off-path. Refuse instead (record is kept).
+  // #46: /undo N>1 already covered runs up to coveredSeq; compare against
+  // that, or an immediate /redo would be stale by its own undone runs.
   {
     const undoSeq = Number(rec.run?.match(/^(\d+)_/)?.[1] ?? 0);
+    const covered = rec.coveredSeq ?? undoSeq;
     const newer = latestRun(rec.sessionFile);
-    if (newer && Number(newer.meta.seq ?? 0) > undoSeq) {
+    if (newer && Number(newer.meta.seq ?? 0) > covered) {
       return {
         text: "[!] redo stale: newer run completed",
         restarted: false,
