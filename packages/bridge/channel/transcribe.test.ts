@@ -99,6 +99,7 @@ describe("transcribeVoice (#42)", () => {
   let tmp: string;
   let scriptsDir: string;
   let sentinel: string;
+  let modelPath: string;
 
   function stub(name: string, body: string): void {
     const p = path.join(scriptsDir, name);
@@ -116,6 +117,10 @@ describe("transcribeVoice (#42)", () => {
     return {
       ...process.env,
       PATH: `${scriptsDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      // Fake model: transcribeVoice gates on existsSync(model); the PATH
+      // stubs never parse it, so this holds on fresh HOMEs (CI runners
+      // without the real ggml-base.bin) too.
+      JB_TRANSCRIBE_MODEL: modelPath,
     } as unknown as Record<string, string>;
   }
 
@@ -124,6 +129,8 @@ describe("transcribeVoice (#42)", () => {
     scriptsDir = path.join(tmp, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
     sentinel = path.join(tmp, "called");
+    modelPath = path.join(tmp, "ggml-fake.bin");
+    fs.writeFileSync(modelPath, "FAKE-WHISPER-MODEL\n");
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 

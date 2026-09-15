@@ -2525,10 +2525,16 @@ exit 0
         text: async () => "",
       };
     }) as any;
-    // PATH: stub dir first; drop JB_TRANSCRIBE_* so defaults apply.
+    // PATH: stub dir first; drop JB_TRANSCRIBE_* so defaults apply, then
+    // point JB_TRANSCRIBE_MODEL at a fake model in tmp so the existsSync
+    // gate passes on fresh HOMEs (CI runners without the real
+    // ggml-base.bin). The stub whisper-cli never parses it.
     for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
     process.env.PATH = `${scriptsDir}${path.delimiter}${savedEnv.PATH ?? ""}`;
     for (const k of ENV_KEYS.slice(1)) delete process.env[k];
+    const fakeModel = path.join(tmp, "ggml-fake.bin");
+    fs.writeFileSync(fakeModel, "FAKE-WHISPER-MODEL\n");
+    process.env.JB_TRANSCRIBE_MODEL = fakeModel;
   });
 
   afterEach(async () => {
