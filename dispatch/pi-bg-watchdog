@@ -144,6 +144,18 @@ has_started() {
   [ -f "$BG_TMP/pi-bg-${t}-started" ]
 }
 
+# record_done <ticket>: the run record reached a terminal state (pi-bg
+# marks state=done on every trapped exit, pi-bg-kill marks killed). A
+# ticket whose wrapper ran its exit trap COMPLETED - if no out.md exists
+# the callback was lost or mislabeled (deploy-swap deaths, 2026-09-15),
+# not a lost process. The sweep must not re-flag it DEAD.
+record_done() {
+  local t="$1" rf
+  rf="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}/pi-bg-$t.json"
+  [ -f "$rf" ] || return 1
+  grep -q '"state": *"done"\|"state": *"killed"' "$rf" 2>/dev/null
+}
+
 # hb_stale <ticket>: 0 when a heartbeat file exists and is older than
 # STALL_MIN min (live process + this = STALLED, issue #52). A fresh hb =
 # healthy; no hb at all (pre-upgrade run) = not judgeable -> never stale.
@@ -272,7 +284,7 @@ for d in "$WT_DIR"/*/*/; do
   # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
   #    killed on purpose (pi-bg-kill marker) -> not a lost callback. Both
   #    checked in the persistent dir AND legacy /tmp (one release of overlap).
-  if has_out "$t" || has_killed "$t"; then continue; fi
+  if has_out "$t" || has_killed "$t" || record_done "$t"; then continue; fi
   # 3) recent activity -> give it time
   mtime="$(stat -c %Y "$d" 2>/dev/null)" || continue
   [ $(( $(date +%s) - mtime )) -gt $((AGE_MIN * 60)) ] || continue

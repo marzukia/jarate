@@ -564,6 +564,36 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
     expect(r.out).toContain("1 dead ticket(s) found");
     expect(r.out).toContain(`DEAD jarate/${TID(5)}`);
   }, 60_000);
+
+  test("run record state=done (no out.md) -> NOT flagged dead (deploy-swap DIED, 2026-09-15)", async () => {
+    // ticket 3740387: the wrapper completed the review but died to a
+    // mid-run script swap BEFORE writing out.md; the exit trap posted the
+    // DIED callback and marked the record done. The sweep must not
+    // re-flag a ticket whose wrapper ran its exit trap.
+    const fx = wdFixture(6);
+    const recDir = path.join(fx.tmp, "home", ".pi-dispatch", "runs");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${TID(6)}.json`),
+      JSON.stringify({ run: TID(6), state: "done" }, null, 2),
+    );
+    const r = await fx.run();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("0 dead ticket(s) found");
+  }, 60_000);
+
+  test("run record state=killed (no out.md, no marker) -> NOT flagged dead", async () => {
+    const fx = wdFixture(7);
+    const recDir = path.join(fx.tmp, "home", ".pi-dispatch", "runs");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${TID(7)}.json`),
+      JSON.stringify({ run: TID(7), state: "killed" }, null, 2),
+    );
+    const r = await fx.run();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("0 dead ticket(s) found");
+  }, 60_000);
 });
 
 const TAIL = path.join(import.meta.dir, "pi-bg-tail");
@@ -1900,4 +1930,145 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
     expect(fs.existsSync(path.join(recDir, `pi-bg-${t}.json`))).toBe(true);
     expect(fs.existsSync(path.join(fx.art, `pi-bg-${t}-raw.out`))).toBe(true);
   }, 60_000);
+});
+
+describe("deploy-swap guard (2026-09-15): wrapper survives a script swap mid-run", () => {
+  // Ticket 20260915-011025-3740387 (and 266215): a jarate deploy (git pull
+  // in the checkout that ~/scripts/pi-bg symlinks into) replaced
+  // dispatch/pi-bg while a wrapper was parked in a long `wait`; bash
+  // re-opens the script by name on its next read -> stale offset in the
+  // new content -> syntax error at `done` (exit 2 = bash's own
+  // syntax-error code). The review was complete (commit + report on disk)
+  // but the wrapper never posted its callback and the watchdog re-flagged
+  // the ticket DEAD. Fix: each run execs a per-run HARD LINK to the
+  // startup inode (git replaces the checkout path; the link keeps the
+  // original file alive and the name stable for the whole run).
+  const collect1 = async (p: ReturnType<typeof spawn>) => {
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { code, out, err };
+  };
+
+  const launchViaLink = (
+    fx: { tmp: string; env: Record<string, string> },
+    extraEnv: Record<string, string> = {},
+  ) => {
+    const real = path.join(fx.tmp, "pi-bg-real");
+    fs.copyFileSync(PI_BG, real);
+    const link = path.join(fx.tmp, "bin", "pi-bg");
+    fs.symlinkSync(real, link);
+    const s = spawn(["bash", link, "worker", "deploy swap test"], {
+      env: { ...fx.env, ...extraEnv },
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return { real, s };
+  };
+
+  // git-style replacement with a 4-line mid-file insert (the bee0a333 cap
+  // fix shifted the live script the same way during the incident)
+  const swapScript = (real: string) => {
+    const src = fs.readFileSync(real, "utf8").split("\n");
+    src.splice(
+      Math.floor(src.length / 2),
+      0,
+      "# shifted 1",
+      "# shifted 2",
+      "# shifted 3",
+      "# shifted 4",
+    );
+    const tmpf = real + ".new";
+    fs.writeFileSync(tmpf, src.join("\n"));
+    fs.renameSync(tmpf, real);
+  };
+
+  const sleepPi = (fx: { tmp: string }, seconds: number) => {
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      `#!/bin/sh\nsleep ${seconds}\necho pi-run-ok\n`,
+    );
+  };
+
+  const kill1 = (s: ReturnType<typeof spawn>, tmp: string) => {
+    try {
+      s.kill("TERM");
+    } catch {
+      /* already dead */
+    }
+    try {
+      execSync(`pkill -f '^/bin/sh ${tmp}/bin/pi ' || true`, {
+        stdio: "ignore",
+      });
+    } catch {
+      /* nothing matched */
+    }
+  };
+
+  const scriptArg = (pid: number) => {
+    try {
+      return (
+        fs
+          .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+          .split("\0")
+          .filter(Boolean)[1] ?? ""
+      );
+    } catch {
+      return "";
+    }
+  };
+
+  test("wrapper runs from its per-run snapshot; swap + run still complete", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepPi(fx, 3);
+    const { real, s } = launchViaLink(fx);
+    try {
+      // the snap exec happens at startup; poll until argv shows it
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000) {
+        if (scriptArg(s.pid).includes("/snap-")) break;
+        await Bun.sleep(100);
+      }
+      expect(scriptArg(s.pid)).toMatch(/\/(snap-[^/]+\/pi-bg)$/);
+      // deploy: replace the checkout-side target while the wrapper is
+      // parked in its `wait` (pi stub sleeping)
+      await Bun.sleep(1000);
+      swapScript(real);
+      const r = await collect1(s);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("pi-run-ok");
+      expect(r.err).not.toMatch(/syntax error/);
+      // snapshot cleaned by the exit trap
+      expect(
+        fs
+          .readdirSync(`${fx.env.HOME}/.pi-bg-art`)
+          .filter((f) => f.startsWith("snap-")),
+      ).toHaveLength(0);
+    } finally {
+      kill1(s, fx.tmp);
+    }
+  }, 30_000);
+
+  test("PI_BG_NOSNAP=1: wrapper stays on the original path (mechanism off)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepPi(fx, 3);
+    const { s } = launchViaLink(fx, { PI_BG_NOSNAP: "1" });
+    try {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000 && scriptArg(s.pid) === "")
+        await Bun.sleep(100);
+      expect(scriptArg(s.pid)).not.toContain("/snap-");
+      expect(scriptArg(s.pid)).toContain("pi-bg");
+      const r = await collect1(s);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("pi-run-ok");
+    } finally {
+      kill1(s, fx.tmp);
+    }
+  }, 30_000);
 });

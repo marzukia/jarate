@@ -83,6 +83,11 @@
 
 set -uo pipefail
 
+# Original argv captured BEFORE any consumption (the profile shift and the
+# --worktree strip below mutate $@): the deploy-swap snapshot exec re-passes
+# the FULL original argument list to the snapshot process.
+PI_BG_ORIG_ARGS=("$@")
+
 # -h/--help: print this header
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   sed -n '2,/^set -uo pipefail$/{ /^set -uo pipefail$/d; p }' "$0" | sed 's/^# \{0,1\}//'
@@ -232,7 +237,10 @@ fi
 # $JB_ROOT/dispatch/profiles/<role>.json silently missed (fresh role got
 # auth+models but no settings.json -> pi fell back to its built-in
 # provider -> 402). Fallback keeps the old behavior if readlink fails.
-JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)"
+# JB_ROOT_SNAPPED: the per-run snapshot exec (deploy-swap guard below)
+# runs bash on a hard link outside the repo, so BASH_SOURCE there would
+# resolve the wrong root - the original process passes its own.
+JB_ROOT="${JB_ROOT_SNAPPED:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)}"
 
 # --- per-run switchboard session id (unique ledger entry per dispatch) ---
 # Unique per run: second-precision timestamp + this wrapper's own pid ($$).
@@ -243,7 +251,7 @@ JB_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || print
 # digits - $$ does (pid_max on these boxes is 4194304, 6-7 digits live).
 # The 3-group numeric shape is preserved: the ticket validators in
 # pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
-run_id="$(date -u +%Y%m%d-%H%M%S)-$$"
+run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
 export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 
 # --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
@@ -258,8 +266,40 @@ mkdir -p "$BG_TMP" 2>/dev/null
 # issue #56 belt: ticket id line BEFORE the slow `git worktree add` /
 # cgroup escape, so the launcher's `head -1 log` returns immediately and a
 # dead ticket leaves an identifiable first log line (pre-fix: >60s silence
-# on big repos, and a TERM'd startup printed nothing).
-echo "[pi-bg] ticket $run_id profile=$profile"
+# on big repos, and a TERM'd startup printed nothing). Printed once: the
+# snapshot re-exec (PI_BG_SNAP) skips it.
+if [ -z "${PI_BG_SNAP:-}" ]; then echo "[pi-bg] ticket $run_id profile=$profile"; fi
+
+# --- deploy-swap guard (2026-09-15, ticket 20260915-011025-3740387) -----
+# bash keeps reading this script from DISK for the whole run. A jarate
+# deploy (git pull in the checkout that ~/scripts/pi-bg symlinks into)
+# swaps dispatch/pi-bg while a long wrapper is parked in `wait` (a 15-min
+# review): the resumed read lands on a stale offset in the NEW content
+# and dies mid-run (bash syntax error, exit 2) - the review was complete
+# (report + PASS on disk) but the wrapper never posted its callback and
+# the watchdog re-flagged the ticket DEAD. Each run now execs a per-run
+# HARD LINK to the startup inode: git replaces the checkout path (new
+# inode) but this link keeps the original file alive for the whole run.
+# Basename stays "pi-bg" so the concurrency cap still counts us; the
+# snapshot is cleaned in the exit trap. Fails open (continue on $0) when
+# the link cannot be made.
+SNAP_DIR="${SNAP_DIR:-}"
+if [ -z "${PI_BG_SNAP:-}" ] && [ "${PI_BG_NOSNAP:-0}" != "1" ]; then
+  _snapdir="$BG_TMP/snap-$run_id"
+  if mkdir -p "$_snapdir" 2>/dev/null && \
+     ln "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" "$_snapdir/pi-bg" 2>/dev/null; then
+    SNAP_DIR="$_snapdir"
+    PI_BG_SNAP=1 PI_BG_RUN_ID="$run_id" JB_ROOT_SNAPPED="$JB_ROOT" SNAP_DIR="$_snapdir" exec bash "$_snapdir/pi-bg" "${PI_BG_ORIG_ARGS[@]+"${PI_BG_ORIG_ARGS[@]}"}"
+  fi
+  rm -rf "$_snapdir" 2>/dev/null || true
+fi
+# Snapshot process path (the original process exec'd away above): until the
+# full bg_on_exit trap registers below, a minimal trap keeps the per-run
+# snapshot from leaking on early exits (provider check, worktree fail).
+# bg_on_exit replaces this on registration and cleans the same dir.
+if [ -n "${SNAP_DIR:-}" ]; then
+  trap 'rm -rf "${SNAP_DIR}" 2>/dev/null' EXIT
+fi
 
 wt_path=""
 wt_branch=""
@@ -644,6 +684,9 @@ bg_on_exit() {
         "$BG_TMP/pi-bg-${run_id}-wb-resp.txt" 2>/dev/null || true
   rm -f "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
   rm -f "$hb_f" 2>/dev/null || true
+  # deploy-swap guard: drop the per-run script snapshot (a hard link to the
+  # startup inode; git already replaced the checkout path)
+  [ -n "${SNAP_DIR:-}" ] && rm -rf "$SNAP_DIR" 2>/dev/null || true
 }
 
 # --- heartbeat (issue #52): long workers emit no signal between dispatch
