@@ -22,6 +22,12 @@
 #     callback was posted, an EXIT/TERM/INT trap posts a 'DIED (no report)'
 #     callback so a killed worker still wakes the orchestrator
 #     (SIGKILL cannot be trapped - see DISPATCH.md recommendations)
+#   - SILENT death (issue #57): exit 1, no output, death <15 min after the
+#     last activity (mid-LLM-call idle timeout) -> the SAME ticket is
+#     relaunched ONCE; a <ticket>.retry1 marker is written before the
+#     relaunch so a second silent death reports a normal FAIL instead of
+#     looping. Leftover SILENT tickets are classified distinctly from
+#     generic DEAD by the pi-bg-watchdog sweep.
 #   - dead letter: final post failure writes $PI_BG_TMPDIR/pi-bg-<id>-webhook-failed
 #     (PI_BG_TMPDIR default ~/.pi-bg-art; honored by pi-bg-tail/-kill/-watchdog//jobs)
 # Fresh machine (issue #29): a missing/empty role profile is seeded from the
@@ -31,7 +37,10 @@
 # No webhook (issue #30): loud warning at dispatch + a run record in
 #   ~/.pi-dispatch/runs/pi-bg-<id>.json marked "delivery":"none".
 # Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live pi-bg
-#   runs per user (default 3; 0 = unlimited, operator escape hatch). The
+#   runs per user (0 = unlimited, operator escape hatch). Fleet default is
+#   3; a per-box override file ~/.config/pi-dispatch/max-concurrent (one
+#   integer) applies when the env var is unset (RCA #57 fix 2: monky's box
+#   pins 2 - shared vLLM queue load). The
 #   fleet shares one vLLM endpoint; unbounded fan-out starved the prefix
 #   cache (2026-09-10 incident). The check runs BEFORE the agent's exec:
 #   count = this uid's live processes whose args contain "pi-bg worker" or
@@ -129,7 +138,13 @@ set -- "${args[@]+"${args[@]}"}"
 #     Runs before the worktree add, cgroup escape and run record so a
 #     refused dispatch leaves no side effects. Fails open if /proc is
 #     unreadable (a cap check must never block dispatch).
-max_c="${PI_BG_MAX_CONCURRENT:-3}"
+# Per-box cap file (RCA #57 fix 2): when PI_BG_MAX_CONCURRENT is unset,
+# ~/.config/pi-dispatch/max-concurrent (one integer) overrides the fleet
+# default of 3. The env var still wins for per-dispatch overrides.
+max_c="${PI_BG_MAX_CONCURRENT:-}"
+if [ -z "$max_c" ] && [ -f "${HOME}/.config/pi-dispatch/max-concurrent" ]; then
+  max_c="$(tr -d '[:space:]' < "${HOME}/.config/pi-dispatch/max-concurrent" 2>/dev/null)"
+fi
 case "$max_c" in
   '' | *[!0-9]*)
     echo "[!] PI_BG_MAX_CONCURRENT='$max_c' is not a non-negative integer, using 3" >&2
@@ -383,6 +398,25 @@ if ! profile_seeded "$PI_CODING_AGENT_DIR"; then
   exit 4
 fi
 
+# --- LLM HTTP idle timeout (RCA #57 fix 1): under shared vLLM queue load
+# the model stream can go byte-quiet for 10+ min; pi's default 300s HTTP
+# idle watchdog then kills the run (exit 1, no output = "silent death").
+# Ensure the profile runs with 900s. Add-key only: an operator-set value
+# (or an unparseable file) is never overwritten.
+PI_BG_IDLE_MS="${PI_BG_IDLE_MS:-900000}" python3 - "$PI_CODING_AGENT_DIR/settings.json" <<'PY' 2>/dev/null || true
+import json, os, sys
+p = sys.argv[1]
+try:
+    cfg = json.load(open(p))
+except Exception:
+    sys.exit(0)
+if isinstance(cfg, dict) and "httpIdleTimeoutMs" not in cfg:
+    cfg["httpIdleTimeoutMs"] = int(os.environ.get("PI_BG_IDLE_MS", "900000"))
+    with open(p, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+PY
+
 # --- secret censor for callback text (jarate/bin/jarate-censor, bun) ---
 # The callback body (task + worker output) is Discord egress from a process
 # outside the bridge, so it routes through the same censor + registry.
@@ -405,6 +439,8 @@ BG_WB_STATUS="$BG_TMP/pi-bg-${run_id}-wb-status"
 # uses it to say "started, callback lost" instead of "no callback on record".
 # Removed in bg_on_exit. A ticket that SIGKILLs keeps it (that is the point).
 touch "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
+# run start epoch: bounds the silent-death session mtime scan (issue #57)
+run_start_epoch=$(date +%s)
 
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
@@ -524,6 +560,10 @@ PY
 # can't run this at all — pi-bg-kill reaps the drained cgroup dir itself.
 bg_on_exit() {
   local ec=$?
+  # exit-code artifact for the watchdog's SILENT classification (issue
+  # #57): the trap runs on every trapped exit (normal/INT/TERM/error);
+  # a SIGKILLed wrapper leaves no rc file (watchdog then says DEAD).
+  printf '%s\n' "$ec" > "$BG_TMP/pi-bg-${run_id}-rc" 2>/dev/null || true
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
      [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
@@ -572,10 +612,61 @@ trap 'exit 143' TERM
 pi_pid=""
 rawf="$BG_TMP/pi-bg-${run_id}-raw.out"
 errf="$BG_TMP/pi-bg-${run_id}-err.log"
+retry1f="$BG_TMP/pi-bg-${run_id}-retry1"
+# SILENT tail bound (issue #57): a silent death (exit 1, no output) counts
+# as the #57 idle-timeout signature only if it came within 15 min of the
+# last activity (raw.out mtime / this run's session file mtime / attempt
+# start). A long-quiet run that dies with no output stays a generic DIED.
+SILENT_TAIL_MAX="${PI_BG_SILENT_TAIL_MAX:-900}"
+att_start=0
+silent_retried=0
+
+# bg_silent_tail: seconds since the newest activity of this run (raw.out
+# mtime, the profile session file for this run's cwd written after run
+# start, or the attempt start). No session file (test stubs, --no-session)
+# -> the attempt start bounds the tail.
+bg_silent_tail() {
+  local now last sm slug sd sf
+  now="$(date +%s)"
+  last="$att_start"
+  sm="$(stat -c %Y "$rawf" 2>/dev/null)" && [ -n "$sm" ] && [ "$sm" -gt "$last" ] && last="$sm"
+  if [ "$wt_mode" -eq 1 ]; then slug="$wt_path"; else slug="$PWD"; fi
+  slug="--${slug#/}"; slug="${slug//\//-}--"
+  sd="$PI_CODING_AGENT_DIR/sessions/$slug"
+  sf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "@$run_start_epoch" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  if [ -n "$sf" ]; then
+    sm="$(stat -c %Y "$sf" 2>/dev/null)" && [ -n "$sm" ] && [ "$sm" -gt "$last" ] && last="$sm"
+  fi
+  echo $(( now - last ))
+}
+
+# bg_log_retry: append a retry entry to this run's record (issue #57): the
+# durable "why did this ticket relaunch" trail. Never fails the run.
+bg_log_retry() {
+  [ -f "$rec_dir/pi-bg-${run_id}.json" ] || return 0
+  PI_BG_REC_FILE="$rec_dir/pi-bg-${run_id}.json" \
+  PI_BG_REC_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  PI_BG_REC_REASON="$1" python3 - <<'PY' 2>/dev/null || true
+import json, os
+f = os.environ["PI_BG_REC_FILE"]
+try:
+    rec = json.load(open(f))
+except Exception:
+    rec = {}
+if not isinstance(rec, dict):
+    rec = {}
+rec.setdefault("retries", []).append(
+    {"at": os.environ["PI_BG_REC_AT"], "reason": os.environ["PI_BG_REC_REASON"]})
+with open(f, "w") as fh:
+    json.dump(rec, fh, indent=2)
+PY
+}
+
 # standard constraints: append to the final (task) argument of every run
 pi_args=( "$@" )
 pi_args[-1]+=$'\n\nSTANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Bound long commands with `timeout` (default 600s) unless the task says otherwise.'
 for attempt in 1 2 3; do
+  att_start="$(date +%s)"
   if [ "$wt_mode" -eq 1 ]; then
     ( cd "$wt_path" && exec pi -p --no-extensions "${pi_args[@]}" ) > "$rawf" 2> "$errf" &
   else
@@ -584,7 +675,32 @@ for attempt in 1 2 3; do
   pi_pid=$!
   wait "$pi_pid"; rc=$?; pi_pid=""
   out="$(cat "$rawf")"
-  [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] && break
+  # Check if output is non-empty (after stripping whitespace)
+  if [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    # output produced: a pending retry1 is consumed (the retry recovered)
+    rm -f "$retry1f" 2>/dev/null || true
+    break
+  fi
+  # --- empty output: classify before deciding whether to relaunch ---
+  silent=0
+  if [ "$rc" -eq 1 ]; then
+    tail="$(bg_silent_tail)"
+    [ "$tail" -lt "$SILENT_TAIL_MAX" ] && silent=1
+  fi
+  if [ "$silent" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
+    # second silent death: stop; the main flow reports a normal FAIL
+    echo "[pi-bg] second silent death (rc=1, no output) - reporting FAIL, no further retry" >&2
+    break
+  fi
+  if [ "$silent" -eq 1 ]; then
+    touch "$retry1f" 2>/dev/null || true
+    echo "[pi-bg] SILENT death (rc=1, no output, quiet ${tail}s < ${SILENT_TAIL_MAX}s) - relaunching ticket once (retry1)" >&2
+    bg_log_retry "silent"
+    silent_retried=1
+    sleep 3
+    continue
+  fi
+  # Local models occasionally return empty completion (rc=0 with empty stream)
   echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
   sleep 3
 done
@@ -601,16 +717,24 @@ if command -v webdrop >/dev/null 2>&1; then
 fi
 
 if [ -n "$webhook" ]; then
+  brief="${out:0:400}"
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-    # empty output: rc!=0 means pi died (killed/crashed), rc==0 is the
-    # local-model empty-completion quirk (retried 3x already)
-    [ $rc -ne 0 ] && status="DIED" || status="EMPTY"
+    if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
+      # second silent death (issue #57): the retry1 did not recover;
+      # report a normal FAIL (the orchestrator decides the fix round)
+      status="FAIL"
+      brief="silent death x2 (rc=1, no output; retry1 did not recover - issue #57)"
+    else
+      # empty output: rc!=0 means pi died (killed/crashed), rc==0 is the
+      # local-model empty-completion quirk (retried 3x already)
+      [ $rc -ne 0 ] && status="DIED" || status="EMPTY"
+    fi
   else
     status="OK"; [ $rc -ne 0 ] && status="FAIL"
   fi
   # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
   verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
-  bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "$status" "${out:0:400}" "$rc" "$verdict"
+  bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "$status" "$brief" "$rc" "$verdict"
   if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json"
   else

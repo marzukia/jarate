@@ -55,6 +55,10 @@ function fixture() {
   env.PI_DISPATCH_RECORD_DIR = path.join(tmp, "records");
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_SERVICE;
+  // running inside a pi-bg ticket (the #56 tests run there all the time
+  // when a worker dispatches the suite) leaks PI_BG_SETSID=1 and would
+  // skip the setsid re-exec under test - hermeticize
+  delete env.PI_BG_SETSID;
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
   // cap off by default: ambient fleet traffic (real pi-bg runs of this
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
@@ -1128,4 +1132,326 @@ describe("#56: session isolation (setsid at launch)", () => {
       execSync(`pkill -f "${fx.tmp}/bin/[p]i" 2>/dev/null || true`);
     }
   }, 40_000);
+});
+
+/**
+ * #57: silent deaths (RCA: pi's LLM HTTP idle timeout kills the run
+ * mid-API-call under shared vLLM load -> exit 1, zero output). The wrapper
+ * now relaunches the SAME ticket ONCE on that signature (marker gates it,
+ * retry logged in the run record); a second silent death reports a normal
+ * FAIL. RCA config fixes: httpIdleTimeoutMs 900000 in the role profile
+ * (template + add-key doctor) and the per-box ~/.config/pi-dispatch/
+ * max-concurrent cap file.
+ */
+describe("#57: silent-death retry + RCA config fixes", () => {
+  const capture = () => {
+    const posts: Array<{ embeds: any[] }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      posts,
+      close: () => server.stop(true),
+    };
+  };
+
+  const waitFor = async (fn: () => boolean, ms = 15_000): Promise<boolean> => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (fn()) return true;
+      await Bun.sleep(100);
+    }
+    return fn();
+  };
+
+  // Mirror of the script's cap count (see #41 tests): this uid's live
+  // "pi-bg worker|reviewer" wrappers, fork-phantoms excluded.
+  const countLivePiBg = (): number => {
+    const out = execSync(`ps -U ${process.getuid()} -o pid=,ppid=,args=`, {
+      encoding: "utf8",
+    });
+    let n = 0;
+    for (const line of out.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (pid === process.pid) continue;
+      let argv: string[];
+      try {
+        argv = fs
+          .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+          .split("\0")
+          .filter(Boolean);
+      } catch {
+        continue;
+      }
+      let match = false;
+      for (let i = 0; i < argv.length; i++) {
+        if (
+          argv[i].split("/").pop() === "pi-bg" &&
+          i + 1 < argv.length &&
+          (argv[i + 1] === "worker" || argv[i + 1] === "reviewer")
+        ) {
+          match = true;
+          break;
+        }
+      }
+      if (!match) continue;
+      let identical = false;
+      try {
+        const p = fs
+          .readFileSync(`/proc/${m[2]}/cmdline`, "utf8")
+          .split("\0")
+          .filter(Boolean)
+          .join(" ");
+        identical = argv.join(" ") === p;
+      } catch {
+        identical = false;
+      }
+      if (!identical) n++;
+    }
+    return n;
+  };
+
+  // fake pi: silent (rc=1, no output) for the first `die` launches, then
+  // produces output. The state file doubles as a launch counter.
+  const silentStubPi = (
+    fx: { tmp: string },
+    die: number,
+    okOut = "silent-retry-ok",
+  ) => {
+    const state = path.join(fx.tmp, "pi-silent-state");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\nif [ "$n" -le "${die}" ]; then sleep 1; exit 1; fi\necho ${okOut}\n`,
+    );
+    fs.chmodSync(piBin, 0o755);
+    return state;
+  };
+
+  const artDir = (fx: { home: string }) => path.join(fx.home, ".pi-bg-art");
+
+  test("silent death once, then success -> OK callback, marker consumed, retry logged", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = silentStubPi(fx, 1);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "silent once task"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("silent-retry-ok");
+      // exactly two launches (original + one retry)
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("2");
+      const runId = fx.records()[0].run;
+      // retry1 marker written before the relaunch, consumed on recovery
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-retry1`)),
+      ).toBe(false);
+      // rc artifact records the final (healthy) exit
+      expect(
+        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+      ).toBe("0");
+      // the retry is logged in the run record
+      const rec = fx.records()[0];
+      expect(rec.retries).toHaveLength(1);
+      expect(rec.retries[0].reason).toBe("silent");
+      // one OK callback, no DIED
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "result").value,
+      ).toContain("silent-retry-ok");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("silent death twice -> normal FAIL after retry1, no third launch, marker kept", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = silentStubPi(fx, Number.MAX_SAFE_INTEGER);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "silent twice task"]);
+      expect(r.code).toBe(1); // pi's rc propagates; the status is in the embed
+      // exactly two launches - the marker gates a third
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("2");
+      const runId = fx.records()[0].run;
+      // marker kept (unconsumed): the watchdog's SILENT signature
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-retry1`)),
+      ).toBe(true);
+      expect(
+        fs.readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8").trim(),
+      ).toBe("1");
+      const rec = fx.records()[0];
+      expect(rec.retries).toHaveLength(1);
+      // one normal FAIL callback (not DIED), silent-x2 brief
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · FAIL \(rc=1\) · \d+m\d{2}s$/);
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "result").value,
+      ).toContain("silent death x2");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("loud exit 1 (has output) -> immediate FAIL, no retry, no marker", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = path.join(fx.tmp, "pi-loud-state");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\necho "error: boom"\nexit 1\n`,
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "loud task"]);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("error: boom");
+      // one launch only - output present is not the #57 signature
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("1");
+      const runId = fx.records()[0].run;
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-retry1`)),
+      ).toBe(false);
+      expect(fx.records()[0].retries ?? []).toHaveLength(0);
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · FAIL \(rc=1\) · \d+m\d{2}s$/);
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "result").value,
+      ).toContain("error: boom");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 30_000);
+
+  test("RCA fix 1: profile settings carry httpIdleTimeoutMs 900000 (fresh seed + add-key merge; operator value kept)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // fresh seed: the repo template now carries the knob
+    const r1 = await fx.run(["worker", "idle 1"]);
+    expect(r1.code).toBe(0);
+    const ws = path.join(fx.home, ".pi", "agent-worker", "settings.json");
+    let cfg = JSON.parse(fs.readFileSync(ws, "utf8"));
+    expect(cfg.httpIdleTimeoutMs).toBe(900000);
+    expect(cfg.defaultProvider).toBe("hydrogen"); // main merge intact
+    // operator-set value: the doctor is add-key only, never overwrites
+    cfg.httpIdleTimeoutMs = 123456;
+    fs.writeFileSync(ws, JSON.stringify(cfg));
+    const r2 = await fx.run(["worker", "idle 2"]);
+    expect(r2.code).toBe(0);
+    cfg = JSON.parse(fs.readFileSync(ws, "utf8"));
+    expect(cfg.httpIdleTimeoutMs).toBe(123456);
+    // pre-upgrade profile (existing settings WITHOUT the key): doctor adds it
+    const rp = path.join(fx.home, ".pi", "agent-reviewer");
+    fs.mkdirSync(rp, { recursive: true });
+    fs.writeFileSync(
+      path.join(rp, "auth.json"),
+      JSON.stringify({ hydrogen: { type: "api_key", key: "sk-test" } }),
+    );
+    fs.writeFileSync(
+      path.join(rp, "models.json"),
+      JSON.stringify({ hydrogen: { models: [{ id: "qwen-test" }] } }),
+    );
+    fs.writeFileSync(
+      path.join(rp, "settings.json"),
+      JSON.stringify({
+        defaultProvider: "hydrogen",
+        defaultModel: "qwen-test",
+        defaultThinkingLevel: "xhigh",
+      }),
+    );
+    const r3 = await fx.run(["reviewer", "idle 3"]);
+    expect(r3.code).toBe(0);
+    cfg = JSON.parse(fs.readFileSync(path.join(rp, "settings.json"), "utf8"));
+    expect(cfg.httpIdleTimeoutMs).toBe(900000);
+    expect(cfg.defaultThinkingLevel).toBe("xhigh"); // untouched
+  }, 30_000);
+
+  test("RCA fix 2: per-box max-concurrent file applies when env var unset (env var still wins)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(piBin, "#!/bin/sh\nsleep 30\necho pi-run-ok\n");
+    fs.chmodSync(piBin, 0o755);
+    const capFile = path.join(
+      fx.home,
+      ".config",
+      "pi-dispatch",
+      "max-concurrent",
+    );
+    fs.mkdirSync(path.dirname(capFile), { recursive: true });
+    const envNoVar = { ...fx.env };
+    delete envNoVar.PI_BG_MAX_CONCURRENT;
+    const base = countLivePiBg();
+    fs.writeFileSync(capFile, `${base + 1}\n`);
+    const a = spawn(["bash", PI_BG, "worker", "capfile a"], {
+      env: envNoVar,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const c = (p: ReturnType<typeof spawn>) =>
+      Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]).then(async ([out, err]) => ({ code: await p.exited, out, err }));
+    try {
+      expect(await waitFor(() => countLivePiBg() - base >= 1)).toBe(true);
+      // b hits the file cap: refused with exit 5
+      const b = spawn(["bash", PI_BG, "worker", "capfile b"], {
+        env: envNoVar,
+        cwd: fx.tmp,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const rb = await c(b);
+      expect(rb.code).toBe(5);
+      expect(rb.err).toMatch(/\[!\] at cap \(\d+\/\d+\)/);
+      // env var still wins: unlimited starts fine while a is in flight
+      const d = spawn(["bash", PI_BG, "worker", "capfile d"], {
+        env: { ...envNoVar, PI_BG_MAX_CONCURRENT: "0" },
+        cwd: fx.tmp,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await Bun.sleep(500); // let d clear the cap check into its sleep
+      d.kill("SIGTERM");
+      const rd = await c(d);
+      expect(rd.err).not.toContain("at cap");
+      expect(rd.code).toBe(143);
+    } finally {
+      a.kill("SIGTERM");
+      await Bun.sleep(200);
+      execSync(`pkill -f "${fx.tmp}/bin/[p]i" 2>/dev/null || true`, {
+        stdio: "ignore",
+      });
+    }
+  }, 30_000);
 });

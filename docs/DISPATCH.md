@@ -60,6 +60,13 @@ refuses at the cap with
 `PI_BG_MAX_CONCURRENT` sets the cap (default 3; 0 = unlimited, operator
 escape hatch). The ps count above stays the manual cross-check.
 
+Per-box override (RCA #57 fix 2, 2026-09-14): when `PI_BG_MAX_CONCURRENT`
+is unset, `pi-bg` reads `~/.config/pi-dispatch/max-concurrent` (one integer,
+created per box) before falling back to the fleet default of 3. monky's box
+pins `2` — the fleet shares one vLLM endpoint and 3 concurrent dispatches
+starved the model stream (issue #57). The env var still wins for per-dispatch
+overrides, so `PI_BG_MAX_CONCURRENT=0` remains the unlimited escape hatch.
+
 ## The flow (default: fire-and-forget)
 
 Dispatch, confirm, end the turn. The callback wakes the orchestrator as a new
@@ -107,6 +114,13 @@ pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] "task"
   is always the final arg).
 - Non-interactive: runs `pi -p --no-extensions`.
 - Empty completion (local-model quirk) → up to 3 attempts, 3s apart.
+- **SILENT death (issue #57):** exit 1, no output, and the death came <15 min
+  after the last activity (pi's LLM HTTP idle watchdog killed the run
+  mid-API-call under shared vLLM load) → the SAME ticket is relaunched ONCE.
+  A `<ticket>.retry1` marker is written before the relaunch so a second
+  silent death reports a normal `FAIL` (no third launch); the retry is
+  logged in the run record. A loud exit 1 (output present) is NOT the
+  #57 signature and fails immediately with no retry.
 - Exit code = pi's exit code.
 
 ### Cgroup escape (automatic, persistent)
@@ -185,6 +199,9 @@ On completion, `pi-bg` posts to the Discord webhook:
 - **Status values:** `OK` (rc=0), `FAIL (rc=N)`, `EMPTY` (all attempts
   whitespace). For reviewers, a trailing `VERDICT: PASS|FAIL` in the output
   (last 300 chars) is the real signal and drives the green/red title.
+  A second silent death (issue #57, retry1 did not recover) is reported as
+  a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
+  treats it like any other FAIL (one fix round, then a decision).
 - **Legacy plain-text fallback:** if the embed builder fails, a
   `[bg:<profile>:<status>] cwd=... task=...` content post is sent instead.
 - Inbound exemption: piscord's `isBgWebhook` exempts its own callbacks
@@ -203,6 +220,11 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 
 - `pi-bg-<id>-raw.out` — live output (tee'd from the first attempt on)
 - `pi-bg-<id>-out.md` — final output (non-empty = run completed)
+- `pi-bg-<id>-rc` — final exit code (written by the EXIT trap; the
+  watchdog's SILENT classification reads it)
+- `pi-bg-<id>-retry1` — silent-death relaunch marker (issue #57): written
+  before the one retry, removed when the retry produced output, kept when a
+  second silent death follows (the watchdog then reports SILENT, not DEAD)
 - `pi-bg-<id>-wb-status` — success-path webhook HTTP code + time
   (recorded at post time; the response body stays in `pi-bg-<id>-wb-resp.txt`)
 - `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail

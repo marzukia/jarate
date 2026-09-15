@@ -1,5 +1,6 @@
 {
   "defaultThinkingLevel": "medium",
   "reserveTokens": 13107,
-  "keepRecentTokens": 20000
+  "keepRecentTokens": 20000,
+  "httpIdleTimeoutMs": 900000
 }
