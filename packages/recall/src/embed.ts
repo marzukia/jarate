@@ -1,8 +1,12 @@
 // Embeddings over the OpenAI-compatible /v1/embeddings endpoint (Ollama).
-// Port of embed_batched()/embed() from the Python pgrag: batch of 64,
-// results re-sorted by `index` so they line up with the input order.
-
-const EMBED_BATCH = 64;
+// Port of embed_batched()/embed() from the Python pgrag: results re-sorted
+// by `index` so they line up with the input order.
+// Batch: 64 took 163s on hydrogen's CPU Ollama (120s timeout, 2026-09-15);
+// 32 fits with margin. Override with JB_RECALL_EMBED_BATCH for fast GPUs.
+const EMBED_BATCH = Math.max(
+  1,
+  Number(process.env.JB_RECALL_EMBED_BATCH ?? 32) || 32,
+);
 
 export interface EmbedOpts {
   url: string;
