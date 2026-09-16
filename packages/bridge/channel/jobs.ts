@@ -297,6 +297,9 @@ export function stateLabel(state: JobState): string {
       return "killed";
     case "lost":
       return "lost";
+    default:
+      // pass unknown states through (never render "undefined")
+      return state;
   }
 }
 
