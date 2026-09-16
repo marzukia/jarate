@@ -25,6 +25,10 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
     message ends. If text must follow the fence, use a SINGLE newline
     (a blank line renders as a visible gap in Discord).
 2.6 State glyphs: `┣` active, `├` pending/done, `┤` cancelled.
+2.7 Every /command reply ships in a code fence - success, error, and usage
+    paths alike (Andryo 2026-09-16). The 40-col budget applies inside the
+    fence too: plain-fence output wraps (wrapFenceLines); keep lines short
+    so wraps do not split ids or URLs.
 
 ## 3 Plain text
 3.1 No emoji. ASCII state tags instead: `[ok] [!] [new] [queued] [-]`.

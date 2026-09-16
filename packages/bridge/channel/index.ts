@@ -3601,7 +3601,7 @@ async function runChannelCommand(
       return { immediate: fence(`[ok] hold off - ${depth} in line, will run`) };
     }
     case "help":
-      return { immediate: HELP_TEXT };
+      return { immediate: fence(HELP_TEXT) };
     case "btw": {
       const question = (arg || "").trim();
       if (!question) return { immediate: fence("[!] usage: /btw <question>") };
@@ -3702,9 +3702,9 @@ async function runChannelCommand(
       // [!] line, no stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
-        // Error paths return a bare [!] line (no fence), success returns
-        // the framed block (fenced here, per the style guide).
-        return { immediate: text.startsWith("[!]") ? text : fence(text) };
+        // Every command reply ships in a code block (Andryo 2026-09-16),
+        // error paths included.
+        return { immediate: fence(text) };
       } catch {
         return { immediate: "[!] context stats unavailable" };
       }
@@ -3905,7 +3905,7 @@ async function runChannelCommand(
         return { immediate: await jobsTail(id, n) };
       }
       // Informational, open to all channel members (private channel).
-      return { immediate: jobsView(sub === "json" ? "json" : "text") };
+      return { immediate: fence(jobsView(sub === "json" ? "json" : "text")) };
     }
     case "new-worktree": {
       // #12: create the interactive session's worktree (owner-only).
@@ -3971,9 +3971,9 @@ async function runChannelCommand(
         if (!id) return { immediate: fence("[!] usage: /sleep cancel <id>") };
         const ok = cancelWake(id);
         return {
-          immediate: ok
-            ? `[ok] cancelled wake ${id}`
-            : `[!] no wake with id ${id}`,
+          immediate: fence(
+            ok ? `[ok] cancelled wake ${id}` : `[!] no wake with id ${id}`,
+          ),
         };
       }
       return { immediate: fence("[!] usage: /sleep [list | cancel <id>]") };
@@ -4006,9 +4006,9 @@ async function runChannelCommand(
         if (!id) return { immediate: fence("[!] usage: /tasks cancel <id>") };
         const ok = cancelTask(id);
         return {
-          immediate: ok
-            ? `[ok] cancelled task ${id}`
-            : `[!] no task with id ${id}`,
+          immediate: fence(
+            ok ? `[ok] cancelled task ${id}` : `[!] no task with id ${id}`,
+          ),
         };
       }
       if (sub === "add") {
@@ -4030,7 +4030,9 @@ async function runChannelCommand(
           };
         const res = parseTaskSpec({ prompt, ...spec });
         if (!res.spec || res.error)
-          return { immediate: `[!] ${res.error ?? "invalid task spec"}` };
+          return {
+            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
+          };
         const task = scheduleTask({
           channelId: ch.id,
           channelName: ch.name,
@@ -4038,10 +4040,11 @@ async function runChannelCommand(
           spec: res.spec,
         });
         return {
-          immediate:
+          immediate: fence(
             `[ok] task ${task.id} scheduled: ${taskWhenLabel(task)}, next fire ` +
-            `${new Date(task.nextFireAt).toISOString()} — ` +
-            `cancel with /tasks cancel ${task.id}`,
+              `${new Date(task.nextFireAt).toISOString()}, ` +
+              `cancel with /tasks cancel ${task.id}`,
+          ),
         };
       }
       if (sub === "reschedule") {
@@ -4056,7 +4059,7 @@ async function runChannelCommand(
           };
         // validate the id against THIS session's tasks before touching the spec
         const t = loadTasks().find((x) => x.id === id && x.channelId === ch.id);
-        if (!t) return { immediate: `[!] no task with id ${id}` };
+        if (!t) return { immediate: fence(`[!] no task with id ${id}`) };
         const spec = specStringParams(parts.slice(1).join(" "));
         if (!spec)
           return {
@@ -4066,14 +4069,17 @@ async function runChannelCommand(
           };
         const res = parseTaskSpec({ prompt: t.prompt, ...spec });
         if (!res.spec || res.error)
-          return { immediate: `[!] ${res.error ?? "invalid task spec"}` };
+          return {
+            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
+          };
         const r = rescheduleTask(id, res.spec, ch.id);
         if (!r.task || r.error)
-          return { immediate: `[!] ${r.error ?? "reschedule failed"}` };
+          return { immediate: fence(`[!] ${r.error ?? "reschedule failed"}`) };
         return {
-          immediate:
+          immediate: fence(
             `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(r.task)}, ` +
-            `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
+              `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
+          ),
         };
       }
       return {
@@ -4160,9 +4166,11 @@ async function runChannelCommand(
       if (!found) return { immediate: fence(`[!] model not found: ${req}`) };
       const ok = await pi.setModel(found);
       return {
-        immediate: ok
-          ? `[ok] model ${found.provider}/${found.id}`
-          : `[!] no auth configured for ${found.provider}/${found.id}`,
+        immediate: fence(
+          ok
+            ? `[ok] model ${found.provider}/${found.id}`
+            : `[!] no auth configured for ${found.provider}/${found.id}`,
+        ),
       };
     }
     default:

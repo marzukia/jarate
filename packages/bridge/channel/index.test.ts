@@ -5185,13 +5185,13 @@ describe("sleep (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound(`/sleep cancel ${w.id}`, "m1"), ctx);
-    expect(replyContent()).toBe(`[ok] cancelled wake ${w.id}`);
+    expect(replyContent()).toBe(fence(`[ok] cancelled wake ${w.id}`));
     expect(loadWakes(tmp)).toHaveLength(0);
   });
 
   test("/sleep cancel: unknown id, missing id, bogus subcommand", async () => {
     await handleInbound(pi, inbound("/sleep cancel nope", "m1"), ctx);
-    expect(replyContent()).toBe("[!] no wake with id nope");
+    expect(replyContent()).toBe(fence("[!] no wake with id nope"));
     await handleInbound(pi, inbound("/sleep cancel", "m2"), ctx);
     expect(replyContent()).toBe(fence("[!] usage: /sleep cancel <id>"));
     await handleInbound(pi, inbound("/sleep xyz", "m3"), ctx);
@@ -5493,6 +5493,26 @@ describe("tasks (integration)", () => {
     expect(replyContent()).toBe(fence("[tasks] no scheduled tasks"));
   });
 
+  test("fence rule: every command reply ships in a code block (Andryo 2026-09-16)", async () => {
+    const cmds = [
+      "/help",
+      "/jobs",
+      "/todos",
+      "/tasks",
+      "/tasks add",
+      "/tasks reschedule",
+      "/tasks cancel",
+      "/sleep",
+      "/sleep cancel",
+      "/model",
+    ];
+    for (let i = 0; i < cmds.length; i++) {
+      await handleInbound(pi, inbound(cmds[i], `m${i}`), ctx);
+      const c = replyContent();
+      expect(c.startsWith("```"), `${cmds[i]} -> ${c.slice(0, 50)}`).toBe(true);
+    }
+  });
+
   test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {
     const one = scheduleTask({
       channelId: "ch1",
@@ -5540,13 +5560,13 @@ describe("tasks (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound(`/tasks cancel ${t.id}`, "m1"), ctx);
-    expect(replyContent()).toBe(`[ok] cancelled task ${t.id}`);
+    expect(replyContent()).toBe(fence(`[ok] cancelled task ${t.id}`));
     expect(loadTasks(tmp)).toHaveLength(0);
   });
 
   test("/tasks cancel: unknown id, missing id, bogus subcommand", async () => {
     await handleInbound(pi, inbound("/tasks cancel nope", "m1"), ctx);
-    expect(replyContent()).toBe("[!] no task with id nope");
+    expect(replyContent()).toBe(fence("[!] no task with id nope"));
     await handleInbound(pi, inbound("/tasks cancel", "m2"), ctx);
     expect(replyContent()).toBe(fence("[!] usage: /tasks cancel <id>"));
     await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
@@ -5674,14 +5694,14 @@ describe("tasks (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound("/tasks reschedule nope 30", "m1"), ctx);
-    expect(replyContent()).toBe("[!] no task with id nope");
+    expect(replyContent()).toBe(fence("[!] no task with id nope"));
     // same id shape on another channel is not THIS session's task
     await handleInbound(
       pi,
       inbound(`/tasks reschedule ${other.id} 30`, "m2"),
       ctx,
     );
-    expect(replyContent()).toBe(`[!] no task with id ${other.id}`);
+    expect(replyContent()).toBe(fence(`[!] no task with id ${other.id}`));
     // untouched
     expect(
       loadTasks(tmp).find((x) => x.id === t.id)!.nextFireAt,
@@ -5725,18 +5745,22 @@ describe("tasks (integration)", () => {
     expect(replyContent()).toBe(resUsage); // missing spec
     // content errors -> one [!] line (from parseTaskSpec / rescheduleTask)
     await handleInbound(pi, inbound('/tasks add "" 30', "m7"), ctx);
-    expect(replyContent()).toBe("[!] prompt is required");
+    expect(replyContent()).toBe(fence("[!] prompt is required"));
     await handleInbound(pi, inbound('/tasks add "x" 0', "m8"), ctx);
-    expect(replyContent()).toBe("[!] minutes must be greater than 0");
+    expect(replyContent()).toBe(fence("[!] minutes must be greater than 0"));
     await handleInbound(pi, inbound('/tasks add "x" 99999', "m9"), ctx);
-    expect(replyContent()).toBe("[!] minutes too large (max 43200 = 30d)");
+    expect(replyContent()).toBe(
+      fence("[!] minutes too large (max 43200 = 30d)"),
+    );
     await handleInbound(pi, inbound('/tasks add "x" yesterday', "m10"), ctx);
     expect(replyContent()).toBe(
-      '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
+      fence(
+        '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
+      ),
     );
     await handleInbound(pi, inbound('/tasks add "x" 99 * * * *', "m11"), ctx);
     expect(replyContent()).toBe(
-      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
+      fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
     );
     await handleInbound(
       pi,
@@ -5744,7 +5768,9 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(replyContent()).toBe(
-      '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
+      fence(
+        '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
+      ),
     );
     await handleInbound(
       pi,
@@ -5752,7 +5778,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(replyContent()).toBe(
-      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
+      fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
     );
     // seed untouched, nothing scheduled on any path above
     expect(loadTasks(tmp).map((x) => x.id)).toEqual([t.id]);
