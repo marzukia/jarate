@@ -1,0 +1,31 @@
+# pi.service — systemd user unit template (FTUE, audit-ftue.md section 2).
+#
+# Install with `jarate setup` (substitutes __AGENT_NAME__), or manually:
+#   sed "s#__AGENT_NAME__#$(id -un)#" deploy/pi.service \
+#     > ~/.config/systemd/user/pi.service
+#   systemctl --user daemon-reload
+#
+# %h = the unit user's home, expanded by systemd — no hardcoded /home/*.
+# __AGENT_NAME__ = placeholder, display name only (journal Description).
+
+[Unit]
+Description=pi coding agent (__AGENT_NAME__) with Discord channel bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=HOME=%h
+Environment=NODE_OPTIONS=--heapsnapshot-near-heap-limit=1
+# %h/bin keeps agent-say/jarate (install.sh symlinks) resolvable by name.
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+# - prefix: a missing env file is NOT fatal (plain = FATAL, verified
+# 2026-09-16). Optional LLM provider keys, chmod 600.
+EnvironmentFile=-%h/.hermes/.env
+WorkingDirectory=%h
+# tail keeps stdin open: RPC mode exits on stdin EOF
+ExecStart=/bin/bash -c 'tail -f /dev/null | %h/.local/bin/pi -c --mode rpc'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
