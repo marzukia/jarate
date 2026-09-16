@@ -638,7 +638,7 @@ cmd_agents_bless() {
 # Human portal prerequisites (NOT reachable with a bot token):
 #   H1. application created, bot token issued
 #   H2. privileged intents: SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES
-#   H3. invite mask incl. MANAGE_WEBHOOKS (1<<21); recommended 2228048
+#   H3. invite mask incl. MANAGE_WEBHOOKS (1<<29); recommended 539098960
 #       (else pass --webhook-url)
 #   H4. LLM endpoint creds (else the agent boots, LLM calls fail)
 
@@ -763,7 +763,16 @@ cmd_setup() {
   ch_type="$(jq -r '.type // empty' <<<"$ch")"
   ch_guild="$(jq -r '.guild_id // empty' <<<"$ch")"
   slog "channel: $SETUP_CH (guild=${ch_guild:-unknown}, type=${ch_type:-?})"
-  [ "$ch_type" != "0" ] || die "setup: channel is a DM; webhooks need a guild channel"
+  # Discord v10 channel types: 0 = guild text, 1 = DM, 4 = guild voice, 5 =
+  # group DM, 15 = guild text (newer). Webhooks need a guild channel - accept
+  # the text types, reject everything else by name.
+  case "$ch_type" in
+    "") ;; # dry-run: s_api_try returns the stub doc, no type - nothing to check
+    0 | 15) ;;
+    *)
+      die "setup: channel type $ch_type is not a guild text channel (0/15). DM=1, voice=4, group-DM=5 - webhooks need a guild text channel"
+      ;;
+  esac
 
   # --- 4. checkout + install.sh --------------------------------------------
   if [ -d "$SETUP_DIR/.git" ]; then
@@ -873,7 +882,12 @@ cmd_setup() {
     slog "using given webhook $wb_id"
   else
     local list
-    list="$(s_api GET "/channels/$SETUP_CH/webhooks")"
+    if ! list="$(s_api_try GET "/channels/$SETUP_CH/webhooks")"; then
+      if grep -q "Missing Permissions" <<<"$list"; then
+        die "setup: bot lacks MANAGE_WEBHOOKS on channel $SETUP_CH (403). Invite mask must include 1<<29 (use 539098960), or pass --webhook-url"
+      fi
+      die "setup: webhook list failed: ${list:0:300}"
+    fi
     if [ "$SETUP_DRY" = 1 ]; then
       sdry "look for existing 'Jarate' webhook in channel $SETUP_CH; POST to create if absent"
     else
@@ -965,7 +979,7 @@ cmd_setup() {
     else
       local tail
       tail="$(journalctl --user -u pi.service --since "$since" --no-pager -n 20 2>/dev/null | tail -c 600 | tr '\n' '|')"
-      die "setup: boot gate failed (${JARATE_SETUP_GATE_S:-90}s). journal tail: $tail. usual suspects: H2 intents not enabled, H3 invite mask (MANAGE_WEBHOOKS 1<<21 / VIEW_CHANNEL), bad token"
+      die "setup: boot gate failed (${JARATE_SETUP_GATE_S:-90}s). journal tail: $tail. usual suspects: H2 intents not enabled, H3 invite mask (MANAGE_WEBHOOKS 1<<29 / VIEW_CHANNEL (mask 539098960)), bad token"
     fi
   fi
 

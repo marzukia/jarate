@@ -24,21 +24,19 @@ so no command can do it for you:
    Application → copy the **Application ID**; Bot tab → **Reset Token** →
    copy `<BOT_TOKEN>`.
 2. **Privileged Gateway Intents** (Bot tab) — portal-only, no REST endpoint:
-   - SERVER MESSAGES (`1<<9`)
-   - MESSAGE CONTENT (`1<<12`)
-   - VOICE STATES (`1<<15`)
+   - GUILD_MESSAGES (`1<<9`)
+   - DIRECT_MESSAGES (`1<<12`)
+   - MESSAGE CONTENT (`1<<15`)
 
-   (The bridge mask is `1 | 1<<9 | 1<<12 | 1<<15`; GUILDS `1<<0` is not
-   privileged and needs no toggle.)
+   (The bridge mask is `1 | 1<<9 | 1<<12 | 1<<15` = 37377; GUILDS `1<<0`
+   is not privileged and needs no toggle.)
 3. **Invite the bot to a guild** — OAuth2 click:
-   `https://discord.com/api/oauth2/authorize?client_id=<APP_ID>&permissions=2228048&scope=bot`
-   2228048 = MANAGE_CHANNELS, ADD_REACTIONS, PRIORITY_SPEAKER, STREAM,
-   VIEW_CHANNEL, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, EMBED_LINKS,
-   ATTACH_FILES, READ_MESSAGE_HISTORY, MENTION_EVERYONE, **MANAGE_WEBHOOKS
-   (`1<<21`)**. `MANAGE_WEBHOOKS` is the bit that lets the bot create its own
-   callback webhook; without it, pass `--webhook-url` (create the webhook by
-   hand: channel → Integrations → New Webhook). Minimum mask if you trim:
-   VIEW_CHANNEL + SEND_MESSAGES + MANAGE_WEBHOOKS = 2099224.
+   `https://discord.com/api/oauth2/authorize?client_id=<APP_ID>&permissions=539098960&scope=bot`
+   539098960 = the full ops mask **plus MANAGE_WEBHOOKS (`1<<29`)** - the bit
+   that lets the bot create its own callback webhook. Without it, `jarate
+   setup --yes` 403s at the webhook step; then pass `--webhook-url` (create
+   the webhook by hand: channel -> Integrations -> New Webhook). Minimum mask
+   if you trim: VIEW_CHANNEL + SEND_MESSAGES + MANAGE_WEBHOOKS = 536873984.
 4. **The IDs** (Discord settings → Advanced → Developer Mode):
    - **channel ID** — right-click a *guild text channel* → Copy Channel ID.
      DMs do not work (webhook callbacks need a guild channel).

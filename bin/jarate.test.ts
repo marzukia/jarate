@@ -868,18 +868,28 @@ function fakeCheckout(f: Fixture): string {
 // Stub curl: logs each call, answers canned Discord responses.
 // Dispatches on METHOD + URL. channel 123 = guild text channel;
 // channel 456 = DM.
-function curlStub(f: Fixture, existingWebhook = false): void {
+function curlStub(
+  f: Fixture,
+  existingWebhook = false,
+  webhook403 = false,
+): void {
   const p = path.join(f.bin, "curl");
+  const wh403 = webhook403
+    ? `
+    if [ -f "$(dirname "$0")/curl.webhook403" ]; then
+      printf '{"message":"Missing Permissions","code":50013}'
+    fi`
+    : "";
   fs.writeFileSync(
     p,
     [
       "#!/bin/sh",
       'log="$(dirname "$0")/curl.log"',
-      "printf '%s\\n' \"$*\" >> \"$log\"",
+      'printf \'%s\\n\' "$*" >> "$log"',
       "method=GET",
       'url=""',
       'prev=""',
-      'has_body=0',
+      "has_body=0",
       'for a in "$@"; do',
       '  if [ "$prev" = "-X" ]; then method="$a"; fi',
       '  if [ "$a" = "@-" ]; then has_body=1; fi',
@@ -888,16 +898,19 @@ function curlStub(f: Fixture, existingWebhook = false): void {
       "done",
       'if [ "$has_body" = 1 ]; then printf \'%s\\n\' "$(cat)" >> "$log"; fi',
       'case "$method $url" in',
-      "  GET\\ */users/@me) printf '{\"id\":\"101\",\"username\":\"stubbot\"}' ;;",
+      '  GET\\ */users/@me) printf \'{"id":"101","username":"stubbot"}\' ;;',
       "  GET\\ */channels/123/webhooks) " +
+        (webhook403 ? wh403 + "; " : " ") +
         (existingWebhook
-          ? "printf '[{\"id\":\"555\",\"name\":\"Jarate\"}]'"
+          ? 'printf \'[{"id":"555","name":"Jarate"}]\''
           : "printf '[]'") +
         " ;;",
-      "  POST\\ */channels/123/webhooks) printf '{\"id\":\"999\",\"token\":\"tok999\"}' ;;",
-      "  GET\\ */webhooks/555) printf '{\"id\":\"555\",\"token\":\"oldtok\"}' ;;",
-      "  GET\\ */channels/123) printf '{\"id\":\"123\",\"type\":4,\"guild_id\":\"9\"}' ;;",
-      "  GET\\ */channels/456) printf '{\"id\":\"456\",\"type\":0}' ;;",
+      '  POST\\ */channels/123/webhooks) printf \'{"id":"999","token":"tok999"}\' ;;',
+      '  GET\\ */webhooks/555) printf \'{"id":"555","token":"oldtok"}\' ;;',
+      // Discord v10 channel types: 0 = guild text, 1 = DM, 4 = guild voice
+      '  GET\\ */channels/123) printf \'{"id":"123","type":0,"guild_id":"9"}\' ;;',
+      '  GET\\ */channels/456) printf \'{"id":"456","type":1,"guild_id":null}\' ;;',
+      '  GET\\ */channels/789) printf \'{"id":"789","type":4,"guild_id":"9"}\' ;;',
       '  *) printf \'{"id":"999","token":"tok999"}\' ;;',
       "esac",
       "",
@@ -1045,9 +1058,9 @@ describe("setup", () => {
     expect(d.next_steps.join("\n")).not.toContain("LLM creds");
 
     // install.sh ran inside the fake checkout
-    expect(
-      fs.readFileSync(path.join(repo, ".install-ran"), "utf8"),
-    ).toBe("ran\n");
+    expect(fs.readFileSync(path.join(repo, ".install-ran"), "utf8")).toBe(
+      "ran\n",
+    );
 
     // exactly the API calls, in design order, with the bot token header
     const calls = fs
@@ -1074,10 +1087,10 @@ describe("setup", () => {
     const settings = JSON.parse(
       fs.readFileSync(path.join(agentDir, "settings.json"), "utf8"),
     );
-    expect(settings.packages).toContain(
-      path.join(repo, "packages/bridge"),
+    expect(settings.packages).toContain(path.join(repo, "packages/bridge"));
+    const mine = settings.channels.filter(
+      (c: { channel: string }) => c.channel === "123",
     );
-    const mine = settings.channels.filter((c: { channel: string }) => c.channel === "123");
     expect(mine.length).toBe(1);
     expect(mine[0]).toEqual({
       id: "discord-testbot",
@@ -1091,19 +1104,17 @@ describe("setup", () => {
       ack: false,
       ownerUserId: "456",
     });
-    expect(settings.channels.some((c: { channel: string }) => c.channel === "777")).toBe(true);
+    expect(
+      settings.channels.some((c: { channel: string }) => c.channel === "777"),
+    ).toBe(true);
     expect(settings.defaultProvider).toBe("127.0.0.1:8081");
     expect(settings.defaultModel).toBe("m1");
     expect(
-      fs
-        .readdirSync(agentDir)
-        .filter((x) => x.startsWith("settings.json.bak-"))
+      fs.readdirSync(agentDir).filter((x) => x.startsWith("settings.json.bak-"))
         .length,
     ).toBe(1);
     expect(
-      fs
-        .readdirSync(agentDir)
-        .filter((x) => x.startsWith("models.json.bak-"))
+      fs.readdirSync(agentDir).filter((x) => x.startsWith("models.json.bak-"))
         .length,
     ).toBe(1);
 
@@ -1142,7 +1153,10 @@ describe("setup", () => {
     expect(jd).toContain(`ExecStart=${repo}/deploy/deploy.sh`);
     // watchdog units copied verbatim from the repo
     expect(fs.readFileSync(path.join(ud, "pi-bg-watchdog.timer"), "utf8")).toBe(
-      fs.readFileSync(path.join(SETUP_REPO, "dispatch", "pi-bg-watchdog.timer"), "utf8"),
+      fs.readFileSync(
+        path.join(SETUP_REPO, "dispatch", "pi-bg-watchdog.timer"),
+        "utf8",
+      ),
     );
 
     // systemctl sequence; loginctl failure is a note, not a failure
@@ -1184,9 +1198,7 @@ describe("setup", () => {
       .readFileSync(path.join(f.bin, "curl.log"), "utf8")
       .trim()
       .split("\n");
-    expect(
-      calls.filter((l) => l.includes("-X POST")).length,
-    ).toBe(0); // no POST: the existing webhook was reused
+    expect(calls.filter((l) => l.includes("-X POST")).length).toBe(0); // no POST: the existing webhook was reused
     // second run: same result, still exactly one channel entry
     const r2 = await f.run(args);
     expect(r2.code).toBe(0);
@@ -1197,7 +1209,8 @@ describe("setup", () => {
       ),
     );
     expect(
-      settings.channels.filter((c: { channel: string }) => c.channel === "123").length,
+      settings.channels.filter((c: { channel: string }) => c.channel === "123")
+        .length,
     ).toBe(1);
     expect(new Set(settings.packages).size).toBe(settings.packages.length);
     expect(
@@ -1261,6 +1274,49 @@ describe("setup", () => {
     const d = doc(r);
     expect(d.ok).toBe(false);
     expect(d.error).toContain("DM");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("voice channel -> rc 1 (only guild text types 0/15 accepted)", async () => {
+    const f = fixture();
+    const repo = fakeCheckout(f);
+    curlStub(f);
+    systemdStubs(f);
+    const r = await f.run([
+      "setup",
+      "aa.bb.cc",
+      "789",
+      "--yes",
+      "--no-units",
+      "--no-verify",
+      "--jarate-dir",
+      repo,
+    ]);
+    expect(r.code).toBe(1);
+    expect(doc(r).error).toContain("not a guild text channel");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("webhook list 403 Missing Permissions -> rc 1 with the mask hint", async () => {
+    const f = fixture();
+    const repo = fakeCheckout(f);
+    curlStub(f, false, true);
+    fs.writeFileSync(path.join(f.bin, "curl.webhook403"), "");
+    systemdStubs(f);
+    const r = await f.run([
+      "setup",
+      "aa.bb.cc",
+      "123",
+      "--yes",
+      "--no-units",
+      "--no-verify",
+      "--jarate-dir",
+      repo,
+    ]);
+    expect(r.code).toBe(1);
+    const d = doc(r);
+    expect(d.error).toContain("MANAGE_WEBHOOKS");
+    expect(d.error).toContain("539098960");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
