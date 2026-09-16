@@ -54,11 +54,28 @@ export function ticketIdFromPid(
   return null;
 }
 
+// ps etime: "MM:SS", "H:MM:SS", or "D-H:MM:SS" (procps). Raw seconds for
+// the dedup comparison; unparseable -> 0.
+function etimeToSecs(etime: string): number {
+  const d = etime.match(/^(\d+)-(\d+):(\d{2}):(\d{2})$/);
+  if (d) return +d[1] * 86400 + +d[2] * 3600 + +d[3] * 60 + +d[4];
+  const h = etime.match(/^(\d+):(\d{2}):(\d{2})$/);
+  if (h) return +h[1] * 3600 + +h[2] * 60 + +h[3];
+  const mm = etime.match(/^(\d+):(\d{2})$/);
+  if (mm) return +mm[1] * 60 + +mm[2];
+  return 0;
+}
+
 // Match the wrapper line shape: <pid> <etime> <bash> <script-path> <profile> <task>
 // The script path is EITHER the installed symlink (.../scripts/pi-bg)
 // OR the per-run snapshot (.../.pi-bg-art/snap-<run_id>/pi-bg — the
 // deploy-swap guard re-execs from a hard-linked copy, 2026-09-15).
-export function parseJobsFromPs(psOut: string): InflightJob[] {
+// procRoot is overridable so the cgroup id resolution is testable with a
+// fake /proc (ticketIdFromPid pattern).
+export function parseJobsFromPs(
+  psOut: string,
+  procRoot: string = "/proc",
+): InflightJob[] {
   const out: InflightJob[] = [];
   for (const line of psOut.split("\n")) {
     const m = line
@@ -73,16 +90,37 @@ export function parseJobsFromPs(psOut: string): InflightJob[] {
       .split("\n")[0]
       .slice(0, 70);
     out.push({
-      id: ticketIdFromPid(Number(m[1])),
+      id: ticketIdFromPid(Number(m[1]), procRoot),
       age: m[2],
       profile: m[3],
       task,
     });
   }
-  return out;
+  // Dedup by resolved ticket id. pi-bg's heartbeat subshell is a forked
+  // child that keeps the wrapper's argv AND cgroup (pi-bg hb loop), so a
+  // live run yields TWO ps lines with the same resolved id. Keep the
+  // longest etime per id — the wrapper always lives >= its forked
+  // helpers — and drop the rest. Null ids pass through untouched (they
+  // cannot be matched; degrades to pre-dedup behavior).
+  const kept = new Map<string, number>(); // id -> index in result
+  const result: InflightJob[] = [];
+  for (const j of out) {
+    if (j.id === null) {
+      result.push(j);
+      continue;
+    }
+    const i = kept.get(j.id);
+    if (i === undefined) {
+      kept.set(j.id, result.length);
+      result.push(j);
+    } else if (etimeToSecs(j.age) > etimeToSecs(result[i].age)) {
+      result[i] = j;
+    }
+  }
+  return result;
 }
 
-export function collectInflightJobs(): InflightJob[] {
+export function collectInflightJobs(procRoot: string = "/proc"): InflightJob[] {
   let raw = "";
   try {
     const uid = process.getuid?.();
@@ -95,7 +133,7 @@ export function collectInflightJobs(): InflightJob[] {
   } catch {
     return [];
   }
-  return parseJobsFromPs(raw);
+  return parseJobsFromPs(raw, procRoot);
 }
 
 export type JobState = "done" | "webhook-failed" | "killed" | "lost";
@@ -303,9 +341,29 @@ export function stateLabel(state: JobState): string {
   }
 }
 
-/** /jobs entry point: in-flight (ps) + history (/tmp artifacts). */
-export function jobsView(format: "text" | "json" = "text"): string {
-  return formatJobsView(collectInflightJobs(), scanJobHistory(), format);
+/** /jobs entry point: in-flight (ps) + history (/tmp artifacts).
+ *  A live run already owns its artifact dir at dispatch time (no out.md
+ *  yet), so scanJobHistory sees it as "lost" and it would render in
+ *  recent right next to its own in-flight row. Exclude in-flight ids
+ *  (non-null only) from the history before formatJobsView slices it —
+ *  text and json paths alike. opts override the ps/history sources for
+ *  tests. */
+export function jobsView(
+  format: "text" | "json" = "text",
+  opts: {
+    inflight?: InflightJob[];
+    history?: JobHistoryEntry[];
+    procRoot?: string;
+  } = {},
+): string {
+  const inflight = opts.inflight ?? collectInflightJobs(opts.procRoot);
+  const inflightIds = new Set(
+    inflight.map((j) => j.id).filter((x): x is string => x !== null),
+  );
+  const history = (opts.history ?? scanJobHistory()).filter(
+    (h) => !inflightIds.has(h.id),
+  );
+  return formatJobsView(inflight, history, format);
 }
 
 // ─── /jobs kill | tail (#44) ─────────────────────────────────────────────

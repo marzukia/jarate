@@ -9,6 +9,7 @@ import {
   type JobHistoryEntry,
   jobsKill,
   jobsTail,
+  jobsView,
   parseJobsFromPs,
   scanJobHistory,
   stateLabel,
@@ -89,6 +90,96 @@ describe("parseJobsFromPs (/jobs)", () => {
 
   test("empty input is empty", () => {
     expect(parseJobsFromPs("")).toEqual([]);
+  });
+});
+
+// ─── parseJobsFromPs dedup (hb subshell alias, RCA 2026-09-16 §1) ────────
+// pi-bg's heartbeat loop is a forked subshell that keeps the wrapper's
+// argv AND cgroup, so one live run shows up as two ps lines resolving to
+// the same ticket id. parseJobsFromPs must collapse them to one entry,
+// keeping the longest etime (the wrapper).
+
+describe("parseJobsFromPs dedup (wrapper + hb subshell)", () => {
+  const RUN = "20260916-043323-3148427";
+  const ARGV = `/bin/bash /home/monky/.pi-bg-art/snap-${RUN}/pi-bg worker PERFORMANCE AUDIT of the ppgrid pipeline`;
+  const TASK = "PERFORMANCE AUDIT of the ppgrid pipeline";
+  let procRoot: string;
+  beforeEach(() => {
+    procRoot = fs.mkdtempSync(path.join(os.tmpdir(), "proc-dedup-"));
+  });
+  afterEach(() => {
+    fs.rmSync(procRoot, { recursive: true, force: true });
+  });
+  const fakeCgroup = (pid: number, runId: string): void => {
+    const d = path.join(procRoot, String(pid));
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      path.join(d, "cgroup"),
+      `0::/user.slice/user-1003.slice/user@1003.service/pi-bg/${runId}\n`,
+    );
+  };
+
+  test("two lines, same resolved id -> one job, LONGEST etime kept", () => {
+    fakeCgroup(3148427, RUN); // wrapper (forked first, oldest)
+    fakeCgroup(3148986, RUN); // hb subshell (same cgroup, +54s)
+    const ps = [`3148427 51:33 ${ARGV}`, `3148986 50:39 ${ARGV}`, ""].join(
+      "\n",
+    );
+    expect(parseJobsFromPs(ps, procRoot)).toEqual([
+      { id: RUN, age: "51:33", profile: "worker", task: TASK },
+    ]);
+  });
+
+  test("hb line first in ps order -> still one job, wrapper etime kept", () => {
+    fakeCgroup(3148427, RUN);
+    fakeCgroup(3148986, RUN);
+    const ps = [`3148986 50:39 ${ARGV}`, `3148427 51:33 ${ARGV}`, ""].join(
+      "\n",
+    );
+    expect(parseJobsFromPs(ps, procRoot)).toEqual([
+      { id: RUN, age: "51:33", profile: "worker", task: TASK },
+    ]);
+  });
+
+  test("D-H:MM:SS beats H:MM:SS (day-format etime compares in seconds)", () => {
+    fakeCgroup(111, RUN);
+    fakeCgroup(222, RUN);
+    const ps = [`111 1-02:00:00 ${ARGV}`, `222 23:59:59 ${ARGV}`, ""].join(
+      "\n",
+    );
+    expect(parseJobsFromPs(ps, procRoot)).toEqual([
+      { id: RUN, age: "1-02:00:00", profile: "worker", task: TASK },
+    ]);
+  });
+
+  test("two DISTINCT resolved ids -> both kept", () => {
+    fakeCgroup(111, RUN);
+    fakeCgroup(222, "20260916-044537-3530347");
+    const ps = [
+      `111 51:33 ${ARGV}`,
+      `222 10:00 /bin/bash /home/monky/.pi-bg-art/snap-20260916-044537-3530347/pi-bg worker other job`,
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps, procRoot)).toEqual([
+      { id: RUN, age: "51:33", profile: "worker", task: TASK },
+      {
+        id: "20260916-044537-3530347",
+        age: "10:00",
+        profile: "worker",
+        task: "other job",
+      },
+    ]);
+  });
+
+  test("unresolvable ids (no cgroup match) -> both kept, no false dedup", () => {
+    // procRoot is empty: ticketIdFromPid -> null for both pids
+    const ps = [`3148427 51:33 ${ARGV}`, `3148986 50:39 ${ARGV}`, ""].join(
+      "\n",
+    );
+    expect(parseJobsFromPs(ps, procRoot)).toEqual([
+      { id: null, age: "51:33", profile: "worker", task: TASK },
+      { id: null, age: "50:39", profile: "worker", task: TASK },
+    ]);
   });
 });
 
@@ -353,6 +444,65 @@ describe("formatJobsView", () => {
     const parsed = JSON.parse(formatJobsView([], big, "json"));
     expect(parsed.history).toHaveLength(10);
     expect(parsed.history[0].id).toBe(big[0].id);
+  });
+});
+
+// ─── jobsView recent exclusion (RCA 2026-09-16 §2) ──────────────────────
+// A live run already owns its artifact dir at dispatch time (no out.md
+// yet), so scanJobHistory sees it as "lost" and it would render in
+// recent right next to its own in-flight row. jobsView must exclude the
+// non-null in-flight ids from the history (text + json).
+
+describe("jobsView (recent excludes in-flight ids)", () => {
+  const LIVE = "20260916-043323-3148427";
+  const DONE = "20260916-044537-3530347";
+  const inflight: InflightJob[] = [
+    { id: LIVE, profile: "worker", age: "51:33", task: "audit" },
+    { id: null, profile: "reviewer", age: "10:00", task: "no cgroup id" },
+  ];
+  const history: JobHistoryEntry[] = [
+    // live run's own artifact dir, scanned as "lost" (no out.md yet)
+    { id: LIVE, state: "lost", mtime: 1_790_000_000, webhook: null },
+    { id: DONE, state: "done", mtime: 1_789_999_700, webhook: "200" },
+  ];
+
+  // the ids on the rendered recent frame's `├` rows only
+  function recentIds(out: string): string[] {
+    const lines = out.split("\n");
+    const i = lines.findIndex((l) => l.startsWith("┌ recent"));
+    if (i === -1) return [];
+    const ids: string[] = [];
+    for (let k = i + 1; k < lines.length; k++) {
+      if (lines[k] === "└") break;
+      const m = lines[k].match(/^├ \S+ · \S+ · (\S+)$/);
+      if (m) ids.push(m[1]);
+    }
+    return ids;
+  }
+
+  test("text: live id hidden from recent, completed id shown", () => {
+    const out = jobsView("text", { inflight, history });
+    const ids = recentIds(out);
+    expect(ids).not.toContain(LIVE);
+    expect(ids).toContain(DONE);
+    // the in-flight frame is unchanged — the live job still renders there
+    expect(out).toContain(`┣ ${LIVE} worker · 51:33`);
+  });
+
+  test("json: history excludes the live id, keeps the completed id", () => {
+    const parsed = JSON.parse(jobsView("json", { inflight, history }));
+    expect(parsed.history.map((h: JobHistoryEntry) => h.id)).toEqual([DONE]);
+    expect(parsed.inflight.map((j: InflightJob) => j.id)).toEqual([LIVE, null]);
+  });
+
+  test("null in-flight id never excludes history (non-null only)", () => {
+    const out = jobsView("text", {
+      inflight: [{ id: null, profile: "worker", age: "10:00", task: "x" }],
+      history,
+    });
+    const ids = recentIds(out);
+    expect(ids).toContain(LIVE); // no non-null inflight id matches LIVE
+    expect(ids).toContain(DONE);
   });
 });
 
