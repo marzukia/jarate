@@ -17,6 +17,7 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { wrapFenceLine } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 
 export interface InflightJob {
@@ -224,7 +225,15 @@ function ageStr(sec: number): string {
 /**
  * Render the /jobs view. format "json" = full machine-readable object
  * (inflight + last 10 history entries); "text" = channel-ready listing
- * (inflight + last 5 history entries). Exported for tests.
+ * (inflight + last 5 history entries).
+ *
+ * v3 frame layout (Andryo 2026-09-16: "make better use of the space"):
+ * - in-flight: `┣ <id> <profile> · <age>` header row (fits 40), task on
+ *   `│ `-gutter continuation lines, wrapped gutter-aware.
+ * - recent: `├ <state> · <age> · <id>` - state first (the signal), id
+ *   last (the lookup key), no webhook noise. State labels compressed
+ *   (webhook-failed -> wb-fail) so the worst row stays under 40.
+ * Exported for tests.
  */
 export function formatJobsView(
   inflight: InflightJob[],
@@ -235,31 +244,60 @@ export function formatJobsView(
   if (format === "json") {
     return JSON.stringify({ inflight, history: history.slice(0, 10) }, null, 2);
   }
-  const lines: string[] = [];
+  const frames: string[] = [];
   if (inflight.length === 0) {
-    lines.push("[jobs] No jobs in flight.");
+    frames.push("┌ jobs · none in flight\n└");
   } else {
-    lines.push(
-      `[jobs] ${inflight.length} job${inflight.length > 1 ? "s" : ""} in flight:`,
-    );
+    const lines = [`┌ jobs · ${inflight.length} in flight`];
     for (const j of inflight) {
+      // id(19) + profile + age fits the 40-col budget on one row.
       lines.push(
         j.id
-          ? `- ${j.id} ${j.profile} · ${j.age} · ${j.task}`
-          : `- ${j.profile} · ${j.age} · ${j.task} (id: none)`,
+          ? `┣ ${j.id} ${j.profile} · ${j.age}`
+          : `┣ ${j.profile} · ${j.age}`,
+      );
+      if (j.task) {
+        for (const t of j.task.split("\n")) {
+          if (!t.trim()) continue;
+          const row = `│ ${t}`;
+          lines.push(
+            ...(row.length > FRAME_COL_MAX
+              ? wrapFenceLine(row, FRAME_COL_MAX)
+              : [row]),
+          );
+        }
+      }
+    }
+    lines.push("└");
+    frames.push(lines.join("\n"));
+  }
+  const recent = history.slice(0, 5);
+  if (recent.length > 0) {
+    const lines = [`┌ recent (newest first) · ${recent.length}`];
+    for (const h of recent) {
+      lines.push(
+        `├ ${stateLabel(h.state)} · ${ageStr(now - h.mtime)} · ${h.id}`,
       );
     }
+    lines.push("└");
+    frames.push(lines.join("\n"));
   }
-  if (history.length > 0) {
-    lines.push("");
-    lines.push("recent (newest first):");
-    for (const h of history.slice(0, 5)) {
-      const age = ageStr(now - h.mtime);
-      const wb = h.webhook ? ` · webhook ${h.webhook}` : "";
-      lines.push(`- ${h.id} ${h.state}${wb} · ${age} ago`);
-    }
+  return frames.join("\n\n");
+}
+
+/** Compressed state labels for the text view (json keeps raw states):
+ *  worst case `├ wb-fail · 1h59m · <19-char id>` = 36 cols. */
+export function stateLabel(state: JobState): string {
+  switch (state) {
+    case "done":
+      return "ok";
+    case "webhook-failed":
+      return "wb-fail";
+    case "killed":
+      return "killed";
+    case "lost":
+      return "lost";
   }
-  return lines.join("\n");
 }
 
 /** /jobs entry point: in-flight (ps) + history (/tmp artifacts). */

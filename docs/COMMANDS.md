@@ -359,18 +359,26 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 ```
 
 In-flight via the process table (the `pi-bg` wrapper process exists only
-while a run is live); recent history from the `/tmp/pi-bg-<ticket>-*`
-artifacts each run leaves (state: `done` / `webhook-failed` / `killed` /
-`lost`, plus the success-path webhook HTTP code when recorded):
+while a run is live); recent history from the `~/.pi-bg-art` artifacts each
+run leaves. v3 frame layout (2026-09-16): in-flight rows carry id + profile
++ age, the task on `│ `-gutter continuation lines; recent rows are
+state-first (`ok` / `wb-fail` / `killed` / `lost`), age, then id - all rows
+stay under the 40-col budget:
 
 ```
-[jobs] 1 job in flight:
-- worker · 04:12 · bulk refactor of channel/
+┌ jobs · 1 in flight
+┣ 20260910-135501-48211 worker · 04:12
+│ bulk refactor of channel/
+└
 
-recent (newest first):
-- 20260910-135501-48211 done · webhook 200 · 12m ago
-- 20260910-131200-77319 webhook-failed · webhook 502 · 54m ago
+┌ recent (newest first) · 2
+├ ok · 12m · 20260910-135501-48211
+├ wb-fail · 54m · 20260910-131200-77319
+└
 ```
+
+The `json` format keeps the raw machine-readable object (states un-compressed,
+plus the success-path webhook HTTP code when recorded).
 
 `kill` and `tail` wrap the dispatch scripts (`pi-bg-kill <id>`,
 `pi-bg-tail <id> [lines]`) and are owner-only: kill is a state change,

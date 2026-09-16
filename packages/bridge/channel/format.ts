@@ -416,7 +416,7 @@ export function wrapFenceLines(
   return out.join("\n");
 }
 
-function wrapFenceLine(line: string, max: number): string[] {
+export function wrapFenceLine(line: string, max: number): string[] {
   // Continuation gutter (STYLE.md 2.2, Andryo 2026-09-16 screenshot):
   // rows that sit on the frame pipe (├/┣/│) keep the pipe on their wrap
   // continuations; everything else (┌/└/plain) falls back to two spaces.

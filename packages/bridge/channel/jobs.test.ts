@@ -11,6 +11,7 @@ import {
   jobsTail,
   parseJobsFromPs,
   scanJobHistory,
+  stateLabel,
   ticketIdFromPid,
 } from "./jobs";
 
@@ -270,23 +271,70 @@ describe("formatJobsView", () => {
     },
   ];
 
-  test("text: in-flight lines + recent history with ages", () => {
+  test("text: v3 frames - in-flight header row + │-gutter task, recent state-first", () => {
     const out = formatJobsView(inflight, history, "text", 1_790_000_000);
-    expect(out).toContain("[jobs] 2 jobs in flight:");
-    expect(out).toContain("- 20260910-120000-7 worker · 00:42 · bulk refactor");
-    expect(out).toContain("- reviewer · 01:00 · no cgroup id (id: none)");
-    expect(out).toContain("recent (newest first):");
-    expect(out).toContain(
-      "- 20260910-103000-4 lost · 0s ago".replace("0s", "0s"),
-    );
-    expect(out).toContain("- 20260910-100000-1 done · webhook 200 · 5m ago");
-    expect(out).toContain(
-      "- 20260910-090000-7 webhook-failed · webhook 502 · 1h0m ago",
+    expect(out).toBe(
+      [
+        "┌ jobs · 2 in flight",
+        "┣ 20260910-120000-7 worker · 00:42",
+        "│ bulk refactor",
+        "┣ reviewer · 01:00",
+        "│ no cgroup id",
+        "└",
+        "",
+        "┌ recent (newest first) · 3",
+        "├ lost · 0s · 20260910-103000-4",
+        "├ ok · 5m · 20260910-100000-1",
+        "├ wb-fail · 1h0m · 20260910-090000-7",
+        "└",
+      ].join("\n"),
     );
   });
 
-  test("text: no in-flight and no history is a single line", () => {
-    expect(formatJobsView([], [], "text")).toBe("[jobs] No jobs in flight.");
+  test("text: long task wraps on │ gutter, all rows stay under 40 cols", () => {
+    const long: InflightJob[] = [
+      {
+        id: "20260910-120000-7",
+        profile: "worker",
+        age: "12m",
+        task: "lib.sh dedup + contract test + pi-restart into repo and wire the webhook",
+      },
+    ];
+    const out = formatJobsView(long, [], "text", 1_790_000_000);
+    for (const line of out.split("\n")) {
+      expect(line.length).toBeLessThanOrEqual(40);
+    }
+    expect(out).toContain("┣ 20260910-120000-7 worker · 12m");
+    expect(out).toContain("│ lib.sh dedup + contract test +");
+    expect(out).toContain("│ pi-restart into repo and wire the");
+    expect(out).toContain("│ webhook");
+  });
+
+  test("text: worst-case recent row stays under 40 cols (wb-fail + 1h59m)", () => {
+    const worst: JobHistoryEntry[] = [
+      {
+        id: "20260910-103000-4",
+        state: "webhook-failed",
+        mtime: 1_789_992_850,
+        webhook: "502",
+      },
+    ];
+    const out = formatJobsView([], worst, "text", 1_790_000_000);
+    for (const line of out.split("\n")) {
+      expect(line.length).toBeLessThanOrEqual(40);
+    }
+    expect(out).toContain("├ wb-fail · 1h59m · 20260910-103000-4");
+  });
+
+  test("stateLabel compresses for the text view, json keeps raw states", () => {
+    expect(stateLabel("done")).toBe("ok");
+    expect(stateLabel("webhook-failed")).toBe("wb-fail");
+    expect(stateLabel("killed")).toBe("killed");
+    expect(stateLabel("lost")).toBe("lost");
+  });
+
+  test("text: no in-flight and no history is a closed empty frame", () => {
+    expect(formatJobsView([], [], "text")).toBe("┌ jobs · none in flight\n└");
   });
 
   test("json: machine-readable object", () => {

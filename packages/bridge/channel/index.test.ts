@@ -7404,9 +7404,9 @@ describe("wave 2c bridge commands", () => {
       expect(
         posts().filter((t) => t.includes("usage: /jobs tail")).length,
       ).toBe(2);
-      // bare /jobs: view path unchanged
+      // bare /jobs: v3 frame view (2026-09-16)
       await handleInbound(pi, inbound("/jobs", "m8"), ctx);
-      expect(posts().some((t) => t.includes("[jobs]"))).toBe(true);
+      expect(posts().some((t) => t.includes("┌ jobs"))).toBe(true);
     } finally {
       process.env.HOME = oldHome;
     }
