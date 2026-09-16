@@ -3,8 +3,10 @@ Description=Jarate deploy (fetch, check, test, restart pi.service, health gate +
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/monky/projects/jarate
-# User units run as monky; no User= key here.
+# %h = the unit user's home, expanded by systemd. `jarate setup` rewrites
+# this to the actual checkout when --jarate-dir is not the default.
+WorkingDirectory=%h/projects/jarate
+# User units run as the agent user; no User= key here.
 # deploy.sh sets PATH (bun) and XDG_RUNTIME_DIR itself.
-ExecStart=/home/monky/projects/jarate/deploy/deploy.sh
+ExecStart=%h/projects/jarate/deploy/deploy.sh
 TimeoutStartSec=600
