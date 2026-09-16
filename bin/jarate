@@ -638,7 +638,7 @@ cmd_agents_bless() {
 # Human portal prerequisites (NOT reachable with a bot token):
 #   H1. application created, bot token issued
 #   H2. privileged intents: SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES
-#   H3. invite mask incl. MANAGE_WEBHOOKS (1<<21); recommended 2228048
+#   H3. invite mask incl. MANAGE_WEBHOOKS (1<<29); recommended 539098960
 #       (else pass --webhook-url)
 #   H4. LLM endpoint creds (else the agent boots, LLM calls fail)
 
@@ -979,7 +979,7 @@ cmd_setup() {
     else
       local tail
       tail="$(journalctl --user -u pi.service --since "$since" --no-pager -n 20 2>/dev/null | tail -c 600 | tr '\n' '|')"
-      die "setup: boot gate failed (${JARATE_SETUP_GATE_S:-90}s). journal tail: $tail. usual suspects: H2 intents not enabled, H3 invite mask (MANAGE_WEBHOOKS 1<<21 / VIEW_CHANNEL), bad token"
+      die "setup: boot gate failed (${JARATE_SETUP_GATE_S:-90}s). journal tail: $tail. usual suspects: H2 intents not enabled, H3 invite mask (MANAGE_WEBHOOKS 1<<29 / VIEW_CHANNEL (mask 539098960)), bad token"
     fi
   fi
 
