@@ -209,6 +209,31 @@ export function renderBoard(todos: Todo[]): string {
 }
 
 /**
+ * Plain line for FENCED contexts (the /todos command ships in a code block
+ * since 2026-09-16, where ** / ~~ render literally). The in-channel
+ * auto-board keeps the marked-up todoLine.
+ */
+export function todoLinePlain(t: Todo): string {
+  const c = fit(t.content, TODO_CONTENT_MAX);
+  switch (t.status) {
+    case "in_progress":
+      return `┣ ${c}`;
+    case "completed":
+      return `├ ${c}`;
+    default:
+      return todoLine(t);
+  }
+}
+
+/** Plain board for fenced /todos output. */
+export function renderBoardPlain(todos: Todo[]): string {
+  const lines = [renderBoardHeader(todos)];
+  for (const t of todos) lines.push(todoLinePlain(t));
+  lines.push("└");
+  return lines.join("\n");
+}
+
+/**
  * <todo-board> LLM context block (re-injected on every inbound run), or
  * "" when the board is empty.
  */

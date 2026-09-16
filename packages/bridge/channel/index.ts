@@ -106,11 +106,12 @@ import {
   mergeTodoLines,
   openCount,
   renderBoard,
+  renderBoardPlain,
   sanitizeTodos,
   saveBoard,
   type TodoBoard,
   todoBoardContextBlock,
-  todoLine,
+  todoLinePlain,
 } from "./todos";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
 import {
@@ -2815,32 +2816,34 @@ const CHANNEL_FORMAT_HINTS: Record<ChannelConfig["type"], string> = {
     "Discord message: markdown supported (bold, bullets, code blocks); keep it compact for chat reading.",
 };
 
+// Fenced at egress (every command reply ships in a code block) - so no
+// markdown markup inside: backticks/asterisks would render literally.
 const HELP_TEXT = [
-  "**Commands**",
-  "`/stop` - stop the current run",
+  "Commands",
+  "/stop - stop the current run",
   "plain message during a run - interrupts the step after ~3s, then takes over",
-  "`/btw <question>` - quick side question, answered briefly",
-  "`/status` - session stats (owner)",
-  "`/usage [all|session|last]` - token usage: current session, all, or last run",
-  "`/context [N]` - what's eating the window: top-N + category totals (est)",
-  "`/reset` - start a NEW session, clearing context (owner)",
-  "`/restart` - restart pi, resuming THIS session (owner)",
-  "`/undo [N]` - revert last N assistant turns (default 1): files + conversation (owner)",
-  "`/redo` - reapply an /undo (one level deep, owner)",
-  "`/verbose [0|1|2|on|off]` - tool detail: 0 text, 1 essential, 2 all (owner)",
-  "`/hold [on|off]` - buffer messages until released (owner)",
-  "`/compact [instructions]` - compact session context (owner)",
-  "`/model [name]` - switch or list models (owner)",
-  "`/jobs` - list pi-bg dispatches: in-flight + recent history (`json` for JSON)",
-  "`/jobs kill <id>` - kill an in-flight pi-bg run (owner)",
-  "`/jobs tail <id> [--n N]` - tail a run's live output (owner)",
-  "`/new-worktree [ref]` - worktree for this session's repo (owner)",
-  "`/merge-worktree [squash]` - merge worktree back, keep or squash (owner)",
-  "`/diff [git-range | file]` - publish a diff (default: working tree) to a shareable viewer URL",
-  "`/todos` - show the channel todo board (arg `all` for every channel)",
-  "`/sleep [list | cancel <id>]` - list or cancel pending session wakes (owner)",
-  "`/tasks [list | add | reschedule | cancel]` - schedule, change or cancel prompt tasks (owner)",
-  "`/help` - this message",
+  "/btw <question> - quick side question, answered briefly",
+  "/status - session stats (owner)",
+  "/usage [all|session|last] - token usage: current session, all, or last run",
+  "/context [N] - what's eating the window: top-N + category totals (est)",
+  "/reset - start a NEW session, clearing context (owner)",
+  "/restart - restart pi, resuming THIS session (owner)",
+  "/undo [N] - revert last N assistant turns (default 1): files + conversation (owner)",
+  "/redo - reapply an /undo (one level deep, owner)",
+  "/verbose [0|1|2|on|off] - tool detail: 0 text, 1 essential, 2 all (owner)",
+  "/hold [on|off] - buffer messages until released (owner)",
+  "/compact [instructions] - compact session context (owner)",
+  "/model [name] - switch or list models (owner)",
+  "/jobs - list pi-bg dispatches: in-flight + recent history (json for JSON)",
+  "/jobs kill <id> - kill an in-flight pi-bg run (owner)",
+  "/jobs tail <id> [--n N] - tail a run's live output (owner)",
+  "/new-worktree [ref] - worktree for this session's repo (owner)",
+  "/merge-worktree [squash] - merge worktree back, keep or squash (owner)",
+  "/diff [git-range | file] - publish a diff (default: working tree) to a shareable viewer URL",
+  "/todos - show the channel todo board (arg all for every channel)",
+  "/sleep [list | cancel <id>] - list or cancel pending session wakes (owner)",
+  "/tasks [list | add | reschedule | cancel] - schedule, change or cancel prompt tasks (owner)",
+  "/help - this message",
 ].join("\n");
 
 function channelTitle(
@@ -4103,7 +4106,7 @@ async function runChannelCommand(
             // 100 chars, so clip the name (never the count or glyph)
             const suffix = ` · ${open} open`;
             return `┌ ${fit(name, FRAME_COL_MAX - 2 - suffix.length)}${suffix}\n${b.todos
-              .map(todoLine)
+              .map(todoLinePlain)
               .join("\n")}\n└`;
           });
         return {
@@ -4115,7 +4118,7 @@ async function runChannelCommand(
       const board = loadBoard(ch.id);
       if (!board || board.todos.length === 0)
         return { immediate: fence("[todos] no open todos") };
-      return { immediate: fence(renderBoard(board.todos)) };
+      return { immediate: fence(renderBoardPlain(board.todos)) };
     }
     case "model": {
       if (!isOwner) return ownerOnly;

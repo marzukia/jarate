@@ -14,6 +14,7 @@ import {
   openCount,
   renderBoard,
   renderBoardHeader,
+  renderBoardPlain,
   sanitizeStatus,
   sanitizeTodos,
   saveBoard,
@@ -162,6 +163,15 @@ describe("todos: rendering", () => {
     expect(openCount(all)).toBe(2);
     expect(openCount([])).toBe(0);
     expect(openCount([{ content: "x", status: "completed" }])).toBe(0);
+  });
+
+  test("plain board strips ** / ~~ for fenced /todos (2026-09-16 fence rule)", () => {
+    expect(renderBoardPlain(all)).toBe(
+      "┌ todos · 2 open\n├ write tests\n┣ fix the bug\n├ read the docs\n┤ old idea\n└",
+    );
+    // marked-up version unchanged for the in-channel board + tool echo
+    expect(renderBoard(all)).toContain("┣ **fix the bug**");
+    expect(renderBoard(all)).toContain("├ ~~read the docs~~");
   });
 
   test("each status renders its v3 state glyph", () => {

@@ -81,7 +81,13 @@ import extension, {
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
-import { fit, loadBoard, renderBoard, saveBoard } from "./todos";
+import {
+  fit,
+  loadBoard,
+  renderBoard,
+  renderBoardPlain,
+  saveBoard,
+} from "./todos";
 import {
   type ChannelMessage,
   loadChannelConfig,
@@ -3753,7 +3759,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       "https://discord.com/api/v10/webhooks/app1/tok123/messages/@original",
     );
     expect(calls[1].method).toBe("PATCH");
-    expect(JSON.parse(calls[1].body).content).toContain("**Commands**");
+    expect(JSON.parse(calls[1].body).content).toContain("Commands");
   });
 
   test("a throwing command still produces the defer ack and an error edit", async () => {
@@ -4744,7 +4750,7 @@ describe("todo board (integration)", () => {
     const content = replyContent();
     expect(content).toBe(
       fence(
-        renderBoard([
+        renderBoardPlain([
           { content: "fix bug", status: "in_progress" },
           { content: "tests", status: "pending" },
         ]),
@@ -4810,7 +4816,7 @@ describe("todo board (integration)", () => {
     expect(content).toContain("┌ Test · 1 open");
     expect(content).toContain("├ a");
     expect(content).toContain("┌ ch2 · 0 open");
-    expect(content).toContain("├ ~~b~~");
+    expect(content).toContain("├ b");
     // each board block is framed: opens with ┌, closes with └
     expect(content.split("\n\n").length).toBe(2);
     for (const block of content.split("\n\n")) {
