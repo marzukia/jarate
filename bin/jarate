@@ -14,6 +14,7 @@
 #   - no emoji
 #
 # Commands:
+#   setup <bot-token> <channel>   fresh-node FTUE (default dry-run; --yes executes)
 #   ctx-report                    context % + token cost (reuses pi-token-cost.py --json)
 #   journal-errors [--since S]    per-agent pi.service warnings (journalctl -p warning)
 #   memory-grep <query>           search ~/memory, top-20 matches
@@ -35,6 +36,8 @@
 #                       falling back to ~/AGENTS.md when that is absent — the
 #                       live boxes keep the main profile's law in ~/AGENTS.md)
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
+#   JARATE_SETUP_GATE_S setup boot-gate window in seconds (default 90)
+#   JARATE_SETUP_POLL_S setup boot-gate poll interval in seconds (default 3)
 
 set -uo pipefail
 
@@ -44,7 +47,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("ctx-report" "journal-errors" "memory-grep" "rag" "agents-check" "agents-bless")
+COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "agents-check" "agents-bless")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -624,7 +627,389 @@ cmd_agents_bless() {
     || die "agents-bless: json assembly failed"
 }
 
-# ─── dispatch ───────────────────────────────────────────────────────────────
+# ─── setup ────────────────────────────────────────────────────────────────────
+# Fresh-node FTUE: token + channel -> running, verified agent (design:
+# audit-ftue.md section 2, 2026-09-15). Default = DRY-RUN: prints the plan,
+# no network, no writes. --yes executes. Idempotent: settings.json jq-merged
+# (timestamped .bak first), the "Jarate" webhook is REUSED when present,
+# units rewritten in place, enable safe to repeat. All curl bounded (-m 15).
+# No TTY usage.
+#
+# Human portal prerequisites (NOT reachable with a bot token):
+#   H1. application created, bot token issued
+#   H2. privileged intents: SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES
+#   H3. invite mask incl. MANAGE_WEBHOOKS (1<<21); recommended 2228048
+#       (else pass --webhook-url)
+#   H4. LLM endpoint creds (else the agent boots, LLM calls fail)
+
+SETUP_API="https://discord.com/api/v10"
+SETUP_CLONE_URL="https://github.com/marzukia/jarate.git"
+SETUP_TOK="" SETUP_CH="" SETUP_OWNER="" SETUP_WH=""
+SETUP_NAME="" SETUP_DIR=""
+SETUP_MBASE="" SETUP_MID="" SETUP_MKEY="" SETUP_MHDR="{}"
+SETUP_DRY=1 SETUP_UNITS=1 SETUP_VERIFY=1
+
+slog() { echo "[setup] $*" >&2; }
+# sdry <line> — dry-run plan line (stderr)
+sdry() { echo "[setup dry] $*" >&2; }
+
+# s_api_try METHOD path [body] — one Discord API call that never dies.
+# rc 0 = ok (response body on stdout); rc 1 = curl failure or Discord error
+# doc (error body on stdout when one arrived). DRY: log only, fake body.
+s_api_try() {
+  local m="$1" p="$2" body="${3:-}"
+  if [ "$SETUP_DRY" = 1 ]; then
+    sdry "$m $SETUP_API$p${body:+ body=$(printf %s "$body" | wc -c)c}"
+    printf '{"id":"dry"}'
+    return 0
+  fi
+  local out
+  if [ -n "$body" ]; then
+    # -d @- + here-string: body via stdin, dodging the 128KB argv element
+    # limit (avatar base64 ~260KB).
+    out="$(curl -sS -m 15 -X "$m" "$SETUP_API$p" \
+      -H "Authorization: Bot $SETUP_TOK" -H "Content-Type: application/json" \
+      -d @- <<<"$body" 2>&1)" || return 1
+  else
+    out="$(curl -sS -m 15 "$SETUP_API$p" \
+      -H "Authorization: Bot $SETUP_TOK" 2>&1)" || return 1
+  fi
+  # Discord error doc: {"message":..., "code":...} without an "id"
+  if printf '%s' "$out" | jq -e \
+    '(.id? // null) == null and ((.code? // .message?) != null)' \
+    >/dev/null 2>&1; then
+    printf '%s' "$out"
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# s_api METHOD path [body] — hard version: die (JSON doc, rc 1) on failure.
+s_api() {
+  local out
+  out="$(s_api_try "$@")" || die "setup: api $1 $2 failed: ${out:0:300}"
+  printf '%s' "$out"
+}
+
+cmd_setup() {
+  SETUP_TOK="" SETUP_CH="" SETUP_OWNER="" SETUP_WH=""
+  SETUP_NAME="${USER:-$(id -un)}" SETUP_DIR="$HOME/projects/jarate"
+  SETUP_MBASE="" SETUP_MID="" SETUP_MKEY="" SETUP_MHDR="{}"
+  SETUP_DRY=1 SETUP_UNITS=1 SETUP_VERIFY=1
+
+  local usage='setup: usage: jarate setup <bot-token> <channel-id> [--yes] [--owner UID] [--name N] [--jarate-dir D] [--webhook-url U] [--model-base URL] [--model-id ID] [--model-key KEY] [--model-headers JSON] [--no-units] [--no-verify]'
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) SETUP_DRY=0 ;;
+      --dry-run) SETUP_DRY=1 ;;
+      --no-units) SETUP_UNITS=0 ;;
+      --no-verify) SETUP_VERIFY=0 ;;
+      --owner) [ $# -ge 2 ] || die_usage "setup: --owner needs a value"; SETUP_OWNER="$2"; shift ;;
+      --name) [ $# -ge 2 ] || die_usage "setup: --name needs a value"; SETUP_NAME="$2"; shift ;;
+      --jarate-dir) [ $# -ge 2 ] || die_usage "setup: --jarate-dir needs a value"; SETUP_DIR="$2"; shift ;;
+      --webhook-url) [ $# -ge 2 ] || die_usage "setup: --webhook-url needs a value"; SETUP_WH="$2"; shift ;;
+      --model-base) [ $# -ge 2 ] || die_usage "setup: --model-base needs a value"; SETUP_MBASE="$2"; shift ;;
+      --model-id) [ $# -ge 2 ] || die_usage "setup: --model-id needs a value"; SETUP_MID="$2"; shift ;;
+      --model-key) [ $# -ge 2 ] || die_usage "setup: --model-key needs a value"; SETUP_MKEY="$2"; shift ;;
+      --model-headers) [ $# -ge 2 ] || die_usage "setup: --model-headers needs a value"; SETUP_MHDR="$2"; shift ;;
+      -h | --help)
+        jq -cn --arg ts "$(ts_now)" \
+          '{ok: true, ts: $ts, error: null,
+            usage: "jarate setup <bot-token> <channel-id> [options]",
+            note: "default is dry-run (plan only, no network, no writes); --yes executes",
+            options: ["--owner <discord-user-id>", "--name <agent-name>",
+                       "--jarate-dir <dir>", "--webhook-url <url>",
+                       "--model-base <url> --model-id <id> --model-key <key>",
+                       "[--model-headers <json>]", "--no-units", "--no-verify"],
+            effect: "installs pi + @jarate/bridge on this node: settings.json, models.json, dispatch webhook, systemd user units, boot verification"}'
+        exit 0 ;;
+      -*) die_usage "setup: unknown flag: $1" ;;
+      *) if [ -z "$SETUP_TOK" ]; then SETUP_TOK="$1"
+         elif [ -z "$SETUP_CH" ]; then SETUP_CH="$1"
+         else die_usage "setup: extra arg: $1"; fi ;;
+    esac
+    shift
+  done
+  [ -n "$SETUP_TOK" ] && [ -n "$SETUP_CH" ] || die_usage "$usage"
+  [[ "$SETUP_CH" =~ ^[0-9]+$ ]] || die_usage "setup: channel id must be numeric: $SETUP_CH"
+  if [ -n "$SETUP_MHDR" ] && ! jq -e . >/dev/null 2>&1 <<<"$SETUP_MHDR"; then
+    die_usage "setup: --model-headers must be valid JSON: $SETUP_MHDR"
+  fi
+  [[ "$SETUP_TOK" == *.*.* ]] \
+    || slog "note: token does not look like a Discord bot token (3 dot parts); continuing"
+
+  slog "(dry=$SETUP_DRY, agent=$SETUP_NAME, channel=$SETUP_CH)"
+
+  # --- 1. local deps -------------------------------------------------------
+  local t
+  for t in git jq python3 curl; do
+    command -v "$t" >/dev/null 2>&1 || die "setup: missing dep: $t"
+  done
+  command -v bun >/dev/null 2>&1 || [ -x "$HOME/.local/bin/bun" ] \
+    || slog "note: bun not on PATH (bridge install); see SETUP.md prerequisites"
+  command -v pi >/dev/null 2>&1 || [ -x "$HOME/.local/bin/pi" ] \
+    || slog "note: pi not on PATH yet; see SETUP.md prerequisites"
+
+  # --- 2. token check ------------------------------------------------------
+  local me bot_id="" bot_name=""
+  me="$(s_api GET /users/@me)"
+  bot_id="$(jq -r '.id // empty' <<<"$me")"
+  bot_name="$(jq -r '.username // empty' <<<"$me")"
+  slog "bot: $bot_id${bot_name:+ ($bot_name)}"
+
+  # --- 3. channel check ----------------------------------------------------
+  local ch ch_type="" ch_guild=""
+  ch="$(s_api GET "/channels/$SETUP_CH")"
+  ch_type="$(jq -r '.type // empty' <<<"$ch")"
+  ch_guild="$(jq -r '.guild_id // empty' <<<"$ch")"
+  slog "channel: $SETUP_CH (guild=${ch_guild:-unknown}, type=${ch_type:-?})"
+  [ "$ch_type" != "0" ] || die "setup: channel is a DM; webhooks need a guild channel"
+
+  # --- 4. checkout + install.sh --------------------------------------------
+  if [ -d "$SETUP_DIR/.git" ]; then
+    slog "checkout present: $SETUP_DIR"
+    if [ "$SETUP_DRY" = 0 ]; then
+      (cd "$SETUP_DIR" && ./install.sh) || die "setup: install.sh failed"
+    else
+      sdry "(cd $SETUP_DIR && ./install.sh)"
+    fi
+  else
+    if [ "$SETUP_DRY" = 0 ]; then
+      mkdir -p "$(dirname "$SETUP_DIR")" || die "setup: cannot create $(dirname "$SETUP_DIR")"
+      git clone "$SETUP_CLONE_URL" "$SETUP_DIR" || die "setup: git clone failed"
+      (cd "$SETUP_DIR" && ./install.sh) || die "setup: install.sh failed"
+    else
+      sdry "git clone $SETUP_CLONE_URL $SETUP_DIR && ./install.sh"
+    fi
+  fi
+
+  # --- 5. LLM endpoint (model block built first: feeds settings merge) ------
+  local prov_key="" provider="null"
+  if [ -n "$SETUP_MBASE" ] && [ -n "$SETUP_MID" ]; then
+    prov_key="$(jq -rn --arg b "$SETUP_MBASE" '$b | split("/") | .[2] // "provider"')"
+    provider="$(jq -cn \
+      --arg name "$SETUP_MID" --arg base "$SETUP_MBASE" \
+      --arg key "${SETUP_MKEY:-local}" --argjson headers "$SETUP_MHDR" \
+      --arg id "$SETUP_MID" \
+      '{name:$name,baseUrl:$base,api:"openai-completions",apiKey:$key,headers:$headers,
+        models:[{id:$id,name:$id,contextWindow:262144,maxTokens:16384,
+                 cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]}')"
+  fi
+
+  # --- 6. settings.json (jq merge, timestamped .bak first) ------------------
+  local settings="$HOME/.pi/agent/settings.json"
+  local entry
+  entry="$(jq -cn \
+    --arg id "discord-$SETUP_NAME" \
+    --arg name "${SETUP_NAME^^}" \
+    --arg ch "$SETUP_CH" \
+    --arg tok "$SETUP_TOK" \
+    --arg owner "$SETUP_OWNER" \
+    '{id:$id,name:$name,type:"discord",enabled:true,channel:$ch,botToken:$tok,
+      default:true,forwardToolCalls:true,ack:false}
+     + (if $owner == "" then {} else {ownerUserId:$owner} end)')"
+  local merge_filter='(.packages // []) as $pk | (.channels // []) as $cs
+    | .packages = (($pk + [$pkg]) | unique)
+    | .channels = (($cs | map(select(.channel != $ch.channel))) + [$ch])
+    | . + (if $prov == "" then {} else {defaultProvider: $prov, defaultModel: $model} end)'
+  local fresh_filter='{packages:[$pkg],channels:[$ch]}
+    + (if $prov == "" then {} else {defaultProvider:$prov,defaultModel:$model} end)'
+  if [ "$SETUP_DRY" = 1 ]; then
+    sdry "merge $settings: packages += $SETUP_DIR/packages/bridge; channels: replace for channel $SETUP_CH${prov_key:+; defaultProvider=$prov_key defaultModel=$SETUP_MID}"
+  else
+    mkdir -p "$HOME/.pi/agent" || die "setup: mkdir failed: $HOME/.pi/agent"
+    [ -f "$settings" ] && cp -p "$settings" "$settings.bak-$(date +%Y%m%d%H%M%S)"
+    local tmp
+    tmp="$(mktemp)" || die "setup: mktemp failed"
+    if [ -f "$settings" ]; then
+      jq --arg pkg "$SETUP_DIR/packages/bridge" --argjson ch "$entry" \
+        --arg prov "$prov_key" --arg model "$SETUP_MID" \
+        "$merge_filter" "$settings" > "$tmp" \
+        || { rm -f "$tmp"; die "setup: settings.json merge failed (invalid existing JSON?): $settings"; }
+    else
+      jq -n --arg pkg "$SETUP_DIR/packages/bridge" --argjson ch "$entry" \
+        --arg prov "$prov_key" --arg model "$SETUP_MID" \
+        "$fresh_filter" > "$tmp" \
+        || { rm -f "$tmp"; die "setup: settings.json write failed"; }
+    fi
+    mv "$tmp" "$settings" && chmod 600 "$settings" \
+      || die "setup: settings.json write failed"
+    slog "settings.json merged (backup kept)"
+  fi
+
+  # --- 7. models.json --------------------------------------------------------
+  local models="$HOME/.pi/agent/models.json"
+  if [ -n "$prov_key" ]; then
+    if [ "$SETUP_DRY" = 1 ]; then
+      sdry "merge $models: provider $prov_key ($SETUP_MID @ $SETUP_MBASE)"
+    else
+      [ -f "$models" ] && cp -p "$models" "$models.bak-$(date +%Y%m%d%H%M%S)"
+      local tmp
+      tmp="$(mktemp)" || die "setup: mktemp failed"
+      if [ -f "$models" ]; then
+        jq --arg k "$prov_key" --argjson p "$provider" \
+          '.providers = ((.providers // {}) + {($k): $p})' "$models" > "$tmp" \
+          || { rm -f "$tmp"; die "setup: models.json merge failed (invalid existing JSON?): $models"; }
+      else
+        jq -n --arg k "$prov_key" --argjson p "$provider" \
+          '{providers:{($k):$p}}' > "$tmp" \
+          || { rm -f "$tmp"; die "setup: models.json write failed"; }
+      fi
+      mv "$tmp" "$models" && chmod 600 "$models" || die "setup: models.json write failed"
+      slog "models.json written (provider $prov_key; defaults set in settings.json)"
+    fi
+  else
+    slog "NOTE: no --model-base/--model-id; agent boots but LLM calls fail until models.json exists (H4)"
+  fi
+
+  # --- 8. dispatch webhook (reuse "Jarate" or POST /channels/{id}/webhooks) --
+  local wcfg="$HOME/.config/pi-dispatch"
+  local wb_id="" wb_tok=""
+  if [ -n "$SETUP_WH" ]; then
+    wb_id="$(sed -E 's#.*webhooks/([0-9]+)/.*#\1#' <<<"$SETUP_WH")"
+    wb_tok="$(sed -E 's#.*/##' <<<"$SETUP_WH")"
+    [ -n "$wb_id" ] && [ -n "$wb_tok" ] \
+      || die "setup: cannot parse webhook id/token from --webhook-url"
+    slog "using given webhook $wb_id"
+  else
+    local list
+    list="$(s_api GET "/channels/$SETUP_CH/webhooks")"
+    if [ "$SETUP_DRY" = 1 ]; then
+      sdry "look for existing 'Jarate' webhook in channel $SETUP_CH; POST to create if absent"
+    else
+      local existing
+      existing="$(jq -c '[.[] | select(.name == "Jarate")] | .[0] // empty' <<<"$list")"
+      if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+        wb_id="$(jq -r '.id' <<<"$existing")"
+        wb_tok="$(s_api GET "/webhooks/$wb_id" | jq -r '.token // empty')"
+        [ -n "$wb_tok" ] || die "setup: existing 'Jarate' webhook $wb_id is owned by another app (no token readable); pass --webhook-url"
+        slog "reusing existing webhook $wb_id"
+      else
+        local b64 body created
+        b64="$(base64 -w0 "$SETUP_DIR/assets/jarate-icon.png" 2>/dev/null)" \
+          || die "setup: avatar missing: $SETUP_DIR/assets/jarate-icon.png"
+        body="$(printf '%s' "$b64" | jq -cRs '{name:"Jarate",avatar:("data:image/png;base64," + .)}')" \
+          || die "setup: avatar body build failed"
+        if ! created="$(s_api_try POST "/channels/$SETUP_CH/webhooks" "$body")"; then
+          slog "avatar body rejected; retrying without avatar: $(head -c 200 <<<"$created")"
+          created="$(s_api_try POST "/channels/$SETUP_CH/webhooks" '{"name":"Jarate"}')" \
+            || die "setup: webhook create failed (MANAGE_WEBHOOKS in invite mask? else --webhook-url): $created"
+        fi
+        wb_id="$(jq -r '.id' <<<"$created")"
+        wb_tok="$(jq -r '.token' <<<"$created")"
+        slog "created webhook $wb_id (avatar $(printf %s "$b64" | wc -c) b64 chars, cap 262144)"
+      fi
+    fi
+  fi
+  if [ "$SETUP_DRY" = 0 ]; then
+    [ -n "$wb_id" ] && [ -n "$wb_tok" ] || die "setup: webhook id/token missing"
+    mkdir -p "$wcfg" || die "setup: mkdir failed: $wcfg"
+    printf 'https://discord.com/api/webhooks/%s/%s\n' "$wb_id" "$wb_tok" > "$wcfg/webhook"
+    printf '%s\n' "$wb_id" > "$wcfg/webhook_author"
+    chmod 600 "$wcfg/webhook" "$wcfg/webhook_author" || die "setup: chmod failed"
+    slog "$wcfg/{webhook,webhook_author} written (600)"
+  else
+    sdry "write $wcfg/webhook + $wcfg/webhook_author (600)"
+  fi
+
+  # --- 9. units (repo templates, %h specifiers — no sed of user paths) -------
+  local unit_dir="$HOME/.config/systemd/user"
+  if [ "$SETUP_UNITS" = 1 ]; then
+    if [ "$SETUP_DRY" = 1 ]; then
+      sdry "write $unit_dir/{pi.service,jarate-deploy.service,jarate-deploy.timer,pi-bg-watchdog.service,pi-bg-watchdog.timer} from repo templates (%h specifiers)"
+      sdry "systemctl --user daemon-reload; loginctl enable-linger $(id -un); systemctl --user enable --now pi.service jarate-deploy.timer pi-bg-watchdog.timer"
+    else
+      command -v systemctl >/dev/null 2>&1 \
+        || die "setup: systemctl not found (need a systemd user session)"
+      export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      [ -f "$SETUP_DIR/deploy/pi.service" ] \
+        || die "setup: template missing: $SETUP_DIR/deploy/pi.service (old checkout? git pull)"
+      mkdir -p "$unit_dir" || die "setup: mkdir failed: $unit_dir"
+      sed "s#__AGENT_NAME__#${SETUP_NAME}#" "$SETUP_DIR/deploy/pi.service" \
+        > "$unit_dir/pi.service" || die "setup: pi.service write failed"
+      sed "s#%h/projects/jarate#${SETUP_DIR}#g" "$SETUP_DIR/deploy/jarate-deploy.service" \
+        > "$unit_dir/jarate-deploy.service" || die "setup: jarate-deploy.service write failed"
+      cp "$SETUP_DIR/deploy/jarate-deploy.timer" "$unit_dir/" \
+        || die "setup: jarate-deploy.timer copy failed"
+      cp "$SETUP_DIR/dispatch/pi-bg-watchdog.service" "$unit_dir/" \
+        || die "setup: pi-bg-watchdog.service copy failed"
+      cp "$SETUP_DIR/dispatch/pi-bg-watchdog.timer" "$unit_dir/" \
+        || die "setup: pi-bg-watchdog.timer copy failed"
+      systemctl --user daemon-reload || die "setup: daemon-reload failed"
+      loginctl enable-linger "$(id -un)" 2>/dev/null \
+        || slog "note: enable-linger needs root (loginctl enable-linger $(id -un))"
+      systemctl --user enable --now pi.service || die "setup: enable pi.service failed"
+      systemctl --user enable --now jarate-deploy.timer pi-bg-watchdog.timer \
+        || die "setup: enable timers failed"
+      slog "units installed + enabled (pi.service, jarate-deploy.timer, pi-bg-watchdog.timer)"
+    fi
+  fi
+
+  # --- 10. verify: journal gate (same signal deploy.sh trusts) ---------------
+  local verified="null"
+  if [ "$SETUP_VERIFY" = 1 ] && [ "$SETUP_DRY" = 0 ]; then
+    slog "boot gate: waiting <=90s for pi.service active + '[interactions] registered'"
+    local since ok=0 deadline
+    since="$(date '+%F %T')"
+    deadline=$(( $(date +%s) + ${JARATE_SETUP_GATE_S:-90} ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      if [ "$(systemctl --user is-active pi.service 2>/dev/null)" = "active" ] \
+         && journalctl --user -u pi.service --since "$since" --no-pager 2>/dev/null | grep -aq '\[interactions\] registered'; then
+        ok=1; break
+      fi
+      sleep "${JARATE_SETUP_POLL_S:-3}"
+    done
+    if [ "$ok" = 1 ]; then
+      verified="true"
+      slog "boot gate passed — send a message to the channel to confirm"
+    else
+      local tail
+      tail="$(journalctl --user -u pi.service --since "$since" --no-pager -n 20 2>/dev/null | tail -c 600 | tr '\n' '|')"
+      die "setup: boot gate failed (${JARATE_SETUP_GATE_S:-90}s). journal tail: $tail. usual suspects: H2 intents not enabled, H3 invite mask (MANAGE_WEBHOOKS 1<<21 / VIEW_CHANNEL), bad token"
+    fi
+  fi
+
+  # --- 11. report -------------------------------------------------------------
+  local -a steps_a=()
+  [ "$SETUP_DRY" = 1 ] && steps_a+=("re-run with --yes to execute (dry-run wrote nothing)")
+  [ -z "$prov_key" ] && steps_a+=("LLM creds: re-run with --model-base/--model-id/--model-key (H4) — agent boots but LLM calls fail")
+  steps_a+=("identity: author ~/AGENTS.md (per-agent, hand-written)")
+  steps_a+=("RAG (optional): docs/PGRAG-SETUP.md")
+  steps_a+=("web search (optional): cp $SETUP_DIR/extensions/mcp-tools.ts ~/.pi/agent/extensions/ + tavily key in settings.json mcp[]")
+  steps_a+=("peers (optional): invite bots to each other's guilds + peerBotIds in settings.json")
+  local steps
+  steps="$(printf '%s\n' "${steps_a[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  local units_out dry_json
+  if [ "$SETUP_DRY" = 1 ]; then
+    units_out="null"
+    dry_json=true
+  elif [ "$SETUP_UNITS" = 1 ]; then
+    units_out="true"
+    dry_json=false
+  else
+    units_out="null"
+    dry_json=false
+  fi
+
+  jq -cn \
+    --arg ts "$(ts_now)" \
+    --argjson dry "$dry_json" \
+    --arg agent "$SETUP_NAME" \
+    --arg ch "$SETUP_CH" \
+    --arg bot_id "$bot_id" \
+    --arg wb_id "$wb_id" \
+    --argjson units "$units_out" \
+    --argjson verified "$verified" \
+    --argjson steps "$steps" \
+    '{ok: true, ts: $ts, error: null, dry_run: $dry,
+      agent: $agent, channel: $ch,
+      bot_id: (if $bot_id == "" or $bot_id == "dry" then null else $bot_id end),
+      webhook_id: (if $wb_id == "" or $wb_id == "dry" then null else $wb_id end),
+      units: $units, verified: $verified, next_steps: $steps}' \
+    || die "setup: json assembly failed"
+}
+
+# ─── dispatch ─────────────────────────────────────────────────────────────────
 
 main() {
   local cmd="${1:-}"
@@ -636,9 +1021,10 @@ main() {
     "" | help | -h | --help)
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
-          commands: ["ctx-report", "journal-errors", "memory-grep", "rag",
-                     "agents-check", "agents-bless"]}'
+          commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
+                     "rag", "agents-check", "agents-bless"]}'
       ;;
+    setup) cmd_setup "${args[@]}" ;;
     ctx-report) cmd_ctx_report "${args[@]}" ;;
     journal-errors) cmd_journal_errors "${args[@]}" ;;
     memory-grep) cmd_memory_grep "${args[@]}" ;;
@@ -649,8 +1035,8 @@ main() {
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
-          commands: ["ctx-report", "journal-errors", "memory-grep", "rag",
-                     "agents-check", "agents-bless"]}'
+          commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
+                     "rag", "agents-check", "agents-bless"]}'
       exit 2
       ;;
   esac
