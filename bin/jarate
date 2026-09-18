@@ -652,7 +652,12 @@ for a in agents:
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     b["tokens"][k] += v
         c = r.get("cost_usd")
-        b["costs"].append(c if isinstance(c, (int, float)) else None)
+        # bool is an int subclass: a hand-edited "cost_usd": true must not
+        # count as priced (same guard the token sums use)
+        b["costs"].append(
+            c if isinstance(c, (int, float)) and not isinstance(c, bool)
+            else None
+        )
         st = r.get("started")
         if isinstance(st, str):
             if b["first"] is None or st < b["first"]:

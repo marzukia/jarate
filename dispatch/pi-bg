@@ -843,12 +843,16 @@ except ValueError:
     tmo = 10
 
 def load():
+    # None = corrupt or not an object (decode failure, or valid JSON that
+    # is a list/str/num). The caller must SKIP: never rewrite such a
+    # record with a cost-only dict (same discipline as bg_mark_record /
+    # bg_log_retry, which treat a corrupt record as skip).
     try:
         with open(rec_f) as fh:
             d = json.load(fh)
-        return d if isinstance(d, dict) else {}
+        return d if isinstance(d, dict) else None
     except Exception:
-        return {}
+        return None
 
 def save(rec):
     try:
@@ -895,13 +899,19 @@ def finish(cost, model, price_ts, price_error=None):
     rec["cost_usd"] = cost
     rec["model"] = model
     rec["price_ts"] = price_ts
-    if price_error:
-        rec["price_error"] = price_error
+    # unconditional: a capture that prices the run must clear a stale
+    # price_error left by an earlier (transiently failed) capture of the
+    # same run, and a failed capture records why
+    rec["price_error"] = price_error
     save(rec)
     if isinstance(cost, (int, float)):
         print("%.2f" % cost)
 
 rec = load()
+if rec is None:
+    # corrupt record: skip the whole capture, never clobber it with a
+    # cost-only dict (the run's identity + project tag would be lost)
+    raise SystemExit(0)
 tok = tokens_sum() if sess_f else None
 if tok is None:
     # no session file (test stubs, --no-session) or no assistant usage:
@@ -942,14 +952,22 @@ if price is None:
                 err = "parse failed"
             if isinstance(data, dict) and isinstance(data.get("data"), list):
                 entries = data["data"]
-                entry = next((m for m in entries if m.get("id") == MODEL), None)
+
+                def mid(m):
+                    # non-dict/None list entries must not raise: a
+                    # malformed entry degrades to an id miss, not a
+                    # masked "fetch/parse failed" (the fetch + parse
+                    # both succeeded)
+                    return str(m.get("id") or "") if isinstance(m, dict) else ""
+
+                entry = next((m for m in entries if mid(m) == MODEL), None)
                 if entry is None:  # fuzzy, same convention as pi-token-cost.py
                     cands = [m for m in entries
-                             if "qwen" in str(m.get("id", "")).lower()
-                             and "27b" in str(m.get("id", "")).lower()]
+                             if "qwen" in mid(m).lower()
+                             and "27b" in mid(m).lower()]
                     plain = [m for m in cands
-                             if "-vl" not in m.get("id", "")
-                             and "reasoning" not in str(m.get("id", "")).lower()]
+                             if "-vl" not in mid(m)
+                             and "reasoning" not in mid(m).lower()]
                     entry = (plain or cands or [None])[0]
                 if entry is None:
                     err = "model not found"
@@ -958,7 +976,10 @@ if price is None:
                     rates = {}
                     for k in ("prompt", "completion", "input_cache_read", "input_cache_write"):
                         v = pr.get(k)
-                        rates[k] = float(v) if v is not None else None
+                        try:
+                            rates[k] = float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            rates[k] = None
                     if rates["prompt"] is None or rates["completion"] is None:
                         err = "parse failed"
                     else:

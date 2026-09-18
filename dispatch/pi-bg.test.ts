@@ -2141,25 +2141,33 @@ describe("--project: tag, cost capture, callback line (2026-09-18)", () => {
   };
 
   // curl stub: canned OpenRouter pricing for the price URL, real curl for
-  // everything else (webhook capture keeps working)
-  const curlStub = (fx: { tmp: string }, mode: "canned" | "fail") => {
+  // everything else (webhook capture keeps working). "malformed" =
+  // well-formed fetch, malformed model list (non-dict entries, null ids)
+  const curlStub = (
+    fx: { tmp: string },
+    mode: "canned" | "fail" | "malformed",
+  ) => {
     const p = path.join(fx.tmp, "bin", "curl");
+    const canned =
+      '{"data":[{"id":"qwen/qwen3.8-27b","pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001","input_cache_write":"0.0000002"}}]}';
+    const malformed =
+      '{"data":[null,42,{"id":null},"qwen/qwen3.8-27b",{"pricing":{"prompt":"1"}}]}';
     const body =
-      mode === "canned"
+      mode === "fail"
         ? `#!/bin/sh
 for a in "$@"; do
   case "$a" in
-    http://prices.local/*)
-      printf '%s' '{"data":[{"id":"qwen/qwen3.8-27b","pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001","input_cache_write":"0.0000002"}}]}'
-      exit 0
-      ;;
+    http://prices.local/*) exit 7 ;;
   esac
 done
 exec /usr/bin/curl "$@"`
         : `#!/bin/sh
 for a in "$@"; do
   case "$a" in
-    http://prices.local/*) exit 7 ;;
+    http://prices.local/*)
+      printf '%s' '${mode === "malformed" ? malformed : canned}'
+      exit 0
+      ;;
   esac
 done
 exec /usr/bin/curl "$@"`;
@@ -2387,5 +2395,119 @@ exec /usr/bin/curl "$@"`;
     expect(rec.tokens?.total).toBe(186);
     expect(rec.cost_usd).toBeNull();
     expect(rec.price_error).toBe("fetch failed");
+  });
+
+  test("corrupt run record: capture skips, never overwrites with a cost-only dict (LOW-1)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const recDir = fx.env.PI_DISPATCH_RECORD_DIR;
+    // pi stub: write the session file, then truncate the run record
+    // mid-run (simulates an interrupted non-atomic record write)
+    const sess = path.join(
+      fx.home,
+      ".pi",
+      "agent-worker",
+      "sessions",
+      sessSlug(fx.tmp),
+    );
+    const line = JSON.stringify({
+      type: "message",
+      message: { role: "assistant", usage: USAGE },
+    });
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      `#!/bin/sh
+mkdir -p ${JSON.stringify(sess)}
+printf '%s\\n' ${JSON.stringify(line)} > ${JSON.stringify(path.join(sess, "s.jsonl"))}
+find ${JSON.stringify(recDir)} -name 'pi-bg-*.json' -exec sh -c 'printf "%s" "{\\"run\\": \\"20260918" > "$1"' _ {} \\;
+echo pi-run-ok
+`,
+    );
+    fs.chmodSync(piBin, 0o755);
+    const r = await fx.run([
+      "worker",
+      "--project",
+      "myproj",
+      "corrupt record task",
+    ]);
+    expect(r.code).toBe(0);
+    const files = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+    expect(files).toHaveLength(1);
+    const after = fs.readFileSync(path.join(recDir, files[0]), "utf8");
+    // the truncated content is intact: no capture (main flow or terminal
+    // trap) rewrote the corrupt record as a cost-only dict
+    expect(after).toBe('{"run": "20260918');
+    expect(after).not.toContain("cost_usd");
+  });
+
+  test("transient price failure then success: later capture clears price_error (LOW-2)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    const art = path.join(fx.tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    // stateful curl stub: the FIRST pricing fetch fails, the rest succeed
+    // (main-flow capture = call 1, terminal-trap capture = call 2)
+    const marker = path.join(fx.tmp, "price-failed-once");
+    const p = path.join(fx.tmp, "bin", "curl");
+    fs.writeFileSync(
+      p,
+      `#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    http://prices.local/*)
+      if [ -f ${JSON.stringify(marker)} ]; then
+        printf '%s' '{"data":[{"id":"qwen/qwen3.8-27b","pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001","input_cache_write":"0.0000002"}}]}'
+        exit 0
+      fi
+      touch ${JSON.stringify(marker)}
+      exit 7
+      ;;
+  esac
+done
+exec /usr/bin/curl "$@"`,
+    );
+    fs.chmodSync(p, 0o755);
+    const r = await fx.run([
+      "worker",
+      "--project",
+      "myproj",
+      "transient price task",
+    ]);
+    expect(r.code).toBe(0);
+    expect(fs.existsSync(marker)).toBe(true); // call 1 really failed
+    const rec = fx.records()[0];
+    expect(rec.tokens?.total).toBe(186);
+    // call 2 priced the run and cleared call 1's stale price_error
+    expect(rec.cost_usd).toBeCloseTo(0.00022, 5);
+    expect(rec.price_error ?? null).toBeNull();
+    expect(rec.model).toBe("qwen/qwen3.8-27b");
+  });
+
+  test("malformed model list: label is model-not-found, not masked fetch/parse (LOW-3)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    const art = path.join(fx.tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    curlStub(fx, "malformed");
+    const r = await fx.run([
+      "worker",
+      "--project",
+      "myproj",
+      "malformed list task",
+    ]);
+    expect(r.code).toBe(0);
+    const rec = fx.records()[0];
+    // fetch + parse succeeded; the list is just malformed (non-dict
+    // entries, null ids) -> the exact failure class, not "fetch failed"
+    expect(rec.price_error).toBe("model not found");
+    expect(rec.cost_usd).toBeNull();
+    expect(rec.tokens?.total).toBe(186); // tokens still kept
   });
 });

@@ -1,40 +1,116 @@
-# out — project-tags: `--project` cost itemisation + `jarate projects` rollups
+# out.md — review fix round (5 LOWs) + 16k-runout RCA
 
-Branch: `pi-bg/20260918-140425-2653975` (base `main`). Spec:
-`~/projects/project-tags-plan.md`. One feature, four pieces: pi-bg tag +
-cost capture, jarate cross-agent rollup, jarate historical backfill, docs.
-No live-box changes, no vLLM, no install run.
+Branch: `pi-bg/20260918-140425-2653975`, base commit `e228bdf5`
+(project-tags). All five LOW findings from `review-out.md` fixed, one
+hermetic test each, RCA doc included.
 
-## Where each piece landed
+## LOW-1 — `bg_capture_cost` must not clobber a corrupt run record
 
-| Piece | File | What |
-|---|---|---|
-| `--project <tag>` flag | `dispatch/pi-bg` | Fork-free arg-parse zone (case), rc 2 usage errors (missing value / bad tag / duplicate), tag stored in the run record as `"project": tag \| null` |
-| Cost capture | `dispatch/pi-bg` | New `bg_capture_cost` + shared `bg_session_file`: session token sum, OpenRouter-list pricing (`qwen/qwen3.8-27b`, exact then pi-token-cost.py fuzzy plain fallback), 24h price cache in `$PI_BG_TMPDIR/pi-bg-price-cache.json` (tmpdir ROOT, shared), bounded `curl --max-time` (`PI_BG_PRICING_URL` / `PI_BG_PRICING_TIMEOUT`, `JARATE_TOKEN_COST_PRICING_OFFLINE=1` = offline). Writes `tokens`, `cost_usd`, `model`, `price_ts` (+`price_error`: `offline` \| `fetch failed` \| `parse failed` \| `model not found`) to the record. Called from `bg_mark_record` (terminal paths, idempotent) and in the main flow before the webhook build (normal path) — the callback always carries the real cost. Never blocks or fails the run. |
-| Callback line | `dispatch/pi-bg` | `bg_build` gains `BG_PJ_TAG` / `BG_PJ_COST`; frame gets ONE line — `│ pj <tag> · $<cost 2dp>` (or `$-`) — appended LAST (right before `└`), clipped to the 40-col budget, so the ~1.8k truncation eats the tail, never the identity header |
-| `jarate projects` | `bin/jarate` | Cross-agent rollup of run records by tag. Single-quote-free base64 Python scanner (`PROJ_SCAN`) per agent; local home runs direct, peers via the existing `sshpass + sudo -u` hop (`jarate_scan`). Hop failure degrades the agent row (`scanned: null` + `error`) with a top-level `warn`; doc stays `ok:true`. Buckets: `runs` / `workers` / `reviewers` / per-field `tokens` / `cost_usd` / `cost_covered` / `first` / `last`. Untagged records -> `unspecified` bucket. **Cost null semantics:** `cost_usd` null if ANY contributing record is unpriced (never a partial sum); `cost_covered` = priced count. `--project` (unknown tag = one zeroed row, not an error), `--since YYYY-MM-DD` (shape-validated, string compare on `started`), `--agent` (no match = ok:false rc 1). Rows sort runs desc, project asc. |
-| `jarate projects-backfill` | `bin/jarate` | Tags untagged historical records. First match wins: `--set RUN=TAG` (validated, repeatable) > record `cwd` under `<home>/.pi-bg-wt/<repo>/` -> `<repo>` (source `worktree`) > `cwd` under `<home>/projects/<name>` -> `<name>` (source `cwd`) > per-agent default: owner `frank` -> `nestfinder`, else `unspecified` (source `default`). Writes `project` + `backfilled: true` + `backfilled_at` atomically (tmp + replace); **idempotent** — a record with a `project` is skipped, never overwritten. `--dry-run` plans without writing. `agents[].map` lists tagged (or would-be) records with their source; `total` sums the agents that answered. |
-| Tests | `dispatch/pi-bg.test.ts`, `bin/jarate.test.ts` | +8 pi-bg (tag storage, 3 usage errors, cost capture + cache write, webhook embed line + 40-col check, offline, no-session, fresh-cache + failing curl, stale-cache + failing curl) and +13 jarate (rollup incl. null semantics + sort, filters, unknown tag, since, agent, hop-fail degrade, empty, usage errors, dry-run, real + idempotency, --set, frank default via hop, backfill hop-fail, --set validation). Hermetic: stubbed `curl` (canned pricing URL, real curl passthrough for the webhook), stubbed `pi` writing the session file at run time (mtime must beat `-newermt @run_start`), `sshpass` stub that extracts the sudo-hop driver and execs it locally with `PI_HOME` selecting the peer fixture home. Updated the help-doc `commands` assertion + the shared missing-flag-value table. |
-| Docs | `docs/DISPATCH.md`, `docs/JARATE.md`, `bin/jarate` header | DISPATCH: usage line, new "Project tags" section (flag rule, record fields, pricing/cache/offline, never-blocks rule, callback line position), callback embed description updated. JARATE: both command sections with output shapes + null semantics + backfill rule order + idempotency; unknown-command `commands` example refreshed (was missing `setup` too). `bin/jarate` header usage + `COMMANDS` array + dispatch cases + unknown-command list updated. |
+- Fix: `dispatch/pi-bg` (`bg_capture_cost` python). `load()` now returns
+  `None` (was `{}`) on decode failure or non-dict JSON, and the capture
+  does `raise SystemExit(0)` when `rec is None` — the whole capture is
+  skipped, so a corrupt record is never rewritten as a cost-only dict.
+  Same skip-on-corrupt discipline as `bg_mark_record` / `bg_log_retry`.
+- Test: `dispatch/pi-bg.test.ts` — "corrupt run record: capture skips,
+  never overwrites with a cost-only dict (LOW-1)". pi stub truncates the
+  record mid-run to `{"run": "20260918`; asserts the file is byte-identical
+  after the run (both the main-flow capture and the terminal-trap capture
+  ran against it).
 
-## Verification
+## LOW-2 — stale `price_error` must clear when a later capture succeeds
 
-- `bun test` (repo root, 34 files): **922 pass, 7 skip, 0 fail** (2026-09-18 run; bridge + recall deps `bun install`ed in the fresh worktree first).
-- `bunx biome check .`: **0 errors** — 1 warning + 1 info remain, both pre-existing on `main` (baseline verified: main reports the identical 1+1).
-- `bun x tsc --noEmit`: clean in `packages/bridge` and `packages/recall` (the repo's tsc gates; no root tsconfig — `dispatch/` / `bin/` test files are bun-transpiled only, same as before).
-- `bash -n dispatch/pi-bg` + `bash -n bin/jarate`: clean.
-- `HOME=/tmp/fake bash install.sh --dry-run`: rc 0, clean.
-- Full-suite flake note: `#41 ... at cap: next dispatch refused` failed ONE full-suite run (15.5s records-waitTimeout); passes solo on this branch (1.08s), under sibling-file load (3/3), and on later full-suite runs. It is fleet-activity-sensitive by design (counts live `pi-bg` processes system-wide; 7 were live from other agents during the failed window). Not a regression: main's solo/sibling runs behave identically.
+- Fix: `dispatch/pi-bg` (`finish()`). `rec["price_error"] = price_error`
+  is now set unconditionally (null on success) instead of only when the
+  arg is truthy.
+- Test: `dispatch/pi-bg.test.ts` — "transient price failure then success:
+  later capture clears price_error (LOW-2)". Stateful curl stub: first
+  pricing fetch exits 7 (marker file proves it), second (terminal trap)
+  serves the canned price. Asserts final record has `cost_usd ≈ 0.00022`,
+  `price_error` null, tokens kept.
 
-## Spec deviations
+## LOW-3 — misleading error label for a malformed model list
 
-1. **Callback line prefix is `│`, not `├`** — spec-literal `│ pj <tag> · $<cost>`. In the jarate frame grammar (STYLE.md) `│` = continuation of the previous field line, which reads correctly: the project line follows the `cwd`/`branch` meta line. Placed LAST so truncation is tail-only.
-2. **Backfill "worktree" rule derives from record `cwd`** — real records carry no `worktree` field (verified across 120 live records: fields = run/profile/cwd/started/delivery/state/finished). `cwd` under `~/.pi-bg-wt/<repo>/<id>` is the source of truth; documented in JARATE.md.
-3. **`--since` is shape-validated only** (`YYYY-MM-DD`, same convention as `journal-errors --since`'s `since_is_abs`) — `2026-13-99` is accepted and filters via string compare. Semantic date validation would be a journal-errors-level change, out of scope.
-4. **Price cache lives in the tmpdir ROOT** (`$PI_BG_TMPDIR/pi-bg-price-cache.json`), not the per-run subdir — the cache must be shared across runs to be a cache; it is a single small JSON file, no per-run cleanup needed (the 24h freshness check handles staleness).
+- Fix: `dispatch/pi-bg` (fuzzy fallback). New `mid(m)` helper
+  (`str(m.get("id") or "") if isinstance(m, dict) else ""`) replaces the
+  bare `m.get(...)` derefs in the exact scan + both fuzzy
+  comprehensions, so non-dict/None entries degrade to an id miss instead
+  of raising into the outer `except` and masking the label as
+  "fetch failed". Also guarded the per-rate `float(v)` conversion
+  (same failure class: a non-numeric pricing value no longer escapes to
+  the outer except; it degrades to `None` -> "parse failed").
+- Test: `dispatch/pi-bg.test.ts` — "malformed model list: label is
+  model-not-found, not masked fetch/parse (LOW-3)". `curlStub` gained a
+  `malformed` mode: well-formed fetch, `data` = `[null, 42, {"id": null},
+  "qwen/qwen3.8-27b", {"pricing": {"prompt": "1"}}]`. Asserts
+  `price_error == "model not found"` (pre-fix: "fetch failed"),
+  `cost_usd` null, tokens kept.
 
-## Commit
+## LOW-4 — boolean `cost_usd` counted as priced in the rollup
 
-Single commit on `pi-bg/20260918-140425-2653975`: 7 files — the 6 code/doc
-files above + this report (+1632 / -39 across the code/docs). No `bun.lock`
-churn (fresh-worktree `bun install` resolved identical versions).
+- Fix: `bin/jarate` (rollup heredoc). Cost collection now uses the
+  bool-excluding guard the token sums already use:
+  `isinstance(c, (int, float)) and not isinstance(c, bool)` else `None`.
+- Test: `bin/jarate.test.ts` (projects) — "boolean cost_usd is not priced:
+  rollup rejects it (LOW-4)". Bucket with one numeric record (0.01) and
+  one `"cost_usd": true`. Pre-fix the bucket would report
+  `cost_usd: 1.01, cost_covered: 2`; asserts `cost_usd: null,
+  cost_covered: 1, runs: 2`.
+
+## LOW-5 — backfill `scanned` must not count non-dict record files
+
+- Fix: none needed — verified `git show e228bdf5:bin/jarate` (lines
+  475-477): the isinstance guard + `continue` already sit ABOVE
+  `scanned += 1` in BACKFILL_SCAN (the review's description has the
+  order reversed; PROJ_SCAN likewise skips non-dicts before building a
+  row). The requested end state was already met at the reviewed commit.
+- Test: `bin/jarate.test.ts` (projects-backfill) — "non-dict record files
+  are not scanned: totals reconcile (LOW-5)". Plants a JSON-array record
+  file + a corrupt file alongside the 4 dict seeds; asserts backfill
+  totals `{scanned: 4, tagged: 3, skipped: 1}` and that `projects`
+  (PROJ_SCAN) reports the same local `scanned: 4` — the two scanners
+  agree on the same input.
+
+## Discrimination check
+
+The 5 new tests run against the pre-fix scripts (`e228bdf5` versions of
+`dispatch/pi-bg` + `bin/jarate`): LOW-1, LOW-2, LOW-3, LOW-4 FAIL
+(LOW-3 reproduced as "fetch failed" vs expected "model not found");
+LOW-5 PASSES (code already correct, test pins the invariant). Against
+the fixed scripts all 5 PASS.
+
+## Final verification (worktree, post-biome-fix)
+
+```
+$ bun test
+ 928 pass
+ 7 skip
+ 0 fail
+ 3733 expect() calls
+Ran 935 tests across 34 files. [135.99s]
+```
+
+```
+$ bunx biome check .
+Checked 78 files in 203ms. No fixes applied.
+Found 1 warning.
+Found 1 info.
+```
+rc 0 — exactly the 2 pre-existing main-baseline findings
+(`bin/jarate.test.ts:910` useTemplate info, `bin/jarate.test.ts:938`
+noTemplateCurlyInString warning), none in this change's files.
+
+```
+$ bash -n dispatch/pi-bg && bash -n bin/jarate
+pi-bg: bash -n OK (rc 0)
+jarate: bash -n OK (rc 0)
+```
+
+## Commit contents
+
+- `dispatch/pi-bg` — LOW-1/2/3 fixes
+- `bin/jarate` — LOW-4 fix
+- `dispatch/pi-bg.test.ts` — 3 new tests + `curlStub` malformed mode
+- `bin/jarate.test.ts` — 2 new tests
+- `issues/rca-16k-thinking-runout.md` — new (16k thinking-runout RCA,
+  ticket 20260918-133528-1639646)
+- `out.md` — this file (replaces the round-1 out.md)

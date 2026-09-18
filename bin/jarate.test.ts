@@ -1577,6 +1577,44 @@ describe("projects", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
+  test("boolean cost_usd is not priced: rollup rejects it (LOW-4)", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    plantRecord(f.home, "pi-bg-n1.json", {
+      run: "n1",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: {
+        input: 100,
+        output: 10,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 110,
+      },
+      cost_usd: 0.01,
+    });
+    plantRecord(f.home, "pi-bg-n2.json", {
+      run: "n2",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-11T10:00:00Z",
+      tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11 },
+      cost_usd: true, // JSON true -> python bool: must not count as priced
+    });
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    const nf = d.projects.find((p: any) => p.project === "nestfinder");
+    expect(nf.runs).toBe(2);
+    // a bool would inflate the sum to 1.01 and count as covered; the
+    // bool-excluding guard keeps it unpriced -> bucket null, only the
+    // numeric record covered
+    expect(nf.cost_usd).toBeNull();
+    expect(nf.cost_covered).toBe(1);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
   test("--project filter keeps one bucket; unknown tag -> zeroed entry", async () => {
     const f = fixture();
     scanSshpass(f);
@@ -1762,6 +1800,28 @@ describe("projects-backfill", () => {
         "utf8",
       ),
     ).toBe(before);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("non-dict record files are not scanned: totals reconcile (LOW-5)", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seedLocal(f);
+    const runsDir = path.join(f.home, ".pi-dispatch", "runs");
+    // valid JSON that is not an object, plus a corrupt file: neither may
+    // count in scanned (they are in neither tagged nor skipped)
+    fs.writeFileSync(path.join(runsDir, "pi-bg-list.json"), "[1, 2, 3]\n");
+    fs.writeFileSync(path.join(runsDir, "pi-bg-corr.json"), '{"run": "corr"\n');
+    const r = await f.run(["projects-backfill"]);
+    expect(r.code).toBe(0);
+    const b = doc(r);
+    expect(b.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
+    // the rollup scanner agrees on the same input (scanned after the
+    // isinstance guard in both scanners)
+    const r2 = await f.run(["projects"]);
+    const d2 = doc(r2);
+    const local = d2.agents.find((a: any) => a.agent === "home");
+    expect(local.scanned).toBe(4);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
