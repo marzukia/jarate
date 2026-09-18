@@ -107,7 +107,7 @@ copy gets a one-liner ack, no re-work.
 ## pi-bg internals
 
 ```
-pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] "task"
+pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
 ```
 
 - Task = last positional argument. Pass-through `pi` flags allowed (the task
@@ -181,6 +181,48 @@ want it touching the working tree (or when two workers share a repo).
   commit/merge, and `git worktree remove <path>` when done.
 - Not a git repo → exit 3 before the agent starts.
 
+### Project tags (invoice itemisation, 2026-09-18)
+
+`--project <tag>` tags a run for cost rollups. Tag rule:
+`[a-z0-9][a-z0-9-]{0,31}`, one per run. Invalid tag, missing value, or a
+duplicate `--project` is a usage error (rc 2, one stderr line, no side
+effects — the flag is consumed in the fork-free arg-parse zone before the
+cap check, so a bad tag never touches the run record or the worktree).
+Untagged runs get `"project": null` in the record.
+
+On exit (terminal state or normal completion, before the callback build),
+`pi-bg` attributes the run's cost to the record:
+
+- **Tokens:** sum of assistant `usage` blocks in the run's session file
+  (the profile's sessions dir, files newer than run start). `total` =
+  input + output + cacheRead (cacheWrite excluded — pi-token-cost
+  convention).
+- **Pricing:** OpenRouter model list (`/api/v1/models`, `PI_BG_PRICING_URL`
+  overrides the URL, `PI_BG_PRICING_TIMEOUT` the curl bound, default 10s),
+  model `qwen/qwen3.8-27b` (exact, then the pi-token-cost.py fuzzy plain
+  fallback). A 24h price cache in
+  `$PI_BG_TMPDIR/pi-bg-price-cache.json` (tmpdir ROOT, shared across runs)
+  is reused while fresh, so only the first run in 24h pays the fetch.
+- **Cost:** input*prompt + output*completion + cacheRead*(cache_read or
+  prompt) + cacheWrite*(cache_write or prompt), rounded to 5 dp. Missing
+  cache rates bill at the prompt rate.
+- **Record fields:** `tokens {input, output, cacheRead, cacheWrite, total}`
+  and `cost_usd` + `model` + `price_ts` on success; on any pricing failure
+  `cost_usd` stays `null` and `price_error` records why: `offline`
+  (`JARATE_TOKEN_COST_PRICING_OFFLINE=1`), `fetch failed`, `parse failed`,
+  or `model not found`. No session file at all -> `tokens` null too.
+- **Never blocks the callback:** bounded curl + python timeout, every
+  failure tolerated. The callback always posts; the cost line degrades.
+
+Callback embed: when a tag is set, the frame gains ONE line —
+`│ pj <tag> · $<cost, 2dp>` (or `$-` when cost is null) — appended LAST,
+right before the `└` close, on purpose: the ~1.8k callback truncation eats
+the tail, never the identity header. The line is clipped to the 40-col
+frame budget.
+
+Rollup: `jarate projects` aggregates records by tag across agents (see
+JARATE.md).
+
 ### Callback protocol
 
 On completion, `pi-bg` posts to the Discord webhook:
@@ -193,7 +235,9 @@ On completion, `pi-bg` posts to the Discord webhook:
   `reviewer · PASS/FAIL`, `worker · DIED (no report)`, `worker · EMPTY`) -
   no glyphs in titles. Description is a framed block (box-drawing,
   <= 40 cols per line): `┌ ok · <run_id>` header + `├` meta lines
-  (repo/wt/branch, or cwd) + `└` close. Fields: `task` (first 200 chars),
+  (repo/wt/branch, or cwd) + an optional `│ pj <tag> · $<cost|$->` line
+  (LAST, only with `--project`; see Project tags) + `└` close. Fields:
+  `task` (first 200 chars),
   `result` (first 400 chars), plus `prompt` / `full output` links when
   `webdrop` is available (7d TTL).
 - **Status values:** `OK` (rc=0), `FAIL (rc=N)`, `EMPTY` (all attempts

@@ -1,86 +1,116 @@
-# out — wave 2c: in-session worktrees, ctx watch, run usage, jobs kill/tail, agent-say peers
+# out.md — review fix round (5 LOWs) + 16k-runout RCA
 
-Branch: `pi-bg/20260914-091714-3097` (base `main` @ 5df82b02, live-frame
-unification already in). Five features, all in `packages/bridge` + `bin` +
-`dispatch/peers.json`. No live-box changes.
+Branch: `pi-bg/20260918-140425-2653975`, base commit `e228bdf5`
+(project-tags). All five LOW findings from `review-out.md` fixed, one
+hermetic test each, RCA doc included.
 
-## Where each piece landed
+## LOW-1 — `bg_capture_cost` must not clobber a corrupt run record
 
-| Piece | Location |
-| --- | --- |
-| #12 `/new-worktree [ref]` | `packages/bridge/channel/worktree.ts` (new) — `newWorktree()`: git repo check, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, random 4, same shape as pi-bg run ids), `git worktree add -b pi-bg/<id> $PI_BG_WT_DIR/<repo>/<id> <ref>` (ref default `HEAD`), state in `<cwd>/.tmp/worktree.json`. Owner-only at the command layer. |
-| #12 `/merge-worktree [squash]` | `worktree.ts` — `mergeWorktree()`: MERGE_HEAD first (a conflicted merge is finalized via `git commit --no-edit` on retry), else `git merge <branch>` (keep; ff when possible) or `git merge --squash` + `git commit -m "squash-merge <branch>"`. Then `git worktree remove` (uncommitted changes block ONLY the removal, merge is kept + retry), `branch -d`/`-D`, state clear. Merges into the live checkout's CURRENT branch — the bridge never checks out another branch in the live repo. |
-| #13 ctx boundary notice | `packages/bridge/channel/ctxwatch.ts` (new) — `observeCtx()`: per-session-file tracker (`ctxWatchers` in index.ts, keyed by session file path), edge-triggered on `floor(pct/10) > lastStep`, upward only, first sample per session = silent baseline. Hooked in the `message_end` handler (after the `ch && agentBusy` guard, before the early-send) → one fenced `[ctx] N% (tok/window)` line per 10% boundary crossed per session. `/reset` = new session file = fresh baseline; `/compact` drop + re-cross below the last announced boundary is silent (once per boundary per session). Lowercase k (local `fmtTokensLC`, does not touch `fmtTokens`). |
-| #40 run usage line | `packages/bridge/channel/usage.ts` — `sumRunUsage(messages)` (assistant-only over `agent_end` `event.messages`; no dedup needed in-memory) + `hasUsage()`. `runUsageLine()` in index.ts → `│ ~219.4k tok · ~$0.096` (same pricing as `~/scripts/pi-token-cost.py`, 3-decimal est. cost). `runFrame()` gains an OPTIONAL trailing param, rendered right before the closing `└`, clipped to the 40-col budget — append-only, builder shape unchanged. Done AND failed frames carry it; zero-usage runs get no line. |
-| #40 `/usage last` | index.ts `case "usage"` intercepts `last` before `renderUsage`: unfenced (like the rest of the /usage family) `[usage] last run  HH:MM:SS  | 1 turns | in … | est $0.00`. In-memory (`lastRunUsage` box object — biome `noExportLet`), set on `agent_end`; `[!] no completed run yet (run one first)` before the first completed run. `usageLine` label widened to `string`; scope validation now admits `last` (renderUsage itself treats it as session scope — the command layer owns it). |
-| #44 `/jobs kill <id>` | `packages/bridge/channel/jobs.ts` — `jobsKill()`: ticket-id regex check, async `runPiBgScript("pi-bg-kill", [id])` (spawn, 20s SIGKILL timeout, 20k char cap, ENOENT → friendly "install.sh link missing"), `[ok] killed <id>` / `[!] <first output line>`, fenced via `jobWrapFence` (sized to the content's backtick runs). Owner-only. |
-| #44 `/jobs tail <id> [--n N]` | `jobs.ts` — `jobsTail()`: same runner over `pi-bg-tail <id> <n>`; `formatTail()` keeps the LAST 40 lines, notes `[..] N earlier lines`, hard-wraps at 40 cols, fenced. `--n` parsed in the command layer (clamped [1,200], bad value = usage line). Owner-only (tail reads a dispatch-user file). Bare `/jobs [json]` view unchanged, still open to all. |
-| #45 agent-say peer names | `bin/agent-say` — non-numeric `$1` resolved via `jq` against `~/.config/agent-fleet/peers.json`; unknown → `agent-say: unknown peer 'x' (add it to …)` exit 2 (before any curl); numeric targets pass through untouched. `dispatch/peers.json` (new) = repo default roster (monky/frank/jimmy). `install.sh` section 3b: one-time seed = repo default + own channel (name `$USER`, id read from settings.json via jq, file never written); existing file never clobbered; dry-run safe. |
+- Fix: `dispatch/pi-bg` (`bg_capture_cost` python). `load()` now returns
+  `None` (was `{}`) on decode failure or non-dict JSON, and the capture
+  does `raise SystemExit(0)` when `rec is None` — the whole capture is
+  skipped, so a corrupt record is never rewritten as a cost-only dict.
+  Same skip-on-corrupt discipline as `bg_mark_record` / `bg_log_retry`.
+- Test: `dispatch/pi-bg.test.ts` — "corrupt run record: capture skips,
+  never overwrites with a cost-only dict (LOW-1)". pi stub truncates the
+  record mid-run to `{"run": "20260918`; asserts the file is byte-identical
+  after the run (both the main-flow capture and the terminal-trap capture
+  ran against it).
 
-## Tests (all new, all passing)
+## LOW-2 — stale `price_error` must clear when a later capture succeeds
 
-- `channel/ctxwatch.test.ts` — 7: baseline silence, fire-on-cross, once per
-  boundary (jump 39.9→72 fires once at 72, not 4/5/6/7), step-edge fire,
-  99.6→"100%", bad samples (NaN/0-window/negative tokens/negative pct)
-  ignored without priming, downward silence + once-per-session semantics.
-- `channel/worktree.test.ts` — 10: ticket shape (fixed Date), state
-  load/missing/corrupted/stale, non-git cwd, create+state, second-new
-  refused, stale-allowed, merge keep (commit lands on live branch, worktree
-  + branch gone), squash (exactly 1 commit, branch force-deleted),
-  uncommitted blocks removal only (merge kept, retry finishes), conflict
-  (count + repo named, resolve + retry finalizes), empty-squash cleanup.
-- `channel/jobs.test.ts` — 8 new: kill success/unknown-id/no-script/
-  timeout, tail success/fence-sizing/backtick-run in output/line cap +
-  drop note/40-col wrap.
-- `channel/usage.test.ts` — 4 new `sumRunUsage` (mixed roles, non-assistant
-  ignored, bad fields clamped, empty) + scope-validation string update.
-- `bin/agent-say.test.ts` (new) — 8: numeric passthrough, peer resolve,
-  unknown peer exit 2 (no curl), no peers file, non-numeric value, `-`
-  stdin form, empty message, missing token.
-- `channel/index.test.ts` — 10 new integration (full harness, owner +
-  non-owner): matchCommand for all new commands, `runUsageLine` pricing,
-  `runFrame` trailing placement/40-col, `message_end` ctx notice end-to-end
-  (baseline silent / 41% fire / same-step silent / drop silent / 91% fire,
-  fenced), `ctxBoundaryNotice` null-safety, `agent_end` done frame PATCH
-  carries the trailing line, `/usage last` empty→populated (unfenced),
-  `/jobs kill|tail` owner gating + stub-script round trip + `--n`,
-  `/new-worktree`→commit→`/merge-worktree` full cycle (non-owner falls
-  through, already-active refused, state file, branch deleted).
+- Fix: `dispatch/pi-bg` (`finish()`). `rec["price_error"] = price_error`
+  is now set unconditionally (null on success) instead of only when the
+  arg is truthy.
+- Test: `dispatch/pi-bg.test.ts` — "transient price failure then success:
+  later capture clears price_error (LOW-2)". Stateful curl stub: first
+  pricing fetch exits 7 (marker file proves it), second (terminal trap)
+  serves the canned price. Asserts final record has `cost_usd ≈ 0.00022`,
+  `price_error` null, tokens kept.
 
-## Verification
+## LOW-3 — misleading error label for a malformed model list
 
-- `bun x tsc --noEmit` (bridge): clean.
-- `bunx biome check .` (repo root): 0 diagnostics (new/modified files only).
-- Full monorepo suite (`bun test`: bridge + recall + dispatch + bin):
-  731 pass / 0 fail / 7 skip (recall integration skips, unchanged).
-  Final gate = 3 sequential full runs, all 731/0. Also ran 41+ full
-  suites on this branch across stress loops; 3 sporadic single-test
-  failures, every one coinciding with concurrent test load while this
-  host's `/tmp` tmpfs sat at 98-100% inodes (tests `mkdtemp` under
-  `os.tmpdir()`); 14 full runs on base `main` @ 5df82b02 clean.
-  Environmental (inode pressure), not this batch's code — flagged for
-  the reviewer: if a single full-suite CI job flakes, re-run it.
-- `bash install.sh --dry-run` (fake HOME): clean; seed branch verified
-  live against a fake checkout: own-channel override, default-roster
-  fallback, no-clobber on re-run.
-- `bin/agent-say` smoke-tested against a stub curl: peer name → resolved
-  channel id on the wire, unknown peer exit 2, numeric passthrough.
+- Fix: `dispatch/pi-bg` (fuzzy fallback). New `mid(m)` helper
+  (`str(m.get("id") or "") if isinstance(m, dict) else ""`) replaces the
+  bare `m.get(...)` derefs in the exact scan + both fuzzy
+  comprehensions, so non-dict/None entries degrade to an id miss instead
+  of raising into the outer `except` and masking the label as
+  "fetch failed". Also guarded the per-rate `float(v)` conversion
+  (same failure class: a non-numeric pricing value no longer escapes to
+  the outer except; it degrades to `None` -> "parse failed").
+- Test: `dispatch/pi-bg.test.ts` — "malformed model list: label is
+  model-not-found, not masked fetch/parse (LOW-3)". `curlStub` gained a
+  `malformed` mode: well-formed fetch, `data` = `[null, 42, {"id": null},
+  "qwen/qwen3.8-27b", {"pricing": {"prompt": "1"}}]`. Asserts
+  `price_error == "model not found"` (pre-fix: "fetch failed"),
+  `cost_usd` null, tokens kept.
 
-## Notes / decisions
+## LOW-4 — boolean `cost_usd` counted as priced in the rollup
 
-- `runFrame` trailing line: optional 5th param — every existing call site
-  unchanged; the failed frame gets it too (spec: done/failed).
-- Ctx notice format: `[ctx] 41% (108k/262k)` — rounded pct, lowercase k,
-  no tag collision with the kimaki set (`[ctx]` is new, documented in
-  COMMANDS.md output-tag table).
-- Worktree ticket ids use a random 4-digit suffix (pi-bg uses pid there;
-  in-session there is no run process, so pid would mislead).
-- `lastRunUsage` + `ctxWatchers` exported as const containers (box pattern
-  / Map) for test reset, per biome `noExportLet`.
-- Docs: `docs/COMMANDS.md` updated (tag table, reference table, /usage
-  last, frame trailing line + [ctx] section, /jobs kill/tail, new
-  worktree section, agent-say peers). `HELP_TEXT` + `matchCommand` in
-  sync. `docs/DISPATCH.md` untouched (agent-say is not a dispatch
-  script; noted in COMMANDS.md instead).
-- Do-not-touch list respected: no `bin/jarate` changes, no drift-guard
-  sections, no live-box files, `bun.lock` only via `bun install`.
+- Fix: `bin/jarate` (rollup heredoc). Cost collection now uses the
+  bool-excluding guard the token sums already use:
+  `isinstance(c, (int, float)) and not isinstance(c, bool)` else `None`.
+- Test: `bin/jarate.test.ts` (projects) — "boolean cost_usd is not priced:
+  rollup rejects it (LOW-4)". Bucket with one numeric record (0.01) and
+  one `"cost_usd": true`. Pre-fix the bucket would report
+  `cost_usd: 1.01, cost_covered: 2`; asserts `cost_usd: null,
+  cost_covered: 1, runs: 2`.
+
+## LOW-5 — backfill `scanned` must not count non-dict record files
+
+- Fix: none needed — verified `git show e228bdf5:bin/jarate` (lines
+  475-477): the isinstance guard + `continue` already sit ABOVE
+  `scanned += 1` in BACKFILL_SCAN (the review's description has the
+  order reversed; PROJ_SCAN likewise skips non-dicts before building a
+  row). The requested end state was already met at the reviewed commit.
+- Test: `bin/jarate.test.ts` (projects-backfill) — "non-dict record files
+  are not scanned: totals reconcile (LOW-5)". Plants a JSON-array record
+  file + a corrupt file alongside the 4 dict seeds; asserts backfill
+  totals `{scanned: 4, tagged: 3, skipped: 1}` and that `projects`
+  (PROJ_SCAN) reports the same local `scanned: 4` — the two scanners
+  agree on the same input.
+
+## Discrimination check
+
+The 5 new tests run against the pre-fix scripts (`e228bdf5` versions of
+`dispatch/pi-bg` + `bin/jarate`): LOW-1, LOW-2, LOW-3, LOW-4 FAIL
+(LOW-3 reproduced as "fetch failed" vs expected "model not found");
+LOW-5 PASSES (code already correct, test pins the invariant). Against
+the fixed scripts all 5 PASS.
+
+## Final verification (worktree, post-biome-fix)
+
+```
+$ bun test
+ 928 pass
+ 7 skip
+ 0 fail
+ 3733 expect() calls
+Ran 935 tests across 34 files. [135.99s]
+```
+
+```
+$ bunx biome check .
+Checked 78 files in 203ms. No fixes applied.
+Found 1 warning.
+Found 1 info.
+```
+rc 0 — exactly the 2 pre-existing main-baseline findings
+(`bin/jarate.test.ts:910` useTemplate info, `bin/jarate.test.ts:938`
+noTemplateCurlyInString warning), none in this change's files.
+
+```
+$ bash -n dispatch/pi-bg && bash -n bin/jarate
+pi-bg: bash -n OK (rc 0)
+jarate: bash -n OK (rc 0)
+```
+
+## Commit contents
+
+- `dispatch/pi-bg` — LOW-1/2/3 fixes
+- `bin/jarate` — LOW-4 fix
+- `dispatch/pi-bg.test.ts` — 3 new tests + `curlStub` malformed mode
+- `bin/jarate.test.ts` — 2 new tests
+- `issues/rca-16k-thinking-runout.md` — new (16k thinking-runout RCA,
+  ticket 20260918-133528-1639646)
+- `out.md` — this file (replaces the round-1 out.md)

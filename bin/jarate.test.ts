@@ -186,6 +186,8 @@ describe("entrypoint", () => {
       "journal-errors",
       "memory-grep",
       "rag",
+      "projects",
+      "projects-backfill",
       "agents-check",
       "agents-bless",
     ]);
@@ -285,6 +287,11 @@ describe("ctx-report", () => {
       [["journal-errors", "--agent"], "--agent needs a value"],
       [["memory-grep", "q", "--root"], "--root needs a value"],
       [["rag", "q", "--project"], "--project needs a value"],
+      [["projects", "--project"], "--project needs a value"],
+      [["projects", "--since"], "--since needs a value"],
+      [["projects", "--agent"], "--agent needs a value"],
+      [["projects-backfill", "--agent"], "--agent needs a value"],
+      [["projects-backfill", "--set"], "--set needs a value"],
     ];
     for (const [args, msg] of cases) {
       const r = await f.run(args);
@@ -1405,6 +1412,540 @@ describe("setup", () => {
     expect(dj.ok).toBe(true);
     expect(dj.agent).toBe(ds.agent);
     expect(dj.next_steps).toEqual(ds.next_steps);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── projects / projects-backfill ───────────────────────────────────────────
+// Cross-agent run-record rollup (2026-09-18). Hermetic: fake homes, records
+// planted under <home>/.pi-dispatch/runs, and an sshpass stub that extracts
+// the driver out of the sudo hop and execs it locally (PI_HOME selects the
+// peer's home), so the "remote" scan runs against the fixture files.
+
+/**
+ * sshpass stub for the scan hop: the last arg is the remote command
+ * `echo 'pass' | sudo -S -u 'owner' bash -c '<driver>'` — strip through
+ * `bash -c '` and the trailing quote, then run the driver in this shell.
+ */
+function scanSshpass(f: Fixture, fail = false): void {
+  const sp = path.join(f.bin, "sshpass");
+  fs.writeFileSync(
+    sp,
+    fail
+      ? "#!/bin/sh\necho 'ssh: refused' >&2\nexit 255\n"
+      : `#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+q="'"
+rest="\${last#*"bash -c "$q}"
+driver="\${rest%"$q"}"
+exec sh -c "$driver"
+`,
+  );
+  fs.chmodSync(sp, 0o755);
+}
+
+function plantRecord(
+  homeDir: string,
+  name: string,
+  rec: Record<string, unknown>,
+): void {
+  const d = path.join(homeDir, ".pi-dispatch", "runs");
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, name), JSON.stringify(rec, null, 2));
+}
+
+const readRecord = (homeDir: string, name: string): Record<string, unknown> =>
+  JSON.parse(
+    fs.readFileSync(path.join(homeDir, ".pi-dispatch", "runs", name), "utf8"),
+  );
+
+describe("projects", () => {
+  const seed = (f: Fixture) => {
+    // local home: 3 records (2 nestfinder, 1 untagged)
+    plantRecord(f.home, "pi-bg-aaa.json", {
+      run: "aaa",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: {
+        input: 100,
+        output: 10,
+        cacheRead: 5,
+        cacheWrite: 1,
+        total: 115,
+      },
+      cost_usd: 0.01,
+    });
+    plantRecord(f.home, "pi-bg-bbb.json", {
+      run: "bbb",
+      profile: "reviewer",
+      started: "2026-09-11T10:00:00Z",
+    });
+    plantRecord(f.home, "pi-bg-ccc.json", {
+      run: "ccc",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-12T10:00:00Z",
+      tokens: { input: 50, output: 5, cacheRead: 0, cacheWrite: 0, total: 55 },
+      cost_usd: null,
+    });
+    // peer home: 1 fully-priced record
+    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-ddd.json", {
+      run: "ddd",
+      profile: "worker",
+      project: "jarate",
+      started: "2026-09-09T10:00:00Z",
+      tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11 },
+      cost_usd: 0.001,
+    });
+  };
+
+  test("cross-agent rollup: buckets, token sums, cost null semantics, sort", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seed(f);
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(Object.keys(d)).toEqual([
+      "ok",
+      "ts",
+      "error",
+      "since",
+      "project",
+      "warn",
+      "projects",
+      "agents",
+    ]);
+    expect(d.since).toBeNull();
+    expect(d.project).toBeNull();
+    expect(d.warn).toBeNull();
+    expect(d.agents).toEqual([
+      { agent: "home", source: "local", scanned: 3, error: null },
+      { agent: "peer-home", source: "ssh+sudo", scanned: 1, error: null },
+    ]);
+    // sort: runs desc, then project asc
+    expect(d.projects.map((p: any) => p.project)).toEqual([
+      "nestfinder",
+      "jarate",
+      "unspecified",
+    ]);
+    const [nf, jt, un] = d.projects;
+    expect(nf).toEqual({
+      project: "nestfinder",
+      runs: 2,
+      workers: 2,
+      reviewers: 0,
+      tokens: {
+        input: 150,
+        output: 15,
+        cacheRead: 5,
+        cacheWrite: 1,
+        total: 170,
+      },
+      // one record unpriced -> the bucket is null, never a partial sum
+      cost_usd: null,
+      cost_covered: 1,
+      first: "2026-09-10T10:00:00Z",
+      last: "2026-09-12T10:00:00Z",
+    });
+    expect(jt).toEqual({
+      project: "jarate",
+      runs: 1,
+      workers: 1,
+      reviewers: 0,
+      tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11 },
+      cost_usd: 0.001,
+      cost_covered: 1,
+      first: "2026-09-09T10:00:00Z",
+      last: "2026-09-09T10:00:00Z",
+    });
+    expect(un).toEqual({
+      project: "unspecified",
+      runs: 1,
+      workers: 0,
+      reviewers: 1,
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost_usd: null,
+      cost_covered: 0,
+      first: "2026-09-11T10:00:00Z",
+      last: "2026-09-11T10:00:00Z",
+    });
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("boolean cost_usd is not priced: rollup rejects it (LOW-4)", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    plantRecord(f.home, "pi-bg-n1.json", {
+      run: "n1",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: {
+        input: 100,
+        output: 10,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 110,
+      },
+      cost_usd: 0.01,
+    });
+    plantRecord(f.home, "pi-bg-n2.json", {
+      run: "n2",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-11T10:00:00Z",
+      tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11 },
+      cost_usd: true, // JSON true -> python bool: must not count as priced
+    });
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    const nf = d.projects.find((p: any) => p.project === "nestfinder");
+    expect(nf.runs).toBe(2);
+    // a bool would inflate the sum to 1.01 and count as covered; the
+    // bool-excluding guard keeps it unpriced -> bucket null, only the
+    // numeric record covered
+    expect(nf.cost_usd).toBeNull();
+    expect(nf.cost_covered).toBe(1);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("--project filter keeps one bucket; unknown tag -> zeroed entry", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seed(f);
+    const r1 = await f.run(["projects", "--project", "nestfinder"]);
+    const d1 = doc(r1);
+    expect(d1.project).toBe("nestfinder");
+    expect(d1.projects).toHaveLength(1);
+    expect(d1.projects[0].project).toBe("nestfinder");
+    expect(d1.projects[0].runs).toBe(2);
+    const r2 = await f.run(["projects", "--project", "nosuch"]);
+    const d2 = doc(r2);
+    expect(d2.ok).toBe(true);
+    expect(d2.projects).toEqual([
+      {
+        project: "nosuch",
+        runs: 0,
+        workers: 0,
+        reviewers: 0,
+        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        cost_usd: null,
+        cost_covered: 0,
+        first: null,
+        last: null,
+      },
+    ]);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("--since drops older records (string compare on started)", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seed(f);
+    const r = await f.run(["projects", "--since", "2026-09-11"]);
+    const d = doc(r);
+    expect(d.since).toBe("2026-09-11");
+    // aaa (09-10) and ddd (09-09) gone; ccc (09-12) + bbb (09-11) kept
+    expect(d.projects.map((p: any) => p.project)).toEqual([
+      "nestfinder",
+      "unspecified",
+    ]);
+    const nf = d.projects.find((p: any) => p.project === "nestfinder");
+    expect(nf.runs).toBe(1);
+    expect(nf.first).toBe("2026-09-12T10:00:00Z");
+    expect(nf.cost_covered).toBe(0);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("--agent narrows to one agent; no match -> ok:false rc 1", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seed(f);
+    const r1 = await f.run(["projects", "--agent", "peer-home"]);
+    const d1 = doc(r1);
+    expect(d1.agents).toEqual([
+      { agent: "peer-home", source: "ssh+sudo", scanned: 1, error: null },
+    ]);
+    expect(d1.projects.map((p: any) => p.project)).toEqual(["jarate"]);
+    const r2 = await f.run(["projects", "--agent", "nosuch"]);
+    expect(r2.code).toBe(1);
+    const d2 = doc(r2);
+    expect(d2.ok).toBe(false);
+    expect(d2.error).toContain("no agents matched");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("peer hop failing -> row error + warn, local data intact, still ok", async () => {
+    const f = fixture();
+    scanSshpass(f, true);
+    seed(f);
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.warn).toBe("agent hop failed: peer-home");
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.scanned).toBeNull();
+    expect(peer.error).toContain("cross-user hop failed");
+    // local records still rolled up
+    expect(d.projects.map((p: any) => p.project)).toEqual([
+      "nestfinder",
+      "unspecified",
+    ]);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("bad --since and invalid --project tag -> rc 2 usage errors", async () => {
+    const f = fixture();
+    const r1 = await f.run(["projects", "--since", "2026-13"]);
+    expect(r1.code).toBe(2);
+    expect(doc(r1).error).toContain("bad --since");
+    const r2 = await f.run(["projects", "--project", "Bad_Tag"]);
+    expect(r2.code).toBe(2);
+    expect(doc(r2).error).toContain("invalid --project tag");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("no run records anywhere -> ok, empty projects, zero agent scans", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.projects).toEqual([]);
+    expect(d.agents.map((a: any) => a.scanned)).toEqual([0, 0]);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+});
+
+describe("projects-backfill", () => {
+  const seedLocal = (f: Fixture) => {
+    // cwd under ~/projects/<name> -> "cwd" rule
+    plantRecord(f.home, "pi-bg-r1.json", {
+      run: "r1",
+      profile: "worker",
+      cwd: `${f.home}/projects/nestfinder/sub`,
+      started: "2026-09-01T00:00:00Z",
+    });
+    // cwd under ~/.pi-bg-wt/<repo>/<id> -> "worktree" rule
+    plantRecord(f.home, "pi-bg-r2.json", {
+      run: "r2",
+      profile: "worker",
+      cwd: `${f.home}/.pi-bg-wt/jarate/20260918-123`,
+      started: "2026-09-02T00:00:00Z",
+    });
+    // no derivation -> per-agent default (home != frank -> unspecified)
+    plantRecord(f.home, "pi-bg-r3.json", {
+      run: "r3",
+      profile: "reviewer",
+      cwd: "/tmp/elsewhere",
+      started: "2026-09-03T00:00:00Z",
+    });
+    // already tagged -> skipped, never overwritten
+    plantRecord(f.home, "pi-bg-r4.json", {
+      run: "r4",
+      profile: "worker",
+      project: "existing",
+      cwd: "/tmp/x",
+      started: "2026-09-04T00:00:00Z",
+    });
+  };
+
+  test("--dry-run plans without writing; sources per rule", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seedLocal(f);
+    const before = fs.readFileSync(
+      path.join(f.home, ".pi-dispatch", "runs", "pi-bg-r1.json"),
+      "utf8",
+    );
+    const r = await f.run(["projects-backfill", "--dry-run"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.error).toBeNull();
+    expect(Object.keys(d)).toEqual([
+      "ok",
+      "ts",
+      "error",
+      "dry_run",
+      "agents",
+      "total",
+    ]);
+    expect(d.dry_run).toBe(true);
+    expect(d.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
+    const local = d.agents.find((a: any) => a.agent === "home");
+    expect(local.source).toBe("local");
+    expect(local.error).toBeNull();
+    expect(local.map).toEqual([
+      { run: "r1", project: "nestfinder", source: "cwd" },
+      { run: "r2", project: "jarate", source: "worktree" },
+      { run: "r3", project: "unspecified", source: "default" },
+    ]);
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.source).toBe("ssh+sudo");
+    expect(peer.scanned).toBe(0);
+    expect(peer.map).toEqual([]);
+    // nothing written
+    expect(
+      fs.readFileSync(
+        path.join(f.home, ".pi-dispatch", "runs", "pi-bg-r1.json"),
+        "utf8",
+      ),
+    ).toBe(before);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("non-dict record files are not scanned: totals reconcile (LOW-5)", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seedLocal(f);
+    const runsDir = path.join(f.home, ".pi-dispatch", "runs");
+    // valid JSON that is not an object, plus a corrupt file: neither may
+    // count in scanned (they are in neither tagged nor skipped)
+    fs.writeFileSync(path.join(runsDir, "pi-bg-list.json"), "[1, 2, 3]\n");
+    fs.writeFileSync(path.join(runsDir, "pi-bg-corr.json"), '{"run": "corr"\n');
+    const r = await f.run(["projects-backfill"]);
+    expect(r.code).toBe(0);
+    const b = doc(r);
+    expect(b.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
+    // the rollup scanner agrees on the same input (scanned after the
+    // isinstance guard in both scanners)
+    const r2 = await f.run(["projects"]);
+    const d2 = doc(r2);
+    const local = d2.agents.find((a: any) => a.agent === "home");
+    expect(local.scanned).toBe(4);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("real run writes project + backfilled + backfilled_at; idempotent", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seedLocal(f);
+    const r1 = await f.run(["projects-backfill"]);
+    const d1 = doc(r1);
+    expect(d1.dry_run).toBe(false);
+    expect(d1.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
+    const rec = readRecord(f.home, "pi-bg-r1.json");
+    expect(rec.project).toBe("nestfinder");
+    expect(rec.backfilled).toBe(true);
+    expect(rec.backfilled_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(rec.cwd).toBe(`${f.home}/projects/nestfinder/sub`); // intact
+    const rec2 = readRecord(f.home, "pi-bg-r2.json");
+    expect(rec2.project).toBe("jarate");
+    const rec4 = readRecord(f.home, "pi-bg-r4.json");
+    expect(rec4.project).toBe("existing"); // never overwritten
+    expect("backfilled" in rec4).toBe(false);
+    // idempotent second pass: everything already tagged
+    const r2 = await f.run(["projects-backfill"]);
+    const d2 = doc(r2);
+    expect(d2.total).toEqual({ scanned: 4, tagged: 0, skipped: 4 });
+    const local = d2.agents.find((a: any) => a.agent === "home");
+    expect(local.map).toEqual([]);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("--set overrides derivation for the named run", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    seedLocal(f);
+    const r = await f.run(["projects-backfill", "--set", "r1=custom-tag"]);
+    const d = doc(r);
+    const local = d.agents.find((a: any) => a.agent === "home");
+    const m1 = local.map.find((m: any) => m.run === "r1");
+    expect(m1).toEqual({ run: "r1", project: "custom-tag", source: "set" });
+    // others unaffected by the set
+    const m2 = local.map.find((m: any) => m.run === "r2");
+    expect(m2.source).toBe("worktree");
+    expect(readRecord(f.home, "pi-bg-r1.json").project).toBe("custom-tag");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("frank home defaults to nestfinder (peer hop); --agent narrows", async () => {
+    const f = fixture();
+    scanSshpass(f);
+    const frankHome = path.join(f.tmp, "frank");
+    fs.mkdirSync(frankHome, { recursive: true });
+    plantRecord(frankHome, "pi-bg-f1.json", {
+      run: "f1",
+      profile: "worker",
+      cwd: "/tmp/zz",
+      started: "2026-09-05T00:00:00Z",
+    });
+    plantRecord(f.home, "pi-bg-l1.json", {
+      run: "l1",
+      profile: "worker",
+      cwd: "/tmp/yy",
+      started: "2026-09-06T00:00:00Z",
+    });
+    const homes = `${f.home}:${frankHome}`;
+    const r = await f.run(["projects-backfill"], { JARATE_AGENT_HOMES: homes });
+    const d = doc(r);
+    const frank = d.agents.find((a: any) => a.agent === "frank");
+    expect(frank.source).toBe("ssh+sudo");
+    expect(frank.map).toEqual([
+      { run: "f1", project: "nestfinder", source: "default" },
+    ]);
+    const local = d.agents.find((a: any) => a.agent === "home");
+    expect(local.map).toEqual([
+      { run: "l1", project: "unspecified", source: "default" },
+    ]);
+    expect(readRecord(frankHome, "pi-bg-f1.json").project).toBe("nestfinder");
+    // --agent narrows to the frank home only
+    const r2 = await f.run(["projects-backfill", "--agent", "frank"], {
+      JARATE_AGENT_HOMES: homes,
+    });
+    const d2 = doc(r2);
+    expect(d2.agents).toHaveLength(1);
+    expect(d2.agents[0].agent).toBe("frank");
+    expect(d2.total).toEqual({ scanned: 1, tagged: 0, skipped: 1 });
+    const r3 = await f.run(["projects-backfill", "--agent", "nosuch"], {
+      JARATE_AGENT_HOMES: homes,
+    });
+    expect(r3.code).toBe(1);
+    expect(doc(r3).error).toContain("no agents matched");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("peer hop failing -> row error, totals count the local agent only", async () => {
+    const f = fixture();
+    scanSshpass(f, true);
+    seedLocal(f);
+    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-p1.json", {
+      run: "p1",
+      profile: "worker",
+      cwd: "/tmp/p",
+    });
+    const r = await f.run(["projects-backfill"]);
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.scanned).toBeNull();
+    expect(peer.error).toContain("cross-user hop failed");
+    expect(d.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("--set validation: no '=', empty run, bad tag -> rc 2", async () => {
+    const f = fixture();
+    const cases: Array<[string[], string]> = [
+      [["projects-backfill", "--set", "novalue"], "wants <run>=<tag>"],
+      [["projects-backfill", "--set", "=tag"], "wants <run>=<tag>"],
+      [["projects-backfill", "--set", "r1=Bad_Tag"], "invalid tag"],
+    ];
+    for (const [args, frag] of cases) {
+      const r = await f.run(args);
+      expect(r.code).toBe(2);
+      expect(doc(r).error).toContain(frag);
+    }
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pi-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
-# usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] "task"
+# usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
 #   (workdir must be a git repo for --worktree; plain runs work anywhere)
 #   pi-bg --help prints this header.
 #
@@ -11,6 +11,18 @@
 #   $PI_BG_WT_DIR/<repo>/<id> (default ~/.pi-bg-wt/<repo>/<id>),
 #   branch pi-bg/<id>. The worktree is KEPT after the run so the orchestrator
 #   can diff/commit/merge it; path + branch are printed and in the callback.
+#
+# --project <tag>: project tag for invoice itemisation (2026-09-18).
+#   tag: [a-z0-9][a-z0-9-]{0,31}, one per run; invalid/missing value =
+#   usage error (rc 2, no side effects). Stored in the run record
+#   ("project": tag | null). At exit the run's session tokens +
+#   OpenRouter-list cost (qwen/qwen3.8-27b rate, 24h price cache in
+#   $PI_BG_TMPDIR/pi-bg-price-cache.json) are attributed to the record
+#   and one "│ pj <tag> · $<cost>" line is appended to the callback
+#   embed. Cost capture is bounded + failure-tolerant: it never blocks
+#   or fails the callback (no session file / price error -> null fields).
+#
+#   jarate projects / projects-backfill roll up records by tag (docs/JARATE.md).
 #
 # On completion, posts a callback to the configured Discord webhook:
 #   webhook URL from $PI_DISPATCH_WEBHOOK or ~/.config/pi-dispatch/webhook
@@ -114,23 +126,37 @@ esac
 
 export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
 
-# --- optional --worktree [ref] (consumed before pi flags) ---
+# --- optional --worktree [ref] + --project <tag> (consumed before pi flags) ---
 # builtin-only on purpose: this zone must stay fork-free for the cap
 # check below (a forked child keeps this wrapper's argv until it execs;
 # a sibling wrapper scanning at the same instant would count it).
 wt_ref=""
 wt_mode=0
+pj_tag=""
 args=()
 while [ $# -gt 0 ]; do
-  if [ "$1" = "--worktree" ]; then
-    wt_mode=1
-    shift
-    # ref is the next arg only if something follows and it is not another flag
-    if [ $# -ge 2 ] && [ "${1#-}" = "$1" ]; then wt_ref="$1"; shift; fi
-  else
-    args+=("$1")
-    shift
-  fi
+  case "$1" in
+    --worktree)
+      wt_mode=1
+      shift
+      # ref is the next arg only if something follows and it is not another flag
+      if [ $# -ge 2 ] && [ "${1#-}" = "$1" ]; then wt_ref="$1"; shift; fi
+      ;;
+    --project)
+      # usage errors here: rc 2, one stderr line, no side effects (the run
+      # record, worktree add and cgroup escape all happen after this zone)
+      shift
+      [ $# -ge 1 ] || { echo "pi-bg: --project needs a value (tag: [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
+      [ -z "$pj_tag" ] || { echo "pi-bg: --project given twice (one tag per run)" >&2; exit 2; }
+      pj_tag="$1"
+      [[ "$pj_tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "pi-bg: invalid --project tag: $pj_tag (want [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
 done
 set -- "${args[@]+"${args[@]}"}"
 
@@ -359,12 +385,14 @@ else
 fi
 rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 mkdir -p "$rec_dir" 2>/dev/null
-PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_CWD="$(pwd)" \
+PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_PROJECT="$pj_tag" \
+PI_BG_REC_CWD="$(pwd)" \
 PI_BG_REC_DELIVERY="$delivery" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' 2>/dev/null || true
 import datetime, json, os, sys
 rec = {
     "run": os.environ["PI_BG_REC_RUN"],
     "profile": os.environ["PI_BG_REC_PROFILE"],
+    "project": os.environ["PI_BG_REC_PROJECT"] or None,
     "cwd": os.environ["PI_BG_REC_CWD"],
     "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "delivery": os.environ["PI_BG_REC_DELIVERY"],
@@ -531,6 +559,7 @@ bg_build() {
   BG_WT="$wt_path" BG_BRANCH="$wt_branch" BG_CWD="$(pwd)" BG_RUN="$run_id" \
   BG_WORKTREE="$wt_mode" BG_REPO="$wt_repo" \
   BG_PURL="$purl" BG_OURL="$ourl" \
+  BG_PJ_TAG="$pj_tag" BG_PJ_COST="${BG_PJ_COST:-}" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
 E = lambda k: os.environ.get("BG_" + k, "")
@@ -585,6 +614,15 @@ if E("WORKTREE") == "1":
     desc_lines.append(kv("branch", E("BRANCH")))
 else:
     desc_lines.append(kv("cwd", E("CWD"), head=True))
+if E("PJ_TAG"):
+    # project line (2026-09-18): LAST in the frame on purpose - the 1.8k
+    # callback truncation eats the tail (fields), never the identity
+    # header. cost null -> "$-".
+    pj = E("PJ_TAG") + " \u00b7 $" + (E("PJ_COST") or "-")
+    line = "\u2502 pj " + pj
+    if len(line) > FRAME_W:
+        line = "\u2502 pj " + clip_end(pj, FRAME_W - 5)
+    desc_lines.append(line)
 desc_lines.append("\u2514")
 desc = "```bash\n" + "\n".join(desc_lines) + "\n```"
 
@@ -629,6 +667,15 @@ rec["state"] = os.environ.get("PI_BG_REC_STATE", "done")
 rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 json.dump(rec, open(p, "w"), indent=2)
 PY
+  # cost capture (2026-09-18, --project): attribute this run's session
+  # tokens + cost on EVERY terminal path (done/failed/DIED/killed). The
+  # main flow already captured before its callback so the embed line
+  # carries the real number; this second call is a cache-hit re-read
+  # (idempotent) that covers the paths it did not. Bounded + failure-
+  # tolerant; the echo feeds BG_PJ_COST for the DIED embed line.
+  if [ -n "$pj_tag" ]; then
+    BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
+  fi
 }
 
 # bg_on_exit: cgroup cleanup + the 'died without report' fallback + per-run
@@ -751,19 +798,230 @@ SILENT_TAIL_MAX="${PI_BG_SILENT_TAIL_MAX:-900}"
 att_start=0
 silent_retried=0
 
+# bg_session_file: the profile session jsonl written for this run after run
+# start (shared by bg_silent_tail and bg_capture_cost so both consumers stay
+# identical): slug from wt_path (worktree runs) else $PWD, dir
+# $PI_CODING_AGENT_DIR/sessions/<slug>, newest *.jsonl newermt the run start
+# epoch. Echoes the path; echoes nothing when there is no match (test stubs,
+# --no-session).
+bg_session_file() {
+  local slug sd sf
+  if [ "$wt_mode" -eq 1 ]; then slug="$wt_path"; else slug="$PWD"; fi
+  slug="--${slug#/}"; slug="${slug//\//-}--"
+  sd="$PI_CODING_AGENT_DIR/sessions/$slug"
+  sf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "@$run_start_epoch" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  [ -n "$sf" ] && printf '%s' "$sf"
+}
+
+# bg_capture_cost: attribute THIS run's session tokens + OpenRouter-list cost
+# to the run record (2026-09-18, --project, invoice itemisation). Echoes the
+# cost (2dp) for the callback project line; empty echo = cost unknown.
+#   - only runs when --project was set (pj_tag); never fails the run
+#   - no session file / no assistant usage -> tokens+cost+model+price_ts null
+#   - JARATE_TOKEN_COST_PRICING_OFFLINE set -> tokens only, cost null
+#   - price: qwen/qwen3.8-27b OpenRouter LIST rate (same convention as
+#     ~/scripts/pi-token-cost.py + NF invoices), cached 24h in
+#     $PI_BG_TMPDIR/pi-bg-price-cache.json; one bounded curl on cache miss;
+#     ANY fetch/parse failure -> cost null + price_error (tokens still kept)
+bg_capture_cost() {
+  [ -n "$pj_tag" ] || return 0
+  [ -f "$rec_dir/pi-bg-${run_id}.json" ] || return 0
+  PI_BG_PJ_FILE="$rec_dir/pi-bg-${run_id}.json" \
+  PI_BG_PJ_CACHE="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}/pi-bg-price-cache.json" \
+  PI_BG_PJ_SESSION="$(bg_session_file)" \
+  python3 - <<'PY' 2>/dev/null
+import datetime, json, os, subprocess
+
+MODEL = "qwen/qwen3.8-27b"
+rec_f = os.environ["PI_BG_PJ_FILE"]
+cache_f = os.environ.get("PI_BG_PJ_CACHE", "")
+sess_f = os.environ.get("PI_BG_PJ_SESSION", "")
+url = os.environ.get("PI_BG_PRICING_URL", "https://openrouter.ai/api/v1/models")
+try:
+    tmo = int(os.environ.get("PI_BG_PRICING_TIMEOUT", "10"))
+except ValueError:
+    tmo = 10
+
+def load():
+    # None = corrupt or not an object (decode failure, or valid JSON that
+    # is a list/str/num). The caller must SKIP: never rewrite such a
+    # record with a cost-only dict (same discipline as bg_mark_record /
+    # bg_log_retry, which treat a corrupt record as skip).
+    try:
+        with open(rec_f) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+def save(rec):
+    try:
+        with open(rec_f, "w") as fh:
+            json.dump(rec, fh, indent=2)
+    except Exception:
+        pass
+
+def tokens_sum():
+    # sum message.role=="assistant" usage across the file; malformed lines
+    # are skipped. Same accounting as pi-token-cost.py: total excludes
+    # cacheWrite.
+    tot = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    found = False
+    try:
+        fh = open(sess_f)
+    except Exception:
+        return None
+    for line in fh:
+        if '"type":"message"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        m = o.get("message") or {}
+        if m.get("role") != "assistant":
+            continue
+        u = m.get("usage")
+        if not isinstance(u, dict):
+            continue
+        found = True
+        for k in tot:
+            v = u.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                tot[k] += v
+    fh.close()
+    if not found:
+        return None
+    tot["total"] = tot["input"] + tot["output"] + tot["cacheRead"]
+    return tot
+
+def finish(cost, model, price_ts, price_error=None):
+    rec["cost_usd"] = cost
+    rec["model"] = model
+    rec["price_ts"] = price_ts
+    # unconditional: a capture that prices the run must clear a stale
+    # price_error left by an earlier (transiently failed) capture of the
+    # same run, and a failed capture records why
+    rec["price_error"] = price_error
+    save(rec)
+    if isinstance(cost, (int, float)):
+        print("%.2f" % cost)
+
+rec = load()
+if rec is None:
+    # corrupt record: skip the whole capture, never clobber it with a
+    # cost-only dict (the run's identity + project tag would be lost)
+    raise SystemExit(0)
+tok = tokens_sum() if sess_f else None
+if tok is None:
+    # no session file (test stubs, --no-session) or no assistant usage:
+    # null fields, move on
+    rec["tokens"] = None
+    rec["cost_usd"] = None
+    rec["model"] = None
+    rec["price_ts"] = None
+    save(rec)
+    raise SystemExit(0)
+rec["tokens"] = tok
+
+if os.environ.get("JARATE_TOKEN_COST_PRICING_OFFLINE"):
+    finish(None, None, None, "offline")
+    raise SystemExit(0)
+
+price, pts = None, None
+try:  # 24h price cache: the exit path must not add minutes to shutdown
+    with open(cache_f) as fh:
+        c = json.load(fh)
+    if isinstance(c, dict) and c.get("model") == MODEL and isinstance(c.get("ts"), str):
+        age = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.datetime.fromisoformat(c["ts"]))
+        if age.total_seconds() < 86400 and isinstance(c.get("price"), dict):
+            price, pts = c["price"], c["ts"]
+except Exception:
+    pass
+if price is None:
+    err = "fetch failed"
+    try:
+        p = subprocess.run(["curl", "-s", "--max-time", str(tmo), url],
+                           capture_output=True, text=True, timeout=tmo + 5)
+        if p.returncode == 0:
+            try:
+                data = json.loads(p.stdout)
+            except ValueError:
+                data = None
+                err = "parse failed"
+            if isinstance(data, dict) and isinstance(data.get("data"), list):
+                entries = data["data"]
+
+                def mid(m):
+                    # non-dict/None list entries must not raise: a
+                    # malformed entry degrades to an id miss, not a
+                    # masked "fetch/parse failed" (the fetch + parse
+                    # both succeeded)
+                    return str(m.get("id") or "") if isinstance(m, dict) else ""
+
+                entry = next((m for m in entries if mid(m) == MODEL), None)
+                if entry is None:  # fuzzy, same convention as pi-token-cost.py
+                    cands = [m for m in entries
+                             if "qwen" in mid(m).lower()
+                             and "27b" in mid(m).lower()]
+                    plain = [m for m in cands
+                             if "-vl" not in mid(m)
+                             and "reasoning" not in mid(m).lower()]
+                    entry = (plain or cands or [None])[0]
+                if entry is None:
+                    err = "model not found"
+                else:
+                    pr = (entry or {}).get("pricing") or {}
+                    rates = {}
+                    for k in ("prompt", "completion", "input_cache_read", "input_cache_write"):
+                        v = pr.get(k)
+                        try:
+                            rates[k] = float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            rates[k] = None
+                    if rates["prompt"] is None or rates["completion"] is None:
+                        err = "parse failed"
+                    else:
+                        price, pts = rates, datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        try:  # cache write is best-effort (a failed cache never fails the run)
+                            tmp = cache_f + ".tmp"
+                            with open(tmp, "w") as fh:
+                                json.dump({"model": MODEL, "price": rates, "ts": pts}, fh)
+                            os.replace(tmp, cache_f)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    if price is None:
+        finish(None, None, None, err)
+        raise SystemExit(0)
+
+prompt = price["prompt"]
+completion = price["completion"]
+cache_read = price.get("input_cache_read")
+if cache_read is None:
+    cache_read = prompt  # no cache price -> bill at prompt rate
+if price.get("input_cache_write") is None:
+    cache_write = prompt  # assumption, noted in pi-token-cost.py
+else:
+    cache_write = price["input_cache_write"]
+cost = (tok["input"] * prompt + tok["output"] * completion
+        + tok["cacheRead"] * cache_read + tok["cacheWrite"] * cache_write)
+finish(round(cost, 5), MODEL, pts)
+PY
+}
+
 # bg_silent_tail: seconds since the newest activity of this run (raw.out
 # mtime, the profile session file for this run's cwd written after run
 # start, or the attempt start). No session file (test stubs, --no-session)
 # -> the attempt start bounds the tail.
 bg_silent_tail() {
-  local now last sm slug sd sf
+  local now last sm sf
   now="$(date +%s)"
   last="$att_start"
   sm="$(stat -c %Y "$rawf" 2>/dev/null)" && [ -n "$sm" ] && [ "$sm" -gt "$last" ] && last="$sm"
-  if [ "$wt_mode" -eq 1 ]; then slug="$wt_path"; else slug="$PWD"; fi
-  slug="--${slug#/}"; slug="${slug//\//-}--"
-  sd="$PI_CODING_AGENT_DIR/sessions/$slug"
-  sf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "@$run_start_epoch" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  sf="$(bg_session_file)"
   if [ -n "$sf" ]; then
     sm="$(stat -c %Y "$sf" 2>/dev/null)" && [ -n "$sm" ] && [ "$sm" -gt "$last" ] && last="$sm"
   fi
@@ -844,6 +1102,14 @@ printf '%s\n' "$out" > "$of"
 if command -v webdrop >/dev/null 2>&1; then
   purl="$(webdrop "$pf" "pi-bg-${run_id}-prompt" --ttl 7d 2>/dev/null | tail -1)" || purl=""
   ourl="$(webdrop "$of" "pi-bg-${run_id}-out" --ttl 7d 2>/dev/null | tail -1)" || ourl=""
+fi
+
+# project tag (2026-09-18): attribute this run's session tokens + cost to
+# the record BEFORE the callback is built, so the embed's project line
+# carries the real number. Bounded + failure-tolerant: never blocks or
+# fails the callback (no session file / price error -> null fields, "$-").
+if [ -n "$pj_tag" ]; then
+  BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
 fi
 
 if [ -n "$webhook" ]; then
