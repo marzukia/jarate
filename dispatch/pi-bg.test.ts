@@ -2093,3 +2093,299 @@ describe("deploy-swap guard (2026-09-15): wrapper survives a script swap mid-run
     }
   }, 30_000);
 });
+
+/**
+ * --project (2026-09-18): project tag for invoice itemisation. The run
+ * record carries "project": tag; at exit the run's session tokens +
+ * OpenRouter-list cost (24h price cache, bounded curl) are attributed to
+ * the record; the callback frame gets a `│ pj` line LAST (1.8k truncation
+ * eats the tail, never the identity header; cost null -> "$-"). Never
+ * blocks or fails the run.
+ */
+describe("--project: tag, cost capture, callback line (2026-09-18)", () => {
+  // mirror of the script's session slug: --<path minus leading />-separated--
+  const sessSlug = (p: string) =>
+    `--${p.replace(/^\//, "").replaceAll("/", "-")}--`;
+
+  // pi stub that writes an assistant-usage session file AT RUN TIME (after
+  // the wrapper's run_start_epoch, so -newermt "@epoch" finds it)
+  const sessionPi = (
+    fx: { tmp: string; home: string },
+    usage: Record<string, number>,
+  ) => {
+    const sess = path.join(
+      fx.home,
+      ".pi",
+      "agent-worker",
+      "sessions",
+      sessSlug(fx.tmp),
+    );
+    const line = JSON.stringify({
+      type: "message",
+      message: { role: "assistant", usage },
+    });
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        `mkdir -p ${JSON.stringify(sess)}`,
+        `printf '%s\\n' ${JSON.stringify(line)} > ${JSON.stringify(
+          path.join(sess, "s.jsonl"),
+        )}`,
+        "echo pi-run-ok",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+  };
+
+  // curl stub: canned OpenRouter pricing for the price URL, real curl for
+  // everything else (webhook capture keeps working)
+  const curlStub = (fx: { tmp: string }, mode: "canned" | "fail") => {
+    const p = path.join(fx.tmp, "bin", "curl");
+    const body =
+      mode === "canned"
+        ? `#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    http://prices.local/*)
+      printf '%s' '{"data":[{"id":"qwen/qwen3.8-27b","pricing":{"prompt":"0.000001","completion":"0.000002","input_cache_read":"0.0000001","input_cache_write":"0.0000002"}}]}'
+      exit 0
+      ;;
+  esac
+done
+exec /usr/bin/curl "$@"`
+        : `#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    http://prices.local/*) exit 7 ;;
+  esac
+done
+exec /usr/bin/curl "$@"`;
+    fs.writeFileSync(p, `${body}\n`);
+    fs.chmodSync(p, 0o755);
+  };
+
+  // 110*1e-6 + 54*2e-6 + 22*1e-7 + 6*2e-7 = 0.0002214
+  const USAGE = { input: 110, output: 54, cacheRead: 22, cacheWrite: 6 };
+  const PRICE_TS = (hAgo = 0) =>
+    new Date(Date.now() - hAgo * 3600 * 1000)
+      .toISOString()
+      .replace(/\.\d{3}Z$/, "Z");
+
+  const capture = () => {
+    const posts: Array<{ embeds: any[] }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      posts,
+      close: () => server.stop(true),
+    };
+  };
+
+  test("record carries the tag; an untagged run gets project null", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "--project", "myproj", "tagged task"]);
+    expect(r.code).toBe(0);
+    expect(fx.records()[0].project).toBe("myproj");
+    const r2 = await fx.run(["worker", "untagged task"]);
+    expect(r2.code).toBe(0);
+    const untagged = fx.records().find((c) => c.project === null);
+    expect(untagged).toBeDefined();
+  });
+
+  test("usage errors: rc 2, one stderr line, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const cases: Array<[string[], string]> = [
+      [["worker", "--project"], "needs a value"],
+      [["worker", "--project", "Bad_Tag", "t"], "invalid --project tag"],
+      [["worker", "--project", "a", "--project", "b", "t"], "given twice"],
+    ];
+    for (const [args, msg] of cases) {
+      const r = await fx.run(args);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain(msg);
+    }
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    try {
+      expect(fx.records()).toHaveLength(0);
+    } catch {
+      /* record dir never created: also fine */
+    }
+  });
+
+  test("cost capture: session usage + stubbed price -> tokens/cost/model in record; price cached 24h", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    const art = path.join(fx.tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    curlStub(fx, "canned");
+    const r = await fx.run(["worker", "--project", "myproj", "cost task"]);
+    expect(r.code).toBe(0);
+    const rec = fx.records()[0];
+    expect(rec.tokens).toEqual({
+      input: 110,
+      output: 54,
+      cacheRead: 22,
+      cacheWrite: 6,
+      total: 186, // input+output+cacheRead (cacheWrite excluded, pi-token-cost convention)
+    });
+    expect(rec.cost_usd).toBeCloseTo(0.00022, 5);
+    expect(rec.model).toBe("qwen/qwen3.8-27b");
+    expect(rec.price_ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(rec.price_error ?? null).toBeNull();
+    // the 24h price cache was written in the shared tmpdir root
+    const cache = JSON.parse(
+      fs.readFileSync(path.join(art, "pi-bg-price-cache.json"), "utf8"),
+    );
+    expect(cache.model).toBe("qwen/qwen3.8-27b");
+    expect(cache.price.prompt).toBe(1e-6);
+    expect(cache.ts).toBe(rec.price_ts);
+  });
+
+  test("webhook embed: `│ pj` line LAST with the real cost; frame still 40 cols", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.PI_BG_TMPDIR = path.join(fx.tmp, "art");
+    fs.mkdirSync(fx.env.PI_BG_TMPDIR, { recursive: true });
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    curlStub(fx, "canned");
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "--project", "myproj", "embed task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+      const lines = em.description.split("\n");
+      expect(lines[0]).toBe("```bash");
+      expect(lines.at(-2)).toBe("└");
+      // project line is the LAST frame row (truncation-safe position)
+      expect(lines.at(-3)).toBe("│ pj myproj · $0.00"); // 0.0002214 -> 2dp
+      for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("offline pricing: tokens kept, cost null, price_error offline; embed $-", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE = "1";
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "--project", "myproj", "offline task"]);
+      expect(r.code).toBe(0);
+      const rec = fx.records()[0];
+      expect(rec.tokens?.total).toBe(186);
+      expect(rec.cost_usd).toBeNull();
+      expect(rec.price_error).toBe("offline");
+      expect(rec.model).toBeNull();
+      expect(rec.price_ts).toBeNull();
+      expect(hook.posts[0].embeds[0].description).toContain("│ pj myproj · $-");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("no session file (stub pi): null cost fields, run OK, embed $-", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "--project", "myproj", "no session"]);
+      expect(r.code).toBe(0);
+      const rec = fx.records()[0];
+      expect(rec.tokens).toBeNull();
+      expect(rec.cost_usd).toBeNull();
+      expect(rec.model).toBeNull();
+      expect(rec.price_ts).toBeNull();
+      expect(hook.posts[0].embeds[0].description).toContain("│ pj myproj · $-");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("fresh price cache + failing curl: cost from the cache, no fetch", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    const art = path.join(fx.tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    curlStub(fx, "fail");
+    const seededTs = PRICE_TS(1); // 1h old: within the 24h window
+    fs.writeFileSync(
+      path.join(art, "pi-bg-price-cache.json"),
+      JSON.stringify({
+        model: "qwen/qwen3.8-27b",
+        price: {
+          prompt: 1e-6,
+          completion: 2e-6,
+          input_cache_read: 1e-7,
+          input_cache_write: 2e-7,
+        },
+        ts: seededTs,
+      }),
+    );
+    const r = await fx.run(["worker", "--project", "myproj", "cache task"]);
+    expect(r.code).toBe(0);
+    const rec = fx.records()[0];
+    expect(rec.cost_usd).toBeCloseTo(0.00022, 5);
+    expect(rec.price_ts).toBe(seededTs); // the cache's ts, not a fetch ts
+    expect(rec.price_error ?? null).toBeNull();
+  });
+
+  test("stale cache + failing curl: cost null, price_error fetch failed, tokens kept", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    const art = path.join(fx.tmp, "art");
+    fs.mkdirSync(art, { recursive: true });
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_PRICING_URL = "http://prices.local/api/v1/models";
+    curlStub(fx, "fail");
+    fs.writeFileSync(
+      path.join(art, "pi-bg-price-cache.json"),
+      JSON.stringify({
+        model: "qwen/qwen3.8-27b",
+        price: { prompt: 1e-6, completion: 2e-6 },
+        ts: PRICE_TS(25), // past the 24h window
+      }),
+    );
+    const r = await fx.run(["worker", "--project", "myproj", "stale task"]);
+    expect(r.code).toBe(0);
+    const rec = fx.records()[0];
+    expect(rec.tokens?.total).toBe(186);
+    expect(rec.cost_usd).toBeNull();
+    expect(rec.price_error).toBe("fetch failed");
+  });
+});

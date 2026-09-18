@@ -1,86 +1,40 @@
-# out — wave 2c: in-session worktrees, ctx watch, run usage, jobs kill/tail, agent-say peers
+# out — project-tags: `--project` cost itemisation + `jarate projects` rollups
 
-Branch: `pi-bg/20260914-091714-3097` (base `main` @ 5df82b02, live-frame
-unification already in). Five features, all in `packages/bridge` + `bin` +
-`dispatch/peers.json`. No live-box changes.
+Branch: `pi-bg/20260918-140425-2653975` (base `main`). Spec:
+`~/projects/project-tags-plan.md`. One feature, four pieces: pi-bg tag +
+cost capture, jarate cross-agent rollup, jarate historical backfill, docs.
+No live-box changes, no vLLM, no install run.
 
 ## Where each piece landed
 
-| Piece | Location |
-| --- | --- |
-| #12 `/new-worktree [ref]` | `packages/bridge/channel/worktree.ts` (new) — `newWorktree()`: git repo check, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, random 4, same shape as pi-bg run ids), `git worktree add -b pi-bg/<id> $PI_BG_WT_DIR/<repo>/<id> <ref>` (ref default `HEAD`), state in `<cwd>/.tmp/worktree.json`. Owner-only at the command layer. |
-| #12 `/merge-worktree [squash]` | `worktree.ts` — `mergeWorktree()`: MERGE_HEAD first (a conflicted merge is finalized via `git commit --no-edit` on retry), else `git merge <branch>` (keep; ff when possible) or `git merge --squash` + `git commit -m "squash-merge <branch>"`. Then `git worktree remove` (uncommitted changes block ONLY the removal, merge is kept + retry), `branch -d`/`-D`, state clear. Merges into the live checkout's CURRENT branch — the bridge never checks out another branch in the live repo. |
-| #13 ctx boundary notice | `packages/bridge/channel/ctxwatch.ts` (new) — `observeCtx()`: per-session-file tracker (`ctxWatchers` in index.ts, keyed by session file path), edge-triggered on `floor(pct/10) > lastStep`, upward only, first sample per session = silent baseline. Hooked in the `message_end` handler (after the `ch && agentBusy` guard, before the early-send) → one fenced `[ctx] N% (tok/window)` line per 10% boundary crossed per session. `/reset` = new session file = fresh baseline; `/compact` drop + re-cross below the last announced boundary is silent (once per boundary per session). Lowercase k (local `fmtTokensLC`, does not touch `fmtTokens`). |
-| #40 run usage line | `packages/bridge/channel/usage.ts` — `sumRunUsage(messages)` (assistant-only over `agent_end` `event.messages`; no dedup needed in-memory) + `hasUsage()`. `runUsageLine()` in index.ts → `│ ~219.4k tok · ~$0.096` (same pricing as `~/scripts/pi-token-cost.py`, 3-decimal est. cost). `runFrame()` gains an OPTIONAL trailing param, rendered right before the closing `└`, clipped to the 40-col budget — append-only, builder shape unchanged. Done AND failed frames carry it; zero-usage runs get no line. |
-| #40 `/usage last` | index.ts `case "usage"` intercepts `last` before `renderUsage`: unfenced (like the rest of the /usage family) `[usage] last run  HH:MM:SS  | 1 turns | in … | est $0.00`. In-memory (`lastRunUsage` box object — biome `noExportLet`), set on `agent_end`; `[!] no completed run yet (run one first)` before the first completed run. `usageLine` label widened to `string`; scope validation now admits `last` (renderUsage itself treats it as session scope — the command layer owns it). |
-| #44 `/jobs kill <id>` | `packages/bridge/channel/jobs.ts` — `jobsKill()`: ticket-id regex check, async `runPiBgScript("pi-bg-kill", [id])` (spawn, 20s SIGKILL timeout, 20k char cap, ENOENT → friendly "install.sh link missing"), `[ok] killed <id>` / `[!] <first output line>`, fenced via `jobWrapFence` (sized to the content's backtick runs). Owner-only. |
-| #44 `/jobs tail <id> [--n N]` | `jobs.ts` — `jobsTail()`: same runner over `pi-bg-tail <id> <n>`; `formatTail()` keeps the LAST 40 lines, notes `[..] N earlier lines`, hard-wraps at 40 cols, fenced. `--n` parsed in the command layer (clamped [1,200], bad value = usage line). Owner-only (tail reads a dispatch-user file). Bare `/jobs [json]` view unchanged, still open to all. |
-| #45 agent-say peer names | `bin/agent-say` — non-numeric `$1` resolved via `jq` against `~/.config/agent-fleet/peers.json`; unknown → `agent-say: unknown peer 'x' (add it to …)` exit 2 (before any curl); numeric targets pass through untouched. `dispatch/peers.json` (new) = repo default roster (monky/frank/jimmy). `install.sh` section 3b: one-time seed = repo default + own channel (name `$USER`, id read from settings.json via jq, file never written); existing file never clobbered; dry-run safe. |
-
-## Tests (all new, all passing)
-
-- `channel/ctxwatch.test.ts` — 7: baseline silence, fire-on-cross, once per
-  boundary (jump 39.9→72 fires once at 72, not 4/5/6/7), step-edge fire,
-  99.6→"100%", bad samples (NaN/0-window/negative tokens/negative pct)
-  ignored without priming, downward silence + once-per-session semantics.
-- `channel/worktree.test.ts` — 10: ticket shape (fixed Date), state
-  load/missing/corrupted/stale, non-git cwd, create+state, second-new
-  refused, stale-allowed, merge keep (commit lands on live branch, worktree
-  + branch gone), squash (exactly 1 commit, branch force-deleted),
-  uncommitted blocks removal only (merge kept, retry finishes), conflict
-  (count + repo named, resolve + retry finalizes), empty-squash cleanup.
-- `channel/jobs.test.ts` — 8 new: kill success/unknown-id/no-script/
-  timeout, tail success/fence-sizing/backtick-run in output/line cap +
-  drop note/40-col wrap.
-- `channel/usage.test.ts` — 4 new `sumRunUsage` (mixed roles, non-assistant
-  ignored, bad fields clamped, empty) + scope-validation string update.
-- `bin/agent-say.test.ts` (new) — 8: numeric passthrough, peer resolve,
-  unknown peer exit 2 (no curl), no peers file, non-numeric value, `-`
-  stdin form, empty message, missing token.
-- `channel/index.test.ts` — 10 new integration (full harness, owner +
-  non-owner): matchCommand for all new commands, `runUsageLine` pricing,
-  `runFrame` trailing placement/40-col, `message_end` ctx notice end-to-end
-  (baseline silent / 41% fire / same-step silent / drop silent / 91% fire,
-  fenced), `ctxBoundaryNotice` null-safety, `agent_end` done frame PATCH
-  carries the trailing line, `/usage last` empty→populated (unfenced),
-  `/jobs kill|tail` owner gating + stub-script round trip + `--n`,
-  `/new-worktree`→commit→`/merge-worktree` full cycle (non-owner falls
-  through, already-active refused, state file, branch deleted).
+| Piece | File | What |
+|---|---|---|
+| `--project <tag>` flag | `dispatch/pi-bg` | Fork-free arg-parse zone (case), rc 2 usage errors (missing value / bad tag / duplicate), tag stored in the run record as `"project": tag \| null` |
+| Cost capture | `dispatch/pi-bg` | New `bg_capture_cost` + shared `bg_session_file`: session token sum, OpenRouter-list pricing (`qwen/qwen3.8-27b`, exact then pi-token-cost.py fuzzy plain fallback), 24h price cache in `$PI_BG_TMPDIR/pi-bg-price-cache.json` (tmpdir ROOT, shared), bounded `curl --max-time` (`PI_BG_PRICING_URL` / `PI_BG_PRICING_TIMEOUT`, `JARATE_TOKEN_COST_PRICING_OFFLINE=1` = offline). Writes `tokens`, `cost_usd`, `model`, `price_ts` (+`price_error`: `offline` \| `fetch failed` \| `parse failed` \| `model not found`) to the record. Called from `bg_mark_record` (terminal paths, idempotent) and in the main flow before the webhook build (normal path) — the callback always carries the real cost. Never blocks or fails the run. |
+| Callback line | `dispatch/pi-bg` | `bg_build` gains `BG_PJ_TAG` / `BG_PJ_COST`; frame gets ONE line — `│ pj <tag> · $<cost 2dp>` (or `$-`) — appended LAST (right before `└`), clipped to the 40-col budget, so the ~1.8k truncation eats the tail, never the identity header |
+| `jarate projects` | `bin/jarate` | Cross-agent rollup of run records by tag. Single-quote-free base64 Python scanner (`PROJ_SCAN`) per agent; local home runs direct, peers via the existing `sshpass + sudo -u` hop (`jarate_scan`). Hop failure degrades the agent row (`scanned: null` + `error`) with a top-level `warn`; doc stays `ok:true`. Buckets: `runs` / `workers` / `reviewers` / per-field `tokens` / `cost_usd` / `cost_covered` / `first` / `last`. Untagged records -> `unspecified` bucket. **Cost null semantics:** `cost_usd` null if ANY contributing record is unpriced (never a partial sum); `cost_covered` = priced count. `--project` (unknown tag = one zeroed row, not an error), `--since YYYY-MM-DD` (shape-validated, string compare on `started`), `--agent` (no match = ok:false rc 1). Rows sort runs desc, project asc. |
+| `jarate projects-backfill` | `bin/jarate` | Tags untagged historical records. First match wins: `--set RUN=TAG` (validated, repeatable) > record `cwd` under `<home>/.pi-bg-wt/<repo>/` -> `<repo>` (source `worktree`) > `cwd` under `<home>/projects/<name>` -> `<name>` (source `cwd`) > per-agent default: owner `frank` -> `nestfinder`, else `unspecified` (source `default`). Writes `project` + `backfilled: true` + `backfilled_at` atomically (tmp + replace); **idempotent** — a record with a `project` is skipped, never overwritten. `--dry-run` plans without writing. `agents[].map` lists tagged (or would-be) records with their source; `total` sums the agents that answered. |
+| Tests | `dispatch/pi-bg.test.ts`, `bin/jarate.test.ts` | +8 pi-bg (tag storage, 3 usage errors, cost capture + cache write, webhook embed line + 40-col check, offline, no-session, fresh-cache + failing curl, stale-cache + failing curl) and +13 jarate (rollup incl. null semantics + sort, filters, unknown tag, since, agent, hop-fail degrade, empty, usage errors, dry-run, real + idempotency, --set, frank default via hop, backfill hop-fail, --set validation). Hermetic: stubbed `curl` (canned pricing URL, real curl passthrough for the webhook), stubbed `pi` writing the session file at run time (mtime must beat `-newermt @run_start`), `sshpass` stub that extracts the sudo-hop driver and execs it locally with `PI_HOME` selecting the peer fixture home. Updated the help-doc `commands` assertion + the shared missing-flag-value table. |
+| Docs | `docs/DISPATCH.md`, `docs/JARATE.md`, `bin/jarate` header | DISPATCH: usage line, new "Project tags" section (flag rule, record fields, pricing/cache/offline, never-blocks rule, callback line position), callback embed description updated. JARATE: both command sections with output shapes + null semantics + backfill rule order + idempotency; unknown-command `commands` example refreshed (was missing `setup` too). `bin/jarate` header usage + `COMMANDS` array + dispatch cases + unknown-command list updated. |
 
 ## Verification
 
-- `bun x tsc --noEmit` (bridge): clean.
-- `bunx biome check .` (repo root): 0 diagnostics (new/modified files only).
-- Full monorepo suite (`bun test`: bridge + recall + dispatch + bin):
-  731 pass / 0 fail / 7 skip (recall integration skips, unchanged).
-  Final gate = 3 sequential full runs, all 731/0. Also ran 41+ full
-  suites on this branch across stress loops; 3 sporadic single-test
-  failures, every one coinciding with concurrent test load while this
-  host's `/tmp` tmpfs sat at 98-100% inodes (tests `mkdtemp` under
-  `os.tmpdir()`); 14 full runs on base `main` @ 5df82b02 clean.
-  Environmental (inode pressure), not this batch's code — flagged for
-  the reviewer: if a single full-suite CI job flakes, re-run it.
-- `bash install.sh --dry-run` (fake HOME): clean; seed branch verified
-  live against a fake checkout: own-channel override, default-roster
-  fallback, no-clobber on re-run.
-- `bin/agent-say` smoke-tested against a stub curl: peer name → resolved
-  channel id on the wire, unknown peer exit 2, numeric passthrough.
+- `bun test` (repo root, 34 files): **922 pass, 7 skip, 0 fail** (2026-09-18 run; bridge + recall deps `bun install`ed in the fresh worktree first).
+- `bunx biome check .`: **0 errors** — 1 warning + 1 info remain, both pre-existing on `main` (baseline verified: main reports the identical 1+1).
+- `bun x tsc --noEmit`: clean in `packages/bridge` and `packages/recall` (the repo's tsc gates; no root tsconfig — `dispatch/` / `bin/` test files are bun-transpiled only, same as before).
+- `bash -n dispatch/pi-bg` + `bash -n bin/jarate`: clean.
+- `HOME=/tmp/fake bash install.sh --dry-run`: rc 0, clean.
+- Full-suite flake note: `#41 ... at cap: next dispatch refused` failed ONE full-suite run (15.5s records-waitTimeout); passes solo on this branch (1.08s), under sibling-file load (3/3), and on later full-suite runs. It is fleet-activity-sensitive by design (counts live `pi-bg` processes system-wide; 7 were live from other agents during the failed window). Not a regression: main's solo/sibling runs behave identically.
 
-## Notes / decisions
+## Spec deviations
 
-- `runFrame` trailing line: optional 5th param — every existing call site
-  unchanged; the failed frame gets it too (spec: done/failed).
-- Ctx notice format: `[ctx] 41% (108k/262k)` — rounded pct, lowercase k,
-  no tag collision with the kimaki set (`[ctx]` is new, documented in
-  COMMANDS.md output-tag table).
-- Worktree ticket ids use a random 4-digit suffix (pi-bg uses pid there;
-  in-session there is no run process, so pid would mislead).
-- `lastRunUsage` + `ctxWatchers` exported as const containers (box pattern
-  / Map) for test reset, per biome `noExportLet`.
-- Docs: `docs/COMMANDS.md` updated (tag table, reference table, /usage
-  last, frame trailing line + [ctx] section, /jobs kill/tail, new
-  worktree section, agent-say peers). `HELP_TEXT` + `matchCommand` in
-  sync. `docs/DISPATCH.md` untouched (agent-say is not a dispatch
-  script; noted in COMMANDS.md instead).
-- Do-not-touch list respected: no `bin/jarate` changes, no drift-guard
-  sections, no live-box files, `bun.lock` only via `bun install`.
+1. **Callback line prefix is `│`, not `├`** — spec-literal `│ pj <tag> · $<cost>`. In the jarate frame grammar (STYLE.md) `│` = continuation of the previous field line, which reads correctly: the project line follows the `cwd`/`branch` meta line. Placed LAST so truncation is tail-only.
+2. **Backfill "worktree" rule derives from record `cwd`** — real records carry no `worktree` field (verified across 120 live records: fields = run/profile/cwd/started/delivery/state/finished). `cwd` under `~/.pi-bg-wt/<repo>/<id>` is the source of truth; documented in JARATE.md.
+3. **`--since` is shape-validated only** (`YYYY-MM-DD`, same convention as `journal-errors --since`'s `since_is_abs`) — `2026-13-99` is accepted and filters via string compare. Semantic date validation would be a journal-errors-level change, out of scope.
+4. **Price cache lives in the tmpdir ROOT** (`$PI_BG_TMPDIR/pi-bg-price-cache.json`), not the per-run subdir — the cache must be shared across runs to be a cache; it is a single small JSON file, no per-run cleanup needed (the 24h freshness check handles staleness).
+
+## Commit
+
+Single commit on `pi-bg/20260918-140425-2653975`: 7 files — the 6 code/doc
+files above + this report (+1632 / -39 across the code/docs). No `bun.lock`
+churn (fresh-worktree `bun install` resolved identical versions).
