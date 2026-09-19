@@ -1514,7 +1514,7 @@ export function collectFinals(
 ): { text: string; replyTo?: string }[] {
   const finals: { text: string; replyTo?: string }[] = [];
   let replyTo: string | undefined;
-  let allowed: Set<string> | null = null;
+  const allowed = new Set<string>();
   for (const m of messages as any[]) {
     if (m?.customType === CHANNEL_MSG_TYPE) {
       replyTo = m.details?.messageId;
@@ -1523,7 +1523,7 @@ export function collectFinals(
         : replyTo
           ? [replyTo]
           : [];
-      allowed = new Set(ids.map(String));
+      for (const id of ids) allowed.add(String(id));
       continue;
     }
     if (m?.role !== "assistant") continue;
@@ -1537,8 +1537,7 @@ export function collectFinals(
     const clean = cleanThinking(text.trim());
     if (!clean) continue;
     const rt = parseReplyTo(clean);
-    const chosen =
-      rt.replyTo && allowed?.has(rt.replyTo) ? rt.replyTo : replyTo;
+    const chosen = rt.replyTo && allowed.has(rt.replyTo) ? rt.replyTo : replyTo;
     finals.push({ text: rt.text, replyTo: chosen });
   }
   return finals;
@@ -5115,7 +5114,10 @@ function sendToPi(
   messageIds?: string[],
 ): boolean {
   const ids = messageIds ?? (messageId ? [messageId] : []);
-  if (ids.length > 0) runInboundIds.set(channelId, ids);
+  if (ids.length > 0) {
+    const prev = runInboundIds.get(channelId) ?? [];
+    runInboundIds.set(channelId, [...new Set([...prev, ...ids])]);
+  }
   interruptCancelled.delete(channelId); // a fresh send opens a fresh run
   try {
     pi.sendMessage(

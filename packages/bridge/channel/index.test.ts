@@ -222,6 +222,42 @@ describe("collectFinals", () => {
     const finals = collectFinals([inbound("A"), assistantText("  spaced  ")]);
     expect(finals).toEqual([{ text: "spaced", replyTo: "A" }]);
   });
+
+  test("rapid-fire: reply-to an earlier inbound in the same run (2026-09-20)", () => {
+    // Andryo msg 1 → my reply → Andryo msg 2 → my reply with <reply-to:msg1>
+    // The allowed set must accumulate ALL inbound ids, not just the last.
+    const finals = collectFinals([
+      inbound("111"),
+      assistantText("first reply"),
+      inbound("222"),
+      assistantText("<reply-to:111>\ntagging the earlier one"),
+    ]);
+    expect(finals).toEqual([
+      { text: "first reply", replyTo: "111" },
+      { text: "tagging the earlier one", replyTo: "111" },
+    ]);
+  });
+
+  test("rapid-fire burst: reply-to a burst member from an earlier burst (2026-09-20)", () => {
+    const burst1 = {
+      customType: "channel-inbound",
+      details: { messageId: "333", messageIds: ["111", "222", "333"] },
+    };
+    const burst2 = {
+      customType: "channel-inbound",
+      details: { messageId: "444", messageIds: ["444"] },
+    };
+    const finals = collectFinals([
+      burst1,
+      assistantText("<reply-to:111>\ntagging 111 from burst 1"),
+      burst2,
+      assistantText("<reply-to:111>\nstill tagging 111 after burst 2"),
+    ]);
+    expect(finals).toEqual([
+      { text: "tagging 111 from burst 1", replyTo: "111" },
+      { text: "still tagging 111 after burst 2", replyTo: "111" },
+    ]);
+  });
 });
 
 describe("parseReplyTo", () => {
