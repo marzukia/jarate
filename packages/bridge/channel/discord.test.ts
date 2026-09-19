@@ -686,13 +686,11 @@ test("outbound: silent by default; real <@id> keeps users parse (T5)", async () 
   });
   expect(allowedMentionsFor("plain text")).toEqual({ parse: [] });
   expect(allowedMentionsFor("hi <@5> and <@!9>")).toEqual({
-    parse: ["users"],
     users: ["5", "9"],
   });
 
   await sendDiscordMessage(cfg("p1"), "echoed @everyone <@999> back");
   expect(bodies[0].allowed_mentions).toEqual({
-    parse: ["users"],
     users: ["999"],
   });
   await sendDiscordMessage(cfg("p1"), "no mention here @everyone");

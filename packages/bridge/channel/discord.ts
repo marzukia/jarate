@@ -733,7 +733,7 @@ export function allowedMentionsFor(text: string): {
   users?: string[];
 } {
   const ids = [...text.matchAll(/<@!?([0-9]+)>/g)].map((m) => m[1]);
-  return ids.length ? { parse: ["users"], users: ids } : { parse: [] };
+  return ids.length ? { users: ids } : { parse: [] };
 }
 
 /** Send a text message to a Discord channel. */
