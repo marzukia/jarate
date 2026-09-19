@@ -38,13 +38,21 @@ function fixture(): Fixture {
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
 
-  // bot token source
+  // bot token source — .channel is the caller's own Discord channel id
+  // (used by the self-channel guard to reject agent-say to yourself)
   const agentDir = path.join(home, ".pi", "agent");
   fs.mkdirSync(agentDir, { recursive: true });
   fs.writeFileSync(
     path.join(agentDir, "settings.json"),
     JSON.stringify({
-      channels: [{ type: "discord", id: "111", botToken: "tok-111" }],
+      channels: [
+        {
+          type: "discord",
+          id: "discord-test",
+          channel: "111",
+          botToken: "tok-111",
+        },
+      ],
     }),
   );
 
@@ -192,5 +200,28 @@ describe("agent-say peer resolution (#45)", () => {
     const r = await f.run(["<channel-id-1>", "hi"]);
     expect(r.code).toBe(1);
     expect(r.err).toContain("no bot token");
+  });
+
+  test("own channel -> exit 3 with the reply-instead hint (2026-09-20 incident)", async () => {
+    const f = fixture();
+    // fixture settings.json has channel: "111" — send to 111 and expect the guard
+    const r = await f.run(["111", "this should have been a normal reply"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("YOUR OWN channel");
+    expect(r.err).toContain("normal reply");
+    expect(r.err).toContain("agent-to-agent");
+    // no curl attempt
+    expect(fs.existsSync(f.capture)).toBe(false);
+  });
+
+  test("other agent channel -> passes the guard (exit 0)", async () => {
+    const f = fixture();
+    // frank's channel is not the caller's own channel (111)
+    const r = await f.run(["<channel-id-2>", "ping frank"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("sent 99");
+    expect(curlUrl(f.capture)).toBe(
+      "https://discord.com/api/v10/channels/<channel-id-2>/messages",
+    );
   });
 });

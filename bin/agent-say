@@ -45,6 +45,20 @@ if [ -z "$msg" ]; then
   exit 2
 fi
 
+# Guard: reject agent-say to your OWN channel. agent-say is for
+# agent-to-agent comms. If you're replying to a human in your own
+# channel, just reply normally — the bridge auto-forwards it.
+# (Incident 2026-09-20: monky sent Cain's infographic link to Frank's
+# channel via agent-say, derailing Franky from his work.)
+own_channel=""
+if [ -f "$HOME/.pi/agent/settings.json" ]; then
+  own_channel=$(jq -r '[.channels[]? | select(.type == "discord") | .channel // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json" 2>/dev/null)
+fi
+if [ -n "$own_channel" ] && [ "$channel" = "$own_channel" ]; then
+  echo "agent-say: channel $channel is YOUR OWN channel. Use a normal reply instead — the bridge auto-forwards it. agent-say is for agent-to-agent comms only." >&2
+  exit 3
+fi
+
 # Secret censor: the message is Discord egress from outside the bridge, so
 # route it through the same censor + registry (jarate/bin/jarate-censor).
 # Missing tool / bun absent / any error = send as-is (never block the peer).
