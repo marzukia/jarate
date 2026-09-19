@@ -874,13 +874,19 @@ export async function runMidRunInterrupt(
       console.log(
         `[channel] mid-run interrupt cancelled: ${messageId} dropped`,
       );
+      // Settle the tick before the delete: the final edit must land while
+      // the ack message still exists (same race as the success path).
+      settleOpTick(`interrupt:${channelId}`, `[ok] interrupted`);
       consumeQueuedAck(channelId, messageId);
       return;
     }
     if (!ctx.isIdle()) {
-      // Settle exceeded the cap: restore the entry (FIFO position kept) so
-      // the re-wake path owns delivery from here on — never steer into a
-      // still-active run (that is the lossy path this feature avoids).
+      // Settle exceeded the cap: stop the tick (NOT settle — the message
+      // goes back to re-wake, an interrupt did not happen) and restore the
+      // entry (FIFO position kept) so the re-wake path owns delivery from
+      // here on — never steer into a still-active run (that is the lossy
+      // path this feature avoids).
+      stopOpTick(`interrupt:${channelId}`);
       const qq = midTurnQueues.get(channelId) ?? [];
       qq.splice(Math.min(idx, qq.length), 0, entry);
       midTurnQueues.set(channelId, qq);

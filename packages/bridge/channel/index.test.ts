@@ -68,6 +68,7 @@ import extension, {
   setInterruptCtx,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
+  settleOpTick,
   stopAllCompactTicks,
   stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
@@ -1386,6 +1387,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
+      queuedAcks.clear();
       jest.useRealTimers();
     });
 
@@ -1687,6 +1689,132 @@ describe("extension handlers (A1/A2/A4)", () => {
         .find((t) => t.includes("running"));
       expect(statusPost).toBeDefined();
       expect(statusPost).toContain("interrupt in ");
+    });
+
+    // ── Interrupt tick lifecycle (ack message is the tick target) ────
+    const ackFlush = async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+
+    test("tick: success path settles the tick before the ack delete", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      await ackFlush(); // ack post resolves -> tick armed on the ack id
+      const ackId = queuedAcks.get("m1")?.ackId;
+      expect(ackId).toBeDefined();
+
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await ackFlush();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+
+      // The final edit (settle) must land on the ack BEFORE the delete:
+      // a PATCH after the DELETE would re-create the message with a stale
+      // line that nothing cleans up.
+      const settleIdx = fetchCalls.findIndex(
+        (c) =>
+          c.method === "PATCH" &&
+          c.url.includes(`/channels/ch1/messages/${ackId}`) &&
+          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+      );
+      const deleteIdx = fetchCalls.findIndex(
+        (c) =>
+          c.method === "DELETE" &&
+          c.url.endsWith(`/channels/ch1/messages/${ackId}`),
+      );
+      expect(settleIdx).toBeGreaterThanOrEqual(0);
+      expect(deleteIdx).toBeGreaterThan(settleIdx);
+    });
+
+    test("tick: cancel path settles the tick before the ack delete", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      ctx.abort = () => {
+        abortCount += 1;
+      }; // does not settle immediately
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      await ackFlush();
+      const ackId = queuedAcks.get("m1")?.ackId;
+      expect(ackId).toBeDefined();
+
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await ackFlush();
+      expect(abortCount).toBe(1);
+      // /stop while the settle wait is pending: cancels the in-flight
+      // interrupt (its ack must be cleaned up, tick settled first).
+      await handleInbound(pi, inbound("/stop", "m2"), ctx);
+      jest.advanceTimersByTime(25);
+      await ackFlush();
+      expect(sent.length).toBe(0); // send dropped
+
+      const settleIdx = fetchCalls.findIndex(
+        (c) =>
+          c.method === "PATCH" &&
+          c.url.includes(`/channels/ch1/messages/${ackId}`) &&
+          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+      );
+      const deleteIdx = fetchCalls.findIndex(
+        (c) =>
+          c.method === "DELETE" &&
+          c.url.endsWith(`/channels/ch1/messages/${ackId}`),
+      );
+      expect(settleIdx).toBeGreaterThanOrEqual(0);
+      expect(deleteIdx).toBeGreaterThan(settleIdx);
+      // tick is gone: no tick edit can re-create the deleted ack
+      expect(settleOpTick(`interrupt:ch1`, "[probe]")).toBe(false);
+    });
+
+    test("tick: settle-cap path stops the tick (no settle, no delete)", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      ctx.abort = () => {
+        abortCount += 1;
+      }; // never settles: the poll loop must hit its 120 s cap
+      await handleInbound(pi, inbound("stuck", "m1"), ctx);
+      await ackFlush();
+      const ackId = queuedAcks.get("m1")?.ackId;
+      expect(ackId).toBeDefined();
+
+      // 120 x 25 ms covers the interrupt arm; 4800 x 25 ms is the poll cap.
+      for (let i = 0; i < 4925; i++) {
+        jest.advanceTimersByTime(25);
+        await Promise.resolve();
+      }
+      await ackFlush();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0);
+      // entry restored to the re-wake queue (existing behavior)
+      expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("m1");
+
+      const ackPatches = fetchCalls
+        .filter(
+          (c) =>
+            c.method === "PATCH" &&
+            c.url.includes(`/channels/ch1/messages/${ackId}`),
+        )
+        .map((c) => String(JSON.parse(c.body).content));
+      // the tick moved while the settle wait ran...
+      expect(ackPatches).toContain(fence("[..] interrupting… 5s"));
+      // ...but the cap path STOPS the tick: no settle edit (the message
+      // goes back to re-wake — an interrupt did not happen)...
+      expect(ackPatches).not.toContain(fence("[ok] interrupted"));
+      // ...and the ack is NOT deleted (it stays with the queued entry).
+      expect(
+        fetchCalls.some(
+          (c) =>
+            c.method === "DELETE" &&
+            c.url.endsWith(`/channels/ch1/messages/${ackId}`),
+        ),
+      ).toBe(false);
+      // tick is gone: advancing further must not edit the ack again
+      expect(settleOpTick(`interrupt:ch1`, "[probe]")).toBe(false);
+      const patchesBefore = ackPatches.length;
+      jest.advanceTimersByTime(10000);
+      await ackFlush();
+      const ackPatchesAfter = fetchCalls.filter(
+        (c) =>
+          c.method === "PATCH" &&
+          c.url.includes(`/channels/ch1/messages/${ackId}`),
+      ).length;
+      expect(ackPatchesAfter).toBe(patchesBefore);
     });
   });
 
@@ -6237,14 +6365,15 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handlers.session_start?.(null, ctx);
     await tick();
 
-    // the placeholder is REPLACED in place with the final line, not re-posted
+    // the placeholder is REPLACED in place with the FENCED final line, not
+    // re-posted (the placeholder was posted fenced — settle matches)
     const finalText = "[new] new session (context cleared)";
     expect(
       edits()
         .slice(editsBefore)
-        .some((t) => t === finalText),
+        .some((t) => t === fence(finalText)),
     ).toBe(true);
-    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
     // marker consumed
     expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
 
@@ -6253,6 +6382,30 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await pollDiscord("ch1");
     const pollUrl = fetchCalls.find((c) => c.url.includes("after="))?.url;
     expect(pollUrl).toContain("after=1000");
+  });
+
+  test("respawn settle without a msgId posts a FENCED final line", async () => {
+    const p = path.join(tmp, ".tmp", "op-marker.json");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const finalText = "[new] new session (context cleared)";
+    fs.writeFileSync(
+      p,
+      JSON.stringify({
+        op: "reset",
+        channelId: "ch1",
+        at: Date.now(),
+        finalText,
+      }),
+    );
+    await handlers.session_start?.(null, ctx);
+    await tick();
+    // fenced fresh post — same style as the fenced placeholder, never bare
+    expect(channelPosts().some((t) => t === fence(finalText))).toBe(true);
+    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    expect(edits().some((t) => t === finalText || t === fence(finalText))).toBe(
+      false,
+    );
+    expect(fs.existsSync(p)).toBe(false); // consumed
   });
 
   test("stale op marker (>10m) is dropped, not shown", async () => {
