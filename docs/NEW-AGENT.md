@@ -243,6 +243,11 @@ For each existing agent (monky, frank, jimmy, ...):
 - `~/.pi/agent/settings.json` channel block: add the new bot's user id to
   `peerBotIds` (otherwise agent-say from the new agent is silently dropped
   by the other-bot filter).
+- `~/.config/agent-fleet/peers.json` on every existing agent: add the new
+  agent. agent-say validates targets against this file (unknown numeric
+  ids exit 4, peer names must exist as keys) and the file is never
+  clobbered — update it by hand. Also add the new agent to
+  `dispatch/peers.json` in the repo (install.sh's seed source).
 - Detached restart so the running agent survives:
   `(sleep 5; XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart pi.service) &`
 
