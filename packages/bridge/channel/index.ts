@@ -889,6 +889,11 @@ export async function runMidRunInterrupt(
       );
       return;
     }
+    // Settle the interrupt tick BEFORE consuming the ack: the tick edits
+    // the ack message in place, so the final edit must land while the
+    // message still exists. consumeQueuedAck then deletes it.
+    const tickKey = `interrupt:${channelId}`;
+    settleOpTick(tickKey, `[ok] interrupted`);
     consumeQueuedAck(channelId, messageId); // entry is owned by the fresh run
     sendToPi(
       pi,
@@ -900,6 +905,7 @@ export async function runMidRunInterrupt(
     );
   } finally {
     interruptingChannels.delete(channelId);
+    // Fallback: if the tick was never armed (no ack) or settle raced, drop it.
     stopOpTick(`interrupt:${channelId}`);
   }
 }
@@ -3111,10 +3117,10 @@ function consumeOpMarker(ctx: ExtensionContext): void {
     `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
   );
   if (m.msgId)
-    editDiscordMessage(ch, m.msgId, m.finalText).catch(() =>
-      sendDiscordMessage(ch, m.finalText).catch(() => {}),
+    editDiscordMessage(ch, m.msgId, fence(m.finalText)).catch(() =>
+      sendDiscordMessage(ch, fence(m.finalText)).catch(() => {}),
     );
-  else sendDiscordMessage(ch, m.finalText).catch(() => {});
+  else sendDiscordMessage(ch, fence(m.finalText)).catch(() => {});
 }
 
 /** Drop the op marker (F1: /stop cancels the op — no respawn comes from
