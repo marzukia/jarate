@@ -5,15 +5,27 @@
 #   agent-say <channel-id|peer> "message"
 #   echo "message" | agent-say <channel-id|peer> -
 #
-# Target: a numeric Discord channel id, or a fleet peer name resolved via
-# ~/.config/agent-fleet/peers.json (seeded by install.sh from the repo
-# default dispatch/peers.json + your own channel; operators add peers).
+# Target: a numeric Discord channel id of a known fleet peer, or a fleet
+# peer name resolved via ~/.config/agent-fleet/peers.json (seeded by
+# install.sh from the repo default dispatch/peers.json + your own channel;
+# operators add peers). Keep the file current on roster/channel changes.
 #
 # Token resolution: $PI_BOT_TOKEN, else first discord botToken in
 # ~/.pi/agent/settings.json.
 #
 # This is how pi agents talk to each other: post to the peer's channel.
 # Your normal reply only auto-forwards to your own channel.
+#
+# Guards (history: 2026-09-20 incident — Cain's infographic delivered to
+# frank's channel via agent-say, derailing Franky):
+#   exit 3  target is your OWN channel -> use a normal reply (the bridge
+#           auto-forwards it)
+#   exit 4  target is not a known fleet peer (peers.json value). Humans
+#           live in your own channel; a raw id that is no agent's channel
+#           is a mis-route. Bypass: AGENT_SAY_FORCE=1.
+#   [warn]  message does not name the target peer (non-blocking nudge:
+#           human deliverables dropped into a peer channel usually do not
+#           address the peer)
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -57,6 +69,39 @@ fi
 if [ -n "$own_channel" ] && [ "$channel" = "$own_channel" ]; then
   echo "agent-say: channel $channel is YOUR OWN channel. Use a normal reply instead — the bridge auto-forwards it. agent-say is for agent-to-agent comms only." >&2
   exit 3
+fi
+
+# Guard: the target must be a known fleet peer channel — a value in the
+# peers file. Name targets were already validated against it during
+# resolution, so this only bites on raw numeric ids (the incident vector:
+# a channel id copied from context that is no agent's channel). Fail
+# closed when the peers file or jq is missing; AGENT_SAY_FORCE=1 bypasses
+# (migration windows, one-off channels).
+peers="$HOME/.config/agent-fleet/peers.json"
+in_peers=""
+peer_name=""
+known_peers=""
+if [ -f "$peers" ] && command -v jq >/dev/null 2>&1; then
+  in_peers="$(jq --arg c "$channel" '[.[] | tostring | select(. == $c)] | length > 0' "$peers" 2>/dev/null || echo false)"
+  peer_name="$(jq -r --arg c "$channel" 'to_entries[] | select((.value | tostring) == $c) | .key' "$peers" 2>/dev/null | head -n 1 || true)"
+  known_peers="$(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$peers" 2>/dev/null | tr '\n' ' ' || true)"
+fi
+if [ "${AGENT_SAY_FORCE:-0}" != "1" ] && [ "$in_peers" != "true" ]; then
+  echo "agent-say: channel $channel is not a known fleet peer (known: ${known_peers:-none}; check $peers). agent-say reaches agents only — for a human, reply normally in your own channel. Bypass: AGENT_SAY_FORCE=1." >&2
+  exit 4
+fi
+
+# Nudge: a message to a peer's channel should name that peer. Human
+# deliverables dropped into a peer channel usually don't (2026-09-20
+# incident: "Cain asked me..." -> frank's channel). Non-blocking: replies
+# inside an agent-to-agent thread often omit the name.
+if [ -n "$peer_name" ]; then
+  lc_msg="$(printf '%s' "$msg" | tr '[:upper:]' '[:lower:]')"
+  lc_name="$(printf '%s' "$peer_name" | tr '[:upper:]' '[:lower:]')"
+  case "$lc_msg" in
+    *"$lc_name"*) ;;
+    *) echo "agent-say: [warn] message to $peer_name's channel does not name $peer_name. If it is for a human, reply in your own channel instead." >&2 ;;
+  esac
 fi
 
 # Secret censor: the message is Discord egress from outside the bridge, so

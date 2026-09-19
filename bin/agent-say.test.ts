@@ -1,12 +1,18 @@
 /**
- * bin/agent-say — egress contract tests (issue #45).
+ * bin/agent-say — egress contract tests (issue #45 + 2026-09-20 gap fix).
  *
  * Runs the real bash script against a fake HOME with a stubbed curl
  * (captures the URL + payload) and a stubbed bun (censor pass-through),
- * and asserts the peer-name resolution contract:
- *   - numeric channel ids pass through untouched
- *   - non-numeric targets resolve via ~/.config/agent-fleet/peers.json
+ * and asserts the target-resolution + guard contract:
+ *   - peer names resolve via ~/.config/agent-fleet/peers.json
  *   - unknown peers fail loudly (exit 2), never a silent curl 404
+ *   - own channel is rejected (exit 3) — reply normally instead
+ *   - numeric ids that are no known fleet peer are rejected (exit 4);
+ *     AGENT_SAY_FORCE=1 bypasses (the 2026-09-20 mis-route vector: a
+ *     channel id copied from context that is no agent's channel)
+ *   - a message that does not name the target peer gets a [warn] on
+ *     stderr (non-blocking nudge; human deliverables dropped into a peer
+ *     channel usually do not address the peer)
  */
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -123,8 +129,9 @@ const curlUrl = (capture: string): string =>
     : "";
 
 describe("agent-say peer resolution (#45)", () => {
-  test("numeric channel id passes through untouched", async () => {
+  test("numeric channel id of a known peer sends", async () => {
     const f = fixture();
+    f.setPeers({ monky: "<channel-id-1>", frank: "<channel-id-2>" });
     const r = await f.run(["<channel-id-1>", "hello monky"]);
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
@@ -193,6 +200,7 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("missing token -> exit 1 with the token hint", async () => {
     const f = fixture();
+    f.setPeers({ monky: "<channel-id-1>" });
     fs.writeFileSync(
       path.join(f.home, ".pi", "agent", "settings.json"),
       JSON.stringify({ channels: [] }),
@@ -216,6 +224,7 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("other agent channel -> passes the guard (exit 0)", async () => {
     const f = fixture();
+    f.setPeers({ monky: "<channel-id-1>", frank: "<channel-id-2>" });
     // frank's channel is not the caller's own channel (111)
     const r = await f.run(["<channel-id-2>", "ping frank"]);
     expect(r.code).toBe(0);
@@ -223,5 +232,107 @@ describe("agent-say peer resolution (#45)", () => {
     expect(curlUrl(f.capture)).toBe(
       "https://discord.com/api/v10/channels/<channel-id-2>/messages",
     );
+  });
+});
+
+describe("agent-say peer allowlist (2026-09-20 gap)", () => {
+  test("numeric id not in peers.json -> exit 4, no curl, known peers listed", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run(["999000111222333444", "where does this go?"]);
+    expect(r.code).toBe(4);
+    expect(r.err).toContain("not a known fleet peer");
+    expect(r.err).toContain("frank=<channel-id-2>");
+    expect(r.err).toContain("AGENT_SAY_FORCE=1");
+    expect(fs.existsSync(f.capture)).toBe(false);
+  });
+
+  test("no peers file + numeric id -> exit 4 (fail closed)", async () => {
+    const f = fixture();
+    f.setPeers(null);
+    const r = await f.run(["<channel-id-2>", "hi"]);
+    expect(r.code).toBe(4);
+    expect(r.err).toContain("not a known fleet peer");
+  });
+
+  test("AGENT_SAY_FORCE=1 bypasses the allowlist (exit 0)", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run(["999000111222333444", "one-off"], undefined, {
+      AGENT_SAY_FORCE: "1",
+    });
+    expect(r.code).toBe(0);
+    expect(curlUrl(f.capture)).toBe(
+      "https://discord.com/api/v10/channels/999000111222333444/messages",
+    );
+  });
+
+  test("own channel wins over the allowlist (exit 3, not exit 4)", async () => {
+    const f = fixture();
+    // caller's own channel (111) IS in peers.json — the more specific
+    // own-channel guard must fire first with its reply-instead hint
+    f.setPeers({ self: "111" });
+    const r = await f.run(["111", "this should have been a normal reply"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("YOUR OWN channel");
+    expect(fs.existsSync(f.capture)).toBe(false);
+  });
+
+  test("name target resolves and passes the allowlist", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run(["frank", "frank, pull pi-dispatch"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("sent 99");
+  });
+});
+
+describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
+  test("message to a peer's numeric id that does not name the peer -> [warn], still sent", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    // regression: the 2026-09-19/20 incident — Cain's infographic
+    // (a human deliverable) sent to frank's channel, no recipient marker
+    const r = await f.run([
+      "<channel-id-2>",
+      "Cain asked me to rework his infographic. Done: https://drop.example/1",
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("sent 99");
+    expect(r.err).toContain("[warn]");
+    expect(r.err).toContain("does not name frank");
+    expect(r.err).toContain("reply in your own channel");
+    expect(curlUrl(f.capture)).toContain("/channels/<channel-id-2>/");
+  });
+
+  test("message that names the peer -> no warning", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run([
+      "<channel-id-2>",
+      "frank: pull pi-dispatch when you get a sec",
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.err).not.toContain("[warn]");
+    expect(r.out.trim()).toBe("sent 99");
+  });
+
+  test("recipient match is case-insensitive", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run([
+      "<channel-id-2>",
+      "FRANK — your pi is running stale",
+    ]);
+    expect(r.code).toBe(0);
+    expect(r.err).not.toContain("[warn]");
+  });
+
+  test("name-specified target still warns when the body omits the peer", async () => {
+    const f = fixture();
+    f.setPeers({ frank: "<channel-id-2>" });
+    const r = await f.run(["frank", "v2: https://drop.example/2 (for Cain)"]);
+    expect(r.code).toBe(0);
+    expect(r.err).toContain("[warn]");
   });
 });

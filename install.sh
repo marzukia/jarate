@@ -142,7 +142,7 @@ if [ -f "$PEERS_DEST" ]; then
 else
   self=""
   if command -v jq >/dev/null 2>&1 && [ -f "$HOME/.pi/agent/settings.json" ]; then
-    self="$(jq -r '[.channels[]? | select(.type == "discord") | .id // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json" 2>/dev/null || true)"
+    self="$(jq -r '[.channels[]? | select(.type == "discord") | .channel // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json" 2>/dev/null || true)"
   fi
   if [ "$DRY" = 1 ]; then
     echo "  peers: [dry-run] would seed $PEERS_DEST (repo default + own channel)"
