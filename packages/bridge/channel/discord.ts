@@ -729,7 +729,7 @@ export function egressText(text: string): string {
  * Exported for tests.
  */
 export function allowedMentionsFor(text: string): {
-  parse: string[];
+  parse?: string[];
   users?: string[];
 } {
   const ids = [...text.matchAll(/<@!?([0-9]+)>/g)].map((m) => m[1]);
