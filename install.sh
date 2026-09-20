@@ -122,6 +122,23 @@ link_into "$HOME/bin/agent-say"      "$JARATE_DIR/bin/agent-say"
 link_into "$HOME/bin/jarate-diff"    "$JARATE_DIR/bin/jarate-diff"
 link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 
+# --- 3a. PATH verification (issue #71) -------------------------------------
+# Assert every linked tool resolves in the unit's PATH. A missing dispatch
+# tool must never be a silent success: the callback is the only wake
+# mechanism, and if pi-bg is unreachable by name the agent can never
+# dispatch a job.
+UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
+PATH_FAIL=0
+for tool in pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog agent-say jarate jarate-diff; do
+  if ! env -i PATH="$UNIT_PATH" command -v "$tool" >/dev/null 2>&1; then
+    echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2
+    PATH_FAIL=1
+  fi
+done
+if [ "$PATH_FAIL" -eq 0 ]; then
+  echo "  PATH: all dispatch tools resolvable in unit env"
+fi
+
 # recall: only adopt if the dest is absent or already our symlink (a live
 # deployed dir with .venv/.git is migrated manually, see DEPLOY.md)
 RECALL_DEST="$HOME/projects/recall"

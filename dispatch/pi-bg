@@ -115,7 +115,19 @@ fi
 # happens once). A box without a setsid binary keeps the legacy behavior
 # instead of breaking dispatch entirely.
 if [ "${PI_BG_SETSID:-0}" != "1" ] && command -v setsid >/dev/null 2>&1; then
-  PI_BG_SETSID=1 exec setsid bash "$0" "$@"
+  # issue #66: capture PWD before re-exec. `setsid bash "$0"` starts a new
+  # session leader; the virtual cwd set by `bash -c 'cd X && ...'` is NOT
+  # inherited (it lives in the parent bash's CWD variable, not the env).
+  # Without this, `pwd` in the re-exec'd process falls back to $HOME and
+  # `git rev-parse --show-toplevel` fails on batch dispatches (2+ from one
+  # shell call). We pass the captured cwd as an env var and chdir below.
+  PI_BG_LANCHED_CWD="$PWD" PI_BG_SETSID=1 exec setsid bash "$0" "$@"
+fi
+
+# Restore the launcher's cwd (issue #66). Only applies to the setsid
+# re-exec'd process; the original process already has the right cwd.
+if [ -n "${PI_BG_LANCHED_CWD:-}" ] && [ -d "${PI_BG_LANCHED_CWD}" ]; then
+  cd "${PI_BG_LANCHED_CWD}" 2>/dev/null || true
 fi
 
 profile="${1:-worker}"

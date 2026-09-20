@@ -17,7 +17,8 @@ Wants=network-online.target
 Environment=HOME=%h
 Environment=NODE_OPTIONS=--heapsnapshot-near-heap-limit=1
 # %h/bin keeps agent-say/jarate (install.sh symlinks) resolvable by name.
-Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+# %h/scripts keeps pi-bg/pi-wait (install.sh symlinks) resolvable by name.
+Environment=PATH=%h/.local/bin:%h/bin:%h/scripts:/usr/local/bin:/usr/bin:/bin
 # - prefix: a missing env file is NOT fatal (plain = FATAL, verified
 # 2026-09-16). Optional LLM provider keys, chmod 600.
 EnvironmentFile=-%h/.hermes/.env
