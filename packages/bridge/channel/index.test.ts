@@ -735,11 +735,13 @@ describe("extension handlers (A1/A2/A4)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],
       }),
     );
+
     handlers = {};
     sent = [];
     midTurnQueues.clear();
@@ -2136,6 +2138,7 @@ describe("extension handlers (A1/A2/A4)", () => {
             name: "One",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
           {
@@ -2212,6 +2215,7 @@ describe("extension handlers (A1/A2/A4)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             bufferFileOnly: true,
           },
         ],
@@ -2273,6 +2277,7 @@ describe("extension handlers (A1/A2/A4)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             bufferFileOnly: true,
           },
         ],
@@ -2328,6 +2333,7 @@ describe("extension handlers (A1/A2/A4)", () => {
               name: "Test",
               type: "discord",
               botToken: "tok1",
+              ownerUserId: "uid",
               bufferFileOnly: true,
             },
           ],
@@ -2373,6 +2379,7 @@ describe("extension handlers (A1/A2/A4)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             bufferFileOnly: true,
           },
         ],
@@ -2757,6 +2764,7 @@ exit 0
         name: "Test",
         type: "discord",
         botToken: "tok1",
+        ownerUserId: "uid",
         transcribe: false,
       },
     ]);
@@ -3863,6 +3871,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     type: "discord",
     botToken: "tok-i",
     channel: "888",
+    ownerUserId: "owner1",
   };
   let pi: any;
   let ctx: any;
@@ -4070,6 +4079,7 @@ describe("compact: defer mid-run + always report", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],
@@ -4842,6 +4852,7 @@ describe("todo board (integration)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],
@@ -5277,6 +5288,7 @@ describe("sleep (integration)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],
@@ -5610,6 +5622,7 @@ describe("tasks (integration)", () => {
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],
@@ -6207,6 +6220,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
             name: "Test",
             type: "discord",
             botToken: "tok1",
+            ownerUserId: "uid",
             ack: true,
           },
         ],

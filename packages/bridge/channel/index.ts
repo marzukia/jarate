@@ -3511,7 +3511,7 @@ async function runChannelCommand(
   fromId: string | undefined,
   native: boolean,
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
-  const isOwner = !ch.ownerUserId || fromId === ch.ownerUserId;
+  const isOwner = !!ch.ownerUserId && fromId === ch.ownerUserId;
   const ownerOnly = !isOwner
     ? { immediate: native ? fence("[!] owner only") : undefined }
     : {};
@@ -4817,7 +4817,7 @@ export async function handleInbound(
   const bang = rawBody.match(/^!\s*([\s\S]+)$/);
   if (bang && ch) {
     noAck();
-    if (ch.ownerUserId && msg.fromId !== ch.ownerUserId) {
+    if (!ch.ownerUserId || msg.fromId !== ch.ownerUserId) {
       replyCmd(fence("[!] ! shell is owner-only"));
       return;
     }

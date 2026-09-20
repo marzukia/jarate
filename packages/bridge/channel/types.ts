@@ -196,9 +196,21 @@ function normalizeChannel(raw: any): ChannelConfig {
  *   2. `systemdUnit` in settings.json (same cascade as channels)
  *   3. "pi.service"
  */
+/**
+ * Resolve the systemd unit name for pi restarts.
+ * Sources (first match wins): $PI_SERVICE, <cwd>/.pi/settings.json,
+ * ~/.pi/agent/settings.json, fallback "pi.service".
+ * issue H2/H3: the result is interpolated into `sh -c "systemctl …"`,
+ * so validate it against the systemd unit name charset. A value with
+ * shell metacharacters (from a cwd-local settings.json in a reviewed
+ * checkout) is rejected and the fallback is used.
+ */
+const UNIT_RE = /^[A-Za-z0-9._@:+-]+\.service$/;
+
 export function resolveSystemdUnit(cwd: string): string {
+  const candidates: string[] = [];
   const env = process.env.PI_SERVICE;
-  if (typeof env === "string" && env.trim()) return env.trim();
+  if (typeof env === "string" && env.trim()) candidates.push(env.trim());
   const sources = [
     path.join(cwd, ".pi", "settings.json"),
     path.join(homedir(), ".pi", "agent", "settings.json"),
@@ -207,10 +219,13 @@ export function resolveSystemdUnit(cwd: string): string {
     try {
       const data = JSON.parse(fs.readFileSync(src, "utf-8"));
       const u = data?.systemdUnit;
-      if (typeof u === "string" && u.trim()) return u.trim();
+      if (typeof u === "string" && u.trim()) candidates.push(u.trim());
     } catch {
       /* continue to next source */
     }
+  }
+  for (const c of candidates) {
+    if (UNIT_RE.test(c)) return c;
   }
   return "pi.service";
 }
