@@ -1415,14 +1415,28 @@ cmd_setup() {
   # --- 10. verify: journal gate (same signal deploy.sh trusts) ---------------
   local verified="null"
   if [ "$SETUP_VERIFY" = 1 ] && [ "$SETUP_DRY" = 0 ]; then
+    # If pi.service is ALREADY active, a fresh '[interactions] registered' line
+    # will not be emitted (the service is not restarting), so gating on the
+    # current run's journal false-fails. In that case, pass if the service is
+    # active AND has EVER registered (any time in the journal).
+    local already_active=0
+    [ "$(systemctl --user is-active pi.service 2>/dev/null)" = "active" ] && already_active=1
     slog "boot gate: waiting <=90s for pi.service active + '[interactions] registered'"
     local since ok=0 deadline
     since="$(date '+%F %T')"
     deadline=$(( $(date +%s) + ${JARATE_SETUP_GATE_S:-90} ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-      if [ "$(systemctl --user is-active pi.service 2>/dev/null)" = "active" ] \
-         && journalctl --user -u pi.service --since "$since" --no-pager 2>/dev/null | grep -aq '\[interactions\] registered'; then
-        ok=1; break
+      if [ "$already_active" = 1 ]; then
+        # already running: pass on active + any-time registration (no restart signal needed)
+        if [ "$(systemctl --user is-active pi.service 2>/dev/null)" = "active" ] \
+           && journalctl --user -u pi.service --no-pager 2>/dev/null | grep -aq '\[interactions\] registered'; then
+          ok=1; break
+        fi
+      else
+        if [ "$(systemctl --user is-active pi.service 2>/dev/null)" = "active" ] \
+           && journalctl --user -u pi.service --since "$since" --no-pager 2>/dev/null | grep -aq '\[interactions\] registered'; then
+          ok=1; break
+        fi
       fi
       sleep "${JARATE_SETUP_POLL_S:-3}"
     done
@@ -1481,8 +1495,6 @@ cmd_setup() {
 main() {
   local cmd="${1:-}"
   [ $# -gt 0 ] && shift
-  local -a args=()
-  read -r -a args <<<"$*"
 
   case "$cmd" in
     "" | help | -h | --help)
@@ -1492,15 +1504,15 @@ main() {
                      "rag", "projects", "projects-backfill",
                      "agents-check", "agents-bless"]}'
       ;;
-    setup) cmd_setup "${args[@]}" ;;
-    ctx-report) cmd_ctx_report "${args[@]}" ;;
-    journal-errors) cmd_journal_errors "${args[@]}" ;;
-    memory-grep) cmd_memory_grep "${args[@]}" ;;
-    rag) cmd_rag "${args[@]}" ;;
-    projects) cmd_projects "${args[@]}" ;;
-    projects-backfill) cmd_projects_backfill "${args[@]}" ;;
-    agents-check) cmd_agents_check "${args[@]}" ;;
-    agents-bless) cmd_agents_bless "${args[@]}" ;;
+    setup) cmd_setup "$@" ;;
+    ctx-report) cmd_ctx_report "$@" ;;
+    journal-errors) cmd_journal_errors "$@" ;;
+    memory-grep) cmd_memory_grep "$@" ;;
+    rag) cmd_rag "$@" ;;
+    projects) cmd_projects "$@" ;;
+    projects-backfill) cmd_projects_backfill "$@" ;;
+    agents-check) cmd_agents_check "$@" ;;
+    agents-bless) cmd_agents_bless "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),

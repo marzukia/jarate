@@ -1354,6 +1354,34 @@ describe("setup", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
+  test("boot gate: already-active service + prior registration passes (no false-fail, #72)", async () => {
+    const f = fixture();
+    const repo = fakeCheckout(f);
+    curlStub(f);
+    systemdStubs(f, "active"); // is-active -> active from the start (service was already running)
+    const r = await f.run(
+      [
+        "setup",
+        "aa.bb.cc",
+        "123",
+        "--yes",
+        "--jarate-dir",
+        repo,
+        "--name",
+        "testbot",
+      ],
+      { JARATE_SETUP_GATE_S: "3", JARATE_SETUP_POLL_S: "1" },
+    );
+    // Post-#72: an already-active service that has EVER registered passes the
+    // gate (the old code required a fresh registration line in the current
+    // run's journal, which an already-running service never emits -> false-fail).
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.verified).toBe(true);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
   test("usage errors -> rc 2 + error doc, before any side effect", async () => {
     const f = fixture();
     curlStub(f);
@@ -1387,14 +1415,11 @@ describe("setup", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("pre-joined args and split args both work", async () => {
+  test("split args work; pre-joined string is one arg (no re-split)", async () => {
     const f = fixture();
     const repo = fakeCheckout(f);
     curlStub(f);
-    const joined = await f.run([
-      "setup",
-      `aa.bb.cc 123 --owner 456 --name testbot --jarate-dir ${repo}`,
-    ]);
+    // Split args: the correct form. Each flag + value is its own arg.
     const split = await f.run([
       "setup",
       "aa.bb.cc",
@@ -1406,13 +1431,23 @@ describe("setup", () => {
       "--jarate-dir",
       repo,
     ]);
-    expect(joined.code).toBe(0);
     expect(split.code).toBe(0);
-    const dj = doc(joined);
     const ds = doc(split);
-    expect(dj.ok).toBe(true);
-    expect(dj.agent).toBe(ds.agent);
-    expect(dj.next_steps).toEqual(ds.next_steps);
+    expect(ds.ok).toBe(true);
+    expect(ds.agent).toBe("testbot");
+    // Pre-joined: a single arg with embedded spaces is ONE arg (not re-split).
+    // setup receives it as the bot-token and finds no channel-id -> usage error.
+    // This is the post-#72 behavior: the old `read -r -a args <<<"$*"` re-split
+    // made this work by accident; the fix (cmd_setup "$@") keeps argv exact,
+    // so callers must pass split args.
+    const joined = await f.run([
+      "setup",
+      `aa.bb.cc 123 --owner 456 --name testbot --jarate-dir ${repo}`,
+    ]);
+    expect(joined.code).toBe(2);
+    const dj = doc(joined);
+    expect(dj.ok).toBe(false);
+    expect(dj.error).toContain("usage");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
