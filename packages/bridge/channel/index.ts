@@ -4336,7 +4336,7 @@ export async function syncTodoBoard(
       }
       return;
     }
-    const text = renderBoard(board.todos);
+    const text = fence(renderBoard(board.todos));
     if (board.boardMessageId) {
       const r = await editDiscordMessage(ch, board.boardMessageId, text);
       if (!r.success)
