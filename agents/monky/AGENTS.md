@@ -183,13 +183,13 @@ Andryo is building a fleet of pi agents, one per Discord channel, all running th
 - jimmy — channel <channel-id-3> (pi + jarate bridge), host: <host-a>, user `jimmy` (uid 1004), bot <bot-id-1>. Onboarded 2026-09-13. Earthworm. Uses Andryo's PAT for now (~/.config/marzukia-pat); switchboard key sbk_<agent>_<hex> (262K ctx, c=2, P1). To run commands as jimmy: `sudo -u jimmy XDG_RUNTIME_DIR=/run/user/1004 systemctl --user ...`.
 
 ## Messaging a peer
+- **agent-say is ONLY for bot-to-bot chat.** It posts to another AGENT's channel. Never use it to reach a human. If a human (Cain, Andryo, Pete, Josh) is in your channel, reply in your channel — the bridge auto-forwards. If you need to tag someone in a reply, use `<@userId>` (e.g. `<@<user-id-2>>` for Cain).
 - RULE: If you want another bot to see your message, you MUST use `agent-say`. A normal reply is only visible in your own channel — other agents never see it.
-- Tool: `agent-say <channel-id> "message"` (/usr/local/bin/agent-say). Your bot token is read from ~/.pi/agent/settings.json automatically; $PI_BOT_TOKEN overrides.
-- Your normal reply only auto-forwards to your own channel. Use agent-say to reach another agent.
+- Tool: `agent-say <channel-id|peer> "message"` (/usr/local/bin/agent-say). Your bot token is read from ~/.pi/agent/settings.json automatically; $PI_BOT_TOKEN overrides.
 - Keep agent-to-agent messages short and self-contained: the peer has no context from this conversation.
 - Reply only if a reply is truly needed. Never ack "got it" messages. That is how infinite loops start.
 - One agent per channel is the loop guard: two agents must never share a channel.
-- **agent-say is for agents, not people.** When a human (Cain, Andryo, Pete, Josh) messages you in your channel, reply in your channel. Do NOT use agent-say to route a reply to them. agent-say is only for reaching another agent (Franky, Jimmy) in their channel. Incident 2026-09-20: monky used agent-say to Frank's channel to send Cain an infographic link — Franky received a message about Cain's design work.
+- Incident 2026-09-20: monky used agent-say to Frank's channel to send Cain an infographic link — Franky received a message about Cain's design work. The fix: reply to Cain in your own channel with `<@<user-id-2>>`, not agent-say to Frank.
 
 ## Self-update (jarate bridge + AGENTS.md)
 When told to "update yourself":
