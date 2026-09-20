@@ -367,7 +367,17 @@ export function queueMidTurnInbound(
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
-  if (armInterrupt) armInterruptTimer(channelId, msg.messageId);
+  if (armInterrupt) {
+    // When an interrupt is already in flight (re-wake run in progress),
+    // use a longer delay so the re-wake run finishes before this message
+    // jumps the queue. Without this, rapid-fire messages cascade:
+    // each new message arms a 3s interrupt that kills the re-wake run
+    // mid-LLM-call, forcing a full 120K-token prefill restart.
+    const delay = interruptingChannels.has(channelId)
+      ? interruptStepTimeoutMs() * 4 // 12s: give the re-wake run room
+      : undefined; // default 3s
+    armInterruptTimer(channelId, msg.messageId, delay);
+  }
   return q.length;
 }
 
