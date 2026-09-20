@@ -95,12 +95,25 @@ fi
 # deliverables dropped into a peer channel usually don't (2026-09-20
 # incident: "Cain asked me..." -> frank's channel). Non-blocking: replies
 # inside an agent-to-agent thread often omit the name.
+# agent-say is ONLY for bot-to-bot. If the message names a human but
+# not the target peer, it is almost certainly mis-routed.
 if [ -n "$peer_name" ]; then
   lc_msg="$(printf '%s' "$msg" | tr '[:upper:]' '[:lower:]')"
   lc_name="$(printf '%s' "$peer_name" | tr '[:upper:]' '[:lower:]')"
   case "$lc_msg" in
     *"$lc_name"*) ;;
-    *) echo "agent-say: [warn] message to $peer_name's channel does not name $peer_name. If it is for a human, reply in your own channel instead." >&2 ;;
+    *)
+      # Check if the message names a known human instead of the peer
+      human_hit=""
+      for h in andryo cain joshua josh pete fehras abby alexa august; do
+        case "$lc_msg" in *"$h"*) human_hit="$h"; break;; esac
+      done
+      if [ -n "$human_hit" ]; then
+        echo "agent-say: [warn] message names '$human_hit' (a human) but not $peer_name. agent-say is ONLY for bot-to-bot. Reply in your own channel to reach $human_hit — use <@userId> to tag them." >&2
+      else
+        echo "agent-say: [warn] message to $peer_name's channel does not name $peer_name. If it is for a human, reply in your own channel instead." >&2
+      fi
+      ;;
   esac
 fi
 
