@@ -43,7 +43,9 @@ so no command can do it for you:
    - **your user ID** — right-click your avatar → Copy User ID → `--owner`.
 5. **LLM endpoint** — an OpenAI-compatible base URL + model id + API key
    (local vLLM/llama.cpp or hosted). The unit template loads optional keys
-   from `~/.hermes/.env` (`EnvironmentFile=-%h/.hermes/.env`).
+   from `~/.hermes/.env` (`EnvironmentFile=-%h/.hermes/.env`) and per-agent
+   extension secrets from `~/.pi/agent/secrets.env` (`settings.json`
+   references those as `${VAR}`, so keys stay out of the settings file).
 6. **The box** — Linux with cgroup v2 + systemd user sessions; `git`,
    `python3`, `jq`, `curl` on PATH; Node ≥ 20 + bun ≥ 1.4 with
    `~/.local/bin` on PATH, `pi` and `bun` installed:

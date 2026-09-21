@@ -1152,6 +1152,7 @@ describe("setup", () => {
     expect(pi).toContain("pi coding agent (testbot)");
     expect(pi).not.toContain("__AGENT_NAME__");
     expect(pi).toContain("EnvironmentFile=-%h/.hermes/.env");
+    expect(pi).toContain("EnvironmentFile=-%h/.pi/agent/secrets.env");
     expect(pi).toContain(
       "Environment=PATH=%h/.local/bin:%h/bin:%h/scripts:/usr/local/bin:/usr/bin:/bin",
     );

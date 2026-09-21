@@ -2,7 +2,13 @@
  * MCP bridge — connects pi to MCP servers over streamable HTTP.
  *
  * Config: `mcp` array in ~/.pi/agent/settings.json
- *   { "mcp": [ { "name": "tavily", "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=..." } ] }
+ *   { "mcp": [ { "name": "tavily", "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}" } ] }
+ *
+ * `${VAR}` references are resolved from the process environment, so API keys
+ * live in a secrets file supplied by pi.service's EnvironmentFile
+ * (e.g. TAVILY_API_KEY in ~/.pi/agent/secrets.env, chmod 600) rather than
+ * sitting in settings.json next to other credentials. An unresolved
+ * reference is reported on stderr and expands to an empty string.
  *
  * For each server, fetches tools via tools/list and registers them as
  * native pi tools. Tool calls are proxied via tools/call.
@@ -22,6 +28,20 @@ interface McpServerConfig {
   tools?: string[];
 }
 
+function expandEnv(value: string, missing: Set<string>): string {
+  return value.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g,
+    (_m, name: string) => {
+      const v = process.env[name];
+      if (v === undefined) {
+        missing.add(name);
+        return "";
+      }
+      return v;
+    },
+  );
+}
+
 function loadMcpConfigs(): McpServerConfig[] {
   const candidates = [
     path.join(process.env.HOME || "", ".pi/agent/settings.json"),
@@ -33,7 +53,21 @@ function loadMcpConfigs(): McpServerConfig[] {
       const settings = JSON.parse(fs.readFileSync(file, "utf8"));
       const mcp = settings?.mcp;
       if (Array.isArray(mcp)) {
-        return mcp.filter((c: any) => c?.url);
+        // Secrets stay out of settings.json: `${VAR}` is resolved from the
+        // process environment, which pi.service supplies via EnvironmentFile
+        // (e.g. TAVILY_API_KEY in ~/.pi/agent/secrets.env).
+        return mcp
+          .filter((c: any) => c?.url)
+          .map((c: any) => {
+            const missing = new Set<string>();
+            const url = expandEnv(String(c.url), missing);
+            if (missing.size > 0) {
+              console.error(
+                `[mcp] ${c.name}: unresolved env var(s): ${[...missing].join(", ")}`,
+              );
+            }
+            return { ...c, url };
+          });
       }
     } catch {
       /* ignore */
