@@ -389,3 +389,28 @@ describe("wrapFenceLines", () => {
     expect(wrapFenceLines(input)).toBe(input);
   });
 });
+
+describe("hoistFencedUrls", () => {
+  test("bare url in fence -> hoisted to plain line after fence", () => {
+    const out = mdToDiscord(
+      "Dev link:\n\n```\nhttp://<tailscale-ip-1>:1313/posts/x/\n```\n\nMore text.",
+    );
+    // url must NOT be inside a fence; it appears as a bare line
+    expect(out).toContain("http://<tailscale-ip-1>:1313/posts/x/");
+    // and the fence is gone (urls-only fence dropped)
+    const urlIdx = out.indexOf("http://<tailscale-ip-1>:1313/posts/x/");
+    expect(out.slice(0, urlIdx)).not.toContain("```");
+  });
+  test("url mixed with code -> code kept in fence, url after", () => {
+    const out = mdToDiscord("```\nport 1313\nhttp://x.test:1313/\n```");
+    expect(out).toContain("port 1313");
+    const urlIdx = out.indexOf("http://x.test:1313/");
+    // url is after the closing fence
+    const fenceClose = out.lastIndexOf("```");
+    expect(urlIdx).toBeGreaterThan(fenceClose);
+  });
+  test("no url in fence -> unchanged", () => {
+    const out = mdToDiscord("```\njust code here\n```");
+    expect(out).toContain("```\njust code here\n```");
+  });
+});

@@ -445,6 +445,62 @@ export function wrapFenceLine(line: string, max: number): string[] {
 }
 
 /**
+ * Hoist bare URLs out of fenced code blocks.
+ *
+ * A URL inside a ``` fence is NOT clickable in Discord - it renders as
+ * monospace text. When the LLM ships a link in a code block (the "dev link"
+ * habit), the reader gets a non-clickable string. Detect fence lines that are
+ * a bare http(s) URL (the whole line, nothing else) and move them to plain
+ * lines immediately after the fence so Discord auto-links them. If a fence
+ * contained only URL lines, the fence is dropped entirely.
+ *
+ * Fence-aware (same toggle as wrapFenceLines); non-URL code lines are left
+ * inside the fence untouched. Exported for tests.
+ */
+export function hoistFencedUrls(md: string): string {
+  const urlLine = /^\s*(https?:\/\/\S+)\s*$/i;
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trimStart().startsWith("```")) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    // collect the whole fence (open line .. close line)
+    const fenceStart = i;
+    let j = i + 1;
+    while (j < lines.length && !lines[j]!.trimStart().startsWith("```")) j++;
+    const fenceEnd = j; // index of the closing fence line
+    const body = lines.slice(fenceStart + 1, fenceEnd);
+    const hoisted: string[] = [];
+    const kept: string[] = [];
+    for (const bl of body) {
+      const m = bl.match(urlLine);
+      if (m) hoisted.push(m[1]!);
+      else kept.push(bl);
+    }
+    if (hoisted.length === 0) {
+      // no urls to hoist; emit fence unchanged
+      out.push(...lines.slice(fenceStart, fenceEnd + 1));
+      i = fenceEnd + 1;
+      continue;
+    }
+    if (kept.length > 0) {
+      // fence still has code in it: keep it, then the hoisted urls after
+      out.push(lines[fenceStart]!, ...kept, lines[fenceEnd]!, ...hoisted);
+    } else {
+      // fence was urls only: drop it, emit the urls as plain lines
+      out.push(...hoisted);
+    }
+    i = fenceEnd + 1;
+  }
+  return out.join("\n");
+}
+
+/**
  * Escape triple backticks in free text so it doesn't open a code block
  * when inserted into a Discord message.
  */
@@ -545,6 +601,7 @@ export function mdToDiscord(md: string): string {
   out = escapeBackticksInCodeBlocks(out);
   out = convertInlineForDiscord(out);
   out = collapseFenceTrailingBlankLines(out);
+  out = hoistFencedUrls(out);
   out = wrapFenceLines(out);
   return out;
 }

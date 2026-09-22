@@ -19,8 +19,8 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
     continue with two spaces. Both gutters are 2 cols. (Andryo 2026-09-16,
     screenshot: bare 2-space wraps under ├ read as detached.)
 2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on Andryo's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
-2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra
-    context goes before the frame.
+2.3a A frame is for SHORT machine state only (a few lines: status, a single command result, a small box). Do NOT put long lists, tables, or triage inside a frame - the monospace box wraps at ~31 cols in Discord's normal (non-zoomed) view and becomes unreadable. For content longer than ~6 lines or with many rows, use plain bullets (no box) instead. If a frame must carry more, keep every row <= ~30 cols so it survives the normal view.
+2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra context, follow-ups, or prose go BEFORE the frame, never after. (A line after `└` breaks the box and reads as detached.)
 2.5 Blank line before a fence: yes. Blank line after a fence: only if the
     message ends. If text must follow the fence, use a SINGLE newline
     (a blank line renders as a visible gap in Discord).

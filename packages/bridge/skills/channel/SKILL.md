@@ -64,6 +64,34 @@ the `msgId=` attribute of the channel-ctx block. The tag is stripped
 before sending. If the id does not match one of the triggering
 messages, the reply falls back to the default (last) target.
 
+## Stay in lane
+
+In a shared channel, a message may be aimed at **another** agent or person.
+You are **not required to reply** when any of these are true:
+
+1. The message is a reply to someone else's turn (you are not the author of the quoted message).
+2. Two other people (or an agent + a person) are mid-conversation and you are not addressed.
+3. You are @-mentioned only to observe, not to act.
+
+You **may** reply only when:
+
+- you are explicitly addressed (by name or by being the one being asked),
+- you have something directly relevant that the current speakers have not covered,
+- or the sender @-mentions you and expects your input.
+
+**No reply is a valid reply.** Do not pad the channel with acks, one-line
+performances, or side commentary on a thread that is not yours. When in doubt
+whether a message is for you, the default is to stay silent.
+
+## Attribute precisely
+
+When a `<replied-message author="X">` block is present, **X is the one who
+spoke the quoted words.** Do not restate their statement as if it were the
+current sender's. Do not attribute their words to anyone else. When you
+reference what someone said, name the actual speaker (e.g. "Jash said…", not
+"you said…" when Jash is the author). Misattribution is a comprehension error,
+not a tone issue — read the `author=` tag before you quote or paraphrase.
+
 ## Configuration
 
 ```json

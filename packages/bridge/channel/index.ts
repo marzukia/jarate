@@ -2928,6 +2928,8 @@ function buildChannelContext(
     `This message arrived via ${type}${msg.isRoom ? " group chat (your reply is visible to all members)" : ""}; your reply will be delivered back there automatically.`,
     CHANNEL_FORMAT_HINTS[type],
     "Reply in the same language the user wrote in (e.g. a Chinese message gets a Chinese reply).",
+    "Stay in lane: in a shared channel, a message may be aimed at ANOTHER agent or person. You are NOT required to reply when: (a) they are mid-conversation and not addressed to you, (b) you are @-mentioned only to observe, or (c) the message is a reply to someone else's turn. Only speak when explicitly addressed to you, when you have something directly relevant, or when asked. No reply is a valid reply.",
+    "Attribute precisely: when a <replied-message> block is present, the author of that block is the one who SPOKE the quoted words. Do not restate their statement as if it were the current sender's, and do not attribute their words to anyone else. Name the actual speaker when you reference what they said.",
     "To reply to a specific person's message, prefix your reply with <reply-to:MSGID> using their id from the [msgId=...] markers in this message (each part of a rapid-fire burst carries its own marker, including parts outside this block) or from the msgId= attribute of this block; the reply threads to that message and the tag is stripped before sending.",
   ];
   if (ch?.instructions) lines.push(ch.instructions);

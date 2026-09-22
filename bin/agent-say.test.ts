@@ -300,8 +300,8 @@ describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
     expect(r.err).toContain("[warn]");
-    expect(r.err).toContain("does not name frank");
-    expect(r.err).toContain("reply in your own channel");
+    expect(r.err).toContain("not frank");
+    expect(r.err).toContain("Reply in your own channel");
     expect(curlUrl(f.capture)).toContain("/channels/<channel-id-2>/");
   });
 
