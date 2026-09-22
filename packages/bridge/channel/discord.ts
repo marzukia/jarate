@@ -534,7 +534,11 @@ export async function pollDiscord(configId: string): Promise<void> {
       ? `/channels/${channelId}/messages?after=${lastMessageId}&limit=10`
       : `/channels/${channelId}/messages?limit=1`;
 
-    const msgs: any[] = (await discordFetch(token, url)) || [];
+    const raw = await discordFetch(token, url);
+    // The messages endpoint returns an array; coerce defensively so a
+    // non-array (null/undefined or an unexpected object) can't throw
+    // "is not iterable" inside the deliver loop.
+    const msgs: any[] = Array.isArray(raw) ? raw : [];
     state.consecutiveErrors = 0;
     state.pollPauseUntil = 0;
 
