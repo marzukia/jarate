@@ -72,6 +72,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 | `~/.config/pi-dispatch/webhook` | the pi-bg callback webhook, first line, chmod 600 |
 | `~/.config/webdrop/config.toml` | copy from an existing agent |
 | `~/.hermes/.env` | copy from an existing agent (OPENROUTER key; credits may be $0 - the LLM does NOT use it, only image gen) |
+| `~/.pi/agent/secrets.env` | per-agent extension secrets, chmod 600 (e.g. `TAVILY_API_KEY` for the MCP bridge; keys are referenced from `settings.json` as `${VAR}`) |
 | `~/.pi/agent/settings.json` | see below |
 | `~/.pi/agent/models.json` | see below |
 | `~/.pi/agent/AGENTS.md` | identity + roster + rules (copy an existing one, rewrite identity/roster) |
@@ -152,6 +153,7 @@ Environment=HOME=/home/<name>
 Environment=PATH=/home/<name>/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=NODE_OPTIONS=--heapsnapshot-near-heap-limit=1
 EnvironmentFile=/home/<name>/.hermes/.env
+EnvironmentFile=/home/<name>/.pi/agent/secrets.env
 WorkingDirectory=/home/<name>
 ExecStart=/bin/bash -c 'tail -f /dev/null | /home/<name>/.local/bin/pi -c --mode rpc'
 Restart=always

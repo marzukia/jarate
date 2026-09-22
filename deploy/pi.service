@@ -20,8 +20,12 @@ Environment=NODE_OPTIONS=--heapsnapshot-near-heap-limit=1
 # %h/scripts keeps pi-bg/pi-wait (install.sh symlinks) resolvable by name.
 Environment=PATH=%h/.local/bin:%h/bin:%h/scripts:/usr/local/bin:/usr/bin:/bin
 # - prefix: a missing env file is NOT fatal (plain = FATAL, verified
-# 2026-09-16). Optional LLM provider keys, chmod 600.
+# 2026-09-16). ~/.hermes/.env carries optional provider keys (OPENROUTER,
+# image gen). ~/.pi/agent/secrets.env carries per-agent extension secrets
+# (e.g. TAVILY_API_KEY for the MCP bridge); settings.json references them
+# as ${VAR}, so keys never sit in settings.json itself. chmod 600.
 EnvironmentFile=-%h/.hermes/.env
+EnvironmentFile=-%h/.pi/agent/secrets.env
 WorkingDirectory=%h
 # tail keeps stdin open: RPC mode exits on stdin EOF
 ExecStart=/bin/bash -c 'tail -f /dev/null | %h/.local/bin/pi -c --mode rpc'
