@@ -207,6 +207,36 @@ describe("convertInlineForDiscord", () => {
     const input = "```\n# not a heading\n[a](b)\n```";
     expect(convertInlineForDiscord(input)).toBe(input);
   });
+  test("backticked bare URL becomes clickable <url>", () => {
+    expect(convertInlineForDiscord("see `https://github.com/x/y` now")).toBe(
+      "see <https://github.com/x/y> now",
+    );
+  });
+  test("backticked http (no s) URL becomes clickable", () => {
+    expect(convertInlineForDiscord("`http://<tailscale-ip-1>:1313/x/`")).toBe(
+      "<http://<tailscale-ip-1>:1313/x/>",
+    );
+  });
+  test("code span with non-URL content is left alone", () => {
+    expect(convertInlineForDiscord("run `pip install x` here")).toBe(
+      "run `pip install x` here",
+    );
+  });
+  test("code span that is a URL plus trailing text is left alone", () => {
+    // not a pure-URL span, so it stays a code span
+    expect(convertInlineForDiscord("`https://x.test and more`")).toBe(
+      "`https://x.test and more`",
+    );
+  });
+  test("bare (unbackticked) URL stays a Discord autolink as-is", () => {
+    expect(convertInlineForDiscord("see https://x.test now")).toBe(
+      "see https://x.test now",
+    );
+  });
+  test("URL inside a code block is NOT unwrapped", () => {
+    const input = "```\n`https://x.test`\n```";
+    expect(convertInlineForDiscord(input)).toBe(input);
+  });
 });
 
 // ─── mdToDiscord pipeline ──────────────────────────────────────────────────

@@ -578,6 +578,13 @@ export function convertInlineForDiscord(md: string): string {
         (_m, text: string, url: string) => `${text} (<${url}>)`,
       ),
     );
+    // `https://…` (a codespan whose ENTIRE content is a bare URL) → <https://…>
+    // so a backticked link stays clickable. Spans with any other content
+    // (e.g. `foo bar`, `code`) are left alone.
+    converted = converted.replace(
+      /`((?:https?:\/\/)[^`\s]+)`/g,
+      (_m, url: string) => `<${url}>`,
+    );
     out.push(converted);
   }
   return out.join("\n");
