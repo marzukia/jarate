@@ -1057,13 +1057,34 @@ function postHandoverFail(
   }
 }
 
-/** Build the handover doc: deterministic extraction (pure) → LLM prose
- *  over the filled skeleton (stubbed in tests) → template → sizeGuard →
- *  write to the store. Returns the doc string; the wiring wraps it into
- *  the CompactionResult. Throws on LLM failure AFTER posting the
- *  sanitized channel notice. */
+/** Deterministic handover doc (NO LLM call). The agent already has all the
+ *  state - references, worktrees, todos, dispatch, machine state, transcript.
+ *  We extract it and write the doc. No model call means no 400/500, no
+ *  headers, no reverse-proxy quirks. The LLM prose sections (Mission /
+ *  In-Flight / Done / Blockers / Decisions / Follow-ups / Gotchas) are
+ *  replaced by the raw transcript span, which carries the actual content;
+ *  the next session reads that. */
+export function renderDeterministic(
+  state: ParsedState,
+  transcript: string,
+  header: string,
+): string {
+  const or = (s: string) => (s.trim() ? s.trim() : "(none)");
+  return [
+    header,
+    `## Transcript (about to be compacted)\n${or(transcript)}`,
+    `## References\n${renderReferences(state)}`,
+    `## State\n${renderState(state)}`,
+    `## Last user asks\n${renderLastAsks(state)}`,
+    renderFileTags(state),
+  ].join("\n\n");
+}
+
+/** Build the handover doc: deterministic extraction (pure) → template →
+ *  sizeGuard → write to the store. NO LLM call. Returns the doc string;
+ *  the wiring wraps it into the CompactionResult. */
 export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
-  const { preparation, branchEntries, ctx, pi, settings } = args;
+  const { preparation, branchEntries, ctx, settings } = args;
   const priorDoc =
     args.priorDoc ?? loadPreviousHandover({ storeDir: settings.storeDir });
   const state = extractDeterministic(preparation, branchEntries, {
@@ -1077,40 +1098,8 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
   });
   const now = args.now ?? new Date();
   const header = buildHeader(now, safeSessionId(ctx), preparation.tokensBefore);
-  const skeleton = renderLlmSkeleton(state);
   const transcript = serializeTranscript(preparation);
-  const complete = args.complete ?? makeDefaultComplete(ctx);
-  const signal = args.signal
-    ? AbortSignal.any([
-        args.signal,
-        AbortSignal.timeout(HANDOVER_GEN_TIMEOUT_MS),
-      ])
-    : AbortSignal.timeout(HANDOVER_GEN_TIMEOUT_MS);
-  let prose: LlmProse;
-  try {
-    const text = await complete(
-      HANDOVER_SYSTEM_PROMPT,
-      buildLlmPrompt({
-        prior: priorDoc,
-        skeleton,
-        transcript,
-        instructions: args.instructions,
-      }),
-      { signal },
-    );
-    prose = parseLlmProse(text);
-  } catch (e) {
-    // MINOR-2 (PR1 review): on an operator abort (/stop) pi posts its own
-    // "[!] compact failed: Compaction cancelled" — skip ours so the channel
-    // is not double-posted with a misleading "handover gen failed".
-    if (args.signal?.aborted) {
-      console.error("[handover] gen aborted - pi's cancel notice covers it");
-    } else {
-      postHandoverFail(pi, ctx, e);
-    }
-    throw e;
-  }
-  let doc = renderTemplate(state, prose, header);
+  let doc = renderDeterministic(state, transcript, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
   writeHandover(doc, { storeDir: settings.storeDir, now });
   return doc;

@@ -958,8 +958,8 @@ describe("buildHandover", () => {
     "[GOTCHAS] vLLM is sacred",
   ].join("\n");
 
-  test("success: doc returned, written to store, tags match details", async () => {
-    const complete = jest.fn(async () => PROSE);
+  test("deterministic: doc returned, written to store, no LLM call", async () => {
+    const complete = jest.fn(async () => "should not be called");
     const doc = await buildHandover({
       preparation: basePrep(),
       branchEntries: [],
@@ -969,52 +969,40 @@ describe("buildHandover", () => {
       complete,
       now: NOW,
     });
-    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete).not.toHaveBeenCalled(); // NO LLM call
     expect(doc).toContain("session sess-77");
-    expect(doc).toContain("## 1 · Mission");
-    expect(doc).toContain("Ship the bridge.");
+    expect(doc).toContain("## Transcript");
+    expect(doc).toContain("## References");
+    expect(doc).toContain("## State");
     const files = fs.readdirSync(storeDir);
     expect(files).toContain("latest.md");
-    expect(files.some((f) => f.startsWith("20260923-1430-"))).toBe(true);
     expect(loadPreviousHandover({ storeDir })).toBe(doc);
-    // details the wiring derives from the doc
     const tags = parsePriorTags(doc);
     expect(tags.readFiles).toContain("/home/monky/code/app/src/a.ts");
     expect(tags.modifiedFiles).toContain("/home/monky/code/app/src/b.ts");
   });
-  test("system prompt + user prompt shape (prior doc is the base, F6)", async () => {
-    let sys = "";
-    let usr = "";
-    const complete = jest.fn(async (s: string, u: string) => {
-      sys = s;
-      usr = u;
-      return PROSE;
-    });
-    await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [],
-      ctx,
-      pi,
-      settings: settings(),
-      complete,
-      priorDoc: PRIOR_DOC,
-      instructions: "keep the decisions",
-      now: NOW,
-    });
-    expect(sys).toContain("[MISSION]");
-    expect(usr).toContain("Build the bridge."); // prior doc text
-    expect(usr).toContain("OPERATOR INSTRUCTIONS: keep the decisions");
-    expect(usr).toContain("[user] fix the bug in PR #42"); // transcript
-    expect(usr).toContain("refs: #42"); // skeleton facts
-  });
-  test("cumulative: prior tags flow into the new doc's tags", async () => {
+
+  test("deterministic: transcript span is embedded in the doc", async () => {
     const doc = await buildHandover({
       preparation: basePrep(),
       branchEntries: [],
       ctx,
       pi,
       settings: settings(),
-      complete: async () => PROSE,
+      now: NOW,
+    });
+    // the actual user/assistant/tool text from the span is in the doc
+    expect(doc).toContain("fix the bug in PR #42"); // user ask
+    expect(doc).toContain("ok, reading /home/monky/code/app/src/a.ts"); // assistant reply
+  });
+
+  test("deterministic: prior tags flow into the new doc", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      pi,
+      settings: settings(),
       priorDoc: PRIOR_DOC,
       now: NOW,
     });
@@ -1023,140 +1011,50 @@ describe("buildHandover", () => {
     expect(tags.readFiles).toContain("/home/monky/code/app/src/a.ts");
     expect(tags.modifiedFiles).toContain("/home/monky/code/app/src/old3.ts");
   });
-  test("LLM failure → throw (wiring falls back to built-in)", async () => {
-    const complete = jest.fn(async () => {
-      throw new Error("boom");
-    });
-    await expect(
-      buildHandover({
-        preparation: basePrep(),
-        branchEntries: [],
-        ctx,
-        pi,
-        settings: settings(),
-        complete,
-        now: NOW,
-      }),
-    ).rejects.toThrow("boom");
-  });
-  test("empty LLM output → (none) sections, no throw", async () => {
-    const doc = await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [],
-      ctx,
-      pi,
-      settings: settings(),
-      complete: async () => "",
-      now: NOW,
-    });
-    expect(doc).toMatch(/## 1 · Mission\n\(none\)/);
-    expect(doc).toMatch(/## 8 · Gotchas & Constraints\n\(none\)/);
-  });
-  test("huge LLM output is size-guarded to the configured budget", async () => {
-    const huge = [
-      "[DONE]",
-      ...Array.from(
-        { length: 500 },
-        (_, i) => `done item ${i} with enough words to burn real token budget`,
+
+  test("deterministic: huge transcript is size-guarded to the budget", async () => {
+    const hugePrep = {
+      ...basePrep(),
+      messagesToSummarize: Array.from(
+        { length: 200 },
+        (_, i) =>
+          ({
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: `done item ${i} with enough words to burn real token budget for the size guard test`,
+              },
+            ],
+          }) as any,
       ),
-    ].join("\n");
+    };
     const doc = await buildHandover({
-      preparation: basePrep(),
+      preparation: hugePrep,
       branchEntries: [],
       ctx,
       pi,
       settings: settings({ sizeGuardTokens: 5_000 }),
-      complete: async () => huge,
       now: NOW,
     });
     expect(estTokens(doc)).toBeLessThanOrEqual(5_000);
-    expect(doc).toContain("… (condensed by size guard)");
   });
-  test("MINOR-2: aborted signal (operator /stop) → no double fail post", async () => {
-    const realFetch = globalThis.fetch;
-    const fetchCalls: { url: string; body?: any }[] = [];
-    globalThis.fetch = (async (url: any, init?: any) => {
-      fetchCalls.push({ url: String(url), body: init?.body });
-      return { ok: true, status: 200, json: async () => ({ id: "o" }) };
-    }) as any;
-    // a channel config so the fail notice WOULD be postable
-    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
-    fs.writeFileSync(
-      path.join(tmp, ".pi", "settings.json"),
-      JSON.stringify({
-        channels: [
-          {
-            id: "ch1",
-            name: "Test",
-            type: "discord",
-            botToken: "tok1",
-            ownerUserId: "uid",
-          },
-        ],
-      }),
-    );
-    const posts = () =>
-      fetchCalls.filter(
-        (c) =>
-          typeof c.body === "string" && c.body.includes("handover gen failed"),
-      );
-    const ac = new AbortController();
-    ac.abort(); // operator /stop
-    await expect(
-      buildHandover({
-        preparation: basePrep(),
-        branchEntries: [],
-        ctx,
-        pi,
-        settings: settings(),
-        complete: async () => {
-          throw new Error("Compaction cancelled");
-        },
-        signal: ac.signal,
-        now: NOW,
-      }),
-    ).rejects.toThrow("Compaction cancelled");
-    expect(posts()).toHaveLength(0); // pi's own cancel notice covers it
-    // control: a non-aborted failure DOES post
-    await expect(
-      buildHandover({
-        preparation: basePrep(),
-        branchEntries: [],
-        ctx,
-        pi,
-        settings: settings(),
-        complete: async () => {
-          throw new Error("boom");
-        },
-        signal: new AbortController().signal,
-        now: NOW,
-      }),
-    ).rejects.toThrow("boom");
-    expect(posts()).toHaveLength(1);
-    globalThis.fetch = realFetch;
-  });
-  test("event signal is forwarded to the LLM call", async () => {
-    const ac = new AbortController();
-    let seen: AbortSignal | undefined;
-    const complete = jest.fn(
-      async (_s: string, _u: string, o?: { signal?: AbortSignal }) => {
-        seen = o?.signal;
-        return PROSE;
-      },
-    );
-    await buildHandover({
-      preparation: basePrep(),
+
+  test("deterministic: empty transcript -> (none), no throw", async () => {
+    const prep = {
+      ...basePrep(),
+      messagesToSummarize: [],
+      turnPrefixMessages: [],
+    };
+    const doc = await buildHandover({
+      preparation: prep,
       branchEntries: [],
       ctx,
       pi,
       settings: settings(),
-      complete,
-      signal: ac.signal,
       now: NOW,
     });
-    expect(seen).toBeInstanceOf(AbortSignal);
-    expect(seen).not.toBe(ac.signal); // combined with the timeout
-    expect(seen?.aborted).toBe(false);
+    expect(doc).toContain("## Transcript");
   });
 });
 
@@ -1376,8 +1274,8 @@ describe("session_before_compact wiring", () => {
     expect(out).toBeDefined();
     const c = out.compaction;
     expect(c.summary).toContain("# Handover - ");
-    expect(c.summary).toContain("## 1 · Mission");
-    expect(c.summary).toContain("Ship the bridge.");
+    expect(c.summary).toContain("## Transcript");
+    expect(c.summary).toContain("fix the bug in PR #42");
     expect(c.firstKeptEntryId).toBe("entry-keep-1");
     expect(c.tokensBefore).toBe(183_000);
     expect(c.details.readFiles).toContain("/home/monky/code/app/src/a.ts");
@@ -1420,21 +1318,14 @@ describe("session_before_compact wiring", () => {
     expect(called).toBe(0);
   });
 
-  test("LLM failure → undefined (built-in fallback) + sanitized channel notice", async () => {
-    setHandoverCompleteForTest(async () => {
-      throw new Error("HTTP 500 Internal Server Error");
-    });
+  test("deterministic: no LLM call, so no fallback needed (500 is gone)", async () => {
+    // The old LLM-failure→fallback path is gone: there is no LLM call, so
+    // there is no 500 to fall back from. A manual compact always produces
+    // the doc.
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
-    expect(out).toBeUndefined();
+    expect(out).toBeDefined();
+    expect(out?.compaction?.summary).toContain("## Transcript");
     expect(isHandoffInFlight()).toBe(false);
-    const posts = channelPosts();
-    expect(
-      posts.some((p: string) =>
-        p.includes("[!] handover gen failed - used standard compact"),
-      ),
-    ).toBe(true);
-    // no raw stack in the channel
-    expect(posts.join("\n")).not.toContain("500 Internal Server Error");
   });
 
   test("F10: in-flight flag set synchronously; concurrent compaction refused", async () => {
