@@ -543,7 +543,9 @@ BG_WB_STATUS="$BG_TMP/pi-bg-${run_id}-wb-status"
 # Removed in bg_on_exit. A ticket that SIGKILLs keeps it (that is the point).
 touch "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
 # run start epoch: bounds the silent-death session mtime scan (issue #57)
-run_start_epoch=$(date +%s)
+# + the session-file discovery below. PI_BG_RUN_START_EPOCH is a test hook
+# (backdates the bound so a backdated session file stays discoverable).
+run_start_epoch="${PI_BG_RUN_START_EPOCH:-$(date +%s)}"
 
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
@@ -777,6 +779,45 @@ bg_on_exit() {
   # deploy-swap guard: drop the per-run script snapshot (a hard link to the
   # startup inode; git already replaced the checkout path)
   [ -n "${SNAP_DIR:-}" ] && rm -rf "$SNAP_DIR" 2>/dev/null || true
+  # session prune (2026-09-23): drop this run's own session transcript so
+  # worker/reviewer .jsonl files stop piling up forever. LAST side effect on
+  # purpose: the cost capture (main flow + bg_mark_record above) and the
+  # DIED death-reason read have already had their chance. Floor-gated
+  # (PI_BG_PRUNE_AGE_H, default 24h), PI_BG_KEEP_SESSION=1 kills it, and it
+  # is failure-tolerant: it never fails the exit or the callback.
+  bg_prune_session
+}
+
+# bg_prune_session: delete THIS run's session jsonl at exit (2026-09-23:
+# monky's box grew to 349MB worker + 56MB reviewer of dead transcripts that
+# nothing ever deleted; the operator swept them by hand). The transcript is
+# only needed while the run is live (cost capture, death reason) - everything
+# reads it within seconds, and the age floor keeps it for any late re-read:
+#   - floor: delete only once the file is at least ${PI_BG_PRUNE_AGE_H:-24}
+#     hours old (N*60 minutes, checked with find -mmin +N*60; N=0 = no
+#     floor, any age matches - test hook). Non-integer N falls back to 24.
+#   - PI_BG_KEEP_SESSION=1: never delete (operator kill-switch). Default =
+#     prune.
+#   - after deleting, rmdir the slug dir if it is now empty (no 100s of
+#     empty <slug> dirs left behind). rmdir only removes empty dirs.
+#   - single confirmed file only: never glob-deletes. Any error (missing
+#     file, missing dir, permissions) -> return 0; never fails the run.
+bg_prune_session() {
+  local sf sf_dir n
+  [ "${PI_BG_KEEP_SESSION:-}" = "1" ] && return 0
+  sf="$(bg_session_file)" || sf=""
+  [ -n "$sf" ] && [ -f "$sf" ] || return 0
+  n="${PI_BG_PRUNE_AGE_H:-24}"
+  case "$n" in
+    '' | *[!0-9]*) n=24 ;;
+  esac
+  # note: find's EXIT code is 0 even when nothing matches - the floor is
+  # only "matched" when find actually prints the path
+  [ -n "$(find "$sf" -mmin +"$((n * 60))" 2>/dev/null)" ] || return 0
+  rm -f "$sf" 2>/dev/null || return 0
+  sf_dir="$(dirname "$sf" 2>/dev/null)" || sf_dir=""
+  [ -n "$sf_dir" ] && rmdir "$sf_dir" 2>/dev/null
+  return 0
 }
 
 # --- heartbeat (issue #52): long workers emit no signal between dispatch
