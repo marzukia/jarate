@@ -1736,6 +1736,30 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     }
   }, 60_000);
 
+  test("class B: reviewer rc=0 with '**Verdict: PASS**' (markdown variant) -> PASS", async () => {
+    // MAJOR-1 regression: the old case-sensitive tail-300 grep missed the
+    // most common real variant '**Verdict: PASS**' and false-FAILed it.
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\nseq 1 250 | paste -sd" "\necho "**Verdict: PASS**"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "md-verdict task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(/^reviewer · PASS · /);
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
   test("class A: silent x2 brief carries the actual stderr reason; err.log kept", async () => {
     const fx = fixture();
     fx.seedMainCreds();

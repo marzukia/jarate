@@ -1242,8 +1242,12 @@ fi
 
 if [ -n "$webhook" ]; then
   brief="${out:0:400}"
-  # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
-  verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
+  # reviewer runs: a 'VERDICT: PASS|FAIL' line is the real signal. Match
+  # case-insensitively, markdown/spacing-tolerant, over the WHOLE output
+  # (take the last match) - real reviewers vary format ('**Verdict: PASS**',
+  # '## Verdict') and position (some put it up front). The old tail -c 300 +
+  # case-sensitive grep false-FAILed ~25% of clean PASS reviews.
+  verdict="$(printf '%s' "$out" | grep -oiE 'verdict:[[:space:]]*\**[[:space:]]*(PASS|FAIL)' | tail -1 | grep -oiE 'PASS|FAIL')"
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
     reason="$(bg_death_reason)"
     if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
