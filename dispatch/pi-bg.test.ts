@@ -1593,6 +1593,190 @@ describe("#57: silent-death retry + RCA config fixes", () => {
       });
     }
   }, 30_000);
+  // --- #57 class B: degenerate completion (rc=0, repetition loop) ---
+  // 34 x 6 tokens = 204 tokens, 6 distinct: top15 = 1.0, distinct = 0.029
+  const DEGEN = Array(34)
+    .fill("handover unit testsuite pi-86 </div> loop")
+    .join(" ");
+  const degStub = (fx: { tmp: string }, variant: "once" | "always") => {
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    const launches = path.join(fx.tmp, "pi-launches.log");
+    const degFile = path.join(fx.tmp, "degen.txt");
+    fs.writeFileSync(degFile, DEGEN);
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        `echo x >> ${launches}`,
+        `n=$(wc -l < ${launches})`,
+        variant === "once"
+          ? `if [ "$n" -eq 1 ]; then cat ${degFile}; else seq 1 250 | paste -sd" " ; fi`
+          : `cat ${degFile}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+    return launches;
+  };
+  const withHook = (fx: ReturnType<typeof fixture>, hook: { url: string }) => {
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+  };
+  const withoutHook = (fx: ReturnType<typeof fixture>) => {
+    delete fx.env.PI_DISPATCH_WEBHOOK;
+    delete fx.env.PI_BG_WB_BACKOFF;
+  };
+  const runIdOf = (fx: ReturnType<typeof fixture>) =>
+    fx.records()[0].run as string;
+  const fieldsOf = (post: any) =>
+    post.embeds[0].fields as Array<{ name: string; value: string }>;
+  const fieldVal = (post: any, name: string) =>
+    fieldsOf(post).find((f) => f.name === name)?.value;
+
+  test("class B: degenerate rc=0 relaunched once, healthy retry -> OK", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const launches = degStub(fx, "once");
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["worker", "degen-once task"]);
+      expect(r.code).toBe(0);
+      const runId = runIdOf(fx);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(/^worker · OK · /);
+      expect(fieldVal(hook.posts[0], "result")).toContain("1 2 3");
+      // exactly two launches; degr1 marker consumed (recovered)
+      expect(fs.readFileSync(launches, "utf8").trim().split("\n")).toHaveLength(
+        2,
+      );
+      expect(fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-degr1`))).toBe(
+        false,
+      );
+      // the relaunch is logged in the run record
+      expect(fx.records()[0].retries).toHaveLength(1);
+      expect(fx.records()[0].retries[0].reason).toBe("degenerate");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: degenerate x2 -> FAIL with the actual signature (no 3rd launch)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const launches = degStub(fx, "always");
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["worker", "degen-x2 task"]);
+      expect(r.code).toBe(0);
+      const runId = runIdOf(fx);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(
+        /^worker · FAIL \(rc=0\) · /,
+      );
+      expect(fieldVal(hook.posts[0], "result")).toContain(
+        "degenerate output x2",
+      );
+      // relaunched ONCE, then stopped; marker kept for forensics
+      expect(fs.readFileSync(launches, "utf8").trim().split("\n")).toHaveLength(
+        2,
+      );
+      expect(fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-degr1`))).toBe(
+        true,
+      );
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: reviewer rc=0 non-empty without VERDICT -> FAIL", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(piBin, '#!/bin/sh\nseq 1 250 | paste -sd" "\n');
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "no-verdict task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(
+        /^reviewer · FAIL \(rc=0\) · /,
+      );
+      expect(fieldVal(hook.posts[0], "result")).toContain("no VERDICT line");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: reviewer rc=0 with trailing VERDICT: PASS -> PASS", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\nseq 1 250 | paste -sd" "\necho "VERDICT: PASS"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "pass-verdict task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(/^reviewer · PASS · /);
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class A: silent x2 brief carries the actual stderr reason; err.log kept", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\nsleep 1\necho "Error: read ECONNRESET 127.0.0.1:8081" >&2\nexit 1\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["worker", "silent-reason task"]);
+      expect(r.code).toBe(1);
+      const runId = runIdOf(fx);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(
+        /^worker · FAIL \(rc=1\) · /,
+      );
+      const brief = fieldVal(hook.posts[0], "result") as string;
+      expect(brief).toContain("silent death x2");
+      expect(brief).toContain("ECONNRESET");
+      // err.log kept for forensics; out.md present but blank, rc recorded
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-err.log`)),
+      ).toBe(true);
+      expect(
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-out.md`), "utf8")
+          .trim(),
+      ).toBe("");
+      expect(
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
+      ).toBe("1");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
 });
 
 describe("#52: heartbeat (hb artifact, created at dispatch, gone on exit)", () => {
