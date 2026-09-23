@@ -500,6 +500,150 @@ export function hoistFencedUrls(md: string): string {
   return out.join("\n");
 }
 
+// ─── Style guard (STYLE.md 2.7 / 3.1 / 4.4 mechanical pass) ───────────────
+
+/** Line-leading bracketed state tag: the STYLE.md 3.1 ASCII tag set
+ * ([ok] [!] [new] [queued] [-]) plus the [..] op-tick tag. Letters only
+ * inside the brackets (1-12), so markdown links [text](url) (where (url)
+ * follows the ] directly) and numbered footnote refs [1] never match.
+ * Exported for tests. */
+export const STYLE_TAG_RE = /^\[(?:[a-z]{1,12}|!|-|\.\.)\](?=\s|$)/;
+
+/** Machine frames (STYLE.md 2.1): box-drawing chars live in fences only.
+ * Exported for tests. */
+export const STYLE_BOX_RE = /[┌┐└┘├┤┣┫│]/;
+
+/** A line that IS a path, whole: /abs, ~/rel, ./rel, ../rel. A space means
+ * prose mentioning a path, not a path line - those stay bare.
+ * Exported for tests. */
+export const STYLE_PATH_RE = /^(?:~\/|\.\.?\/|\/)(?:[\w.@+-]+\/)*[\w.@+-]+$/;
+
+/** Deterministic log-line shapes: [timestamp] prefix, ISO date, HH:MM:SS,
+ * UPPERCASE level prefix (ERROR: ...), journal "Sep 23 09:22:22 host ...".
+ * All alternatives anchored - linear scan, no backtracking on long lines.
+ * Exported for tests. */
+export const STYLE_LOG_RE = new RegExp(
+  "^\\[(?:\\d{4}-\\d{2}-\\d{2}[T ]|\\d{1,2}:\\d{2}:\\d{2})" +
+    "|^\\d{4}[-/]\\d{2}[-/]\\d{2}[ T]\\d{2}:\\d{2}" +
+    "|^\\d{1,2}:\\d{2}:\\d{2}[ .]" +
+    "|^(?:ERROR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL|CRIT|NOTICE)(?::|\\s)" +
+    "|^[A-Z][a-z]{2} \\d{1,2} \\d{2}:\\d{2}:\\d{2} \\S",
+);
+
+/** Length of the leading backtick run (>=3), else 0 - the same
+ * ```-prefixed toggle convention as every other fence-aware pass here. */
+function fenceRun(line: string): number {
+  const t = line.trimStart();
+  if (!t.startsWith("```")) return 0;
+  let n = 0;
+  while (n < t.length && t[n] === "`") n++;
+  return n >= 3 ? n : 0;
+}
+
+/** Naive brace/bracket balance (strings ignored) - only used to decide
+ * whether a `{` line starts a multi-line JSON object. Never throws. */
+function braceDepth(line: string): number {
+  let d = 0;
+  for (const c of line) {
+    if (c === "{" || c === "[") d++;
+    else if (c === "}" || c === "]") d--;
+  }
+  return d;
+}
+
+/** One top-level (outside any existing fence) line is MACHINE state when
+ * it is a bracketed tag, carries box-drawing frame chars, is a bare path,
+ * a deterministic log line, or a JSON object line. Everything else - prose,
+ * lists, headings, blockquotes, inline code - is left alone (conservative:
+ * a missed fence is less bad than a mangled message). */
+function isMachineLine(raw: string): boolean {
+  const t = raw.trim();
+  if (t === "") return false;
+  if (t.startsWith("`")) return false; // inline code: 4.4's one-line form
+  if (/^#{1,6}\s/.test(t)) return false; // heading
+  if (t.startsWith(">")) return false; // blockquote
+  if (/^(?:[-*+]|\d{1,3}\.\s)/.test(t)) return false; // list item
+  if (STYLE_TAG_RE.test(t)) return true;
+  if (STYLE_BOX_RE.test(t)) return true;
+  if (STYLE_PATH_RE.test(t)) return true;
+  if (STYLE_LOG_RE.test(t)) return true;
+  return t.startsWith("{"); // JSON object line
+}
+
+/**
+ * Deterministic mechanical fence pass (STYLE.md 2.7 / 4.4). Post-format
+ * only: takes already-formatted markdown and fences top-level machine
+ * state. Every /command reply and every machine output (script errors,
+ * command output, logs, JSON, paths, bracketed state tags, box frames)
+ * ships in a code fence.
+ *
+ * - Consecutive machine lines share ONE fence (a frame or a tag block),
+ *   never one fence per line.
+ * - An unbalanced `{` line (multi-line JSON) also pulls in body lines
+ *   until the braces balance; a blank line or an existing fence stops it
+ *   (100-line cap).
+ * - Lines already inside a fence are untouched (no double-fence).
+ * - Fenced lines are kept to the 40-col budget via wrapFenceLine.
+ * - Pure, fast (single pass, anchored patterns), and idempotent:
+ *   styleGuard(styleGuard(x)) === styleGuard(x).
+ */
+export function styleGuard(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const open = fenceRun(line);
+    if (open > 0) {
+      // existing fence: pass delimiter + body through verbatim; the
+      // closer is the first fence line at least as long as the opener
+      // (a ``` line nested in a ```` fence is body, not a closer)
+      out.push(line);
+      i++;
+      while (i < lines.length && fenceRun(lines[i]!) < open) {
+        out.push(lines[i]!);
+        i++;
+      }
+      if (i < lines.length) {
+        out.push(lines[i]!);
+        i++;
+      }
+      continue;
+    }
+    if (!isMachineLine(line)) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    // machine block: consecutive machine lines go into ONE fence
+    const block: string[] = [line];
+    i++;
+    let depth = braceDepth(line);
+    while (i < lines.length) {
+      const nxt = lines[i]!;
+      const nt = nxt.trim();
+      if (nt === "" || fenceRun(nxt) > 0) break;
+      if (depth > 0) {
+        // inside an unbalanced JSON object: pull in the body lines
+        if (block.length >= 100) break;
+        block.push(nxt);
+        i++;
+        depth += braceDepth(nxt);
+        continue;
+      }
+      if (!isMachineLine(nxt)) break;
+      block.push(nxt);
+      i++;
+      depth = braceDepth(nxt);
+    }
+    const marker = block.some((l) => l.includes("```")) ? "````" : "```";
+    out.push(marker);
+    for (const bl of block) out.push(...wrapFenceLine(bl, FRAME_COL_MAX));
+    out.push(marker);
+  }
+  return out.join("\n");
+}
+
 /**
  * Escape triple backticks in free text so it doesn't open a code block
  * when inserted into a Discord message.
@@ -610,5 +754,7 @@ export function mdToDiscord(md: string): string {
   out = collapseFenceTrailingBlankLines(out);
   out = hoistFencedUrls(out);
   out = wrapFenceLines(out);
+  // Last step: deterministic machine-state fence pass (STYLE.md 2.7/4.4)
+  out = styleGuard(out);
   return out;
 }
