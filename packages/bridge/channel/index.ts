@@ -66,6 +66,13 @@ import {
 } from "./discord";
 import { mdToDiscord } from "./format";
 import { FRAME_COL_MAX } from "./frame";
+import {
+  buildHandover,
+  type HandoverComplete,
+  parsePriorTags,
+  resolveHandoffSettings,
+  shouldHandoff,
+} from "./handover";
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
@@ -238,6 +245,7 @@ export function resetRuntimeStateForTest(): void {
   runtimeStateLoadedFor = null;
   heldChannels.clear();
   verboseOverride.clear();
+  handoffInFlight = false;
 }
 function ensureRuntimeStateLoaded(): void {
   const dir = runtimeStateDir ?? "";
@@ -589,6 +597,25 @@ export const compactingChannels = new Map<string, CompactingEntry>();
 /** Pending op-shutdown timers by channel (F1). The window is cleared on
  *  /stop, which clears this timer, so the shutdown chain never runs. */
 const opShutdownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ─── Handover compaction state (mechanism A, design v2) ────────────────────
+// F10: set SYNCHRONOUSLY at session_before_compact handler entry, before
+// any await — the gate reads it, so a second compaction in the same tick
+// never starts a second handover generation. Cleared in the handler's
+// finally (success AND failure paths).
+let handoffInFlight = false;
+export function isHandoffInFlight(): boolean {
+  return handoffInFlight;
+}
+export function setHandoffInFlight(v: boolean): void {
+  handoffInFlight = v;
+}
+/** Test seam: stub the handover LLM call in the session_before_compact
+ *  wiring (null → default completeSimple path). */
+let handoverCompleteForTest: HandoverComplete | null = null;
+export function setHandoverCompleteForTest(fn: HandoverComplete | null): void {
+  handoverCompleteForTest = fn;
+}
 
 /**
  * True while an op window is open: compaction OR a restart-class op
@@ -1563,7 +1590,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2622,6 +2649,70 @@ export default function (pi: ExtensionAPI) {
     settleCompacting(ctx);
   });
 
+  // ─── Handover compaction (mechanism A, design v2, PR1) ────────────────
+  // A qualifying compaction returns a DURABLE handover doc as pi's custom
+  // compaction result ({ compaction: { summary } }) — never cancel:true
+  // (F1: that emits session_compact_failed and disturbs the op-window
+  // settle flow). Gate: handoff.enabled (PR1 default false), reason
+  // manual|threshold (threshold only at/over the HANDOFF_THRESHOLD
+  // fraction of the TOTAL window), no handover in flight. LLM failure or
+  // abort → undefined → pi falls back to the built-in compact (the
+  // sanitized channel notice is posted inside buildHandover).
+  pi.on("session_before_compact", (event, ctx) => {
+    const settings = resolveHandoffSettings(ctx.cwd);
+    let percent: number | null = null;
+    try {
+      percent = ctx.getContextUsage?.()?.percent ?? null;
+    } catch {
+      percent = null;
+    }
+    if (
+      !shouldHandoff(event, {
+        enabled: settings.enabled,
+        threshold: settings.threshold,
+        inFlight: handoffInFlight,
+        percent,
+      })
+    )
+      return undefined;
+    // F10: synchronous, before any await.
+    handoffInFlight = true;
+    return (async () => {
+      try {
+        const doc = await buildHandover({
+          preparation: event.preparation,
+          branchEntries: event.branchEntries,
+          ctx,
+          pi,
+          settings,
+          instructions: event.customInstructions,
+          signal: event.signal,
+          complete: handoverCompleteForTest ?? undefined,
+        });
+        const tags = parsePriorTags(doc);
+        return {
+          compaction: {
+            summary: doc,
+            firstKeptEntryId: event.preparation.firstKeptEntryId,
+            tokensBefore: event.preparation.tokensBefore,
+            details: {
+              readFiles: tags.readFiles,
+              modifiedFiles: tags.modifiedFiles,
+            },
+          },
+        };
+      } catch (e) {
+        console.error(
+          "[handover] fallback to built-in compact:",
+          sanitizeUnknownValue(e),
+        );
+        return undefined;
+      } finally {
+        handoffInFlight = false;
+      }
+    })();
+  });
+
   // ─── Auto-forward on turn end ──────────────────────────────────────────
   // An assistant message with no tool calls is the final answer of its
   // step. A run can contain several (steering messages interrupt the
@@ -2854,6 +2945,7 @@ const HELP_TEXT = [
   "/verbose [0|1|2|on|off] - tool detail: 0 text, 1 essential, 2 all (owner)",
   "/hold [on|off] - buffer messages until released (owner)",
   "/compact [instructions] - compact session context (owner)",
+  "/handover [instructions] - compact via the handover doc (owner; needs handoff.enabled)",
   "/model [name] - switch or list models (owner)",
   "/jobs - list pi-bg dispatches: in-flight + recent history (json for JSON)",
   "/jobs kill <id> - kill an in-flight pi-bg run (owner)",
@@ -3315,8 +3407,37 @@ function scheduleOpShutdown(
 
 /** /reset = NEW session: move the current session file aside so the
  *  systemd respawn's 'pi -c' starts fresh. (ctx.newSession does NOT exist
- *  on event ctx — only on registerCommand ctx — reviewer F1, 2026-09-10.) */
-function moveSessionFileAside(ctx: ExtensionContext): void {
+ *  on event ctx — only on registerCommand ctx — reviewer F1, 2026-09-10.)
+ *  F5 (2026-09-23 handoff review): move the EXPLICIT live file
+ *  (ctx.sessionManager.getSessionFile(), passed by the caller); the
+ *  newest-by-mtime scan is a fallback ONLY when that file is gone. The
+ *  old mtime-only path picked the wrong file whenever two session files
+ *  were live at once (encDir string mismatch + multi-channel ops). */
+export function moveSessionFileAside(
+  ctx: ExtensionContext,
+  targetFile?: string | null,
+): void {
+  let explicit: string | null = null;
+  try {
+    explicit = targetFile ?? ctx.sessionManager?.getSessionFile?.() ?? null;
+  } catch {
+    explicit = targetFile ?? null;
+  }
+  if (explicit) {
+    try {
+      if (fs.existsSync(explicit)) {
+        fs.renameSync(explicit, `${explicit}.reset-${Date.now()}`);
+        return;
+      }
+      console.warn(
+        `[reset] explicit session file missing, falling back to mtime scan: ${explicit}`,
+      );
+    } catch (e) {
+      console.warn(
+        `[reset] explicit move failed, falling back to mtime scan: ${sanitizeUnknownValue(e)}`,
+      );
+    }
+  }
   const home = process.env.HOME || "/root";
   const sessionsBase = path.join(home, ".pi", "agent", "sessions");
   const encDir = path.join(
@@ -3767,7 +3888,7 @@ async function runChannelCommand(
         "[new] new session (context cleared)",
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP, () =>
-        moveSessionFileAside(ctx),
+        moveSessionFileAside(ctx, ctx.sessionManager?.getSessionFile?.()),
       );
       return native
         ? { immediate: fence("[..] resetting...") }
@@ -3901,6 +4022,39 @@ async function runChannelCommand(
         const t = channelError(err);
         if (t !== null) return { immediate: fence(`[!] compact failed: ${t}`) };
       }
+      return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
+    }
+    case "handover": {
+      // Manual mechanism A: same path as /compact (reason=manual), the
+      // handoff module builds the doc in session_before_compact when
+      // handoff.enabled. Disabled → standard compact (same as /compact).
+      if (!isOwner) return ownerOnly;
+      const instructions = (arg || "").trim() || undefined;
+      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
+      if (!ctx.isIdle()) {
+        const replacing = pendingCompact !== null;
+        pendingCompact = { ch, instructions };
+        const why = agentBusy
+          ? "run in progress"
+          : "compact already in progress";
+        return {
+          immediate: fence(
+            `[queued] handover (${why})${replacing ? ", replaces earlier" : ""}`,
+          ),
+        };
+      }
+      const settings = resolveHandoffSettings(ctx.cwd);
+      const err = startCompact(pi, { ch, instructions }, ctx, !native);
+      if (err !== null) {
+        const t = channelError(err);
+        if (t !== null)
+          return { immediate: fence(`[!] handover failed: ${t}`) };
+      }
+      if (!settings.enabled)
+        sendDiscordMessage(
+          ch,
+          "[!] handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
+        ).catch(() => {});
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
