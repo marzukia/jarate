@@ -64,6 +64,10 @@ function fixture() {
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
+  // session-prune vars (2026-09-23) must not leak from the ambient env
+  delete env.PI_BG_PRUNE_AGE_H;
+  delete env.PI_BG_KEEP_SESSION;
+  delete env.PI_BG_RUN_START_EPOCH;
   // cap off by default: ambient fleet traffic (real pi-bg runs of this
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
   // PI_BG_MAX_CONCURRENT explicitly per spawn.
@@ -2463,6 +2467,20 @@ exec /usr/bin/curl "$@"`;
     expect(rec.model).toBe("qwen/qwen3.8-27b");
     expect(rec.price_ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
     expect(rec.price_error ?? null).toBeNull();
+    // session prune (default 24h floor) must NOT delete this fresh in-test
+    // transcript: cost capture just read it and it is younger than the floor
+    expect(
+      fs.existsSync(
+        path.join(
+          fx.home,
+          ".pi",
+          "agent-worker",
+          "sessions",
+          sessSlug(fx.tmp),
+          "s.jsonl",
+        ),
+      ),
+    ).toBe(true);
     // the 24h price cache was written in the shared tmpdir root
     const cache = JSON.parse(
       fs.readFileSync(path.join(art, "pi-bg-price-cache.json"), "utf8"),
@@ -2717,5 +2735,155 @@ exec /usr/bin/curl "$@"`,
     expect(rec.price_error).toBe("model not found");
     expect(rec.cost_usd).toBeNull();
     expect(rec.tokens?.total).toBe(186); // tokens still kept
+  });
+});
+
+/**
+ * session prune (2026-09-23): every pi-bg worker/reviewer run left its pi
+ * session .jsonl under ~/.pi/agent-<profile>/sessions/<slug>/ forever
+ * (monky's box: 349MB worker + 56MB reviewer of dead transcripts). The
+ * EXIT trap now drops the run's OWN transcript once it is past the age
+ * floor (PI_BG_PRUNE_AGE_H, default 24h; 0 = no floor) and reaps the slug
+ * dir when it is empty. PI_BG_KEEP_SESSION=1 kills pruning. It must never
+ * delete a transcript that is still younger than the floor (cost capture
+ * + death-reason reads finish within seconds of the run) and never break
+ * the callback.
+ */
+describe("session prune: exit trap drops the run's own transcript (2026-09-23)", () => {
+  // mirror of the script's session slug: --<path minus leading />-separated--
+  const sessSlug = (p: string) =>
+    `--${p.replace(/^\//, "").replaceAll("/", "-")}--`;
+  const sessDir = (fx: { home: string; tmp: string }) =>
+    path.join(fx.home, ".pi", "agent-worker", "sessions", sessSlug(fx.tmp));
+  const sessFile = (fx: { home: string; tmp: string }) =>
+    path.join(sessDir(fx), "s.jsonl");
+
+  // pi stub that writes an assistant-usage session file AT RUN TIME (after
+  // the wrapper's run start, so bg_session_file discovers it). `touchArg`
+  // backdates the mtime; discovery then also needs PI_BG_RUN_START_EPOCH
+  // backdated FURTHER (the file must stay "newer than run start").
+  const sessionPi = (
+    fx: { tmp: string; home: string },
+    usage: Record<string, number>,
+    touchArg?: string,
+  ) => {
+    const line = JSON.stringify({
+      type: "message",
+      message: { role: "assistant", usage },
+    });
+    const lines = [
+      "#!/bin/sh",
+      `mkdir -p ${JSON.stringify(sessDir(fx))}`,
+      `printf '%s\\n' ${JSON.stringify(line)} > ${JSON.stringify(
+        sessFile(fx),
+      )}`,
+    ];
+    if (touchArg)
+      lines.push(`touch -d '${touchArg}' ${JSON.stringify(sessFile(fx))}`);
+    lines.push("echo pi-run-ok", "");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(piBin, lines.join("\n"));
+    fs.chmodSync(piBin, 0o755);
+  };
+
+  const hook = () => {
+    const posts: Array<{ embeds: any[] }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      posts,
+      close: () => server.stop(true),
+    };
+  };
+
+  const USAGE = { input: 100, output: 40, cacheRead: 0, cacheWrite: 0 };
+
+  test("N=0 (no floor): prunes the fresh session + empty slug dir, cost still captured, callback OK", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.PI_BG_PRUNE_AGE_H = "0";
+    fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE = "1"; // tokens only, no curl
+    const h = hook();
+    fx.env.PI_DISPATCH_WEBHOOK = h.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "--project", "myproj", "prune task"]);
+      expect(r.code).toBe(0);
+      // cost capture read the transcript BEFORE the prune: tokens in record
+      expect(fx.records()[0].tokens?.total).toBe(140);
+      // transcript pruned (N=0 = no floor) and the now-empty slug dir reaped
+      expect(fs.existsSync(sessFile(fx))).toBe(false);
+      expect(fs.existsSync(sessDir(fx))).toBe(false);
+      // the run still posted its normal OK callback
+      expect(h.posts).toHaveLength(1);
+      expect(h.posts[0].embeds[0].title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      delete fx.env.PI_BG_PRUNE_AGE_H;
+      delete fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE;
+      h.close();
+    }
+  });
+
+  test("fresh session younger than a high floor is kept (dir too)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.PI_BG_PRUNE_AGE_H = "999999"; // ~114y: a fresh file never matches
+    const r = await fx.run(["worker", "keep task"]);
+    expect(r.code).toBe(0);
+    expect(fs.existsSync(sessFile(fx))).toBe(true);
+    expect(fs.existsSync(sessDir(fx))).toBe(true);
+    delete fx.env.PI_BG_PRUNE_AGE_H;
+  });
+
+  test("PI_BG_KEEP_SESSION=1: session kept even with N=0 (no floor)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.PI_BG_PRUNE_AGE_H = "0";
+    fx.env.PI_BG_KEEP_SESSION = "1";
+    const r = await fx.run(["worker", "keep session task"]);
+    expect(r.code).toBe(0);
+    expect(fs.existsSync(sessFile(fx))).toBe(true);
+    expect(fs.existsSync(sessDir(fx))).toBe(true);
+    delete fx.env.PI_BG_PRUNE_AGE_H;
+    delete fx.env.PI_BG_KEEP_SESSION;
+  });
+
+  test("default 24h floor: a 2-day-old transcript is pruned + slug dir reaped", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE, "2 days ago");
+    // backdate the run start FURTHER than the file mtime so bg_session_file
+    // still discovers it (2d old > 3d run start) while the file is past the
+    // default 24h floor
+    fx.env.PI_BG_RUN_START_EPOCH = String(
+      Math.floor(Date.now() / 1000) - 3 * 86400,
+    );
+    const r = await fx.run(["worker", "old transcript task"]);
+    expect(r.code).toBe(0);
+    expect(fs.existsSync(sessFile(fx))).toBe(false);
+    expect(fs.existsSync(sessDir(fx))).toBe(false);
+    delete fx.env.PI_BG_RUN_START_EPOCH;
+  });
+
+  test("no session file (plain stub pi): nothing to prune, run OK", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    fx.env.PI_BG_PRUNE_AGE_H = "0";
+    const r = await fx.run(["worker", "no session task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    delete fx.env.PI_BG_PRUNE_AGE_H;
   });
 });
