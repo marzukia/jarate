@@ -8,6 +8,7 @@ import {
   limitHeadingDepth,
   mdToDiscord,
   serializeEmbeds,
+  styleGuard,
   unnestCodeBlocksFromLists,
   wrapFenceLines,
 } from "./format";
@@ -442,5 +443,158 @@ describe("hoistFencedUrls", () => {
   test("no url in fence -> unchanged", () => {
     const out = mdToDiscord("```\njust code here\n```");
     expect(out).toContain("```\njust code here\n```");
+  });
+});
+
+// ─── styleGuard (STYLE.md 2.7 / 3.1 / 4.4) ─────────────────────────────────
+
+describe("styleGuard", () => {
+  const F = (s: string) => `\`\`\`\n${s}\n\`\`\``;
+
+  test("bare [ok] tag line -> fenced (the /compact bug)", () => {
+    expect(styleGuard("[ok] compacted: 153k -> 36k")).toBe(
+      F("[ok] compacted: 153k -> 36k"),
+    );
+    expect(styleGuard("[!] compact failed: timeout")).toBe(
+      F("[!] compact failed: timeout"),
+    );
+    expect(styleGuard("[queued] 2 in line")).toBe(F("[queued] 2 in line"));
+    expect(styleGuard("[-] stopped")).toBe(F("[-] stopped"));
+    expect(styleGuard("[..] resetting...")).toBe(F("[..] resetting..."));
+    expect(styleGuard("[new] session (context cleared)")).toBe(
+      F("[new] session (context cleared)"),
+    );
+  });
+
+  test("bare box frame -> one fence, not double-fenced", () => {
+    const frame = "┌ ok · 20260923-092222-670483\n│ 1 call · 5s\n└";
+    const once = styleGuard(frame);
+    expect(once).toBe(F(frame));
+    // second pass: content is inside the fence now - untouched
+    expect(styleGuard(once)).toBe(once);
+    // exactly two fence delimiters, nothing else
+    expect(once.split("\n").filter((l) => l.trim() === "```")).toHaveLength(2);
+  });
+
+  test("consecutive [ok] + [!] lines share ONE fence", () => {
+    const block = "[ok] step 1\n[!] step 2\n[-] step 3";
+    const out = styleGuard(block);
+    expect(out).toBe(F(block));
+    expect(out.split("\n").filter((l) => l.trim() === "```")).toHaveLength(2);
+  });
+
+  test("plain prose with no markers -> unchanged", () => {
+    const prose =
+      "All good. The deploy is done and the tests pass.\n\nShip it when ready.";
+    expect(styleGuard(prose)).toBe(prose);
+  });
+
+  test("already-fenced content -> unchanged (no double fence)", () => {
+    const fenced = "```\n[ok] compacted: 153k -> 36k\n```";
+    expect(styleGuard(fenced)).toBe(fenced);
+    const frame = "```\n┌ ok · run\n└\n```";
+    expect(styleGuard(frame)).toBe(frame);
+  });
+
+  test("idempotent: styleGuard(styleGuard(x)) === styleGuard(x)", () => {
+    const inputs = [
+      "[ok] compacted: 153k -> 36k",
+      "┌ ok · run\n│ 1 call\n└",
+      "[ok] a\n[!] b",
+      "plain prose line",
+      "```\n[ok] x\n```",
+      '{"a": 1, "b": [2, 3]}',
+      "/home/monky/projects/jarate",
+      "ERROR: unit failed",
+      "prose before\n[!] bare mid\nprose after",
+      "```\n└\n```\n\n[!] bare after fence",
+    ];
+    for (const input of inputs) {
+      const once = styleGuard(input);
+      expect(styleGuard(once)).toBe(once);
+    }
+  });
+
+  test("JSON object lines -> fenced (single and multi-line)", () => {
+    expect(styleGuard('{"a": 1, "b": [2, 3]}')).toBe(
+      F('{"a": 1, "b": [2, 3]}'),
+    );
+    const multi = '{\n  "a": 1\n  "b": 2\n}';
+    const out = styleGuard(multi);
+    expect(out).toBe(F(multi));
+  });
+
+  test("bare path line -> fenced; prose mentioning a path stays", () => {
+    expect(styleGuard("/home/monky/projects/jarate")).toBe(
+      F("/home/monky/projects/jarate"),
+    );
+    expect(styleGuard("~/scripts/pi-bg")).toBe(F("~/scripts/pi-bg"));
+    // a >40-col path wraps to the fence budget, stays fenced
+    const longPath = "/home/monky/projects/jarate/packages/bridge";
+    const wrapped = styleGuard(longPath).split("\n");
+    expect(wrapped[0]).toBe("```");
+    expect(wrapped.at(-1)).toBe("```");
+    for (const l of wrapped.slice(1, -1))
+      expect(l.length).toBeLessThanOrEqual(40);
+    expect(styleGuard("wrote /tmp/x.ts for you")).toBe(
+      "wrote /tmp/x.ts for you",
+    );
+  });
+
+  test("log line shapes -> fenced", () => {
+    expect(styleGuard("2026-09-23 09:22:22 ERROR boom")).toBe(
+      F("2026-09-23 09:22:22 ERROR boom"),
+    );
+    expect(styleGuard("ERROR: unit failed")).toBe(F("ERROR: unit failed"));
+    // a >40-col error line is wrapped to the fence budget (STYLE.md 2.3)
+    const longErr = "ERROR: Failed to start transient timer unit";
+    const wrapped = styleGuard(longErr).split("\n");
+    expect(wrapped[0]).toBe("```");
+    expect(wrapped.at(-1)).toBe("```");
+    for (const l of wrapped.slice(1, -1))
+      expect(l.length).toBeLessThanOrEqual(40);
+    expect(styleGuard("Sep 23 09:22:22 host pi.service: msg")).toBe(
+      F("Sep 23 09:22:22 host pi.service: msg"),
+    );
+    expect(styleGuard("2026-09-23 was a good day")).toBe(
+      "2026-09-23 was a good day",
+    );
+  });
+
+  test("machine line between prose -> fenced, prose untouched", () => {
+    const out = styleGuard("a\n[ok] b\nc");
+    expect(out).toBe(`a\n${F("[ok] b")}\nc`);
+  });
+
+  test("list items, headings, blockquotes, inline code -> untouched", () => {
+    expect(styleGuard("- [ok] item in list")).toBe("- [ok] item in list");
+    expect(styleGuard("1. [!] numbered item")).toBe("1. [!] numbered item");
+    expect(styleGuard("# [ok] heading")).toBe("# [ok] heading");
+    expect(styleGuard("> [!] quoted")).toBe("> [!] quoted");
+    expect(styleGuard("`error: x` inline")).toBe("`error: x` inline");
+    // markdown link is not a state tag
+    expect(styleGuard("[text](https://x.test) stays")).toBe(
+      "[text](https://x.test) stays",
+    );
+  });
+
+  test("fenced lines kept to the 40-col budget", () => {
+    const long = `├ ${"a".repeat(60)}`;
+    const out = styleGuard(long).split("\n");
+    expect(out[0]).toBe("```");
+    expect(out.at(-1)).toBe("```");
+    for (const l of out.slice(1, -1)) expect(l.length).toBeLessThanOrEqual(40);
+  });
+
+  test("unclosed existing fence -> left alone (conservative)", () => {
+    const input = "```\n[ok] still inside";
+    expect(styleGuard(input)).toBe(input);
+  });
+
+  test("mdToDiscord: bare frame in LLM text gets fenced as last step", () => {
+    const out = mdToDiscord("Done.\n\n┌ ok · 1 call · 5s\n└");
+    expect(out).toContain(F("┌ ok · 1 call · 5s\n└"));
+    // idempotent through the full pipeline
+    expect(mdToDiscord(out)).toBe(out);
   });
 });
