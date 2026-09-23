@@ -35,6 +35,8 @@ export interface ChannelConfig {
   default?: boolean;
   /** Owner user ID for multi-user asking (discord). When set, only this user's reply resolves. */
   ownerUserId?: string;
+  /** Additional owners; checked alongside `ownerUserId`. */
+  ownerUserIds?: string[];
   /** When true, tool calls and results are forwarded to the channel alongside the final response. */
   forwardToolCalls?: boolean;
   /** Buffer file-only messages (no text, no voice note) for up to 10
@@ -180,6 +182,7 @@ function normalizeChannel(raw: any): ChannelConfig {
     instructions: raw.instructions,
     default: raw.default === true,
     ownerUserId: raw.ownerUserId,
+    ownerUserIds: raw.ownerUserIds,
     forwardToolCalls: raw.forwardToolCalls === true,
     bufferFileOnly: raw.bufferFileOnly === true,
     transcribe: raw.transcribe !== false,

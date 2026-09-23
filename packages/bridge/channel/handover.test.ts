@@ -1386,7 +1386,9 @@ describe("session_before_compact wiring", () => {
     await handleInbound(pi, msg, ctx);
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
-    // the command was not consumed: delivered to pi as plain text
-    expect(sent).toHaveLength(1);
+    // not the owner: refused explicitly — never handed to pi as plain text
+    // (2026-09-23: a recognised command silently became a prompt when the
+    // sender was not permitted, which reads as the bridge ignoring commands)
+    expect(sent).toHaveLength(0);
   });
 });
