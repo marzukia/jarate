@@ -36,9 +36,7 @@ import type {
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { fmtTokensLC } from "./ctxwatch";
-import { sendDiscordMessage } from "./discord";
 import { jobsView } from "./jobs";
-import { sanitizeUnknownValue } from "./sanitize";
 import { defaultHome, loadBoard, renderBoardPlain } from "./todos";
 import { getDefaultChannel, loadChannelConfig } from "./types";
 
@@ -1025,36 +1023,6 @@ export function makeDefaultComplete(ctx: ExtensionContext): HandoverComplete {
       .map((c) => c.text)
       .join("\n");
   };
-}
-
-/** Post a sanitized one-liner to the default channel when generation
- *  fails (the wiring still returns undefined → built-in compact). */
-function postHandoverFail(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  e: unknown,
-): void {
-  console.error(
-    "[handover] gen failed - falling back to built-in compact:",
-    sanitizeUnknownValue(e),
-  );
-  try {
-    const cfg = loadChannelConfig(ctx.cwd);
-    const ch = cfg ? getDefaultChannel(cfg) : null;
-    if (ch)
-      void sendDiscordMessage(
-        ch,
-        // Fenced: a bare single-line notice is not authentic (fence rule).
-        // Mirrors index.ts fence() without importing it (circular dep).
-        "```\n[!] handover gen failed - used standard compact\n```",
-      );
-    void pi; // pi reserved for future channel routing (F10 surface)
-  } catch (e2) {
-    console.error(
-      "[handover] fail notice post failed:",
-      sanitizeUnknownValue(e2),
-    );
-  }
 }
 
 /** Deterministic handover doc (NO LLM call). The agent already has all the

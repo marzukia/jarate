@@ -948,15 +948,6 @@ describe("buildHandover", () => {
     }),
   };
   const pi: any = { sendMessage: () => {} };
-  const PROSE = [
-    "[MISSION] Ship the bridge.",
-    "[IN_FLIGHT] Next: wire the handler",
-    "[DONE] Wrote tests",
-    "[BLOCKERS] (none)",
-    "[DECISIONS] Chose bun",
-    "[FOLLOWUPS] Tag corpus",
-    "[GOTCHAS] vLLM is sacred",
-  ].join("\n");
 
   test("deterministic: doc returned, written to store, no LLM call", async () => {
     const complete = jest.fn(async () => "should not be called");
