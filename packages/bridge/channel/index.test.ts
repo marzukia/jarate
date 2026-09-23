@@ -13,6 +13,7 @@ import {
   setChannelCursor,
 } from "./discord";
 import { FRAME_COL_MAX } from "./frame";
+import { writeHandover } from "./handover";
 import extension, {
   bashToolEssential,
   buildInteractionHandler,
@@ -66,6 +67,7 @@ import extension, {
   runShellPassthrough,
   runUsageLine,
   setInterruptCtx,
+  setProcessExitHookForTest,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
   settleOpTick,
@@ -6156,6 +6158,343 @@ describe("tasks (integration)", () => {
   });
 });
 
+// ─── Handoff mechanism B: size-gated restart (PR2) ────────────────────────
+
+describe("handoff mechanism B (size-gated restart)", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  let sessDir = "";
+  let liveFile = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  let shutdowns = 0;
+  let seedMsgs: string[] = [];
+  let restarter: string[] = [];
+  const realFetch = globalThis.fetch;
+
+  const CHANNELS = [
+    {
+      id: "ch1",
+      name: "Test",
+      type: "discord",
+      botToken: "tok1",
+      ownerUserId: "uid",
+      peerBotIds: ["bot-a"],
+      default: true,
+    },
+  ];
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const channelPosts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.url.includes("/channels/ch1/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+
+  const edits = () =>
+    fetchCalls
+      .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+
+  // wait out a pending op shutdown (300ms arm + immediate isIdle) so the
+  // session-file move happens while HOME still points at tmp
+  const waitOpShutdown = () => new Promise((r) => setTimeout(r, 1100));
+
+  const writeSettings = (handoff: Record<string, unknown>) => {
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels: CHANNELS, handoff }),
+    );
+  };
+
+  const markerPath = () => path.join(tmp, ".tmp", "op-marker.json");
+
+  const writeMarker = (m: Record<string, unknown>) => {
+    fs.mkdirSync(path.dirname(markerPath()), { recursive: true });
+    fs.writeFileSync(markerPath(), JSON.stringify(m));
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-b-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, "home"), { recursive: true });
+    storeDir = path.join(tmp, "home", "handovers");
+    sessDir = path.join(tmp, "sessions");
+    fs.mkdirSync(sessDir, { recursive: true });
+    liveFile = path.join(sessDir, "live.jsonl");
+    fs.writeFileSync(liveFile, "x".repeat(1024));
+    shutdowns = 0;
+    seedMsgs = [];
+    restarter = [];
+    fetchCalls = [];
+    (handlers as any) = {};
+    pi = {
+      on: (n: string, fn: any) => {
+        (handlers as any)[n] = fn;
+      },
+      sendMessage: () => {},
+      sendUserMessage: (c: string) => {
+        seedMsgs.push(c);
+      },
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+    };
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      model: { id: "m", name: "M", provider: "p" },
+      modelRegistry: {
+        getAvailable: () => [],
+      },
+      sessionManager: {
+        getSessionFile: () => liveFile,
+        getSessionId: () => "sess-b",
+      },
+      getContextUsage: () => ({
+        tokens: 1000,
+        contextWindow: 262144,
+        percent: 1,
+      }),
+      compact: () => {},
+      shutdown: () => {
+        shutdowns++;
+      },
+      on: () => {},
+    };
+    // op machinery needs a live cursor: seed the discord state for ch1
+    seedChannelStateForTest("ch1", "ch1", path.join(tmp, ".tmp"));
+    setChannelCursor("ch1", "1000");
+    (globalThis as any).fetch = jest.fn(async (url: any, init?: any) => {
+      fetchCalls.push({
+        method: init?.method ?? "GET",
+        url: String(url),
+        body: init?.body,
+      });
+      return { ok: true, status: 200, json: async () => ({ id: "out1" }) };
+    });
+    setSystemdRestartHookForTest((u) => restarter.push(u));
+    setProcessExitHookForTest(() => {});
+    extension(pi as any);
+  });
+  afterEach(() => {
+    setSystemdRestartHookForTest(null);
+    setProcessExitHookForTest(null);
+    (globalThis as any).fetch = realFetch;
+    (handlers as any) = {};
+    clearAllCompacting();
+    stopAllOpTicks();
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("under the cap: compaction settles, no restart op", async () => {
+    writeSettings({ enabled: true, restartFileCap: 10_000_000, storeDir });
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    expect(isCompacting("ch1")).toBe(true);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    expect(isCompacting("ch1")).toBe(false);
+    expect(channelPosts().some((t) => t.includes("handing-off"))).toBe(false);
+    expect(restarter).toEqual([]);
+    expect(shutdowns).toBe(0);
+    expect(fs.existsSync(markerPath())).toBe(false);
+    expect(fs.existsSync(liveFile)).toBe(true); // file untouched
+  });
+
+  test("over the cap: restart op — placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
+    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(1_572_864)); // 1.5 MB
+    const stale = path.join(sessDir, "old.jsonl");
+    fs.writeFileSync(stale, "old session");
+
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+
+    // placeholder posted + marker left for the respawn to settle
+    expect(channelPosts().some((t) => t.includes("[..] handing-off..."))).toBe(
+      true,
+    );
+    expect(fs.existsSync(markerPath())).toBe(true);
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(marker.seeded).toBe(false);
+    expect(marker.finalText).toBe(
+      "[ok] context handoff -> new session (file was 1.5 MB)",
+    );
+    // restart chain: bounded shutdown + systemd restart
+    expect(shutdowns).toBe(1);
+    expect(restarter).toEqual(["pi.service"]);
+    // F5: the explicit live file moved aside; F2: the OTHER .jsonl
+    // archived so the respawn's 'pi -c' target is provably small
+    const files = fs.readdirSync(sessDir);
+    expect(files.some((f) => f.startsWith("live.jsonl.reset-"))).toBe(true);
+    expect(files.some((f) => f.startsWith("old.jsonl.stale-"))).toBe(true);
+    expect(files.filter((f) => f.endsWith(".jsonl"))).toEqual([]);
+  });
+
+  test("/stop during the handoff op: cancelled, marker cleared, cursor restored, file untouched", async () => {
+    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(1_572_864));
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await new Promise((r) => setTimeout(r, 50)); // B gate opened the op
+    expect(opWindowLabel("ch1")).toBe("handing-off");
+    await handleInbound(pi, inbound("/stop", "m2"), ctx);
+    expect(isCompacting("ch1")).toBe(false);
+    expect(fs.existsSync(markerPath())).toBe(false); // marker went with the op
+    expect(getChannelCursor("ch1")).toBe("1000"); // rewound to op start
+    await waitOpShutdown(); // the shutdown timer was dropped at /stop
+    expect(shutdowns).toBe(0);
+    expect(fs.existsSync(liveFile)).toBe(true); // file never moved
+    expect(restarter).toEqual([]);
+  });
+
+  test("handoff disabled: over-cap file, no restart op", async () => {
+    writeSettings({ enabled: false, restartFileCap: 1000, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(2048));
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    expect(shutdowns).toBe(0);
+    expect(restarter).toEqual([]);
+    expect(fs.existsSync(liveFile)).toBe(true);
+    expect(fs.existsSync(markerPath())).toBe(false);
+  });
+
+  test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
+    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(1_572_864));
+
+    // auto-compact in flight: no bridge window (startCompact not involved),
+    // isIdle false → /compact QUEUES behind it (pendingCompact)
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    expect(isCompacting("ch1")).toBe(false); // queued, not started
+    // the auto compaction finishes → session_compact settles + flushes
+    ctx.isIdle = () => true;
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(opWindowLabel("ch1")).toBe("compacting"); // flushed C2's window
+    expect(fs.existsSync(markerPath())).toBe(false); // B skipped it
+    // C2 settles → B proceeds
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(shutdowns).toBe(1);
+  });
+
+  test("boot seed: handoff marker (seeded:false) → user-message seed + marker settled", async () => {
+    writeSettings({ enabled: true, storeDir });
+    writeHandover(
+      [
+        "# Handover - 2026-09-23 · session s · 100k tokens → handoff",
+        "",
+        "## 1 · Mission",
+        "Ship the bridge with tests.",
+        "",
+        "## 2 · In-flight (NOW)",
+        "Wiring the compact handler.",
+        "",
+        "## 10 · Last 3 user asks",
+        "1. do the thing",
+      ].join("\n"),
+      { storeDir, now: new Date() },
+    );
+    writeMarker({
+      op: "handoff",
+      channelId: "ch1",
+      at: Date.now(),
+      msgId: "out1",
+      finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
+      seeded: false,
+    });
+
+    await handlers.session_start?.(null, ctx);
+
+    // the seed is a plain user message (never a channel-inbound: no
+    // Discord echo, no polluting the next handover's last-asks)
+    expect(seedMsgs).toHaveLength(1);
+    const lines = seedMsgs[0].split("\n");
+    expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
+    expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
+    expect(lines[3]).toBe("Last ask: 1. do the thing");
+    expect(lines[4]).toBe(
+      `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
+    );
+    // marker consumed: a second boot cannot re-seed
+    expect(fs.existsSync(markerPath())).toBe(false);
+    // placeholder replaced with the final line
+    expect(
+      edits().some((t) =>
+        t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+      ),
+    ).toBe(true);
+  });
+
+  test("ordinary boot (no marker): no seed, even with a doc in the store", async () => {
+    writeSettings({ enabled: true, storeDir });
+    writeHandover("# doc\n## 1 · Mission\nShip.", {
+      storeDir,
+      now: new Date(),
+    });
+    await handlers.session_start?.(null, ctx);
+    expect(seedMsgs).toHaveLength(0);
+  });
+
+  test("already-seeded marker: no re-seed, final line still settled", async () => {
+    writeSettings({ enabled: true, storeDir });
+    writeHandover("# doc\n## 1 · Mission\nShip.", {
+      storeDir,
+      now: new Date(),
+    });
+    writeMarker({
+      op: "handoff",
+      channelId: "ch1",
+      at: Date.now(),
+      msgId: "out1",
+      finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
+      seeded: true,
+    });
+    await handlers.session_start?.(null, ctx);
+    expect(seedMsgs).toHaveLength(0);
+    expect(fs.existsSync(markerPath())).toBe(false);
+    expect(
+      edits().some((t) =>
+        t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("restart-class ops (/reset /restart): block + tick + cursor replay", () => {
   let tmp = "";
   let oldHome = "";
@@ -6283,6 +6622,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     clearAllInterrupts();
     setInterruptCtx(null);
     setSystemdRestartHookForTest(null);
+    setProcessExitHookForTest(null);
     for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
     queuedAcks.clear();
     pendingInterrupts.clear();
@@ -6795,6 +7135,10 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     setSystemdRestartHookForTest((u) => {
       got.push(u);
     });
+    // F7 (PR2): capture the delayed self-exit instead of killing the
+    // test runner (installed BEFORE the watchdog fires)
+    const exits: number[] = [];
+    setProcessExitHookForTest((c) => exits.push(c));
     const flush = async (n: number) => {
       for (let i = 0; i < n; i++) await Promise.resolve();
     };
@@ -6863,6 +7207,13 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(midTurnQueues.get("ch1")?.length ?? 0).toBe(0);
     // no stale marker left to settle some future boot
     expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
+    // F7 (PR2): the failed restart KILLS the process (delayed 500ms,
+    // after the post lands) so systemd Restart=always actually respawns
+    // 'pi -c' — a live process leaves the unit "active" forever.
+    expect(exits).toEqual([]);
+    jest.advanceTimersByTime(500);
+    await flush(10);
+    expect(exits).toEqual([1]);
   });
 });
 

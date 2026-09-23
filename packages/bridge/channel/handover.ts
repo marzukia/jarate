@@ -80,7 +80,9 @@ export type HandoverComplete = (
 
 /** Resolved handoff settings (defaults → ~/.pi/agent → <cwd>/.pi → env). */
 export interface HandoffSettings {
-  /** PR1 default FALSE — the handoff path is opt-in until PR2. */
+  /** Default TRUE (Andryo 2026-09-23: handoff is the default behaviour,
+   *  not a flag to flip). Opt out with `handoff: { enabled: false }` in
+   *  settings.json or HANDOFF_ENABLED=0 in the service env. */
   enabled: boolean;
   /** Fraction (0..1) of the TOTAL context window where the handoff kicks
    *  in for threshold compactions. Env: HANDOFF_THRESHOLD. */
@@ -95,7 +97,7 @@ export interface HandoffSettings {
 }
 
 export const HANDOFF_DEFAULTS: HandoffSettings = {
-  enabled: false,
+  enabled: true,
   threshold: 0.8,
   restartFileCap: 64_000_000,
   sizeGuardTokens: 12_000,
@@ -111,6 +113,9 @@ export interface ShouldHandoffFlags {
   inFlight: boolean;
   /** 0..100 from ctx.getContextUsage().percent; null when unavailable. */
   percent: number | null;
+  /** A handover doc was written within HANDOFF_FRESH_WINDOW_MS: the
+   *  (possibly just-seeded) session is not yet handoff-eligible. */
+  freshWindow: boolean;
 }
 
 /** LLM prose sections of the doc (markers, not markdown headers). */
@@ -202,20 +207,33 @@ export function resolveHandoffSettings(
   if (Number.isFinite(envT) && envT > 0 && envT <= 1) s.threshold = envT;
   const envC = Number(env.HANDOFF_RESTART_FILE_CAP ?? "");
   if (Number.isFinite(envC) && envC > 0) s.restartFileCap = Math.floor(envC);
+  // Env override of the flag itself (1/0, true/false) — same precedence as
+  // the other env knobs: env beats settings.json beats default.
+  const envE = env.HANDOFF_ENABLED?.trim().toLowerCase();
+  if (envE === "1" || envE === "true") s.enabled = true;
+  else if (envE === "0" || envE === "false") s.enabled = false;
   return s;
 }
 
 /** Pure gate: should this compaction produce a handover?
- *  manual → yes (when enabled, not in-flight); threshold → only at/over
- *  the fraction of the total window; overflow/other → no (built-in). */
+ *  off / in-flight / fresh-window → no; manual → yes; threshold → only
+ *  at/over the fraction of the total window; overflow/other → no (built-in). */
 export function shouldHandoff(
   event: { reason: string },
   flags: ShouldHandoffFlags,
 ): boolean {
   if (!flags.enabled) return false;
   if (flags.inFlight) return false;
+  if (flags.freshWindow) return false;
   if (event.reason === "manual") return true;
   if (event.reason === "threshold") {
+    // MINOR-1 (PR1 review; Andryo resolved with option a): the threshold is
+    // a fraction of the TOTAL context window, NOT the remaining space —
+    // INTENTIONAL, do not change the math. Pi's auto compaction fires at
+    // window - reserveTokens (~94% of a 262k window), always above the 80%
+    // gate, so auto compactions ALWAYS hand off. The gate has visible
+    // effect only for manual /compact or /handover well under the window
+    // (and on small windows where reserve pushes the auto point down).
     if (flags.percent == null) return true; // pi already picked the point
     return flags.percent >= flags.threshold * 100;
   }
@@ -848,11 +866,14 @@ export function loadPreviousHandover(
   }
 }
 
-/** 3-line digest of a doc for a future seed message (PR2 mechanism B).
- *  PR1 does not seed — this is groundwork. */
+/** 3-line digest of a doc for the boot-seed message (PR2 mechanism B,
+ *  F4/F8): mission + in-flight + last ask. The "last ask" is the NEWEST
+ *  (highest-numbered) entry - the section renders oldest->newest, and the
+ *  pending question the agent must answer is the last one, not the first
+ *  (MINOR-1). */
 export function parseKickoff(doc: string): string {
   const { sections } = splitDoc(doc);
-  const pick = (match: (title: string) => boolean): string => {
+  const firstLine = (match: (title: string) => boolean): string => {
     const s = sections.find((x) => match(x.title));
     if (!s) return NONE;
     for (const line of s.body.split("\n")) {
@@ -861,10 +882,21 @@ export function parseKickoff(doc: string): string {
     }
     return NONE;
   };
+  const lastAsk = (): string => {
+    const s = sections.find((x) => x.title.includes("user asks"));
+    if (!s) return NONE;
+    const numbered: string[] = [];
+    for (const line of s.body.split("\n")) {
+      const t = line.trim();
+      if (/^\d+\./.test(t))
+        numbered.push(t.length > 160 ? `${t.slice(0, 157)}...` : t);
+    }
+    return numbered.length ? numbered[numbered.length - 1] : NONE;
+  };
   return (
-    `Mission: ${pick((t) => t.includes("Mission"))}\n` +
-    `In-flight: ${pick((t) => t.includes("In-flight"))}\n` +
-    `Last ask: ${pick((t) => t.includes("user asks"))}`
+    `Mission: ${firstLine((t) => t.includes("Mission"))}\n` +
+    `In-flight: ${firstLine((t) => t.includes("In-flight"))}\n` +
+    `Last ask: ${lastAsk()}`
   );
 }
 
@@ -1068,11 +1100,79 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
     );
     prose = parseLlmProse(text);
   } catch (e) {
-    postHandoverFail(pi, ctx, e);
+    // MINOR-2 (PR1 review): on an operator abort (/stop) pi posts its own
+    // "[!] compact failed: Compaction cancelled" — skip ours so the channel
+    // is not double-posted with a misleading "handover gen failed".
+    if (args.signal?.aborted) {
+      console.error("[handover] gen aborted - pi's cancel notice covers it");
+    } else {
+      postHandoverFail(pi, ctx, e);
+    }
     throw e;
   }
   let doc = renderTemplate(state, prose, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
   writeHandover(doc, { storeDir: settings.storeDir, now });
   return doc;
+}
+
+// ─── Fresh window + boot seed (mechanism B, PR2) ──────────────────────────
+
+/** Short window after a handover during which the (possibly just-seeded)
+ *  session is NOT handoff-eligible. The seed reads the 12k-token doc into
+ *  a fresh session — well under the threshold — but on a small window (or
+ *  back-to-back compactions) a second handoff could re-run the LLM over a
+ *  tiny span using the just-written doc as its own base. Keyed on the
+ *  latest.md `updated` stamp: the same signal mechanism B leaves behind
+ *  (the doc is written in the very compaction that triggers the restart),
+ *  so a just-seeded session is covered without extra persisted state. */
+export const HANDOFF_FRESH_WINDOW_MS = 5 * 60 * 1000;
+
+/** When the latest handover doc was written (ms epoch; 0 = none). */
+export function lastHandoffAt(
+  storeDir: string,
+  home: string = defaultHome(),
+): number {
+  try {
+    const raw = fs.readFileSync(
+      path.join(expandHome(storeDir, home), "latest.md"),
+      "utf8",
+    );
+    const m = raw.match(/^updated:\s*(\S+)/m);
+    if (!m) return 0;
+    const t = Date.parse(m[1]);
+    return Number.isFinite(t) ? t : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** True when a handover doc was written less than HANDOFF_FRESH_WINDOW_MS
+ *  ago (feeds shouldHandoff's `freshWindow` flag). */
+export function isHandoffFreshWindow(
+  storeDir: string,
+  now: number = Date.now(),
+  home: string = defaultHome(),
+): boolean {
+  const at = lastHandoffAt(storeDir, home);
+  return at > 0 && now - at < HANDOFF_FRESH_WINDOW_MS;
+}
+
+/**
+ * The boot-seed message (F4/F8): a 3-line digest of the doc + a forced
+ * read of latest.md + the pending-question instruction. Pure — the wiring
+ * sends it via pi.sendUserMessage. The path is the EXPANDED absolute
+ * storeDir so the agent's read tool takes it as-is.
+ */
+export function buildSeedKickoff(
+  doc: string,
+  storeDir: string,
+  home: string = defaultHome(),
+): string {
+  const latest = path.join(expandHome(storeDir, home), "latest.md");
+  return [
+    "Context handed off: the previous session was compacted and the process restarted with a fresh, small context.",
+    parseKickoff(doc),
+    `Read ${latest} before continuing. Answer the last pending user question if any.`,
+  ].join("\n");
 }
