@@ -817,9 +817,9 @@ describe("resolveHandoffSettings", () => {
   const write = (p: string, obj: unknown) =>
     fs.writeFileSync(p, JSON.stringify(obj));
 
-  test("defaults: enabled FALSE (PR1), threshold 0.8, cap 64000000", () => {
+  test("defaults: enabled TRUE (PR2), threshold 0.8, cap 64000000", () => {
     const s = resolveHandoffSettings(path.join(tmp, "proj"), {});
-    expect(s.enabled).toBe(false);
+    expect(s.enabled).toBe(true);
     expect(s.threshold).toBe(0.8);
     expect(s.restartFileCap).toBe(64_000_000);
     expect(s.sizeGuardTokens).toBe(12_000);
@@ -1356,8 +1356,8 @@ describe("session_before_compact wiring", () => {
     "[GOTCHAS] vLLM is sacred",
   ].join("\n");
 
-  test("disabled (PR1 default): built-in path, LLM not called", async () => {
-    writeSettings({ channels: CHANNELS }); // no handoff block → enabled false
+  test("disabled (explicit opt-out): built-in path, LLM not called", async () => {
+    writeSettings({ channels: CHANNELS, handoff: { enabled: false } }); // explicit opt-out
     let called = 0;
     setHandoverCompleteForTest(async () => {
       called++;
@@ -1456,8 +1456,8 @@ describe("session_before_compact wiring", () => {
     expect(isHandoffInFlight()).toBe(false);
   });
 
-  test("/handover: owner triggers compact, disabled notice posted (PR1 default)", async () => {
-    writeSettings({ channels: CHANNELS }); // handoff disabled
+  test("/handover: owner triggers compact, disabled notice posted (opt-out)", async () => {
+    writeSettings({ channels: CHANNELS, handoff: { enabled: false } }); // handoff opted out
     const msg: ChannelMessage = {
       channelId: "ch1",
       channelName: "Test",

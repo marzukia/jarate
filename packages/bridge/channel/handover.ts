@@ -80,11 +80,9 @@ export type HandoverComplete = (
 
 /** Resolved handoff settings (defaults → ~/.pi/agent → <cwd>/.pi → env). */
 export interface HandoffSettings {
-  /** PR2: still default FALSE in code. Enabling on the live box is an
-   *  explicit operator move: `handoff: { enabled: true }` in
-   *  ~/.pi/agent/settings.json, or HANDOFF_ENABLED=1 in the service env.
-   *  (Out-of-scope change: the box already runs handoff.enabled=true in
-   *  config — PR1's path was opted in ahead of this PR.) */
+  /** Default TRUE (Andryo 2026-09-23: handoff is the default behaviour,
+   *  not a flag to flip). Opt out with `handoff: { enabled: false }` in
+   *  settings.json or HANDOFF_ENABLED=0 in the service env. */
   enabled: boolean;
   /** Fraction (0..1) of the TOTAL context window where the handoff kicks
    *  in for threshold compactions. Env: HANDOFF_THRESHOLD. */
@@ -99,7 +97,7 @@ export interface HandoffSettings {
 }
 
 export const HANDOFF_DEFAULTS: HandoffSettings = {
-  enabled: false,
+  enabled: true,
   threshold: 0.8,
   restartFileCap: 64_000_000,
   sizeGuardTokens: 12_000,
