@@ -122,6 +122,7 @@ not a tone issue — read the `author=` tag before you quote or paraphrase.
 | `channel` | yes | Discord channel ID (numeric id or `#name`) |
 | `botToken` | discord | Discord bot token |
 | `ownerUserId` | optional | Discord user id allowed to use owner commands |
+| `ownerUserIds` | optional | list of further owner ids (checked alongside `ownerUserId`) |
 | `forwardToolCalls` | optional | `true` — tool calls/results included in auto-forwarded responses |
 | `default` | optional | Active channel on startup |
 | `startupMessage` | optional | Posted once when the channel connects |

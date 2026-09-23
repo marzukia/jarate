@@ -101,6 +101,7 @@ carries the thread.
       "botToken": "your-bot-token",
       "default": true,
       "ownerUserId": "your-discord-user-id",
+      "ownerUserIds": ["second-operator-id"],
       "forwardToolCalls": false
     },
   ]
@@ -118,6 +119,7 @@ carries the thread.
 | `channel` | yes | Discord channel ID (numeric id or `#name`) |
 | `botToken` | discord | Discord bot token |
 | `ownerUserId` | optional | Discord user id allowed to use owner commands |
+| `ownerUserIds` | optional | list of further owner ids (checked alongside `ownerUserId`) |
 | `forwardToolCalls` | optional | `true` — tool calls/results appended to forwarded responses |
 | `default` | optional | Active channel on startup |
 | `startupMessage` | optional | Posted once when the channel connects |

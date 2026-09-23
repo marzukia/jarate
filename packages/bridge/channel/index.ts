@@ -980,7 +980,7 @@ export async function updateQueuedInbound(
   const entry = q?.find((e) => e.msg.messageId === messageId);
   if (!entry) return false;
   const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
-  if (ch?.ownerUserId && authorId !== ch.ownerUserId) return false;
+  if (hasOwnerConfigured(ch) && !isOwnerUser(ch, authorId)) return false;
   entry.msg.body = content;
   entry.msg.attachments = attachments;
 
@@ -1021,9 +1021,9 @@ export async function deleteQueuedInbound(
   const idx = q ? q.findIndex((e) => e.msg.messageId === messageId) : -1;
   const ack = queuedAcks.get(messageId);
   if (idx === -1 && !ack) return; // never queued, no ack: not ours
-  if (ch?.ownerUserId) {
+  if (hasOwnerConfigured(ch)) {
     const fromId = idx !== -1 && q ? q[idx].msg.fromId : ack?.fromId;
-    if (fromId !== ch.ownerUserId) return; // owner only
+    if (!isOwnerUser(ch, fromId)) return; // owner only
   }
   if (idx !== -1 && q) {
     q.splice(idx, 1);
@@ -1598,6 +1598,33 @@ export function matchCommand(
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
+}
+
+/**
+ * Owner check. `ownerUserIds` (list) is preferred; the legacy single
+ * `ownerUserId` still works, so existing configs are unaffected. A channel
+ * with no owner configured admits nobody.
+ *
+ * 2026-09-23: an unset owner used to be invisible — owner-only commands
+ * silently fell through to the agent as plain text ("why isn't /status
+ * working" was the agent answering the command as a prompt). Refusals are
+ * now explicit for both transports; see the `ownerOnly` note in
+ * runChannelCommand. Exported for tests.
+ */
+export function isOwnerUser(
+  ch: { ownerUserId?: string; ownerUserIds?: string[] } | undefined | null,
+  userId: string | undefined,
+): boolean {
+  if (!ch || !userId) return false;
+  if (ch.ownerUserIds?.includes(userId)) return true;
+  return !!ch.ownerUserId && ch.ownerUserId === userId;
+}
+
+/** Does this channel have any owner configured at all? */
+export function hasOwnerConfigured(
+  ch: { ownerUserId?: string; ownerUserIds?: string[] } | undefined | null,
+): boolean {
+  return !!(ch?.ownerUserId || ch?.ownerUserIds?.length);
 }
 
 // ─── /jobs: in-flight pi-bg dispatches + recent history ─────────────────
@@ -3827,10 +3854,22 @@ async function runChannelCommand(
   fromId: string | undefined,
   native: boolean,
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
-  const isOwner = !!ch.ownerUserId && fromId === ch.ownerUserId;
-  const ownerOnly = !isOwner
-    ? { immediate: native ? fence("[!] owner only") : undefined }
-    : {};
+  const isOwner = isOwnerUser(ch, fromId);
+  // A recognised command is NEVER handed to the agent as plain text when the
+  // sender is not permitted. It used to be (`immediate` was only set on the
+  // native/slash path), so an owner-only command from a non-owner quietly
+  // became a prompt and the agent answered it as chat — indistinguishable
+  // from the bridge ignoring commands. Refuse explicitly on both transports,
+  // and name the misconfiguration when no owner is set at all.
+  const ownerOnly = isOwner
+    ? {}
+    : {
+        immediate: fence(
+          hasOwnerConfigured(ch)
+            ? "[!] owner only"
+            : "[!] owner only (no owner configured: set channels[].ownerUserId or ownerUserIds)",
+        ),
+      };
   switch (name.toLowerCase()) {
     case "stop": {
       // /stop while compacting is owner-only (isOwner pattern): it aborts
@@ -5167,7 +5206,7 @@ export async function handleInbound(
   const bang = rawBody.match(/^!\s*([\s\S]+)$/);
   if (bang && ch) {
     noAck();
-    if (!ch.ownerUserId || msg.fromId !== ch.ownerUserId) {
+    if (!isOwnerUser(ch, msg.fromId)) {
       replyCmd(fence("[!] ! shell is owner-only"));
       return;
     }

@@ -5,7 +5,7 @@ Matching is case-insensitive; every command needs a leading `/` except bare
 `stop` (exact match, no args — `stop that` is chat, not a command).
 
 Access: **anyone** = any member of the channel; **owner** = the configured
-`ownerUserId`.
+`ownerUserId` / `ownerUserIds`. A channel with **no** owner configured refuses owner-only commands explicitly (it never hands them to the agent as chat).
 
 ## Output tags
 

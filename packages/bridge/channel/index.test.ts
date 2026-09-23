@@ -35,11 +35,13 @@ import extension, {
   fence,
   fileOnlyPrompt,
   handleInbound,
+  hasOwnerConfigured,
   heldChannels,
   interruptStepTimeoutMs,
   isCompacting,
   isEssentialToolCall,
   isHeld,
+  isOwnerUser,
   isVerbose,
   LIVE_TEXT_PLACEHOLDER,
   LIVE_TEXT_THROTTLE_MS,
@@ -3098,10 +3100,13 @@ describe("#39 /hold", () => {
     );
 
     await handleInbound(pi, otherInbound("/hold on", "m4"), ctx);
-    // text-form command from a non-owner: not executed, falls through to
-    // pi as plain text (the "[!] owner only" ack is the native path)
+    // text-form command from a non-owner: not executed, and refused
+    // explicitly. A recognised command must never fall through to pi as
+    // plain text — the agent then answers the command as a prompt, which
+    // reads as "the bridge is ignoring my commands" (2026-09-23).
     expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
-    expect(sent).toHaveLength(1);
+    expect(posts().some((t) => t.includes("[!] owner only"))).toBe(true);
+    expect(sent).toHaveLength(0);
   });
 
   test("hold flag persists to channel-state.json and reloads after restart", async () => {
@@ -7907,13 +7912,13 @@ describe("wave 2c bridge commands", () => {
     const oldHome = process.env.HOME;
     process.env.HOME = home;
     try {
-      // non-owner: falls through to pi as plain text
+      // non-owner: refused, never handed to pi as plain text
       await handleInbound(
         pi,
         otherInbound("/jobs kill 20260914-091714-3097", "m1"),
         ctx,
       );
-      expect(sent).toHaveLength(1);
+      expect(sent).toHaveLength(0);
       expect(posts().some((t) => t.includes("killed"))).toBe(false);
       // owner kill
       await handleInbound(
@@ -7968,9 +7973,9 @@ describe("wave 2c bridge commands", () => {
 
   test("/new-worktree + /merge-worktree: owner-only full cycle (#12)", async () => {
     initRepo(tmp);
-    // non-owner: falls through as plain text
+    // non-owner: refused, never handed to pi as plain text
     await handleInbound(pi, otherInbound("/new-worktree", "m1"), ctx);
-    expect(sent).toHaveLength(1);
+    expect(sent).toHaveLength(0);
     expect(loadWorktreeStateFile()).toBeNull();
     // owner: creates the worktree
     await handleInbound(pi, inbound("/new-worktree", "m2"), ctx);
@@ -8021,4 +8026,28 @@ describe("wave 2c bridge commands", () => {
       return null;
     }
   }
+
+  describe("owner config: ownerUserIds list + no-owner detection", () => {
+    test("ownerUserIds admits any listed user; legacy ownerUserId still works", () => {
+      expect(isOwnerUser({ ownerUserIds: ["a", "b"] }, "b")).toBe(true);
+      expect(isOwnerUser({ ownerUserIds: ["a"] }, "c")).toBe(false);
+      // legacy single field keeps working (existing configs unaffected)
+      expect(isOwnerUser({ ownerUserId: "uid" }, "uid")).toBe(true);
+      expect(isOwnerUser({ ownerUserId: "uid" }, "other")).toBe(false);
+      // both fields together: either matches
+      expect(
+        isOwnerUser({ ownerUserId: "uid", ownerUserIds: ["a"] }, "a"),
+      ).toBe(true);
+      // no owner configured (or no sender) admits nobody
+      expect(isOwnerUser({}, "anyone")).toBe(false);
+      expect(isOwnerUser({ ownerUserId: "uid" }, undefined)).toBe(false);
+    });
+
+    test("hasOwnerConfigured distinguishes absent from empty", () => {
+      expect(hasOwnerConfigured({})).toBe(false);
+      expect(hasOwnerConfigured({ ownerUserIds: [] })).toBe(false);
+      expect(hasOwnerConfigured({ ownerUserIds: ["a"] })).toBe(true);
+      expect(hasOwnerConfigured({ ownerUserId: "uid" })).toBe(true);
+    });
+  });
 });
