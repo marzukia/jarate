@@ -11,6 +11,7 @@ import {
   buildHandover,
   buildHeader,
   buildLlmPrompt,
+  buildSeedKickoff,
   type ExtractCtxState,
   estTokens,
   extractDeterministic,
@@ -20,8 +21,11 @@ import {
   formatContextLine,
   formatSessionStats,
   HANDOFF_DEFAULTS,
+  HANDOFF_FRESH_WINDOW_MS,
   type HandoffSettings,
   type HandoverPreparation,
+  isHandoffFreshWindow,
+  lastHandoffAt,
   loadPreviousHandover,
   parseKickoff,
   parseLlmProse,
@@ -103,12 +107,14 @@ describe("shouldHandoff (gate)", () => {
       enabled: boolean;
       inFlight: boolean;
       percent: number | null;
+      freshWindow: boolean;
     }> = {},
   ) => ({
     enabled: true,
     threshold: 0.8,
     inFlight: false,
     percent: 85,
+    freshWindow: false,
     ...over,
   });
   test("disabled → false for manual AND threshold", () => {
@@ -125,6 +131,16 @@ describe("shouldHandoff (gate)", () => {
     );
     expect(
       shouldHandoff({ reason: "threshold" }, flags({ inFlight: true })),
+    ).toBe(false);
+  });
+  test("fresh window → false (PR2: just-seeded session not yet eligible)", () => {
+    // even a manual /handover within 5m of the last doc write falls to
+    // the built-in compact (the doc is the base for the NEXT handoff)
+    expect(
+      shouldHandoff({ reason: "manual" }, flags({ freshWindow: true })),
+    ).toBe(false);
+    expect(
+      shouldHandoff({ reason: "threshold" }, flags({ freshWindow: true })),
     ).toBe(false);
   });
   test("enabled + manual → true", () => {
@@ -711,6 +727,77 @@ describe("parseKickoff", () => {
   });
 });
 
+// ─── Fresh window + seed kickoff (PR2 mechanism B) ───────────────────────────
+
+describe("fresh window (just-seeded guard)", () => {
+  let tmp = "";
+  let storeDir = "";
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-fresh-"));
+    storeDir = path.join(tmp, "handovers");
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  test("no store → not fresh", () => {
+    expect(lastHandoffAt(storeDir, tmp)).toBe(0);
+    expect(isHandoffFreshWindow(storeDir, NOW.getTime(), tmp)).toBe(false);
+  });
+  test("fresh doc (now) → fresh; 6m later → not fresh", () => {
+    writeHandover("# d", { storeDir, now: NOW });
+    expect(lastHandoffAt(storeDir, tmp)).toBe(NOW.getTime());
+    expect(isHandoffFreshWindow(storeDir, NOW.getTime() + 60_000, tmp)).toBe(
+      true,
+    );
+    expect(
+      isHandoffFreshWindow(storeDir, NOW.getTime() + 6 * 60_000, tmp),
+    ).toBe(false);
+    expect(
+      isHandoffFreshWindow(
+        storeDir,
+        NOW.getTime() + HANDOFF_FRESH_WINDOW_MS,
+        tmp,
+      ),
+    ).toBe(false);
+  });
+  test("corrupt latest.md → not fresh (guard degrades open)", () => {
+    fs.mkdirSync(storeDir, { recursive: true });
+    fs.writeFileSync(path.join(storeDir, "latest.md"), "path: /nope\n");
+    expect(isHandoffFreshWindow(storeDir, Date.now(), tmp)).toBe(false);
+  });
+});
+
+describe("buildSeedKickoff (F4/F8)", () => {
+  const doc = [
+    "# Handover - 2026-09-23 · session s · 100k tokens → handoff",
+    "",
+    "## 1 · Mission",
+    "Ship the bridge with tests.",
+    "",
+    "## 2 · In-flight (NOW)",
+    "Wiring the compact handler.",
+    "",
+    "## 10 · Last 3 user asks",
+    "1. do the thing",
+  ].join("\n");
+  test("digest + forced read of latest.md + pending-question instruction", () => {
+    const home = "/home/monky";
+    const k = buildSeedKickoff(doc, "~/.jarate/handovers", home);
+    const lines = k.split("\n");
+    // preamble + 3-line digest + the read instruction
+    expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
+    expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
+    expect(lines[3]).toBe("Last ask: 1. do the thing");
+    expect(lines[4]).toBe(
+      `Read ${path.join(home, ".jarate", "handovers", "latest.md")} before continuing. Answer the last pending user question if any.`,
+    );
+  });
+  test("absolute storeDir is not re-expanded", () => {
+    const k = buildSeedKickoff(doc, "/abs/handovers", "/home/monky");
+    expect(k).toContain("Read /abs/handovers/latest.md before continuing.");
+  });
+});
+
 // ─── resolveHandoffSettings ─────────────────────────────────────────────────
 
 describe("resolveHandoffSettings", () => {
@@ -772,6 +859,34 @@ describe("resolveHandoffSettings", () => {
       HANDOFF_RESTART_FILE_CAP: "32000000",
     } as NodeJS.ProcessEnv);
     expect(s.restartFileCap).toBe(32_000_000);
+  });
+  test("env HANDOFF_ENABLED overrides settings both ways", () => {
+    write(path.join(tmp, "home", ".pi", "agent", "settings.json"), {
+      handoff: { enabled: false },
+    });
+    expect(
+      resolveHandoffSettings(path.join(tmp, "proj"), {
+        HANDOFF_ENABLED: "1",
+      } as NodeJS.ProcessEnv).enabled,
+    ).toBe(true);
+    expect(
+      resolveHandoffSettings(path.join(tmp, "proj"), {
+        HANDOFF_ENABLED: "true",
+      } as NodeJS.ProcessEnv).enabled,
+    ).toBe(true);
+    write(path.join(tmp, "home", ".pi", "agent", "settings.json"), {
+      handoff: { enabled: true },
+    });
+    expect(
+      resolveHandoffSettings(path.join(tmp, "proj"), {
+        HANDOFF_ENABLED: "0",
+      } as NodeJS.ProcessEnv).enabled,
+    ).toBe(false);
+    // unset env → settings value stands
+    expect(
+      resolveHandoffSettings(path.join(tmp, "proj"), {} as NodeJS.ProcessEnv)
+        .enabled,
+    ).toBe(true);
   });
   test("invalid values fall back to defaults", () => {
     write(path.join(tmp, "proj", ".pi", "settings.json"), {
@@ -955,6 +1070,69 @@ describe("buildHandover", () => {
     });
     expect(estTokens(doc)).toBeLessThanOrEqual(5_000);
     expect(doc).toContain("… (condensed by size guard)");
+  });
+  test("MINOR-2: aborted signal (operator /stop) → no double fail post", async () => {
+    const realFetch = globalThis.fetch;
+    const fetchCalls: { url: string; body?: any }[] = [];
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({ url: String(url), body: init?.body });
+      return { ok: true, status: 200, json: async () => ({ id: "o" }) };
+    }) as any;
+    // a channel config so the fail notice WOULD be postable
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "uid",
+          },
+        ],
+      }),
+    );
+    const posts = () =>
+      fetchCalls.filter(
+        (c) =>
+          typeof c.body === "string" && c.body.includes("handover gen failed"),
+      );
+    const ac = new AbortController();
+    ac.abort(); // operator /stop
+    await expect(
+      buildHandover({
+        preparation: basePrep(),
+        branchEntries: [],
+        ctx,
+        pi,
+        settings: settings(),
+        complete: async () => {
+          throw new Error("Compaction cancelled");
+        },
+        signal: ac.signal,
+        now: NOW,
+      }),
+    ).rejects.toThrow("Compaction cancelled");
+    expect(posts()).toHaveLength(0); // pi's own cancel notice covers it
+    // control: a non-aborted failure DOES post
+    await expect(
+      buildHandover({
+        preparation: basePrep(),
+        branchEntries: [],
+        ctx,
+        pi,
+        settings: settings(),
+        complete: async () => {
+          throw new Error("boom");
+        },
+        signal: new AbortController().signal,
+        now: NOW,
+      }),
+    ).rejects.toThrow("boom");
+    expect(posts()).toHaveLength(1);
+    globalThis.fetch = realFetch;
   });
   test("event signal is forwarded to the LLM call", async () => {
     const ac = new AbortController();

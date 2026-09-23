@@ -1,116 +1,109 @@
-# out.md — review fix round (5 LOWs) + 16k-runout RCA
+# PR2 — Handoff Compaction: mechanism B (size-gated restart) + seed-on-boot
 
-Branch: `pi-bg/20260918-140425-2653975`, base commit `e228bdf5`
-(project-tags). All five LOW findings from `review-out.md` fixed, one
-hermetic test each, RCA doc included.
+Branch: pi-bg/20260923-044432-549447 (on PR1 47a131ea)
 
-## LOW-1 — `bg_capture_cost` must not clobber a corrupt run record
+## What changed
 
-- Fix: `dispatch/pi-bg` (`bg_capture_cost` python). `load()` now returns
-  `None` (was `{}`) on decode failure or non-dict JSON, and the capture
-  does `raise SystemExit(0)` when `rec is None` — the whole capture is
-  skipped, so a corrupt record is never rewritten as a cost-only dict.
-  Same skip-on-corrupt discipline as `bg_mark_record` / `bg_log_retry`.
-- Test: `dispatch/pi-bg.test.ts` — "corrupt run record: capture skips,
-  never overwrites with a cost-only dict (LOW-1)". pi stub truncates the
-  record mid-run to `{"run": "20260918`; asserts the file is byte-identical
-  after the run (both the main-flow capture and the terminal-trap capture
-  ran against it).
+### a) Mechanism B — size-gated restart, post-settle (F1/F2/F4/F5)
+- `session_compact` handler now runs `settleCompacting(ctx)` THEN
+  `handoffRestartForSize(pi, ctx)` (F1: gate decides after the window is
+  closed, so the restart op it opens cannot be swept by its own settle).
+- The gate is deferred one macrotask (setTimeout 0): pi's MANUAL compact
+  path calls the ctx.compact wrapper's onComplete belt (clearCompacting)
+  AFTER the emit; a synchronous window open would be wiped by that belt.
+- `maybeHandoffRestart` (index.ts): enabled + live file
+  (`ctx.sessionManager.getSessionFile()`) > `restartFileCap` (default
+  64_000_000) → beginRestartOp(op "handoff", label "handing-off",
+  finalText `[ok] context handoff -> new session (file was N.N MB)`,
+  marker `{seeded:false}`) + scheduleOpShutdown with preShutdown
+  `moveSessionFileAside(ctx, liveFile)` (F5, explicit file) then
+  `archiveStaleSessions(liveFile)` (F2: every other `*.jsonl` in the
+  session dir → `*.jsonl.stale-<ts>`, so the respawn's `pi -c` resume
+  target is provably small). Reuses the /reset chain verbatim
+  (op window + marker + cursor rewind + bounded shutdown + systemd
+  restart + watchdog). `/stop` cancels it unmodified.
+- Skips (no-op): handoff disabled, no discord channel, no session file,
+  file <= cap, or a settle-flushed /compact re-opened the window (label
+  "compacting") — that compaction's own settle re-runs the gate.
 
-## LOW-2 — stale `price_error` must clear when a later capture succeeds
+### b) Seed-on-boot (F4)
+- `OpMarker` gains `seeded?: boolean`; `writeOpMarker`/`beginRestartOp`
+  gain an optional marker param (existing call sites unchanged).
+- `consumeOpMarker(pi, ctx)` (exported): ONLY a marker with
+  `op === "handoff"` && `seeded !== true` seeds: plain
+  `pi.sendUserMessage(buildSeedKickoff(doc, storeDir))` — preamble +
+  parseKickoff 3-line digest + `Read <abs storeDir>/latest.md before
+  continuing. Answer the last pending user question if any.` (F8) — then
+  flips `seeded=true` (crash-safety: flip AFTER send; a crash re-seeds
+  next boot, harmless; flip-before-send would lose the seed). Not a
+  channel-inbound entry: no Discord echo, doesn't pollute the next
+  handover's last-asks. Ordinary boots (incl. OOM respawns without a
+  handoff marker) never seed.
+- Fresh-window guard (F4): `shouldHandoff` gains `freshWindow` flag —
+  true when latest.md's `updated` stamp is < 5 min old
+  (`HANDOFF_FRESH_WINDOW_MS`), wired in the session_before_compact
+  handler. A just-seeded session (the doc was written in the very
+  compaction that triggered the restart) is not handoff-eligible for a
+  short window.
 
-- Fix: `dispatch/pi-bg` (`finish()`). `rec["price_error"] = price_error`
-  is now set unconditionally (null on success) instead of only when the
-  arg is truthy.
-- Test: `dispatch/pi-bg.test.ts` — "transient price failure then success:
-  later capture clears price_error (LOW-2)". Stateful curl stub: first
-  pricing fetch exits 7 (marker file proves it), second (terminal trap)
-  serves the canned price. Asserts final record has `cost_usd ≈ 0.00022`,
-  `price_error` null, tokens kept.
+### c) MINOR fixes (PR1 review)
+- MINOR-2: buildHandover's catch skips the "handover gen failed" post
+  when `args.signal.aborted` (operator /stop — pi's cancel notice covers
+  it).
+- MINOR-4: `handover` added to `allowedWhileCompacting`.
+- MINOR-1: threshold math UNCHANGED; comment added — 80%-of-total-window
+  is intentional (Andryo option a); pi's auto compaction fires at ~94% of
+  a 262K window, so auto compactions always hand off.
 
-## LOW-3 — misleading error label for a malformed model list
+### d) F7 watchdog death + enable path
+- `armRestartWatchdog`: after posting `[!] restart failed - check unit
+  X`, it now `process.exit(1)` 500ms later (injectable via
+  `setProcessExitHookForTest`) — a live process leaves the unit
+  "active", so systemd Restart=always would never respawn.
+- `HANDOFF_ENABLED=1|0|true|false` env path added to
+  resolveHandoffSettings (env beats settings beats default).
 
-- Fix: `dispatch/pi-bg` (fuzzy fallback). New `mid(m)` helper
-  (`str(m.get("id") or "") if isinstance(m, dict) else ""`) replaces the
-  bare `m.get(...)` derefs in the exact scan + both fuzzy
-  comprehensions, so non-dict/None entries degrade to an id miss instead
-  of raising into the outer `except` and masking the label as
-  "fetch failed". Also guarded the per-rate `float(v)` conversion
-  (same failure class: a non-numeric pricing value no longer escapes to
-  the outer except; it degrades to `None` -> "parse failed").
-- Test: `dispatch/pi-bg.test.ts` — "malformed model list: label is
-  model-not-found, not masked fetch/parse (LOW-3)". `curlStub` gained a
-  `malformed` mode: well-formed fetch, `data` = `[null, 42, {"id": null},
-  "qwen/qwen3.8-27b", {"pricing": {"prompt": "1"}}]`. Asserts
-  `price_error == "model not found"` (pre-fix: "fetch failed"),
-  `cost_usd` null, tokens kept.
+## Files changed
+- packages/bridge/channel/handover.ts — HANDOFF_ENABLED env, freshWindow
+  flag + MINOR-1 comment, MINOR-2 abort check, lastHandoffAt /
+  isHandoffFreshWindow / buildSeedKickoff.
+- packages/bridge/channel/index.ts — mechanism B gate + archiveStale-
+  Sessions + handoffRestartForSize, seeded op marker, consumeOpMarker
+  boot seed, watchdog F7 exit, handover allowedWhileCompacting,
+  freshWindow wiring.
+- packages/bridge/channel/handover.test.ts — +8 tests (env flag,
+  fresh-window gate, lastHandoffAt/isHandoffFreshWindow,
+  buildSeedKickoff, MINOR-2 abort vs control).
+- packages/bridge/channel/index.test.ts — +8 tests (under-cap no-op,
+  over-cap full chain, disabled, settle-flush skip-then-restart, /stop
+  during op, boot seed, ordinary boot no-seed, already-seeded no
+  re-seed) + F7 exit assertion in the #28 watchdog test.
 
-## LOW-4 — boolean `cost_usd` counted as priced in the rollup
+## Verification
+- `bun x tsc --noEmit` (packages/bridge): clean.
+- `bun test` (packages/bridge): 848 pass, 0 fail, 3028 expect() calls.
+- `bunx biome check .` (repo root): exit 0; my 4 files have 0
+  diagnostics (only pre-existing bin/jarate.test.ts warning+info remain,
+  present on baseline).
+- `HOME=/tmp/fake-home-dry bash install.sh --dry-run`: exit 0.
 
-- Fix: `bin/jarate` (rollup heredoc). Cost collection now uses the
-  bool-excluding guard the token sums already use:
-  `isinstance(c, (int, float)) and not isinstance(c, bool)` else `None`.
-- Test: `bin/jarate.test.ts` (projects) — "boolean cost_usd is not priced:
-  rollup rejects it (LOW-4)". Bucket with one numeric record (0.01) and
-  one `"cost_usd": true`. Pre-fix the bucket would report
-  `cost_usd: 1.01, cost_covered: 2`; asserts `cost_usd: null,
-  cost_covered: 1, runs: 2`.
+## How to enable (live box)
+`handoff.enabled` stays FALSE in code. On the live box (monky) it is
+ALREADY true in `~/.pi/agent/settings.json` (PR1 path opted in ahead of
+this PR — out-of-scope change, no action needed). Otherwise:
+- `~/.pi/agent/settings.json`: `{"handoff": {"enabled": true}}`, or
+- pi.service env: `HANDOFF_ENABLED=1` (then restart pi — operator move).
+Mechanism B then restarts on any compaction that leaves the live session
+file over `handoff.restartFileCap` (default 64 MB; env
+`HANDOFF_RESTART_FILE_CAP`).
 
-## LOW-5 — backfill `scanned` must not count non-dict record files
-
-- Fix: none needed — verified `git show e228bdf5:bin/jarate` (lines
-  475-477): the isinstance guard + `continue` already sit ABOVE
-  `scanned += 1` in BACKFILL_SCAN (the review's description has the
-  order reversed; PROJ_SCAN likewise skips non-dicts before building a
-  row). The requested end state was already met at the reviewed commit.
-- Test: `bin/jarate.test.ts` (projects-backfill) — "non-dict record files
-  are not scanned: totals reconcile (LOW-5)". Plants a JSON-array record
-  file + a corrupt file alongside the 4 dict seeds; asserts backfill
-  totals `{scanned: 4, tagged: 3, skipped: 1}` and that `projects`
-  (PROJ_SCAN) reports the same local `scanned: 4` — the two scanners
-  agree on the same input.
-
-## Discrimination check
-
-The 5 new tests run against the pre-fix scripts (`e228bdf5` versions of
-`dispatch/pi-bg` + `bin/jarate`): LOW-1, LOW-2, LOW-3, LOW-4 FAIL
-(LOW-3 reproduced as "fetch failed" vs expected "model not found");
-LOW-5 PASSES (code already correct, test pins the invariant). Against
-the fixed scripts all 5 PASS.
-
-## Final verification (worktree, post-biome-fix)
-
-```
-$ bun test
- 928 pass
- 7 skip
- 0 fail
- 3733 expect() calls
-Ran 935 tests across 34 files. [135.99s]
-```
-
-```
-$ bunx biome check .
-Checked 78 files in 203ms. No fixes applied.
-Found 1 warning.
-Found 1 info.
-```
-rc 0 — exactly the 2 pre-existing main-baseline findings
-(`bin/jarate.test.ts:910` useTemplate info, `bin/jarate.test.ts:938`
-noTemplateCurlyInString warning), none in this change's files.
-
-```
-$ bash -n dispatch/pi-bg && bash -n bin/jarate
-pi-bg: bash -n OK (rc 0)
-jarate: bash -n OK (rc 0)
-```
-
-## Commit contents
-
-- `dispatch/pi-bg` — LOW-1/2/3 fixes
-- `bin/jarate` — LOW-4 fix
-- `dispatch/pi-bg.test.ts` — 3 new tests + `curlStub` malformed mode
-- `bin/jarate.test.ts` — 2 new tests
-- `issues/rca-16k-thinking-runout.md` — new (16k thinking-runout RCA,
-  ticket 20260918-133528-1639646)
-- `out.md` — this file (replaces the round-1 out.md)
+## Deviations
+- The gate is registered as ONE combined session_compact handler
+  (settle, then gate) rather than a second listener — the test pi stubs
+  are last-wins, so a separate listener would have replaced the settle
+  handler and broken existing tests.
+- Watchdog F7 exit is delayed 500ms after the Discord post so the
+  failure line lands before the process dies; both timers unref'd.
+- Fresh window keys on latest.md's `updated` stamp (doc write) as a
+  proxy for seed time — also suppresses a 2nd handoff within 5 min of
+  any mechanism A doc write (intentional, cheap).

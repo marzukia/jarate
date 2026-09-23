@@ -68,7 +68,10 @@ import { mdToDiscord } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
+  buildSeedKickoff,
   type HandoverComplete,
+  isHandoffFreshWindow,
+  loadPreviousHandover,
   parsePriorTags,
   resolveHandoffSettings,
   shouldHandoff,
@@ -580,7 +583,8 @@ export type OpLabel =
   | "resetting"
   | "restarting"
   | "undoing"
-  | "redoing";
+  | "redoing"
+  | "handing-off";
 
 interface CompactingEntry {
   since: number;
@@ -2076,7 +2080,7 @@ export default function (pi: ExtensionAPI) {
     // to the user the channel is blocked from the op until this lands
     // (see beginRestartOp). Stale markers are dropped, not shown.
     try {
-      consumeOpMarker(ctx);
+      consumeOpMarker(pi, ctx);
     } catch (e) {
       console.error("[op] marker settle failed:", sanitizeUnknownValue(e));
     }
@@ -2644,6 +2648,11 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
+    // Mechanism B (PR2): the size-gated restart gate runs AFTER the
+    // settle above (F1). No-op unless handoff is enabled AND the live
+    // session file exceeds restartFileCap (then: restart op, seeded
+    // fresh session on the respawn).
+    handoffRestartForSize(pi, ctx);
   });
   pi.on("session_compact_failed", (_event, ctx) => {
     settleCompacting(ctx);
@@ -2672,6 +2681,11 @@ export default function (pi: ExtensionAPI) {
         threshold: settings.threshold,
         inFlight: handoffInFlight,
         percent,
+        // A just-written doc (possibly with a mechanism B restart + seed
+        // still pending) keeps this session non-handoff-eligible for a
+        // short window — the fresh session must not immediately rebuild
+        // the doc it was just seeded with.
+        freshWindow: isHandoffFreshWindow(settings.storeDir),
       })
     )
       return undefined;
@@ -3150,6 +3164,12 @@ interface OpMarker {
   msgId: string | null;
   /** Final line the respawn posts into the channel. */
   finalText: string;
+  /** Handoff op only (mechanism B, F4): false until the respawn seeds
+   *  the fresh session from the doc. The op marker is the ONLY seed
+   *  gate — reset/restart/undo/redo markers never carry seeded:false,
+   *  so ordinary boots (incl. OOM respawns without a handoff) never
+   *  seed. */
+  seeded?: boolean;
 }
 const opMarkerPath = (cwd: string) => path.join(cwd, ".tmp", "op-marker.json");
 
@@ -3158,6 +3178,7 @@ function writeOpMarker(
   ch: ChannelConfig,
   op: string,
   finalText: string,
+  marker?: { seeded?: boolean },
 ): void {
   try {
     const p = opMarkerPath(ctx.cwd);
@@ -3169,6 +3190,7 @@ function writeOpMarker(
       msgId: null,
       finalText,
     };
+    if (marker?.seeded !== undefined) m.seeded = marker.seeded;
     const tmp = `${p}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(m));
     fs.renameSync(tmp, p);
@@ -3197,8 +3219,15 @@ function updateOpMarkerMsgId(
 
 /** Respawn-side settle: replace the dead process's op placeholder with
  *  the final line. Called from session_start. Stale markers (>10m —
- *  e.g. pi crashed and the channel sat dark) are dropped, not shown. */
-function consumeOpMarker(ctx: ExtensionContext): void {
+ *  e.g. pi crashed and the channel sat dark) are dropped, not shown.
+ *
+ *  Mechanism B seed (F4): ONLY a handoff marker with seeded!=true seeds
+ *  the fresh session (sendUserMessage with the doc digest + forced
+ *  read of latest.md), then the marker is flipped seeded=true and
+ *  unlinked. The flip happens AFTER the send: a crash between them
+ *  re-seeds the next boot (harmless duplicate), while a flip-before-
+ *  send crash would lose the seed entirely. */
+export function consumeOpMarker(pi: ExtensionAPI, ctx: ExtensionContext): void {
   const p = opMarkerPath(ctx.cwd);
   let m: OpMarker | null = null;
   try {
@@ -3206,16 +3235,22 @@ function consumeOpMarker(ctx: ExtensionContext): void {
   } catch {
     return; // no marker — normal boot
   }
+  const valid =
+    typeof m?.channelId === "string" &&
+    typeof m?.finalText === "string" &&
+    m.finalText.length > 0;
+  if (valid && m.op === "handoff" && m.seeded !== true) {
+    try {
+      seedFromHandoffDoc(pi, ctx);
+      markHandoffSeeded(ctx);
+    } catch (e) {
+      console.error("[handoff] boot seed failed:", sanitizeUnknownValue(e));
+    }
+  }
   try {
     fs.unlinkSync(p);
   } catch {}
-  if (
-    !m ||
-    typeof m.channelId !== "string" ||
-    typeof m.finalText !== "string" ||
-    !m.finalText
-  )
-    return;
+  if (!valid) return;
   if (typeof m.at !== "number" || Date.now() - m.at > OP_MARKER_TTL_MS) {
     console.log(`[op] ${m.op ?? "?"} marker stale (>10m) — dropped`);
     return;
@@ -3230,6 +3265,39 @@ function consumeOpMarker(ctx: ExtensionContext): void {
       sendDiscordMessage(ch, fence(m.finalText)).catch(() => {}),
     );
   else sendDiscordMessage(ch, fence(m.finalText)).catch(() => {});
+}
+
+/** Flip seeded=true on the handoff op marker (F4 crash-safety flip). */
+function markHandoffSeeded(ctx: ExtensionContext): void {
+  try {
+    const p = opMarkerPath(ctx.cwd);
+    const m = JSON.parse(fs.readFileSync(p, "utf8")) as OpMarker;
+    if (m?.op !== "handoff") return;
+    m.seeded = true;
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(m));
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    console.error("[handoff] seeded flip failed:", sanitizeUnknownValue(e));
+  }
+}
+
+/** Mechanism B: seed the fresh session from the handover doc (F4/F8).
+ *  A plain user message (pi.sendUserMessage — always triggers a turn),
+ *  NOT a channel-inbound entry: it must not echo to Discord, and the
+ *  next handover's "last 3 user asks" keys on channel-inbound entries.
+ *  The seed itself cannot re-trigger a handoff: the fresh session is far
+ *  under the threshold, and the fresh-window guard (latest.md < 5m)
+ *  blocks handoffs for this session either way. */
+function seedFromHandoffDoc(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  const settings = resolveHandoffSettings(ctx.cwd);
+  const doc = loadPreviousHandover({ storeDir: settings.storeDir });
+  if (!doc) {
+    console.log("[handoff] no handover doc at boot - seed skipped");
+    return;
+  }
+  pi.sendUserMessage(buildSeedKickoff(doc, settings.storeDir));
+  console.log("[handoff] seeded fresh session from the handover doc");
 }
 
 /** Drop the op marker (F1: /stop cancels the op — no respawn comes from
@@ -3247,6 +3315,15 @@ export function setSystemdRestartHookForTest(
   fn: ((unit: string) => void) | null,
 ): void {
   systemdRestartHook = fn;
+}
+
+let processExitHook: ((code: number) => void) | null = null;
+/** Override process.exit (tests: the watchdog F7 death must not kill the
+ *  runner). */
+export function setProcessExitHookForTest(
+  fn: ((code: number) => void) | null,
+): void {
+  processExitHook = fn;
 }
 
 /** The restart command for a resolved unit name (issue #28: the unit is
@@ -3295,12 +3372,13 @@ function beginRestartOp(
   op: string,
   label: OpLabel,
   finalText: string,
+  marker?: { seeded?: boolean },
 ): Promise<string | null> {
   beginCompacting(pi, ch, ctx, {
     label,
     rewindTo: getChannelCursor(ch.id),
   });
-  writeOpMarker(ctx, ch, op, finalText);
+  writeOpMarker(ctx, ch, op, finalText, marker);
   if (ch.type !== "discord") return Promise.resolve(null);
   return sendDiscordMessage(ch, fence(`[..] ${label}...`))
     .then((r) => {
@@ -3350,6 +3428,15 @@ function armRestartWatchdog(
     drainQueuedAfterCompact(pi, ctx);
     const line = fence(`[!] restart failed - check unit ${unit}`);
     if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
+    // F7 (design v2, PR2): a swallowed restart leaves THIS process alive
+    // and the unit "active" — systemd will never auto-respawn it. Die on
+    // purpose (after the post lands): Restart=always respawns 'pi -c',
+    // which loads the small session file and settles the op marker.
+    const exitTimer = setTimeout(
+      () => (processExitHook ?? process.exit.bind(process))(1),
+      500,
+    );
+    exitTimer.unref?.();
   }, RESTART_WATCHDOG_MS);
   t.unref?.();
 }
@@ -3467,6 +3554,112 @@ export function moveSessionFileAside(
   candidates.sort((a, b) => b[1] - a[1]);
   target = candidates[0]?.[0] ?? null;
   if (target) fs.renameSync(target, `${target}.reset-${Date.now()}`);
+}
+
+/** F2 (mechanism B, PR2): after the live session file is moved aside by
+ *  preShutdown, archive EVERY OTHER .jsonl in the same session dir to
+ *  .jsonl.stale-<ts>. The respawn runs 'pi -c' (continueRecent = newest
+ *  .jsonl by mtime) — the 2nd-newest is exactly what it would pick, so
+ *  without this the "fresh" boot can resume a huge superseded session.
+ *  Superseded files stay on disk for PR3's GC sweep. Best-effort: an
+ *  archive failure must not abort the restart. */
+export function archiveStaleSessions(liveFile: string): void {
+  const dir = path.dirname(liveFile);
+  const ts = Date.now();
+  let n = 0;
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.stale-*
+      const p = path.join(dir, f);
+      if (p === liveFile) continue; // preShutdown step 1 already moved it
+      fs.renameSync(p, `${p}.stale-${ts}`);
+      n++;
+    }
+  } catch (e) {
+    console.warn(
+      `[handoff] stale session archive failed: ${sanitizeUnknownValue(e)}`,
+    );
+  }
+  if (n > 0)
+    console.log(`[handoff] archived ${n} stale session file(s) in ${dir}`);
+}
+
+// ─── Handoff mechanism B: size-gated restart (design v2, PR2) ────────────
+// Registered on session_compact AFTER the settle ran (F1: the
+// compaction window is already closed when the gate decides, so the
+// restart op it opens cannot be swept by the settle it reacts to).
+// Gate: the LIVE session file size > restartFileCap — the OOM
+// condition, NOT every compaction (mechanism A's doc compaction is the
+// usual path; the restart is the rare memory fix). Reuses the SAME
+// /reset restart chain (op window + marker + cursor rewind + bounded
+// shutdown + systemd restart + watchdog). Deferred one macrotask:
+// on the MANUAL compact path pi's ctx.compact wrapper calls its
+// onComplete belt (clearCompacting) AFTER the session_compact emit —
+// a synchronous window open would be wiped by that belt. A 0ms timer
+// runs after all pending microtasks (emit + compaction_end + belt).
+export function handoffRestartForSize(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  setTimeout(() => {
+    try {
+      void maybeHandoffRestart(pi, ctx);
+    } catch (e) {
+      console.error("[handoff] restart gate failed:", sanitizeUnknownValue(e));
+    }
+  }, 0);
+}
+
+/** The actual size gate + restart chain (exported for direct tests). */
+export async function maybeHandoffRestart(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const settings = resolveHandoffSettings(ctx.cwd);
+  if (!settings.enabled) return;
+  const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
+  if (ch?.type !== "discord") return;
+  // A settle-flushed /compact re-opened the window (label "compacting"):
+  // let it finish — its own settle re-runs this gate (the file is still
+  // big, so the restart lands after that compact). Opening the op here
+  // would orphan the in-flight compaction's window + belt.
+  if (compactingChannels.get(ch.id)?.label === "compacting") return;
+  let live: string | null = null;
+  try {
+    live = ctx.sessionManager?.getSessionFile?.() ?? null;
+  } catch {
+    live = null;
+  }
+  if (!live) return;
+  let size: number;
+  try {
+    size = fs.statSync(live).size;
+  } catch {
+    return; // file gone — nothing to gate on
+  }
+  if (size <= settings.restartFileCap) return;
+  const mb = (size / (1024 * 1024)).toFixed(1);
+  console.log(
+    `[handoff] session file ${mb}MB > cap ${settings.restartFileCap}B - restart op`,
+  );
+  // F4: the op marker carries seeded:false — the respawn's session_start
+  // seeds the fresh session from the doc (the ONLY seed gate). F5: move
+  // the EXPLICIT live file at shutdown; F2: archive the other stale
+  // .jsonl so the respawn's 'pi -c' resume target is provably small.
+  const finalText = `[ok] context handoff -> new session (file was ${mb} MB)`;
+  const placeholderP = beginRestartOp(
+    pi,
+    ctx,
+    ch,
+    "handoff",
+    "handing-off",
+    finalText,
+    { seeded: false },
+  );
+  scheduleOpShutdown(pi, ctx, ch, placeholderP, () => {
+    moveSessionFileAside(ctx, live);
+    archiveStaleSessions(live);
+  });
 }
 
 // /undo + /redo share the idle guard: abort the in-flight run, drop the
@@ -4899,6 +5092,7 @@ export async function handleInbound(
       cmd.name === "stop" ||
       cmd.name === "hold" ||
       cmd.name === "compact" ||
+      cmd.name === "handover" ||
       cmd.name === "reset" ||
       cmd.name === "restart";
     if (!isCompacting(ch.id) || allowedWhileCompacting) {
