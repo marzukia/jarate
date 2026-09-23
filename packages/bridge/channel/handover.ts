@@ -1012,7 +1012,9 @@ function postHandoverFail(
     if (ch)
       void sendDiscordMessage(
         ch,
-        "[!] handover gen failed - used standard compact",
+        // Fenced: a bare single-line notice is not authentic (fence rule).
+        // Mirrors index.ts fence() without importing it (circular dep).
+        "```\n[!] handover gen failed - used standard compact\n```",
       );
     void pi; // pi reserved for future channel routing (F10 surface)
   } catch (e2) {
