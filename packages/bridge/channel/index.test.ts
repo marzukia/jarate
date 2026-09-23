@@ -12,6 +12,7 @@ import {
   seedChannelStateForTest,
   setChannelCursor,
 } from "./discord";
+import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { writeHandover } from "./handover";
 import extension, {
@@ -898,7 +899,8 @@ describe("extension handlers (A1/A2/A4)", () => {
     );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     expect(post).toBeDefined();
-    expect(JSON.parse(post!.body).content).toBe("[!] boom");
+    // Machine output ships fenced (STYLE.md 4.4): the guard fences it
+    expect(JSON.parse(post!.body).content).toBe(styleGuard("[!] boom"));
   });
 
   test("A2: user /stop abort is not posted as a run error", async () => {
@@ -1542,7 +1544,8 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(
         posts.some(
           (p) =>
-            String(JSON.parse(p.body).content) === "[!] rate limited, retrying",
+            String(JSON.parse(p.body).content) ===
+            styleGuard("[!] rate limited, retrying"),
         ),
       ).toBe(true);
     });
@@ -2501,7 +2504,11 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
       )
       .map((c) => JSON.parse(c.body).content);
-    expect(contents.filter((t) => t.includes(REPEAT_WARNING)).length).toBe(1);
+    // agent_end posts go through mdToDiscord: the bare [!] warning line is
+    // guarded (fenced + wrapped to the 40-col budget)
+    expect(
+      contents.filter((t) => t === styleGuard(REPEAT_WARNING)).length,
+    ).toBe(1);
   });
 
   test("F1: /undo re-run — session_start re-sends the parked trigger after the undo-restart", async () => {
@@ -3808,7 +3815,7 @@ describe("live intermediate text (SPEC B)", () => {
     };
     await handlers.agent_end({ messages: [failure] }, ctx);
     expect(deletes(tId!)).toHaveLength(1);
-    expect(posts().some((p) => p === "[!] boom")).toBe(true);
+    expect(posts().some((p) => p === styleGuard("[!] boom"))).toBe(true);
   });
 
   test("no-tools-no-status: zero tool calls -> no live-text message at all", async () => {
@@ -4270,10 +4277,12 @@ describe("compact: defer mid-run + always report", () => {
     opts.onError(new Error("Nothing to compact (session too small)"));
     await tick();
     expect(
-      channelPosts().some((t) =>
-        t.includes(
-          "[!] compact failed: Nothing to compact (session too small)",
-        ),
+      channelPosts().some(
+        (t) =>
+          t ===
+          styleGuard(
+            "[!] compact failed: Nothing to compact (session too small)",
+          ),
       ),
     ).toBe(true);
   });
