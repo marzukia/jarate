@@ -64,7 +64,7 @@ import {
   suppressAutoReact,
   unreactMessage,
 } from "./discord";
-import { mdToDiscord } from "./format";
+import { mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
@@ -2620,7 +2620,9 @@ export default function (pi: ExtensionAPI) {
     if (err !== null) {
       const t = channelError(err);
       if (t !== null)
-        sendDiscordMessage(pc.ch, `[!] compact failed: ${t}`).catch(() => {});
+        sendDiscordMessage(pc.ch, styleGuard(`[!] compact failed: ${t}`)).catch(
+          () => {},
+        );
     }
     return err === null;
   };
@@ -3096,12 +3098,15 @@ export function buildInteractionHandler(
       );
       text = r.btw
         ? undefined
-        : (r.immediate ?? (r.consumed ? undefined : "ok"));
+        : (r.immediate ?? (r.consumed ? undefined : fence("ok")));
     } catch (e) {
       const t = channelError(e);
       if (t !== null) text = `[!] command failed: ${t}`;
     }
-    if (text !== undefined) await editInteractionMessage(botToken, d, text);
+    // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
+    // machine-state lines; already-fenced immediates pass through unchanged.
+    if (text !== undefined)
+      await editInteractionMessage(botToken, d, styleGuard(text));
   };
 }
 
@@ -3730,9 +3735,13 @@ function startCompact(
   const report = (text: string) => {
     // Replace the ticking placeholder in place when one is armed; the
     // fresh-post fallback covers the native slash path and the (impossible
-    // in practice) settle-before-post race.
+    // in practice) settle-before-post race. settleOpTick wraps its arg in
+    // a fence itself, so the guard only applies to the fresh-post path
+    // (fence(styleGuard(x)) would double-fence; styleGuard is a no-op on
+    // the single tag lines that reach the settle path).
+    const guarded = styleGuard(text);
     if (!settleCompactTick(ch.id, text))
-      sendDiscordMessage(ch, text).catch(() => {});
+      sendDiscordMessage(ch, guarded).catch(() => {});
   };
   try {
     ctx.compact({
@@ -4246,7 +4255,9 @@ async function runChannelCommand(
       if (!settings.enabled)
         sendDiscordMessage(
           ch,
-          "[!] handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
+          styleGuard(
+            "[!] handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
+          ),
         ).catch(() => {});
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
@@ -5065,7 +5076,9 @@ export async function handleInbound(
   // /status /reset /verbose — owner only. Commands consume the message.
   const replyCmd = (text: string) => {
     if (!ch) return;
-    sendDiscordMessage(ch, text, msg.messageId).catch(() => {});
+    // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
+    // machine-state lines; already-fenced replies pass through unchanged.
+    sendDiscordMessage(ch, styleGuard(text), msg.messageId).catch(() => {});
   };
   // Commands reply directly instead of running a turn — tell the poller
   // not to ack these messages with 👀 (synchronous, no race).
