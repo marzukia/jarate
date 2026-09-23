@@ -975,7 +975,16 @@ export function makeDefaultComplete(ctx: ExtensionContext): HandoverComplete {
       env: auth.env ?? toProviderEnv(process.env),
       signal: opts?.signal,
     });
-    if (res.stopReason === "error" || res.stopReason === "aborted")
+    // MAJOR-1 (review): a "length" stop = output cap hit = partial prose.
+    // Accepting it makes a truncated doc the cumulative base, so every later
+    // handover inherits the hole. pi's own compaction rejects length stops for
+    // the same reason (compaction.js getSummarizationFailure). Fall back to the
+    // built-in compact instead (no doc written, latest.md untouched).
+    if (
+      res.stopReason === "error" ||
+      res.stopReason === "aborted" ||
+      res.stopReason === "length"
+    )
       throw new Error(
         res.errorMessage || `handover generation stopped: ${res.stopReason}`,
       );
