@@ -711,13 +711,14 @@ describe("parseKickoff", () => {
     "1. do the thing",
     "2. and this",
   ].join("\n");
-  test("3 lines: mission, in-flight, last ask", () => {
+  test("3 lines: mission, in-flight, last ask (NEWEST)", () => {
     const k = parseKickoff(doc);
     const lines = k.split("\n");
     expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[1]).toBe("In-flight: Wiring the compact handler.");
-    expect(lines[2]).toBe("Last ask: 1. do the thing");
+    // MINOR-1: the pending ask is the newest (line 2), not the oldest.
+    expect(lines[2]).toBe("Last ask: 2. and this");
   });
   test("missing sections → (none) lines", () => {
     const k = parseKickoff("# bare doc\nno sections");

@@ -867,10 +867,13 @@ export function loadPreviousHandover(
 }
 
 /** 3-line digest of a doc for the boot-seed message (PR2 mechanism B,
- *  F4/F8): mission + in-flight + last ask. */
+ *  F4/F8): mission + in-flight + last ask. The "last ask" is the NEWEST
+ *  (highest-numbered) entry - the section renders oldest->newest, and the
+ *  pending question the agent must answer is the last one, not the first
+ *  (MINOR-1). */
 export function parseKickoff(doc: string): string {
   const { sections } = splitDoc(doc);
-  const pick = (match: (title: string) => boolean): string => {
+  const firstLine = (match: (title: string) => boolean): string => {
     const s = sections.find((x) => match(x.title));
     if (!s) return NONE;
     for (const line of s.body.split("\n")) {
@@ -879,10 +882,21 @@ export function parseKickoff(doc: string): string {
     }
     return NONE;
   };
+  const lastAsk = (): string => {
+    const s = sections.find((x) => x.title.includes("user asks"));
+    if (!s) return NONE;
+    const numbered: string[] = [];
+    for (const line of s.body.split("\n")) {
+      const t = line.trim();
+      if (/^\d+\./.test(t))
+        numbered.push(t.length > 160 ? `${t.slice(0, 157)}...` : t);
+    }
+    return numbered.length ? numbered[numbered.length - 1] : NONE;
+  };
   return (
-    `Mission: ${pick((t) => t.includes("Mission"))}\n` +
-    `In-flight: ${pick((t) => t.includes("In-flight"))}\n` +
-    `Last ask: ${pick((t) => t.includes("user asks"))}`
+    `Mission: ${firstLine((t) => t.includes("Mission"))}\n` +
+    `In-flight: ${firstLine((t) => t.includes("In-flight"))}\n` +
+    `Last ask: ${lastAsk()}`
   );
 }
 
