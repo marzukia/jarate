@@ -40,6 +40,15 @@
 #     relaunch so a second silent death reports a normal FAIL instead of
 #     looping. Leftover SILENT tickets are classified distinctly from
 #     generic DEAD by the pi-bg-watchdog sweep.
+#   - DEGENERATE completion (issue #57 class B, 2026-09-23): rc=0 with a
+#     repetition-loop output (the model loops on a collapsed vocabulary,
+#     e.g. HTML fragments) is DETECTED, not shipped as an OK callback: the
+#     ticket is relaunched ONCE (fresh session = unpolluted context) behind
+#     a <ticket>.degr1 marker; a second degenerate reports FAIL with the
+#     actual signature. Reviewer runs must end with a trailing
+#     'VERDICT: PASS|FAIL' line - rc=0 without one reports FAIL (incomplete
+#     or degenerate review), not OK. Empty-output deaths carry the actual
+#     reason (last session errorMessage, else stderr tail) in the brief.
 #   - dead letter: final post failure writes $PI_BG_TMPDIR/pi-bg-<id>-webhook-failed
 #     (PI_BG_TMPDIR default ~/.pi-bg-art; honored by pi-bg-tail/-kill/-watchdog//jobs)
 # Fresh machine (issue #29): a missing/empty role profile is seeded from the
@@ -723,8 +732,9 @@ bg_on_exit() {
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
      [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
+    reason="$(bg_death_reason)"
     bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
-      "no output captured - pi-bg exited before completion (exit=$ec)" "$ec" ""
+      "no output captured - pi-bg exited before completion (exit=$ec)${reason:+; reason: $reason}" "$ec" ""
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
   fi
   if [ "$ESCAPE_ACTIVE" -eq 1 ]; then
@@ -748,14 +758,20 @@ bg_on_exit() {
   # INT, TERM - the INT/TERM traps funnel into this EXIT trap). Kept:
   # out.md (completion marker: watchdog + /jobs), raw.out (pi-bg-tail spool
   # + /jobs "run started"), wb-status (webhook audit: /jobs),
-  # webhook-failed (dead letter: watchdog + /jobs). A SIGKILLed wrapper
-  # cannot run this trap - its files stay for forensics (the watchdog flags
-  # the ticket DEAD instead).
+  # webhook-failed (dead letter: watchdog + /jobs), and err.log when
+  # out.md is non-empty. err.log is KEPT on empty output: the stderr tail
+  # is the only death reason for a silent death (issue #57) and forensics
+  # needs it. A SIGKILLed wrapper cannot run this trap - its files stay
+  # for forensics (the watchdog flags the ticket DEAD instead).
   rm -f "$BG_TMP/pi-bg-${run_id}-body.json" \
         "$BG_TMP/pi-bg-${run_id}-body-plain.json" \
-        "$BG_TMP/pi-bg-${run_id}-err.log" \
         "$BG_TMP/pi-bg-${run_id}-prompt.md" \
         "$BG_TMP/pi-bg-${run_id}-wb-resp.txt" 2>/dev/null || true
+  # err.log is kept when out.md has no non-whitespace content (empty
+  # output: the stderr tail is the only death reason, issue #57)
+  if [ -n "$(tr -d '[:space:]' < "$BG_TMP/pi-bg-${run_id}-out.md" 2>/dev/null | head -c 1)" ]; then
+    rm -f "${errf:-}" 2>/dev/null || true
+  fi
   rm -f "$BG_TMP/pi-bg-${run_id}-started" 2>/dev/null || true
   rm -f "$hb_f" 2>/dev/null || true
   # deploy-swap guard: drop the per-run script snapshot (a hard link to the
@@ -809,6 +825,12 @@ retry1f="$BG_TMP/pi-bg-${run_id}-retry1"
 SILENT_TAIL_MAX="${PI_BG_SILENT_TAIL_MAX:-900}"
 att_start=0
 silent_retried=0
+# degenerate-completion relaunch (issue #57 class B): mirror of the
+# silent-death retry1 - ONE relaunch behind a <ticket>.degr1 marker; a
+# second degenerate reports FAIL (degen_final) instead of looping.
+degr1f="$BG_TMP/pi-bg-${run_id}-degr1"
+degen_retried=0
+degen_final=0
 
 # bg_session_file: the profile session jsonl written for this run after run
 # start (shared by bg_silent_tail and bg_capture_cost so both consumers stay
@@ -1024,6 +1046,82 @@ finish(round(cost, 5), MODEL, pts)
 PY
 }
 
+# bg_degenerate <text>: 1 when <text> is a repetition-loop degeneration
+# (issue #57 class B, 2026-09-23 ticket 20260923-032230-1930679: the 27B
+# model looped on a collapsed vocabulary - HTML fragments - across an
+# 8.8K-char 'review' that pi ended stopReason=stop, rc=0, no error). The
+# loop shuffles, so n-gram repetition is weak; the signal is vocabulary
+# collapse: top-15 word coverage >= 0.60 AND distinct-word ratio <= 0.30.
+# Measured 2026-09-23 on this box: the garbled run 0.86/0.08, every
+# healthy out.md of the prior 2 days <= 0.21/0.71 (3x margin). Runs on
+# 200+ tokens only (short boilerplate can be repetitive by nature).
+# Thresholds overridable via PI_BG_DEGEN_* env. Failure-tolerant: any
+# error -> 0 (never blocks or fails the run).
+bg_degenerate() {
+  PI_BG_DEGEN_TOP15="${PI_BG_DEGEN_TOP15:-0.60}" \
+  PI_BG_DEGEN_DISTINCT="${PI_BG_DEGEN_DISTINCT:-0.30}" \
+  PI_BG_DEGEN_MIN_TOKENS="${PI_BG_DEGEN_MIN_TOKENS:-200}" \
+    python3 -c '
+import os, sys
+from collections import Counter
+try:
+    top = float(os.environ.get("PI_BG_DEGEN_TOP15", "0.60"))
+    dis = float(os.environ.get("PI_BG_DEGEN_DISTINCT", "0.30"))
+    mn = int(os.environ.get("PI_BG_DEGEN_MIN_TOKENS", "200"))
+except ValueError:
+    top, dis, mn = 0.60, 0.30, 200
+toks = sys.stdin.read().split()
+n = len(toks)
+if n < mn:
+    print(0)
+    raise SystemExit(0)
+c = Counter(toks)
+t15 = sum(v for _, v in c.most_common(15)) / n
+print(1 if (t15 >= top and len(c) / n <= dis) else 0)
+' <<< "$1" 2>/dev/null || echo 0
+}
+
+# bg_death_reason: the ACTUAL reason for an empty-output death (issue #57):
+# the last assistant errorMessage in this run's session file, else the
+# stderr tail (err.log). Echoes <= 200 chars; echoes nothing when unknown.
+# Bounded + failure-tolerant: never fails the run.
+bg_death_reason() {
+  local sf why
+  sf="$(bg_session_file)"
+  if [ -n "$sf" ]; then
+    why="$(PI_BG_DEATH_FILE="$sf" python3 -c '
+import json, os
+last = ""
+try:
+    fh = open(os.environ["PI_BG_DEATH_FILE"])
+except Exception:
+    raise SystemExit(0)
+for line in fh:
+    if "\"role\"" not in line:
+        continue
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    m = o.get("message") or {}
+    if m.get("role") != "assistant":
+        continue
+    e = m.get("errorMessage")
+    if isinstance(e, str) and e:
+        last = e
+fh.close()
+if last:
+    print(" ".join(last.split())[:200])
+' 2>/dev/null)"
+    [ -n "$why" ] && { printf '%s' "$why"; return 0; }
+  fi
+  if [ -n "${errf:-}" ] && [ -f "$errf" ]; then
+    why="$(tail -c 400 "$errf" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | tail -c 200)"
+    [ -n "$why" ] && { printf '%s' "$why"; return 0; }
+  fi
+  return 0
+}
+
 # bg_silent_tail: seconds since the newest activity of this run (raw.out
 # mtime, the profile session file for this run's cwd written after run
 # start, or the attempt start). No session file (test stubs, --no-session)
@@ -1077,8 +1175,26 @@ for attempt in 1 2 3; do
   out="$(cat "$rawf")"
   # Check if output is non-empty (after stripping whitespace)
   if [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
-    # output produced: a pending retry1 is consumed (the retry recovered)
-    rm -f "$retry1f" 2>/dev/null || true
+    # rc=0 + non-empty: screen for a repetition-loop degeneration (issue
+    # #57 class B). rc!=0 is already a loud FAIL - no degenerate check.
+    degen=0
+    [ "$rc" -eq 0 ] && degen="$(bg_degenerate "$out")"
+    if [ "$degen" -eq 1 ] && [ "$degen_retried" -eq 1 ]; then
+      # second degenerate: stop; the main flow reports a normal FAIL
+      echo "[pi-bg] second degenerate completion (rc=0, repetition loop) - reporting FAIL, no further retry" >&2
+      degen_final=1
+      break
+    fi
+    if [ "$degen" -eq 1 ]; then
+      touch "$degr1f" 2>/dev/null || true
+      echo "[pi-bg] DEGENERATE output (rc=0, repetition loop) - relaunching ticket once (degr1)" >&2
+      bg_log_retry "degenerate"
+      degen_retried=1
+      sleep 3
+      continue
+    fi
+    # healthy output: pending retry1/degr1 markers are consumed (recovered)
+    rm -f "$retry1f" "$degr1f" 2>/dev/null || true
     break
   fi
   # --- empty output: classify before deciding whether to relaunch ---
@@ -1126,22 +1242,40 @@ fi
 
 if [ -n "$webhook" ]; then
   brief="${out:0:400}"
+  # reviewer runs: a 'VERDICT: PASS|FAIL' line is the real signal. Match
+  # case-insensitively, markdown/spacing-tolerant, over the WHOLE output
+  # (take the last match) - real reviewers vary format ('**Verdict: PASS**',
+  # '## Verdict') and position (some put it up front). The old tail -c 300 +
+  # case-sensitive grep false-FAILed ~25% of clean PASS reviews.
+  verdict="$(printf '%s' "$out" | grep -oiE 'verdict:[[:space:]]*\**[[:space:]]*(PASS|FAIL)' | tail -1 | grep -oiE 'PASS|FAIL')"
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    reason="$(bg_death_reason)"
     if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
       # second silent death (issue #57): the retry1 did not recover;
       # report a normal FAIL (the orchestrator decides the fix round)
       status="FAIL"
       brief="silent death x2 (rc=1, no output; retry1 did not recover - issue #57)"
+      [ -n "$reason" ] && brief="$brief; reason: $reason"
     else
       # empty output: rc!=0 means pi died (killed/crashed), rc==0 is the
       # local-model empty-completion quirk (retried 3x already)
       [ $rc -ne 0 ] && status="DIED" || status="EMPTY"
+      [ -n "$reason" ] && brief="reason: $reason"
     fi
   else
     status="OK"; [ $rc -ne 0 ] && status="FAIL"
+    if [ "$degen_final" -eq 1 ]; then
+      # second degenerate completion (issue #57 class B): the relaunch did
+      # not recover; FAIL with the actual signature, not a bare OK
+      status="FAIL"
+      brief="degenerate output x2 (rc=0, repetition loop; relaunch did not recover - issue #57)"
+    elif [ "$profile" = "reviewer" ] && [ -z "$verdict" ] && [ "$rc" -eq 0 ]; then
+      # PR-flow contract: a reviewer run ends with a VERDICT line. rc=0
+      # without one = incomplete or degenerate review (issue #57).
+      status="FAIL"
+      brief="no VERDICT line - review incomplete or degenerate (issue #57)"
+    fi
   fi
-  # reviewer runs: a trailing 'VERDICT: PASS|FAIL' is the real signal
-  verdict="$(printf '%s' "$out" | tail -c 300 | grep -oE 'VERDICT: (PASS|FAIL)' | tail -1 | awk '{print $2}')"
   bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "$status" "$brief" "$rc" "$verdict"
   if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json"

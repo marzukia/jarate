@@ -1,109 +1,94 @@
-# PR2 — Handoff Compaction: mechanism B (size-gated restart) + seed-on-boot
+# issue #57 - pi-bg "silent exit=1 mid-turn" - investigation + fix
 
-Branch: pi-bg/20260923-044432-549447 (on PR1 47a131ea)
+## Verdict
+Today's "garbled" ticket (20260923-032230-1930679) is NOT the class A silent
+death that retry1 handles. It is class B: rc=0, pi finished clean, and the
+MODEL degenerated into a repetition loop. pi-bg shipped it as status=OK.
+Fixed: degenerate rc=0 completions are now detected, relaunched once, and
+reported with the actual signature when they recur. PR:
+https://github.com/marzukia/jarate/pull/76
 
-## What changed
+## Evidence (root cause)
+Ticket artifacts, all read before changing anything:
 
-### a) Mechanism B — size-gated restart, post-settle (F1/F2/F4/F5)
-- `session_compact` handler now runs `settleCompacting(ctx)` THEN
-  `handoffRestartForSize(pi, ctx)` (F1: gate decides after the window is
-  closed, so the restart op it opens cannot be swept by its own settle).
-- The gate is deferred one macrotask (setTimeout 0): pi's MANUAL compact
-  path calls the ctx.compact wrapper's onComplete belt (clearCompacting)
-  AFTER the emit; a synchronous window open would be wiped by that belt.
-- `maybeHandoffRestart` (index.ts): enabled + live file
-  (`ctx.sessionManager.getSessionFile()`) > `restartFileCap` (default
-  64_000_000) → beginRestartOp(op "handoff", label "handing-off",
-  finalText `[ok] context handoff -> new session (file was N.N MB)`,
-  marker `{seeded:false}`) + scheduleOpShutdown with preShutdown
-  `moveSessionFileAside(ctx, liveFile)` (F5, explicit file) then
-  `archiveStaleSessions(liveFile)` (F2: every other `*.jsonl` in the
-  session dir → `*.jsonl.stale-<ts>`, so the respawn's `pi -c` resume
-  target is provably small). Reuses the /reset chain verbatim
-  (op window + marker + cursor rewind + bounded shutdown + systemd
-  restart + watchdog). `/stop` cancels it unmodified.
-- Skips (no-op): handoff disabled, no discord channel, no session file,
-  file <= cap, or a settle-flushed /compact re-opened the window (label
-  "compacting") — that compaction's own settle re-runs the gate.
+- rc file = 0. run record state=done (03:22:30 -> 03:24:47, 137s).
+  Webhook status was 204 (OK), NOT a silent death.
+- Session jsonl (~/.pi/agent-reviewer/sessions/...1930679...): 3 clean
+  toolUse turns; final assistant message stopReason=stop, output=4242
+  tokens, text 8827 chars, NO errorMessage. raw.out (8831 B) matches.
+- Final text starts mid-HTML (`</div>`) and loops shuffled fragments
+  ("handover / unit / testsuite / pi-86") - vocabulary collapse, not
+  stdout corruption. Context only ~29.5K/131K, maxTokens=32768: not a
+  context-overflow stop. Trigger: reviewer prompt forced a full read of a
+  ~17K-token HTML design doc right before the long-form write.
+- The follow-up resume run (20260923-032513-2085840) passed clean
+  (VERDICT: PASS) - degeneration was transient; a fresh session recovers.
+- Class A (issue #57 original, ECONNRESET mid-LLM-call, rc=1 + empty
+  output) is still covered by the existing retry1 logic - untouched.
 
-### b) Seed-on-boot (F4)
-- `OpMarker` gains `seeded?: boolean`; `writeOpMarker`/`beginRestartOp`
-  gain an optional marker param (existing call sites unchanged).
-- `consumeOpMarker(pi, ctx)` (exported): ONLY a marker with
-  `op === "handoff"` && `seeded !== true` seeds: plain
-  `pi.sendUserMessage(buildSeedKickoff(doc, storeDir))` — preamble +
-  parseKickoff 3-line digest + `Read <abs storeDir>/latest.md before
-  continuing. Answer the last pending user question if any.` (F8) — then
-  flips `seeded=true` (crash-safety: flip AFTER send; a crash re-seeds
-  next boot, harmless; flip-before-send would lose the seed). Not a
-  channel-inbound entry: no Discord echo, doesn't pollute the next
-  handover's last-asks. Ordinary boots (incl. OOM respawns without a
-  handoff marker) never seed.
-- Fresh-window guard (F4): `shouldHandoff` gains `freshWindow` flag —
-  true when latest.md's `updated` stamp is < 5 min old
-  (`HANDOFF_FRESH_WINDOW_MS`), wired in the session_before_compact
-  handler. A just-seeded session (the doc was written in the very
-  compaction that triggered the restart) is not handoff-eligible for a
-  short window.
+Detector baseline (measured on this box, 2026-09-23):
+- garbled out.md: top15 word coverage 0.860, distinct ratio 0.084
+- 12 healthy out.md from prior 2 days: top15 <= 0.205, distinct >= 0.706
+- word 8-gram ratio is useless here (0.060) - the loop shuffles, so the
+  signal is vocabulary collapse, not n-gram repetition. 3x margin both ways.
 
-### c) MINOR fixes (PR1 review)
-- MINOR-2: buildHandover's catch skips the "handover gen failed" post
-  when `args.signal.aborted` (operator /stop — pi's cancel notice covers
-  it).
-- MINOR-4: `handover` added to `allowedWhileCompacting`.
-- MINOR-1: threshold math UNCHANGED; comment added — 80%-of-total-window
-  is intentional (Andryo option a); pi's auto compaction fires at ~94% of
-  a 262K window, so auto compactions always hand off.
+## Fix (dispatch/pi-bg only; watchdog unchanged)
+1. bg_degenerate: top15 coverage >= 0.60 AND distinct ratio <= 0.30,
+   min 200 tokens, thresholds overridable (PI_BG_DEGEN_*), failure-
+   tolerant (any error -> 0, never blocks the run).
+2. Retry loop: degenerate rc=0 -> relaunch ONCE (fresh session =
+   unpolluted context) behind a <ticket>.degr1 marker, logged as
+   retry reason "degenerate". Second degenerate -> degen_final -> FAIL
+   "degenerate output x2 (rc=0, repetition loop; relaunch did not
+   recover - issue #57)". No third launch.
+3. Reviewer verdict gate: rc=0 non-empty without a trailing
+   "VERDICT: PASS|FAIL" line -> FAIL "no VERDICT line - review
+   incomplete or degenerate (issue #57)". A reviewer run that loops
+   for 30 minutes without a verdict can no longer masquerade as OK.
+4. bg_death_reason: for empty-output deaths (silent-x2 / DIED / EMPTY)
+   the brief now carries the actual reason: last assistant errorMessage
+   from the session file, else the stderr tail (<= 200 chars). err.log
+   is kept when out.md is blank (previously always removed) so the
+   reason is reproducible from artifacts.
+5. The -degr1 marker does NOT match the watchdog SILENT classification
+   (rc=1 + -retry1 + empty out.md) - watchdog behavior unchanged.
+   Webhook callback shape (embed fields, titles) and the concurrency
+   cap are unchanged.
 
-### d) F7 watchdog death + enable path
-- `armRestartWatchdog`: after posting `[!] restart failed - check unit
-  X`, it now `process.exit(1)` 500ms later (injectable via
-  `setProcessExitHookForTest`) — a live process leaves the unit
-  "active", so systemd Restart=always would never respawn.
-- `HANDOFF_ENABLED=1|0|true|false` env path added to
-  resolveHandoffSettings (env beats settings beats default).
+## Tests
+dispatch/pi-bg.test.ts, 5 new tests in the #57 describe (fake pi stubs,
+capture webhook):
+- class B: degenerate rc=0 relaunched once, healthy retry -> OK
+  (2 launches, degr1 consumed, retry logged, OK callback)
+- class B: degenerate x2 -> FAIL (rc=0), no 3rd launch, marker kept
+- class B: reviewer rc=0 non-empty without VERDICT -> FAIL
+- class B: reviewer rc=0 with trailing VERDICT: PASS -> PASS
+- class A: silent x2 brief carries "ECONNRESET" from stderr; err.log
+  kept, rc recorded, out.md blank
 
-## Files changed
-- packages/bridge/channel/handover.ts — HANDOFF_ENABLED env, freshWindow
-  flag + MINOR-1 comment, MINOR-2 abort check, lastHandoffAt /
-  isHandoffFreshWindow / buildSeedKickoff.
-- packages/bridge/channel/index.ts — mechanism B gate + archiveStale-
-  Sessions + handoffRestartForSize, seeded op marker, consumeOpMarker
-  boot seed, watchdog F7 exit, handover allowedWhileCompacting,
-  freshWindow wiring.
-- packages/bridge/channel/handover.test.ts — +8 tests (env flag,
-  fresh-window gate, lastHandoffAt/isHandoffFreshWindow,
-  buildSeedKickoff, MINOR-2 abort vs control).
-- packages/bridge/channel/index.test.ts — +8 tests (under-cap no-op,
-  over-cap full chain, disabled, settle-flush skip-then-restart, /stop
-  during op, boot seed, ordinary boot no-seed, already-seeded no
-  re-seed) + F7 exit assertion in the #28 watchdog test.
+Results (worktree):
+- bun test pi-bg.test.ts: 66 pass, 1 skip (root-only), 0 fail
+- bun test pi-bg-kill.test.ts pi-bg-watchdog.test.ts: 18 pass, 0 fail
+- detector verified against real artifacts: garbled out.md -> 1;
+  resume out.md + 3 healthy out.md -> 0
+- bunx biome check .: exit 0; bash -n pi-bg: clean;
+  HOME=/tmp/fake bash install.sh --dry-run: exit 0
 
-## Verification
-- `bun x tsc --noEmit` (packages/bridge): clean.
-- `bun test` (packages/bridge): 848 pass, 0 fail, 3028 expect() calls.
-- `bunx biome check .` (repo root): exit 0; my 4 files have 0
-  diagnostics (only pre-existing bin/jarate.test.ts warning+info remain,
-  present on baseline).
-- `HOME=/tmp/fake-home-dry bash install.sh --dry-run`: exit 0.
+Known pre-existing flake (NOT caused by this change): #41 "at cap:
+next dispatch refused" fails on unmodified HEAD on this box - it is
+sensitive to live fleet traffic (10 concurrent pi-bg wrappers at test
+time). Fails identically before and after the change.
 
-## How to enable (live box)
-`handoff.enabled` stays FALSE in code. On the live box (monky) it is
-ALREADY true in `~/.pi/agent/settings.json` (PR1 path opted in ahead of
-this PR — out-of-scope change, no action needed). Otherwise:
-- `~/.pi/agent/settings.json`: `{"handoff": {"enabled": true}}`, or
-- pi.service env: `HANDOFF_ENABLED=1` (then restart pi — operator move).
-Mechanism B then restarts on any compaction that leaves the live session
-file over `handoff.restartFileCap` (default 64 MB; env
-`HANDOFF_RESTART_FILE_CAP`).
+## Deployment note
+Live ~/scripts/pi-bg == repo main before this PR (verified by diff).
+After merge: rsync dispatch/ to live boxes (or the existing deploy
+path); the degr1 marker is additive - old in-flight tickets are
+unaffected. No pi.service restart required for the dispatcher itself.
 
-## Deviations
-- The gate is registered as ONE combined session_compact handler
-  (settle, then gate) rather than a second listener — the test pi stubs
-  are last-wins, so a separate listener would have replaced the settle
-  handler and broken existing tests.
-- Watchdog F7 exit is delayed 500ms after the Discord post so the
-  failure line lands before the process dies; both timers unref'd.
-- Fresh window keys on latest.md's `updated` stamp (doc write) as a
-  proxy for seed time — also suppresses a 2nd handoff within 5 min of
-  any mechanism A doc write (intentional, cheap).
+## Confidence
+HIGH on the diagnosis (rc/session/raw.out artifacts are unambiguous:
+rc=0, stop, no error, vocabulary-collapsed text, recovery on resume).
+HIGH on the detector not false-positiving on this box's recent healthy
+outputs (3x margin, 200-token floor, failure-tolerant). MEDIUM on
+generalization to other models/boxes - thresholds are env-overridable
+(PI_BG_DEGEN_TOP15/DISTINCT/MIN_TOKENS) exactly for that.
