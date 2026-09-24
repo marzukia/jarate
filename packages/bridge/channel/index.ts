@@ -2806,6 +2806,14 @@ export default function (pi: ExtensionAPI) {
     // re-wake continuation below) and cannot abort that run.
     flushPendingCompact(ctx);
 
+    // Proactive token-% gate (once per settled turn): context at/over the
+    // handoff threshold with nothing in flight → the same compact /compact
+    // runs. Deferred one macrotask like the size gate — if the re-wake run
+    // below starts before the timer fires, the gate skips (not idle) and
+    // that run's own agent_end re-checks. A flush-started compact above
+    // already owns the op window, so the gate yields to it.
+    autoCompactByToken(pi, ctx);
+
     // Capture the run's channel BEFORE the re-wake await: a second channel's
     // inbound can arrive during that await and overwrite lastActiveChannel,
     // which would mis-target this run's activity block, failure post, and
@@ -3692,6 +3700,74 @@ export async function maybeHandoffRestart(
     moveSessionFileAside(ctx, live);
     archiveStaleSessions(live);
   });
+}
+
+// ─── Handoff proactive gate: token-% auto-compact (design v2, PR3) ────────
+// Registered on agent_end: after EVERY settled turn, if the context is
+// at/over the handoff threshold (the same number shouldHandoff's
+// "threshold" reason uses — settings.threshold, default 0.8) and nothing
+// is in flight, start the SAME compact /compact runs (startCompact). The
+// handover doc is written by the session_before_compact path; the size
+// gate (handoffRestartForSize on session_compact) then decides the
+// restart as before. Composes with the size gate: token gate = "compact
+// when big in tokens", size gate = "restart when the file is big".
+// Covers the case the size gate misses: high token % + small session
+// file (many small messages). Deferred one macrotask (same model as
+// handoffRestartForSize): a re-wake run may start before the timer fires;
+// the idle check skips it and that run's own agent_end re-checks.
+export function autoCompactByToken(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  setTimeout(() => {
+    try {
+      void maybeAutoCompactByToken(pi, ctx);
+    } catch (e) {
+      console.error(
+        "[handoff] auto-compact gate failed:",
+        sanitizeUnknownValue(e),
+      );
+    }
+  }, 0);
+}
+
+/** The actual token-% gate + compact trigger (exported for direct tests).
+ *  Failure-tolerant: any error logs and returns — never crashes the
+ *  settle path. */
+export async function maybeAutoCompactByToken(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const settings = resolveHandoffSettings(ctx.cwd);
+  if (!settings.enabled) return;
+  const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
+  if (ch?.type !== "discord") return;
+  // A compact/restart op window is open for this channel: let it settle —
+  // its own settle re-runs this gate.
+  if (isCompacting(ch.id)) return;
+  // Handover doc build in flight, or a doc was just written (the fresh
+  // window covers the just-seeded session): don't re-compact.
+  if (isHandoffInFlight()) return;
+  if (isHandoffFreshWindow(settings.storeDir)) return;
+  // A re-wake run started after agent_end: let it settle — its own
+  // agent_end re-checks.
+  if (!ctx.isIdle()) return;
+  let percent: number | null = null;
+  try {
+    percent = ctx.getContextUsage?.()?.percent ?? null;
+  } catch {
+    percent = null;
+  }
+  if (percent == null || !Number.isFinite(percent)) return;
+  if (percent < settings.threshold * 100) return;
+  console.log(
+    `[handoff] auto-compact: ctx ${percent}% >= ${settings.threshold * 100}%`,
+  );
+  // Same path /compact uses: ctx.compact + the op window (beginCompacting)
+  // inside startCompact. postPlaceholder=true = the text-command path
+  // (ticking placeholder, settle-in-place report).
+  const err = startCompact(pi, { ch }, ctx, true);
+  if (err !== null) console.error(`[handoff] auto-compact failed: ${err}`);
 }
 
 // /undo + /redo share the idle guard: abort the in-flight run, drop the
