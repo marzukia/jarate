@@ -94,7 +94,7 @@ absolute UTC.
   (`truncated` true when cut); row `error` set when the hop itself failed
   (row `warnings` = `null` then).
 - `ok:false` when any agent row errored or no agents matched `--agent`.
-- Hop env: `JARATE_SSH_HOST` (default `andryo@127.0.0.1`),
+- Hop env: `JARATE_SSH_HOST` (default `admin@127.0.0.1`),
   `JARATE_SUDO_PASS` (env, else `~/.config/sudo-pass` 0600 file - never a
   literal in code), `JARATE_AGENT_HOMES` (test
   override: colon-separated home list).
@@ -220,7 +220,7 @@ and never overwritten (even by `--set`). `--dry-run` plans without writing.
 Drift check for the agent's AGENTS.md — the main profile's law file. Target
 resolution: `~/.pi/agent/AGENTS.md` if present, else `~/AGENTS.md` (live
 boxes keep the law in `~/AGENTS.md`), else `JARATE_AGENTS_MD` wins over both.
-Changes require Andryo's explicit approval (2026-09-14). Compares the live
+Changes require the operator's explicit approval (2026-09-14). Compares the live
 file's sha256 against the manifest `~/.pi/agent/.agents-md-hash` (one line:
 `<sha256>  <UTC ts>  <note>` — fixed path; only `JARATE_AGENTS_MD` moves it,
 to the checked file's directory). ALERT-ONLY: the check never reverts and
@@ -247,7 +247,7 @@ unreadable/missing (nothing is written then). Manifest write is atomic
 (tmp + mv).
 
 ```json
-{"ok": true, "ts": "...", "error": null, "hash": "<new sha256>", "note": "andryo approved"}
+{"ok": true, "ts": "...", "error": null, "hash": "<new sha256>", "note": "operator approved"}
 ```
 
 - Both commands honor `JARATE_AGENTS_MD` (default resolution: `~/.pi/agent/AGENTS.md`,

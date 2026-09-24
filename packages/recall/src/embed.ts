@@ -1,7 +1,7 @@
 // Embeddings over the OpenAI-compatible /v1/embeddings endpoint (Ollama).
 // Port of embed_batched()/embed() from the Python pgrag: results re-sorted
 // by `index` so they line up with the input order.
-// Batch: on hydrogen's CPU Ollama a 400-word chunk embeds in ~6.5s, so a
+// Batch: on a CPU-only Ollama host a 400-word chunk embeds in ~6.5s, so a
 // 64-item batch took 163s and a 32-item batch ~208s (120s timeout,
 // 2026-09-15). 12 items ~= 78s leaves margin; override with
 // JB_RECALL_EMBED_BATCH for fast GPUs.

@@ -146,7 +146,7 @@ describe("watchdog AGENTS.md drift tripwire (alert-only, one warn per hash)", ()
       await f.run();
       expect(f.posts).toHaveLength(1);
       // approved change: re-bless the manifest to the current hash
-      const p = spawn(["bash", JARATE, "agents-bless", "andryo approved"], {
+      const p = spawn(["bash", JARATE, "agents-bless", "operator approved"], {
         env: { ...process.env, HOME: f.home },
         cwd: f.tmp,
         stdout: "pipe",

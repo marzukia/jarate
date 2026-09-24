@@ -204,7 +204,7 @@ function dateFromMtime(file: string): string {
  */
 export function usageFrame(label: string, span: string, s: UsageStats): string {
   // share of the TOTAL prompt (new + cached) served from cache - the
-  // number Andryo watches; cacheRead can exceed the new-input count.
+  // number operator watches; cacheRead can exceed the new-input count.
   const total = s.input + s.cacheRead;
   const pct = total > 0 ? Math.round((s.cacheRead / total) * 100) : 0;
   return [

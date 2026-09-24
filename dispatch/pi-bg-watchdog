@@ -55,7 +55,7 @@ set -uo pipefail
 
 WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
 # persistent artifact dir (same default as pi-bg); /tmp is a tmpfs on the
-# hydrogen box and a reboot wipes it (2026-09-13 DEAD-flood). LEGACY_TMP is
+# reference agent host and a reboot wipes it (2026-09-13 DEAD-flood). LEGACY_TMP is
 # checked as a fallback for one release (pre-upgrade runs).
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 LEGACY_TMP="/tmp"

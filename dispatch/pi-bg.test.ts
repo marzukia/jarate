@@ -85,16 +85,16 @@ function fixture() {
   const seedMainCreds = () => {
     fs.writeFileSync(
       path.join(mainAgent, "auth.json"),
-      JSON.stringify({ hydrogen: { type: "api_key", key: "sk-test" } }),
+      JSON.stringify({ vllm: { type: "api_key", key: "sk-test" } }),
     );
     fs.writeFileSync(
       path.join(mainAgent, "models.json"),
-      JSON.stringify({ hydrogen: { models: [{ id: "qwen-test" }] } }),
+      JSON.stringify({ vllm: { models: [{ id: "qwen-test" }] } }),
     );
     fs.writeFileSync(
       path.join(mainAgent, "settings.json"),
       JSON.stringify({
-        defaultProvider: "hydrogen",
+        defaultProvider: "vllm",
         defaultModel: "qwen-test",
       }),
     );
@@ -141,7 +141,7 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
     const settings = JSON.parse(
       fs.readFileSync(path.join(prof, "settings.json"), "utf-8"),
     );
-    expect(settings.defaultProvider).toBe("hydrogen"); // from main settings
+    expect(settings.defaultProvider).toBe("vllm"); // from main settings
     expect(settings.defaultThinkingLevel).toBe("medium"); // from repo template
   });
 
@@ -185,11 +185,11 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
     const auth = JSON.parse(
       fs.readFileSync(path.join(prof, "auth.json"), "utf-8"),
     );
-    expect(auth.hydrogen.key).toBe("sk-test"); // main creds landed
+    expect(auth.vllm.key).toBe("sk-test"); // main creds landed
     const models = JSON.parse(
       fs.readFileSync(path.join(prof, "models.json"), "utf-8"),
     );
-    expect(models.hydrogen.models[0].id).toBe("qwen-test"); // main models landed
+    expect(models.vllm.models[0].id).toBe("qwen-test"); // main models landed
   });
 
   test("seeding is idempotent: a customized profile survives a second seed", async () => {
@@ -246,7 +246,7 @@ describe("#37: JB_ROOT resolves symlinks (normal launch is ~/scripts/pi-bg)", ()
       fs.readFileSync(path.join(prof, "settings.json"), "utf-8"),
     );
     expect(settings.defaultThinkingLevel).toBe("medium"); // repo template
-    expect(settings.defaultProvider).toBe("hydrogen"); // merged from main settings
+    expect(settings.defaultProvider).toBe("vllm"); // merged from main settings
     expect(settings.defaultModel).toBe("qwen-test"); // merged from main settings
   });
 });
@@ -1503,7 +1503,7 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     const ws = path.join(fx.home, ".pi", "agent-worker", "settings.json");
     let cfg = JSON.parse(fs.readFileSync(ws, "utf8"));
     expect(cfg.httpIdleTimeoutMs).toBe(900000);
-    expect(cfg.defaultProvider).toBe("hydrogen"); // main merge intact
+    expect(cfg.defaultProvider).toBe("vllm"); // main merge intact
     // operator-set value: the doctor is add-key only, never overwrites
     cfg.httpIdleTimeoutMs = 123456;
     fs.writeFileSync(ws, JSON.stringify(cfg));
@@ -1516,16 +1516,16 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     fs.mkdirSync(rp, { recursive: true });
     fs.writeFileSync(
       path.join(rp, "auth.json"),
-      JSON.stringify({ hydrogen: { type: "api_key", key: "sk-test" } }),
+      JSON.stringify({ vllm: { type: "api_key", key: "sk-test" } }),
     );
     fs.writeFileSync(
       path.join(rp, "models.json"),
-      JSON.stringify({ hydrogen: { models: [{ id: "qwen-test" }] } }),
+      JSON.stringify({ vllm: { models: [{ id: "qwen-test" }] } }),
     );
     fs.writeFileSync(
       path.join(rp, "settings.json"),
       JSON.stringify({
-        defaultProvider: "hydrogen",
+        defaultProvider: "vllm",
         defaultModel: "qwen-test",
         defaultThinkingLevel: "xhigh",
       }),

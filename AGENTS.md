@@ -33,9 +33,9 @@ bash install.sh --dry-run          # installer regression check
 ## Rules
 
 - **Do not touch live boxes:** `~/.pi/agent/settings.json`,
-  `~/.pi/agent/piscord`, `/home/frank/projects/jarate/packages/bridge` are
-  live deployments, not
-  part of this repo. Never edit, restart, or `git config` anything there.
+  `~/.pi/agent/piscord`, and the deployed `projects/jarate/packages/bridge`
+  checkouts are live deployments, not part of this repo. Never edit,
+  restart, or `git config` anything there.
   (Reading them for reference is fine.)
 - **Never restart `pi.service`** as part of a change. Restart reminders are
   printed by install.sh for humans to act on.
@@ -51,7 +51,7 @@ bash install.sh --dry-run          # installer regression check
 - **No emoji in user-facing strings.** Command acks, warnings, error lines,
   and anything posted to Discord use kimaki-style ASCII tags:
   `[!]` warning/error, `[ok]` success, `[new]`/`[..]`/`[queued]` state, `- ` list
-  items. Plain words beat decoration. (Andryo, 2026-09-10)
+  items. Plain words beat decoration. (operator, 2026-09-10)
 - Emoji are allowed ONLY where the platform requires them: Discord
   **reactions** (the 👀 inbound ack is a reaction and stays).
 - Applies to new code; don't bulk-strip emoji outside your change's scope.
@@ -72,7 +72,7 @@ bash install.sh --dry-run          # installer regression check
 
 1. Branch `pi-bg/<id>` or `feature/<name>` from `main`.
 2. Commit, push, `gh pr create --base main`
-   (`GH_TOKEN=$(cat /home/monky/.config/marzukia-pat)`).
+   (`GH_TOKEN=$(cat ~/.config/marzukia-pat)`).
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
    merge: `~/scripts/pi-bg reviewer "adversarially review <branch/PR> ..."`.
@@ -81,7 +81,7 @@ bash install.sh --dry-run          # installer regression check
 ## Do-not-touch list
 
 - `~/.pi/agent/settings.json` on live boxes (bot tokens)
-- `/home/monky/.pi/agent/piscord`, `/home/frank/projects/jarate/packages/bridge` (live checkouts)
+- `~/.pi/agent/piscord` and deployed `projects/jarate/packages/bridge` checkouts (live checkouts)
 - `pi.service` (never restart from within a task)
 - `marzukia/piscord` repo (legacy upstream)
 - `bun.lock` churn beyond what `bun install` does

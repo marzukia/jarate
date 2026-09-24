@@ -420,8 +420,10 @@ dispatch workers get (`--worktree`): the worktree lands at
 
 `agent-say <target> "msg"` accepts a peer NAME or a numeric channel id.
 Names resolve through `~/.config/agent-fleet/peers.json` (seeded by
-`install.sh` from the repo's `dispatch/peers.json` plus the agent's own
-channel); unknown names fail with `agent-say: unknown peer 'x'` and exit 2.
+`install.sh` from the local `dispatch/peers.json` — gitignored, copy
+`dispatch/peers.example.json` and fill in real channel ids — plus the
+agent's own channel); unknown names fail with `agent-say: unknown peer 'x'`
+and exit 2.
 Guards on the resolved target (2026-09-20 incident: a human deliverable
 routed to a peer's channel):
 
@@ -431,7 +433,9 @@ routed to a peer's channel):
   the valid peers). Humans live in your own channel; a raw id that is no
   agent's channel is a mis-route. Bypass: `AGENT_SAY_FORCE=1`.
 - message does not name the target peer → `[warn]` on stderr
-  (non-blocking nudge, the send still goes out).
+  (non-blocking nudge, the send still goes out). `AGENT_SAY_HUMANS`
+  (space-separated list of human names) sharpens the nudge: a body that
+  names a known human but not the peer warns to reply in your own channel.
 
 Keep the peers file current when the fleet roster or an agent's channel
 changes (install.sh never clobbers an existing file).

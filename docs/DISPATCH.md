@@ -43,7 +43,7 @@ pi-bg dispatches = concurrent generation streams = queue depth.
 - **monky: max 3** concurrent dispatches (workers + reviewers combined)
 - **frank: max 3**
 
-Andryo, 2026-09-10. (A temporary monky cap of 2 followed a queue scare that
+operator, 2026-09-10. (A temporary monky cap of 2 followed a queue scare that
 turned out to be a 524K-ctx session starving the prefix cache, not worker
 count - restored to 3 the same day. Keep fleet sessions compacted well under
 ~300K: big resident contexts evict prefix blocks for everyone.) Count live
@@ -255,7 +255,7 @@ On completion, `pi-bg` posts to the Discord webhook:
 ### Webhook delivery audit
 
 Per-run artifacts in `~/.pi-bg-art/` — persistent, survives reboot (`/tmp`
-on the hydrogen box is a tmpfs that a reboot wipes; 2026-09-13: a wiped
+on the agent host is a tmpfs that a reboot wipes; 2026-09-13: a wiped
 `/tmp` lost every `out.md` and the watchdog re-flagged ~15 finished tickets
 as DEAD). `$PI_BG_TMPDIR` still overrides the dir. For one release,
 `pi-bg-watchdog` and `pi-bg-tail` also check the legacy `/tmp` location so
@@ -291,7 +291,7 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 
 ### AGENTS.md drift tripwire (watchdog, alert-only)
 
-`~/.pi/agent/AGENTS.md` is prompt-level law: changes require Andryo's
+`~/.pi/agent/AGENTS.md` is prompt-level law: changes require the operator's
 explicit approval (2026-09-14). The rule is mechanical now — the watchdog
 sweep (every 15 min) runs `jarate agents-check` and compares the live file
 (`~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md` — live boxes keep the law
@@ -352,7 +352,7 @@ for agents, not people: for a human in your own channel, just reply.
 - **Default to fire-and-forget for anything non-trivial:** dispatch, confirm,
   end turn, let the callback wake you. In-turn `pi-wait` is the exception
   (short task, answer must land in this turn). A polling loop in the channel
-  reads as "stuck" to the human — Andryo's call, 2026-09-08.
+  reads as "stuck" to the human — the operator's call, 2026-09-08.
 
 ## Responsiveness (hard rule)
 

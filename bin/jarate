@@ -35,7 +35,7 @@
 #   JARATE_TOKEN_COST   path to pi-token-cost.py (default: ~/scripts, then repo)
 #   JARATE_CTX_LIMIT    context limit fallback when models.json has none
 #   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
-#   JARATE_SSH_HOST     cross-user hop target (default andryo@127.0.0.1)
+#   JARATE_SSH_HOST     cross-user hop target (default admin@127.0.0.1)
 #   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
 #   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
 #   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
@@ -253,7 +253,7 @@ agent_homes() {
     IFS=':' read -r -a AGENT_HOMES <<<"$JARATE_AGENT_HOMES"
   else
     AGENT_HOMES=("$HOME")
-    local ssh_user="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
+    local ssh_user="${JARATE_SSH_HOST:-admin@127.0.0.1}"
     ssh_user="${ssh_user%%@*}"
     local self="$(id -un)"
     local u uid
@@ -271,7 +271,7 @@ agent_homes() {
 # only if that user has pi.service enabled, followed by the warning lines.
 # Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
 run_remote_probe() { # $1=name $2=uid $3=since
-  local host="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
+  local host="${JARATE_SSH_HOST:-admin@127.0.0.1}"
   local pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
   if [ -z "$pass" ]; then
     echo "[jarate:probe] no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
@@ -335,7 +335,7 @@ cmd_journal_errors() {
       uid="$(getent passwd "$name" 2>/dev/null | cut -d: -f3)"
       text="$(run_remote_probe "$name" "$uid" "$since")" || rc=$?
       if [ "$rc" -ne 0 ]; then
-        err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-andryo@127.0.0.1})"
+        err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
       elif [ -z "$text" ] || [ "${text%%$'\n'*}" != "[jarate:pi]" ]; then
         # no pi.service for this user -> not an agent, skip the row
         included=$((included - 1))
@@ -527,7 +527,7 @@ jarate_scan() {
       'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
   else
     owner="${home##*/}"
-    host="${JARATE_SSH_HOST:-andryo@127.0.0.1}"
+    host="${JARATE_SSH_HOST:-admin@127.0.0.1}"
     pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
     if [ -z "$pass" ]; then
       echo "no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
@@ -587,7 +587,7 @@ cmd_projects() {
     elif [ "$h" = "$HOME" ]; then
       err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-andryo@127.0.0.1})"
+      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
@@ -764,7 +764,7 @@ cmd_projects_backfill() {
     elif [ "$h" = "$HOME" ]; then
       err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-andryo@127.0.0.1})"
+      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
@@ -994,7 +994,7 @@ cmd_rag() {
 }
 
 # ─── agents-check / agents-bless ───────────────────────────────────────────
-# AGENTS.md is prompt-level law: changes require Andryo's explicit approval
+# AGENTS.md is prompt-level law: changes require the operator's explicit approval
 # (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
 # check never reverts, never blocks; the watchdog (pi-bg-watchdog) posts one
 # warning per drifted hash. Manifest: <sha256>  <UTC timestamp>  <note>.

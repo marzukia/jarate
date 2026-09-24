@@ -22,7 +22,7 @@ import * as path from "node:path";
 /** Default per-note transcription budget, seconds. */
 export const DEFAULT_TRANSCRIBE_TIMEOUT_S = 120;
 
-/** Default thread count for whisper-cli (4 of 6 cores on hydrogen). */
+/** Default thread count for whisper-cli (4 of 6 cores on the reference box). */
 const DEFAULT_THREADS = 4;
 
 /** Extensions whisper-cli decodes natively (flac/mp3/ogg/wav). ogg is

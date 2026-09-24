@@ -478,7 +478,7 @@ describe("publishDiff (pipeline)", () => {
       ok: true,
       status: 201,
       json: async () => ({
-        url: `https://drop.junkyard.sh/test-${String(url).includes("api") ? "ok" : "x"}.html`,
+        url: `https://drop.example.com/test-${String(url).includes("api") ? "ok" : "x"}.html`,
       }),
       text: async () => "",
     })) as any;
@@ -498,7 +498,7 @@ describe("publishDiff (pipeline)", () => {
     fs.mkdirSync(path.join(tmpHome, ".config", "webdrop"), { recursive: true });
     fs.writeFileSync(
       path.join(tmpHome, ".config", "webdrop", "config.toml"),
-      'server = "https://drop.junkyard.sh"\ntoken = "t"\n',
+      'server = "https://drop.example.com"\ntoken = "t"\n',
     );
   };
 
@@ -552,7 +552,7 @@ describe("publishDiff (pipeline)", () => {
     fs.writeFileSync(path.join(tmp, "a.txt"), "x\ny\n");
     const r = await publishDiff(tmp, undefined, tmpHome);
     expect(r).toBe(
-      "[ok] working tree · 1 file +1 -0 · ttl 7d\nhttps://drop.junkyard.sh/test-ok.html",
+      "[ok] working tree · 1 file +1 -0 · ttl 7d\nhttps://drop.example.com/test-ok.html",
     );
   });
 
@@ -561,7 +561,7 @@ describe("publishDiff (pipeline)", () => {
     fs.writeFileSync(path.join(tmp, "p.diff"), SAMPLE);
     const r = await publishDiff(tmp, "p.diff", tmpHome);
     expect(r).toBe(
-      "[ok] p.diff · 3 files +4 -1 · ttl 7d\nhttps://drop.junkyard.sh/test-ok.html",
+      "[ok] p.diff · 3 files +4 -1 · ttl 7d\nhttps://drop.example.com/test-ok.html",
     );
   });
 
@@ -598,7 +598,7 @@ describe("publishDiff (pipeline)", () => {
       tmpHome,
     );
     expect(r).toBe(
-      "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.junkyard.sh/test-ok.html",
+      "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.example.com/test-ok.html",
     );
   });
 

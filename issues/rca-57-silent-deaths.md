@@ -1,8 +1,8 @@
 # RCA: silent pi-bg deaths (jarate #57)
 
-Window: 2026-09-13 21:57 → 2026-09-14 ~08:00 AEST, <host-a>.
+Window: 2026-09-13 21:57 → 2026-09-14 ~08:00 AEST, the agent host.
 Symptom: pi-bg worker/reviewer runs exit 1 with zero captured output, mid-run.
-7 confirmed deaths. Constraint from Andryo: no blame without evidence — vLLM
+7 confirmed deaths. Constraint from the operator: no blame without evidence — vLLM
 had been the suspect and had to be proven or exonerated with data.
 
 ## Verdict
@@ -32,7 +32,7 @@ Note: the RCA worker itself (ticket 20260914-041132-27376) died after
 241 m 19 s with no output — an instance of the same phenomenon. The analysis
 above was completed inline; this file is the writeup it never produced.
 
-## Recommended fixes (filed, not applied — Andryo's call)
+## Recommended fixes (filed, not applied — operator's call)
 
 1. Bump pi `LLM_IDLE_TIMEOUT` 600 s → 900 s. The observed gap distribution
    (survivors ≤ 7 min) plus queue contention means 10 min is under the real

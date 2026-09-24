@@ -265,7 +265,7 @@ function ageStr(sec: number): string {
  * (inflight + last 10 history entries); "text" = channel-ready listing
  * (inflight + last 5 history entries).
  *
- * v3 frame layout (Andryo 2026-09-16: "make better use of the space"):
+ * v3 frame layout (operator 2026-09-16: "make better use of the space"):
  * - in-flight: `┣ <id> <profile> · <age>` header row (fits 40), task on
  *   `│ `-gutter continuation lines, wrapped gutter-aware.
  * - recent: `├ <state> · <age> · <id>` - state first (the signal), id

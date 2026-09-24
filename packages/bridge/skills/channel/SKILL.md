@@ -88,8 +88,8 @@ whether a message is for you, the default is to stay silent.
 When a `<replied-message author="X">` block is present, **X is the one who
 spoke the quoted words.** Do not restate their statement as if it were the
 current sender's. Do not attribute their words to anyone else. When you
-reference what someone said, name the actual speaker (e.g. "Jash said…", not
-"you said…" when Jash is the author). Misattribution is a comprehension error,
+reference what someone said, name the actual speaker (e.g. "sam said…", not
+"you said…" when sam is the author). Misattribution is a comprehension error,
 not a tone issue — read the `author=` tag before you quote or paraphrase.
 
 ## Configuration

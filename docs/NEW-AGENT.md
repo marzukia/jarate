@@ -1,4 +1,4 @@
-# NEW-AGENT.md - onboarding a new pi agent on hydrogen
+# NEW-AGENT.md - onboarding a new pi agent on the agent host
 
 Runbook for adding a new Discord agent to the fleet (pi + jarate bridge +
 switchboard). Proven end-to-end with **jimmy** (2026-09-13). ~45 minutes of
@@ -7,7 +7,7 @@ actual work; most of it is waiting on npm.
 ## 0. Prerequisites (ask the operator)
 
 - [ ] A Discord bot token for the new agent (developer portal).
-- [ ] A Discord channel for the agent (id, e.g. `<channel-id-3>`).
+- [ ] A Discord channel for the agent (id, e.g. `<channel-id>`).
 - [ ] A pi-bg callback webhook for that channel.
 - [ ] Switchboard key params: ctx budget (tokens), concurrency cap (1-8),
       priority (P0 senior, P1 new).
@@ -28,7 +28,7 @@ echo <name>:<password> | chpasswd
 loginctl enable-linger <name>   # user units start at boot
 ```
 
-Fleet convention: the andryo user password lives in `~/.config/sudo-pass`
+Fleet convention: the operator user password lives in `~/.config/sudo-pass`
 (0600) on each agent home - never in docs or code (a literal lived in
 public git history until the 2026-09-13 scrub + rotation).
 Note the uid - XDG_RUNTIME_DIR=/run/user/<uid> is needed for every
@@ -47,7 +47,7 @@ VALUES ('sbk_<name>_<16 hex>', '<name>', <cap>, <budget>, true,
 
 Budget = per-key aggregate KV headroom in tokens - headroom for the key's
 in-flight sessions at its concurrency cap. It does NOT have to equal the
-`X-Switchboard-Context` header (jimmy's live row: budget 405504, header
+`X-Switchboard-Context` header (example live row: budget 405504, header
 262144, 53/53 requests 200). The per-key cap/budget gates are phase 0 =
 observe-only (they log `keycap-would-reject` kv_events, never deny).
 Actual rejections on the live server: 400 = context header is not an
@@ -68,7 +68,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 
 | file | contents |
 |---|---|
-| `~/.config/marzukia-pat` | Andryo's PAT (copy from an existing agent, chmod 600) - GitHub for now |
+| `~/.config/marzukia-pat` | the operator's PAT (copy from an existing agent, chmod 600) - GitHub for now |
 | `~/.config/pi-dispatch/webhook` | the pi-bg callback webhook, first line, chmod 600 |
 | `~/.config/webdrop/config.toml` | copy from an existing agent |
 | `~/.hermes/.env` | copy from an existing agent (OPENROUTER key; credits may be $0 - the LLM does NOT use it, only image gen) |
@@ -84,8 +84,8 @@ node is system-wide (/usr/bin/node) - no per-user step.
 
 ```json
 {
-  "defaultProvider": "hydrogen",
-  "defaultModel": "qwen3.8-27b",
+  "defaultProvider": "<provider>",
+  "defaultModel": "<model-id>",
   "packages": ["/home/<name>/projects/jarate/packages/bridge"],
   "channels": [{
     "id": "<name>",
@@ -95,11 +95,11 @@ node is system-wide (/usr/bin/node) - no per-user step.
     "channel": "<channel-id>",
     "botToken": "<bot-token>",
     "default": true,
-    "ownerUserId": "<user-id-1>",
+    "ownerUserId": "<userId>",
     "forwardToolCalls": false,
     "ack": false,
     "bufferFileOnly": false,
-    "startupMessage": "<name> (pi) online - 262K ctx, switchboard/hydrogen",
+    "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>",
     "peerBotIds": ["<every other agent's bot user id>"]
   }],
   "mcp": [{ "name": "tavily", "url": "<shared tavily mcp url from an existing agent>" }],
@@ -111,8 +111,8 @@ node is system-wide (/usr/bin/node) - no per-user step.
 ### models.json (switchboard provider)
 
 ```json
-{ "providers": { "hydrogen": {
-  "name": "Hydrogen (switchboard)",
+{ "providers": { "<provider>": {
+  "name": "<Provider> (switchboard)",
   "baseUrl": "http://127.0.0.1:8081/v1",
   "api": "openai-completions",
   "apiKey": "sbk_<name>_<hex>",
@@ -123,11 +123,11 @@ node is system-wide (/usr/bin/node) - no per-user step.
     "X-Switchboard-Project": "<name>",
     "X-Switchboard-Priority": "P1"
   },
-  "models": [{ "id": "qwen3.8-27b", "name": "Qwen3.8 27B",
+  "models": [{ "id": "<model-id>", "name": "<Model Name>",
     "reasoning": true, "input": ["text", "image"],
     "contextWindow": <context-class>, "maxTokens": 16384,
     "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-    "compat": { "thinkingFormat": "qwen-chat-template" } }]
+    "compat": { "thinkingFormat": "<thinkingFormat>" } }]
 }}}
 ```
 
@@ -136,7 +136,7 @@ Copy the model block verbatim from an existing agent's models.json.
 Gotcha (400 on first call): `X-Switchboard-Context` must be an ALLOCATED
 context class from the switchboard chunk table - live values when this was
 written: 65536, 98304, 131072, 262144, 524288. Set it and
-`contextWindow` to the same class (jimmy: 262144, i.e. 256K). Using the key
+`contextWindow` to the same class (example agent: 262144, i.e. 256K). Using the key
 budget here (e.g. 405504, 396K) is NOT a class and 400s with "not an
 allocated context class". The budget stays on the key row in the DB.
 
@@ -193,7 +193,7 @@ merged with the main agent's defaultProvider + defaultModel. Verified:
 running the repo's pi-bg with a fresh fake HOME seeds all three files
 provider included.
 
-History (how jimmy 402'd on 2026-09-13): `JB_ROOT` was computed as
+History (how a new agent 402'd on 2026-09-13): `JB_ROOT` was computed as
 `$(dirname "${BASH_SOURCE[0]}")/..` WITHOUT symlink resolution. The normal
 launch path is the `~/scripts/pi-bg` symlink (install.sh), so JB_ROOT
 resolved to the home dir, the template lookup
@@ -208,7 +208,7 @@ produces (and as a manual safety net):
 ```bash
 # worker (defaultThinkingLevel medium) and reviewer (xhigh) separately:
 cat > ~/.pi/agent-<role>/settings.json <<'EOF'
-{ "defaultProvider": "hydrogen", "defaultModel": "qwen3.8-27b",
+{ "defaultProvider": "<provider>", "defaultModel": "<model-id>",
   "defaultThinkingLevel": "medium", "reserveTokens": 13107,
   "keepRecentTokens": 20000 }
 EOF
@@ -217,7 +217,7 @@ EOF
 
 models.json in the role dir is already seeded from main (same switchboard
 key) - leave it. Verify before the first real dispatch: `ls ~/.pi/agent-worker/`
-must show settings.json with defaultProvider hydrogen.
+must show settings.json with defaultProvider <provider>.
 
 ## 7. Start + verify
 
@@ -248,8 +248,10 @@ For each existing agent (monky, frank, jimmy, ...):
 - `~/.config/agent-fleet/peers.json` on every existing agent: add the new
   agent. agent-say validates targets against this file (unknown numeric
   ids exit 4, peer names must exist as keys) and the file is never
-  clobbered — update it by hand. Also add the new agent to
-  `dispatch/peers.json` in the repo (install.sh's seed source).
+  clobbered — update it by hand. Also add the new agent to the local
+  `dispatch/peers.json` (gitignored; seeded from
+  `dispatch/peers.example.json` — keep both in sync on roster changes,
+  install.sh's seed source).
 - Detached restart so the running agent survives:
   `(sleep 5; XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart pi.service) &`
 
@@ -263,15 +265,15 @@ sudo -u <name> bash -lc '
 ```
 
 Skills: copy an existing agent's `~/.pi/agent/skills/` (machine-level docs:
-webdrop, traefik-ops, erpnext, hydrogen-desktop, pi-token-cost,
+webdrop, traefik-ops, erpnext, desktop, pi-token-cost,
 github-invites, bootstrap-project).
 
 ## 10. Post-onboard notes
 
-- Dispatch cap per agent: 3 (monky/frank), 2 (jimmy) - Andryo sets per agent.
+- Dispatch cap per agent: <operator> sets per agent (e.g. 3 for senior agents, 2 for new ones).
 - Fresh agents get latest bridge commands by pulling main + restarting their
   pi.service (new commands like /tasks, /diff only exist after the merge).
-- /tmp on hydrogen is a 32G tmpfs: it wipes on reboot. pi-bg artifacts now
+- /tmp on the agent host is a 32G tmpfs: it wipes on reboot. pi-bg artifacts now
   live in ~/.pi-bg-art (PR #35); anything else you park in /tmp is volatile.
 - OOM history: 13 Sep 2026, 11:24-11:49 kernel OOM slide wedged the box
   until a power reset (61 kills). Size new heavy units with memory caps.

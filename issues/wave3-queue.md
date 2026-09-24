@@ -1,4 +1,4 @@
-# Wave 3 queue (2026-09-15, Andryo GO "all of those")
+# Wave 3 queue (2026-09-15, operator GO "all of those")
 
 11 open issues. Ordering minimizes same-file merge conflicts + puts security first.
 

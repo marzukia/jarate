@@ -71,7 +71,7 @@ Notes:
   50-word overlap. Deterministic. Cap heading-based chunks: a giant section
   still gets split at the word-window size.
 - Embed in batches (e.g. 64) via the local OpenAI-compatible `/v1/embeddings`
-  endpoint (Ollama on neon, see embedding model section).
+  endpoint (Ollama on <host-b>, see embedding model section).
 - Upsert on `content_hash`; **prune on by default** (delete hashes no longer
   present, `--no-prune` to disable) — with path-in-hash, a rename otherwise
   orphans the old row.
@@ -141,20 +141,20 @@ $$;
 - Thin HTTP API (20-line FastAPI) if a third-party client appears.
 - pgvectorscale if we pass ~10M chunks (we will not, soon).
 
-## Embedding model (decision: Ollama on NEON, per Andryo 2026-09-05)
+## Embedding model (decision: Ollama on <host-b>, per the operator 2026-09-05)
 
-vLLM serves one model per instance — the running hydrogen server has
-qwen3.8-27b only, no embed model (verified by Frankie). A 274M-param embed
+vLLM serves one model per instance — the running <host-a> server has a
+chat model only, no embed model (verified by Frankie). A 274M-param embed
 deploy is CPU-friendly: **Ollama** on a box with an AMD/GPU (set RAG_EMBED_URL).
-Andryo's call, over hydrogen. Setup assigned to Frankie 2026-09-05.
+The operator's call, over <host-a>. Setup assigned to Frankie 2026-09-05.
 Ingest and
-query hit Ollama for embeddings, vLLM on hydrogen stays chat-only.
+query hit Ollama for embeddings, vLLM on <host-a> stays chat-only.
 
 ## Rollout
 
-1. (Frankie) Clean up neon, install Ollama, pull `nomic-embed-text`, verify
+1. (Frankie) Clean up <host-b>, install Ollama, pull `nomic-embed-text`, verify
    `/v1/embeddings` returns 1024-d vectors; endpoint TBA.
-2. Create schema on hydrogen Postgres (16.13 confirmed running, pgvector
+2. Create schema on <host-a> Postgres (16.13 confirmed running, pgvector
    0.6.2 available — checked by Frankie).
 3. Write `ingest.py` + `query.py`, ingest `~/projects` + `~/memory`.
 4. Smoke test: 5 known questions, verify the right source file appears in
@@ -163,9 +163,9 @@ query hit Ollama for embeddings, vLLM on hydrogen stays chat-only.
 
 ## Open items
 
-- ~~Which Postgres instance?~~ → hydrogen (Frankie confirmed PG 16.13 +
-  pgvector 0.6.2 there; helium VMs reported gone 2026-09-05).
-- Embedding model: Ollama `nomic-embed-text` on neon (decided; Frankie
+- ~~Which Postgres instance?~~ → <host-a> (Frankie confirmed PG 16.13 +
+  pgvector 0.6.2 there; the old VM box reported gone 2026-09-05).
+- Embedding model: Ollama `nomic-embed-text` on <host-b> (decided; Frankie
   installing, endpoint TBA).
 - Access: shared DB role with INSERT/SELECT on `chunks` + **EXECUTE on
   `search()`** only (no DDL).

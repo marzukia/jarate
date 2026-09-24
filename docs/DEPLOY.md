@@ -57,7 +57,7 @@ cd <jarate> && git pull --ff-only
 ## recall (packages/recall)
 
 Source of truth: `packages/recall/` in this repo (TypeScript port of the
-Python pgrag, 2026-09-10; full git history of monkytheluffy/pgrag lives
+Python pgrag, 2026-09-10; full git history of the old pgrag repo lives
 under `packages/memory/` in the old refs). The box copy `~/projects/recall`
 is a **symlink** into the checkout; it **replaces the old `~/projects/pgrag`
 symlink** (orchestrator migrates the box link).

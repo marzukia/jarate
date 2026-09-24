@@ -214,8 +214,8 @@ describe("convertInlineForDiscord", () => {
     );
   });
   test("backticked http (no s) URL becomes clickable", () => {
-    expect(convertInlineForDiscord("`http://<tailscale-ip-1>:1313/x/`")).toBe(
-      "<http://<tailscale-ip-1>:1313/x/>",
+    expect(convertInlineForDiscord("`http://100.64.0.1:1313/x/`")).toBe(
+      "<http://100.64.0.1:1313/x/>",
     );
   });
   test("code span with non-URL content is left alone", () => {
@@ -424,12 +424,12 @@ describe("wrapFenceLines", () => {
 describe("hoistFencedUrls", () => {
   test("bare url in fence -> hoisted to plain line after fence", () => {
     const out = mdToDiscord(
-      "Dev link:\n\n```\nhttp://<tailscale-ip-1>:1313/posts/x/\n```\n\nMore text.",
+      "Dev link:\n\n```\nhttp://100.64.0.1:1313/posts/x/\n```\n\nMore text.",
     );
     // url must NOT be inside a fence; it appears as a bare line
-    expect(out).toContain("http://<tailscale-ip-1>:1313/posts/x/");
+    expect(out).toContain("http://100.64.0.1:1313/posts/x/");
     // and the fence is gone (urls-only fence dropped)
-    const urlIdx = out.indexOf("http://<tailscale-ip-1>:1313/posts/x/");
+    const urlIdx = out.indexOf("http://100.64.0.1:1313/posts/x/");
     expect(out.slice(0, urlIdx)).not.toContain("```");
   });
   test("url mixed with code -> code kept in fence, url after", () => {

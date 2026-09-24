@@ -78,7 +78,7 @@ export type HandoverComplete = (
 
 /** Resolved handoff settings (defaults → ~/.pi/agent → <cwd>/.pi → env). */
 export interface HandoffSettings {
-  /** Default TRUE (Andryo 2026-09-23: handoff is the default behaviour,
+  /** Default TRUE (operator 2026-09-23: handoff is the default behaviour,
    *  not a flag to flip). Opt out with `handoff: { enabled: false }` in
    *  settings.json or HANDOFF_ENABLED=0 in the service env. */
   enabled: boolean;
@@ -225,7 +225,7 @@ export function shouldHandoff(
   if (flags.freshWindow) return false;
   if (event.reason === "manual") return true;
   if (event.reason === "threshold") {
-    // MINOR-1 (PR1 review; Andryo resolved with option a): the threshold is
+    // MINOR-1 (PR1 review; operator resolved with option a): the threshold is
     // a fraction of the TOTAL context window, NOT the remaining space —
     // INTENTIONAL, do not change the math. Pi's auto compaction fires at
     // window - reserveTokens (~94% of a 262k window), always above the 80%

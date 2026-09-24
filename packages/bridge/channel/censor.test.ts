@@ -39,7 +39,7 @@ const reg = (lines: string[]) => {
 const T36 = "aB3".repeat(12); // 36 alnum
 const GHP = `ghp_${T36}`;
 const GHO = `gho_${T36}`;
-const SBK = "sbk_<agent>_<hex>";
+const SBK = "sbk_agent_0123456789abcdef";
 
 describe("pattern classes", () => {
   test("github classic token ghp_ (36 alnum)", () => {
@@ -98,7 +98,7 @@ describe("pattern classes", () => {
     );
     // rendered tool-line form: markdown-escaped underscores
     expect(
-      censor(`bash echo sbk\\_jimmy\\_56659a2ca404b4a6`, { file: R }),
+      censor(`bash echo sbk\\_agent\\_0123456789abcdef`, { file: R }),
     ).toBe("bash echo [REDACTED:switchboard]");
     // short tails and the bare prefix stay
     expect(censor("the sbk_ key and sbk_abc", { file: R })).toBe(
@@ -195,10 +195,10 @@ describe("pattern classes", () => {
   });
 
   test("sshpass -p <arg>", () => {
-    const out = censor("sshpass -p hunter2 ssh andryo@10.9.8.7 ls", {
+    const out = censor("sshpass -p hunter2 ssh alice@10.9.8.7 ls", {
       file: R,
     });
-    expect(out).toBe("sshpass -p [REDACTED:sshpass] ssh andryo@10.9.8.7 ls");
+    expect(out).toBe("sshpass -p [REDACTED:sshpass] ssh alice@10.9.8.7 ls");
   });
 
   test("key-adjacent values in code blocks", () => {

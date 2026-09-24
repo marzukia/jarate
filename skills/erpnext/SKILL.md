@@ -2,7 +2,7 @@
 name: erpnext
 description: >
   Operate the self-hosted ERPNext v16 trial on <host-a> (two AU entities,
-  Andryo Pty Ltd + Andryo Marzuki Sole Trader, GST 10%, AUD, April fiscal year).
+  <entity-a> + <entity-b>, GST 10%, AUD, April fiscal year).
   Use when the user asks about the books, ERPNext, GST, invoices, GL, companies,
   or wants to run/report through the ERPNext REST/MCP API. Covers stack layout,
   credentials, bench commands, the PostgreSQL patches applied, and the
@@ -15,22 +15,22 @@ Self-hosted **ERPNext v16.34.2** (Frappe + PostgreSQL 15 + Redis) running under
 **rootless podman** on <host-a>, bound to `127.0.0.1:8899`. Trial data
 for two Australian entities:
 
-- `Andryo Pty Ltd` (abbr **APT**)
-- `Andryo Marzuki (Sole Trader)` (abbr **AST**)
+- `<entity-a>`
+- `<entity-b>`
 
 Both: country Australia, currency AUD, April-start fiscal years (2025-26,
 2026-27), GST 10% (tax templates + rules per company).
 
 ## Layout
 
-- Deployment: `/home/monky/projects/erpnext/`
+- Deployment: `/home/<user>/projects/erpnext/`
   - `ref/` — cloned `frappe/frappe_docker` (compose files live here)
   - `.env`, `.adminpw` — DB + admin creds (600)
   - `CREDENTIALS.md` — full credential reference (600)
   - `scripts/patch-postgres-groupby.py` — PG GROUP BY patch (idempotent)
 - Site name: `books.erpnext.local`, HTTP `http://127.0.0.1:8899`
-- DB: postgres container `erp-db-1`, db/user `_b7346ad2581d2e5a`
-- Worktree (this skill): `/home/monky/.pi-bg-wt/jarate/20260910-054245-19520/`
+- DB: postgres container `erp-db-1`, db/user `<db-name>`
+- Worktree (this skill): `~/projects/jarate` (a git worktree of this repo)
 
 ## Containers (9, all on the `erpnet` podman network)
 
@@ -39,7 +39,7 @@ workers + gunicorn on :8000), `erp-frontend-1` (nginx :8080 -> published
 127.0.0.1:8899), websocket, queues, scheduler, configurator.
 
 ```bash
-cd /home/monky/projects/erpnext/ref   # compose files are here
+cd /home/<user>/projects/erpnext/ref   # compose files are here
 podman compose ps                      # status
 podman compose up -d                   # start
 podman logs erp-backend-1 --tail 50
@@ -54,16 +54,16 @@ podman exec erp-backend-1 bench --site books.erpnext.local execute <mod.fn>
 
 ## Credentials (see CREDENTIALS.md for the full set)
 
-- Web: `http://127.0.0.1:8899`, `Administrator` / `xCBwc7xwD9LHCtIG`
+- Web: `http://127.0.0.1:8899`, `Administrator` / `<admin-pass>`
 - REST/MCP user: `mcp@books.erpnext.local`
-  - API key `7ab0941c50d09f0` / secret `70ba2eef4fc6835`
+  - API key `<api-key>` / secret `<api-secret>`
   - Roles: Accounts User, Report Manager, Accounts Manager
-- DB root: `postgres` / `3ezEy4RvrlJLnXZ`, db `_b7346ad2581d2e5a`
+- DB root: `postgres` / `<db-pass>`, db `<db-name>`
 
 Quick REST check:
 
 ```bash
-curl -u 7ab0941c50d09f0:70ba2eef4fc6835 \
+curl -u <api-key>:<api-secret> \
   http://127.0.0.1:8899/api/resource/Company
 ```
 
@@ -74,8 +74,8 @@ curl -u 7ab0941c50d09f0:70ba2eef4fc6835 \
 
 ```
 ERPNEXT_URL=http://127.0.0.1:8899
-ERPNEXT_API_KEY=7ab0941c50d09f0
-ERPNEXT_API_SECRET=70ba2eef4fc6835
+ERPNEXT_API_KEY=<api-key>
+ERPNEXT_API_SECRET=<api-secret>
 ```
 
 Tools used to verify: `erpnext_company_list`, `erpnext_doc_get`,
@@ -90,7 +90,7 @@ Postgres three spots broke. Patches are **source edits inside the container**
 
 ```bash
 # 1) GROUP BY in get_voucher_outstandings CTEs (accounts/utils.py)
-podman cp /home/monky/projects/erpnext/scripts/patch-postgres-groupby.py \
+podman cp /home/<user>/projects/erpnext/scripts/patch-postgres-groupby.py \
   erp-backend-1:/tmp/patch-postgres-groupby.py
 podman exec erp-backend-1 python3 /tmp/patch-postgres-groupby.py
 

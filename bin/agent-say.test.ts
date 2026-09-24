@@ -131,12 +131,12 @@ const curlUrl = (capture: string): string =>
 describe("agent-say peer resolution (#45)", () => {
   test("numeric channel id of a known peer sends", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>", frank: "<channel-id-2>" });
-    const r = await f.run(["<channel-id-1>", "hello monky"]);
+    f.setPeers({ monky: "1111111111111111111", frank: "2222222222222222222" });
+    const r = await f.run(["1111111111111111111", "hello monky"]);
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
     expect(curlUrl(f.capture)).toBe(
-      "https://discord.com/api/v10/channels/<channel-id-1>/messages",
+      "https://discord.com/api/v10/channels/1111111111111111111/messages",
     );
     // the bot token from the fake settings.json was used
     expect(fs.readFileSync(f.capture, "utf8")).toContain(
@@ -146,18 +146,18 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("peer name resolves via ~/.config/agent-fleet/peers.json", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>", frank: "<channel-id-2>" });
+    f.setPeers({ monky: "1111111111111111111", frank: "2222222222222222222" });
     const r = await f.run(["frank", "ping from monky"]);
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
     expect(curlUrl(f.capture)).toBe(
-      "https://discord.com/api/v10/channels/<channel-id-2>/messages",
+      "https://discord.com/api/v10/channels/2222222222222222222/messages",
     );
   });
 
   test("unknown peer fails loudly with exit 2, no curl attempt", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>" });
+    f.setPeers({ monky: "1111111111111111111" });
     const r = await f.run(["jimmy", "hi"]);
     expect(r.code).toBe(2);
     expect(r.err).toContain("unknown peer 'jimmy'");
@@ -183,16 +183,16 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("- stdin form works with a peer name", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>" });
+    f.setPeers({ monky: "1111111111111111111" });
     const r = await f.run(["monky", "-"], "multi\nline msg");
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
-    expect(curlUrl(f.capture)).toContain("/channels/<channel-id-1>/");
+    expect(curlUrl(f.capture)).toContain("/channels/1111111111111111111/");
   });
 
   test("empty message still exits 2 (resolution happens before it)", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>" });
+    f.setPeers({ monky: "1111111111111111111" });
     const r = await f.run(["monky", ""]);
     expect(r.code).toBe(2);
     expect(r.err).toContain("empty message");
@@ -200,12 +200,12 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("missing token -> exit 1 with the token hint", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>" });
+    f.setPeers({ monky: "1111111111111111111" });
     fs.writeFileSync(
       path.join(f.home, ".pi", "agent", "settings.json"),
       JSON.stringify({ channels: [] }),
     );
-    const r = await f.run(["<channel-id-1>", "hi"]);
+    const r = await f.run(["1111111111111111111", "hi"]);
     expect(r.code).toBe(1);
     expect(r.err).toContain("no bot token");
   });
@@ -224,13 +224,13 @@ describe("agent-say peer resolution (#45)", () => {
 
   test("other agent channel -> passes the guard (exit 0)", async () => {
     const f = fixture();
-    f.setPeers({ monky: "<channel-id-1>", frank: "<channel-id-2>" });
+    f.setPeers({ monky: "1111111111111111111", frank: "2222222222222222222" });
     // frank's channel is not the caller's own channel (111)
-    const r = await f.run(["<channel-id-2>", "ping frank"]);
+    const r = await f.run(["2222222222222222222", "ping frank"]);
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
     expect(curlUrl(f.capture)).toBe(
-      "https://discord.com/api/v10/channels/<channel-id-2>/messages",
+      "https://discord.com/api/v10/channels/2222222222222222222/messages",
     );
   });
 });
@@ -238,11 +238,11 @@ describe("agent-say peer resolution (#45)", () => {
 describe("agent-say peer allowlist (2026-09-20 gap)", () => {
   test("numeric id not in peers.json -> exit 4, no curl, known peers listed", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
+    f.setPeers({ frank: "2222222222222222222" });
     const r = await f.run(["999000111222333444", "where does this go?"]);
     expect(r.code).toBe(4);
     expect(r.err).toContain("not a known fleet peer");
-    expect(r.err).toContain("frank=<channel-id-2>");
+    expect(r.err).toContain("frank=2222222222222222222");
     expect(r.err).toContain("AGENT_SAY_FORCE=1");
     expect(fs.existsSync(f.capture)).toBe(false);
   });
@@ -250,14 +250,14 @@ describe("agent-say peer allowlist (2026-09-20 gap)", () => {
   test("no peers file + numeric id -> exit 4 (fail closed)", async () => {
     const f = fixture();
     f.setPeers(null);
-    const r = await f.run(["<channel-id-2>", "hi"]);
+    const r = await f.run(["2222222222222222222", "hi"]);
     expect(r.code).toBe(4);
     expect(r.err).toContain("not a known fleet peer");
   });
 
   test("AGENT_SAY_FORCE=1 bypasses the allowlist (exit 0)", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
+    f.setPeers({ frank: "2222222222222222222" });
     const r = await f.run(["999000111222333444", "one-off"], undefined, {
       AGENT_SAY_FORCE: "1",
     });
@@ -280,7 +280,7 @@ describe("agent-say peer allowlist (2026-09-20 gap)", () => {
 
   test("name target resolves and passes the allowlist", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
+    f.setPeers({ frank: "2222222222222222222" });
     const r = await f.run(["frank", "frank, pull pi-dispatch"]);
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
@@ -290,26 +290,31 @@ describe("agent-say peer allowlist (2026-09-20 gap)", () => {
 describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
   test("message to a peer's numeric id that does not name the peer -> [warn], still sent", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
-    // regression: the 2026-09-19/20 incident — Cain's infographic
-    // (a human deliverable) sent to frank's channel, no recipient marker
-    const r = await f.run([
-      "<channel-id-2>",
-      "Cain asked me to rework his infographic. Done: https://drop.example/1",
-    ]);
+    f.setPeers({ frank: "2222222222222222222" });
+    // regression: the 2026-09-19/20 incident — a human's deliverable
+    // sent to a peer's channel, no recipient marker. AGENT_SAY_HUMANS
+    // carries the (fake) human roster for the nudge guard.
+    const r = await f.run(
+      [
+        "2222222222222222222",
+        "sam asked me to rework their infographic. Done: https://drop.example/1",
+      ],
+      undefined,
+      { AGENT_SAY_HUMANS: "sam" },
+    );
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("sent 99");
     expect(r.err).toContain("[warn]");
     expect(r.err).toContain("not frank");
     expect(r.err).toContain("Reply in your own channel");
-    expect(curlUrl(f.capture)).toContain("/channels/<channel-id-2>/");
+    expect(curlUrl(f.capture)).toContain("/channels/2222222222222222222/");
   });
 
   test("message that names the peer -> no warning", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
+    f.setPeers({ frank: "2222222222222222222" });
     const r = await f.run([
-      "<channel-id-2>",
+      "2222222222222222222",
       "frank: pull pi-dispatch when you get a sec",
     ]);
     expect(r.code).toBe(0);
@@ -319,9 +324,9 @@ describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
 
   test("recipient match is case-insensitive", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
+    f.setPeers({ frank: "2222222222222222222" });
     const r = await f.run([
-      "<channel-id-2>",
+      "2222222222222222222",
       "FRANK — your pi is running stale",
     ]);
     expect(r.code).toBe(0);
@@ -330,8 +335,12 @@ describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
 
   test("name-specified target still warns when the body omits the peer", async () => {
     const f = fixture();
-    f.setPeers({ frank: "<channel-id-2>" });
-    const r = await f.run(["frank", "v2: https://drop.example/2 (for Cain)"]);
+    f.setPeers({ frank: "2222222222222222222" });
+    const r = await f.run(
+      ["frank", "v2: https://drop.example/2 (for sam)"],
+      undefined,
+      { AGENT_SAY_HUMANS: "sam" },
+    );
     expect(r.code).toBe(0);
     expect(r.err).toContain("[warn]");
   });

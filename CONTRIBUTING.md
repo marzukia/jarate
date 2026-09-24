@@ -34,7 +34,7 @@ references context `ci` when the org upgrades to Pro.
 use kimaki-style ASCII tags: `[!]` warning/error, `[ok]` success,
 `[new]`/`[..]`/`[queued]` state, `- ` list items. Emoji only where the
 platform requires them (Discord reactions, e.g. the 👀 inbound ack).
-See AGENTS.md § Style. (Andryo, 2026-09-10)
+See AGENTS.md § Style. (operator, 2026-09-10)
 
 ## PR description template
 
@@ -68,4 +68,4 @@ restarts). End with VERDICT: PASS or VERDICT: FAIL and ranked findings."
 - Reviewer findings are actionable: one fix round by a worker, then re-review
   or the orchestrator decides. No infinite loops.
 - Merge only on `VERDICT: PASS` + green `ci`.
-- Humans (Andryo) can override a FAIL; note the override in the PR.
+- Humans (the operator) can override a FAIL; note the override in the PR.

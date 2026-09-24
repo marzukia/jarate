@@ -479,7 +479,7 @@ describe("renderTemplate", () => {
     ...emptyCtx,
     priorDoc: PRIOR_DOC,
     contextUsage: null,
-    modelLabel: "hydrogen/qwen3.8-27b",
+    modelLabel: "vllm/qwen3.8-27b",
     sessionFile: null,
     sessionEntryCount: null,
   });
@@ -529,7 +529,7 @@ describe("renderTemplate", () => {
     expect(doc).toContain("- PR/issues/tickets:");
     expect(doc).toContain("#42");
     expect(doc).toContain("https://example.com/a");
-    expect(doc).toContain("- model: hydrogen/qwen3.8-27b");
+    expect(doc).toContain("- model: vllm/qwen3.8-27b");
     expect(doc).toContain("183k tokens before compaction");
     expect(doc).toContain("1. fix the bug in PR #42");
   });

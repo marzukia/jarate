@@ -137,7 +137,7 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
     path.join(agentDir, "models.json"),
     JSON.stringify({
       providers: {
-        hydrogen: { headers: { "X-Switchboard-Context": "262144" } },
+        vllm: { headers: { "X-Switchboard-Context": "262144" } },
       },
     }),
   );
@@ -760,20 +760,20 @@ describe("agents-check / agents-bless", () => {
   test("bless writes one-line manifest; check -> drift:false", async () => {
     const f = fixture();
     fs.writeFileSync(AGENTS(f), "# law v1\n");
-    const r = await f.run(["agents-bless", "blessed by andryo"]);
+    const r = await f.run(["agents-bless", "blessed by operator"]);
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
     expect(d.error).toBeNull();
     expect(d.hash).toBe(sha("# law v1\n"));
-    expect(d.note).toBe("blessed by andryo");
+    expect(d.note).toBe("blessed by operator");
     // manifest: exactly one line, <sha256>  <ts>  <note>
     const lines = fs.readFileSync(MANIFEST(f), "utf8").split("\n");
     expect(lines).toHaveLength(2); // trailing newline -> last element ""
     const [mh, mts, ...mnote] = lines[0].split("  ");
     expect(mh).toBe(sha("# law v1\n"));
     expect(mts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
-    expect(mnote.join("  ")).toBe("blessed by andryo");
+    expect(mnote.join("  ")).toBe("blessed by operator");
     const r2 = await f.run(["agents-check"]);
     const d2 = doc(r2);
     expect(d2.drift).toBe(false);

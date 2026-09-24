@@ -718,7 +718,7 @@ export function opTickLine(label: string, secs: number): string {
 
 /** Live status frames render inside a code fence (style guide v3):
  * box-drawing chars stay aligned on mobile, no markdown mangling.
- * Andryo 2026-09-14. */
+ * operator 2026-09-14. */
 export const fence = (s: string): string => `\`\`\`
 ${s}
 \`\`\``;
@@ -1270,7 +1270,7 @@ export function isEssentialToolCall(toolName: string, input: any): boolean {
   return true; // edits, writes, tasks, MCP/custom: all essential
 }
 
-/** Run-frame header state (live-frame unification, Andryo 2026-09-13):
+/** Run-frame header state (live-frame unification, operator 2026-09-13):
  *  the in-run "working" message and the end-of-run message are the SAME
  *  frame; only the header flips working -> done/failed in place. */
 export type RunFrameState = "working" | "done" | "failed";
@@ -4166,7 +4166,7 @@ async function runChannelCommand(
       // [!] line, no stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
-        // Every command reply ships in a code block (Andryo 2026-09-16),
+        // Every command reply ships in a code block (operator 2026-09-16),
         // error paths included.
         return { immediate: fence(text) };
       } catch {

@@ -9,8 +9,8 @@ no data migration.** The old `uv run ingest.py / query.py` workflow is dead.
 
 - Schema: `schema.sql` (dim 768, nomic-embed-text) — the data contract, kept
   exactly.
-- Embeddings: Ollama on neon — `http://localhost:11434/v1/embeddings`
-- DB: Postgres 16 on hydrogen, db `rag`, roles `monky` / `frank` (scram,
+- Embeddings: Ollama on <host-b> — `http://localhost:11434/v1/embeddings`
+- DB: Postgres 16 on <host-a>, db `rag`, roles per agent (scram,
   127.0.0.1)
 
 ## Usage

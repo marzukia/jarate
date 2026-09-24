@@ -229,7 +229,7 @@ describe("collectFinals", () => {
   });
 
   test("rapid-fire: reply-to an earlier inbound in the same run (2026-09-20)", () => {
-    // Andryo msg 1 → my reply → Andryo msg 2 → my reply with <reply-to:msg1>
+    // operator msg 1 → my reply → operator msg 2 → my reply with <reply-to:msg1>
     // The allowed set must accumulate ALL inbound ids, not just the last.
     const finals = collectFinals([
       inbound("111"),
@@ -384,9 +384,9 @@ describe("matchCommand (A3)", () => {
       name: "compact",
       arg: "keep the decisions",
     });
-    expect(matchCommand("/model hydrogen/qwen3.8-27b")).toEqual({
+    expect(matchCommand("/model vllm/qwen3.8-27b")).toEqual({
       name: "model",
-      arg: "hydrogen/qwen3.8-27b",
+      arg: "vllm/qwen3.8-27b",
     });
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined });
     expect(matchCommand("/todos")).toEqual({ name: "todos", arg: undefined });
@@ -2862,7 +2862,7 @@ describe("#39 /hold", () => {
   let fetchCalls: { url: string; method: string; body?: any }[] = [];
   const realFetch = globalThis.fetch;
 
-  const OWNER = "<user-id-1>";
+  const OWNER = "1000000000000000001";
   const inbound = (body: string, id: string): ChannelMessage => ({
     channelId: "ch1",
     channelName: "Test",
@@ -3149,7 +3149,7 @@ describe("#10 verbosity levels", () => {
   let fetchCalls: { url: string; method: string; body?: any }[] = [];
   const realFetch = globalThis.fetch;
 
-  const OWNER = "<user-id-1>";
+  const OWNER = "1000000000000000001";
   const inbound = (body: string, id: string): ChannelMessage => ({
     channelId: "ch1",
     channelName: "Test",
@@ -3537,7 +3537,7 @@ describe("live intermediate text (SPEC B)", () => {
   let posted: { content: string; id: string }[] = [];
   let msgN = 0;
   const realFetch = globalThis.fetch;
-  const OWNER = "<user-id-1>";
+  const OWNER = "1000000000000000001";
 
   const inbound = (body: string, id: string): ChannelMessage => ({
     channelId: "ch1",
@@ -4004,8 +4004,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     };
     ctx.modelRegistry = {
       getAvailable: () => [
-        { id: "qwen3.8-27b", name: "Qwen", provider: "hydrogen" },
-        { id: "other-123", name: "Other", provider: "hydrogen" },
+        { id: "qwen3.8-27b", name: "Qwen", provider: "vllm" },
+        { id: "other-123", name: "Other", provider: "vllm" },
       ],
     };
     let compacted: any = null;
@@ -4017,9 +4017,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     await h(d("model", { options: [{ name: "name", value: "qwen3.8-27b" }] }));
     expect(set?.id).toBe("qwen3.8-27b");
     const modelEdit = calls.at(-1);
-    expect(JSON.parse(modelEdit!.body).content).toContain(
-      "hydrogen/qwen3.8-27b",
-    );
+    expect(JSON.parse(modelEdit!.body).content).toContain("vllm/qwen3.8-27b");
 
     await h(
       d("compact", {
@@ -5692,7 +5690,7 @@ describe("tasks (integration)", () => {
     expect(replyContent()).toBe(fence("[tasks] no scheduled tasks"));
   });
 
-  test("fence rule: every command reply ships in a code block (Andryo 2026-09-16)", async () => {
+  test("fence rule: every command reply ships in a code block (operator 2026-09-16)", async () => {
     const cmds = [
       "/help",
       "/jobs",
@@ -7622,7 +7620,7 @@ describe("wave 2c bridge commands", () => {
   const oldWtDir = process.env.PI_BG_WT_DIR;
   const oldGitEnv: Record<string, string | undefined> = {};
 
-  const OWNER = "<user-id-1>";
+  const OWNER = "1000000000000000001";
   const base = (body: string, id: string, fromId: string): ChannelMessage => ({
     channelId: "ch1",
     channelName: "Test",

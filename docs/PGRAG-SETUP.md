@@ -14,7 +14,7 @@ Runbook for setting up the RAG corpus on a new agent box. Verified
   model means the schema and every existing row must be rebuilt — a full
   re-embed.
 - **Gotcha 2 — embed host down = pgrag down.** All queries and ingests
-  call the embed URL first. If the Ollama host (default: neon) is
+  call the embed URL first. If the Ollama host (default: the GPU box) is
   unreachable, `query.py` / `ingest.py` fail immediately with
   `httpx.ConnectError: [Errno 111] Connection refused` (verified). Postgres
   data is untouched; it recovers when the host is back.

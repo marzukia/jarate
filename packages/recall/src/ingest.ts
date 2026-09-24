@@ -9,7 +9,7 @@ import { connect, pruneOrphans, upsertChunks } from "./db";
 import { embedBatched } from "./embed";
 
 export const INGEST_VERSION = "v1";
-// Per-batch upsert + a generous timeout: on hydrogen's CPU Ollama a
+// Per-batch upsert + a generous timeout: on a CPU-only Ollama host a
 // 400-word chunk embeds in ~6-10s, so one batch can approach the timeout
 // under load; 300s (override JB_RECALL_EMBED_TIMEOUT_MS) keeps a batch
 // alive, and per-batch upsert (below) means a later failure still keeps

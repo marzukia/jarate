@@ -16,9 +16,9 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 2.2 Full border: `┌` top, `├`/`┣` rows, `└` bottom. Never ship an open
     frame. Wrapped continuations keep the pipe: a row on the gutter
     (`├`/`┣`/`│`) continues with `│ ` (pipe + space); `┌`/`└`/plain lines
-    continue with two spaces. Both gutters are 2 cols. (Andryo 2026-09-16,
+    continue with two spaces. Both gutters are 2 cols. (operator 2026-09-16,
     screenshot: bare 2-space wraps under ├ read as detached.)
-2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on Andryo's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
+2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on the operator's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
 2.3a A frame is for SHORT machine state only (a few lines: status, a single command result, a small box). Do NOT put long lists, tables, or triage inside a frame - the monospace box wraps at ~31 cols in Discord's normal (non-zoomed) view and becomes unreadable. For content longer than ~6 lines or with many rows, use plain bullets (no box) instead. If a frame must carry more, keep every row <= ~30 cols so it survives the normal view.
 2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra context, follow-ups, or prose go BEFORE the frame, never after. (A line after `└` breaks the box and reads as detached.)
 2.5 Blank line before a fence: yes. Blank line after a fence: only if the
@@ -26,7 +26,7 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
     (a blank line renders as a visible gap in Discord).
 2.6 State glyphs: `┣` active, `├` pending/done, `┤` cancelled.
 2.7 Every /command reply ships in a code fence - success, error, and usage
-    paths alike (Andryo 2026-09-16). The 40-col budget applies inside the
+    paths alike (operator 2026-09-16). The 40-col budget applies inside the
     fence too: plain-fence output wraps (wrapFenceLines); keep lines short
     so wraps do not split ids or URLs.
 
@@ -46,9 +46,9 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 4.4 Machine output posted to Discord (script errors, command output,
     logs, JSON, paths) goes in a code fence - never bare prose. One-line
     errors: inline code. Multi-line or raw logs: fenced block.
-    (2026-09-15 Andryo: pi-restart's bare "Failed to start transient
+    (2026-09-15 operator: pi-restart's bare "Failed to start transient
     timer unit" line; applies to all jarate scripts incl. pi-postcheck.)
 
 ## 5 Precedence
 AGENTS.md (injected) > this file > session habit. Edit this file when a
-rule is confirmed by Andryo; keep it under 60 lines so re-ingest is cheap.
+rule is confirmed by the operator; keep it under 60 lines so re-ingest is cheap.

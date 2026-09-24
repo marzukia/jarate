@@ -304,7 +304,7 @@ run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
 export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 
 # --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
-#     hydrogen box is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
+#     reference agent host is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
 #     /tmp lost every out.md and the watchdog re-flagged finished tickets as
 #     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
 #     and the bridge /jobs history — keep all per-run files in the same place

@@ -79,8 +79,8 @@ XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user -u pi.service --no-pager \
   | grep 'slash commands' | tail -1
 ```
 
-Reference box: <host-a>, Fedora 42 x64, agent user `monky`,
-`node v22.22.2`, `bun 1.4.2`, `pi 0.85.1`. Steps marked `[verified]` in
+Reference box: <host-a>, Linux x64 (example: Fedora 42), agent user
+`monky`, `node v22.22.2`, `bun 1.4.2`, `pi 0.85.1`. Steps marked `[verified]` in
 SETUP.md were run there; `[verify-on-fresh-box]` = reconstructed from box
 state.
 

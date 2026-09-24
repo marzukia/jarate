@@ -97,7 +97,7 @@ carries the thread.
       "name": "MONKY",
       "type": "discord",
       "enabled": true,
-      "channel": "<channel-id-1>",
+      "channel": "<channel-id>",
       "botToken": "your-bot-token",
       "default": true,
       "ownerUserId": "your-discord-user-id",

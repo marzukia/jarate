@@ -120,7 +120,7 @@ skip semantics as `latestRun`). What N>1 restore does and does not do:
 **One level deep.** `/undo` writes `~/.pi/agent/undo/redo.json`
 (run dir + removed session lines); `/redo` applies the run's **post**
 snapshot and re-appends the removed lines, then consumes the record.
-A second `/redo` says `[!] nothing to redo`. No stack — Andryo's spec.
+A second `/redo` says `[!] nothing to redo`. No stack — operator's spec.
 For `/undo N` the record's `run` is the Nth-from-last run: `/redo` lands
 on the state AFTER that run (i.e. just before the next one started) and
 re-appends every removed line of all N turns. It stays one level — a

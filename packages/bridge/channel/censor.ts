@@ -115,7 +115,7 @@ const RULES: PatternRule[] = [
     // Switchboard house key: sbk_<name>_<16 hex> (docs/NEW-AGENT.md).
     // The run-frame path censors BEFORE it clips (toolActionText), so the
     // key is whole and unescaped there. The final-send censor still sees
-    // the escaped + clipped form (sbk\_jimmy\_…, cut at the 28-col text
+    // the escaped + clipped form (sbk\_agent\_…, cut at the 28-col text
     // budget), so the pattern must accept the escaped form too. The
     // classic/fine-grained GitHub shapes are longer than any tool-line
     // clip and reach the final censor unescaped (or clipped mid-run, where
