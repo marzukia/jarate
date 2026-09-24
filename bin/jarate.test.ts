@@ -84,7 +84,7 @@ function fixture(): Fixture {
       'lines="$(grep -rn $mode $ci -e "$pat" "$root" 2>/dev/null)"',
       "rc=$?",
       '[ "$rc" -ge 2 ] && exit "$rc"  # grep error (e.g. bad regex) => like rg rc>1',
-      "[ -z \"$lines\" ] && exit 1    # no match",
+      '[ -z "$lines" ] && exit 1    # no match',
       "printf '%s\\n' \"$lines\" | sort -t: -k1,1 -k2,2n",
       "exit 0",
       "",
