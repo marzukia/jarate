@@ -50,6 +50,48 @@ function fixture(): Fixture {
   fs.writeFileSync(sp, "#!/bin/sh\necho '[jarate:pi]'\necho 'P1 peer warn'\n");
   fs.chmodSync(sp, 0o755);
 
+  // stub rg: ripgrep is NOT preinstalled on GitHub's ubuntu-latest runner,
+  // so memory-grep was red in CI while green on hosts with rg (2026-09-24).
+  // Implements the rg subset cmd_memory_grep uses, on top of grep:
+  //   - exit 0 (match) / 1 (no match) / 2 (error), like rg
+  //   - "file:lineno:text" lines; --sort path => sort by path, then lineno
+  //   - -F => grep -F (literal); regex mode => grep -E, so a bad regex
+  //     ("[", "(unterminated") exits 2 like a real rg failure
+  const rg = path.join(bin, "rg");
+  fs.writeFileSync(
+    rg,
+    [
+      "#!/bin/sh",
+      'mode=""; ci=""; quiet=""; pat=""; root=""',
+      "while [ $# -gt 0 ]; do",
+      '  a="$1"; shift',
+      '  case "$a" in',
+      '    -F) mode="-F" ;;',
+      '    -i) ci="-i" ;;',
+      "    -q) quiet=1 ;;",
+      "    -n | --no-heading) : ;;  # grep -r already emits file:lineno:text",
+      "    --sort) shift ;;        # consumes value 'path'; we always sort by path",
+      '    -e) pat="$1"; shift ;;',
+      "    -*) : ;;                # other rg flags: ignore",
+      '    *) root="$a" ;;',
+      "  esac",
+      "done",
+      '[ -n "$mode" ] || mode="-E"',
+      'if [ -n "$quiet" ]; then',
+      '  grep -r $mode $ci -e "$pat" "$root" >/dev/null 2>&1',
+      "  exit $?",
+      "fi",
+      'lines="$(grep -rn $mode $ci -e "$pat" "$root" 2>/dev/null)"',
+      "rc=$?",
+      '[ "$rc" -ge 2 ] && exit "$rc"  # grep error (e.g. bad regex) => like rg rc>1',
+      "[ -z \"$lines\" ] && exit 1    # no match",
+      "printf '%s\\n' \"$lines\" | sort -t: -k1,1 -k2,2n",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(rg, 0o755);
+
   // stub pi-token-cost.py (python3 -r JSON)
   const ptc = path.join(home, "scripts", "pi-token-cost.py");
   fs.mkdirSync(path.dirname(ptc), { recursive: true });
