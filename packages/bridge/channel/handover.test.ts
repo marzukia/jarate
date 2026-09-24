@@ -43,6 +43,7 @@ import extension, {
   isCompacting,
   isHandoffInFlight,
   moveSessionFileAside,
+  opWindowLabel,
   setHandoffInFlight,
   setHandoverCompleteForTest,
   setSystemdRestartHookForTest,
@@ -1390,5 +1391,260 @@ describe("session_before_compact wiring", () => {
     // (2026-09-23: a recognised command silently became a prompt when the
     // sender was not permitted, which reads as the bridge ignoring commands)
     expect(sent).toHaveLength(0);
+  });
+});
+
+// ─── Proactive token-% auto-compact gate (agent_end wiring) ───────────────
+// After every settled turn: context at/over the handoff threshold, nothing
+// in flight → the same compact /compact runs (startCompact). The doc is
+// written by the session_before_compact path; the size gate on
+// session_compact decides the restart as before.
+
+describe("auto-compact token-% gate", () => {
+  let tmp = "";
+  let oldHome = "";
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  let ctx: any;
+  let compacts = 0;
+  const realFetch = globalThis.fetch;
+
+  const mkEvent = (reason: string) => ({
+    type: "session_before_compact",
+    preparation: basePrep(),
+    branchEntries: [],
+    reason,
+    willRetry: false,
+    signal: new AbortController().signal,
+  });
+
+  const writeSettings = (obj: unknown) =>
+    fs.writeFileSync(
+      path.join(tmp, "proj", ".pi", "settings.json"),
+      JSON.stringify(obj),
+    );
+
+  const CHANNELS = [
+    {
+      id: "ch1",
+      name: "Test",
+      type: "discord",
+      botToken: "tok1",
+      ownerUserId: "uid",
+      ack: true,
+    },
+  ];
+
+  const flushMacrotasks = () => new Promise((r) => setTimeout(r, 20));
+
+  const PROSE = [
+    "[MISSION] Ship the bridge.",
+    "[IN_FLIGHT] Wire the handler",
+    "[DONE] Wrote tests",
+    "[BLOCKERS] (none)",
+    "[DECISIONS] Chose bun",
+    "[FOLLOWUPS] Tag corpus",
+    "[GOTCHAS] vLLM is sacred",
+  ].join("\n");
+
+  beforeEach(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-autocompact-"));
+    oldHome = process.env.HOME || "";
+    const home = path.join(tmp, "home");
+    process.env.HOME = home;
+    fs.mkdirSync(path.join(tmp, "proj", ".pi"), { recursive: true });
+    writeSettings({
+      channels: CHANNELS,
+      handoff: {
+        enabled: true,
+        storeDir: path.join(home, ".jarate", "handovers"),
+      },
+    });
+    handlers = {};
+    fetchCalls = [];
+    compacts = 0;
+    const pi: any = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: () => {},
+    };
+    extension(pi);
+    ctx = {
+      cwd: path.join(tmp, "proj"),
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      compact: () => {
+        compacts++;
+      },
+      modelRegistry: { getAvailable: () => [] },
+      // 80.1%: at/over the default 0.8 threshold.
+      getContextUsage: () => ({
+        tokens: 210_000,
+        contextWindow: 262_144,
+        percent: 80.1,
+      }),
+      model: { id: "cur", name: "Cur", provider: "test" },
+      sessionManager: {
+        getSessionFile: () => null,
+        getSessionId: () => "sess-9",
+        getEntries: () => new Array(12).fill({ type: "message" }),
+      },
+      shutdown: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+    seedChannelStateForTest("ch1", "ch1", path.join(tmp, "tmp"));
+    setChannelCursor("ch1", "1000");
+    setSystemdRestartHookForTest(() => {});
+    // lastActiveChannel = ch1, no run started: /status is read-only.
+    await handleInbound(
+      { on: () => {}, sendMessage: () => {} } as any,
+      {
+        channelId: "ch1",
+        channelName: "Test",
+        channelType: "discord",
+        messageId: "s1",
+        from: "owner",
+        fromId: "uid",
+        body: "/status",
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        isRoom: false,
+      },
+      ctx,
+    );
+  });
+
+  afterEach(() => {
+    setHandoverCompleteForTest(null);
+    setHandoffInFlight(false);
+    stopAllOpTicks();
+    clearAllCompacting();
+    clearDiscordStatesForTest();
+    process.env.HOME = oldHome;
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("at/over threshold + idle + enabled + nothing in flight → compact", async () => {
+    const logs: string[] = [];
+    const realLog = console.log;
+    console.log = (...a: any[]) => {
+      logs.push(a.join(" "));
+    };
+    try {
+      await handlers.agent_end({ messages: [] }, ctx);
+      await flushMacrotasks();
+    } finally {
+      console.log = realLog;
+    }
+    expect(compacts).toBe(1);
+    // the /compact path was used: op window open, label "compacting"
+    expect(isCompacting("ch1")).toBe(true);
+    expect(opWindowLabel("ch1")).toBe("compacting");
+    expect(
+      logs.some(
+        (l) =>
+          l ===
+          `[handoff] auto-compact: ctx 80.1% >= ${HANDOFF_DEFAULTS.threshold * 100}%`,
+      ),
+    ).toBe(true);
+  });
+
+  test("under threshold → not triggered (invisible)", async () => {
+    ctx.getContextUsage = () => ({
+      tokens: 200_000,
+      contextWindow: 262_144,
+      percent: 79.9,
+    });
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(0);
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("over threshold but handoff in flight → not triggered (no double)", async () => {
+    setHandoffInFlight(true);
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(0);
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("over threshold but in the fresh window → not triggered", async () => {
+    // a doc was just written (e.g. by the compact this gate would start):
+    // the seeded session is not handoff-eligible for HANDOFF_FRESH_WINDOW_MS
+    const home = path.join(tmp, "home");
+    writeHandover("# Handover - just written\n", {
+      storeDir: path.join(home, ".jarate", "handovers"),
+      home,
+    });
+    expect(isHandoffFreshWindow(path.join(home, ".jarate", "handovers"))).toBe(
+      true,
+    );
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(0);
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("disabled → not triggered", async () => {
+    const home = path.join(tmp, "home");
+    writeSettings({
+      channels: CHANNELS,
+      handoff: {
+        enabled: false,
+        storeDir: path.join(home, ".jarate", "handovers"),
+      },
+    });
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(0);
+    expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("no loop: settle → compact → doc → settle does NOT re-fire", async () => {
+    // 1) settled turn over threshold: the gate fires the compact.
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(1);
+    expect(isCompacting("ch1")).toBe(true);
+    // 2) pi compacts: session_before_compact writes the handover doc
+    //    (the SAME path /compact + shouldHandoff uses).
+    setHandoverCompleteForTest(async () => PROSE);
+    const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
+    expect(out).toBeDefined();
+    expect(
+      fs.existsSync(
+        path.join(tmp, "home", ".jarate", "handovers", "latest.md"),
+      ),
+    ).toBe(true);
+    // 3) the compact settles: window closed, size gate ran (no-op — the
+    //    mock session file is null, far under the restart cap).
+    handlers.session_compact({}, ctx);
+    await flushMacrotasks();
+    expect(isCompacting("ch1")).toBe(false);
+    // 4) next settled turn: still over threshold, but the fresh window
+    //    (doc just written) blocks a re-fire — no tight loop.
+    await handlers.agent_end({ messages: [] }, ctx);
+    await flushMacrotasks();
+    expect(compacts).toBe(1);
+    expect(isCompacting("ch1")).toBe(false);
   });
 });
