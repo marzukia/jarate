@@ -84,6 +84,7 @@ import extension, {
   updateQueuedInbound,
   verboseLevel,
   verboseOverride,
+  workingMaxMs,
 } from "./index";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
@@ -1071,6 +1072,53 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(last).toContain("│ └ edit a.txt");
   });
 
+  test("working frame stalls after the max lifetime without agent_end (#84 L3)", async () => {
+    jest.useFakeTimers();
+    verboseOverride.set("ch1", 2);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    await handlers.turn_start(null, ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const placeholder = fetchCalls.find(
+      (c) =>
+        c.method === "POST" &&
+        c.url.endsWith("/channels/ch1/messages") &&
+        String(JSON.parse(c.body).content).includes("┌ working · 0 calls"),
+    );
+    expect(placeholder).toBeDefined();
+
+    const edits = () =>
+      fetchCalls
+        .filter(
+          (c) =>
+            c.method === "PATCH" && c.url.includes("/channels/ch1/messages/"),
+        )
+        .map((c) =>
+          String(
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+          ),
+        );
+
+    // still counting up well before the cap
+    jest.advanceTimersByTime(5000);
+    expect(edits().at(-1)).toContain("┌ working · 0 calls · 5s");
+
+    // cross the 30-min cap: the run never ended (no agent_end), so the tick
+    // settles the frame to its TRUE state (stalled) and stops — it must not
+    // count up forever.
+    jest.advanceTimersByTime(workingMaxMs() - 5000 + 5000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(edits().at(-1)).toBe(fence("[!] run stalled - /stop to abort"));
+
+    // tick is gone: advancing further must not edit the frame again
+    const n = edits().length;
+    jest.advanceTimersByTime(10000);
+    expect(edits().length).toBe(n);
+  });
+
   test("verbose off: no tool-call block created, sent, or edited (#38)", async () => {
     // ch1 has no forwardToolCalls and no override -> verbose off
     expect(isVerbose(loadChannelConfig(ctx.cwd)[0]!)).toBe(false);
@@ -1808,7 +1856,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(settleOpTick(`interrupt:ch1`, "[probe]")).toBe(false);
     });
 
-    test("tick: settle-cap path stops the tick (no settle, no delete)", async () => {
+    test("tick: settle-cap path settles the tick back to the queued line (#84 L1)", async () => {
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       ctx.abort = () => {
         abortCount += 1;
@@ -1838,8 +1886,10 @@ describe("extension handlers (A1/A2/A4)", () => {
         .map((c) => String(JSON.parse(c.body).content));
       // the tick moved while the settle wait ran...
       expect(ackPatches).toContain(fence("[..] interrupting… 5s"));
-      // ...but the cap path STOPS the tick: no settle edit (the message
-      // goes back to re-wake — an interrupt did not happen)...
+      // ...but the cap path SETTLES the tick back to the queued line (the
+      // message's TRUE state — an interrupt did not happen), NOT a frozen
+      // mid-interrupt line (#84 L1)...
+      expect(ackPatches.at(-1)).toBe(fence("[queued] 1 in line"));
       expect(ackPatches).not.toContain(fence("[ok] interrupted"));
       // ...and the ack is NOT deleted (it stays with the queued entry).
       expect(
@@ -6856,6 +6906,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     stopAllOpTicks();
     clearAllCompacting();
     clearAllInterrupts();
+    resetRuntimeStateForTest(); // no hold/verbose leaks across tests (#84 L2)
     setInterruptCtx(null);
     setSystemdRestartHookForTest(null);
     setProcessExitHookForTest(null);
@@ -6926,6 +6977,58 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await waitOpShutdown();
     expect(shutdowns).toBe(1);
     expect(fs.existsSync(sess)).toBe(true); // not moved aside
+  });
+
+  test("/reset drains queued inbounds before shutdown (#84 L2): acks deleted, not orphaned", async () => {
+    await handlers.session_start?.(null, ctx); // configRoot for ack REST
+    // a run is in flight: a plain message queues + posts an ack
+    ctx.isIdle = () => false;
+    await handleInbound(pi, inbound("queued work", "mq1"), ctx);
+    await tick(); // settle the fire-and-forget ack post
+    const ackId = queuedAcks.get("mq1")?.ackId;
+    expect(ackId).toBeDefined();
+    expect(channelPosts().some((t) => t.includes("[queued] 1 in line"))).toBe(
+      true,
+    );
+
+    // #84 L2: /reset must drain the queue while the process is still alive,
+    // so the ack is DELETED — a respawn never references it, and a shutdown
+    // map-clear would orphan the message in the channel forever.
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick(); // settle the fire-and-forget delete
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+    expect(queuedAcks.get("mq1")).toBeUndefined();
+    const del = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" &&
+        c.url.endsWith(`/channels/ch1/messages/${ackId}`),
+    );
+    expect(del).toBeDefined();
+  });
+
+  test("/reset keeps a HELD channel's buffer (#84 L2, A4 parity): no drain", async () => {
+    await handlers.session_start?.(null, ctx); // configRoot for ack REST
+    // hold the channel, then buffer a message (held queues even while idle)
+    await handleInbound(pi, inbound("/hold on", "mh1"), ctx);
+    await tick();
+    expect(isHeld(loadChannelConfig(ctx.cwd)[0]!)).toBe(true);
+    await handleInbound(pi, inbound("buffered work", "mq1"), ctx);
+    await tick();
+    const ackId = queuedAcks.get("mq1")?.ackId;
+    expect(ackId).toBeDefined();
+
+    // #84 L2 (A4): a HELD channel's queue is the operator's buffer — /reset
+    // keeps it. No drain, the ack is NOT deleted.
+    await handleInbound(pi, inbound("/reset", "m1"), ctx);
+    await tick();
+    expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("mq1");
+    expect(queuedAcks.get("mq1")?.ackId).toBe(ackId);
+    const del = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" &&
+        c.url.endsWith(`/channels/ch1/messages/${ackId}`),
+    );
+    expect(del).toBeUndefined();
   });
 
   test("/reset placeholder ticks in place every 5s (shared op tick)", async () => {
