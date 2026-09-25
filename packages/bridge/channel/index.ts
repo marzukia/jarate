@@ -475,6 +475,16 @@ export function disarmInterrupt(channelId: string, messageId: string): void {
 // Commands (/stop, /reset, ...) never reach this path — they are consumed
 // before the mid-turn gate. /stop clears the timers so a stopped run is
 // not interrupted by a stale message.
+// #84 L3: max lifetime for a run's live working frame. A run that never
+// ends (hung tool or stream) would otherwise count up forever — nothing
+// closes the frame without agent_end. On expiry the tick settles the frame
+// to its true state (stalled) and stops. 30 min default (env-overridable).
+export function workingMaxMs(): number {
+  const raw = process.env.PISCORD_WORKING_MAX_MS;
+  if (!raw) return 30 * 60 * 1000;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000;
+}
 const DEFAULT_INTERRUPT_STEP_TIMEOUT_MS = 3000;
 
 /** Interrupt step timeout in ms (env PISCORD_INTERRUPT_STEP_TIMEOUT_MS, default 3000). */
@@ -922,15 +932,20 @@ export async function runMidRunInterrupt(
       return;
     }
     if (!ctx.isIdle()) {
-      // Settle exceeded the cap: stop the tick (NOT settle — the message
-      // goes back to re-wake, an interrupt did not happen) and restore the
-      // entry (FIFO position kept) so the re-wake path owns delivery from
-      // here on — never steer into a still-active run (that is the lossy
-      // path this feature avoids).
-      stopOpTick(`interrupt:${channelId}`);
+      // Settle exceeded the cap: restore the entry (FIFO position kept) so
+      // the re-wake path owns delivery from here on — never steer into a
+      // still-active run (that is the lossy path this feature avoids).
+      // #84 L1: settle the tick back to the queued line (its TRUE state)
+      // instead of stopping it frozen mid-interrupt. The ack stays with the
+      // queued entry and is deleted when the re-wake consumes it.
       const qq = midTurnQueues.get(channelId) ?? [];
-      qq.splice(Math.min(idx, qq.length), 0, entry);
+      const at = Math.min(idx, qq.length);
+      qq.splice(at, 0, entry);
       midTurnQueues.set(channelId, qq);
+      const pos = at + 1;
+      const ack = queuedAcks.get(messageId);
+      if (ack) ack.pos = pos;
+      settleOpTick(`interrupt:${channelId}`, `[queued] ${pos} in line`);
       console.log(
         `[channel] mid-run interrupt: settle exceeded cap, ${messageId} left to re-wake`,
       );
@@ -2284,11 +2299,18 @@ export default function (pi: ExtensionAPI) {
   const armWorkingTick = () => {
     const ch = lastActiveChannel;
     if (!ch || !statusMsgId) return;
-    armOpTick(`working:${ch.id}`, ch, statusMsgId, () => {
+    const key = `working:${ch.id}`;
+    armOpTick(key, ch, statusMsgId, () => {
       if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
       const wch = lastActiveChannel;
       if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
       const secs = Math.floor((Date.now() - runStartedAt) / 1000);
+      // #84 L3: cap the frame's lifetime. A run that never ends would
+      // count up forever — settle to the true state (stalled) and stop.
+      if (Date.now() - runStartedAt >= workingMaxMs()) {
+        settleOpTick(key, "[!] run stalled - /stop to abort");
+        return null;
+      }
       // UNFENCED body: armOpTick fences exactly once (review F1).
       return workingFrameBody(wch, Math.floor(secs / 5) * 5);
     });
@@ -3647,9 +3669,10 @@ export function archiveStaleSessions(liveFile: string): void {
 // Registered on session_compact AFTER the settle ran (F1: the
 // compaction window is already closed when the gate decides, so the
 // restart op it opens cannot be swept by the settle it reacts to).
-// Gate: the LIVE session file size > restartFileCap — the OOM
-// condition, NOT every compaction (mechanism A's doc compaction is the
-// usual path; the restart is the rare memory fix). Reuses the SAME
+// Issue #85 follow-up: EVERY handoff-qualifying compact restarts into a
+// fresh seeded session (the file-size cap is gone). The fresh-window
+// guard (isHandoffFreshWindow, 5 min) keeps the seeded session from
+// immediately re-handoffing and restarting again. Reuses the SAME
 // /reset restart chain (op window + marker + cursor rewind + bounded
 // shutdown + systemd restart + watchdog). Deferred one macrotask:
 // on the MANUAL compact path pi's ctx.compact wrapper calls its
@@ -3669,7 +3692,11 @@ export function handoffRestartForSize(
   }, 0);
 }
 
-/** The actual size gate + restart chain (exported for direct tests). */
+/** The restart chain (exported for direct tests). Issue #85 follow-up:
+ *  every handoff-qualifying compact (manual /compact, threshold ≥80% auto)
+ *  restarts into a fresh seeded session — the file-size cap is gone.
+ *  The fresh-window guard (isHandoffFreshWindow) keeps the just-seeded
+ *  session from immediately re-handoffing and restarting again. */
 export async function maybeHandoffRestart(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -3679,10 +3706,13 @@ export async function maybeHandoffRestart(
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
   if (ch?.type !== "discord") return;
   // A settle-flushed /compact re-opened the window (label "compacting"):
-  // let it finish — its own settle re-runs this gate (the file is still
-  // big, so the restart lands after that compact). Opening the op here
+  // let it finish — its own settle re-runs this gate. Opening the op here
   // would orphan the in-flight compaction's window + belt.
   if (compactingChannels.get(ch.id)?.label === "compacting") return;
+  // Fresh window: a handover doc was written <5 min ago (possibly with a
+  // restart + seed still pending). Don't re-restart on the seeded
+  // session's first settle — it would loop.
+  if (isHandoffFreshWindow(settings.storeDir)) return;
   let live: string | null = null;
   try {
     live = ctx.sessionManager?.getSessionFile?.() ?? null;
@@ -3696,11 +3726,8 @@ export async function maybeHandoffRestart(
   } catch {
     return; // file gone — nothing to gate on
   }
-  if (size <= settings.restartFileCap) return;
   const mb = (size / (1024 * 1024)).toFixed(1);
-  console.log(
-    `[handoff] session file ${mb}MB > cap ${settings.restartFileCap}B - restart op`,
-  );
+  console.log(`[handoff] compact settled - restart op (session file ${mb}MB)`);
   // F4: the op marker carries seeded:false — the respawn's session_start
   // seeds the fresh session from the doc (the ONLY seed gate). F5: move
   // the EXPLICIT live file at shutdown; F2: archive the other stale
@@ -4221,6 +4248,16 @@ async function runChannelCommand(
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
+      // #84 L2: drain queued inbounds while the process is still alive — a
+      // restart wipes the in-memory maps at shutdown (no Discord delete), so
+      // a queued ack posted now would be orphaned in the channel forever.
+      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
+      if (dropped > 0)
+        console.log(
+          `[channel] /reset dropped ${dropped} queued mid-turn inbound(s)`,
+        );
       try {
         ctx.abort();
       } catch {}
@@ -4253,6 +4290,16 @@ async function runChannelCommand(
       userStoppedRun = true;
       clearInterrupts(ch.id);
       if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
+      // #84 L2: drain queued inbounds while the process is still alive — a
+      // restart wipes the in-memory maps at shutdown (no Discord delete), so
+      // a queued ack posted now would be orphaned in the channel forever.
+      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
+      if (dropped > 0)
+        console.log(
+          `[channel] /restart dropped ${dropped} queued mid-turn inbound(s)`,
+        );
       try {
         ctx.abort();
       } catch {}
@@ -4277,6 +4324,16 @@ async function runChannelCommand(
         return { immediate: fence("[!] usage: /undo [N] (N is 1 or more)") };
       const r = await runUndo(ctx, n);
       if (!r.restarted) return { immediate: fence(r.text) };
+      // #84 L2: drain queued inbounds while the process is still alive — a
+      // restart wipes the in-memory maps at shutdown (no Discord delete), so
+      // a queued ack posted now would be orphaned in the channel forever.
+      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
+      if (dropped > 0)
+        console.log(
+          `[channel] /undo dropped ${dropped} queued mid-turn inbound(s)`,
+        );
       // performUndo already truncated the session file + parked the re-run
       // trigger (F1); the respawn resumes the pre-turn state. #46: N>1
       // removed every turn back to the Nth trigger in this ONE restart.
@@ -4299,6 +4356,16 @@ async function runChannelCommand(
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runRedo(ctx);
       if (!r.restarted) return { immediate: fence(r.text) };
+      // #84 L2: drain queued inbounds while the process is still alive — a
+      // restart wipes the in-memory maps at shutdown (no Discord delete), so
+      // a queued ack posted now would be orphaned in the channel forever.
+      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
+      const held = isHeld(ch);
+      const dropped = held ? 0 : clearQueuedInbound(ch.id);
+      if (dropped > 0)
+        console.log(
+          `[channel] /redo dropped ${dropped} queued mid-turn inbound(s)`,
+        );
       const placeholderP = beginRestartOp(
         pi,
         ctx,
