@@ -188,3 +188,160 @@ describe("pi-bg-kill #56: session process-group kill", () => {
     }
   }, 30_000);
 });
+
+/**
+ * #86: short-id resolution. The strict full-id regex made the natural
+ * cleanup call `pi-bg-kill 2332046` a silent exit-2 no-op (the incident
+ * loop had stderr on /dev/null and four live workers died un-killled).
+ * A 7+ digit numeric arg must resolve against the run records: exactly
+ * one match -> kill that ticket; 0 or 2+ matches -> exit 2 with a clear
+ * error on stderr. Non-numeric junk -> exit 2 (the incident's literal
+ * glob `20260925-*2332046*` was passed as a single arg).
+ */
+describe("pi-bg-kill #86: short-id resolution (run records)", () => {
+  const FULL = "20260925-201500-2332046";
+  const SUFFIX = "2332046";
+
+  type Env = Record<string, string>;
+
+  const setup = (withCgroup: boolean) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill86-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    const recDir = path.join(tmp, "records");
+    const cgRoot = path.join(tmp, "cg");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(recDir, { recursive: true });
+    const cg = path.join(cgRoot, "pi-bg", FULL);
+    if (withCgroup) fs.mkdirSync(cg, { recursive: true });
+    const env: Env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_RECORD_DIR: recDir,
+      PI_DISPATCH_WEBHOOK: "",
+      PI_BG_KILL_WAIT: "1",
+    };
+    delete env.PI_SERVICE;
+    const writeRec = (run: string) =>
+      fs.writeFileSync(
+        path.join(recDir, `pi-bg-${run}.json`),
+        JSON.stringify({
+          run,
+          profile: "worker",
+          project: null,
+          cwd: path.join(tmp, "workdir"),
+          started: "2026-09-25T20:15:00Z",
+          delivery: "webhook",
+          state: "running",
+        }),
+      );
+    const runKill = async (arg: string) => {
+      const p = spawn(["bash", KILL, arg], {
+        env,
+        cwd: tmp,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [out, err] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      return { code, out, err };
+    };
+    const close = () => fs.rmSync(tmp, { recursive: true, force: true });
+    return { tmp, cg, env, writeRec, runKill, close };
+  };
+
+  test("unique short id resolves via run record and kills the ticket", async () => {
+    const s = setup(true);
+    s.writeRec(FULL);
+    const victim = spawn(["sleep", "300"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    fs.writeFileSync(path.join(s.cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    let posted = 0;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async () => {
+        posted += 1;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    s.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    s.env.PI_BG_WB_BACKOFF = "0";
+
+    const r = await s.runKill(SUFFIX);
+    try {
+      expect(r.code).toBe(0);
+      // resolved to the FULL id, not the suffix
+      expect(r.out).toContain(`killed ${FULL}`);
+      expect(r.err).toContain(`short id ${SUFFIX} -> ${FULL}`);
+      expect(victim.exitCode ?? victim.killed).toBeTruthy();
+      expect(posted).toBe(1);
+    } finally {
+      victim.kill("SIGKILL");
+      server.stop(true);
+      s.close();
+    }
+  }, 30_000);
+
+  test("no run record match -> exit 2, clear error naming the arg", async () => {
+    const s = setup(false);
+    s.writeRec("20260925-201500-9999999"); // different suffix
+    const r = await s.runKill("1234567");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("no run record");
+    expect(r.err).toContain("1234567");
+    s.close();
+  });
+
+  test("ambiguous short id (two records) -> exit 2 naming both", async () => {
+    const s = setup(false);
+    s.writeRec(FULL);
+    s.writeRec("20260924-090000-2332046");
+    const r = await s.runKill(SUFFIX);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("ambiguous");
+    expect(r.err).toContain(FULL);
+    expect(r.err).toContain("20260924-090000-2332046");
+    s.close();
+  });
+
+  test("non-numeric arg -> exit 2 (the incident's literal glob)", async () => {
+    const s = setup(false);
+    s.writeRec(FULL);
+    const r = await s.runKill("20260925-*2332046*");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("not a ticket id");
+    s.close();
+  });
+
+  test("resolved short id without cgroup dir -> exit 2 (existing path)", async () => {
+    const s = setup(false); // record exists, cgroup dir does not
+    s.writeRec(FULL);
+    const r = await s.runKill(SUFFIX);
+    expect(r.code).toBe(2);
+    // resolution succeeded first, then the standard unknown-ticket error
+    expect(r.err).toContain(`short id ${SUFFIX} -> ${FULL}`);
+    expect(r.err).toContain(`no cgroup for ticket '${FULL}'`);
+    s.close();
+  });
+
+  test("full id still accepted unchanged (no record dir needed)", async () => {
+    const s = setup(false);
+    fs.rmSync(s.env.PI_DISPATCH_RECORD_DIR, { recursive: true, force: true });
+    // full id + no cgroup -> exit 2 at the cgroup check, proving the full
+    // id never went through the record-resolution branch
+    const r = await s.runKill(FULL);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain(`no cgroup for ticket '${FULL}'`);
+    expect(r.err).not.toContain("short id");
+    s.close();
+  });
+});

@@ -34,6 +34,14 @@
 #       > PI_BG_PRUNE_DAYS (default 7) are pruned: the ticket's artifact
 #       files (persistent dir + legacy /tmp) and the record itself are
 #       deleted. Live tickets (cgroup member / worktree cwd) keep theirs.
+#   4c. cwd-ticket sweep (issue #86): non-worktree runs (no --worktree)
+#       leave no dir under $WT_DIR and were invisible to DEAD detection.
+#       Run records with state=running whose cgroup dir is empty (no
+#       processes - "stale") AND whose heartbeat is stale > STALL_MIN min
+#       are DEAD: same dead webhook payload + dead log as the worktree
+#       sweep, record marked state=killed, empty cgroup reaped via the
+#       guarded cgroup.kill (cgroup.kill is only ever written when
+#       cgroup.procs is empty - issue #86).
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -103,6 +111,23 @@ cg_has_members() {
   [ -n "$(tr -d '[:space:]' 2>/dev/null < "$d/cgroup.procs")" ] && return 0
   [ -n "$(tr -d '[:space:]' 2>/dev/null < "$d/cgroup.threads")" ] && return 0
   return 1
+}
+
+# cg_kill_guarded <cgroup-dir> (issue #86): write cgroup.kill=1 ONLY when
+# the cgroup holds NO process. cgroup.kill kills every current member, so
+# on a non-empty cgroup it is a nuke, not a cleanup: 2026-09-25 a "clean up
+# stale cgroups" loop wrote cgroup.kill on four LIVE ticket cgroups and
+# killed four workers mid-run. "Stale" means no processes. Live PIDs ->
+# warning on stderr, no write, rc 1. Every watchdog cleanup path that
+# writes cgroup.kill goes through here.
+cg_kill_guarded() {
+  local d="$1"
+  if cg_has_members "$d"; then
+    echo "[pi-bg-watchdog] warning: $d not empty (live PIDs), skipping cgroup.kill" >&2
+    return 1
+  fi
+  echo 1 > "$d/cgroup.kill" 2>/dev/null || true
+  return 0
 }
 
 # is_live <ticket> <wt-path>: 0 if a process still matches this ticket
@@ -332,6 +357,91 @@ for d in "$WT_DIR"/*/*/; do
   printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
 done
 
+# ─── cwd-ticket sweep (issue #86): non-worktree dispatches ──────────────────
+# The sweep above enumerates $WT_DIR/*/*/ only; runs without --worktree
+# leave no dir there and were invisible to DEAD detection. 2026-09-25:
+# four cwd workers were SIGKILLed by the orchestrator's own cleanup loop,
+# posted no callback, kept state=running records, and this watchdog found
+# "0 dead, 0 stalled".
+#
+# DEAD (cwd) = ALL of:
+#   - run record state=running (the wrapper's exit trap never ran)
+#   - the ticket cgroup dir exists and is EMPTY (no member in
+#     cgroup.procs/threads - "stale" means no processes; a live member
+#     keeps the ticket out of this sweep)
+#   - the heartbeat file is stale > STALL_MIN min (fresh hb = healthy;
+#     absent hb = pre-upgrade run, not judgeable -> never flagged here)
+# On DEAD: post the dead webhook (same payload as the worktree sweep),
+# append the dead log (same today-dedupe), reap the empty cgroup via the
+# guarded cgroup.kill, and mark the record state=killed (same audit path
+# as pi-bg-kill, so the record stops lying "running").
+rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+cwd_found=0
+if [ -d "$rec_dir" ]; then
+  while IFS=$'\t' read -r rt rcwd; do
+    [ -n "$rt" ] || continue
+    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    cg="$CG_DIR/$rt"
+    [ -d "$cg" ] || continue          # no escape dir -> not judgeable here
+    cg_has_members "$cg" && continue  # live member -> not stale
+    hb_stale "$rt" || continue        # fresh/absent hb -> not DEAD
+    has_out "$rt" && continue         # completed normally (record unclosed)
+    has_killed "$rt" && continue      # pi-bg-kill already reported it
+    already_dead "$rt" && continue    # flagged earlier today
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would flag cwd ticket DEAD $rt (cgroup empty, hb stale)"
+      continue
+    fi
+    # last activity = the heartbeat mtime: the hb child touched it every
+    # 30s while the wrapper lived, so its mtime is the death clock
+    hb_f="$BG_TMP/pi-bg-${rt}-hb"
+    [ -f "$hb_f" ] || hb_f="$LEGACY_TMP/pi-bg-${rt}-hb"
+    hbm="$(stat -c %Y "$hb_f" 2>/dev/null)" || hbm=""
+    last="$(date -u -d "@${hbm:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || last="unknown"
+    reason="cwd run: cgroup empty, heartbeat stale > ${STALL_MIN} min (issue #86)"
+    echo "[pi-bg-watchdog] DEAD cwd/$rt (last activity $last, $reason)"
+    DT+=("$rt"); DREPO+=("cwd"); DP+=("${rcwd:--}")
+    DLAST+=("$last"); DREAS+=("$reason"); DTYPE+=("DEAD")
+    printf '%s %s %s %s %s\n' "$today" "$rt" "cwd" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
+    # cgroup cleanup: guarded cgroup.kill (memberless only, issue #86),
+    # drop the plain-file leftovers a non-cgroupfs test root keeps, rmdir
+    cg_kill_guarded "$cg"
+    rm -f "$cg/cgroup.procs" "$cg/cgroup.kill" 2>/dev/null
+    rmdir "$cg" 2>/dev/null
+    # mark the record killed (issue #51 audit path, same as pi-bg-kill):
+    # audit-only, never breaks the sweep
+    PI_BG_REC_STATE="killed" python3 - "$rec_dir/pi-bg-${rt}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+    cwd_found=$((cwd_found + 1))
+    found=$((found + 1))
+  done < <(python3 - "$rec_dir" <<'PY' 2>/dev/null
+import glob, json, os, sys
+d = sys.argv[1]
+for f in sorted(glob.glob(os.path.join(d, "pi-bg-*.json"))):
+    try:
+        rec = json.load(open(f))
+    except Exception:
+        continue
+    if rec.get("state") != "running":
+        continue
+    run = str(rec.get("run") or "")
+    if not run:
+        continue
+    print(f"{run}\t{rec.get('cwd') or ''}")
+PY
+  )
+fi
+[ "$cwd_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $cwd_found dead cwd ticket(s)"
+
 # ─── empty cgroup reaper (2026-09-14, issue: pi-bg cgroup-dir leak) ─────────
 # A ticket dir that holds no process is a leak: a live run always keeps at
 # least the wrapper shell in its escape cgroup. Untrappable deaths (bun
@@ -554,5 +664,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, ${#ST[@]} stalled, $pruned_state run record(s) pruned (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, ${#ST[@]} stalled, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0
