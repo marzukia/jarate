@@ -3669,9 +3669,10 @@ export function archiveStaleSessions(liveFile: string): void {
 // Registered on session_compact AFTER the settle ran (F1: the
 // compaction window is already closed when the gate decides, so the
 // restart op it opens cannot be swept by the settle it reacts to).
-// Gate: the LIVE session file size > restartFileCap — the OOM
-// condition, NOT every compaction (mechanism A's doc compaction is the
-// usual path; the restart is the rare memory fix). Reuses the SAME
+// Issue #85 follow-up: EVERY handoff-qualifying compact restarts into a
+// fresh seeded session (the file-size cap is gone). The fresh-window
+// guard (isHandoffFreshWindow, 5 min) keeps the seeded session from
+// immediately re-handoffing and restarting again. Reuses the SAME
 // /reset restart chain (op window + marker + cursor rewind + bounded
 // shutdown + systemd restart + watchdog). Deferred one macrotask:
 // on the MANUAL compact path pi's ctx.compact wrapper calls its
@@ -3691,7 +3692,11 @@ export function handoffRestartForSize(
   }, 0);
 }
 
-/** The actual size gate + restart chain (exported for direct tests). */
+/** The restart chain (exported for direct tests). Issue #85 follow-up:
+ *  every handoff-qualifying compact (manual /compact, threshold ≥80% auto)
+ *  restarts into a fresh seeded session — the file-size cap is gone.
+ *  The fresh-window guard (isHandoffFreshWindow) keeps the just-seeded
+ *  session from immediately re-handoffing and restarting again. */
 export async function maybeHandoffRestart(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -3701,10 +3706,13 @@ export async function maybeHandoffRestart(
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
   if (ch?.type !== "discord") return;
   // A settle-flushed /compact re-opened the window (label "compacting"):
-  // let it finish — its own settle re-runs this gate (the file is still
-  // big, so the restart lands after that compact). Opening the op here
+  // let it finish — its own settle re-runs this gate. Opening the op here
   // would orphan the in-flight compaction's window + belt.
   if (compactingChannels.get(ch.id)?.label === "compacting") return;
+  // Fresh window: a handover doc was written <5 min ago (possibly with a
+  // restart + seed still pending). Don't re-restart on the seeded
+  // session's first settle — it would loop.
+  if (isHandoffFreshWindow(settings.storeDir)) return;
   let live: string | null = null;
   try {
     live = ctx.sessionManager?.getSessionFile?.() ?? null;
@@ -3718,11 +3726,8 @@ export async function maybeHandoffRestart(
   } catch {
     return; // file gone — nothing to gate on
   }
-  if (size <= settings.restartFileCap) return;
   const mb = (size / (1024 * 1024)).toFixed(1);
-  console.log(
-    `[handoff] session file ${mb}MB > cap ${settings.restartFileCap}B - restart op`,
-  );
+  console.log(`[handoff] compact settled - restart op (session file ${mb}MB)`);
   // F4: the op marker carries seeded:false — the respawn's session_start
   // seeds the fresh session from the doc (the ONLY seed gate). F5: move
   // the EXPLICIT live file at shutdown; F2: archive the other stale
