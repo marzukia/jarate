@@ -6376,18 +6376,19 @@ describe("handoff mechanism B (size-gated restart)", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("under the cap: compaction settles, no restart op", async () => {
-    writeSettings({ enabled: true, restartFileCap: 10_000_000, storeDir });
+  test("every compact restarts (issue #85 follow-up): small file, no cap check", async () => {
+    // The file-size cap is gone: any handoff-qualifying compact restarts.
+    // liveFile is 1KB from beforeEach — it still restarts.
+    writeSettings({ enabled: true, storeDir });
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
-    expect(isCompacting("ch1")).toBe(true);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
     await waitOpShutdown();
-    expect(isCompacting("ch1")).toBe(false);
-    expect(channelPosts().some((t) => t.includes("handing-off"))).toBe(false);
-    expect(restarter).toEqual([]);
-    expect(shutdowns).toBe(0);
-    expect(fs.existsSync(markerPath())).toBe(false);
-    expect(fs.existsSync(liveFile)).toBe(true); // file untouched
+    expect(shutdowns).toBe(1);
+    expect(restarter).toEqual(["pi.service"]);
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(marker.seeded).toBe(false);
+    expect(fs.existsSync(liveFile)).toBe(false); // moved aside
   });
 
   test("over the cap: restart op — placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
@@ -6451,10 +6452,9 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(markerPath())).toBe(false);
   });
 
-  test("default cap (2MB, issue #85): a 262k-window compact (2.5MB file) crosses it → restart op", async () => {
-    // no restartFileCap in settings → the default applies. A full 262k
-    // context compact writes a 1–5MB file: under the old 64MB default the
-    // restart was unreachable, at 2MB it lands.
+  test("every compact restarts (issue #85 follow-up): 2.5MB file, no cap check", async () => {
+    // The file-size cap is gone: the restart fires on every handoff
+    // qualifying compact regardless of file size.
     writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(2_621_440)); // 2.5 MB
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
@@ -6469,16 +6469,23 @@ describe("handoff mechanism B (size-gated restart)", () => {
     );
   });
 
-  test("default cap (2MB): a small-context compact (1KB file) settles in place", async () => {
+  test("fresh window guard: a just-seeded session does not immediately re-restart", async () => {
     writeSettings({ enabled: true, storeDir });
-    // liveFile is 1KB from beforeEach: under the 2MB default cap
+    // Write a fresh handover doc (latest.md with an updated: timestamp)
+    // so isHandoffFreshWindow returns true.
+    const docFile = path.join(storeDir, "latest.md");
+    fs.mkdirSync(storeDir, { recursive: true });
+    fs.writeFileSync(
+      docFile,
+      `# Handover\nupdated: ${new Date().toISOString()}\n`,
+    );
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
     await waitOpShutdown();
+    // The restart op was skipped (fresh window) — no shutdown.
     expect(shutdowns).toBe(0);
     expect(restarter).toEqual([]);
-    expect(fs.existsSync(liveFile)).toBe(true);
-    expect(fs.existsSync(markerPath())).toBe(false);
+    expect(fs.existsSync(liveFile)).toBe(true); // file untouched
   });
 
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
