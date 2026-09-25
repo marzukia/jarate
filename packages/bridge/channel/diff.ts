@@ -876,6 +876,9 @@ export async function publishDiff(
   const html = renderDiffHtml(diffText, src.label, DEFAULT_TTL);
   const r = await publishHtml(html, cfg);
   if (r.error) return `[!] ${r.error}`;
+  // #87 contract: the URL is the LAST line, by itself. The /diff case in
+  // index.ts fences the status line and leaves the URL bare so Discord
+  // links it (a fenced URL is monospace, not clickable).
   return (
     `[ok] ${src.label} · ${stats.files} file${stats.files === 1 ? "" : "s"} ` +
     `+${stats.adds} -${stats.dels} · ttl ${DEFAULT_TTL}\n${r.url}`

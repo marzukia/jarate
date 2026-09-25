@@ -7390,10 +7390,10 @@ describe("/diff (issue #7)", () => {
 
   test("/diff publishes the working tree diff and replies with url + stats", async () => {
     await handleInbound(pi, inbound("/diff", "dm1"), ctx);
+    // #87: the viewer URL ships bare after the fence (clickable), the
+    // status line stays fenced
     expect(replyContent()).toBe(
-      fence(
-        "[ok] working tree · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
-      ),
+      `${fence("[ok] working tree · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
     );
     const up = fetchCalls.find((c) =>
       c.url.startsWith("https://drop.test/api/"),
@@ -7417,10 +7417,9 @@ describe("/diff (issue #7)", () => {
       ),
       ctx,
     );
+    // #87: bare URL after the fence, same split as the worktree path
     expect(replyContent()).toBe(
-      fence(
-        "[ok] pasted diff · 1 file +1 -1 · ttl 7d\nhttps://drop.test/feedd00d.html",
-      ),
+      `${fence("[ok] pasted diff · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
     );
   });
 

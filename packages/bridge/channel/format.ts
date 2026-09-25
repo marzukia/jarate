@@ -571,6 +571,47 @@ function isMachineLine(raw: string): boolean {
 }
 
 /**
+ * Auto-linkable http(s) URL tokens on a machine line (issue #87).
+ * Returns each bare URL plus the range to remove from the line. A
+ * `<url>` autolink or `url` inline-code wrapper immediately around the
+ * URL is absorbed into the range, so removing the range removes the
+ * wrapper too. A URL inside a quoted or code-spanned region that opened
+ * EARLIER on the line (a JSON string value, a mixed-content span) is not
+ * linkable here - removing it would break the quoted content - and is
+ * skipped. Trailing sentence punctuation (.,;:!?)]) is not part of the
+ * URL. Exported for tests.
+ */
+export function extractMachineUrls(
+  line: string,
+): { url: string; start: number; end: number }[] {
+  const found: { url: string; start: number; end: number }[] = [];
+  const re = /https?:\/\/[^\s"'<>`]+/g;
+  let m: RegExpExecArray | null = re.exec(line);
+  while (m !== null) {
+    const s = m.index;
+    let e = m.index + m[0].length;
+    while (e > s && /[.,;:!?)\]]/.test(line[e - 1]!)) e--;
+    const wrapped =
+      (line[s - 1] === "<" && line[e] === ">") ||
+      (line[s - 1] === "`" && line[e] === "`");
+    const ws = wrapped ? s - 1 : s;
+    const we = wrapped ? e + 1 : e;
+    const before = line.slice(0, ws);
+    if (
+      (before.match(/"/g)?.length ?? 0) % 2 === 1 ||
+      (before.match(/'/g)?.length ?? 0) % 2 === 1 ||
+      (before.match(/`/g)?.length ?? 0) % 2 === 1
+    ) {
+      m = re.exec(line);
+      continue;
+    }
+    found.push({ url: line.slice(s, e), start: ws, end: we });
+    m = re.exec(line);
+  }
+  return found;
+}
+
+/**
  * Deterministic mechanical fence pass (STYLE.md 2.7 / 4.4). Post-format
  * only: takes already-formatted markdown and fences top-level machine
  * state. Every /command reply and every machine output (script errors,
@@ -583,6 +624,9 @@ function isMachineLine(raw: string): boolean {
  *   until the braces balance; a blank line or an existing fence stops it
  *   (100-line cap).
  * - Lines already inside a fence are untouched (no double-fence).
+ * - A URL on a machine line is hoisted to a BARE line after the fence
+ *   (issue #87): a fenced URL is monospace, not clickable, and the
+ *   clickability passes run before this one.
  * - Fenced lines are kept to the 40-col budget via wrapFenceLine.
  * - Pure, fast (single pass, anchored patterns), and idempotent:
  *   styleGuard(styleGuard(x)) === styleGuard(x).
@@ -637,9 +681,30 @@ export function styleGuard(md: string): string {
       depth = braceDepth(nxt);
     }
     const marker = block.some((l) => l.includes("```")) ? "````" : "```";
-    out.push(marker);
-    for (const bl of block) out.push(...wrapFenceLine(bl, FRAME_COL_MAX));
-    out.push(marker);
+    // #87: URLs on machine lines must not be trapped in this NEW fence -
+    // the URL-clickability passes already ran. Hoist each URL to a bare
+    // line AFTER the fence so Discord links it; the line's remainder
+    // stays fenced and is dropped if it is empty or punctuation-only.
+    const hoisted: string[] = [];
+    const rest: string[] = [];
+    for (const bl of block) {
+      const urls = extractMachineUrls(bl);
+      if (urls.length === 0) {
+        rest.push(bl);
+        continue;
+      }
+      let r = bl;
+      for (const u of urls) r = r.slice(0, u.start) + r.slice(u.end);
+      r = r.replace(/[ \t]+/g, " ").trim();
+      if (/\w/.test(r)) rest.push(r);
+      for (const u of urls) hoisted.push(u.url);
+    }
+    if (rest.length > 0) {
+      out.push(marker);
+      for (const rl of rest) out.push(...wrapFenceLine(rl, FRAME_COL_MAX));
+      out.push(marker);
+    }
+    out.push(...hoisted);
   }
   return out.join("\n");
 }

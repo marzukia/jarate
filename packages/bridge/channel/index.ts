@@ -4178,6 +4178,14 @@ async function runChannelCommand(
       // channel members, like /jobs.
       try {
         const text = await publishDiff(ctx.cwd, arg);
+        // #87: the viewer URL is the one link the user asked for - a
+        // fenced URL is monospace, not clickable. Fence the status line,
+        // leave the URL bare (publishDiff keeps the URL on its own last
+        // line for exactly this split).
+        const nl = text.lastIndexOf("\n");
+        const last = nl > 0 ? text.slice(nl + 1) : "";
+        if (/^https?:\/\/\S+$/i.test(last))
+          return { immediate: `${fence(text.slice(0, nl))}\n${last}` };
         return { immediate: fence(text) };
       } catch {
         return { immediate: fence("[!] diff publish failed") };
