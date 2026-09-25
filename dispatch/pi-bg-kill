@@ -5,7 +5,9 @@
 # printed on stdout): /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.
 # service/pi-bg/<ticket-id>/. Killing via the cgroup is precise: only this
 # run's process tree dies, nothing else.
-# usage: pi-bg-kill <ticket-id> [--dry-run]
+# usage: pi-bg-kill <ticket-id|short-suffix> [--dry-run]
+#   ticket id is YYYYMMDD-HHMMSS-NNNNN; a 7+ digit suffix is resolved via
+#   the run records (~/.pi-dispatch/runs) when it matches exactly one run
 #   --dry-run  print the process tree that WOULD be killed; change nothing
 # real kill: SIGTERM to every member AND the ticket's process group (issue
 # #56: pi-bg runs under setsid - the wrapper is the session leader, the pi
@@ -26,12 +28,16 @@ BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
+# run records (issue #51 + #86 short-id resolution): the same dir pi-bg
+# writes state=running/done/killed records into. Defined up front: the id
+# validator below resolves short ids against it.
+REC_DIR="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 
 id="" dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1; shift ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*) echo "unknown arg: $1 (want <ticket-id> [--dry-run])" >&2; exit 2 ;;
     *)
       if [ -z "$id" ]; then id="$1";
@@ -42,8 +48,39 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$id" ] || { echo "usage: pi-bg-kill <ticket-id> [--dry-run]" >&2; exit 2; }
 if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
-  echo "pi-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
-  exit 2
+  # Short id (issue #86): the strict full-id regex used to be the only
+  # accepted form, so the natural cleanup call `pi-bg-kill 2332046` exited
+  # 2; with the caller's stderr on /dev/null (as the incident loop had it)
+  # that was a silent no-op and four live workers died un-killled. A
+  # 7+ digit numeric arg is resolved against the run records: the ticket
+  # suffix must match EXACTLY ONE record file. 0 matches or 2+ matches ->
+  # exit 2 with a clear error on stderr (check the exit code; read stderr).
+  if [[ "$id" =~ ^[0-9]{7,}$ ]]; then
+    matches=()
+    for rf in "$REC_DIR"/pi-bg-*.json; do
+      [ -f "$rf" ] || continue
+      base="${rf##*/}"; base="${base#pi-bg-}"; base="${base%.json}"
+      [[ "$base" =~ ^[0-9]{8}-[0-9]{6}-([0-9]{7,})$ ]] || continue
+      [ "${BASH_REMATCH[1]}" = "$id" ] && matches+=("$base")
+    done
+    case "${#matches[@]}" in
+      1)
+        echo "pi-bg-kill: short id $id -> ${matches[0]} (run record)" >&2
+        id="${matches[0]}"
+        ;;
+      0)
+        echo "pi-bg-kill: no run record in $REC_DIR matches short id '$id' (want the full id, or a unique 7+ digit suffix)" >&2
+        exit 2
+        ;;
+      *)
+        echo "pi-bg-kill: short id '$id' is ambiguous, matches: ${matches[*]} (use the full id)" >&2
+        exit 2
+        ;;
+    esac
+  else
+    echo "pi-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix resolved from $REC_DIR)" >&2
+    exit 2
+  fi
 fi
 
 # temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the
@@ -165,7 +202,18 @@ while :; do
   sleep 0.5
 done
 if [ "$gone" -eq 0 ]; then
-  echo 1 > "$CG/cgroup.kill" 2>/dev/null || true
+  # cgroup.kill guard (issue #86): cgroup.kill nukes every CURRENT member,
+  # so it is only safe on an EMPTY cgroup - "stale" means no processes.
+  # Non-empty here: the targeted per-pid/group SIGKILL below is the kill
+  # path; a blind cgroup.kill in this window would kill whatever shows up
+  # next. 2026-09-25: a cleanup loop wrote cgroup.kill on four LIVE ticket
+  # cgroups and killed four workers mid-run (one 2s after its last tool
+  # call). Live PIDs -> warning, no write.
+  if [ -z "$(cg_procs)" ]; then
+    echo 1 > "$CG/cgroup.kill" 2>/dev/null || true
+  else
+    echo "pi-bg-kill: warning: $CG not empty (live PIDs), skipping cgroup.kill - per-pid SIGKILL only" >&2
+  fi
   for p in $pids0; do kill -KILL "$p" 2>/dev/null; done
   for g in $gl; do kill -KILL "-$g" 2>/dev/null; done
 fi
@@ -193,7 +241,6 @@ printf '%s killed %s by %s after %ss; pids: %s\n' \
 # already marked it "done" (its trap runs before the drain confirms); for
 # an operator kill "killed" is the final state. Same audit-only posture
 # as pi-bg: a missing/corrupt record never breaks the kill path.
-REC_DIR="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 if [ -f "$REC_DIR/pi-bg-${id}.json" ]; then
   PI_BG_REC_STATE="killed" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
 import datetime, json, os, sys
