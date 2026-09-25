@@ -598,3 +598,93 @@ describe("styleGuard", () => {
     expect(mdToDiscord(out)).toBe(out);
   });
 });
+
+// ─── styleGuard URL hoisting (issue #87) ─────────────────────────────────
+
+describe("styleGuard: URLs on machine lines stay clickable (#87)", () => {
+  const F = (s: string) => `\`\`\`
+${s}
+\`\`\``;
+
+  test("tag+URL line through mdToDiscord ends with a bare URL outside any fence", () => {
+    const url = "https://webdrop.example/f/abc123";
+    const out = mdToDiscord(`[ok] uploaded: ${url}`);
+    const lines = out.split("\n");
+    // last line is the bare URL; nothing after it
+    expect(lines.at(-1)).toBe(url);
+    // the URL appears exactly once and no fence delimiter follows it
+    expect(out.split(url)).toHaveLength(2);
+    expect(out.slice(out.indexOf(url))).not.toContain("```");
+    // the line's remainder stayed fenced
+    expect(out).toContain("[ok] uploaded:");
+  });
+
+  test("autolink <url> and backticked url on a tag line hoist bare", () => {
+    const out = styleGuard("[ok] see <https://x.test/file> for details");
+    const lines = out.split("\n");
+    expect(lines.at(-1)).toBe("https://x.test/file");
+    expect(lines[0]).toBe("```");
+    expect(lines.at(-2)).toBe("```");
+    expect(lines.slice(1, -2)).toEqual(["[ok] see for details"]);
+    // the pipeline already turns `url` spans into <url> (autolink form)
+    const out2 = mdToDiscord("[ok] see `https://x.test/file` for details");
+    expect(out2.split("\n").at(-1)).toBe("https://x.test/file");
+  });
+
+  test("remainder empty or punctuation-only -> fence dropped, URL bare", () => {
+    // [!] carries no word char: nothing left to fence
+    expect(styleGuard("[!] https://x.test/a")).toBe("https://x.test/a");
+  });
+
+  test("URL inside a quoted JSON value stays fenced, untouched", () => {
+    const input = '{\n  "url": "https://x.test/a"\n}';
+    expect(styleGuard(input)).toBe(F(input));
+  });
+
+  test("trailing sentence punctuation is not part of the hoisted URL", () => {
+    const out = styleGuard("[ok] got it: https://x.test/a.");
+    expect(out.split("\n").at(-1)).toBe("https://x.test/a");
+  });
+
+  test("machine block: url lines hoist after the shared fence", () => {
+    const out = styleGuard(
+      "[ok] built https://x.test/a\n[!] log https://x.test/b",
+    );
+    const lines = out.split("\n");
+    expect(lines.at(-1)).toBe("https://x.test/b");
+    expect(lines.at(-2)).toBe("https://x.test/a");
+    expect(lines.at(-3)).toBe("```");
+    expect(lines[0]).toBe("```");
+  });
+
+  test("idempotent: styleGuard(styleGuard(x)) === styleGuard(x)", () => {
+    const inputs = [
+      "[ok] uploaded: https://x.test/a",
+      "[ok] see <https://x.test/file> for details",
+      "[!] https://x.test/a",
+      '{\n  "url": "https://x.test/a"\n}',
+      "```\n[ok] x\n```\nhttps://x.test/a",
+    ];
+    for (const input of inputs) {
+      const once = styleGuard(input);
+      expect(styleGuard(once)).toBe(once);
+    }
+  });
+
+  test("mdToDiscord: /diff shape keeps the URL bare after the fence", () => {
+    const status = "[ok] working tree · 3 files +12 -3 · ttl 7d";
+    const url = "https://drop.junkyard.sh/abc123";
+    // what the /diff case now posts: fenced status, bare URL after
+    const posted = `\`\`\`
+${status}
+\`\`\`
+${url}`;
+    const out = mdToDiscord(posted);
+    expect(out.split("\n").at(-1)).toBe(url);
+    expect(out.slice(out.indexOf(url))).not.toContain("```");
+    // the unfenced two-line /diff text lands the same way
+    const out2 = mdToDiscord(`${status}\n${url}`);
+    expect(out2.split("\n").at(-1)).toBe(url);
+    expect(out2.slice(out2.indexOf(url))).not.toContain("```");
+  });
+});
