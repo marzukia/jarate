@@ -6401,6 +6401,36 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(markerPath())).toBe(false);
   });
 
+  test("default cap (2MB, issue #85): a 262k-window compact (2.5MB file) crosses it → restart op", async () => {
+    // no restartFileCap in settings → the default applies. A full 262k
+    // context compact writes a 1–5MB file: under the old 64MB default the
+    // restart was unreachable, at 2MB it lands.
+    writeSettings({ enabled: true, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(2_621_440)); // 2.5 MB
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    expect(shutdowns).toBe(1);
+    expect(restarter).toEqual(["pi.service"]);
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(marker.finalText).toBe(
+      "[ok] context handoff -> new session (file was 2.5 MB)",
+    );
+  });
+
+  test("default cap (2MB): a small-context compact (1KB file) settles in place", async () => {
+    writeSettings({ enabled: true, storeDir });
+    // liveFile is 1KB from beforeEach: under the 2MB default cap
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    expect(shutdowns).toBe(0);
+    expect(restarter).toEqual([]);
+    expect(fs.existsSync(liveFile)).toBe(true);
+    expect(fs.existsSync(markerPath())).toBe(false);
+  });
+
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
     writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
@@ -6504,6 +6534,200 @@ describe("handoff mechanism B (size-gated restart)", () => {
         t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
       ),
     ).toBe(true);
+  });
+});
+
+describe("handoff token gate: agent_settled re-check (issue #85)", () => {
+  // RC1: the gate's first shot fires from agent_end via a 0ms timer, but
+  // pi clears the run-active flag (isIdle → true) only in
+  // _emitAgentSettled — AFTER the awaited agent_end handler resolves. On
+  // any run whose handler awaits Discord I/O (live-text delete, re-wake)
+  // the timer fires while isIdle() is still false → silent bail. The
+  // agent_settled listener is the reliable shot: pi emits it exactly once
+  // per completed run, after every continuation.
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  let sessDir = "";
+  let liveFile = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  const realFetch = globalThis.fetch;
+
+  const CHANNELS = [
+    {
+      id: "ch1",
+      name: "Test",
+      type: "discord",
+      botToken: "tok1",
+      ownerUserId: "uid",
+      peerBotIds: ["bot-a"],
+      default: true,
+    },
+  ];
+
+  const tick = (ms = 25) => new Promise((r) => setTimeout(r, ms));
+
+  const writeSettings = (handoff: Record<string, unknown>) => {
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels: CHANNELS, handoff }),
+    );
+  };
+
+  const compactPosts = () =>
+    fetchCalls
+      .filter(
+        (c) => c.url.includes("/channels/ch1/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      )
+      .filter(
+        (t: unknown) =>
+          typeof t === "string" && t.includes("[..] compacting..."),
+      );
+
+  beforeEach(async () => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-a85-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, "home"), { recursive: true });
+    storeDir = path.join(tmp, "home", "handovers");
+    sessDir = path.join(tmp, "sessions");
+    fs.mkdirSync(sessDir, { recursive: true });
+    liveFile = path.join(sessDir, "live.jsonl");
+    fs.writeFileSync(liveFile, "x".repeat(1024));
+    fetchCalls = [];
+    (handlers as any) = {};
+    pi = {
+      on: (n: string, fn: any) => {
+        (handlers as any)[n] = fn;
+      },
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+    };
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      model: { id: "m", name: "M", provider: "p" },
+      modelRegistry: { getAvailable: () => [] },
+      sessionManager: {
+        getSessionFile: () => liveFile,
+        getSessionId: () => "sess-a85",
+      },
+      getContextUsage: () => ({
+        tokens: 222_822,
+        contextWindow: 262_144,
+        percent: 85,
+      }),
+      compact: () => {},
+      shutdown: () => {},
+      on: () => {},
+    };
+    (globalThis as any).fetch = jest.fn(async (url: any, init?: any) => {
+      fetchCalls.push({
+        method: init?.method ?? "GET",
+        url: String(url),
+        body: init?.body,
+      });
+      return { ok: true, status: 200, json: async () => ({ id: "out1" }) };
+    });
+    setProcessExitHookForTest(() => {});
+    writeSettings({ enabled: true, threshold: 0.8, storeDir });
+    seedChannelStateForTest("ch1", "ch1", path.join(tmp, ".tmp"));
+    setChannelCursor("ch1", "1000");
+    extension(pi as any);
+    // Re-point lastActiveChannel at THIS describe's ch1 (module state,
+    // leaked by earlier describes) and load channels for presence paths.
+    await handlers.session_start?.(null, ctx);
+  });
+  afterEach(() => {
+    setProcessExitHookForTest(null);
+    (globalThis as any).fetch = realFetch;
+    (handlers as any) = {};
+    clearAllCompacting();
+    stopAllOpTicks();
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("I/O-pending agent_end bails; agent_settled re-checks and fires", async () => {
+    // A run whose agent_end handler awaits Discord I/O (live-text delete,
+    // re-wake): pi has NOT cleared the run flag, so isIdle() is false
+    // while the 0ms gate timer from agent_end fires.
+    ctx.isIdle = () => false;
+    await handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false); // RC1: the agent_end shot bailed
+
+    // pi settles: _isAgentRunActive cleared, agent_settled emitted.
+    ctx.isIdle = () => true;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true); // the settled shot fired
+    expect(compactPosts()).toHaveLength(1);
+  });
+
+  test("re-wake active at agent_settled: skip; the re-wake's own settled fires", async () => {
+    // The re-wake continuation started from agent_end is still running
+    // (a run is active → isIdle false → the gate must yield to that run).
+    ctx.isIdle = () => false;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false);
+    // The re-wake run settles → its own agent_settled re-checks.
+    ctx.isIdle = () => true;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true);
+    expect(compactPosts()).toHaveLength(1);
+  });
+
+  test("I/O-free agent_end fires first; agent_settled double-fire is safe", async () => {
+    // The old lucky path: the handler settles I/O-free, so the agent_end
+    // 0ms timer runs the gate with isIdle() true and starts the compact.
+    ctx.isIdle = () => true;
+    await handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true);
+    // agent_settled's second shot must bail on the isCompacting guard —
+    // ONE compact window, ONE placeholder post.
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true);
+    expect(compactPosts()).toHaveLength(1);
+  });
+
+  test("under threshold at settled: no compact", async () => {
+    ctx.getContextUsage = () => ({
+      tokens: 131_072,
+      contextWindow: 262_144,
+      percent: 50,
+    });
+    ctx.isIdle = () => true;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false);
+    expect(compactPosts()).toHaveLength(0);
+  });
+
+  test("handoff disabled at settled: no compact", async () => {
+    writeSettings({ enabled: false, threshold: 0.8, storeDir });
+    ctx.isIdle = () => true;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(false);
+    expect(compactPosts()).toHaveLength(0);
   });
 });
 
