@@ -50,7 +50,7 @@ jobs:
         # needs jq, rg, python3 (all in the ubuntu image)
         run: cd bin && bun test
 
-  dispatch:
+  test:  # job name satisfies branch-protection required check "test"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
