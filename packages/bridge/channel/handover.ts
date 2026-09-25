@@ -86,7 +86,9 @@ export interface HandoffSettings {
    *  in for threshold compactions. Env: HANDOFF_THRESHOLD. */
   threshold: number;
   /** Session-file size that forces the restart-class op. Env:
-   *  HANDOFF_RESTART_FILE_CAP. */
+   *  HANDOFF_RESTART_FILE_CAP. Default 2MB (issue #85): a full 262k-window
+   *  compact writes 1–5MB of session file, so the old 64MB default made
+   *  the restart-class op effectively unreachable. */
   restartFileCap: number;
   /** sizeGuard hard cap for the doc, in tokens. */
   sizeGuardTokens: number;
@@ -97,7 +99,9 @@ export interface HandoffSettings {
 export const HANDOFF_DEFAULTS: HandoffSettings = {
   enabled: true,
   threshold: 0.8,
-  restartFileCap: 64_000_000,
+  // issue #85: lowered from 64MB — a 262k context is a 1–5MB file, so the
+  // old cap was unreachable and /compact never rotated the session.
+  restartFileCap: 2_000_000,
   sizeGuardTokens: 12_000,
   storeDir: "~/.jarate/handovers",
 };

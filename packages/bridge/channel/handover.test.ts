@@ -819,11 +819,13 @@ describe("resolveHandoffSettings", () => {
   const write = (p: string, obj: unknown) =>
     fs.writeFileSync(p, JSON.stringify(obj));
 
-  test("defaults: enabled TRUE (PR2), threshold 0.8, cap 64000000", () => {
+  test("defaults: enabled TRUE (PR2), threshold 0.8, cap 2000000 (issue #85)", () => {
     const s = resolveHandoffSettings(path.join(tmp, "proj"), {});
     expect(s.enabled).toBe(true);
     expect(s.threshold).toBe(0.8);
-    expect(s.restartFileCap).toBe(64_000_000);
+    // 2MB (was 64MB, issue #85): a full 262k-window compact writes a
+    // 1–5MB session file, so the old default made the restart unreachable.
+    expect(s.restartFileCap).toBe(2_000_000);
     expect(s.sizeGuardTokens).toBe(12_000);
     expect(s.storeDir).toBe("~/.jarate/handovers");
   });

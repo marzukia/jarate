@@ -2806,12 +2806,15 @@ export default function (pi: ExtensionAPI) {
     // re-wake continuation below) and cannot abort that run.
     flushPendingCompact(ctx);
 
-    // Proactive token-% gate (once per settled turn): context at/over the
-    // handoff threshold with nothing in flight → the same compact /compact
-    // runs. Deferred one macrotask like the size gate — if the re-wake run
-    // below starts before the timer fires, the gate skips (not idle) and
-    // that run's own agent_end re-checks. A flush-started compact above
-    // already owns the op window, so the gate yields to it.
+    // Proactive token-% gate (first shot): context at/over the handoff
+    // threshold with nothing in flight → the same compact /compact runs.
+    // Deferred one macrotask like the size gate — if the re-wake run below
+    // starts before the timer fires, the gate skips (not idle). The
+    // RELIABLE shot is the agent_settled listener below (issue #85): pi
+    // clears the run-active flag (isIdle → true) only AFTER this awaited
+    // handler resolves, so on runs that await Discord I/O the timer fires
+    // while isIdle() is still false and this shot bails. A flush-started
+    // compact above already owns the op window, so the gate yields to it.
     autoCompactByToken(pi, ctx);
 
     // Capture the run's channel BEFORE the re-wake await: a second channel's
@@ -2966,6 +2969,22 @@ export default function (pi: ExtensionAPI) {
           unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
       }
     }
+  });
+
+  // ─── Handoff token gate: settled re-check (issue #85) ─────────────────
+  // pi clears _isAgentRunActive (isIdle → true) only in _emitAgentSettled,
+  // which runs AFTER the awaited agent_end handler resolves. On any run
+  // whose handler awaits Discord I/O (live-text delete, re-wake) the
+  // agent_end 0ms timer fires while isIdle() is still false → the gate
+  // bails and is never re-run. pi emits agent_settled exactly once per
+  // completed run, after every continuation (a re-wake started from
+  // agent_end settles inside the same _runAgentPrompt), so at this point
+  // isIdle() is reliably true — except while a re-wake run is active, in
+  // which case the gate skips and that run's own agent_settled re-checks.
+  // The agent_end call above stays as a belt-and-braces first shot; the
+  // guards (isCompacting, fresh window) make a double-fire safe.
+  pi.on("agent_settled", (_event, ctx) => {
+    autoCompactByToken(pi, ctx);
   });
 }
 
@@ -3703,18 +3722,23 @@ export async function maybeHandoffRestart(
 }
 
 // ─── Handoff proactive gate: token-% auto-compact (design v2, PR3) ────────
-// Registered on agent_end: after EVERY settled turn, if the context is
-// at/over the handoff threshold (the same number shouldHandoff's
-// "threshold" reason uses — settings.threshold, default 0.8) and nothing
-// is in flight, start the SAME compact /compact runs (startCompact). The
-// handover doc is written by the session_before_compact path; the size
-// gate (handoffRestartForSize on session_compact) then decides the
-// restart as before. Composes with the size gate: token gate = "compact
-// when big in tokens", size gate = "restart when the file is big".
-// Covers the case the size gate misses: high token % + small session
-// file (many small messages). Deferred one macrotask (same model as
-// handoffRestartForSize): a re-wake run may start before the timer fires;
-// the idle check skips it and that run's own agent_end re-checks.
+// Registered on agent_end (first shot) and agent_settled (issue #85: the
+// reliable shot — pi clears the run-active flag only after the awaited
+// agent_end handler resolves, so on runs that await Discord I/O the
+// agent_end timer fires while isIdle() is still false and bails). After
+// EVERY settled turn, if the context is at/over the handoff threshold
+// (the same number shouldHandoff's "threshold" reason uses —
+// settings.threshold, default 0.8) and nothing is in flight, start the
+// SAME compact /compact runs (startCompact). The handover doc is written
+// by the session_before_compact path; the size gate
+// (handoffRestartForSize on session_compact) then decides the restart as
+// before. Composes with the size gate: token gate = "compact when big in
+// tokens", size gate = "restart when the file is big". Covers the case
+// the size gate misses: high token % + small session file (many small
+// messages). Deferred one macrotask (same model as handoffRestartForSize):
+// a re-wake run may start before the timer fires; the idle check skips it
+// and that run's own agent_settled re-checks. The guards (isCompacting,
+// fresh window) make a double-fire from both events safe.
 export function autoCompactByToken(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -3749,8 +3773,8 @@ export async function maybeAutoCompactByToken(
   // window covers the just-seeded session): don't re-compact.
   if (isHandoffInFlight()) return;
   if (isHandoffFreshWindow(settings.storeDir)) return;
-  // A re-wake run started after agent_end: let it settle — its own
-  // agent_end re-checks.
+  // A re-wake run started after agent_end (still active at agent_settled):
+  // let it settle — its own agent_settled re-checks.
   if (!ctx.isIdle()) return;
   let percent: number | null = null;
   try {
