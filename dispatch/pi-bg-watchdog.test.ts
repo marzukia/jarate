@@ -636,21 +636,21 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
         expect(r.out).not.toContain(`DEAD cwd/${t}`);
       }
       expect(f.posts).toHaveLength(1);
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t1), "utf8")).state,
-      ).toBe("running");
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t2), "utf8")).state,
-      ).toBe("running");
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t3), "utf8")).state,
-      ).toBe("done");
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t4), "utf8")).state,
-      ).toBe("running");
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t5), "utf8")).state,
-      ).toBe("killed");
+      expect(JSON.parse(fs.readFileSync(recFile(f, t1), "utf8")).state).toBe(
+        "running",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t2), "utf8")).state).toBe(
+        "running",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t3), "utf8")).state).toBe(
+        "done",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t4), "utf8")).state).toBe(
+        "running",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t5), "utf8")).state).toBe(
+        "killed",
+      );
       // live cgroup dir survives (sweep + reaper both skip members)
       expect(fs.existsSync(cgDir(f, t2))).toBe(true);
     } finally {
@@ -667,9 +667,9 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       expect(r.code).toBe(0);
       expect(r.out).toContain(`dry-run: would flag cwd ticket DEAD ${t}`);
       expect(f.posts).toHaveLength(0);
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state,
-      ).toBe("running");
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "running",
+      );
       expect(fs.existsSync(cgDir(f, t))).toBe(true);
     } finally {
       f.close();
@@ -696,9 +696,9 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       // the worktree sweep owns the flag; it does not mark records
       // (existing behavior), so the record stays running until the
       // age prune - the point here is exactly ONE flag, no double post
-      expect(
-        JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state,
-      ).toBe("running");
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "running",
+      );
     } finally {
       f.close();
     }
