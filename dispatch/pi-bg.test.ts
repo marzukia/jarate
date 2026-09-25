@@ -67,6 +67,7 @@ function fixture() {
   // session-prune vars (2026-09-23) must not leak from the ambient env
   delete env.PI_BG_PRUNE_AGE_H;
   delete env.PI_BG_KEEP_SESSION;
+  delete env.PI_BG_PRUNE_SESSIONS;
   delete env.PI_BG_RUN_START_EPOCH;
   // cap off by default: ambient fleet traffic (real pi-bg runs of this
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
@@ -2744,7 +2745,10 @@ exec /usr/bin/curl "$@"`,
  * (monky's box: 349MB worker + 56MB reviewer of dead transcripts). The
  * EXIT trap now drops the run's OWN transcript once it is past the age
  * floor (PI_BG_PRUNE_AGE_H, default 24h; 0 = no floor) and reaps the slug
- * dir when it is empty. PI_BG_KEEP_SESSION=1 kills pruning. It must never
+ * dir when it is empty. Pruning is an OPT-IN (PI_BG_PRUNE_SESSIONS=1);
+ * the default is KEEP (2026-09-25 incident: the old destructive default
+ * deleted live sessions with ~11B tokens of billing data). PI_BG_KEEP_
+ * SESSION=1 always wins (backwards-compat kill-switch). It must never
  * delete a transcript that is still younger than the floor (cost capture
  * + death-reason reads finish within seconds of the run) and never break
  * the callback.
@@ -2805,11 +2809,12 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
 
   const USAGE = { input: 100, output: 40, cacheRead: 0, cacheWrite: 0 };
 
-  test("N=0 (no floor): prunes the fresh session + empty slug dir, cost still captured, callback OK", async () => {
+  test("opt-in + N=0 (no floor): prunes the fresh session + empty slug dir, cost still captured, callback OK", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sessionPi(fx, USAGE);
     fx.env.PI_BG_PRUNE_AGE_H = "0";
+    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt-in: without it the default keeps
     fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE = "1"; // tokens only, no curl
     const h = hook();
     fx.env.PI_DISPATCH_WEBHOOK = h.url;
@@ -2829,6 +2834,7 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;
       delete fx.env.PI_BG_PRUNE_AGE_H;
+      delete fx.env.PI_BG_PRUNE_SESSIONS;
       delete fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE;
       h.close();
     }
@@ -2839,31 +2845,48 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
     fx.seedMainCreds();
     sessionPi(fx, USAGE);
     fx.env.PI_BG_PRUNE_AGE_H = "999999"; // ~114y: a fresh file never matches
+    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt in: the floor is what keeps it
     const r = await fx.run(["worker", "keep task"]);
     expect(r.code).toBe(0);
     expect(fs.existsSync(sessFile(fx))).toBe(true);
     expect(fs.existsSync(sessDir(fx))).toBe(true);
     delete fx.env.PI_BG_PRUNE_AGE_H;
+    delete fx.env.PI_BG_PRUNE_SESSIONS;
   });
 
-  test("PI_BG_KEEP_SESSION=1: session kept even with N=0 (no floor)", async () => {
+  test("PI_BG_KEEP_SESSION=1: session kept even with opt-in + N=0 (no floor)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sessionPi(fx, USAGE);
     fx.env.PI_BG_PRUNE_AGE_H = "0";
-    fx.env.PI_BG_KEEP_SESSION = "1";
+    fx.env.PI_BG_PRUNE_SESSIONS = "1";
+    fx.env.PI_BG_KEEP_SESSION = "1"; // keep wins over the opt-in
     const r = await fx.run(["worker", "keep session task"]);
     expect(r.code).toBe(0);
     expect(fs.existsSync(sessFile(fx))).toBe(true);
     expect(fs.existsSync(sessDir(fx))).toBe(true);
     delete fx.env.PI_BG_PRUNE_AGE_H;
+    delete fx.env.PI_BG_PRUNE_SESSIONS;
     delete fx.env.PI_BG_KEEP_SESSION;
   });
 
-  test("default 24h floor: a 2-day-old transcript is pruned + slug dir reaped", async () => {
+  test("default (no prune env): session KEPT even with N=0 (2026-09-25 flip)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.PI_BG_PRUNE_AGE_H = "0"; // no floor: only an opt-in could prune
+    const r = await fx.run(["worker", "default keep task"]);
+    expect(r.code).toBe(0);
+    expect(fs.existsSync(sessFile(fx))).toBe(true);
+    expect(fs.existsSync(sessDir(fx))).toBe(true);
+    delete fx.env.PI_BG_PRUNE_AGE_H;
+  });
+
+  test("default 24h floor + opt-in: a 2-day-old transcript is pruned + slug dir reaped", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sessionPi(fx, USAGE, "2 days ago");
+    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt in: the default would keep it
     // backdate the run start FURTHER than the file mtime so bg_session_file
     // still discovers it (2d old > 3d run start) while the file is past the
     // default 24h floor
@@ -2874,7 +2897,21 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
     expect(r.code).toBe(0);
     expect(fs.existsSync(sessFile(fx))).toBe(false);
     expect(fs.existsSync(sessDir(fx))).toBe(false);
+    delete fx.env.PI_BG_PRUNE_SESSIONS;
     delete fx.env.PI_BG_RUN_START_EPOCH;
+  });
+
+  test("no --project: run record still gets tokens (2026-09-25 ledger fix)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sessionPi(fx, USAGE);
+    fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE = "1"; // tokens only, no curl
+    const r = await fx.run(["worker", "untagged cost task"]);
+    expect(r.code).toBe(0);
+    const rec = fx.records()[0];
+    expect(rec.project).toBeNull();
+    expect(rec.tokens?.total).toBe(140); // input+output (no cache in USAGE)
+    delete fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE;
   });
 
   test("no session file (plain stub pi): nothing to prune, run OK", async () => {

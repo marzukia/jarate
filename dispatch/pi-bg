@@ -17,10 +17,12 @@
 #   usage error (rc 2, no side effects). Stored in the run record
 #   ("project": tag | null). At exit the run's session tokens +
 #   OpenRouter-list cost (qwen/qwen3.8-27b rate, 24h price cache in
-#   $PI_BG_TMPDIR/pi-bg-price-cache.json) are attributed to the record
-#   and one "│ pj <tag> · $<cost>" line is appended to the callback
-#   embed. Cost capture is bounded + failure-tolerant: it never blocks
-#   or fails the callback (no session file / price error -> null fields).
+#   $PI_BG_TMPDIR/pi-bg-price-cache.json) are attributed to the record on
+#   EVERY run (2026-09-25: the token ledger must not depend on the tag),
+#   and one "│ pj <tag> · $<cost>" line is appended to the callback embed
+#   when a tag was given. Cost capture is bounded + failure-tolerant: it
+#   never blocks or fails the callback (no session file / price error ->
+#   null fields).
 #
 #   jarate projects / projects-backfill roll up records by tag (docs/JARATE.md).
 #
@@ -690,15 +692,14 @@ rec["state"] = os.environ.get("PI_BG_REC_STATE", "done")
 rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 json.dump(rec, open(p, "w"), indent=2)
 PY
-  # cost capture (2026-09-18, --project): attribute this run's session
-  # tokens + cost on EVERY terminal path (done/failed/DIED/killed). The
-  # main flow already captured before its callback so the embed line
-  # carries the real number; this second call is a cache-hit re-read
-  # (idempotent) that covers the paths it did not. Bounded + failure-
-  # tolerant; the echo feeds BG_PJ_COST for the DIED embed line.
-  if [ -n "$pj_tag" ]; then
-    BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
-  fi
+  # cost capture (2026-09-18, --project; 2026-09-25: every run): attribute
+  # this run's session tokens + cost on EVERY terminal path
+  # (done/failed/DIED/killed), with or without a project tag. The main flow
+  # already captured before its callback so the embed line carries the real
+  # number; this second call is a cache-hit re-read (idempotent) that covers
+  # the paths it did not. Bounded + failure-tolerant; the echo feeds
+  # BG_PJ_COST for the DIED embed line.
+  BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
 }
 
 # bg_on_exit: cgroup cleanup + the 'died without report' fallback + per-run
@@ -779,12 +780,14 @@ bg_on_exit() {
   # deploy-swap guard: drop the per-run script snapshot (a hard link to the
   # startup inode; git already replaced the checkout path)
   [ -n "${SNAP_DIR:-}" ] && rm -rf "$SNAP_DIR" 2>/dev/null || true
-  # session prune (2026-09-23): drop this run's own session transcript so
-  # worker/reviewer .jsonl files stop piling up forever. LAST side effect on
-  # purpose: the cost capture (main flow + bg_mark_record above) and the
-  # DIED death-reason read have already had their chance. Floor-gated
-  # (PI_BG_PRUNE_AGE_H, default 24h), PI_BG_KEEP_SESSION=1 kills it, and it
-  # is failure-tolerant: it never fails the exit or the callback.
+  # session prune (2026-09-23; default flipped to KEEP 2026-09-25 after a
+  # prune deleted live billing data): when opted in (PI_BG_PRUNE_SESSIONS=1)
+  # drop this run's own session transcript so worker/reviewer .jsonl files
+  # stop piling up forever. LAST side effect on purpose: the cost capture
+  # (main flow + bg_mark_record above) and the DIED death-reason read have
+  # already had their chance. Floor-gated (PI_BG_PRUNE_AGE_H, default 24h),
+  # PI_BG_KEEP_SESSION=1 kills it, and it is failure-tolerant: it never
+  # fails the exit or the callback.
   bg_prune_session
 }
 
@@ -793,17 +796,23 @@ bg_on_exit() {
 # nothing ever deleted; the operator swept them by hand). The transcript is
 # only needed while the run is live (cost capture, death reason) - everything
 # reads it within seconds, and the age floor keeps it for any late re-read:
-#   - floor: delete only once the file is at least ${PI_BG_PRUNE_AGE_H:-24}
-#     hours old (N*60 minutes, checked with find -mmin +N*60; N=0 = no
-#     floor, any age matches - test hook). Non-integer N falls back to 24.
-#   - PI_BG_KEEP_SESSION=1: never delete (operator kill-switch). Default =
-#     prune.
+#   - DEFAULT = KEEP. The old default (prune) deleted live sessions and
+#     lost ~11B tokens of billing data (2026-09-25 incident); pruning is
+#     now an opt-in.
+#   - PI_BG_PRUNE_SESSIONS=1: opt in to pruning. Absent/0 = keep.
+#   - PI_BG_KEEP_SESSION=1: never delete (operator kill-switch + the
+#     backwards-compat opt-out; keep always wins over prune).
+#   - floor: even when opted in, delete only once the file is at least
+#     ${PI_BG_PRUNE_AGE_H:-24} hours old (N*60 minutes, checked with find
+#     -mmin +N*60; N=0 = no floor, any age matches - test hook).
+#     Non-integer N falls back to 24.
 #   - after deleting, rmdir the slug dir if it is now empty (no 100s of
 #     empty <slug> dirs left behind). rmdir only removes empty dirs.
 #   - single confirmed file only: never glob-deletes. Any error (missing
 #     file, missing dir, permissions) -> return 0; never fails the run.
 bg_prune_session() {
   local sf sf_dir n
+  [ "${PI_BG_PRUNE_SESSIONS:-}" = "1" ] || return 0
   [ "${PI_BG_KEEP_SESSION:-}" = "1" ] && return 0
   sf="$(bg_session_file)" || sf=""
   [ -n "$sf" ] && [ -f "$sf" ] || return 0
@@ -891,7 +900,9 @@ bg_session_file() {
 # bg_capture_cost: attribute THIS run's session tokens + OpenRouter-list cost
 # to the run record (2026-09-18, --project, invoice itemisation). Echoes the
 # cost (2dp) for the callback project line; empty echo = cost unknown.
-#   - only runs when --project was set (pj_tag); never fails the run
+#   - runs on EVERY run, tag or not (2026-09-25: the --project gate left
+#     82/87 records with null tokens); the "│ pj" callback line itself
+#     stays project-gated. Never fails the run
 #   - no session file / no assistant usage -> tokens+cost+model+price_ts null
 #   - JARATE_TOKEN_COST_PRICING_OFFLINE set -> tokens only, cost null
 #   - price: qwen/qwen3.8-27b OpenRouter LIST rate (same convention as
@@ -899,7 +910,6 @@ bg_session_file() {
 #     $PI_BG_TMPDIR/pi-bg-price-cache.json; one bounded curl on cache miss;
 #     ANY fetch/parse failure -> cost null + price_error (tokens still kept)
 bg_capture_cost() {
-  [ -n "$pj_tag" ] || return 0
   [ -f "$rec_dir/pi-bg-${run_id}.json" ] || return 0
   PI_BG_PJ_FILE="$rec_dir/pi-bg-${run_id}.json" \
   PI_BG_PJ_CACHE="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}/pi-bg-price-cache.json" \
@@ -1273,13 +1283,14 @@ if command -v webdrop >/dev/null 2>&1; then
   ourl="$(webdrop "$of" "pi-bg-${run_id}-out" --ttl 7d 2>/dev/null | tail -1)" || ourl=""
 fi
 
-# project tag (2026-09-18): attribute this run's session tokens + cost to
-# the record BEFORE the callback is built, so the embed's project line
-# carries the real number. Bounded + failure-tolerant: never blocks or
-# fails the callback (no session file / price error -> null fields, "$-").
-if [ -n "$pj_tag" ]; then
-  BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
-fi
+# cost capture (2026-09-18 --project; 2026-09-25: every run): attribute
+# this run's session tokens + cost to the record BEFORE the callback is
+# built, so the record's token ledger is complete on every terminal path
+# and the embed's project line carries the real number. Bounded +
+# failure-tolerant: never blocks or fails the callback (no session file /
+# price error -> null fields, "$-"). The "│ pj" callback line itself stays
+# project-gated (bg_build).
+BG_PJ_COST="$(bg_capture_cost)" || BG_PJ_COST=""
 
 if [ -n "$webhook" ]; then
   brief="${out:0:400}"
