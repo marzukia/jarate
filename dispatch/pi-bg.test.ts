@@ -905,7 +905,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("below cap: all stubs start and complete", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10);
     const base = countLivePiBg();
     const max = base + 3;
     const stubs = [1, 2, 3].map((i) =>
@@ -928,7 +928,11 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("at cap: next dispatch refused (exit 5, cap line, no run record)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    // 10s sleep: the /proc scan in the cap check is slow on busy CI
+    // runners (hundreds of processes). 3s was not enough — the stubs
+    // expired before the record write, and the waitFor for 2 records
+    // timed out (15s). 10s gives the scan room.
+    sleepStubPi(fx, 10);
     const base = countLivePiBg();
     const max = base + 2;
     const a = spawnStub(fx, "cap t2 stub a", {
@@ -1031,7 +1035,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("PI_BG_MAX_CONCURRENT=0: unlimited (4 in flight, above default 3)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10);
     const base = countLivePiBg();
     const stubs = [1, 2, 3, 4].map((i) =>
       spawnStub(fx, `cap t4 stub ${i}`, { PI_BG_MAX_CONCURRENT: "0" }),
