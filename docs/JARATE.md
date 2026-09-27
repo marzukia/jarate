@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "rag", "projects", "projects-backfill", "agents-check", "agents-bless"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "rag", "projects", "projects-backfill", "agents-check", "agents-bless", "pat-request", "pat-run", "pat-status"]}
 ```
 
 ## Commands
@@ -254,6 +254,42 @@ unreadable/missing (nothing is written then). Manifest write is atomic
   fallback `~/AGENTS.md`); the manifest stays at `~/.pi/agent/.agents-md-hash`
   unless the override moves it next to the checked file.
 
+### `pat-request <scope> <reason...>`
+
+Ask the channel owner for a GitHub PAT. The bridge posts an
+Approve/Deny button message to the agent channel. rc 0 ok | 1 vault
+error | 2 usage. Scope: `default` (classic PAT) or `owner/repo:read|write`
+(fine-grained; token file in `~/.config/marzukia-pats/`). Full runbook:
+`docs/PAT-VAULT.md`.
+
+```json
+{"ok": true, "id": "pat_5b0e...", "state": "pending", "ttl": "2026-09-26T12:05:00Z"}
+```
+
+### `pat-run <request-id> -- <cmd> [args...]`
+
+Run ONE command under the approved token (single-use id). The child gets
+`GH_TOKEN` + git env-config header + `GIT_TERMINAL_PROMPT=0`; the token
+never appears in argv or on stdout. Child stdout/stderr pass through
+verbatim; the wrapper exits with the **child's rc**. Exit 124 (no JSON
+doc) = the command hit `JARATE_PAT_RUN_TIMEOUT_S` (default 900s). rc 1
++ JSON doc = vault error, command never ran (`state: pending` / `expired`
+/ `already used`, `unknown id`, `scope: token file missing ...`).
+
+Tool path (LLM): the whole tail is ONE word; first token = id, rest is a
+raw string parsed by shell-words (no expansion, no shell). Quoting
+semantics + the bash-vs-tool path difference: `docs/PAT-VAULT.md`.
+
+### `pat-status [request-id]`
+
+Read-only. No id = this agent's non-terminal requests + budget headroom
+(5 approvals/hour rolling). With id = the full record. The token is never
+in the output.
+
+```json
+{"ok": true, "pending": [{"id": "pat_5b0e...", "state": "approved", "scope": "marzukia/jarate:write", "claim_deadline": "..."}], "budget": {"approvals_last_hour": 2, "cap": 5}}
+```
+
 ## Env overrides (tests + machines)
 
 | Var | Meaning |
@@ -266,6 +302,13 @@ unreadable/missing (nothing is written then). Manifest write is atomic
 | `JARATE_RECALL_CLI` | explicit path to the recall CLI |
 | `JARATE_AGENTS_MD` | explicit AGENTS.md path (else `~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md`) |
 | `JARATE_ROOT` | repo root for the bundled recall (auto-detected otherwise) |
+| `JARATE_PAT_DIR` | PAT vault socket dir (default `$XDG_RUNTIME_DIR/jarate`) |
+| `JARATE_PAT_FILE_DIR` | vault published-file dir (default `$XDG_RUNTIME_DIR/jarate-pat`) |
+| `JARATE_PAT_PATS_DIR` | fine-grained token store (default `~/.config/marzukia-pats`) |
+| `JARATE_PAT_AUDIT_FILE` | audit log (default `~/.jarate/pat-audit.log`) |
+| `JARATE_PAT_TRANSPORT` | `socket` (default) or `file` (bridge side) |
+| `JARATE_PAT_RUN_TIMEOUT_S` | `pat-run` command cap in seconds (default 900) |
+| `JARATE_PAT_BIN` | explicit path to the jarate-pat wrapper (tests) |
 
 ## Consumers
 

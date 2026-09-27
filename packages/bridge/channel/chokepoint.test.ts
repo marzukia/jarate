@@ -103,6 +103,7 @@ describe("egress choke point", () => {
       "sendFilesToDiscord",
       "respondToInteraction",
       "editInteractionMessage",
+      "sendInteractionFollowup",
     ];
     for (const fn of senders) {
       expect(functionBody(fn), `${fn} must call egressText`).toContain(

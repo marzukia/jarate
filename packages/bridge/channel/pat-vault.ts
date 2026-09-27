@@ -1,0 +1,1285 @@
+/**
+ * PAT vault — one GitHub token, handed from the bridge to an agent for
+ * exactly one command, after exactly one human button tap.
+ *
+ * Security invariants (design v4 §11):
+ *   1. Only the bridge reads a PAT file — at handoff (socket mode) or at
+ *      approve (file mode, to publish).
+ *   2. Only an owner's tap mutates a request; every other tap gets an
+ *      ephemeral reply and an audit line, state untouched.
+ *   3. One tap = one token = one command. `handed-off` is terminal.
+ *   4. The token is in at most 3 places at once: bridge memory, the bun
+ *      wrapper, one child's env. Never in argv, never in a file (socket
+ *      mode), never in the LLM context.
+ *   5. Every secret lifetime is timer-owned by the bridge (TTL 5m, claim
+ *      60s, censor grace 10s, startup sweep).
+ *   6. The budget is enforced here (bridge), not in the CLI.
+ *   7. Restart-safe: state + approvals persist; the published-file dir is
+ *      bridge-owned (anything in it at boot is stale).
+ *   8. Deliverable feedback: the defer consumes the one-shot interaction
+ *      callback, so every post-defer reply goes through
+ *      sendInteractionFollowup (interaction webhook) and every path
+ *      clears the "Thinking" ack with deleteDeferredAck.
+ *   9. handlePatComponent NEVER REJECTS (top-level try/catch; M1) — an
+ *      escaped rejection would be an unhandled promise rejection and kill
+ *      the whole bridge under Node 22's unhandled-rejections=throw.
+ *
+ * Runbook: docs/PAT-VAULT.md.
+ */
+
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+import { dropRuntimeSecrets, registerRuntimeSecrets } from "./censor";
+import {
+  deferInteraction,
+  deleteDeferredAck,
+  editDiscordMessage,
+  getDiscordChannelId,
+  sendDiscordMessage,
+  sendInteractionFollowup,
+} from "./discord";
+import { hasOwnerConfigured, isOwnerUser } from "./index";
+import type { ChannelConfig } from "./types";
+
+// ─── Constants (all env-overridable for tests) ───────────────────────────
+
+const SCOPE_RE =
+  /^(default|[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}:(read|write))$/;
+const TOKEN_RE =
+  /^(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})$/;
+const COMPONENT_RE = /^pat:(approve|deny):pat_([0-9a-f-]{36})$/;
+const HOUR_MS = 3_600_000;
+const MAX_LINE_BYTES = 1_000_000; // N6: conforming run line ≈ 850 KB
+const MAX_LINES_PER_CONN = 4;
+const BASE_READ_TIMEOUT_MS = 5_000;
+const DONE_WAIT_EXTRA_MS = 30_000;
+const SEEN_FRESH_MS = 10 * 60_000;
+const TERMINAL_KEEP = 50;
+
+function envNum(name: string, def: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────
+
+export type PatRequestState =
+  | "pending"
+  | "approved"
+  | "handed-off"
+  | "expired"
+  | "denied";
+
+export interface PatRequest {
+  id: string; // "pat_" + crypto.randomUUID() (no secret in the id)
+  agent: string; // self-attested from the request line
+  scope: string;
+  reason: string;
+  channelId: string;
+  messageId: string; // the button message, for match checks
+  state: PatRequestState;
+  created: number; // epoch ms
+  approvedAt?: number;
+  handedOffAt?: number;
+  ttlDeadline: number; // created + ttlMs
+  claimDeadline?: number; // approvedAt + claimMs
+  deniedBy?: string;
+  runRc?: number;
+  expiredKind?: "ttl" | "claim";
+}
+
+export interface PatVaultState {
+  ch: ChannelConfig;
+  botToken: string;
+  transport: "socket" | "file";
+  now: () => number;
+  secrets: { register: (l: string[]) => void; drop: (l: string[]) => void };
+  ttlMs: number;
+  claimMs: number;
+  maxPending: number;
+  budgetPerHour: number;
+  censorGraceMs: number;
+  seenCap: number;
+  stateDir: string;
+  stateFile: string;
+  socketDir: string;
+  socketPath: string;
+  fileDir: string;
+  patsDir: string;
+  defaultPatFile: string;
+  auditFile: string;
+  auditDir: string;
+  requests: Map<string, PatRequest>;
+  approvals: Record<string, number[]>;
+  seen: Map<string, number>;
+  timers: Map<string, ReturnType<typeof setTimeout>[]>;
+  server: net.Server | null;
+  stopped: boolean;
+}
+
+export interface StartPatVaultOpts {
+  pi?: unknown;
+  ctx?: unknown;
+  ch: ChannelConfig;
+  botToken: string;
+  stateDir: string;
+  xdgDir?: string;
+  socketDir?: string;
+  fileDir?: string;
+  patsDir?: string;
+  defaultPatFile?: string;
+  auditFile?: string;
+  transport?: "socket" | "file";
+  now?: () => number;
+  secrets?: { register?: (l: string[]) => void; drop?: (l: string[]) => void };
+}
+
+export interface PatVaultHandle {
+  vault: PatVaultState;
+  /** Resolves once the socket bind attempt finished (or the vault runs
+   *  request-only without a socket). Socket tests await this. */
+  ready: Promise<void>;
+  handlePatComponent: (d: any) => Promise<void>;
+}
+
+// ─── Module-level instance registry (L4: once per process per socket) ────
+
+const vaultEntries = new Map<string, { vault: PatVaultState; refs: number }>();
+
+/** Test hook: stop every live vault and clear the module registry. */
+export function __patVaultResetForTest(): void {
+  for (const entry of [...vaultEntries.values()]) {
+    stopVaultCore(entry.vault);
+  }
+  vaultEntries.clear();
+}
+
+// ─── Small helpers ────────────────────────────────────────────────────────
+
+function iso(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+function timeOfDay(ms: number): string {
+  return new Date(ms).toISOString().slice(11, 19);
+}
+
+function kv(pairs: Record<string, unknown>): string {
+  return Object.entries(pairs)
+    .filter(([, v]) => v !== undefined && v !== null)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+}
+
+function base(r: PatRequest): Record<string, unknown> {
+  return { agent: r.agent, scope: r.scope, id: r.id };
+}
+
+/** Append-only audit line (design §8). Never breaks the flow. */
+function audit(
+  st: PatVaultState,
+  event: string,
+  pre?: Record<string, unknown>,
+  extra?: Record<string, unknown>,
+): void {
+  try {
+    if (!fs.existsSync(st.auditDir)) {
+      fs.mkdirSync(st.auditDir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(st.auditDir, 0o700);
+    }
+    const parts = [
+      iso(st.now()),
+      kv(pre ?? {}),
+      `event=${event}`,
+      kv(extra ?? {}),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    fs.appendFileSync(st.auditFile, `${parts}\n`, { encoding: "utf-8" });
+    fs.chmodSync(st.auditFile, 0o600);
+  } catch {
+    // audit never breaks the flow
+  }
+}
+
+function persist(st: PatVaultState): void {
+  try {
+    fs.mkdirSync(st.stateDir, { recursive: true });
+    // Terminal records pruned to the last 50 (oldest dropped first).
+    const all = [...st.requests.values()];
+    const terminal = all
+      .filter((r) => r.state === "expired" || r.state === "denied")
+      .sort((a, b) => a.created - b.created);
+    const dropIds = new Set(
+      terminal
+        .slice(0, Math.max(0, terminal.length - TERMINAL_KEEP))
+        .map((r) => r.id),
+    );
+    const keep = new Map<string, PatRequest>();
+    for (const r of all) if (!dropIds.has(r.id)) keep.set(r.id, r);
+    const freshSeen = [...st.seen.entries()]
+      .filter(([, ts]) => st.now() - ts < SEEN_FRESH_MS)
+      .slice(-st.seenCap);
+    const doc = {
+      v: 1,
+      requests: Object.fromEntries(keep),
+      approvals: st.approvals,
+      seen: Object.fromEntries(freshSeen),
+    };
+    const tmp = `${st.stateFile}.tmp-${process.pid}`;
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+      fs.writeSync(fd, JSON.stringify(doc));
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, st.stateFile);
+  } catch (e) {
+    console.error("[pat-vault] persist failed:", e);
+  }
+}
+
+// ─── Token store (design §3) ──────────────────────────────────────────────
+
+function listPats(st: PatVaultState, dir: string, out: string[]): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      listPats(st, p, out);
+    } else if (e.isFile()) {
+      const rel = path.relative(st.patsDir, p).split(path.sep).join("/");
+      // Sanitized names only: keep exactly the scope-grammar shapes.
+      if (SCOPE_RE.test(rel) && !out.includes(rel)) {
+        out.push(rel);
+      }
+    }
+  }
+}
+
+/** Known scopes = `default` + recursive listing of the pats dir. */
+export function knownScopes(st: PatVaultState): string[] {
+  const scopes = ["default"];
+  listPats(st, st.patsDir, scopes);
+  return scopes;
+}
+
+function tokenFileFor(st: PatVaultState, scope: string): string {
+  if (scope === "default") return st.defaultPatFile;
+  return path.join(st.patsDir, scope);
+}
+
+/** Read the scope token file: one line, token only, trailing newline
+ *  trimmed. Throws on ENOENT/EACCES/empty (design §3). */
+export function readScopeToken(st: PatVaultState, scope: string): string {
+  const p = tokenFileFor(st, scope);
+  const raw = fs.readFileSync(p, "utf-8");
+  const token = raw.split("\n")[0].trim();
+  if (!token) throw new Error(`empty token file: ${p}`);
+  return token;
+}
+
+export function validateTokenShape(token: string): boolean {
+  return TOKEN_RE.test(token);
+}
+
+function tokenKind(token: string): "classic" | "fine" {
+  return token.startsWith("github_pat_") ? "fine" : "classic";
+}
+
+// ─── File-mode publish (design §10/N5) ────────────────────────────────────
+
+function publishedPath(st: PatVaultState, id: string): string {
+  return path.join(st.fileDir, `pat-${id}`);
+}
+
+/** mkstemp-in-dir → write → close → rename(2): atomic, same fs, 0600. */
+function publishTokenFile(
+  st: PatVaultState,
+  id: string,
+  token: string,
+): string {
+  const finalPath = publishedPath(st, id);
+  const tmp = path.join(
+    st.fileDir,
+    `.pat-${id}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`,
+  );
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeSync(fd, `${token}\n`);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, finalPath);
+  return finalPath;
+}
+
+function unlinkPublished(st: PatVaultState, id: string): void {
+  try {
+    fs.unlinkSync(publishedPath(st, id));
+  } catch {
+    // already gone (sweep / claim settle raced)
+  }
+}
+
+// ─── Startup sweep + bind (design §5, once per process — L4) ─────────────
+
+function startupSweep(st: PatVaultState): void {
+  let n = 0;
+  try {
+    if (fs.existsSync(st.fileDir)) {
+      n = fs.readdirSync(st.fileDir).length;
+      fs.rmSync(st.fileDir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    audit(st, "vault-error", undefined, { err: `sweep: ${String(e)}` });
+  }
+  try {
+    fs.mkdirSync(st.fileDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(st.fileDir, 0o700);
+  } catch (e) {
+    audit(st, "vault-error", undefined, { err: `filedir: ${String(e)}` });
+  }
+  audit(st, "sweep", undefined, { n });
+}
+
+function bindSocket(st: PatVaultState): Promise<void> {
+  return (async () => {
+    try {
+      fs.mkdirSync(st.socketDir, { recursive: true, mode: 0o700 });
+      fs.chmodSync(st.socketDir, 0o700);
+    } catch (e) {
+      audit(st, "vault-error", undefined, { err: `socket dir: ${String(e)}` });
+      return;
+    }
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (fs.existsSync(st.socketPath)) fs.unlinkSync(st.socketPath);
+      } catch {
+        // stale unlink failure: the listen below decides
+      }
+      try {
+        const srv = await new Promise<net.Server>((resolve, reject) => {
+          const s = net.createServer((sock) => handleConnection(st, sock));
+          s.on("error", reject);
+          s.listen(st.socketPath, () => resolve(s));
+        });
+        try {
+          fs.chmodSync(st.socketPath, 0o600);
+        } catch {
+          // best effort
+        }
+        srv.on("error", (e) => {
+          audit(st, "vault-error", undefined, { err: `server: ${String(e)}` });
+        });
+        st.server = srv;
+        return;
+      } catch (e: any) {
+        if (e?.code !== "EADDRINUSE" || attempt === 2) {
+          // Request-only (socket down): posts + taps + edits still work.
+          audit(st, "vault-error", undefined, {
+            err: `bind: ${e?.code ?? String(e)}`,
+          });
+          return;
+        }
+        // EADDRINUSE: second unlink + bind (crash leftover reappearing)
+      }
+    }
+  })();
+}
+
+// ─── Timers ───────────────────────────────────────────────────────────────
+
+function track(
+  st: PatVaultState,
+  id: string,
+  t: ReturnType<typeof setTimeout>,
+): void {
+  const arr = st.timers.get(id) ?? [];
+  arr.push(t);
+  st.timers.set(id, arr);
+  t.unref?.();
+}
+
+function settleTtl(st: PatVaultState, id: string): void {
+  const req = st.requests.get(id);
+  if (req?.state !== "pending") return;
+  req.state = "expired";
+  req.expiredKind = "ttl";
+  audit(st, "expire-ttl", base(req));
+  persist(st);
+  void editRequestMessage(st, req, ttlExpiredText(st, req));
+}
+
+function settleClaim(st: PatVaultState, id: string): void {
+  const req = st.requests.get(id);
+  if (req?.state !== "approved") return;
+  req.state = "expired";
+  req.expiredKind = "claim";
+  if (st.transport === "file") unlinkPublished(st, id);
+  audit(st, "expire-claim", base(req));
+  persist(st);
+  void editRequestMessage(st, req, claimExpiredText(st, req));
+}
+
+function armTtl(st: PatVaultState, req: PatRequest): void {
+  track(
+    st,
+    req.id,
+    setTimeout(
+      () => settleTtl(st, req.id),
+      Math.max(0, req.ttlDeadline - st.now()),
+    ),
+  );
+}
+
+function armClaim(st: PatVaultState, req: PatRequest): void {
+  track(
+    st,
+    req.id,
+    setTimeout(
+      () => settleClaim(st, req.id),
+      Math.max(0, (req.claimDeadline ?? 0) - st.now()),
+    ),
+  );
+}
+
+/** Socket-mode censor drop: at max(commandDone, handoff) + grace. Scheduled
+ *  when the done line arrives (commandDone known); connection close or
+ *  read timeout drops immediately (the token is no longer in transit). */
+function scheduleCensorDrop(
+  st: PatVaultState,
+  req: PatRequest,
+  token: string,
+  delayMs: number,
+): void {
+  track(
+    st,
+    req.id,
+    setTimeout(
+      () => {
+        try {
+          st.secrets.drop([token]);
+        } catch {
+          // drop is best-effort; the github pattern is the backstop
+        }
+      },
+      Math.max(0, delayMs),
+    ),
+  );
+}
+
+// ─── Discord message text (design §6) ─────────────────────────────────────
+
+function ttlMinutes(st: PatVaultState): string {
+  const m = Math.round(st.ttlMs / 60_000);
+  return m > 0 ? `${m}m` : `${st.ttlMs}ms`;
+}
+
+function buttonRow(id: string): Array<Record<string, unknown>> {
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: 1, label: "Approve", custom_id: `pat:approve:${id}` },
+        { type: 2, style: 4, label: "Deny", custom_id: `pat:deny:${id}` },
+      ],
+    },
+  ];
+}
+
+function postText(st: PatVaultState, req: PatRequest): string {
+  return [
+    `[pending] PAT request — ${req.agent}`,
+    `scope: ${req.scope}`,
+    `reason: ${req.reason}`,
+    `expires: ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)})`,
+    "[ Approve ] [ Deny ]",
+  ].join("\n");
+}
+
+function approvedText(st: PatVaultState, req: PatRequest): string {
+  return [
+    `[ok] PAT approved — ${req.agent} (${req.id})`,
+    `scope: ${req.scope}`,
+    `claim by ${timeOfDay(req.claimDeadline ?? req.ttlDeadline)}Z (${Math.round(
+      st.claimMs / 1000,
+    )}s, single use)`,
+    `jarate pat-run ${req.id} -- <cmd>`,
+  ].join("\n");
+}
+
+function deniedText(req: PatRequest, username: string): string {
+  return `[denied] PAT request ${req.id} — ${username}`;
+}
+
+function ttlExpiredText(st: PatVaultState, req: PatRequest): string {
+  return `[expired] PAT request ${req.id} unanswered (${ttlMinutes(st)})`;
+}
+
+function claimExpiredText(st: PatVaultState, req: PatRequest): string {
+  return `[expired] PAT ${req.id} not claimed within ${Math.round(
+    st.claimMs / 1000,
+  )}s`;
+}
+
+/** Edit the request's button message; components: [] kills the buttons. */
+async function editRequestMessage(
+  st: PatVaultState,
+  req: PatRequest,
+  text: string,
+): Promise<void> {
+  if (!req.messageId) return;
+  const res = await editDiscordMessage(st.ch, req.messageId, text, {
+    components: [],
+  });
+  if (!res.success) {
+    console.error(`[pat-vault] edit failed for ${req.id}:`, res.error);
+  }
+}
+
+// ─── State machine: request / run / status (design §5) ────────────────────
+
+export interface PatRunBeginResult {
+  ok: boolean;
+  error?: string;
+  file?: boolean;
+  token?: string;
+  kind?: "classic" | "fine";
+  req?: PatRequest;
+  timeoutS?: number;
+}
+
+/** `request` op. Registers the record BEFORE the Discord POST (N6); a
+ *  failed POST unregisters and errors (retry is safe — nothing posted). */
+export async function patRequest(
+  st: PatVaultState,
+  line: any,
+): Promise<Record<string, unknown>> {
+  const agent =
+    typeof line?.agent === "string" && line.agent ? line.agent : "unknown";
+  const scope = typeof line?.scope === "string" ? line.scope : "";
+  const reason = typeof line?.reason === "string" ? line.reason : "";
+
+  const known = knownScopes(st);
+  if (!known.includes(scope)) {
+    audit(st, "scope-reject", { agent, scope });
+    return {
+      ok: false,
+      error: `scope: unknown '${scope}' (known: ${known.join(", ")})`,
+    };
+  }
+  if (reason.length < 3 || reason.length > 200) {
+    return { ok: false, error: "usage: reason must be 3-200 chars" };
+  }
+  const pendingCount = [...st.requests.values()].filter(
+    (r) => r.agent === agent && r.state === "pending",
+  ).length;
+  if (pendingCount >= st.maxPending) {
+    const pending = [...st.requests.values()].find(
+      (r) => r.agent === agent && r.state === "pending",
+    )!;
+    audit(st, "pending-reject", { agent, scope, id: pending.id });
+    return {
+      ok: false,
+      error: `pending: ${pending.id} expires ${iso(pending.ttlDeadline)}`,
+    };
+  }
+  const now = st.now();
+  const recent = (st.approvals[agent] ?? []).filter((ts) => ts > now - HOUR_MS);
+  if (recent.length >= st.budgetPerHour) {
+    const nextSlot = Math.min(...recent) + HOUR_MS;
+    audit(st, "budget-reject", { agent, scope, next_slot: nextSlot });
+    return {
+      ok: false,
+      error: `budget: ${st.budgetPerHour} approvals in last hour; next slot ${iso(nextSlot)}`,
+    };
+  }
+  if (!hasOwnerConfigured(st.ch)) {
+    console.warn(
+      `[pat-vault] request from ${agent}: no owner configured on channel ${st.ch.id} (vault is effectively disabled)`,
+    );
+    audit(st, "no-owner", { agent, scope });
+  }
+
+  const id = `pat_${crypto.randomUUID()}`;
+  const req: PatRequest = {
+    id,
+    agent,
+    scope,
+    reason,
+    channelId: String(getDiscordChannelId(st.ch.id) || st.ch.channel),
+    messageId: "",
+    state: "pending",
+    created: now,
+    ttlDeadline: now + st.ttlMs,
+  };
+  st.requests.set(id, req);
+
+  const res = await sendDiscordMessage(st.ch, postText(st, req), {
+    components: buttonRow(id),
+  });
+  if (!res.success) {
+    st.requests.delete(id);
+    audit(
+      st,
+      "post-fail",
+      { agent, scope, id },
+      { reason: res.error ?? "unknown" },
+    );
+    return { ok: false, error: `post failed: ${res.error ?? "unknown"}` };
+  }
+  req.messageId = String(res.messageId ?? "");
+  armTtl(st, req);
+  audit(st, "request", { agent, scope, id });
+  persist(st);
+  return { ok: true, id, state: "pending", ttl: iso(req.ttlDeadline) };
+}
+
+/** `run` op (begin). The socket server keeps the connection open for the
+ *  done-wait after a successful handoff. */
+export function patRunBegin(st: PatVaultState, line: any): PatRunBeginResult {
+  const id = typeof line?.id === "string" ? line.id : "";
+  const req = st.requests.get(id);
+  if (!req) return { ok: false, error: "unknown id" };
+
+  const cmd = line?.cmd;
+  if (
+    !Array.isArray(cmd) ||
+    cmd.length < 1 ||
+    cmd.length > 200 ||
+    !cmd.every(
+      (c: unknown) => typeof c === "string" && c.length > 0 && c.length <= 4096,
+    )
+  ) {
+    return {
+      ok: false,
+      error: "usage: cmd must be 1-200 strings (each <=4096 chars)",
+    };
+  }
+  const timeoutS = line?.timeout_s;
+  if (!Number.isInteger(timeoutS) || timeoutS < 1 || timeoutS > 3600) {
+    return { ok: false, error: "usage: timeout_s must be 1-3600" };
+  }
+
+  if (req.state === "pending") {
+    return { ok: false, error: "state: pending (awaiting approval)" };
+  }
+  if (req.state === "expired") {
+    const deadline =
+      req.expiredKind === "claim"
+        ? (req.claimDeadline ?? req.ttlDeadline)
+        : req.ttlDeadline;
+    return { ok: false, error: `state: expired at ${iso(deadline)}` };
+  }
+  if (req.state === "denied" || req.state === "handed-off") {
+    return { ok: false, error: "state: already used" };
+  }
+
+  // approved → handoff
+  if (st.transport === "file") {
+    // The file was published at approve; kind for the audit is re-derived
+    // from the published file when it still exists (it may have been
+    // swept by a restart — the wrapper will report file missing then).
+    let kind: "classic" | "fine" | "unknown" = "unknown";
+    try {
+      const t = fs
+        .readFileSync(publishedPath(st, id), "utf-8")
+        .split("\n")[0]
+        .trim();
+      if (t) kind = tokenKind(t);
+    } catch {
+      // swept or missing: wrapper will error cleanly
+    }
+    req.state = "handed-off";
+    req.handedOffAt = st.now();
+    audit(st, "handoff", base(req), { kind });
+    persist(st);
+    return { ok: true, file: true, req, timeoutS };
+  }
+
+  // socket mode: fresh-read the token at handoff (rotation-aware).
+  let token: string;
+  try {
+    token = readScopeToken(st, req.scope);
+  } catch {
+    audit(st, "handoff-error", base(req), {
+      err: `token file missing for ${req.scope}`,
+    });
+    return { ok: false, error: `scope: token file missing for ${req.scope}` };
+  }
+  if (!validateTokenShape(token)) {
+    audit(st, "handoff-error", base(req), {
+      err: `token shape invalid for ${req.scope}`,
+    });
+    return { ok: false, error: `scope: token shape invalid for ${req.scope}` };
+  }
+  const kind = tokenKind(token);
+  // Single use by construction: the state flip happens before the token
+  // line is flushed — a second run on the same id gets `already used`.
+  req.state = "handed-off";
+  req.handedOffAt = st.now();
+  st.secrets.register([token]);
+  audit(st, "handoff", base(req), { kind });
+  persist(st);
+  return { ok: true, token, kind, req, timeoutS };
+}
+
+/** `done` line handling (second line of a run connection). */
+export function patRunDone(
+  st: PatVaultState,
+  id: string,
+  rc: number,
+  socketModeToken: string | undefined,
+): boolean {
+  const req = st.requests.get(id);
+  if (req?.state !== "handed-off" || req?.runRc !== undefined) return false;
+  req.runRc = rc;
+  audit(st, "done", base(req), { rc });
+  persist(st);
+  if (socketModeToken) {
+    // max(commandDone, handoff) + grace — commandDone is now.
+    scheduleCensorDrop(st, req, socketModeToken, st.censorGraceMs);
+  }
+  return true;
+}
+
+/** Connection closed / read-timed-out before done: the run never reported. */
+export function patRunAbandon(
+  st: PatVaultState,
+  id: string,
+  token: string | undefined,
+): boolean {
+  const req = st.requests.get(id);
+  if (req?.state !== "handed-off" || req?.runRc !== undefined) return false;
+  req.runRc = -1;
+  audit(st, "done", base(req), { rc: -1 });
+  persist(st);
+  if (token) {
+    try {
+      st.secrets.drop([token]);
+    } catch {
+      // backstop: github pattern
+    }
+  }
+  return true;
+}
+
+/** `status` op. The token is never in the output. */
+export function patStatus(
+  st: PatVaultState,
+  line: any,
+): Record<string, unknown> {
+  const id = typeof line?.id === "string" ? line.id : "";
+  if (id) {
+    const req = st.requests.get(id);
+    if (!req) return { ok: false, error: "unknown id" };
+    const out: Record<string, unknown> = {
+      ok: true,
+      id: req.id,
+      state: req.state,
+      scope: req.scope,
+      created: iso(req.created),
+    };
+    if (req.approvedAt) out.approved = iso(req.approvedAt);
+    if (req.handedOffAt) out.handed_off = iso(req.handedOffAt);
+    if (req.runRc !== undefined) out.run_rc = req.runRc;
+    return out;
+  }
+  const agent =
+    typeof line?.agent === "string" && line.agent ? line.agent : "unknown";
+  const recent = (st.approvals[agent] ?? []).filter(
+    (ts) => ts > st.now() - HOUR_MS,
+  );
+  return {
+    ok: true,
+    pending: [...st.requests.values()]
+      .filter(
+        (r) =>
+          r.agent === agent &&
+          (r.state === "pending" || r.state === "approved"),
+      )
+      .map((r) => {
+        const o: Record<string, unknown> = {
+          id: r.id,
+          state: r.state,
+          scope: r.scope,
+        };
+        if (r.claimDeadline) o.claim_deadline = iso(r.claimDeadline);
+        return o;
+      }),
+    budget: { approvals_last_hour: recent.length, cap: st.budgetPerHour },
+  };
+}
+
+// ─── Socket server (design §5: ~40 lines of line-buffering + dispatch) ────
+
+function handleConnection(st: PatVaultState, sock: net.Socket): void {
+  let buf = "";
+  let lineCount = 0;
+  let settled = false;
+  let runCtx: {
+    req: PatRequest;
+    token: string | null;
+    timeoutS: number;
+  } | null = null;
+
+  const send = (obj: Record<string, unknown>): void => {
+    if (!settled && !sock.destroyed) {
+      sock.write(`${JSON.stringify({ v: 1, ...obj })}\n`);
+    }
+  };
+
+  const finish = (): void => {
+    if (settled) return;
+    settled = true;
+    // done never arrived: settle the run as -1 and drop the censor secret.
+    if (
+      runCtx &&
+      runCtx.req.state === "handed-off" &&
+      runCtx.req.runRc === undefined
+    ) {
+      patRunAbandon(st, runCtx.req.id, runCtx.token ?? undefined);
+    }
+    try {
+      sock.end();
+    } catch {
+      // already gone
+    }
+  };
+
+  const onReadTimeout = (): void => {
+    if (
+      runCtx &&
+      runCtx.req.state === "handed-off" &&
+      runCtx.req.runRc === undefined
+    ) {
+      // done-wait expired (timeout_s + 30s): the child is dead or dying;
+      // record -1 now so the connection close doesn't double-settle.
+      patRunAbandon(st, runCtx.req.id, runCtx.token ?? undefined);
+    }
+    finish();
+  };
+
+  sock.setTimeout(BASE_READ_TIMEOUT_MS, onReadTimeout);
+  sock.on("error", finish);
+  sock.on("close", finish);
+
+  sock.on("data", (d: Buffer) => {
+    if (settled) return;
+    buf += d.toString("utf-8");
+    let idx = buf.indexOf("\n");
+    while (idx >= 0) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      idx = buf.indexOf("\n");
+      if (line.length > MAX_LINE_BYTES) {
+        send({ ok: false, error: "usage: line too long (1 MB cap)" });
+        return finish();
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        send({ ok: false, error: "usage: bad json" });
+        return finish();
+      }
+      lineCount++;
+      if (lineCount === 1) {
+        if (parsed?.op === "request") {
+          // Async reply: the connection is held until the POST resolves.
+          // `continue` (not return) so any further line in the same chunk
+          // still hits the too-many-lines guard below.
+          void patRequest(st, parsed).then((r) => {
+            send(r);
+            finish();
+          });
+          continue;
+        }
+        if (parsed?.op === "status") {
+          send(patStatus(st, parsed));
+          return finish();
+        }
+        if (parsed?.op === "run") {
+          const r = patRunBegin(st, parsed);
+          if (!r.ok || !r.req || !r.timeoutS) {
+            send({ ok: false, error: r.error });
+            return finish();
+          }
+          runCtx = {
+            req: r.req,
+            token: r.token ?? null,
+            timeoutS: r.timeoutS,
+          };
+          send(
+            r.file
+              ? { ok: true, file: true }
+              : { ok: true, token: r.token, kind: r.kind },
+          );
+          // done-wait: the clamped timeout_s + 30s (N6). A coalesced
+          // done line in the same chunk is handled on the next iteration.
+          sock.setTimeout(
+            r.timeoutS * 1000 + DONE_WAIT_EXTRA_MS,
+            onReadTimeout,
+          );
+          continue;
+        }
+        send({ ok: false, error: "usage: unknown op" });
+        return finish();
+      }
+      if (lineCount === 2 && runCtx) {
+        if (parsed?.op !== "done") {
+          send({ ok: false, error: "usage: expected done" });
+          return finish();
+        }
+        const rc = typeof parsed.rc === "number" ? Math.trunc(parsed.rc) : -1;
+        const done = patRunDone(
+          st,
+          runCtx.req.id,
+          rc,
+          st.transport === "socket" ? (runCtx.token ?? undefined) : undefined,
+        );
+        if (done) send({ ok: true });
+        else send({ ok: false, error: "usage: run not active" });
+        return finish();
+      }
+      send({
+        ok: false,
+        error: `usage: too many lines (max ${MAX_LINES_PER_CONN})`,
+      });
+      return finish();
+    }
+    if (buf.length > MAX_LINE_BYTES) {
+      send({ ok: false, error: "usage: line too long (1 MB cap)" });
+      return finish();
+    }
+  });
+}
+
+// ─── Component handler (design §5 — the F1 gate) ──────────────────────────
+
+function markSeen(st: PatVaultState, id: string): boolean {
+  if (st.seen.has(id)) return false;
+  st.seen.set(id, st.now());
+  if (st.seen.size > st.seenCap) {
+    for (const k of st.seen.keys()) {
+      if (st.seen.size <= st.seenCap) break;
+      st.seen.delete(k);
+    }
+  }
+  return true;
+}
+
+function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
+  return async (d: any): Promise<void> => {
+    let parsedId: string | undefined;
+    try {
+      // 1. Cheap stateless match FIRST (no defer, no callback for other
+      //    buttons — the "Thinking" toast must not fire for non-vault
+      //    components). Non-matching type-4 event → ignore entirely.
+      const m = COMPONENT_RE.exec(String(d?.data?.custom_id ?? ""));
+      if (d?.type !== 4 || !m) return;
+      const verb = m[1];
+      parsedId = `pat_${m[2]}`;
+
+      // 2. Defer — the first network op; from here the callback is SPENT.
+      await deferInteraction(st.botToken, d);
+
+      // 3. Dedupe (gateway redelivery; tokens are single-use anyway).
+      if (!markSeen(st, String(d.id))) return;
+
+      // 4. Lookup. Miss → stale id / settled elsewhere.
+      const req = st.requests.get(parsedId);
+      if (!req) {
+        await sendInteractionFollowup(
+          st.botToken,
+          d,
+          "[!] request not found or already handled",
+          { ephemeral: true },
+        );
+        await deleteDeferredAck(st.botToken, d);
+        return;
+      }
+
+      // 5. Message + channel match (stale-copy / forwarded button).
+      if (
+        String(d.message_id) !== req.messageId ||
+        String(d.channel_id) !== req.channelId
+      ) {
+        await sendInteractionFollowup(
+          st.botToken,
+          d,
+          "[!] request not found or already handled",
+          { ephemeral: true },
+        );
+        await deleteDeferredAck(st.botToken, d);
+        return;
+      }
+
+      // 6. Owner gate (ownerUserIds preferred / ownerUserId legacy).
+      const uid = String(d.user?.id ?? "");
+      if (!isOwnerUser(st.ch, uid)) {
+        audit(st, "non-owner-tap", base(req), { user: uid });
+        await sendInteractionFollowup(
+          st.botToken,
+          d,
+          "[!] only the owner can approve PAT requests",
+          { ephemeral: true },
+        );
+        await deleteDeferredAck(st.botToken, d);
+        return;
+      }
+
+      // 7. State gate.
+      if (req.state !== "pending") {
+        await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
+          ephemeral: true,
+        });
+        await deleteDeferredAck(st.botToken, d);
+        return;
+      }
+
+      // 8. Transition (the only place state mutates).
+      const now = st.now();
+      if (verb === "approve") {
+        if (st.transport === "file") {
+          // File mode reads the token NOW (to publish). Missing file =
+          // error outcome: no transition — the request stays pending so
+          // the owner can re-tap after the file is restored (M1 named
+          // pre-check: specific message, not the generic vault error).
+          let token: string;
+          try {
+            token = readScopeToken(st, req.scope);
+            if (!validateTokenShape(token))
+              throw new Error(`token shape invalid for ${req.scope}`);
+          } catch {
+            audit(st, "vault-error", base(req), { err: "token file missing" });
+            await sendInteractionFollowup(
+              st.botToken,
+              d,
+              "[!] token file missing",
+              {
+                ephemeral: true,
+              },
+            );
+            await deleteDeferredAck(st.botToken, d);
+            return;
+          }
+          // No run-time handoff in file mode: the censor window opens at
+          // approve (N5) and drops at claimDeadline + grace.
+          st.secrets.register([token]);
+          publishTokenFile(st, req.id, token);
+          track(
+            st,
+            req.id,
+            setTimeout(
+              () => {
+                try {
+                  st.secrets.drop([token]);
+                } catch {
+                  // github pattern backstop
+                }
+              },
+              Math.max(0, st.claimMs + st.censorGraceMs),
+            ),
+          );
+        }
+        req.state = "approved";
+        req.approvedAt = now;
+        req.claimDeadline = now + st.claimMs;
+        const approvals = st.approvals[req.agent] ?? [];
+        approvals.push(now);
+        st.approvals[req.agent] = approvals;
+        armClaim(st, req);
+        audit(st, "approve", base(req), { user: uid });
+        persist(st);
+        await editRequestMessage(st, req, approvedText(st, req));
+      } else {
+        req.state = "denied";
+        req.deniedBy = uid;
+        audit(st, "deny", base(req), { user: uid });
+        persist(st);
+        await editRequestMessage(
+          st,
+          req,
+          deniedText(req, String(d.user?.username ?? uid)),
+        );
+      }
+      await deleteDeferredAck(st.botToken, d);
+    } catch (e) {
+      // M1: never reject. Log + audit + best-effort deliverable feedback.
+      console.error("[interactions] vault handler failed:", e);
+      audit(st, "vault-error", { id: parsedId }, { err: String(e) });
+      await sendInteractionFollowup(st.botToken, d, "[!] vault error", {
+        ephemeral: true,
+      });
+      await deleteDeferredAck(st.botToken, d);
+    }
+  };
+}
+
+// ─── Persistence load / recovery ──────────────────────────────────────────
+
+function load(st: PatVaultState): void {
+  let doc: any;
+  try {
+    doc = JSON.parse(fs.readFileSync(st.stateFile, "utf-8"));
+  } catch {
+    return; // first start
+  }
+  const now = st.now();
+  for (const [id, raw] of Object.entries<any>(doc.requests ?? {})) {
+    const r: PatRequest = { ...raw, id };
+    st.requests.set(id, r);
+    if (r.state === "pending") {
+      if (r.ttlDeadline <= now) {
+        r.state = "expired";
+        r.expiredKind = "ttl";
+        audit(st, "recovered-expired", base(r));
+        void editRequestMessage(st, r, ttlExpiredText(st, r));
+      } else {
+        armTtl(st, r);
+      }
+    } else if (r.state === "approved") {
+      if (r.claimDeadline && r.claimDeadline <= now) {
+        r.state = "expired";
+        r.expiredKind = "claim";
+        if (st.transport === "file") unlinkPublished(st, id);
+        audit(st, "recovered-expired", base(r));
+        void editRequestMessage(st, r, claimExpiredText(st, r));
+      } else {
+        armClaim(st, r);
+      }
+    }
+  }
+  if (doc.approvals && typeof doc.approvals === "object") {
+    st.approvals = doc.approvals;
+  }
+  if (doc.seen && typeof doc.seen === "object") {
+    for (const [k, ts] of Object.entries<any>(doc.seen)) {
+      if (typeof ts === "number" && now - ts < SEEN_FRESH_MS)
+        st.seen.set(k, ts);
+    }
+  }
+  persist(st);
+}
+
+// ─── start / stop (design §9) ─────────────────────────────────────────────
+
+function stopVaultCore(st: PatVaultState): void {
+  st.stopped = true;
+  persist(st);
+  for (const arr of st.timers.values()) {
+    for (const t of arr) clearTimeout(t);
+  }
+  st.timers.clear();
+  st.server?.close();
+  st.server = null;
+}
+
+/** Start (or reuse, L4) the vault for this channel. The first instance
+ *  per socket path performs the startup sweep + socket bind; later
+ *  instances in the same process share state and server. Refcounted: the
+ *  server closes, timers clear, and state persists only when the LAST
+ *  instance stops. */
+export function startPatVault(opts: StartPatVaultOpts): PatVaultHandle {
+  const home = process.env.HOME || os.homedir();
+  const xdg =
+    opts.xdgDir ??
+    process.env.XDG_RUNTIME_DIR ??
+    path.join("/run/user", String(process.getuid ? process.getuid() : 0));
+  const socketDir =
+    opts.socketDir ?? process.env.JARATE_PAT_DIR ?? path.join(xdg, "jarate");
+  const socketPath = path.join(socketDir, "pat.sock");
+  const existing = vaultEntries.get(socketPath);
+  if (existing) {
+    existing.refs += 1;
+    return makeHandle(existing.vault);
+  }
+
+  const st: PatVaultState = {
+    ch: opts.ch,
+    botToken: opts.botToken,
+    transport:
+      opts.transport ??
+      (process.env.JARATE_PAT_TRANSPORT === "file" ? "file" : "socket"),
+    now: opts.now ?? (() => Date.now()),
+    secrets: {
+      register: opts.secrets?.register ?? registerRuntimeSecrets,
+      drop: opts.secrets?.drop ?? dropRuntimeSecrets,
+    },
+    ttlMs: envNum("JARATE_PAT_TTL_MS", 300_000),
+    claimMs: envNum("JARATE_PAT_CLAIM_MS", 60_000),
+    maxPending: envNum("JARATE_PAT_MAX_PENDING", 1),
+    budgetPerHour: envNum("JARATE_PAT_BUDGET_PER_HOUR", 5),
+    censorGraceMs: envNum("JARATE_PAT_CENSOR_GRACE_MS", 10_000),
+    seenCap: envNum("JARATE_PAT_SEEN_CAP", 500),
+    stateDir: opts.stateDir,
+    stateFile: path.join(opts.stateDir, "pat-vault.json"),
+    socketDir,
+    socketPath,
+    fileDir:
+      opts.fileDir ??
+      process.env.JARATE_PAT_FILE_DIR ??
+      path.join(xdg, "jarate-pat"),
+    patsDir:
+      opts.patsDir ??
+      process.env.JARATE_PAT_PATS_DIR ??
+      path.join(home, ".config", "marzukia-pats"),
+    defaultPatFile:
+      opts.defaultPatFile ??
+      path.join(
+        path.dirname(
+          opts.patsDir ?? path.join(home, ".config", "marzukia-pats"),
+        ),
+        "marzukia-pat",
+      ),
+    auditFile:
+      opts.auditFile ??
+      process.env.JARATE_PAT_AUDIT_FILE ??
+      path.join(home, ".jarate", "pat-audit.log"),
+    auditDir: path.dirname(
+      opts.auditFile ??
+        process.env.JARATE_PAT_AUDIT_FILE ??
+        path.join(home, ".jarate", "pat-audit.log"),
+    ),
+    requests: new Map(),
+    approvals: {},
+    seen: new Map(),
+    timers: new Map(),
+    server: null,
+    stopped: false,
+  };
+
+  startupSweep(st);
+  load(st);
+  const ready = bindSocket(st);
+  vaultEntries.set(socketPath, { vault: st, refs: 1 });
+  return makeHandle(st, ready);
+}
+
+function makeHandle(st: PatVaultState, ready?: Promise<void>): PatVaultHandle {
+  return {
+    vault: st,
+    ready: ready ?? Promise.resolve(),
+    handlePatComponent: makeHandler(st),
+  };
+}
+
+/** Stop one channel's vault handle (refcounted; L4). */
+export function stopPatVault(h: PatVaultHandle): void {
+  const entry = vaultEntries.get(h.vault.socketPath);
+  if (!entry) return;
+  entry.refs -= 1;
+  if (entry.refs > 0) return;
+  vaultEntries.delete(h.vault.socketPath);
+  stopVaultCore(h.vault);
+}

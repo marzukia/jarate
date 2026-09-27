@@ -79,6 +79,7 @@ import {
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
+import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
@@ -157,6 +158,9 @@ import { mergeWorktree, newWorktree } from "./worktree";
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
+// PAT vault handles per channel (L4: once per process per socket path;
+// start on connect, stopPatVault on shutdown — refcounted internally).
+const patVaultHandles = new Map<string, PatVaultHandle>();
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -1388,7 +1392,12 @@ async function sendFinalWithFiles(
   replyTo?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   const md = mdToDiscord(text);
-  if (files.length === 0) return sendDiscordMessage(ch, md, replyTo);
+  if (files.length === 0)
+    return sendDiscordMessage(
+      ch,
+      md,
+      replyTo ? { replyToMessageId: replyTo } : undefined,
+    );
   return sendDiscordMessageWithFiles(ch, md, files, replyTo);
 }
 
@@ -2105,9 +2114,21 @@ export default function (pi: ExtensionAPI) {
           if (bt) {
             connectDiscordPresence(bt);
             registerDiscordCommands(bt).catch(() => {});
+            // PAT vault: started alongside the interaction handler;
+            // state persists in <cwd>/.tmp (same dir as channel-state).
+            // L4: once per process per socket path; refcounted stop on
+            // shutdown.
+            const vh = startPatVault({
+              pi,
+              ctx,
+              ch,
+              botToken: bt,
+              stateDir: path.join(ctx.cwd, ".tmp"),
+            });
+            patVaultHandles.set(ch.id, vh);
             setDiscordInteractionHandler(
               bt,
-              buildInteractionHandler(pi, ctx, ch, bt),
+              buildInteractionHandler(pi, ctx, ch, bt, vh),
             );
           }
           // startupMessage is posted by the poller once the bot's own user
@@ -2233,6 +2254,11 @@ export default function (pi: ExtensionAPI) {
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
+        const vh = patVaultHandles.get(ch.id);
+        if (vh) {
+          stopPatVault(vh);
+          patVaultHandles.delete(ch.id);
+        }
         if (ch.botToken) {
           stopDiscordPresence(ch.botToken);
           setDiscordInteractionHandler(ch.botToken, null);
@@ -3141,8 +3167,21 @@ export function buildInteractionHandler(
   ctx: ExtensionContext,
   ch: ChannelConfig,
   botToken: string,
+  vaultRef?: { handlePatComponent(d: any): Promise<void> } | null,
 ): (d: any) => Promise<void> {
   return async (d: any) => {
+    // Type-4 (button) events go to the PAT vault. The .catch is the M1
+    // dispatch-side backstop: handlePatComponent never rejects by
+    // construction (top-level catch), but the gateway branch calls this
+    // handler un-awaited inside a sync-only try/catch — an escaped
+    // rejection would crash the whole bridge (Node 22 defaults to
+    // unhandled-rejections=throw).
+    if (d?.type === 4) {
+      vaultRef
+        ?.handlePatComponent(d)
+        .catch((e) => console.error("[interactions] vault handler failed:", e));
+      return;
+    }
     // Config fallback covers the pre-resolution window where no gateway
     // state exists yet (and keeps tests simple).
     const cid = getDiscordChannelId(ch.id) || ch.channel;
@@ -5292,7 +5331,9 @@ export async function handleInbound(
     if (!ch) return;
     // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
     // machine-state lines; already-fenced replies pass through unchanged.
-    sendDiscordMessage(ch, styleGuard(text), msg.messageId).catch(() => {});
+    sendDiscordMessage(ch, styleGuard(text), {
+      replyToMessageId: msg.messageId,
+    }).catch(() => {});
   };
   // Commands reply directly instead of running a turn — tell the poller
   // not to ack these messages with 👀 (synchronous, no race).
@@ -5475,7 +5516,9 @@ export async function handleInbound(
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
     noAck();
-    sendDiscordMessage(ch, fence(`[queued] ${pos} in line`), msg.messageId)
+    sendDiscordMessage(ch, fence(`[queued] ${pos} in line`), {
+      replyToMessageId: msg.messageId,
+    })
       .then((res) => {
         if (res.success && res.messageId)
           queuedAcks.set(msg.messageId, {
@@ -5590,7 +5633,7 @@ export async function handleInbound(
           fence(
             `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
           ),
-          msg.messageId,
+          { replyToMessageId: msg.messageId },
         ).catch(() => {});
         return;
       }

@@ -232,6 +232,9 @@ describe("entrypoint", () => {
       "projects-backfill",
       "agents-check",
       "agents-bless",
+      "pat-request",
+      "pat-run",
+      "pat-status",
     ]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });

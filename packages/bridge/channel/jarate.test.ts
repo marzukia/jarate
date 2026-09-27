@@ -23,7 +23,9 @@ describe("runJarate", () => {
     const home = makeJarateHome(
       'printf \'{"ok":true,"cmd":"%s","args":"%s"}\' "$1" "$2"',
     );
-    const r = await runJarate("ctx-report", "--profile main", envFor(home));
+    const r = await runJarate("ctx-report", "--profile main", {
+      env: envFor(home),
+    });
     expect(r.code).toBe(0);
     expect(r.timedOut).toBe(false);
     const d = JSON.parse(r.out);
@@ -37,7 +39,7 @@ describe("runJarate", () => {
     const home = makeJarateHome(
       'printf \'{"ok":false,"error":"boom"}\'; exit 3',
     );
-    const r = await runJarate("ctx-report", "", envFor(home));
+    const r = await runJarate("ctx-report", "", { env: envFor(home) });
     expect(r.code).toBe(3);
     const t = jarateText(r);
     expect(t).toContain('"ok":false');
@@ -47,7 +49,7 @@ describe("runJarate", () => {
 
   test("non-zero exit without JSON -> synthesized ok:false", async () => {
     const home = makeJarateHome("echo oops; exit 2");
-    const r = await runJarate("ctx-report", "", envFor(home));
+    const r = await runJarate("ctx-report", "", { env: envFor(home) });
     const d = JSON.parse(jarateText(r));
     expect(d.ok).toBe(false);
     expect(d.error).toContain("exited 2");
@@ -56,7 +58,7 @@ describe("runJarate", () => {
 
   test("missing entrypoint -> spawn failed ok:false", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-tool-"));
-    const r = await runJarate("ctx-report", "", envFor(home));
+    const r = await runJarate("ctx-report", "", { env: envFor(home) });
     const d = JSON.parse(jarateText(r));
     expect(d.ok).toBe(false);
     expect(d.error).toContain("spawn failed");
@@ -68,7 +70,7 @@ describe("runJarate", () => {
     const old = process.env.JARATE_TOOL_TIMEOUT_MS;
     process.env.JARATE_TOOL_TIMEOUT_MS = "300";
     try {
-      const r = await runJarate("rag", "sleep", envFor(home));
+      const r = await runJarate("rag", "sleep", { env: envFor(home) });
       expect(r.timedOut).toBe(true);
       const d = JSON.parse(jarateText(r));
       expect(d.ok).toBe(false);
@@ -93,7 +95,15 @@ describe("registerJarateTool", () => {
     registerJarateTool(pi);
     expect(Object.keys(tools)).toEqual(["jarate"]);
     // subcommands are discoverable from the description
-    for (const cmd of ["ctx-report", "journal-errors", "memory-grep", "rag"]) {
+    for (const cmd of [
+      "ctx-report",
+      "journal-errors",
+      "memory-grep",
+      "rag",
+      "pat-request",
+      "pat-run",
+      "pat-status",
+    ]) {
       expect(tools.jarate.description).toContain(cmd);
     }
     expect(tools.jarate.parameters.properties.cmd).toBeDefined();
