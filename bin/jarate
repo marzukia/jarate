@@ -27,6 +27,9 @@
 #   rag <question> [--project P]  RAG one-call over project knowledge (recall --json)
 #   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
 #   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
+#   pat-request <scope> <reason>  ask the channel owner for a GitHub PAT (JSON doc; rc 0/1/2)
+#   pat-run <id> -- <cmd> [args]  run one command under the approved token (child rc; 124 on cap)
+#   pat-status [id]               read-only PAT request state (never prints the token)
 #
 # Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
 # Callers use $HOME/bin/jarate — do not rely on PATH.
@@ -44,6 +47,12 @@
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
 #   JARATE_SETUP_GATE_S setup boot-gate window in seconds (default 90)
 #   JARATE_SETUP_POLL_S setup boot-gate poll interval in seconds (default 3)
+#   JARATE_PAT_DIR      PAT vault socket dir (default $XDG_RUNTIME_DIR/jarate)
+#   JARATE_PAT_FILE_DIR PAT vault published-file dir (default $XDG_RUNTIME_DIR/jarate-pat)
+#   JARATE_PAT_PATS_DIR fine-grained token store (default ~/.config/marzukia-pats)
+#   JARATE_PAT_AUDIT_FILE audit log (default ~/.jarate/pat-audit.log)
+#   JARATE_PAT_TRANSPORT socket|file (bridge side; default socket)
+#   JARATE_PAT_RUN_TIMEOUT_S wrapper command cap in seconds (default 900)
 
 set -uo pipefail
 
@@ -53,7 +62,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "projects" "projects-backfill" "agents-check" "agents-bless")
+COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -1490,6 +1499,55 @@ cmd_setup() {
     || die "setup: json assembly failed"
 }
 
+# ─── pat-* (PAT vault) ────────────────────────────────────────────────────────
+# Thin dispatchers to the sibling `jarate-pat` (bun) — the only process that
+# ever sees the token. Each passes rc through via exec (no JSON re-wrap):
+#   rc 0 ok | 1 vault error (JSON doc on stdout) | 2 usage
+
+find_jarate_pat() {
+  local d c
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${JARATE_PAT_BIN:-}" "$d/jarate-pat" "$JARATE_ROOT/bin/jarate-pat"; do
+    if [ -n "$c" ] && [ -f "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_pat_request() {
+  local jp
+  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
+  [ $# -ge 2 ] || die_usage "pat-request: usage: jarate pat-request <scope> <reason...>"
+  exec "$jp" request "$@"
+}
+
+cmd_pat_run() {
+  local jp
+  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
+  [ $# -ge 1 ] || die_usage "pat-run: usage: jarate pat-run <request-id> -- <cmd> [args...]"
+  if [ $# -eq 1 ]; then
+    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
+    #   pat_x -- gh pr create -m "fix: x"
+    # first whitespace token = id, remainder = raw string for shellWords.
+    local tail="$1" id rest
+    id="${tail%% *}"
+    rest="${tail#* }"
+    [ "$rest" = "$tail" ] && rest=""
+    exec "$jp" run-raw "$id" "$rest"
+  fi
+  # Bash path: real argv, lossless — pass through untouched (keeps `--`).
+  exec "$jp" run "$@"
+}
+
+cmd_pat_status() {
+  local jp
+  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
+  [ $# -le 1 ] || die_usage "pat-status: usage: jarate pat-status [request-id]"
+  exec "$jp" status "$@"
+}
+
 # ─── dispatch ─────────────────────────────────────────────────────────────────
 
 main() {
@@ -1502,7 +1560,8 @@ main() {
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "rag", "projects", "projects-backfill",
-                     "agents-check", "agents-bless"]}'
+                     "agents-check", "agents-bless",
+                     "pat-request", "pat-run", "pat-status"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
@@ -1513,13 +1572,17 @@ main() {
     projects-backfill) cmd_projects_backfill "$@" ;;
     agents-check) cmd_agents_check "$@" ;;
     agents-bless) cmd_agents_bless "$@" ;;
+    pat-request) cmd_pat_request "$@" ;;
+    pat-run) cmd_pat_run "$@" ;;
+    pat-status) cmd_pat_status "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "rag", "projects", "projects-backfill",
-                     "agents-check", "agents-bless"]}'
+                     "agents-check", "agents-bless",
+                     "pat-request", "pat-run", "pat-status"]}'
       exit 2
       ;;
   esac

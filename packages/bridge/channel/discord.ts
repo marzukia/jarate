@@ -740,11 +740,17 @@ export function allowedMentionsFor(text: string): {
   return ids.length ? { users: ids } : { parse: [] };
 }
 
-/** Send a text message to a Discord channel. */
+/** Send a text message to a Discord channel.
+ *
+ *  opts.components: embed a component row (e.g. PAT vault buttons).
+ *  opts.replyToMessageId: reply to a specific message. */
 export async function sendDiscordMessage(
   config: ChannelConfig,
   raw: string,
-  replyToMessageId?: string,
+  opts?: {
+    components?: Array<Record<string, unknown>>;
+    replyToMessageId?: string;
+  },
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
@@ -754,7 +760,12 @@ export async function sendDiscordMessage(
   const token = config.botToken;
   if (token) {
     // Bot token: send via REST
-    const base = { content: text, allowed_mentions: allowedMentionsFor(text) };
+    const base: Record<string, unknown> = {
+      content: text,
+      allowed_mentions: allowedMentionsFor(text),
+    };
+    if (opts?.components) base.components = opts.components;
+    const replyToMessageId = opts?.replyToMessageId;
     const withRef = replyToMessageId
       ? { ...base, message_reference: { message_id: replyToMessageId } }
       : base;
@@ -792,6 +803,7 @@ export async function sendDiscordMessage(
         body: JSON.stringify({
           content: text,
           allowed_mentions: allowedMentionsFor(text),
+          ...(opts?.components ? { components: opts.components } : {}),
         }),
       });
       if (resp.ok) return { success: true };
@@ -804,11 +816,13 @@ export async function sendDiscordMessage(
   return { success: false, error: "No bot token or webhook URL" };
 }
 
-/** Edit a sent channel message in place (used for the live status line). */
+/** Edit a sent channel message in place (used for the live status line).
+ *  opts.components: replace the component row ([] clears it). */
 export async function editDiscordMessage(
   config: ChannelConfig,
   messageId: string,
   raw: string,
+  opts?: { components?: Array<Record<string, unknown>> },
 ): Promise<{ success: boolean; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
@@ -819,7 +833,10 @@ export async function editDiscordMessage(
   try {
     await discordFetch(token, `/channels/${channelId}/messages/${messageId}`, {
       method: "PATCH",
-      body: { content: text },
+      body: {
+        content: text,
+        ...(opts?.components ? { components: opts.components } : {}),
+      },
     });
     return { success: true };
   } catch (err) {
@@ -1288,6 +1305,11 @@ function connectPresence(st: PresenceState): void {
         );
       }
     } else if (msg.op === 0 && msg.t === "INTERACTIONS_CREATE") {
+      // Dispatch log (PAT vault §0): makes type-4 (button) delivery
+      // greppable — the parked /status RCA never had this line.
+      console.log(
+        `[interactions] type=${msg.d.type} id=${msg.d.id} channel=${msg.d.channel_id} custom=${msg.d.data?.custom_id ?? "-"}`,
+      );
       const h = interactionHandlers.get(st.token);
       if (h) {
         try {
@@ -1557,6 +1579,54 @@ export async function editInteractionMessage(
       "[interactions] edit failed:",
       sanitizeSensitiveText(String(e)),
     );
+  }
+}
+
+/** Post-defer reply on an interaction. The callback is already spent
+ *  (defer consumed it — Discord allows exactly ONE callback response per
+ *  interaction), so this goes to the interaction webhook — the same
+ *  endpoint family editInteractionMessage uses for @original. Errors are
+ *  swallowed (a failed followup must not kill the tap flow). */
+export async function sendInteractionFollowup(
+  botToken: string,
+  d: any,
+  text: string,
+  opts?: { ephemeral?: boolean },
+): Promise<void> {
+  try {
+    await discordFetch(
+      botToken,
+      `/webhooks/${d.application_id}/${d.token}/messages?wait=true`,
+      {
+        method: "POST",
+        body: {
+          content: egressText(text), // secret censor
+          ...(opts?.ephemeral ? { flags: 64 } : {}),
+        },
+      },
+    );
+  } catch (e) {
+    console.error(
+      "[interactions] followup failed:",
+      sanitizeSensitiveText(String(e)),
+    );
+  }
+}
+
+/** Clear the deferred "Thinking" ack. Every error is swallowed: a 404
+ *  (already gone) is normal, a network blip must not kill the tap flow. */
+export async function deleteDeferredAck(
+  botToken: string,
+  d: any,
+): Promise<void> {
+  try {
+    await discordFetch(
+      botToken,
+      `/webhooks/${d.application_id}/${d.token}/messages/@original`,
+      { method: "DELETE" },
+    );
+  } catch {
+    // 404 (already gone) and network blips are both non-fatal here.
   }
 }
 

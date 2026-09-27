@@ -29,12 +29,21 @@ export interface JarateResult {
  * `detached: true` puts the child in its own process group so the timeout
  * kill also takes down grandchild helpers (a hung `ssh`/`bun` holding the
  * stdout pipe would otherwise delay the close event past the cap).
+ *
+ * `opts.timeoutMs` (N2): per-call cap. The default `jarateTimeoutMs()`
+ * (30s, bridge env) is right for the read-only ops; `pat-run` needs the
+ * wrapper cap (900s) + 120s socket overhead, so execute() passes
+ * `timeoutMs: 1_020_000` for it. (v2 tried to ride the cap through the
+ * CHILD env — the setTimeout lives in the bridge process, so that never
+ * worked.)
  */
 export function runJarate(
   cmd: string,
   args: string,
-  env: NodeJS.ProcessEnv = process.env,
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
 ): Promise<JarateResult> {
+  const env = opts.env ?? process.env;
+  const timeoutMs = opts.timeoutMs ?? jarateTimeoutMs();
   const jarate = path.join(env.HOME ?? "", "bin", "jarate");
   return new Promise((resolve) => {
     let p: ReturnType<typeof spawn>;
@@ -66,7 +75,7 @@ export function runJarate(
           /* already dead */
         }
       }
-    }, jarateTimeoutMs());
+    }, timeoutMs);
     p.stdout?.on("data", (d) => cap(String(d)));
     p.stderr?.on("data", (d) => cap(String(d)));
     p.on("error", (e) => {
@@ -87,11 +96,11 @@ export function runJarate(
  *   - non-zero     -> stdout if it starts with '{' (entrypoint error doc),
  *                     else a synthesized ok:false with the output tail.
  */
-export function jarateText(r: JarateResult): string {
+export function jarateText(r: JarateResult, timeoutMs?: number): string {
   if (r.timedOut) {
     return JSON.stringify({
       ok: false,
-      error: `jarate timed out after ${Math.round(jarateTimeoutMs() / 1000)}s`,
+      error: `jarate timed out after ${Math.round((timeoutMs ?? jarateTimeoutMs()) / 1000)}s`,
     });
   }
   const out = r.out.trim();
@@ -104,7 +113,20 @@ export function jarateText(r: JarateResult): string {
   });
 }
 
-const JARATE_COMMANDS = ["ctx-report", "journal-errors", "memory-grep", "rag"];
+const JARATE_COMMANDS = [
+  "ctx-report",
+  "journal-errors",
+  "memory-grep",
+  "rag",
+  "pat-request",
+  "pat-run",
+  "pat-status",
+];
+
+/** Per-call bridge cap for pat-run: wrapper command cap (900s) + 120s
+ *  socket/wrapper overhead (N2). */
+const PAT_RUN_TIMEOUT_MS = 1_020_000;
+const PAT_RUN_DEFAULT_CAP_S = "900";
 
 /**
  * Register the single `jarate` tool (cmd + args string). Subcommands are
@@ -119,7 +141,10 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
       "memory-grep <query> [--root D] [--regex]: search ~/memory, top-20 matches. " +
-      "rag <question> [--project P]: RAG query over project knowledge (recall).",
+      "rag <question> [--project P]: RAG query over project knowledge (recall). " +
+      "pat-request <scope> <reason>: ask the channel owner for a GitHub PAT (scope: default or owner/repo:read|write). " +
+      "pat-run <request-id> -- <cmd> [args]: run one command under the approved token (single use; token is injected as GH_TOKEN, never echo it; 900s cap). " +
+      "pat-status [request-id]: read-only state of PAT requests (no token).",
     promptSnippet:
       "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep, rag) as JSON",
     promptGuidelines: [
@@ -144,9 +169,29 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       _onUpdate,
       _ctx,
     ) {
-      const r = await runJarate(params.cmd, params.args ?? "");
+      const args = params.args ?? "";
+      // pat-run: per-call timeout + the wrapper command cap in the child
+      // env (N2). Everything else: defaults (30s, process.env).
+      const r =
+        params.cmd === "pat-run"
+          ? await runJarate(params.cmd, args, {
+              env: {
+                ...process.env,
+                JARATE_PAT_RUN_TIMEOUT_S: PAT_RUN_DEFAULT_CAP_S,
+              },
+              timeoutMs: PAT_RUN_TIMEOUT_MS,
+            })
+          : await runJarate(params.cmd, args);
       return {
-        content: [{ type: "text", text: jarateText(r) }],
+        content: [
+          {
+            type: "text",
+            text: jarateText(
+              r,
+              params.cmd === "pat-run" ? PAT_RUN_TIMEOUT_MS : undefined,
+            ),
+          },
+        ],
         details: {},
       };
     },

@@ -13,7 +13,7 @@ agent stack). Read this before touching anything.
 - `dispatch/` — `pi-bg`, `pi-wait` bash scripts (the orchestration machinery).
 - `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
-- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
+- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook), PAT-VAULT.md (PAT vault runbook).
 - `.githooks/pre-commit` — biome gate; `core.hooksPath` is set by install.sh.
 
 ## Commands
@@ -21,7 +21,8 @@ agent stack). Read this before touching anything.
 ```bash
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit   # must stay clean
-cd packages/bridge && bun x bun test       # 482 pass, 0 fail
+cd packages/bridge && bun x bun test       # 923 pass, 0 fail
+# PAT vault (jarate pat-request/pat-run/pat-status): docs/PAT-VAULT.md
 cd packages/recall && bun x tsc --noEmit   # must stay clean
 cd packages/recall && bun test             # unit + integration (integration
                                            # skips if Postgres/Ollama unreachable)
