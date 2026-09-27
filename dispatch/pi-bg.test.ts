@@ -949,16 +949,13 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       expect(r.err).toMatch(
         /\[!\] at cap \(\d+\/\d+\), try again later or pi-bg-kill a ticket/,
       );
-      // a + b recorded their dispatch; the refused c left no record
-      expect(
-        await waitFor(() => {
-          try {
-            return fx.records().length === 2;
-          } catch {
-            return false; // record dir not created yet
-          }
-        }),
-      ).toBe(true);
+      // Collect a + b so their run records flush (pi-bg writes the record
+      // asynchronously on exit). The refused c left no record; once a + b are
+      // collected, exactly 2 records must exist. (Old order awaited only c then
+      // polled for 2 records - a race on slow runners: c exits fast, a + b may
+      // not have recorded yet.)
+      await collect(a);
+      await collect(b);
       expect(fx.records()).toHaveLength(2);
     } finally {
       killStubs([a, b, ...(c ? [c] : [])], fx.tmp);
