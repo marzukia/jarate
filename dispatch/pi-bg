@@ -357,16 +357,37 @@ fi
 wt_path=""
 wt_branch=""
 wt_repo=""
+
+# --- launch-fail early-notify (issue #86: silent launch-fail) -----------
+# A --worktree launch-fail (not a git repo / worktree add failed) exits HERE,
+# BEFORE the webhook is read below and before the bg_on_exit DIED-fallback
+# trap registers at the end. Without this, the ticket dies with only a stderr
+# line and NO webhook -> the orchestrator never wakes (2026-09-27: 3 nestfinder
+# workers failed `--worktree nestfinder-clone`, a ref that doesn't exist, and
+# all three died silently). Read the webhook now (same source as below) and
+# arm a minimal EXIT trap that posts DIED if no callback was sent. The
+# full bg_on_exit trap (line ~860) REPLACES this on registration and does
+# the same DIED post, so a normal run is unaffected; the per-run snapshot
+# cleanup stays on the EXIT path via the compound trap.
+if [ -z "${webhook:-}" ] && [ -n "${PI_DISPATCH_WEBHOOK:-}" ]; then
+  webhook="$PI_DISPATCH_WEBHOOK"
+elif [ -z "${webhook:-}" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")" 2>/dev/null
+fi
 if [ "$wt_mode" -eq 1 ]; then
   ref="${wt_ref:-HEAD}"
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "pi-bg: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2; exit 3; }
+    echo "pi-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
+    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: not a git repo\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
+    exit 3; }
   id="$run_id"
   wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
   wt_branch="pi-bg/$id"
   wt_repo="$(basename "$top")"
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
-    echo "pi-bg: worktree add failed (ref=$ref path=$wt_path)" >&2; exit 3; fi
+    echo "pi-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
+    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: worktree add failed ref=$ref\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
+    exit 3; fi
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run"
 fi
 
