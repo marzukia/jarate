@@ -1640,6 +1640,67 @@ describe("persistence", () => {
     }
   });
 
+  test("terminal records (incl. handed-off) pruned to last 50; approvals capped", async () => {
+    const f = mkVault({});
+    try {
+      const now = Date.now();
+      const HOUR = 3_600_000;
+      // Seed 60 handed-off records, 1h apart, oldest first (terminal,
+      // no timers). They must NOT accumulate past TERMINAL_KEEP.
+      for (let i = 0; i < 60; i++) {
+        const id = `pat_seed-${String(i).padStart(2, "0")}`;
+        f.st.requests.set(id, {
+          id,
+          agent: "monky",
+          scope: "default",
+          reason: `seed ${i}`,
+          channelId: "999",
+          messageId: `msg-${i}`,
+          state: "handed-off",
+          created: now - (60 - i) * HOUR,
+          handedOffAt: now - (60 - i) * HOUR,
+          ttlDeadline: now - (60 - i) * HOUR,
+          runRc: 0,
+        } as any);
+      }
+      // 200 approval stamps, all >1h old (budget gate untouched).
+      f.st.approvals.monky = Array.from(
+        { length: 200 },
+        (_, i) => now - (200 - i + 1) * HOUR,
+      );
+      // One state change triggers persist.
+      const r = await patRequest(f.st, {
+        agent: "monky",
+        scope: "default",
+        reason: "prune check",
+      });
+      expect(r.ok).toBe(true);
+      const p = path.join(f.tmp, "state", "pat-vault.json");
+      const doc = JSON.parse(fs.readFileSync(p, "utf-8"));
+      const reqs = Object.values(doc.requests) as any[];
+      const handedOff = reqs.filter((x) => x.state === "handed-off");
+      // Keep-last-50: oldest 10 (seed-00..09) dropped, rest kept, + the
+      // fresh pending.
+      expect(handedOff.length).toBe(50);
+      expect(reqs.length).toBe(51);
+      expect(reqs.some((x) => x.id === "pat_seed-00")).toBe(false);
+      expect(reqs.some((x) => x.id === "pat_seed-09")).toBe(false);
+      expect(reqs.some((x) => x.id === "pat_seed-10")).toBe(true);
+      expect(reqs.some((x) => x.id === "pat_seed-59")).toBe(true);
+      // In-memory map pruned too (issue #99: accumulation in memory).
+      expect(f.st.requests.has("pat_seed-00")).toBe(false);
+      expect(f.st.requests.has("pat_seed-10")).toBe(true);
+      expect(f.st.requests.has("pat_seed-59")).toBe(true);
+      // Approvals capped to the last 50 (newest kept, oldest dropped).
+      expect(doc.approvals.monky.length).toBe(50);
+      expect(f.st.approvals.monky.length).toBe(50);
+      expect(doc.approvals.monky[0]).toBe(now - 51 * HOUR);
+      expect(doc.approvals.monky[49]).toBe(now - 2 * HOUR);
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("state file is 0600 once written", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pat-mode-"));
     try {

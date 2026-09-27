@@ -1519,6 +1519,18 @@ find_jarate_pat() {
 cmd_pat_request() {
   local jp
   jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
+  if [ $# -eq 1 ]; then
+    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
+    #   owner/repo:read needs a token for x
+    # first whitespace token = scope, remainder = reason (the wrapper
+    # re-joins the reason parts — here it is already joined).
+    local tail="$1" scope reason
+    scope="${tail%% *}"
+    reason="${tail#* }"
+    [ "$reason" = "$tail" ] && reason=""
+    [ -n "$reason" ] || die_usage "pat-request: usage: jarate pat-request <scope> <reason...>"
+    exec "$jp" request "$scope" "$reason"
+  fi
   [ $# -ge 2 ] || die_usage "pat-request: usage: jarate pat-request <scope> <reason...>"
   exec "$jp" request "$@"
 }
