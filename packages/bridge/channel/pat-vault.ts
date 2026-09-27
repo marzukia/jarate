@@ -58,6 +58,7 @@ const BASE_READ_TIMEOUT_MS = 5_000;
 const DONE_WAIT_EXTRA_MS = 30_000;
 const SEEN_FRESH_MS = 10 * 60_000;
 const TERMINAL_KEEP = 50;
+const APPROVALS_KEEP = 50;
 
 function envNum(name: string, def: number): number {
   const n = Number(process.env[name]);
@@ -208,24 +209,40 @@ function audit(
 function persist(st: PatVaultState): void {
   try {
     fs.mkdirSync(st.stateDir, { recursive: true });
-    // Terminal records pruned to the last 50 (oldest dropped first).
+    // Terminal records (expired, denied, handed-off) pruned to the last
+    // 50 (oldest dropped first). handed-off is terminal per the state
+    // machine; without it, used-up records accumulate forever.
     const all = [...st.requests.values()];
     const terminal = all
-      .filter((r) => r.state === "expired" || r.state === "denied")
+      .filter(
+        (r) =>
+          r.state === "expired" ||
+          r.state === "denied" ||
+          r.state === "handed-off",
+      )
       .sort((a, b) => a.created - b.created);
     const dropIds = new Set(
       terminal
         .slice(0, Math.max(0, terminal.length - TERMINAL_KEEP))
         .map((r) => r.id),
     );
-    const keep = new Map<string, PatRequest>();
-    for (const r of all) if (!dropIds.has(r.id)) keep.set(r.id, r);
+    for (const id of dropIds) st.requests.delete(id);
     const freshSeen = [...st.seen.entries()]
       .filter(([, ts]) => st.now() - ts < SEEN_FRESH_MS)
       .slice(-st.seenCap);
+    // Approval stamps: keep the last APPROVALS_KEEP per agent (memory +
+    // file). The budget gate only reads the rolling hour, and it blocks
+    // at budgetPerHour, so max(50, budgetPerHour) always covers every
+    // stamp the gate can still see.
+    const approvalsKeep = Math.max(APPROVALS_KEEP, st.budgetPerHour);
+    for (const [agent, arr] of Object.entries(st.approvals)) {
+      if (Array.isArray(arr) && arr.length > approvalsKeep) {
+        st.approvals[agent] = arr.slice(-approvalsKeep);
+      }
+    }
     const doc = {
       v: 1,
-      requests: Object.fromEntries(keep),
+      requests: Object.fromEntries(st.requests),
       approvals: st.approvals,
       seen: Object.fromEntries(freshSeen),
     };

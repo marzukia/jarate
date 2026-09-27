@@ -600,6 +600,43 @@ exit ${exitCode}
     expect(String(doc.error)).toContain("usage");
   });
 
+  test("pat-request tool path: pre-joined single word -> request; rc 0", async () => {
+    // LLM tool path (jarate.ts): the whole tail arrives as ONE pre-joined
+    // string. Must not die_usage (issue #98).
+    const s = mkStub();
+    const r = await runJarate(["pat-request", "s1 reason with spaces"], s.env);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out)).toEqual({
+      ok: true,
+      id: "pat_stub",
+      state: "pending",
+      ttl: "300s",
+    });
+    expect(s.log()).toBe("request s1 reason with spaces\n");
+  });
+
+  test("pat-request tool path and bash path give identical wrapper argv", async () => {
+    const s1 = mkStub();
+    const r1 = await runJarate(["pat-request", "s1 reason words here"], s1.env);
+    const s2 = mkStub();
+    const r2 = await runJarate(
+      ["pat-request", "s1", "reason words here"],
+      s2.env,
+    );
+    expect(r1.code).toBe(0);
+    expect(r2.code).toBe(0);
+    expect(s1.log()).toBe(s2.log());
+  });
+
+  test("pat-request single word with no reason -> usage rc 2", async () => {
+    const s = mkStub();
+    const r = await runJarate(["pat-request", "s1"], s.env);
+    expect(r.code).toBe(2);
+    const doc = JSON.parse(r.out) as Doc;
+    expect(doc.ok).toBe(false);
+    expect(String(doc.error)).toContain("usage");
+  });
+
   test("pat-run multi-word tail -> run (real argv)", async () => {
     const s = mkStub(7);
     const r = await runJarate(["pat-run", "pat_x", "--", "cmd", "a b"], s.env);
