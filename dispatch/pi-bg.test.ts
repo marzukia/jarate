@@ -817,7 +817,9 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
     const recs = fx.records();
     expect(recs).toHaveLength(1);
     expect(recs[0].state).toBe("killed");
-    expect(recs[0].reason).toContain("launch-fail: worktree add failed ref=nosuchref");
+    expect(recs[0].reason).toContain(
+      "launch-fail: worktree add failed ref=nosuchref",
+    );
     expect(recs[0].finished).toBeTruthy();
   });
 });
