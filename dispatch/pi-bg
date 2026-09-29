@@ -353,6 +353,30 @@ PY
 # early heartbeat (#52 + #101): the ticket is visible to the watchdog from birth
 : > "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null || true
 
+# mark_launch_fail <reason>: run record state=killed on a --worktree
+# launch-fail (issue #101 follow-up). The record was written state=running
+# at ticket creation above, but the launch-fail exits below run BEFORE the
+# cgroup escape (no ticket cgroup dir -> the watchdog's cwd sweep cannot
+# judge it) and before the full bg_mark_record helper is defined further
+# down. Without this the record stays "running" forever. Same fault
+# tolerance as bg_mark_record: missing/corrupt record is skipped.
+mark_launch_fail() {
+  local f="$rec_dir/pi-bg-${run_id}.json"
+  [ -f "$f" ] || return 0
+  PI_BG_REC_REASON="$1" python3 - "$f" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = "killed"
+rec["reason"] = os.environ["PI_BG_REC_REASON"]
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+}
+
 # issue #56 belt: ticket id line BEFORE the slow `git worktree add` /
 # cgroup escape, so the launcher's `head -1 log` returns immediately and a
 # dead ticket leaves an identifiable first log line (pre-fix: >60s silence
@@ -417,6 +441,7 @@ if [ "$wt_mode" -eq 1 ]; then
   ref="${wt_ref:-HEAD}"
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
     echo "pi-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
+    mark_launch_fail "launch-fail: not a git repo"
     [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: not a git repo\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
     exit 3; }
   id="$run_id"
@@ -425,6 +450,7 @@ if [ "$wt_mode" -eq 1 ]; then
   wt_repo="$(basename "$top")"
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
     echo "pi-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
+    mark_launch_fail "launch-fail: worktree add failed ref=$ref"
     [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: worktree add failed ref=$ref\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
     exit 3; fi
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run"

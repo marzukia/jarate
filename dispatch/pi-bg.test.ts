@@ -64,6 +64,11 @@ function fixture() {
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
+  // launcher's cwd (issue #66) is the same leak class: when the suite runs
+  // inside a pi-bg ticket, PI_BG_LANCHED_CWD points at the launcher's dir
+  // and pi-bg cd's back to it. Left in, a "non-git cwd" launch-fail test
+  // lands in a git repo and worktree tests hit the wrong repo.
+  delete env.PI_BG_LANCHED_CWD;
   // session-prune vars (2026-09-23) must not leak from the ambient env
   delete env.PI_BG_PRUNE_AGE_H;
   delete env.PI_BG_KEEP_SESSION;
@@ -764,6 +769,56 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       delete fx.env.PI_BG_WB_BACKOFF;
       hook.close();
     }
+  });
+});
+
+describe("#101 follow-up: launch-fail marks the run record killed", () => {
+  // --worktree launch-fails (non-git cwd / bad ref) exit BEFORE the cgroup
+  // escape -> no ticket cgroup dir for the watchdog's cwd sweep to judge.
+  // The record (written state=running at ticket creation, #101) must be
+  // marked killed by the launch-fail path itself, else it stays "running"
+  // forever (only the 7-day record prune clears it).
+
+  test("non-git cwd: exit 3, record state=killed (not running)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // fx.tmp is not a git repo (and nothing above it under /tmp is)
+    const r = await fx.run(["worker", "--worktree", "launch fail task"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].state).toBe("killed");
+    expect(recs[0].reason).toBe("launch-fail: not a git repo");
+    expect(recs[0].finished).toBeTruthy();
+  });
+
+  test("bad worktree ref: exit 3, record state=killed (not running)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // git repo in the run cwd so launch reaches the worktree-add step
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+    const r = await fx.run([
+      "worker",
+      "--worktree",
+      "nosuchref",
+      "bad ref task",
+    ]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].state).toBe("killed");
+    expect(recs[0].reason).toContain("launch-fail: worktree add failed ref=nosuchref");
+    expect(recs[0].finished).toBeTruthy();
   });
 });
 
