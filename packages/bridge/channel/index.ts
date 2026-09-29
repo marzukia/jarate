@@ -2270,6 +2270,21 @@ export default function (pi: ExtensionAPI) {
     clearAllCompacting();
     stopAllOpTicks();
     pendingAttachments.clear();
+    // #84b (follow-up to #84 L2): drain queued inbounds while the process
+    // is still alive. session_shutdown runs on EVERY process death (deploy,
+    // systemd restart, crash, reboot) — the map clears below would wipe the
+    // only in-memory reference to queued ack messages, orphaning the
+    // "[queued] N in line" / "[..] interrupting" messages in the channel
+    // forever. A HELD channel's queue is the operator's buffer: keep it
+    // (/stop A4, /reset #84 L2) — boot replay re-delivers its inbounds.
+    for (const ch of channels) {
+      if (isHeld(ch)) continue;
+      const dropped = clearQueuedInbound(ch.id);
+      if (dropped > 0)
+        console.log(
+          `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
+        );
+    }
     midTurnQueues.clear();
     queuedAcks.clear();
     clearAllInterrupts();
