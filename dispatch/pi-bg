@@ -314,6 +314,45 @@ export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 
+# --- issue #101: early bookkeeping (run record + heartbeat) at TICKET CREATION.
+#     The 20260928-095136-360941 wedge died between the cgroup-escape banner
+#     and the run-record write (old spot, ~40 lines below) with ZERO artifacts:
+#     no record, no heartbeat, no dead letter, no callback - invisible to the
+#     watchdog. Written here (before worktree add / cgroup escape / profile
+#     seeding) so a death at ANY later point is a classifiable dead ticket.
+#     A record-write failure must be LOUD (old: 2>/dev/null || true). ---
+webhook="${PI_DISPATCH_WEBHOOK:-}"
+if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
+fi
+if [ -n "$webhook" ]; then
+  delivery="webhook"
+else
+  delivery="none"
+  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with pi-wait" >&2
+fi
+rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+mkdir -p "$rec_dir" 2>/dev/null
+PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_PROJECT="$pj_tag" \
+PI_BG_REC_CWD="$(pwd)" \
+PI_BG_REC_DELIVERY="$delivery" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' \
+  || echo "[pi-bg] WARNING: run-record write failed ($run_id) - watchdog blind spot (issue #101)" >&2
+import datetime, json, os, sys
+rec = {
+    "run": os.environ["PI_BG_REC_RUN"],
+    "profile": os.environ["PI_BG_REC_PROFILE"],
+    "project": os.environ["PI_BG_REC_PROJECT"] or None,
+    "cwd": os.environ["PI_BG_REC_CWD"],
+    "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "delivery": os.environ["PI_BG_REC_DELIVERY"],
+    "state": "running",
+}
+with open(sys.argv[1], "w") as fh:
+    json.dump(rec, fh, indent=2)
+PY
+# early heartbeat (#52 + #101): the ticket is visible to the watchdog from birth
+: > "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null || true
+
 # issue #56 belt: ticket id line BEFORE the slow `git worktree add` /
 # cgroup escape, so the launcher's `head -1 log` returns immediately and a
 # dead ticket leaves an identifiable first log line (pre-fix: >60s silence
@@ -414,37 +453,10 @@ else
   echo "[pi-bg] cgroup escape unavailable, running in caller cgroup"
 fi
 
-webhook="${PI_DISPATCH_WEBHOOK:-}"
-if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
-  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
-fi
-
-# --- no-webhook warning + run record (issue #30): a missing webhook must
-#     not be a silent no-op — the callback is the ONLY wake mechanism. ---
-if [ -n "$webhook" ]; then
-  delivery="webhook"
-else
-  delivery="none"
-  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with pi-wait" >&2
-fi
-rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
-mkdir -p "$rec_dir" 2>/dev/null
-PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_PROJECT="$pj_tag" \
-PI_BG_REC_CWD="$(pwd)" \
-PI_BG_REC_DELIVERY="$delivery" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' 2>/dev/null || true
-import datetime, json, os, sys
-rec = {
-    "run": os.environ["PI_BG_REC_RUN"],
-    "profile": os.environ["PI_BG_REC_PROFILE"],
-    "project": os.environ["PI_BG_REC_PROJECT"] or None,
-    "cwd": os.environ["PI_BG_REC_CWD"],
-    "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "delivery": os.environ["PI_BG_REC_DELIVERY"],
-    "state": "running",
-}
-with open(sys.argv[1], "w") as fh:
-    json.dump(rec, fh, indent=2)
-PY
+# (issue #101: webhook resolution + run record + early heartbeat moved up
+#  to ticket creation, just after the BG_TMP block - a death before the old
+#  spot now still leaves a classifiable record. The exit trap's
+#  bg_mark_record overwrites state on every trapped exit as before.)
 
 # --- profile doctor (issue #29): the role home must hold provider creds.
 #     A fresh machine has none; pi then replies empty and the empty-completion
