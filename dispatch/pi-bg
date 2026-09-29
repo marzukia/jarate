@@ -1386,6 +1386,14 @@ if [ -n "$webhook" ]; then
   if [ -z "$verdict" ]; then
     verdict="$(printf '%s' "$out" | grep -oiE '^[[:space:]]*\**[[:space:]]*(PASS|FAIL)[[:space:]]*\**[[:space:]]*$' | tail -1 | grep -oiE 'PASS|FAIL')"
   fi
+  # fallback 2 (issue #101e): a BOLD '**PASS'**/'**FAIL**' token with trailing
+  # text (e.g. '**PASS** - merge conditions met') is a deliberate verdict
+  # marker, but the bare-line fallback above is end-anchored so it misses the
+  # trailing text. A bolded PASS/FAIL is distinct from prose ('the test FAILED
+  # badly' has no bold) so it is safe to take. Last such token wins.
+  if [ -z "$verdict" ]; then
+    verdict="$(printf '%s' "$out" | grep -oiE '\*\*(PASS|FAIL)\*\*' | tail -1 | grep -oiE 'PASS|FAIL')"
+  fi
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
     reason="$(bg_death_reason)"
     if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
