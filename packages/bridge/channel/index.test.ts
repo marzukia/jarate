@@ -7385,6 +7385,90 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(loadPersistedCursors(path.join(tmp, ".tmp")).ch1).toBe("1000");
   });
 
+  test("#84b: session_shutdown drains queued inbounds (acks deleted); held channel keeps its buffer", async () => {
+    // Two channels in settings so configRoot resolves both for the REST
+    // drain — rewrite BEFORE session_start loads the channel list.
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "uid",
+            ack: true,
+          },
+          {
+            id: "ch2",
+            name: "Other",
+            type: "discord",
+            botToken: "tok2",
+            ownerUserId: "uid",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+
+    // ch1 (non-held): two queued inbounds + their acks — the orphan path
+    const m2 = inbound("hello", "m2");
+    queueMidTurnInbound(
+      "ch1",
+      m2,
+      "ctx\n\nhello",
+      "discord/Test",
+      "hello",
+      false,
+    );
+    queuedAcks.set("m2", { ackId: "ack1", fromId: "uid", pos: 1 });
+    const m2b = inbound("again", "m2b");
+    queueMidTurnInbound(
+      "ch1",
+      m2b,
+      "ctx\n\nagain",
+      "discord/Test",
+      "again",
+      false,
+    );
+    queuedAcks.set("m2b", { ackId: "ack1b", fromId: "uid", pos: 2 });
+
+    // ch2 (held): the operator's buffer — must NOT be drained (A4 parity,
+    // /stop + /reset #84 L2)
+    const m3: ChannelMessage = {
+      ...inbound("keep", "m3"),
+      channelId: "ch2",
+      channelName: "Other",
+    };
+    queueMidTurnInbound(
+      "ch2",
+      m3,
+      "ctx\n\nkeep",
+      "discord/Other",
+      "keep",
+      false,
+    );
+    queuedAcks.set("m3", { ackId: "ack2", fromId: "uid", pos: 1 });
+    heldChannels.add("ch2");
+
+    await handlers.session_shutdown?.(); // awaits its REST deletes
+
+    // DELETE only: the drain's renumber also PATCHes the surviving acks,
+    // so a DELETE|PATCH check would pass even if a delete never fired.
+    const deleted = (ackId: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${ackId}`),
+      );
+    expect(deleted("ack1")).toBe(true); // non-held: ack deleted, no orphan
+    expect(deleted("ack1b")).toBe(true); // every queued ack in the line
+    expect(deleted("ack2")).toBe(false); // held: buffer kept, ack untouched
+    expect(midTurnQueues.get("ch1")).toBeUndefined(); // drained
+    expect(queuedAcks.has("m2")).toBe(false);
+    expect(queuedAcks.has("m2b")).toBe(false);
+  });
+
   test("second /reset while an op window is open is rejected; /compact sees the active op; /status shows the op label", async () => {
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
