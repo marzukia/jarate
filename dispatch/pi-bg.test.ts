@@ -2981,3 +2981,95 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
     delete fx.env.PI_BG_PRUNE_AGE_H;
   });
 });
+
+describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () => {
+  // Franky's dispatch shape: nohup pi-bg ... 2>&1 | head -2. head -2
+  // consumes the ticket + worktree banners and EXITS; the launcher's 3rd
+  // stdout write (the cgroup-escape line) then hits SIGPIPE. Default bash
+  // dispo = die WITHOUT running the EXIT trap: no DIED webhook, no dead
+  // letter, no terminal run record, no raw.out, pi never execs. 4 tickets
+  // died this way on 2026-09-29 (3944433, 1878647, 1950594,
+  // 4012647/4012640); the one piped through head -3 survived. The launcher
+  // now ignores SIGPIPE (trap "" PIPE after set -uo pipefail): a mis-piped
+  // dispatcher degrades to lost banners, not a lost ticket.
+  test("head -2 pipe: pi still execs, callback lands, record reaches done", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // webhook server: the orchestrator wake is the strongest "not lost"
+    // signal, and its presence removes the no-webhook stderr warning so
+    // head -2 captures exactly the ticket + worktree banners (RCA shape)
+    let body: { embeds: any[] } | null = null;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") body = (await req.json()) as any;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      // git repo in the run cwd so --worktree works (the RCA scenario)
+      const sh = (cmd: string) =>
+        execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+      sh("git init -b main");
+      sh("git config user.email t@t");
+      sh("git config user.name t");
+      fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+      sh("git add a.txt");
+      sh("git commit -m init");
+      // fake pi writes a marker (proof it exec'd) + output
+      const marker = path.join(fx.tmp, "pi-ran");
+      fs.writeFileSync(
+        path.join(fx.tmp, "bin", "pi"),
+        `#!/bin/sh\ntouch "${marker}"\necho pi-run-ok\n`,
+      );
+      fs.chmodSync(path.join(fx.tmp, "bin", "pi"), 0o755);
+
+      // the mis-piped dispatcher (Franky's exact shape; nohup elided -
+      // stdin/stdout are the pipe either way). bash -c waits for the
+      // launcher (setsid re-exec does not fork: not a group leader), so
+      // p.exited covers the whole run.
+      const p = spawn(
+        [
+          "bash",
+          "-c",
+          `bash "${PI_BG}" worker --worktree "sigpipe task" 2>&1 | head -2`,
+        ],
+        { env: fx.env, cwd: fx.tmp, stdout: "pipe", stderr: "pipe" },
+      );
+      const [out] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      expect(code).toBe(0);
+
+      // head -2 captured exactly the 2 banners, then closed the pipe
+      const lines = out.trim().split("\n");
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatch(
+        /^\[pi-bg\] ticket \d{8}-\d{6}-\d+ profile=worker$/,
+      );
+      expect(lines[1]).toContain("[pi-bg] worktree: ");
+
+      // the ticket is NOT lost:
+      // 1) pi still exec'd (the launcher survived its 3rd stdout write)
+      expect(fs.existsSync(marker)).toBe(true);
+      // 2) the callback landed (the run completed end-to-end)
+      expect(body).not.toBeNull();
+      expect(body!.embeds[0].title).toMatch(/^worker \u00b7 OK/);
+      // 3) the run record reached a terminal state (the EXIT trap ran:
+      //    bg_mark_record; pre-fix the record was stuck "running")
+      const recs = fx.records();
+      expect(recs).toHaveLength(1);
+      expect(recs[0].state).toBe("done");
+      expect(recs[0].finished).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
+      );
+    } finally {
+      server.stop(true);
+    }
+  }, 30_000);
+});

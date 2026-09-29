@@ -106,6 +106,24 @@
 
 set -uo pipefail
 
+# --- SIGPIPE hardening (#101 follow-up, Franky's BUG-2 RCA, 2026-09-29) -----
+# A dispatcher pipes the launcher: nohup pi-bg ... 2>&1 | head -2. head
+# consumes the ticket + worktree banners and EXITS; the launcher's next
+# stdout write (the cgroup-escape line) then hits SIGPIPE. bash's default
+# SIGPIPE dispo dies WITHOUT running the EXIT trap: no DIED webhook, no
+# dead letter, no terminal run record, no raw.out, pi never execs - the
+# ticket is lost (only the birth heartbeat remains; watchdog flags DEAD at
+# 10 min). 4 tickets died this way on 2026-09-29 (3944433, 1878647,
+# 1950594, 4012647/4012640); the one piped through head -3 survived.
+# Ignoring SIGPIPE makes those writes fail EPIPE instead: a mis-piped
+# dispatcher loses banners, not the ticket. The EXIT trap (DIED post +
+# bg_mark_record) writes to files and the webhook, not stdout, so it runs
+# clean even with the pipe closed. Inherited through every exec below
+# (setsid re-exec, the per-run snapshot, the pi child). set -e is NOT in
+# effect (only -u -o pipefail), so a failed echo/printf mid-script cannot
+# abort the launcher; the banner echoes are guarded anyway (belt).
+trap "" PIPE
+
 # Original argv captured BEFORE any consumption (the profile shift and the
 # --worktree strip below mutate $@): the deploy-swap snapshot exec re-passes
 # the FULL original argument list to the snapshot process.
@@ -382,7 +400,9 @@ PY
 # dead ticket leaves an identifiable first log line (pre-fix: >60s silence
 # on big repos, and a TERM'd startup printed nothing). Printed once: the
 # snapshot re-exec (PI_BG_SNAP) skips it.
-if [ -z "${PI_BG_SNAP:-}" ]; then echo "[pi-bg] ticket $run_id profile=$profile"; fi
+# 2>/dev/null || true: EPIPE-safe (the dispatcher's pipe may already be
+# closed; SIGPIPE is ignored above, so the write just fails).
+if [ -z "${PI_BG_SNAP:-}" ]; then echo "[pi-bg] ticket $run_id profile=$profile" 2>/dev/null || true; fi
 
 # --- deploy-swap guard (2026-09-15, ticket 20260915-011025-3740387) -----
 # bash keeps reading this script from DISK for the whole run. A jarate
@@ -453,7 +473,7 @@ if [ "$wt_mode" -eq 1 ]; then
     mark_launch_fail "launch-fail: worktree add failed ref=$ref"
     [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: worktree add failed ref=$ref\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
     exit 3; fi
-  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run"
+  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
 fi
 
 # task = last positional arg (early: the exit trap needs it)
@@ -473,10 +493,10 @@ ESCAPE_CG="$CG_PARENT/pi-bg/${run_id}"
 ESCAPE_ACTIVE=0
 if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/dev/null; then
   ESCAPE_ACTIVE=1
-  echo "[pi-bg] cgroup escape active: $ESCAPE_CG"
+  echo "[pi-bg] cgroup escape active: $ESCAPE_CG" 2>/dev/null || true
 else
   rmdir "$ESCAPE_CG" 2>/dev/null
-  echo "[pi-bg] cgroup escape unavailable, running in caller cgroup"
+  echo "[pi-bg] cgroup escape unavailable, running in caller cgroup" 2>/dev/null || true
 fi
 
 # (issue #101: webhook resolution + run record + early heartbeat moved up
@@ -1400,6 +1420,9 @@ if [ -n "$webhook" ]; then
   fi
 fi
 
-printf '%s\n' "$out"
-[ "$wt_mode" -eq 1 ] && printf '[pi-bg] worktree kept: %s (branch %s)\n' "$wt_path" "$wt_branch"
+# final stdout writes: with a mis-piped dispatcher (| head -N) the pipe is
+# already closed - EPIPE, not death (SIGPIPE ignored at the top); rc is the
+# explicit `exit $rc` below, never the printf status.
+printf '%s\n' "$out" 2>/dev/null || true
+[ "$wt_mode" -eq 1 ] && printf '[pi-bg] worktree kept: %s (branch %s)\n' "$wt_path" "$wt_branch" 2>/dev/null || true
 exit $rc
