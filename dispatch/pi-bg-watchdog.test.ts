@@ -309,18 +309,24 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
         f.manifest(),
         `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  reaper test\n`,
       );
+      // #101: age the dirs past REAPER_MIN_AGE (fresh dirs are skipped-young)
+      const age = (d: string) =>
+        fs.utimesSync(d, new Date(Date.now() - 10 * 60 * 1000), new Date(Date.now() - 10 * 60 * 1000));
       const e1 = plant(f, 1);
       const e2 = plant(f, 2);
       const e3 = plant(f, 3);
+      for (const d of [e1, e2, e3]) age(d);
       // non-empty: live pid in cgroup.procs (fake root: plain file)
       const live = plant(f, 4);
       fs.writeFileSync(path.join(live, "cgroup.procs"), `${process.pid}\n`);
+      age(live);
       // non-empty: threaded mode (count in cgroup.threads only)
       const threaded = plant(f, 5);
       fs.writeFileSync(
         path.join(threaded, "cgroup.threads"),
         `${process.pid}\n`,
       );
+      age(threaded);
 
       const r = await f.run();
       expect(r.code).toBe(0);
@@ -343,12 +349,43 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
     try {
       const e1 = plant(f, 6);
       const e2 = plant(f, 7);
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      fs.utimesSync(e1, old, old);
+      fs.utimesSync(e2, old, old);
       const r = await f.run(["--dry-run"]);
       expect(r.code).toBe(0);
       expect(r.out).toContain(`dry-run: would reap empty cgroup ${e1}`);
       expect(r.out).toContain(`dry-run: would reap empty cgroup ${e2}`);
       expect(fs.existsSync(e1)).toBe(true);
       expect(fs.existsSync(e2)).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("#101: young empty dir (age < REAPER_MIN_AGE) is skipped, not reaped", async () => {
+    const f = fixture();
+    try {
+      const young = plant(f, 8); // fresh: mtime = now
+      const aged = plant(f, 9);
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      fs.utimesSync(aged, old, old);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(fs.existsSync(young)).toBe(true); // skipped, NOT rmdir'd
+      expect(r.out).toContain("skipped 1 young cgroup dir(s) (age < 300s, issue #101)");
+      expect(fs.existsSync(aged)).toBe(false); // old empty dir still reaped
+      expect(r.out).toContain(`reaped empty cgroup ${aged}`);
+      // the override opens the window: with MIN_AGE=0 the fresh dir is reaped too
+      const f2 = fixture();
+      try {
+        const y2 = plant(f2, 10);
+        const r2 = await f2.run([], { PI_BG_REAPER_MIN_AGE: "0" });
+        expect(r2.code).toBe(0);
+        expect(fs.existsSync(y2)).toBe(false);
+      } finally {
+        f2.close();
+      }
     } finally {
       f.close();
     }
