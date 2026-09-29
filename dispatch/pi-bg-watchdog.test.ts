@@ -311,7 +311,11 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
       );
       // #101: age the dirs past REAPER_MIN_AGE (fresh dirs are skipped-young)
       const age = (d: string) =>
-        fs.utimesSync(d, new Date(Date.now() - 10 * 60 * 1000), new Date(Date.now() - 10 * 60 * 1000));
+        fs.utimesSync(
+          d,
+          new Date(Date.now() - 10 * 60 * 1000),
+          new Date(Date.now() - 10 * 60 * 1000),
+        );
       const e1 = plant(f, 1);
       const e2 = plant(f, 2);
       const e3 = plant(f, 3);
@@ -373,7 +377,9 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
       const r = await f.run();
       expect(r.code).toBe(0);
       expect(fs.existsSync(young)).toBe(true); // skipped, NOT rmdir'd
-      expect(r.out).toContain("skipped 1 young cgroup dir(s) (age < 300s, issue #101)");
+      expect(r.out).toContain(
+        "skipped 1 young cgroup dir(s) (age < 300s, issue #101)",
+      );
       expect(fs.existsSync(aged)).toBe(false); // old empty dir still reaped
       expect(r.out).toContain(`reaped empty cgroup ${aged}`);
       // the override opens the window: with MIN_AGE=0 the fresh dir is reaped too
