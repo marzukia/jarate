@@ -334,13 +334,22 @@ function resolveChannel(channelId: string): ChannelConfig | undefined {
 }
 
 /** Drop the stored ack for a consumed/dropped message, then renumber the
- *  acks of the entries still in line. Fire-and-forget REST. */
-function consumeQueuedAck(channelId: string, messageId: string): void {
+ *  acks of the entries still in line. The REST delete is fire-and-forget
+ *  unless `deletes` is given — the shutdown drain passes one and awaits
+ *  it, because the process may exit before an unawaited delete lands. */
+function consumeQueuedAck(
+  channelId: string,
+  messageId: string,
+  deletes?: Promise<unknown>[],
+): void {
   const ack = queuedAcks.get(messageId);
   if (ack) {
     queuedAcks.delete(messageId);
     const ch = resolveChannel(channelId);
-    if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
+    if (ch) {
+      const del = deleteDiscordMessage(ch, ack.ackId).catch(() => {});
+      if (deletes) deletes.push(del);
+    }
   }
   renumberQueuedAcks(channelId);
 }
@@ -424,11 +433,17 @@ export function popOldestQueuedInbound(): {
   return { channelId: oldest.channelId, msg: oldest.msg };
 }
 
-/** Drop all queued inbounds for a channel (/stop). Returns the count dropped. */
-export function clearQueuedInbound(channelId: string): number {
+/** Drop all queued inbounds for a channel (/stop, shutdown drain).
+ *  `deletes` collects the ack-delete promises so the caller can await
+ *  them (session_shutdown must — the process dies right after). Returns
+ *  the count dropped. */
+export function clearQueuedInbound(
+  channelId: string,
+  deletes?: Promise<unknown>[],
+): number {
   const q = midTurnQueues.get(channelId);
   if (!q) return 0;
-  for (const e of q) consumeQueuedAck(channelId, e.msg.messageId);
+  for (const e of q) consumeQueuedAck(channelId, e.msg.messageId, deletes);
   const n = q.length;
   midTurnQueues.delete(channelId);
   return n;
@@ -2251,6 +2266,27 @@ export default function (pi: ExtensionAPI) {
     // rewindTo is null for compaction.
     for (const [id, e] of compactingChannels)
       if (e.rewindTo) setChannelCursor(id, e.rewindTo);
+    // #84b (follow-up to #84 L2): drain queued inbounds BEFORE the
+    // disconnects below — deleteDiscordMessage resolves the channel id
+    // via the state set, which disconnectDiscord deletes (the fallback
+    // is the raw config value, which may be a name). session_shutdown
+    // runs on EVERY process death (deploy, systemd restart, crash,
+    // reboot) — without this the map clears below would wipe the only
+    // in-memory reference to queued ack messages, orphaning the
+    // "[queued] N in line" / "[..] interrupting" messages in the channel
+    // forever. A HELD channel's acks are kept on purpose (operator
+    // buffer, /stop A4, /reset #84 L2) — but the buffer entries
+    // themselves are lost with the clears below (as pre-PR); only the
+    // placeholder line remains in the channel.
+    const shutdownDeletes: Promise<unknown>[] = [];
+    for (const ch of channels) {
+      if (isHeld(ch)) continue;
+      const dropped = clearQueuedInbound(ch.id, shutdownDeletes);
+      if (dropped > 0)
+        console.log(
+          `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
+        );
+    }
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
@@ -2270,21 +2306,6 @@ export default function (pi: ExtensionAPI) {
     clearAllCompacting();
     stopAllOpTicks();
     pendingAttachments.clear();
-    // #84b (follow-up to #84 L2): drain queued inbounds while the process
-    // is still alive. session_shutdown runs on EVERY process death (deploy,
-    // systemd restart, crash, reboot) — the map clears below would wipe the
-    // only in-memory reference to queued ack messages, orphaning the
-    // "[queued] N in line" / "[..] interrupting" messages in the channel
-    // forever. A HELD channel's queue is the operator's buffer: keep it
-    // (/stop A4, /reset #84 L2) — boot replay re-delivers its inbounds.
-    for (const ch of channels) {
-      if (isHeld(ch)) continue;
-      const dropped = clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
-        );
-    }
     midTurnQueues.clear();
     queuedAcks.clear();
     clearAllInterrupts();
@@ -2298,6 +2319,11 @@ export default function (pi: ExtensionAPI) {
       clearInterval(bufferFlushTicker);
       bufferFlushTicker = null;
     }
+    // pi may process.exit in the microtask chain right after this handler
+    // (zero I/O turns) — await the drain's REST deletes so they reach
+    // Discord before the process dies. Worst case a few x ~300ms, well
+    // inside the systemd stop timeout.
+    await Promise.allSettled(shutdownDeletes);
   });
 
   // ─── /undo store: non-git preimages ─────────────────────────────────

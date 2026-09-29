@@ -7453,19 +7453,17 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     queuedAcks.set("m3", { ackId: "ack2", fromId: "uid", pos: 1 });
     heldChannels.add("ch2");
 
-    await handlers.session_shutdown?.();
-    // fire-and-forget REST deletes need event-loop turns to land
-    await new Promise((r) => setTimeout(r, 25));
+    await handlers.session_shutdown?.(); // awaits its REST deletes
 
-    const touched = (ackId: string) =>
+    // DELETE only: the drain's renumber also PATCHes the surviving acks,
+    // so a DELETE|PATCH check would pass even if a delete never fired.
+    const deleted = (ackId: string) =>
       fetchCalls.some(
-        (c) =>
-          (c.method === "DELETE" || c.method === "PATCH") &&
-          c.url.includes(`/messages/${ackId}`),
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${ackId}`),
       );
-    expect(touched("ack1")).toBe(true); // non-held: ack deleted, no orphan
-    expect(touched("ack1b")).toBe(true); // every queued ack in the line
-    expect(touched("ack2")).toBe(false); // held: buffer kept, ack untouched
+    expect(deleted("ack1")).toBe(true); // non-held: ack deleted, no orphan
+    expect(deleted("ack1b")).toBe(true); // every queued ack in the line
+    expect(deleted("ack2")).toBe(false); // held: buffer kept, ack untouched
     expect(midTurnQueues.get("ch1")).toBeUndefined(); // drained
     expect(queuedAcks.has("m2")).toBe(false);
     expect(queuedAcks.has("m2b")).toBe(false);
