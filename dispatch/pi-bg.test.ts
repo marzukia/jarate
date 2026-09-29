@@ -1822,6 +1822,59 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     }
   }, 60_000);
 
+  test("class B: reviewer rc=0 ending on a BARE 'PASS' line (no 'verdict:' prefix) -> PASS (#101d)", async () => {
+    // Franky's PR #2210 reviewer ended on a bare 'PASS' line - the strict
+    // 'verdict:' grep missed it and false-FAILed ('no VERDICT line') even
+    // though the review pack was complete. The fallback accepts a bare
+    // trailing PASS/FAIL as the verdict.
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\necho "re-ran the 6 contracts"\necho "sabotage both directions ok"\necho "PASS"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "bare-pass task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(/^reviewer · PASS · /);
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: reviewer rc=0 with 'PASS' mid-output (not final) -> still FAIL (#101d)", async () => {
+    // The bare-PASS fallback must only match a trailing line - a 'PASS'
+    // mentioned mid-review with no final verdict is still incomplete.
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\necho "the result looks PASS-worthy"\necho "but I found an open bug"\necho "leaving it for a follow-up"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "mid-pass task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(
+        /^reviewer · FAIL \(rc=0\) · /,
+      );
+      expect(fieldVal(hook.posts[0], "result")).toContain("no VERDICT line");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
   test("class A: silent x2 brief carries the actual stderr reason; err.log kept", async () => {
     const fx = fixture();
     fx.seedMainCreds();

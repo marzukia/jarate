@@ -1379,6 +1379,13 @@ if [ -n "$webhook" ]; then
   # '## Verdict') and position (some put it up front). The old tail -c 300 +
   # case-sensitive grep false-FAILed ~25% of clean PASS reviews.
   verdict="$(printf '%s' "$out" | grep -oiE 'verdict:[[:space:]]*\**[[:space:]]*(PASS|FAIL)' | tail -1 | grep -oiE 'PASS|FAIL')"
+  # fallback (issue #101d): a reviewer that ends on a BARE 'PASS'/'FAIL' line
+  # (no 'verdict:' prefix) is a complete review - the strict grep above misses
+  # it and false-FAILs ('no VERDICT line'). If no 'verdict:' match, accept a
+  # bare trailing PASS/FAIL as the final line. Takes the last such line.
+  if [ -z "$verdict" ]; then
+    verdict="$(printf '%s' "$out" | grep -oiE '^[[:space:]]*\**[[:space:]]*(PASS|FAIL)[[:space:]]*\**[[:space:]]*$' | tail -1 | grep -oiE 'PASS|FAIL')"
+  fi
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
     reason="$(bg_death_reason)"
     if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
