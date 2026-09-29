@@ -1875,6 +1875,85 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     }
   }, 60_000);
 
+  test("class B: reviewer rc=0 ending on '**PASS** - trailing text' (bold, not bare) -> PASS (#101e)", async () => {
+    // Franky's PR #2216 reviewer ended on '**PASS** - merge conditions on the
+    // reviewer side are met'. The #101d bare-line fallback is end-anchored so
+    // the trailing text made it miss. A bolded **PASS**/**FAIL** token is a
+    // deliberate verdict marker (distinct from prose like 'the test FAILED
+    // badly'), so accept it even with trailing text.
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\necho "re-ran the contracts"\necho "sabotage both directions ok"\necho "**PASS** - merge conditions on the reviewer side are met"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "bold-pass task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(/^reviewer · PASS · /);
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: reviewer rc=0 with '**FAIL**: N contracts broken' (bold + trailing) -> FAIL (#101e)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\necho "checked the diff"\necho "**FAIL**: 3 contracts broken"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "bold-fail task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      // A found verdict (FAIL) titles as 'reviewer · FAIL · <dur>' (no rc=0
+      // suffix - that's only for the 'no VERDICT line' false-FAIL case).
+      expect(hook.posts[0].embeds[0].title).toMatch(/^reviewer · FAIL · /);
+      expect(hook.posts[0].embeds[0].title).not.toContain("no VERDICT");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
+  test("class B: reviewer rc=0 with prose 'FAILED' (no bold) and no verdict -> still FAIL (#101e)", async () => {
+    // The bold fallback must not match non-bold prose. 'the test FAILED badly'
+    // has no ** markers, so with no other verdict the review is incomplete.
+    const fx = fixture();
+    fx.seedMainCreds();
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      '#!/bin/sh\necho "ran the suite"\necho "the test FAILED badly"\necho "no conclusion reached"\n',
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    withHook(fx, hook);
+    try {
+      const r = await fx.run(["reviewer", "prose-failed task"]);
+      expect(r.code).toBe(0);
+      expect(hook.posts).toHaveLength(1);
+      expect(hook.posts[0].embeds[0].title).toMatch(
+        /^reviewer · FAIL \(rc=0\) · /,
+      );
+      expect(fieldVal(hook.posts[0], "result")).toContain("no VERDICT line");
+    } finally {
+      withoutHook(fx);
+      hook.close();
+    }
+  }, 60_000);
+
   test("class A: silent x2 brief carries the actual stderr reason; err.log kept", async () => {
     const fx = fixture();
     fx.seedMainCreds();
