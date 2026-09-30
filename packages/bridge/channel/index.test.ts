@@ -1710,6 +1710,45 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(q?.[0].msg.messageId).toBe("m1");
     });
 
+    test("re-wake yields to an in-flight interrupt; deferred entry re-wakes after the interrupt run", async () => {
+      // Slow settle: the abort does NOT settle the run immediately, so the
+      // interrupt stays in flight across the aborted run's agent_end — the
+      // real pi ordering (pi awaits the agent_end handler before clearing
+      // the run-active flag).
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      await handleInbound(pi, inbound("first queued msg", "m1"), ctx);
+      // m1's interrupt fires and starts its settle wait (run still active).
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0); // settle still polling
+      // A second message arrives mid-settle: queued + armed.
+      await handleInbound(pi, inbound("second queued msg", "m2"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // The aborted run's agent_end lands while m1's interrupt is in
+      // flight: the re-wake DEFERS — m2 stays queued, no run starts, no
+      // send. (Before the fix this started m2's full run, which held
+      // isIdle() false and ate m1's 120 s settle cap — the 2026-09-30
+      // incident.)
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(0);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(midTurnQueues.get("ch1")?.[0].msg.messageId).toBe("m2");
+      // The run settles: the interrupt message gets the next run.
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m1");
+      // The interrupt run ends: the deferred entry re-wakes in order.
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(2);
+      expect(sent[1].m.details.messageId).toBe("m2");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
     test("/stop during the settle window drops the pending send", async () => {
       ctx.abort = () => {
         abortCount += 1;
