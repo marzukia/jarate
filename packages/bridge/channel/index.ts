@@ -948,6 +948,21 @@ export async function runMidRunInterrupt(
       // the ack message still exists (same race as the success path).
       settleOpTick(`interrupt:${channelId}`, `[ok] interrupted`);
       consumeQueuedAck(channelId, messageId);
+      // Re-wake vehicle: this run's agent_end deferred to us, so if we are
+      // dropped, no run exists to re-wake the deferred entries. Kick the
+      // oldest one now when idle (no-op while a run is active — its
+      // agent_end owns delivery; the compaction-drain path covers
+      // compaction-abort, drainQueuedAfterCompact).
+      if (ctx.isIdle()) {
+        const queued = popOldestQueuedInbound();
+        if (queued)
+          handleInbound(pi, queued.msg, ctx, true).catch((e) => {
+            console.error(
+              "[channel] cancel re-wake failed:",
+              sanitizeUnknownValue(e),
+            );
+          });
+      }
       return;
     }
     if (!ctx.isIdle()) {
@@ -2942,9 +2957,11 @@ export default function (pi: ExtensionAPI) {
     // delivered it (2026-09-30 incident: re-wake run started 2 s after the
     // abort and ate the entire settle window). The entries stay queued
     // (FIFO position and acks intact — nothing popped); the interrupt run's
-    // own agent_end re-wakes them. /stop in the window clears the queue
-    // (non-held) or the channel is held (held channels are skipped by
-    // popOldestQueuedInbound), so nothing is lost or double-sent.
+    // own agent_end re-wakes them. /stop in the window clears only its OWN
+    // channel's queue (non-held) — cross-channel entries are rescued by the
+    // interrupt cancel branch's re-wake kick (runMidRunInterrupt); held
+    // channels are skipped by popOldestQueuedInbound. Nothing is lost or
+    // double-sent.
     if (interruptingChannels.size > 0) {
       console.log(
         `[channel] re-wake deferred: interrupt in flight (${[...interruptingChannels].join(", ")})`,

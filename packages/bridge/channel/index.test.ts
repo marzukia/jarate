@@ -1952,6 +1952,142 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
   });
 
+  describe("mid-run interrupt (two channels)", () => {
+    let abortCount: number;
+    let idle: boolean;
+
+    // Two-channel variant of the `inbound` helper: channelId selects the
+    // fixture channel (ch1 = interrupted, ch2 = the entry at risk).
+    const inboundCh = (
+      body: string,
+      id: string,
+      channelId = "ch1",
+    ): ChannelMessage => ({
+      channelId,
+      channelName: channelId === "ch1" ? "Test" : "Test2",
+      channelType: "discord",
+      messageId: id,
+      from: "u",
+      fromId: "uid",
+      body,
+      timestamp: new Date().toISOString(),
+      attachments: [],
+      isRoom: false,
+    });
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      abortCount = 0;
+      idle = false;
+      // Two-channel settings fixture (ch1 + ch2, both owned by "uid").
+      fs.writeFileSync(
+        path.join(tmp, ".pi", "settings.json"),
+        JSON.stringify({
+          channels: [
+            {
+              id: "ch1",
+              name: "Test",
+              type: "discord",
+              botToken: "tok1",
+              ownerUserId: "uid",
+              ack: true,
+            },
+            {
+              id: "ch2",
+              name: "Test2",
+              type: "discord",
+              botToken: "tok2",
+              ownerUserId: "uid",
+              ack: true,
+            },
+          ],
+        }),
+      );
+      // Re-run the extension so handler closures (the re-wake
+      // handleInbound, pi.sendMessage) target this fixture.
+      handlers = {};
+      pi = {
+        registerMessageRenderer: () => {},
+        registerTool: () => {},
+        on: (n: string, fn: any) => {
+          handlers[n] = fn;
+        },
+        sendMessage: (m: any, o?: any) => {
+          sent.push({ m, o });
+        },
+      };
+      extension(pi);
+      // Slow settle: the abort does NOT settle the run immediately, so
+      // the interrupt stays in flight across the aborted run's agent_end
+      // (the real pi ordering: pi awaits the agent_end handler before
+      // clearing the run-active flag).
+      ctx.isIdle = () => idle;
+      ctx.abort = () => {
+        abortCount += 1;
+      };
+      setInterruptCtx(ctx);
+    });
+
+    afterEach(() => {
+      clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+      setInterruptCtx(null);
+      clearAllInterrupts();
+      pendingInterrupts.clear();
+      queuedAcks.clear();
+      jest.useRealTimers();
+    });
+
+    test("/stop in the deferral window re-wakes the cross-channel queued entry (cancel-branch kick)", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      expect(idle).toBe(false);
+      // 1. m1 (ch1) arrives mid-run: queued, interrupt armed.
+      await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
+      // 2. m1's interrupt fires: abort in flight, settle polling — the
+      //    run is still active, so no send yet.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0);
+      // 3. m2 (ch2) arrives mid-settle: queued in a DIFFERENT channel —
+      //    the entry the deferred agent_end should re-wake.
+      await handleInbound(pi, inboundCh("m2 body", "m2", "ch2"), ctx);
+      expect(midTurnQueues.get("ch2")?.length).toBe(1);
+      // 4. The aborted run's agent_end lands while m1's interrupt is in
+      //    flight: the re-wake DEFERS — m2 stays queued, no run starts,
+      //    no send.
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(0);
+      expect(midTurnQueues.get("ch2")?.length).toBe(1);
+      // 5. The run settles and /stop on ch1 wins the race: the interrupt
+      //    send is dropped at the next settle tick. /stop clears only
+      //    ch1's queue — m2 (ch2) is NOT cleared, and with the interrupt
+      //    dropped there is no run left to re-wake it.
+      idle = true;
+      await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(0); // m1's send never happened
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      // The cancel branch's re-wake kick runs handleInbound for m2; that
+      // chain awaits memoryToc's fs read before sending — under fake
+      // timers the read completes on an event-loop turn (setImmediate),
+      // not a microtask flush.
+      for (let i = 0; i < 25 && sent.length === 0; i++) {
+        await new Promise<void>((r) => setImmediate(r));
+      }
+      // 6. m2 was re-woken by the cancel branch: no orphaned entry with a
+      //    stale [queued] ack (fails without the kick).
+      expect(sent.some((s) => s.m?.details?.messageId === "m2")).toBe(true);
+      expect(midTurnQueues.has("ch2")).toBe(false);
+      // m2's own armed interrupt now finds pi idle and the queue empty:
+      // no double send, no spurious abort.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(sent.length).toBe(1);
+      expect(abortCount).toBe(1);
+    });
+  });
+
   describe("queue control (. queue suffix, edit, delete)", () => {
     let abortCount: number;
     let idle: boolean;
