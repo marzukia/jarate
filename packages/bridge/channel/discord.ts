@@ -30,8 +30,11 @@ const DISCORD_API = "https://discord.com/api/v10";
 export const POLL_INTERVAL_MS = 5_000;
 /** Backfill poll interval (ms) when the gateway is connected. */
 export const POLL_BACKFILL_MS = 60_000;
-/** Gateway intents: GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | GUILD_MESSAGE_CONTENT = 37377. */
-const GATEWAY_INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
+/** Gateway intents: GUILDS | INTERACTIONS | GUILD_MESSAGES | DIRECT_MESSAGES |
+ *  GUILD_MESSAGE_CONTENT. INTERACTIONS (1<<1) was missing — no
+ *  INTERACTION_CREATE ever arrived, so slash commands + vault buttons
+ *  were dead in production (RCA 2026-10-01). */
+const GATEWAY_INTENTS = 1 | (1 << 1) | (1 << 9) | (1 << 12) | (1 << 15);
 
 // ─── Private state per channel ─────────────────────────────────────────────
 
@@ -1304,7 +1307,7 @@ function connectPresence(st: PresenceState): void {
           sanitizeSensitiveText(String(e)),
         );
       }
-    } else if (msg.op === 0 && msg.t === "INTERACTIONS_CREATE") {
+    } else if (msg.op === 0 && msg.t === "INTERACTION_CREATE") {
       // Dispatch log (PAT vault §0): makes type-4 (button) delivery
       // greppable — the parked /status RCA never had this line.
       console.log(
