@@ -457,6 +457,10 @@ if [ -z "${webhook:-}" ] && [ -n "${PI_DISPATCH_WEBHOOK:-}" ]; then
 elif [ -z "${webhook:-}" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")" 2>/dev/null
 fi
+# issue #30 no-webhook corner: with neither source present, `webhook` stays
+# UNSET under `set -u` and the guard below aborts with rc 1 (unbound variable)
+# instead of skipping the post; default to empty so a launch-fail exits clean 3.
+webhook="${webhook:-}"
 if [ "$wt_mode" -eq 1 ]; then
   ref="${wt_ref:-HEAD}"
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {

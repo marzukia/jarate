@@ -903,6 +903,32 @@ describe("#86: launch-fail webhook", () => {
       hook.close();
     }
   });
+
+  test("no-webhook corner (#30): rc 3, LAUNCH-FAIL printed, no unbound variable, no webhook attempt", async () => {
+    const fx = fixture();
+    // documented no-webhook mode: fixture fake HOME has no
+    // ~/.config/pi-dispatch/webhook and PI_DISPATCH_WEBHOOK is deleted,
+    // so the early read leaves `webhook` unset (set -u corner)
+    expect(
+      fs.existsSync(path.join(fx.home, ".config", "pi-dispatch", "webhook")),
+    ).toBe(false);
+    expect(fx.env.PI_DISPATCH_WEBHOOK).toBeUndefined();
+    // fixture cwd (os.tmpdir) is not inside a git repo
+    const r = await fx.run(["worker", "--worktree", "t"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
+    // pre-fix: `line 381: webhook: unbound variable` + rc 1 (MINOR-1)
+    expect(r.err).not.toContain("unbound variable");
+    // no webhook attempt: a post would need a URL (none exists); if a
+    // broken guard ever fired one, curl would fail and leave the
+    // -webhook-failed dead letter in BG_TMP ($HOME/.pi-bg-art)
+    const m = r.out.match(/^\[pi-bg\] ticket (\S+)/);
+    if (!m) throw new Error("no ticket line on stdout");
+    expect(m[1]).toMatch(/^\d{8}-\d{6}-\d+$/);
+    const artDir = path.join(fx.home, ".pi-bg-art");
+    const files = fs.existsSync(artDir) ? fs.readdirSync(artDir) : [];
+    expect(files.filter((f) => f.endsWith("-webhook-failed"))).toEqual([]);
+  });
 });
 
 /**
