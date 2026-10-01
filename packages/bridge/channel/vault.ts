@@ -1817,8 +1817,15 @@ function load(st: VaultState): void {
       // longer arrive (connection died with the process).
       c.runsInFlight = 0;
     }
-    if (c.state === "active" && c.valueSource === "stored") {
-      // Re-register the stored value for the censor across restarts.
+    if (
+      (c.state === "pending" || c.state === "active") &&
+      c.valueSource === "stored"
+    ) {
+      // Re-register the stored value for the censor across restarts. A
+      // live pending BYO must stay censored if the bridge restarts inside
+      // the <=5min window (the registry has no TTL — a missed registration
+      // is missed forever). Dead pendings were settled to expired above,
+      // so only still-live ones reach this line.
       try {
         st.secrets.register([readValueFile(st, c.id)]);
       } catch {
@@ -1836,6 +1843,23 @@ function load(st: VaultState): void {
     }
   }
   persist(st);
+}
+
+/** A crash between the value-file write and persist leaves a 0600 secret
+ *  file with no credential record. Sweep it at boot, after load (needs
+ *  the credential map). */
+function sweepOrphanValueFiles(st: VaultState): void {
+  try {
+    for (const name of fs.readdirSync(st.secretsDir)) {
+      if (!name.endsWith(".secret")) continue;
+      const id = name.slice(0, -".secret".length);
+      if (st.credentials.has(id)) continue;
+      fs.unlinkSync(path.join(st.secretsDir, name));
+      audit(st, "sweep", { actor: "system" }, { orphan: name });
+    }
+  } catch (e) {
+    console.error("[vault] orphan value sweep failed:", e);
+  }
 }
 
 // ─── start / stop ─────────────────────────────────────────────────────────
@@ -1940,6 +1964,7 @@ export function startVault(opts: StartVaultOpts): VaultHandle {
 
   startupSweep(st);
   load(st);
+  sweepOrphanValueFiles(st);
   const ready = bindSocket(st);
   vaultEntries.set(socketPath, { vault: st, refs: 1 });
   return makeHandle(st, ready);
