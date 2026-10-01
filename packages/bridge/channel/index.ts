@@ -920,10 +920,10 @@ export async function runMidRunInterrupt(
     } catch {
       /* best-effort abort */
     }
-    // Wait for the session to fully settle (see function doc). If another
-    // queued message's re-wake starts a run during this window, we wait
-    // for that run too — the interrupt message then follows it as a fresh
-    // run. Nothing is lost; order may be inverted for the other message.
+    // Wait for the session to fully settle (see function doc). The
+    // agent_end re-wake yields to this in-flight interrupt (it does not
+    // start a re-wake run while we wait), so the window covers only
+    // post-run compaction/retries — NOT another queued message's full run.
     // Cap: 120 s (compaction/retry are LLM calls and can be slow). If
     // /stop, /reset or /restart lands in this window the send is dropped
     // (interruptCancelled), consistent with those commands dropping queued
@@ -948,6 +948,21 @@ export async function runMidRunInterrupt(
       // the ack message still exists (same race as the success path).
       settleOpTick(`interrupt:${channelId}`, `[ok] interrupted`);
       consumeQueuedAck(channelId, messageId);
+      // Re-wake vehicle: this run's agent_end deferred to us, so if we are
+      // dropped, no run exists to re-wake the deferred entries. Kick the
+      // oldest one now when idle (no-op while a run is active — its
+      // agent_end owns delivery; the compaction-drain path covers
+      // compaction-abort, drainQueuedAfterCompact).
+      if (ctx.isIdle()) {
+        const queued = popOldestQueuedInbound();
+        if (queued)
+          handleInbound(pi, queued.msg, ctx, true).catch((e) => {
+            console.error(
+              "[channel] cancel re-wake failed:",
+              sanitizeUnknownValue(e),
+            );
+          });
+      }
       return;
     }
     if (!ctx.isIdle()) {
@@ -2933,15 +2948,35 @@ export default function (pi: ExtensionAPI) {
     // to pi before this handler returns, so the new turn actually starts
     // (triggerTurn; pi continues the run for a steer queued at agent_end).
     // Repeats on each agent_end until the queue drains.
-    const queued = popOldestQueuedInbound();
-    if (queued) {
+    //
+    // YIELD TO IN-FLIGHT INTERRUPTS (any channel): an in-flight interrupt's
+    // settle loop is waiting on isIdle() so its message can start the next
+    // run. A re-wake run started here would hold isIdle() false for the run's
+    // whole duration (minutes), the interrupt would burn its 120 s settle
+    // cap, and its placeholder would linger until a later re-wake finally
+    // delivered it (2026-09-30 incident: re-wake run started 2 s after the
+    // abort and ate the entire settle window). The entries stay queued
+    // (FIFO position and acks intact — nothing popped); the interrupt run's
+    // own agent_end re-wakes them. /stop in the window clears only its OWN
+    // channel's queue (non-held) — cross-channel entries are rescued by the
+    // interrupt cancel branch's re-wake kick (runMidRunInterrupt); held
+    // channels are skipped by popOldestQueuedInbound. Nothing is lost or
+    // double-sent.
+    if (interruptingChannels.size > 0) {
       console.log(
-        `[channel] re-wake: starting run for queued mid-turn inbound (${queued.channelId})`,
+        `[channel] re-wake deferred: interrupt in flight (${[...interruptingChannels].join(", ")})`,
       );
-      try {
-        await handleInbound(pi, queued.msg, ctx, true);
-      } catch (e) {
-        console.error("[channel] re-wake failed:", sanitizeUnknownValue(e));
+    } else {
+      const queued = popOldestQueuedInbound();
+      if (queued) {
+        console.log(
+          `[channel] re-wake: starting run for queued mid-turn inbound (${queued.channelId})`,
+        );
+        try {
+          await handleInbound(pi, queued.msg, ctx, true);
+        } catch (e) {
+          console.error("[channel] re-wake failed:", sanitizeUnknownValue(e));
+        }
       }
     }
 
