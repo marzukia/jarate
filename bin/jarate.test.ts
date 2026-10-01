@@ -235,6 +235,11 @@ describe("entrypoint", () => {
       "pat-request",
       "pat-run",
       "pat-status",
+      "vault-request",
+      "vault-run",
+      "vault-status",
+      "vault-revoke",
+      "vault-audit",
     ]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });

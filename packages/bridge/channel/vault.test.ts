@@ -1,0 +1,1220 @@
+/**
+ * Generic vault tests — docs/vault-design.md §12.
+ *
+ * Harness mirrors pat-vault.test.ts:
+ *  - FakeDiscord: fetch stub enforcing Discord's one-callback rule.
+ *  - Real clocks with env-shortened constants (TTL 1.2s, claim 0.8s,
+ *    censor grace 0.2s, hour 0.6s); windows driven by manipulating
+ *    state timestamps where waiting is impractical.
+ *  - Sockets bind under a mkdtemp XDG dir — no box state touched.
+ *
+ * Covers: request validation, owner-approval gate, single-use (one-shot),
+ * time-boxed window + expiry, permanent + revoke, deny, stored (BYO)
+ * values, legacy PAT fallback, permissions, never-echo (state/audit/wire),
+ * audit completeness, max-pending, restart recovery, budget, file
+ * transport.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+import { clearRegistryCache, clearRuntimeSecrets } from "./censor";
+import {
+  __vaultResetForTest,
+  knownNames,
+  readKnownValue,
+  startVault,
+  stopVault,
+  type VaultHandle,
+  type VaultState,
+  validateRequestLine,
+  validateValueShape,
+  vaultRequest,
+} from "./vault";
+
+// ─── fake Discord REST ─────────────────────────────────────────────────────
+
+function resp(status: number, data: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => data,
+    text: async () =>
+      data == null
+        ? ""
+        : typeof data === "string"
+          ? data
+          : JSON.stringify(data),
+  };
+}
+
+class FakeDiscord {
+  calls: Array<{ url: string; method: string; body: any }> = [];
+  callbackSpent = new Set<string>();
+  private msgSeq = 0;
+
+  install(): void {
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = String(input);
+      const method: string = init?.method ?? "GET";
+      let body: any;
+      if (typeof init?.body === "string") {
+        try {
+          body = JSON.parse(init.body);
+        } catch {
+          body = init.body;
+        }
+      }
+      this.calls.push({ url, method, body });
+      const cb = url.match(/\/interactions\/([^/]+)\/[^/]+\/callback$/);
+      if (cb) {
+        if (this.callbackSpent.has(cb[1])) {
+          return resp(400, { message: "unknown interaction" });
+        }
+        this.callbackSpent.add(cb[1]);
+        return resp(204, null);
+      }
+      if (method === "POST" && /\/channels\/[^/]+\/messages$/.test(url)) {
+        return resp(200, { id: `msg-${++this.msgSeq}` });
+      }
+      if (
+        method === "POST" &&
+        url.includes("/webhooks/") &&
+        url.includes("messages?wait=true")
+      ) {
+        return resp(200, { id: "followup" });
+      }
+      if (method === "PATCH" && url.includes("/messages/"))
+        return resp(204, null);
+      if (method === "DELETE") return resp(204, null);
+      return resp(200, {});
+    }) as any;
+  }
+
+  followups(): Array<{ url: string; body: any }> {
+    return this.calls
+      .filter(
+        (c) =>
+          c.method === "POST" &&
+          c.url.includes("/webhooks/") &&
+          c.url.includes("messages?wait=true"),
+      )
+      .map((c) => ({ url: c.url, body: c.body }));
+  }
+
+  callbacksFor(id: string): number {
+    return this.calls.filter(
+      (c) =>
+        c.method === "POST" &&
+        c.url.includes(`/interactions/${id}/`) &&
+        c.url.endsWith("/callback"),
+    ).length;
+  }
+
+  channelPosts(): any[] {
+    return this.calls.filter(
+      (c) => c.method === "POST" && /\/channels\/[^/]+\/messages$/.test(c.url),
+    );
+  }
+
+  messageEdits(): any[] {
+    return this.calls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
+  }
+}
+
+// ─── fixtures ──────────────────────────────────────────────────────────────
+
+const OWNER = "108801968763305984";
+const OTHER = "215356028869541889";
+const FINE_TOKEN = `github_pat_${"f".repeat(30)}`;
+const CLASSIC_TOKEN = `ghp_${"c".repeat(36)}`;
+const BYO_VALUE = `sk-vault-byo-${"x".repeat(24)}`;
+
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+interface VaultFix {
+  h: VaultHandle;
+  st: VaultState;
+  fd: FakeDiscord;
+  tmp: string;
+  ch: any;
+  xdg: string;
+  vaultDir: string;
+  knownDir: string;
+  secretsDir: string;
+  stateFile: string;
+  auditPath: string;
+  legacyPatsDir: string;
+  legacyDefaultPatFile: string;
+  auditLines: () => string[];
+  auditEvents: () => Array<Record<string, unknown>>;
+  cleanup: () => void;
+}
+
+const realFetch = globalThis.fetch;
+const savedEnv: Record<string, string | undefined> = {};
+
+function setEnv(k: string, v: string): void {
+  savedEnv[k] = process.env[k];
+  process.env[k] = v;
+}
+
+function restoreEnv(): void {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  for (const k of Object.keys(savedEnv)) delete process.env[k];
+}
+
+function mkVault(
+  over: {
+    transport?: "socket" | "file";
+    ch?: any;
+    budgetPerHour?: number;
+    xdgDir?: string;
+  } = {},
+): VaultFix {
+  const tmp = over.xdgDir
+    ? path.join(over.xdgDir, "..")
+    : fs.mkdtempSync(path.join(os.tmpdir(), "vault-"));
+  const xdg = over.xdgDir ?? path.join(tmp, "xdg");
+  const vaultDir = path.join(tmp, "vault");
+  const knownDir = path.join(vaultDir, "known");
+  const secretsDir = path.join(vaultDir, "secrets");
+  const stateFile = path.join(vaultDir, "state.json");
+  const auditPath = path.join(vaultDir, "audit.log");
+
+  // Known values: github-pat scope in the vault known/ dir; legacy
+  // fallback files for the legacy-fallback test.
+  fs.mkdirSync(path.join(knownDir, "github-pat", "marzukia"), {
+    recursive: true,
+  });
+  fs.writeFileSync(
+    path.join(knownDir, "github-pat", "marzukia", "jarate:write"),
+    FINE_TOKEN,
+    {
+      mode: 0o600,
+    },
+  );
+  fs.mkdirSync(path.join(knownDir, "api-key"), { recursive: true });
+  for (const n of ["window-key", "other-key", "bk-0", "bk-1", "bk-3"]) {
+    fs.writeFileSync(path.join(knownDir, "api-key", n), `key-${n}-value`, {
+      mode: 0o600,
+    });
+  }
+  const legacyPatsDir = path.join(tmp, "legacy-pats");
+  fs.mkdirSync(path.join(legacyPatsDir, "legacyorg"), { recursive: true });
+  fs.writeFileSync(
+    path.join(legacyPatsDir, "legacyorg", "legacorepo:read"),
+    `${FINE_TOKEN}\n`,
+    { mode: 0o600 },
+  );
+  const legacyDefaultPatFile = path.join(tmp, "marzukia-pat");
+  fs.writeFileSync(legacyDefaultPatFile, `${CLASSIC_TOKEN}\n`, { mode: 0o600 });
+
+  const ch =
+    over.ch ??
+    ({
+      id: "ch1",
+      name: "ch1",
+      type: "discord",
+      channel: "999",
+      botToken: "tok-ch1",
+      ownerUserId: OWNER,
+      ownerUserIds: [OWNER],
+    } as any);
+
+  // Shortened clocks (env read at startVault).
+  setEnv("JARATE_VAULT_TTL_MS", "1200");
+  setEnv("JARATE_VAULT_CLAIM_MS", "800");
+  setEnv("JARATE_VAULT_CENSOR_GRACE_MS", "200");
+  setEnv("JARATE_VAULT_HOUR_MS", "600");
+  setEnv("JARATE_VAULT_MAX_PENDING", "1");
+  setEnv("JARATE_VAULT_BUDGET_PER_HOUR", String(over.budgetPerHour ?? 5));
+
+  const h = startVault({
+    ch,
+    botToken: ch.botToken,
+    stateDir: path.join(tmp, "state"),
+    xdgDir: xdg,
+    vaultDir,
+    knownDir,
+    secretsDir,
+    stateFile,
+    auditFile: auditPath,
+    legacyPatsDir,
+    legacyDefaultPatFile,
+    transport: over.transport ?? "socket",
+  });
+
+  return {
+    h,
+    st: h.vault,
+    fd: (() => {
+      const fd = new FakeDiscord();
+      fd.install();
+      return fd;
+    })(),
+    tmp,
+    ch,
+    xdg,
+    vaultDir,
+    knownDir,
+    secretsDir,
+    stateFile,
+    auditPath,
+    legacyPatsDir,
+    legacyDefaultPatFile,
+    auditLines: () => readAudit(auditPath),
+    auditEvents: () => readAudit(auditPath).map((l) => JSON.parse(l)),
+    cleanup: () => {
+      stopVault(h);
+      globalThis.fetch = realFetch;
+      clearRegistryCache();
+      clearRuntimeSecrets();
+      __vaultResetForTest();
+      restoreEnv();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+function readAudit(p: string): string[] {
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, "utf-8").trim().split("\n");
+}
+
+function mkD(
+  id: string,
+  customId: string,
+  over: Record<string, any> = {},
+): any {
+  return {
+    type: 4,
+    id,
+    token: `intok-${id}`,
+    application_id: "app1",
+    channel_id: "999",
+    message_id: "",
+    data: { custom_id: customId },
+    user: { id: OWNER, username: "Owner" },
+    ...over,
+  };
+}
+
+/** Create a pending request the way the socket `vrequest` op would. */
+async function makePending(
+  f: VaultFix,
+  line: Record<string, unknown> = {
+    agent: "monky",
+    kind: "github-pat",
+    name: "marzukia/jarate:write",
+    level: "one-shot",
+    reason: "open PR for #41",
+  },
+): Promise<string> {
+  const r = await vaultRequest(f.st, line as any);
+  if (!r.ok) throw new Error(`vaultRequest failed: ${r.error}`);
+  return r.id as string;
+}
+
+/** Owner-approves the credential, awaiting the followup post. */
+async function approve(f: VaultFix, id: string): Promise<void> {
+  await f.h.ready;
+  const cred = f.st.credentials.get(id);
+  await f.h.handleVaultComponent(
+    mkD(`i-${id}`, `vault:approve:${id}`, {
+      message_id: cred?.messageId ?? "",
+    }),
+  );
+}
+
+/** Owner-deny / owner-revoke taps (message_id matched). */
+async function tap(
+  f: VaultFix,
+  id: string,
+  verb: "deny" | "revoke",
+): Promise<void> {
+  await f.h.ready;
+  const cred = f.st.credentials.get(id);
+  await f.h.handleVaultComponent(
+    mkD(`i-${verb}-${id}`, `vault:${verb}:${id}`, {
+      message_id: cred?.messageId ?? "",
+    }),
+  );
+}
+
+/** Socket client against the fixture's vault.sock. */
+class VaultClient {
+  sock: net.Socket;
+  /** Everything received, verbatim (wire audit). */
+  raw = "";
+  private buf = "";
+  private lineResolvers: Array<(line: string) => void> = [];
+  private queued: string[] = [];
+
+  constructor(xdg: string) {
+    this.sock = net.connect(path.join(xdg, "jarate", "vault.sock"));
+    this.sock.on("data", (d: Buffer) => this.onData(d));
+  }
+
+  connect(): Promise<void> {
+    return new Promise((res, rej) => {
+      this.sock.once("connect", () => res());
+      this.sock.once("error", (e) => rej(e));
+    });
+  }
+
+  private onData(d: Buffer): void {
+    this.raw += d.toString("utf-8");
+    this.buf += d.toString("utf-8");
+    let idx = this.buf.indexOf("\n");
+    while (idx >= 0) {
+      const line = this.buf.slice(0, idx);
+      this.buf = this.buf.slice(idx + 1);
+      idx = this.buf.indexOf("\n");
+      const r = this.lineResolvers.shift();
+      if (r) r(line);
+      else this.queued.push(line);
+    }
+  }
+
+  send(obj: Record<string, unknown>): void {
+    this.sock.write(`${JSON.stringify({ v: 1, ...obj })}\n`);
+  }
+
+  nextLine(timeoutMs = 5000): Promise<string> {
+    return new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("client timeout")), timeoutMs);
+      this.lineResolvers.push((line) => {
+        clearTimeout(t);
+        res(line);
+      });
+      const q = this.queued.shift();
+      if (q !== undefined) {
+        clearTimeout(t);
+        res(q);
+      }
+    });
+  }
+
+  close(): void {
+    this.sock.destroy();
+  }
+}
+
+async function vrun(
+  f: VaultFix,
+  id: string,
+  cmd: string[] = ["true"],
+  agent = "monky",
+): Promise<any> {
+  const c = new VaultClient(f.xdg);
+  try {
+    await c.connect();
+    c.send({ op: "vrun", id, agent, cmd, timeout_s: 60 });
+    return JSON.parse(await c.nextLine());
+  } finally {
+    c.close();
+  }
+}
+
+async function vstatus(
+  f: VaultFix,
+  id?: string,
+  agent = "monky",
+): Promise<any> {
+  const c = new VaultClient(f.xdg);
+  try {
+    await c.connect();
+    c.send({ op: "vstatus", agent, ...(id ? { id } : {}) });
+    return JSON.parse(await c.nextLine());
+  } finally {
+    c.close();
+  }
+}
+
+async function vrevoke(f: VaultFix, id: string, agent = "monky"): Promise<any> {
+  const c = new VaultClient(f.xdg);
+  try {
+    await c.connect();
+    c.send({ op: "vrevoke", agent, id });
+    return JSON.parse(await c.nextLine());
+  } finally {
+    c.close();
+  }
+}
+
+function modeOf(p: string): number {
+  return (fs.statSync(p).mode & 0o777) as number;
+}
+
+beforeEach(() => {
+  restoreEnv();
+});
+
+afterEach(() => {
+  clearRegistryCache();
+});
+
+// ─── pure helpers ──────────────────────────────────────────────────────────
+
+describe("validateRequestLine", () => {
+  test("rejects bad kind", () => {
+    const r = validateRequestLine({
+      kind: "ssh-key" as any,
+      name: "x",
+      level: "one-shot",
+      reason: "abc",
+    } as any);
+    expect(r.ok).toBe(false);
+  });
+
+  test("github-pat name must be default or owner/repo:perm", () => {
+    expect(
+      validateRequestLine({
+        kind: "github-pat",
+        name: "bad/scope!",
+        level: "one-shot",
+        reason: "abc",
+      } as any).ok,
+    ).toBe(false);
+    expect(
+      validateRequestLine({
+        kind: "github-pat",
+        name: "default",
+        level: "one-shot",
+        reason: "abc",
+      } as any).ok,
+    ).toBe(true);
+  });
+
+  test("time-boxed needs hours 1..72", () => {
+    const base = {
+      kind: "api-key" as const,
+      name: "k",
+      envvar: "K",
+      reason: "abc",
+    };
+    expect(
+      validateRequestLine({ ...base, level: "time-boxed" } as any).ok,
+    ).toBe(false);
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 0,
+      } as any).ok,
+    ).toBe(false);
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 73,
+      } as any).ok,
+    ).toBe(false);
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 2,
+      } as any).ok,
+    ).toBe(true);
+    // --hours on non-time-boxed is a usage error
+    expect(
+      validateRequestLine({
+        kind: "api-key",
+        name: "k",
+        level: "one-shot",
+        hours: 2,
+        reason: "abc",
+      } as any).ok,
+    ).toBe(false);
+  });
+
+  test("envvar: required for non-github-pat, defaults to GH_TOKEN for github-pat", () => {
+    expect(
+      validateRequestLine({
+        kind: "api-key",
+        name: "k",
+        level: "one-shot",
+        reason: "abc",
+      } as any).ok,
+    ).toBe(false);
+    expect(
+      validateRequestLine({
+        kind: "api-key",
+        name: "k",
+        level: "one-shot",
+        envvar: "MY_KEY",
+        reason: "abc",
+      } as any).ok,
+    ).toBe(true);
+    const r = validateRequestLine({
+      kind: "github-pat",
+      name: "default",
+      level: "one-shot",
+      reason: "abc",
+    } as any);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.envvar).toBe("GH_TOKEN");
+  });
+
+  test("reason 3..200", () => {
+    expect(
+      validateRequestLine({
+        kind: "api-key",
+        name: "k",
+        level: "one-shot",
+        envvar: "K",
+        reason: "ab",
+      } as any).ok,
+    ).toBe(false);
+  });
+});
+
+describe("validateValueShape", () => {
+  test("github-pat: token regex", () => {
+    expect(validateValueShape("github-pat", FINE_TOKEN)).toBe(true);
+    expect(validateValueShape("github-pat", CLASSIC_TOKEN)).toBe(true);
+    expect(validateValueShape("github-pat", "not-a-token")).toBe(false);
+  });
+
+  test("api-key: no whitespace, 1..4096", () => {
+    expect(validateValueShape("api-key", "abc.def/ghi")).toBe(true);
+    expect(validateValueShape("api-key", "has space")).toBe(false);
+    expect(validateValueShape("api-key", "")).toBe(false);
+    expect(validateValueShape("api-key", "a".repeat(4097))).toBe(false);
+  });
+
+  test("password: no newlines, 1..4096", () => {
+    expect(validateValueShape("password", "p w s s\nword")).toBe(false);
+    expect(validateValueShape("password", "p w s s word")).toBe(true);
+  });
+});
+
+// ─── state machine ─────────────────────────────────────────────────────────
+
+describe("one-shot (single-use)", () => {
+  test("request -> owner approve -> run once -> consumed; second run rejected", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+
+      // Run before approval is rejected.
+      let r = await vrun(f, id);
+      expect(r.ok).toBe(false);
+      expect(String(r.error)).toMatch(/pending/i);
+
+      await approve(f, id);
+      const cred = f.st.credentials.get(id)!;
+      expect(cred.state).toBe("active");
+
+      r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(r.token).toBe(FINE_TOKEN);
+      expect(r.envvar).toBe("GH_TOKEN");
+      expect(r.git_header).toBe(true);
+
+      // Second run: consumed.
+      r = await vrun(f, id);
+      expect(r.ok).toBe(false);
+      expect(String(r.error)).toMatch(/already used/i);
+      expect(f.st.credentials.get(id)?.state).toBe("consumed");
+
+      const events = f.auditEvents().map((e) => e.event);
+      expect(events).toContain("request");
+      expect(events).toContain("approve");
+      expect(events).toContain("use");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("non-owner button tap is ignored; state stays pending", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await f.h.handleVaultComponent(
+        mkD(`i-n1`, `vault:approve:${id}`, {
+          user: { id: OTHER, username: "Other" },
+          message_id: f.st.credentials.get(id)?.messageId ?? "",
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const events = f.auditEvents().map((e) => e.event);
+      expect(events).toContain("non-owner-tap");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("deny -> denied, terminal; run rejected", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await tap(f, id, "deny");
+      expect(f.st.credentials.get(id)?.state).toBe("denied");
+      const r = await vrun(f, id);
+      expect(r.ok).toBe(false);
+      const events = f.auditEvents().map((e) => e.event);
+      expect(events).toContain("deny");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("max-pending: second request while one is pending is rejected", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      await makePending(f);
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "other-key",
+        level: "one-shot",
+        envvar: "OTHER",
+        reason: "second request",
+      } as any);
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toMatch(/pending/i);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("time-boxed", () => {
+  test("reusable within window; expires after hours; use-after-expiry rejected", async () => {
+    // HOUR_MS shortened to 600ms in the fixture; hours=1 -> 600ms window.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "window-key",
+        level: "time-boxed",
+        hours: 1,
+        envvar: "WIN_KEY",
+        reason: "short window",
+      });
+      await approve(f, id);
+      const cred = f.st.credentials.get(id)!;
+      expect(cred.state).toBe("active");
+      expect(cred.expiresAt).toBeGreaterThan(0);
+
+      // Two runs inside the window.
+      let r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(r.envvar).toBe("WIN_KEY");
+      expect(r.git_header).toBe(false);
+      r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(f.st.credentials.get(id)?.useCount).toBe(2);
+
+      // Expire the window (timer or lazy settle).
+      await tick(700);
+      const events = f.auditEvents().map((e) => e.event);
+      expect(events).toContain("expire");
+      expect(f.st.credentials.get(id)?.state).toBe("expired");
+
+      r = await vrun(f, id);
+      expect(r.ok).toBe(false);
+      expect(String(r.error)).toMatch(/expired/i);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("concurrent runs: both hand off, each done counted, counter drains", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "window-key",
+        level: "time-boxed",
+        hours: 2,
+        envvar: "KC",
+        reason: "concurrent runs",
+      });
+      await approve(f, id);
+
+      const c1 = new VaultClient(f.xdg);
+      const c2 = new VaultClient(f.xdg);
+      await Promise.all([c1.connect(), c2.connect()]);
+      c1.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      c2.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      const r1 = JSON.parse(await c1.nextLine());
+      const r2 = JSON.parse(await c2.nextLine());
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      expect(r1.token).toBe(r2.token);
+
+      c1.send({ op: "vdone", id, rc: 0 });
+      expect(JSON.parse(await c1.nextLine()).ok).toBe(true);
+      c2.send({ op: "vdone", id, rc: 3 });
+      const d2 = JSON.parse(await c2.nextLine());
+      expect(d2.ok, JSON.stringify(d2)).toBe(true);
+      c1.close();
+      c2.close();
+
+      const st = await vstatus(f, id);
+      expect(st.ok).toBe(true);
+      expect(st.use_count).toBe(2);
+      expect(st.last_rc).toBe(3);
+      expect(f.st.credentials.get(id)!.runsInFlight).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  }, 20000);
+});
+
+describe("permanent", () => {
+  test("stays active until revoked; use-after-revoke rejected", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      // known mode needs a known value file for password kind
+      fs.mkdirSync(path.join(f.knownDir, "password"), { recursive: true });
+      fs.writeFileSync(
+        path.join(f.knownDir, "password", "db-pass"),
+        "correct horse battery staple",
+        { mode: 0o600 },
+      );
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "password",
+        name: "db-pass",
+        level: "permanent",
+        envvar: "DB_PASSWORD",
+        reason: "db access",
+      });
+      const r0 = await vrun(f, id);
+      expect(r0.ok).toBe(false); // pending
+      await approve(f, id);
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      const r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(r.envvar).toBe("DB_PASSWORD");
+
+      // No expiry scheduled.
+      expect(f.st.credentials.get(id)?.expiresAt).toBeUndefined();
+
+      // Agent self-revoke.
+      const rv = await vrevoke(f, id);
+      expect(rv.ok).toBe(true);
+      expect(f.st.credentials.get(id)?.state).toBe("revoked");
+      const r2 = await vrun(f, id);
+      expect(r2.ok).toBe(false);
+      expect(String(r2.error)).toMatch(/revoked/i);
+      const events = f.auditEvents().map((e) => e.event);
+      expect(events).toContain("revoke");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("stored values (BYO --from-env)", () => {
+  test("value file 0600 with exact bytes; never in state/audit; deleted at terminal", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "byo-key",
+        level: "one-shot",
+        envvar: "BYO_KEY",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "bring your own key",
+      } as any);
+      expect(res.ok).toBe(true);
+      const id = res.id as string;
+
+      // Value file: exact bytes, 0600.
+      const vp = path.join(f.secretsDir, `${id}.secret`);
+      expect(fs.readFileSync(vp, "utf-8")).toBe(BYO_VALUE);
+      expect(modeOf(vp)).toBe(0o600);
+
+      // No literal in state.json or audit.
+      expect(fs.readFileSync(f.stateFile, "utf-8")).not.toContain(BYO_VALUE);
+      expect(f.auditLines().join("\n")).not.toContain(BYO_VALUE);
+
+      await approve(f, id);
+      const run = await vrun(f, id);
+      expect(run.ok).toBe(true);
+      expect(run.token).toBe(BYO_VALUE);
+
+      // Wire: the value crossed the socket exactly once (this run).
+      // (Audit the wire below via a fresh client is racy — instead assert
+      // the state/audit invariants and file deletion.)
+      const st = fs.readFileSync(f.stateFile, "utf-8");
+      expect(st).not.toContain(BYO_VALUE);
+      expect(f.auditLines().join("\n")).not.toContain(BYO_VALUE);
+      // Terminal: value file deleted.
+      expect(fs.existsSync(vp)).toBe(false);
+      expect(f.st.credentials.get(id)?.state).toBe("consumed");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("reject on request failure keeps no value file", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "byo-bad",
+        level: "one-shot",
+        envvar: "BYO",
+        from_env: "MY_SECRET",
+        value: "has space inside",
+        reason: "bad shape",
+      } as any);
+      expect(res.ok).toBe(false);
+      const files = fs.readdirSync(f.secretsDir);
+      expect(files.filter((x) => x.endsWith(".secret")).length).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("deny deletes the stored value file", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "password",
+        name: "byo-pw",
+        level: "permanent",
+        envvar: "PW",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "stored pw",
+      } as any);
+      expect(res.ok).toBe(true);
+      const id = res.id as string;
+      const vp = path.join(f.secretsDir, `${id}.secret`);
+      expect(fs.existsSync(vp)).toBe(true);
+      await tap(f, id, "deny");
+      expect(f.st.credentials.get(id)?.state).toBe("denied");
+      expect(fs.existsSync(vp)).toBe(false);
+      expect(fs.readFileSync(f.stateFile, "utf-8")).not.toContain(BYO_VALUE);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("legacy github-pat fallback", () => {
+  test("vault known/ wins; then legacy pats dir; then default file", async () => {
+    const f = mkVault();
+    try {
+      expect(knownNames(f.st, "github-pat")).toContain("marzukia/jarate:write");
+      expect(knownNames(f.st, "github-pat")).toContain(
+        "legacyorg/legacorepo:read",
+      );
+      expect(knownNames(f.st, "github-pat")).toContain("default");
+
+      // Vault known/ file (no trailing newline handling differences):
+      expect(readKnownValue(f.st, "github-pat", "marzukia/jarate:write")).toBe(
+        FINE_TOKEN,
+      );
+      // Legacy scoped file (with trailing newline, trimmed on read):
+      expect(
+        readKnownValue(f.st, "github-pat", "legacyorg/legacorepo:read"),
+      ).toBe(FINE_TOKEN);
+      // Legacy default file:
+      expect(readKnownValue(f.st, "github-pat", "default")).toBe(CLASSIC_TOKEN);
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+describe("permissions", () => {
+  test("dirs 0700, state/audit/value 0600", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      // A request persists state.json.
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-perm",
+        level: "one-shot",
+        envvar: "BP",
+        from_env: "MY_SECRET",
+        value: "perm-test-value",
+        reason: "perms check",
+      });
+      expect(modeOf(f.vaultDir)).toBe(0o700);
+      expect(modeOf(f.knownDir)).toBe(0o700);
+      expect(modeOf(f.secretsDir)).toBe(0o700);
+      expect(modeOf(f.stateFile)).toBe(0o600);
+      expect(modeOf(f.auditPath)).toBe(0o600);
+      expect(modeOf(path.join(f.secretsDir, `${id}.secret`))).toBe(0o600);
+      const socketDir = path.join(f.xdg, "jarate");
+      expect(modeOf(socketDir)).toBe(0o700);
+      expect(modeOf(path.join(socketDir, "vault.sock"))).toBe(0o600);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("never-echo (wire audit)", () => {
+  test("one-shot: token crosses the socket exactly once", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await approve(f, id);
+      const c = new VaultClient(f.xdg);
+      await c.connect();
+      c.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      const line1 = await c.nextLine();
+      c.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      const line2 = await c.nextLine();
+      c.close();
+      expect(JSON.parse(line1).token).toBe(FINE_TOKEN);
+      expect(JSON.parse(line2).ok).toBe(false);
+      expect(c.raw.split(FINE_TOKEN).length - 1).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("status output never contains a value", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "byo-status",
+        level: "one-shot",
+        envvar: "BS",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "status check",
+      });
+      await approve(f, id);
+      const s = await vstatus(f, id);
+      expect(s.ok).toBe(true);
+      expect(JSON.stringify(s)).not.toContain(BYO_VALUE);
+      const s2 = await vstatus(f);
+      expect(JSON.stringify(s2)).not.toContain(BYO_VALUE);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("audit completeness", () => {
+  test("full one-shot lifecycle events in order, with actor", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await approve(f, id);
+      await vrun(f, id);
+      const ev = f.auditEvents();
+      const seq = ev.map((e) => e.event);
+      const iReq = seq.indexOf("request");
+      const iApp = seq.indexOf("approve");
+      const iUse = seq.indexOf("use");
+      expect(iReq).toBeGreaterThanOrEqual(0);
+      expect(iApp).toBeGreaterThan(iReq);
+      expect(iUse).toBeGreaterThan(iApp);
+      const req = ev[iReq];
+      expect(req.agent).toBe("monky");
+      expect(req.kind).toBe("github-pat");
+      expect(req.name).toBe("marzukia/jarate:write");
+      expect(req.ts).toBeTruthy();
+      const app = ev[iApp];
+      expect(app.user).toBe(OWNER);
+      expect(app.id).toBe(id);
+      expect(seq).toContain("use");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("budget: cap 2 approvals/hour; third rejected with next slot", async () => {
+    const f = mkVault({ budgetPerHour: 2 });
+    try {
+      await f.h.ready;
+      for (let i = 0; i < 2; i++) {
+        const res = await vaultRequest(f.st, {
+          agent: "monky",
+          kind: "api-key",
+          name: `bk-${i}`,
+          level: "one-shot",
+          envvar: "BK",
+          reason: `budget test ${i}`,
+        } as any);
+        expect(res.ok).toBe(true);
+        await approve(f, res.id as string);
+      }
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-3",
+        level: "one-shot",
+        envvar: "BK",
+        reason: "budget test 3",
+      } as any);
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toMatch(/budget/i);
+      expect(String(res.error)).toMatch(/next slot/i);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("restart recovery", () => {
+  test("pending stored credential survives stop/start; value file intact", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 10_000; // keep the pending record alive across restart
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "persist-key",
+        level: "one-shot",
+        envvar: "PK",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "restart test",
+      } as any);
+      expect(res.ok).toBe(true);
+      const id = res.id as string;
+      const vp = path.join(f.secretsDir, `${id}.secret`);
+      expect(fs.existsSync(vp)).toBe(true);
+
+      // Stop and restart the vault on the same dirs (no rm — the second
+      // fixture must see the state + value file).
+      stopVault(f.h);
+      __vaultResetForTest();
+      const f2 = mkVault({ xdgDir: path.join(f.tmp, "xdg") });
+      try {
+        await f2.h.ready;
+        const cred = f2.st.credentials.get(id);
+        expect(cred).toBeDefined();
+        expect(cred?.state).toBe("pending");
+        expect(fs.readFileSync(vp, "utf-8")).toBe(BYO_VALUE);
+        // And it can still be approved + used after restart.
+        await approve(f2, id);
+        const run = await vrun(f2, id);
+        expect(run.ok).toBe(true);
+        expect(run.token).toBe(BYO_VALUE);
+      } finally {
+        f2.cleanup();
+      }
+    } finally {
+      fs.rmSync(f.tmp, { recursive: true, force: true });
+    }
+  }, 20000);
+});
+
+describe("file transport", () => {
+  test("vrun publishes a 0600 value doc; bridge deletes it at terminal", async () => {
+    const f = mkVault({ transport: "file" });
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await approve(f, id);
+      const c = new VaultClient(f.xdg);
+      await c.connect();
+      c.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      const line = await c.nextLine();
+      c.close();
+      const r = JSON.parse(line);
+      expect(r.ok).toBe(true);
+      expect(r.file).toBe(true);
+      const fp = path.join(f.xdg, "jarate-vault", `vault-${id}`);
+      expect(modeOf(fp)).toBe(0o600);
+      const doc = JSON.parse(fs.readFileSync(fp, "utf-8"));
+      expect(doc.value).toBe(FINE_TOKEN);
+      expect(doc.kind).toBe("github-pat");
+      expect(doc.envvar).toBe("GH_TOKEN");
+      expect(doc.git_header).toBe(true);
+
+      // Done -> terminal for one-shot: file deleted.
+      const c2 = new VaultClient(f.xdg);
+      await c2.connect();
+      c2.send({ op: "vrun", id, agent: "monky", cmd: ["true"], timeout_s: 60 });
+      // (second run rejected — consumed)
+      const line2 = await c2.nextLine();
+      c2.close();
+      expect(JSON.parse(line2).ok).toBe(false);
+      // The vdone from the first run was never sent by this fake client;
+      // simulate it:
+      const c3 = new VaultClient(f.xdg);
+      await c3.connect();
+      c3.send({ op: "vdone", id, rc: 0 });
+      await c3.nextLine();
+      c3.close();
+      await tick(50);
+      expect(fs.existsSync(fp)).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("request edge cases", () => {
+  test("unknown id on run/status/revoke", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const r1 = await vrun(f, "vault_nope");
+      expect(r1.ok).toBe(false);
+      const r2 = await vstatus(f, "vault_nope");
+      expect(r2.ok).toBe(false);
+      const r3 = await vrevoke(f, "vault_nope");
+      expect(r3.ok).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("known: no value file for name is a request error listing known names", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "does-not-exist",
+        level: "one-shot",
+        envvar: "X",
+        reason: "no known file",
+      } as any);
+      expect(res.ok).toBe(false);
+      expect(String(res.error)).toMatch(/no value file/i);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});

@@ -152,6 +152,7 @@ import {
   type UsageStats,
   usageFrame,
 } from "./usage";
+import { startVault, stopVault, type VaultHandle } from "./vault";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
 
@@ -161,6 +162,8 @@ let agentBusy = false;
 // PAT vault handles per channel (L4: once per process per socket path;
 // start on connect, stopPatVault on shutdown — refcounted internally).
 const patVaultHandles = new Map<string, PatVaultHandle>();
+// Generic vault handles per channel (same L4 refcount pattern).
+const vaultHandles = new Map<string, VaultHandle>();
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -2141,9 +2144,19 @@ export default function (pi: ExtensionAPI) {
               stateDir: path.join(ctx.cwd, ".tmp"),
             });
             patVaultHandles.set(ch.id, vh);
+            // Generic vault: started alongside the PAT vault; state lives
+            // in ~/.jarate/vault (its own dir, L4 refcounted).
+            const vh2 = startVault({
+              pi,
+              ctx,
+              ch,
+              botToken: bt,
+              stateDir: path.join(ctx.cwd, ".tmp"),
+            });
+            vaultHandles.set(ch.id, vh2);
             setDiscordInteractionHandler(
               bt,
-              buildInteractionHandler(pi, ctx, ch, bt, vh),
+              buildInteractionHandler(pi, ctx, ch, bt, vh, vh2),
             );
           }
           // startupMessage is posted by the poller once the bot's own user
@@ -2294,6 +2307,11 @@ export default function (pi: ExtensionAPI) {
         if (vh) {
           stopPatVault(vh);
           patVaultHandles.delete(ch.id);
+        }
+        const vh2 = vaultHandles.get(ch.id);
+        if (vh2) {
+          stopVault(vh2);
+          vaultHandles.delete(ch.id);
         }
         if (ch.botToken) {
           stopDiscordPresence(ch.botToken);
@@ -3209,10 +3227,11 @@ export function buildInteractionHandler(
   ch: ChannelConfig,
   botToken: string,
   vaultRef?: { handlePatComponent(d: any): Promise<void> } | null,
+  vault2Ref?: { handleVaultComponent(d: any): Promise<void> } | null,
 ): (d: any) => Promise<void> {
   return async (d: any) => {
-    // Type-4 (button) events go to the PAT vault. The .catch is the M1
-    // dispatch-side backstop: handlePatComponent never rejects by
+    // Type-4 (button) events go to the vaults. The .catch is the M1
+    // dispatch-side backstop: each component handler never rejects by
     // construction (top-level catch), but the gateway branch calls this
     // handler un-awaited inside a sync-only try/catch — an escaped
     // rejection would crash the whole bridge (Node 22 defaults to
@@ -3220,6 +3239,9 @@ export function buildInteractionHandler(
     if (d?.type === 4) {
       vaultRef
         ?.handlePatComponent(d)
+        .catch((e) => console.error("[interactions] vault handler failed:", e));
+      vault2Ref
+        ?.handleVaultComponent(d)
         .catch((e) => console.error("[interactions] vault handler failed:", e));
       return;
     }
