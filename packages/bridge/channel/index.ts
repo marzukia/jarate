@@ -83,6 +83,7 @@ import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
+import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
@@ -2090,7 +2091,7 @@ export default function (pi: ExtensionAPI) {
   );
 
   // ─── Startup / Shutdown ────────────────────────────────────────────────
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     sessionStartTs = Date.now();
     setInterruptCtx(ctx);
     workspaceRoot = ctx.cwd;
@@ -2210,6 +2211,40 @@ export default function (pi: ExtensionAPI) {
       console.error("[op] marker settle failed:", sanitizeUnknownValue(e));
     }
 
+    // Post-restart wake (issue #111, P0): on a real process start
+    // (reason "startup"), post ONE "back online" message — planned /
+    // unplanned restart class + the in-flight pi-bg summary — to the
+    // default channel. Fire-and-forget: never blocks or fails startup;
+    // no channel/token/webhook = silent no-op; two startups racing
+    // within 60s post once.
+    {
+      const wakeCh =
+        defaultCh ?? enabled.find((c) => c.type === "discord") ?? null;
+      // event?.reason: the test harness fires session_start(null, ctx);
+      // real pi always passes the event (reason "startup" on process start)
+      void runRestartWake({
+        reason: event?.reason,
+        stateDir: path.join(ctx.cwd, ".tmp"),
+        target:
+          wakeCh && (wakeCh.botToken || wakeCh.webhookUrl)
+            ? {
+                channelId: getDiscordChannelId(wakeCh.id) ?? wakeCh.channel,
+                botToken: wakeCh.botToken,
+                webhookUrl: wakeCh.webhookUrl,
+              }
+            : null,
+      })
+        .then((r) => {
+          if (r.posted)
+            console.log(
+              `[wake] posted restart wake (${r.restartClass}) to ${wakeCh?.id}`,
+            );
+        })
+        .catch((e) =>
+          console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
+        );
+    }
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -2302,6 +2337,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    // Clean-stop marker (issue #111): the next process start classifies
+    // this stop as PLANNED; a crash that never runs this hook leaves no
+    // marker, so the wake says unplanned. In-process /new and /reload
+    // also fire this — harmless, the marker is only consumed on a real
+    // process start.
+    writeCleanStop(path.join(workspaceRoot, ".tmp"));
     if (typingTimer) {
       clearInterval(typingTimer);
       typingTimer = null;
