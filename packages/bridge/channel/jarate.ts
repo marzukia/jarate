@@ -121,12 +121,17 @@ const JARATE_COMMANDS = [
   "pat-request",
   "pat-run",
   "pat-status",
+  "vault-request",
+  "vault-run",
+  "vault-status",
+  "vault-revoke",
+  "vault-audit",
 ];
 
-/** Per-call bridge cap for pat-run: wrapper command cap (900s) + 120s
- *  socket/wrapper overhead (N2). */
-const PAT_RUN_TIMEOUT_MS = 1_020_000;
-const PAT_RUN_DEFAULT_CAP_S = "900";
+/** Per-call bridge cap for pat-run / vault-run: wrapper command cap
+ *  (900s) + 120s socket/wrapper overhead (N2). */
+const RUN_TIMEOUT_MS = 1_020_000;
+const RUN_DEFAULT_CAP_S = "900";
 
 /**
  * Register the single `jarate` tool (cmd + args string). Subcommands are
@@ -144,7 +149,13 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "rag <question> [--project P]: RAG query over project knowledge (recall). " +
       "pat-request <scope> <reason>: ask the channel owner for a GitHub PAT (scope: default or owner/repo:read|write). " +
       "pat-run <request-id> -- <cmd> [args]: run one command under the approved token (single use; token is injected as GH_TOKEN, never echo it; 900s cap). " +
-      "pat-status [request-id]: read-only state of PAT requests (no token).",
+      "pat-status [request-id]: read-only state of PAT requests (no token). " +
+      "vault-request <kind> <name> <level> [--label L] [--hours N] [--envvar VAR] [--from-env VAR] <reason>: " +
+      "ask the owner for a credential (kind: github-pat|api-key|password; level: one-shot|time-boxed|permanent). " +
+      "vault-run <request-id> -- <cmd> [args]: run a command under the approved credential (token injected as env, never echo it; 900s cap). " +
+      "vault-status [request-id]: read-only vault state (no value). " +
+      "vault-revoke <request-id>: self-revoke your pending/active credential. " +
+      "vault-audit [n]: last n audit lines (default 20).",
     promptSnippet:
       "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep, rag) as JSON",
     promptGuidelines: [
@@ -170,26 +181,24 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       _ctx,
     ) {
       const args = params.args ?? "";
-      // pat-run: per-call timeout + the wrapper command cap in the child
-      // env (N2). Everything else: defaults (30s, process.env).
-      const r =
-        params.cmd === "pat-run"
-          ? await runJarate(params.cmd, args, {
-              env: {
-                ...process.env,
-                JARATE_PAT_RUN_TIMEOUT_S: PAT_RUN_DEFAULT_CAP_S,
-              },
-              timeoutMs: PAT_RUN_TIMEOUT_MS,
-            })
-          : await runJarate(params.cmd, args);
+      // pat-run / vault-run: per-call timeout + the wrapper command cap in
+      // the child env (N2). Everything else: defaults (30s, process.env).
+      const isRun = params.cmd === "pat-run" || params.cmd === "vault-run";
+      const r = isRun
+        ? await runJarate(params.cmd, args, {
+            env: {
+              ...process.env,
+              JARATE_PAT_RUN_TIMEOUT_S: RUN_DEFAULT_CAP_S,
+              JARATE_VAULT_RUN_TIMEOUT_S: RUN_DEFAULT_CAP_S,
+            },
+            timeoutMs: RUN_TIMEOUT_MS,
+          })
+        : await runJarate(params.cmd, args);
       return {
         content: [
           {
             type: "text",
-            text: jarateText(
-              r,
-              params.cmd === "pat-run" ? PAT_RUN_TIMEOUT_MS : undefined,
-            ),
+            text: jarateText(r, isRun ? RUN_TIMEOUT_MS : undefined),
           },
         ],
         details: {},

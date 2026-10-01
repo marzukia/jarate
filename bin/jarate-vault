@@ -1,0 +1,675 @@
+#!/usr/bin/env bun
+/**
+ * jarate-vault — generic vault client. The ONLY process that ever sees a
+ * credential value (besides the bridge itself and the spawned child's env).
+ *
+ * Subcommands:
+ *   request <kind> <name> <level> [--label L] [--hours N] [--envvar V]
+ *           [--from-env E] <reason...>
+ *   request-raw <prejoined>        tool path (N4): shellWords re-split
+ *   run <id> -- <cmd> [args...]    run a command under the approved value
+ *   run-raw <id> <raw>             tool path: <raw> is one pre-joined string
+ *   status [id]                    read-only state (never prints a value)
+ *   revoke <id>                    agent self-revoke (pending/active)
+ *   audit [n]                      last n local audit lines (default 20)
+ *
+ * rc: 0 ok | 1 vault error (JSON doc on stdout) | 2 usage
+ *
+ * The value crosses the socket as one JSON line (socket mode) or is read
+ * from the published file (file mode: reply is {"file":true}); it is
+ * validated for shape, then put in the child's ENV only — never argv.
+ * On the command cap: SIGKILL the child process group, send done rc=124,
+ * exit 124 (child output passed through verbatim, no JSON doc).
+ *
+ * Child env: <envvar>=value; for kind github-pat additionally GH_TOKEN +
+ * git env-config header (the exact PAT-vault contract).
+ *
+ * Env:
+ *   JARATE_VAULT_SOCKET_DIR  socket dir (default $XDG_RUNTIME_DIR/jarate)
+ *   JARATE_VAULT_FILE_DIR    published-file dir (default $XDG_RUNTIME_DIR/jarate-vault)
+ *   JARATE_VAULT_DIR         data dir (default ~/.jarate/vault; audit lives here)
+ *   JARATE_VAULT_AUDIT_FILE  audit log override
+ *   JARATE_VAULT_RUN_TIMEOUT_S  command cap (default 900)
+ *   JARATE_AGENT             agent name self-attested on lines
+ *
+ * docs/vault-design.md
+ */
+
+import * as child from "node:child_process";
+import * as fs from "node:fs";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+
+type Kind = "github-pat" | "api-key" | "password";
+type Level = "one-shot" | "time-boxed" | "permanent";
+
+const KINDS: Kind[] = ["github-pat", "api-key", "password"];
+const LEVELS: Level[] = ["one-shot", "time-boxed", "permanent"];
+const TOKEN_RE =
+  /^(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})$/;
+const CONNECT_TIMEOUT_MS = 15_000;
+const REPLY_TIMEOUT_MS = 15_000;
+const DONE_TIMEOUT_MS = 5_000;
+const SHAPE_RETRY_DELAY_MS = 50;
+const VALUE_MAX = 4096;
+
+function xdg(): string {
+  return (
+    process.env.XDG_RUNTIME_DIR ||
+    path.join("/run/user", String(process.getuid ? process.getuid() : 0))
+  );
+}
+
+function home(): string {
+  return process.env.HOME || os.homedir() || "/";
+}
+
+function socketPath(): string {
+  return path.join(
+    process.env.JARATE_VAULT_SOCKET_DIR || path.join(xdg(), "jarate"),
+    "vault.sock",
+  );
+}
+
+function publishedFile(id: string): string {
+  return path.join(
+    process.env.JARATE_VAULT_FILE_DIR || path.join(xdg(), "jarate-vault"),
+    `vault-${id}`,
+  );
+}
+
+function auditFilePath(): string {
+  return (
+    process.env.JARATE_VAULT_AUDIT_FILE ??
+    path.join(
+      process.env.JARATE_VAULT_DIR ?? path.join(home(), ".jarate", "vault"),
+      "audit.log",
+    )
+  );
+}
+
+function agentName(): string {
+  return process.env.JARATE_AGENT || path.basename(os.homedir() || "unknown");
+}
+
+function runCapSeconds(): number {
+  const n = Number(process.env.JARATE_VAULT_RUN_TIMEOUT_S);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 900;
+}
+
+// ─── shellWords (N4 — same semantics as jarate-pat) ───────────────────────
+// Splits a pre-joined command string back into argv: unquoted whitespace
+// splits; single quotes preserve everything literally (no escapes inside);
+// double quotes honor \" and \\; a backslash outside quotes escapes the
+// next character. NO expansion: $var, backticks, globs stay literal.
+// Unterminated quote or trailing backslash → error (rc 2 usage).
+export function shellWords(s: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let has = false;
+  let i = 0;
+  const push = (): void => {
+    if (has) words.push(cur);
+    cur = "";
+    has = false;
+  };
+  while (i < s.length) {
+    const c = s[i];
+    if (c === " " || c === "\t") {
+      push();
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      const end = s.indexOf("'", i + 1);
+      if (end === -1) throw new Error("unterminated single quote");
+      cur += s.slice(i + 1, end);
+      has = true;
+      i = end + 1;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      let part = "";
+      while (j < s.length) {
+        const cj = s[j];
+        if (cj === "\\") {
+          if (j + 1 >= s.length) throw new Error("trailing backslash");
+          const nx = s[j + 1];
+          if (nx === '"' || nx === "\\") part += nx;
+          else part += `\\${nx}`; // other escapes stay literal
+          j += 2;
+          continue;
+        }
+        if (cj === '"') break;
+        part += cj;
+        j++;
+      }
+      if (j >= s.length) throw new Error("unterminated double quote");
+      cur += part;
+      has = true;
+      i = j + 1;
+      continue;
+    }
+    if (c === "\\") {
+      if (i + 1 >= s.length) throw new Error("trailing backslash");
+      cur += s[i + 1];
+      has = true;
+      i += 2;
+      continue;
+    }
+    cur += c;
+    has = true;
+    i++;
+  }
+  push();
+  return words;
+}
+
+// ─── output helpers ───────────────────────────────────────────────────────
+
+/** Vault error: JSON doc on stdout, rc 1. */
+function fail(msg: string): never {
+  process.stdout.write(JSON.stringify({ ok: false, error: msg }) + "\n");
+  process.exit(1);
+}
+
+/** Usage error: JSON doc on stdout, rc 2. */
+function failUsage(msg: string): never {
+  process.stdout.write(JSON.stringify({ ok: false, error: msg }) + "\n");
+  process.exit(2);
+}
+
+/** Print the vault reply minus its `v` protocol field. */
+function printReply(line: string): void {
+  let doc: any;
+  try {
+    doc = JSON.parse(line);
+  } catch {
+    fail("vault: malformed reply from bridge");
+  }
+  const { v: _v, ...rest } = doc;
+  process.stdout.write(JSON.stringify(rest) + "\n");
+}
+
+// ─── socket round-trip ────────────────────────────────────────────────────
+
+function dial(): net.Socket {
+  const sp = socketPath();
+  if (!fs.existsSync(sp)) {
+    fail(`vault unavailable: no socket at ${sp} (pi.service down?)`);
+  }
+  const sock = net.connect(sp);
+  const t = setTimeout(() => {
+    try {
+      sock.destroy();
+    } catch {
+      // already gone
+    }
+    fail(`vault unavailable: no reply from socket at ${sp} (pi.service down?)`);
+  }, CONNECT_TIMEOUT_MS);
+  sock.once("connect", () => clearTimeout(t));
+  sock.once("error", (e) => {
+    clearTimeout(t);
+    fail(`vault unavailable: socket at ${sp} (${e.message})`);
+  });
+  return sock;
+}
+
+function sendLine(sock: net.Socket, obj: Record<string, unknown>): void {
+  sock.write(JSON.stringify({ v: 1, ...obj }) + "\n");
+}
+
+function readLine(sock: net.Socket, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    let done = false;
+    const t = setTimeout(
+      () => finish(false, null, new Error("vault timeout")),
+      timeoutMs,
+    );
+    function finish(ok: boolean, line: string | null, err?: Error): void {
+      if (done) return;
+      done = true;
+      clearTimeout(t);
+      sock.removeListener("data", onData);
+      sock.removeListener("error", onError);
+      sock.removeListener("close", onClose);
+      if (ok) resolve(line as string);
+      else reject(err as Error);
+    }
+    function onData(d: Buffer): void {
+      buf += d.toString("utf-8");
+      const idx = buf.indexOf("\n");
+      if (idx >= 0) finish(true, buf.slice(0, idx));
+    }
+    function onError(e: Error): void {
+      finish(false, null, e);
+    }
+    function onClose(): void {
+      const idx = buf.indexOf("\n");
+      if (idx >= 0) finish(true, buf.slice(0, idx));
+      else finish(false, null, new Error("vault closed the connection"));
+    }
+    sock.on("data", onData);
+    sock.on("error", onError);
+    sock.on("close", onClose);
+  });
+}
+
+/** request/status/revoke: one line in, one line out. */
+async function roundTrip(obj: Record<string, unknown>): Promise<string> {
+  const sock = dial();
+  try {
+    sendLine(sock, obj);
+    const line = await readLine(sock, REPLY_TIMEOUT_MS);
+    sock.end();
+    return line;
+  } catch (e) {
+    sock.destroy();
+    fail(`vault unavailable: ${(e as Error).message}`);
+  }
+}
+
+// ─── value shape (bridge re-validates; this is the early fail) ────────────
+
+export function valueShapeValid(kind: Kind, value: string): boolean {
+  if (value.length === 0 || value.length > VALUE_MAX) return false;
+  if (value.includes("\n") || value.includes("\r")) return false;
+  if (kind === "github-pat") return TOKEN_RE.test(value);
+  if (kind === "api-key") return !/[ \t]/.test(value);
+  return true; // password
+}
+
+// ─── child spawn (value in env only) ──────────────────────────────────────
+
+interface RunMeta {
+  kind: Kind;
+  envvar: string;
+  gitHeader: boolean;
+}
+
+function spawnChild(
+  cmd: string[],
+  value: string,
+  meta: RunMeta,
+  timeoutS: number,
+): Promise<number> {
+  const env: Record<string, string> = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    [meta.envvar]: value,
+  };
+  if (meta.gitHeader) {
+    // The exact PAT-vault git contract (env-only, never argv).
+    env.GH_TOKEN = value;
+    env.GIT_CONFIG_COUNT = "1";
+    env.GIT_CONFIG_KEY_0 = "http.https://github.com/.extraHeader";
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Bearer ${value}`;
+  }
+  return new Promise((resolve) => {
+    let p: child.ChildProcess;
+    try {
+      p = child.spawn(cmd[0], cmd.slice(1), {
+        env,
+        stdio: "inherit",
+        detached: true,
+      });
+    } catch (e) {
+      process.stdout.write(
+        JSON.stringify({ ok: false, error: `spawn failed: ${(e as Error).message}` }) + "\n",
+      );
+      resolve(1);
+      return;
+    }
+    let settled = false;
+    let capped = false;
+    const t = setTimeout(() => {
+      capped = true;
+      try {
+        if (p.pid) process.kill(-p.pid, "SIGKILL"); // whole group
+        else p.kill("SIGKILL");
+      } catch {
+        try {
+          p.kill("SIGKILL");
+        } catch {
+          /* already dead */
+        }
+      }
+    }, timeoutS * 1000);
+    p.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      process.stdout.write(
+        JSON.stringify({ ok: false, error: `spawn failed: ${e.message}` }) + "\n",
+      );
+      resolve(1);
+    });
+    p.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      resolve(capped ? 124 : code ?? 1);
+    });
+  });
+}
+
+// ─── request argv parsing ─────────────────────────────────────────────────
+
+interface ParsedRequest {
+  kind: Kind;
+  name: string;
+  level: Level;
+  label?: string;
+  hours?: number;
+  envvar?: string;
+  fromEnv?: string;
+  reason: string;
+}
+
+const USAGE_REQUEST =
+  "request: usage: jarate vault-request <kind> <name> <level> [--label L] [--hours N] [--envvar V] [--from-env E] <reason...>";
+
+export function parseRequestArgv(argv: string[]): ParsedRequest {
+  const pos: string[] = [];
+  const opts: Record<string, string> = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--label" || a === "--hours" || a === "--envvar" || a === "--from-env") {
+      const v = argv[++i];
+      if (v === undefined || v.startsWith("-") && v !== "-")
+        failUsage(`${USAGE_REQUEST} (missing value for ${a})`);
+      opts[a] = v;
+    } else if (a.startsWith("--")) {
+      failUsage(`${USAGE_REQUEST} (unknown flag ${a})`);
+    } else {
+      pos.push(a);
+    }
+  }
+  const [kind, name, level, ...reasonParts] = pos;
+  if (!kind || !name || !level) failUsage(USAGE_REQUEST);
+  if (!KINDS.includes(kind as Kind))
+    failUsage(`${USAGE_REQUEST} (kind: ${KINDS.join("|")})`);
+  if (!LEVELS.includes(level as Level))
+    failUsage(`${USAGE_REQUEST} (level: ${LEVELS.join("|")})`);
+  let hours: number | undefined;
+  if (opts["--hours"] !== undefined) {
+    hours = Number(opts["--hours"]);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 72)
+      failUsage(`${USAGE_REQUEST} (--hours 1..72)`);
+  }
+  const reason = reasonParts.join(" ");
+  if (reason.length < 3) failUsage(`${USAGE_REQUEST} (reason 3-200 chars)`);
+  const envvar =
+    opts["--envvar"] !== undefined
+      ? opts["--envvar"]
+      : kind === "github-pat"
+        ? "GH_TOKEN"
+        : undefined;
+  if (envvar === undefined)
+    failUsage(`${USAGE_REQUEST} (api-key/password need --envvar V)`);
+  return {
+    kind: kind as Kind,
+    name,
+    level: level as Level,
+    ...(opts["--label"] !== undefined ? { label: opts["--label"] } : {}),
+    ...(hours !== undefined ? { hours } : {}),
+    ...(envvar !== undefined ? { envvar } : {}),
+    ...(opts["--from-env"] !== undefined ? { fromEnv: opts["--from-env"] } : {}),
+    reason,
+  };
+}
+
+function requestLine(p: ParsedRequest): Record<string, unknown> {
+  const line: Record<string, unknown> = {
+    op: "vrequest",
+    agent: agentName(),
+    kind: p.kind,
+    name: p.name,
+    level: p.level,
+    reason: p.reason,
+  };
+  if (p.label !== undefined) line.label = p.label;
+  if (p.hours !== undefined) line.hours = p.hours;
+  if (p.envvar !== undefined) line.envvar = p.envvar;
+  if (p.fromEnv !== undefined) {
+    line.from_env = p.fromEnv;
+    const v = process.env[p.fromEnv];
+    if (typeof v !== "string" || v === "")
+      fail(`value: env var ${p.fromEnv} missing or empty (agent env)`);
+    if (!valueShapeValid(p.kind, v))
+      fail(`value: shape invalid for ${p.kind} (length 1-${VALUE_MAX})`);
+    line.value = v;
+  }
+  return line;
+}
+
+// ─── subcommands ──────────────────────────────────────────────────────────
+
+async function cmdRequest(argv: string[]): Promise<void> {
+  const p = parseRequestArgv(argv);
+  const line = await roundTrip(requestLine(p));
+  printReply(line);
+  const doc = JSON.parse(line);
+  process.exit(doc.ok ? 0 : 1);
+}
+
+async function cmdRun(id: string, cmd: string[]): Promise<void> {
+  if (cmd.length < 1) failUsage("run: usage: jarate vault-run <request-id> -- <cmd> [args...]");
+  const capS = runCapSeconds();
+  const sock = dial();
+  let reply: any;
+  try {
+    sendLine(sock, {
+      op: "vrun",
+      id,
+      agent: agentName(),
+      cmd,
+      timeout_s: capS,
+    });
+    const line = await readLine(sock, REPLY_TIMEOUT_MS);
+    reply = JSON.parse(line);
+  } catch (e) {
+    sock.destroy();
+    fail(`vault unavailable: ${(e as Error).message}`);
+  }
+  if (!reply.ok) {
+    sock.end();
+    fail(reply.error);
+  }
+  const kind: Kind = KINDS.includes(reply.kind) ? reply.kind : "password";
+  const envvar: string =
+    typeof reply.envvar === "string" && reply.envvar
+      ? reply.envvar
+      : kind === "github-pat"
+        ? "GH_TOKEN"
+        : "VALUE";
+  const gitHeader = reply.git_header === true || kind === "github-pat";
+
+  let value: string;
+  if (reply.file) {
+    // File mode: the published doc is {value, kind, envvar, git_header}.
+    // Metadata from the reply (authoritative); the value from the file.
+    const p = publishedFile(id);
+    let raw: string | null;
+    try {
+      raw = fs.readFileSync(p, "utf-8");
+    } catch {
+      raw = null;
+    }
+    let doc: any = null;
+    if (raw !== null) {
+      try {
+        doc = JSON.parse(raw);
+      } catch {
+        doc = null;
+      }
+    }
+    if (doc === null || typeof doc.value !== "string") {
+      await new Promise((r) => setTimeout(r, SHAPE_RETRY_DELAY_MS));
+      try {
+        raw = fs.readFileSync(p, "utf-8");
+      } catch {
+        raw = null;
+      }
+      if (raw === null) {
+        sock.end();
+        fail(`file missing: ${p}`);
+      }
+      try {
+        doc = JSON.parse(raw);
+      } catch {
+        doc = null;
+      }
+      if (doc === null || typeof doc.value !== "string") {
+        sock.end();
+        fail(`file invalid: ${p} (value doc)`);
+      }
+    }
+    value = doc.value;
+  } else {
+    if (typeof reply.token !== "string") {
+      sock.end();
+      fail("value shape invalid (bridge)");
+    }
+    value = reply.token;
+  }
+  if (!valueShapeValid(kind, value)) {
+    sock.end();
+    fail(`value shape invalid (${kind})`);
+  }
+
+  const rc = await spawnChild(cmd, value, { kind, envvar, gitHeader }, capS);
+  // Report to the bridge, then exit with the CHILD's rc (pass-through).
+  try {
+    sendLine(sock, { op: "vdone", id, rc });
+    try {
+      await readLine(sock, DONE_TIMEOUT_MS);
+    } catch {
+      // bridge ack is optional — the command already ran
+    }
+  } catch {
+    // bridge already gone (restart): the run result still stands
+  }
+  sock.end();
+  process.exit(rc);
+}
+
+async function cmdStatus(argv: string[]): Promise<void> {
+  const id = argv[0];
+  const line = await roundTrip({ op: "vstatus", agent: agentName(), ...(id ? { id } : {}) });
+  printReply(line);
+  const doc = JSON.parse(line);
+  process.exit(doc.ok ? 0 : 1);
+}
+
+async function cmdRevoke(id: string): Promise<void> {
+  if (!id) failUsage("revoke: usage: jarate vault-revoke <request-id>");
+  const line = await roundTrip({ op: "vrevoke", agent: agentName(), id });
+  printReply(line);
+  const doc = JSON.parse(line);
+  process.exit(doc.ok ? 0 : 1);
+}
+
+function cmdAudit(argv: string[]): void {
+  let n = 20;
+  if (argv.length > 0) {
+    n = Number(argv[0]);
+    if (!Number.isInteger(n) || n < 1 || n > 500) {
+      failUsage("audit: usage: jarate vault-audit [n] (n: 1..500)");
+    }
+  }
+  const p = auditFilePath();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(p, "utf-8");
+  } catch {
+    process.stdout.write(
+      JSON.stringify({ ok: true, count: 0, lines: [], file: p }) + "\n",
+    );
+    process.exit(0);
+  }
+  const lines = raw
+    .split("\n")
+    .filter((l) => l.length > 0)
+    .slice(-n)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return l; // keep non-JSON lines verbatim (corruption visible)
+      }
+    });
+  process.stdout.write(JSON.stringify({ ok: true, count: lines.length, lines }) + "\n");
+  process.exit(0);
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const [sub, ...rest] = process.argv.slice(2);
+  switch (sub) {
+    case "request":
+      await cmdRequest(rest);
+      return;
+    case "request-raw": {
+      const [raw] = rest;
+      if (typeof raw !== "string" || raw.length === 0) failUsage(USAGE_REQUEST);
+      let words: string[];
+      try {
+        words = shellWords(raw);
+      } catch (e) {
+        failUsage(`${USAGE_REQUEST} (${(e as Error).message})`);
+      }
+      await cmdRequest(words);
+      return;
+    }
+    case "run": {
+      const [id, sep, ...cmd] = rest;
+      if (!id || sep !== "--" || cmd.length < 1) {
+        failUsage("run: usage: jarate vault-run <request-id> -- <cmd> [args...]");
+      }
+      await cmdRun(id, cmd);
+      return;
+    }
+    case "run-raw": {
+      const [id, raw] = rest;
+      if (!id || typeof raw !== "string" || !raw.trimStart().startsWith("--")) {
+        failUsage("run: usage: jarate vault-run <request-id> -- <cmd> [args...]");
+      }
+      let words: string[];
+      try {
+        words = shellWords(raw.trim());
+      } catch (e) {
+        failUsage(`run: ${(e as Error).message}`);
+      }
+      if (words[0] !== "--" || words.length < 2) {
+        failUsage("run: usage: jarate vault-run <request-id> -- <cmd> [args...]");
+      }
+      await cmdRun(id, words.slice(1));
+      return;
+    }
+    case "status":
+      await cmdStatus(rest);
+      return;
+    case "revoke":
+      await cmdRevoke(rest[0]);
+      return;
+    case "audit":
+      cmdAudit(rest);
+      return;
+    default:
+      failUsage(
+        "usage: jarate-vault <request|run|status|revoke|audit> ...",
+      );
+  }
+}
+
+if (import.meta.main) {
+  main().catch((e) => {
+    // Belt-and-braces: never a raw stack trace, always a JSON doc.
+    fail(`vault unavailable: ${e instanceof Error ? e.message : String(e)}`);
+  });
+}
