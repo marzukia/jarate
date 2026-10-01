@@ -3271,7 +3271,11 @@ export function buildInteractionHandler(
     // handler un-awaited inside a sync-only try/catch — an escaped
     // rejection would crash the whole bridge (Node 22 defaults to
     // unhandled-rejections=throw).
-    if (d?.type === 4) {
+    // MESSAGE_COMPONENT (button/select) events go to the vaults — type 3
+    // per the current Discord spec (it was 4 in the old numbering; the
+    // type-4 gate + missing INTERACTIONS intent is why every tap fell
+    // through to the slash-command path, RCA 2026-10-01).
+    if (d?.type === 3) {
       vaultRef
         ?.handlePatComponent(d)
         .catch((e) => console.error("[interactions] vault handler failed:", e));
@@ -4143,6 +4147,11 @@ async function runChannelCommand(
             : "[!] owner only (no owner configured: set channels[].ownerUserId or ownerUserIds)",
         ),
       };
+  // Robustness: a misrouted event (no d.data.name) must fail with a
+  // readable line, not a TypeError (2026-10-01: a button tap crashed here
+  // before the type gate was fixed).
+  if (typeof name !== "string" || name.length === 0)
+    return { immediate: fence("[!] unknown command") };
   switch (name.toLowerCase()) {
     case "stop": {
       // /stop while compacting is owner-only (isOwner pattern): it aborts

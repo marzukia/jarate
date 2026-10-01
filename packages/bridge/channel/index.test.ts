@@ -4195,6 +4195,61 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     expect(JSON.parse(edit!.body).content).toContain("boom");
   });
 
+  test("type-3 (MESSAGE_COMPONENT) events route to the vault handlers, not the command path", async () => {
+    let patCalled = false;
+    let vaultCalled = false;
+    const h = buildInteractionHandler(
+      pi,
+      ctx,
+      ch,
+      "tok-i",
+      {
+        handlePatComponent: async () => {
+          patCalled = true;
+        },
+      },
+      {
+        handleVaultComponent: async () => {
+          vaultCalled = true;
+        },
+      },
+    );
+    await h({
+      id: "i3",
+      token: "tok123",
+      application_id: "app1",
+      channel_id: "888",
+      user: { id: "owner1" },
+      type: 3,
+      data: {
+        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
+      },
+    });
+    expect(patCalled).toBe(true);
+    expect(vaultCalled).toBe(true);
+    // The router itself made no network call — the component handlers own
+    // the ack (they no-op for non-matching custom_ids).
+    expect(calls.length).toBe(0);
+  });
+
+  test("command path with a missing name fails readable, not TypeError", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h({
+      id: "i4",
+      token: "t",
+      application_id: "app1",
+      channel_id: "888",
+      user: { id: "owner1" },
+      type: 2,
+      data: {},
+    }); // must not throw
+    const edit = calls.find((c) =>
+      c.url.endsWith("/webhooks/app1/t/messages/@original"),
+    );
+    expect(edit).toBeDefined();
+    expect(JSON.parse(edit!.body).content).toContain("unknown command");
+  });
+
   test("btw defers, sends to pi, and leaves the deferred message alone", async () => {
     let sent = false;
     pi.sendMessage = () => {

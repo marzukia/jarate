@@ -752,6 +752,7 @@ export async function sendDiscordMessage(
   raw: string,
   opts?: {
     components?: Array<Record<string, unknown>>;
+    embeds?: Array<Record<string, unknown>>;
     replyToMessageId?: string;
   },
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
@@ -768,6 +769,7 @@ export async function sendDiscordMessage(
       allowed_mentions: allowedMentionsFor(text),
     };
     if (opts?.components) base.components = opts.components;
+    if (opts?.embeds) base.embeds = opts.embeds;
     const replyToMessageId = opts?.replyToMessageId;
     const withRef = replyToMessageId
       ? { ...base, message_reference: { message_id: replyToMessageId } }
@@ -807,6 +809,7 @@ export async function sendDiscordMessage(
           content: text,
           allowed_mentions: allowedMentionsFor(text),
           ...(opts?.components ? { components: opts.components } : {}),
+          ...(opts?.embeds ? { embeds: opts.embeds } : {}),
         }),
       });
       if (resp.ok) return { success: true };
@@ -825,7 +828,10 @@ export async function editDiscordMessage(
   config: ChannelConfig,
   messageId: string,
   raw: string,
-  opts?: { components?: Array<Record<string, unknown>> },
+  opts?: {
+    components?: Array<Record<string, unknown>>;
+    embeds?: Array<Record<string, unknown>>;
+  },
 ): Promise<{ success: boolean; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
@@ -839,6 +845,7 @@ export async function editDiscordMessage(
       body: {
         content: text,
         ...(opts?.components ? { components: opts.components } : {}),
+        ...(opts?.embeds ? { embeds: opts.embeds } : {}),
       },
     });
     return { success: true };
