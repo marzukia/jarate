@@ -825,6 +825,113 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
 });
 
 /**
+ * #86: launch-fail webhook. A --worktree launch-fail (not a git repo /
+ * worktree add failed) exits 3 BEFORE the run record + bg_on_exit register,
+ * so the early trap must post the DIED callback itself. The capture hook's
+ * req.json() 500s on a non-JSON body (body stays null), so a captured body
+ * is proof the payload is valid JSON - the Discord 400/50109 shape check.
+ */
+describe("#86: launch-fail webhook", () => {
+  const capture = () => {
+    let body: { content: string } | null = null;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") body = (await req.json()) as any;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      getBody: () => body,
+      close: () => server.stop(true),
+    };
+  };
+
+  test("not a git repo: rc 3 + DIED (launch) body is valid JSON with ticket id", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      // fixture cwd (os.tmpdir) is not inside a git repo
+      const r = await fx.run(["worker", "--worktree", "t"]);
+      expect(r.code).toBe(3);
+      expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
+      const cap = hook.getBody();
+      if (!cap) throw new Error("webhook not captured (or body was not JSON)");
+      expect(cap.content).toMatch(/DIED \(launch\)/);
+      expect(cap.content).toContain("[!] pi-bg");
+      // ticket id: printed on the first stdout line, shape ^\d{8}-\d{6}-\d+$
+      const m = r.out.match(/^\[pi-bg\] ticket (\S+)/);
+      if (!m) throw new Error("no ticket line on stdout");
+      expect(m[1]).toMatch(/^\d{8}-\d{6}-\d+$/);
+      expect(cap.content).toContain(m[1]);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("git repo + bad ref: rc 3 + body has worktree add failed + ref name", async () => {
+    const fx = fixture();
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const ref = `no-such-ref-${Date.now()}`;
+      const r = await fx.run(["worker", "--worktree", ref, "t"]);
+      expect(r.code).toBe(3);
+      expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
+      const cap = hook.getBody();
+      if (!cap) throw new Error("webhook not captured (or body was not JSON)");
+      expect(cap.content).toContain("worktree add failed");
+      expect(cap.content).toContain(ref);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  });
+
+  test("no-webhook corner (#30): rc 3, LAUNCH-FAIL printed, no unbound variable, no webhook attempt", async () => {
+    const fx = fixture();
+    // documented no-webhook mode: fixture fake HOME has no
+    // ~/.config/pi-dispatch/webhook and PI_DISPATCH_WEBHOOK is deleted,
+    // so the early read leaves `webhook` unset (set -u corner)
+    expect(
+      fs.existsSync(path.join(fx.home, ".config", "pi-dispatch", "webhook")),
+    ).toBe(false);
+    expect(fx.env.PI_DISPATCH_WEBHOOK).toBeUndefined();
+    // fixture cwd (os.tmpdir) is not inside a git repo
+    const r = await fx.run(["worker", "--worktree", "t"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
+    // pre-fix: `line 381: webhook: unbound variable` + rc 1 (MINOR-1)
+    expect(r.err).not.toContain("unbound variable");
+    // no webhook attempt: a post would need a URL (none exists); if a
+    // broken guard ever fired one, curl would fail and leave the
+    // -webhook-failed dead letter in BG_TMP ($HOME/.pi-bg-art)
+    const m = r.out.match(/^\[pi-bg\] ticket (\S+)/);
+    if (!m) throw new Error("no ticket line on stdout");
+    expect(m[1]).toMatch(/^\d{8}-\d{6}-\d+$/);
+    const artDir = path.join(fx.home, ".pi-bg-art");
+    const files = fs.existsSync(artDir) ? fs.readdirSync(artDir) : [];
+    expect(files.filter((f) => f.endsWith("-webhook-failed"))).toEqual([]);
+  });
+});
+
+/**
  * #41: concurrency cap (PI_BG_MAX_CONCURRENT, default 3).
  *
  * pi-bg counts this uid's live "pi-bg worker|reviewer" processes before
