@@ -1099,7 +1099,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("below cap: all stubs start and complete", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10); // hardening margin, not the flake fix
     const base = countLivePiBg();
     const max = base + 3;
     const stubs = [1, 2, 3].map((i) =>
@@ -1143,16 +1143,12 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       expect(r.err).toMatch(
         /\[!\] at cap \(\d+\/\d+\), try again later or pi-bg-kill a ticket/,
       );
-      // a + b recorded their dispatch; the refused c left no record
-      expect(
-        await waitFor(() => {
-          try {
-            return fx.records().length === 2;
-          } catch {
-            return false; // record dir not created yet
-          }
-        }),
-      ).toBe(true);
+      // The run record is written at dispatch, before the stub pi launches.
+      // Collect a + b (waits for their exit) so the assertion no longer
+      // depends on a 15s poll deadline, and so a + b's exit traps complete
+      // before bun teardown kills the children. The refused c left no record.
+      await collect(a);
+      await collect(b);
       expect(fx.records()).toHaveLength(2);
     } finally {
       killStubs([a, b, ...(c ? [c] : [])], fx.tmp);
@@ -1225,7 +1221,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("PI_BG_MAX_CONCURRENT=0: unlimited (4 in flight, above default 3)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10); // hardening margin, not the flake fix
     const base = countLivePiBg();
     const stubs = [1, 2, 3, 4].map((i) =>
       spawnStub(fx, `cap t4 stub ${i}`, { PI_BG_MAX_CONCURRENT: "0" }),
