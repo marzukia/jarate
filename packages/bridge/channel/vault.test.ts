@@ -19,7 +19,11 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearRegistryCache, clearRuntimeSecrets } from "./censor";
+import {
+  clearRegistryCache,
+  clearRuntimeSecrets,
+  getRuntimeSecrets,
+} from "./censor";
 import {
   __vaultResetForTest,
   knownNames,
@@ -1113,9 +1117,12 @@ describe("restart recovery", () => {
       expect(fs.existsSync(vp)).toBe(true);
 
       // Stop and restart the vault on the same dirs (no rm — the second
-      // fixture must see the state + value file).
+      // fixture must see the state + value file). Clear the process-global
+      // censor registry to model a fresh process: a restart must re-arm it.
       stopVault(f.h);
       __vaultResetForTest();
+      clearRegistryCache();
+      clearRuntimeSecrets();
       const f2 = mkVault({ xdgDir: path.join(f.tmp, "xdg") });
       try {
         await f2.h.ready;
@@ -1123,11 +1130,17 @@ describe("restart recovery", () => {
         expect(cred).toBeDefined();
         expect(cred?.state).toBe("pending");
         expect(fs.readFileSync(vp, "utf-8")).toBe(BYO_VALUE);
+        // F1: a still-live pending BYO value must be re-registered for the
+        // censor across the restart (the registry has no TTL).
+        expect(getRuntimeSecrets()).toContain(BYO_VALUE);
         // And it can still be approved + used after restart.
         await approve(f2, id);
         const run = await vrun(f2, id);
         expect(run.ok).toBe(true);
         expect(run.token).toBe(BYO_VALUE);
+        // ...and the registration is dropped after run + censor grace.
+        await new Promise((r) => setTimeout(r, 300));
+        expect(getRuntimeSecrets()).not.toContain(BYO_VALUE);
       } finally {
         f2.cleanup();
       }
@@ -1135,6 +1148,42 @@ describe("restart recovery", () => {
       fs.rmSync(f.tmp, { recursive: true, force: true });
     }
   }, 20000);
+
+  test("orphan secrets/<id>.secret (crash before persist) is swept at boot", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      // Simulate a crash between writeValueFile and persist: stop the
+      // vault, then leave a value file with no state.json record.
+      stopVault(f.h);
+      __vaultResetForTest();
+      const orphanId = `vault-${"o".repeat(8)}-orphan`;
+      fs.writeFileSync(
+        path.join(f.secretsDir, `${orphanId}.secret`),
+        "orphan-value",
+        { mode: 0o600 },
+      );
+      const f2 = mkVault({ xdgDir: path.join(f.tmp, "xdg") });
+      try {
+        await f2.h.ready;
+        expect(
+          fs.existsSync(path.join(f2.secretsDir, `${orphanId}.secret`)),
+        ).toBe(false);
+        // The sweep is audited.
+        expect(
+          f2
+            .auditEvents()
+            .some(
+              (e) => e.event === "sweep" && e.orphan === `${orphanId}.secret`,
+            ),
+        ).toBe(true);
+      } finally {
+        f2.cleanup();
+      }
+    } finally {
+      fs.rmSync(f.tmp, { recursive: true, force: true });
+    }
+  }, 15000);
 });
 
 describe("file transport", () => {
