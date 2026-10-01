@@ -462,7 +462,7 @@ if [ "$wt_mode" -eq 1 ]; then
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
     echo "pi-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
     mark_launch_fail "launch-fail: not a git repo"
-    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: not a git repo\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
+    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then hcode=$(python3 -c '\''import json,sys;print(json.dumps({"content":"[!] pi-bg "+sys.argv[1]+" DIED (launch): --worktree needs a git repo (cwd="+sys.argv[2]+")"}))'\'' "$run_id" "$(pwd)" | curl -s -o /dev/null -w '\''%{http_code}'\'' -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- 2>/dev/null); case "${hcode:-000}" in 2*) ;; *) echo "launch-fail DIED webhook post failed http=${hcode:-000} when=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${run_id}-webhook-failed" 2>/dev/null ;; esac; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
     exit 3; }
   id="$run_id"
   wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
@@ -471,7 +471,7 @@ if [ "$wt_mode" -eq 1 ]; then
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
     echo "pi-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
     mark_launch_fail "launch-fail: worktree add failed ref=$ref"
-    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then { printf "ticket: %s\nstatus: DIED (launch)\nreason: worktree add failed ref=$ref\n" "$run_id"; } | { curl -s -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- >/dev/null 2>&1 || true; }; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
+    [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then hcode=$(python3 -c '\''import json,sys;print(json.dumps({"content":"[!] pi-bg "+sys.argv[1]+" DIED (launch): worktree add failed (ref="+sys.argv[2]+")"}))'\'' "$run_id" "$ref" | curl -s -o /dev/null -w '\''%{http_code}'\'' -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- 2>/dev/null); case "${hcode:-000}" in 2*) ;; *) echo "launch-fail DIED webhook post failed http=${hcode:-000} when=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${run_id}-webhook-failed" 2>/dev/null ;; esac; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null' EXIT
     exit 3; fi
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
 fi
