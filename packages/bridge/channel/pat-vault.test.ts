@@ -245,7 +245,7 @@ function mkD(
   over: Record<string, any> = {},
 ): any {
   return {
-    type: 4,
+    type: 3, // MESSAGE_COMPONENT (current Discord spec)
     id,
     token: `intok-${id}`,
     application_id: "app1",

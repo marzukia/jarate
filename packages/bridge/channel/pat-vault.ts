@@ -1003,7 +1003,8 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       //    buttons — the "Thinking" toast must not fire for non-vault
       //    components). Non-matching type-4 event → ignore entirely.
       const m = COMPONENT_RE.exec(String(d?.data?.custom_id ?? ""));
-      if (d?.type !== 4 || !m) return;
+      // MESSAGE_COMPONENT is type 3 (current Discord spec; see vault.ts).
+      if (d?.type !== 3 || !m) return;
       const verb = m[1];
       parsedId = `pat_${m[2]}`;
 

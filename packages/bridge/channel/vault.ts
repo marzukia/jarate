@@ -626,7 +626,9 @@ function settleTtl(st: VaultState, id: string): void {
   void editCredentialMessage(
     st,
     c,
-    `[expired] VAULT request ${c.id} unanswered (${ttlText(st, c)})`,
+    `unanswered (${ttlText(st, c)})`,
+    [],
+    "expired",
   ).catch(() => {});
 }
 
@@ -639,11 +641,9 @@ function settleClaim(st: VaultState, id: string): void {
   settleStoredValueFromDisk(st, c);
   audit(st, "expire", credFields(c), { actor: "system", reason: "claim" });
   persist(st);
-  void editCredentialMessage(
-    st,
-    c,
-    `[expired] VAULT ${c.id} claim window missed`,
-  ).catch(() => {});
+  void editCredentialMessage(st, c, "claim window missed", [], "expired").catch(
+    () => {},
+  );
 }
 
 function settleWindow(st: VaultState, id: string): void {
@@ -655,11 +655,9 @@ function settleWindow(st: VaultState, id: string): void {
   settleStoredValueFromDisk(st, c);
   audit(st, "expire", credFields(c), { actor: "system", reason: "window" });
   persist(st);
-  void editCredentialMessage(
-    st,
-    c,
-    `[expired] VAULT ${c.id} window ended`,
-  ).catch(() => {});
+  void editCredentialMessage(st, c, "window ended", [], "expired").catch(
+    () => {},
+  );
 }
 
 function armTtl(st: VaultState, c: VaultCredential): void {
@@ -730,69 +728,101 @@ function revokeButtons(id: string): Array<Record<string, unknown>> {
   ];
 }
 
-function postText(st: VaultState, c: VaultCredential): string {
-  const lines = [
-    `[pending] VAULT request — ${c.agent}`,
-    `kind: ${c.kind}`,
-    `name: ${c.name}`,
-    `level: ${c.level}${c.level === "time-boxed" ? ` (${c.hours}h)` : ""}`,
-  ];
-  if (c.label) lines.push(`label: ${c.label}`);
-  lines.push(
-    `envvar: ${c.envvar}`,
-    `reason: ${c.reason}`,
-    `expires: ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)})`,
-    "[ Approve ] [ Deny ]",
-  );
-  return lines.join("\n");
+// ─── Discord message (embed) ───────────────────────────────────────────────
+// 2026-10-01 (Andryo): request/status messages ship as a Discord embed
+// ("proper chat container"), not a wall of plain text. Content line stays
+// short + copyable; all detail lives in the embed.
+
+const EMBED_COLOR: Record<string, number> = {
+  pending: 0xf1c40f,
+  approved: 0x2ecc71,
+  used: 0x2ecc71,
+  denied: 0xe74c3c,
+  expired: 0x95a5a6,
+  revoked: 0x95a5a6,
+};
+
+function levelText(st: VaultState, c: VaultCredential): string {
+  if (c.level === "one-shot")
+    return `one-shot (single use) — claim by ${timeOfDay(
+      c.claimDeadline ?? c.ttlDeadline,
+    )}Z (${Math.round(st.claimMs / 1000)}s)`;
+  if (c.level === "time-boxed")
+    return `time-boxed (${c.hours}h, reusable) — active until ${timeOfDay(
+      c.expiresAt ?? 0,
+    )}Z`;
+  return "permanent (until revoked)";
 }
 
-function approvedText(st: VaultState, c: VaultCredential): string {
-  const lines = [
-    `[ok] VAULT approved — ${c.agent} (${c.id})`,
-    `kind: ${c.kind}  name: ${c.name}`,
+/** Embed for the request/status message. `status` selects title + color. */
+function credEmbed(
+  st: VaultState,
+  c: VaultCredential,
+  status: string,
+): Record<string, unknown> {
+  const fields: Array<Record<string, unknown>> = [
+    { name: "kind", value: String(c.kind), inline: true },
+    { name: "name", value: String(c.name), inline: true },
+    { name: "level", value: levelText(st, c), inline: false },
   ];
-  if (c.level === "one-shot") {
-    lines.push(
-      `level: one-shot (single use)`,
-      `claim by ${timeOfDay(c.claimDeadline ?? c.ttlDeadline)}Z (${Math.round(
-        st.claimMs / 1000,
-      )}s)`,
-    );
-  } else if (c.level === "time-boxed") {
-    lines.push(
-      `level: time-boxed (${c.hours}h, reusable)`,
-      `active until ${timeOfDay(c.expiresAt ?? 0)}Z`,
-    );
-  } else {
-    lines.push(`level: permanent (until revoked)`);
+  if (c.label)
+    fields.push({ name: "label", value: String(c.label), inline: false });
+  if (status === "pending") {
+    fields.push({ name: "envvar", value: String(c.envvar), inline: true });
+    fields.push({
+      name: "reason",
+      value: String(c.reason || "—"),
+      inline: false,
+    });
   }
-  lines.push(`jarate vault-run ${c.id} -- <cmd>`, "[ Revoke ]");
-  return lines.join("\n");
+  const titles: Record<string, string> = {
+    pending: `VAULT request — ${c.agent}`,
+    approved: `VAULT approved — ${c.agent}`,
+    denied: `VAULT denied — ${c.agent}`,
+    expired: `VAULT expired — ${c.agent}`,
+    revoked: `VAULT revoked`,
+    used: `VAULT used`,
+  };
+  let footer = c.id;
+  if (status === "pending")
+    footer = `expires ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)}) · ${c.id}`;
+  return {
+    title: titles[status] ?? titles.pending,
+    color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
+    fields,
+    footer: { text: footer },
+  };
 }
 
-function deniedText(c: VaultCredential, username: string): string {
-  return `[denied] VAULT request ${c.id} — ${username}`;
+function approvedText(c: VaultCredential): string {
+  return `jarate vault-run ${c.id} -- <cmd>`;
 }
 
-function revokedText(c: VaultCredential, who: string): string {
-  return `[revoked] VAULT ${c.id} — ${who}`;
+function deniedText(_c: VaultCredential, username: string): string {
+  return `denied by ${username}`;
+}
+
+function revokedText(_c: VaultCredential, who: string): string {
+  return `revoked by ${who}`;
 }
 
 function usedText(c: VaultCredential): string {
-  return `[ok] VAULT ${c.id} used (rc ${c.lastRc ?? -1})`;
+  return `used (rc ${c.lastRc ?? -1})`;
 }
 
-/** Edit the request's button message; components: [] kills the buttons. */
+/** Edit the request's button message; components: [] kills the buttons;
+ *  the embed is replaced in place so the color tracks the status. */
 async function editCredentialMessage(
   st: VaultState,
   c: VaultCredential,
   text: string,
   components: Array<Record<string, unknown>> = [],
+  status: string = "pending",
 ): Promise<void> {
   if (!c.messageId) return;
   const res = await editDiscordMessage(st.ch, c.messageId, text, {
     components,
+    embeds: [credEmbed(st, c, status)],
   });
   if (!res.success) {
     console.error(`[vault] edit failed for ${c.id}:`, res.error);
@@ -1042,8 +1072,9 @@ export async function vaultRequest(
     st.secrets.register([storedValue]);
   }
 
-  const res = await sendDiscordMessage(st.ch, postText(st, cred), {
+  const res = await sendDiscordMessage(st.ch, "tap Approve or Deny", {
     components: pendingButtons(id),
+    embeds: [credEmbed(st, cred, "pending")],
   });
   if (!res.success) {
     st.credentials.delete(id);
@@ -1186,7 +1217,9 @@ export function vaultRunBegin(st: VaultState, line: any): VaultRunBeginResult {
     if (cred.valueSource === "known") {
       scheduleCensorDrop(st, id, value, st.censorGraceMs);
     }
-    void editCredentialMessage(st, cred, usedText(cred)).catch(() => {});
+    void editCredentialMessage(st, cred, usedText(cred), [], "used").catch(
+      () => {},
+    );
   } else {
     cred.runsInFlight += 1;
   }
@@ -1364,9 +1397,13 @@ export function vaultRevoke(
       from_state: was,
     });
     persist(st);
-    void editCredentialMessage(st, cred, revokedText(cred, agent)).catch(
-      () => {},
-    );
+    void editCredentialMessage(
+      st,
+      cred,
+      revokedText(cred, agent),
+      [],
+      "revoked",
+    ).catch(() => {});
     return { ok: true, id, state: "revoked" };
   }
   return { ok: false, error: `state: ${cred.state} (terminal)` };
@@ -1551,7 +1588,10 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
     let parsedId: string | undefined;
     try {
       const m = COMPONENT_RE.exec(String(d?.data?.custom_id ?? ""));
-      if (d?.type !== 4 || !m) return;
+      // MESSAGE_COMPONENT is type 3 (current Discord spec; it was 4 in the
+      // old numbering — the type-4 gate is why every tap fell through to
+      // the slash-command path, RCA 2026-10-01).
+      if (d?.type !== 3 || !m) return;
       const verb = m[1] as "approve" | "deny" | "revoke";
       parsedId = `vault_${m[2]}`;
 
@@ -1709,8 +1749,9 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         await editCredentialMessage(
           st,
           cred,
-          approvedText(st, cred),
+          approvedText(cred),
           revokeButtons(cred.id),
+          "approved",
         );
       } else {
         cred.state = "denied";
@@ -1726,6 +1767,8 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
           st,
           cred,
           deniedText(cred, String(d.user?.username ?? uid)),
+          [],
+          "denied",
         );
       }
       await deleteDeferredAck(st.botToken, d);
