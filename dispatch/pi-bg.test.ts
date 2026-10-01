@@ -62,6 +62,7 @@ function fixture() {
   // which leak the same way and make children look like snapshot runs.
   delete env.PI_BG_SETSID;
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
+  delete env.PI_BG_HB_INTERVAL; // cap window must stay at the 30s default
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
   // launcher's cwd (issue #66) is the same leak class: when the suite runs
@@ -133,6 +134,36 @@ function fixture() {
 
   return { tmp, home, mainAgent, env, run, seedMainCreds, records };
 }
+
+/**
+ * Mirror of the script's cap count (issue #123): fresh heartbeat files in
+ * the fixture's artifact dir. The script counts pi-bg-<run_id>-hb files
+ * under its artifact dir (default $HOME/.pi-bg-art; the fixture deletes
+ * PI_BG_TMPDIR, so <fx>/home/.pi-bg-art) touched within 3 x
+ * PI_BG_HB_INTERVAL - one live ticket = exactly one fresh file, whatever
+ * processes it spawned. A missing dir (pre-ticket-creation) counts 0,
+ * the same fail-open as the script's find.
+ */
+const countFreshHb = (fx: { tmp: string }, intervalSec = 30): number => {
+  const art = path.join(fx.tmp, "home", ".pi-bg-art");
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(art);
+  } catch {
+    return 0;
+  }
+  const cutoff = Date.now() - intervalSec * 3 * 1000;
+  let n = 0;
+  for (const e of entries) {
+    if (!/^pi-bg-.+-hb$/.test(e)) continue;
+    try {
+      if (fs.statSync(path.join(art, e)).mtimeMs >= cutoff) n++;
+    } catch {
+      /* raced the unlink at exit - gone */
+    }
+  }
+  return n;
+};
 
 describe("#29: missing role profile is seeded, then fail loud if no provider", () => {
   test("auto-seeds a missing profile from main agent creds + repo template", async () => {
@@ -934,70 +965,18 @@ describe("#86: launch-fail webhook", () => {
 /**
  * #41: concurrency cap (PI_BG_MAX_CONCURRENT, default 3).
  *
- * pi-bg counts this uid's live "pi-bg worker|reviewer" processes before
- * exec'ing the agent and refuses with a [!] line + exit 5 at the cap.
- * Real traffic on the same uid (e.g. the dispatch running this suite)
- * is counted too, so every assertion is made relative to a baseline
- * captured immediately before spawning stubs.
+ * pi-bg counts live tickets by fresh heartbeat files (issue #123: the
+ * old /proc argv scan matched 2+ processes per ticket - wrapper, hb
+ * child, lingering launcher - plus same-uid test stubs, so the pinned
+ * cap admitted far fewer real tickets than configured). Each ticket
+ * creates pi-bg-<run_id>-hb at ticket creation and its hb child touches
+ * it every PI_BG_HB_INTERVAL while the ticket is alive; the script
+ * counts files fresh within 3 intervals. Each fixture's artifact dir is
+ * isolated (the fixture deletes PI_BG_TMPDIR -> <fx>/home/.pi-bg-art),
+ * so live host traffic is invisible and the count starts at 0; the
+ * baseline capture stays for the relative asserts.
  */
 describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
-  // Mirror of the script's count: this uid's processes whose /proc cmdline
-  // carries an argv element whose basename is pi-bg immediately followed by
-  // a worker|reviewer element (the script's review F1 rule), excluding the
-  // test process itself. A match whose parent has an identical cmdline is a
-  // fork-window phantom (a forked helper that has not exec'd yet keeps the
-  // parent's argv) and is skipped, same rule as the script. The element
-  // match matters: a launcher "bash -c" carries "pi-bg worker" inside one
-  // -c string, so a substring test over the ps line double-counted it while
-  // the script's element scan did not (deterministic at-cap fail while any
-  // fleet launcher is alive, 2026-09-14 baseline).
-  const countLivePiBg = (): number => {
-    const out = execSync(`ps -U ${process.getuid()} -o pid=,ppid=,args=`, {
-      encoding: "utf8",
-    });
-    let n = 0;
-    for (const line of out.split("\n")) {
-      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const pid = Number(m[1]);
-      if (pid === process.pid) continue;
-      let argv: string[];
-      try {
-        argv = fs
-          .readFileSync(`/proc/${pid}/cmdline`, "utf8")
-          .split("\0")
-          .filter(Boolean);
-      } catch {
-        continue; // unreadable (other user / zombie) - the script skips too
-      }
-      let match = false;
-      for (let i = 0; i < argv.length; i++) {
-        if (
-          argv[i].split("/").pop() === "pi-bg" &&
-          i + 1 < argv.length &&
-          (argv[i + 1] === "worker" || argv[i + 1] === "reviewer")
-        ) {
-          match = true;
-          break;
-        }
-      }
-      if (!match) continue;
-      let identical = false;
-      try {
-        const p = fs
-          .readFileSync(`/proc/${m[2]}/cmdline`, "utf8")
-          .split("\0")
-          .filter(Boolean)
-          .join(" ");
-        identical = argv.join(" ") === p;
-      } catch {
-        identical = false;
-      }
-      if (!identical) n++;
-    }
-    return n;
-  };
-
   const sleepStubPi = (fx: { tmp: string }, seconds: number) => {
     const piBin = path.join(fx.tmp, "bin", "pi");
     fs.writeFileSync(piBin, `#!/bin/sh\nsleep ${seconds}\necho pi-run-ok\n`);
@@ -1070,14 +1049,14 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     const fx = fixture();
     fx.seedMainCreds();
     sleepStubPi(fx, 3);
-    const base = countLivePiBg();
+    const base = countFreshHb(fx);
     const max = base + 3;
     const stubs = [1, 2, 3].map((i) =>
       spawnStub(fx, `cap t1 stub ${i}`, { PI_BG_MAX_CONCURRENT: String(max) }),
     );
     try {
       // all three wrappers in flight at once
-      expect(await waitFor(() => countLivePiBg() - base >= 3)).toBe(true);
+      expect(await waitFor(() => countFreshHb(fx) - base >= 3)).toBe(true);
       const results = await Promise.all(stubs.map(collect));
       for (const r of results) {
         expect(r.code).toBe(0);
@@ -1093,7 +1072,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     const fx = fixture();
     fx.seedMainCreds();
     sleepStubPi(fx, 3);
-    const base = countLivePiBg();
+    const base = countFreshHb(fx);
     const max = base + 2;
     const a = spawnStub(fx, "cap t2 stub a", {
       PI_BG_MAX_CONCURRENT: String(max),
@@ -1104,7 +1083,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     let c: ReturnType<typeof spawn> | undefined;
     try {
       // two stubs in flight
-      expect(await waitFor(() => countLivePiBg() - base >= 2)).toBe(true);
+      expect(await waitFor(() => countFreshHb(fx) - base >= 2)).toBe(true);
       c = spawnStub(fx, "cap t2 stub c", {
         PI_BG_MAX_CONCURRENT: String(max),
       });
@@ -1139,13 +1118,13 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     sleepStubPi(fx, 2);
     const envNoCap: Record<string, string> = { ...fx.env };
     delete envNoCap.PI_BG_MAX_CONCURRENT;
-    // settle: the previous test's killed wrappers may still be draining
-    // their cgroups; the default cap (3) would count them. Wait until the
-    // live count stops changing (two equal samples 100ms apart).
-    let prev = countLivePiBg();
+    // settle: no-op under per-fixture artifact isolation (kept as a guard
+    // against a future shared PI_BG_TMPDIR regression). Wait until the
+    // count stops changing (two equal samples 100ms apart).
+    let prev = countFreshHb(fx);
     expect(
       await waitFor(() => {
-        const cur = countLivePiBg();
+        const cur = countFreshHb(fx);
         if (cur === prev) return true;
         prev = cur;
         return false;
@@ -1181,7 +1160,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     fx.seedMainCreds();
     // immediate stub pi: the wrapper is short-lived, so a self-count would
     // refuse exactly this case (live = base + 1(self) >= max = base + 1)
-    const base = countLivePiBg();
+    const base = countFreshHb(fx);
     const r = await collect(
       spawnStub(fx, "cap t3 self", {
         PI_BG_MAX_CONCURRENT: String(base + 1),
@@ -1196,13 +1175,13 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     const fx = fixture();
     fx.seedMainCreds();
     sleepStubPi(fx, 3);
-    const base = countLivePiBg();
+    const base = countFreshHb(fx);
     const stubs = [1, 2, 3, 4].map((i) =>
       spawnStub(fx, `cap t4 stub ${i}`, { PI_BG_MAX_CONCURRENT: "0" }),
     );
     try {
       // 4 concurrent > the default cap of 3: only max=0 lets all start
-      expect(await waitFor(() => countLivePiBg() - base >= 4)).toBe(true);
+      expect(await waitFor(() => countFreshHb(fx) - base >= 4)).toBe(true);
       const results = await Promise.all(stubs.map(collect));
       for (const r of results) {
         expect(r.code).toBe(0);
@@ -1252,7 +1231,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       );
       try {
         await Bun.sleep(300); // let the nobody process appear in ps
-        const base = countLivePiBg(); // root-uid view: nobody excluded here too
+        const base = countFreshHb(fx); // fixture view: nobody's files are in its own HOME
         const r = await collect(
           spawnStub(fx, "cap t5 other", {
             PI_BG_MAX_CONCURRENT: String(base + 1),
@@ -1474,54 +1453,8 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     return fn();
   };
 
-  // Mirror of the script's cap count (see #41 tests): this uid's live
-  // "pi-bg worker|reviewer" wrappers, fork-phantoms excluded.
-  const countLivePiBg = (): number => {
-    const out = execSync(`ps -U ${process.getuid()} -o pid=,ppid=,args=`, {
-      encoding: "utf8",
-    });
-    let n = 0;
-    for (const line of out.split("\n")) {
-      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const pid = Number(m[1]);
-      if (pid === process.pid) continue;
-      let argv: string[];
-      try {
-        argv = fs
-          .readFileSync(`/proc/${pid}/cmdline`, "utf8")
-          .split("\0")
-          .filter(Boolean);
-      } catch {
-        continue;
-      }
-      let match = false;
-      for (let i = 0; i < argv.length; i++) {
-        if (
-          argv[i].split("/").pop() === "pi-bg" &&
-          i + 1 < argv.length &&
-          (argv[i + 1] === "worker" || argv[i + 1] === "reviewer")
-        ) {
-          match = true;
-          break;
-        }
-      }
-      if (!match) continue;
-      let identical = false;
-      try {
-        const p = fs
-          .readFileSync(`/proc/${m[2]}/cmdline`, "utf8")
-          .split("\0")
-          .filter(Boolean)
-          .join(" ");
-        identical = argv.join(" ") === p;
-      } catch {
-        identical = false;
-      }
-      if (!identical) n++;
-    }
-    return n;
-  };
+  // Mirror of the script's cap count is the shared countFreshHb above
+  // (issue #123: heartbeat files, not processes).
 
   // fake pi: silent (rc=1, no output) for the first `die` launches, then
   // produces output. The state file doubles as a launch counter.
@@ -1717,7 +1650,7 @@ describe("#57: silent-death retry + RCA config fixes", () => {
     fs.mkdirSync(path.dirname(capFile), { recursive: true });
     const envNoVar = { ...fx.env };
     delete envNoVar.PI_BG_MAX_CONCURRENT;
-    const base = countLivePiBg();
+    const base = countFreshHb(fx);
     fs.writeFileSync(capFile, `${base + 1}\n`);
     const a = spawn(["bash", PI_BG, "worker", "capfile a"], {
       env: envNoVar,
@@ -1731,7 +1664,7 @@ describe("#57: silent-death retry + RCA config fixes", () => {
         new Response(p.stderr).text(),
       ]).then(async ([out, err]) => ({ code: await p.exited, out, err }));
     try {
-      expect(await waitFor(() => countLivePiBg() - base >= 1)).toBe(true);
+      expect(await waitFor(() => countFreshHb(fx) - base >= 1)).toBe(true);
       // b hits the file cap: refused with exit 5
       const b = spawn(["bash", PI_BG, "worker", "capfile b"], {
         env: envNoVar,

@@ -71,17 +71,23 @@
 #   integer) applies when the env var is unset (RCA #57 fix 2: monky's box
 #   pins 2 - shared vLLM queue load). The
 #   fleet shares one vLLM endpoint; unbounded fan-out starved the prefix
-#   cache (2026-09-10 incident). The check runs BEFORE the agent's exec:
-#   count = this uid's live processes whose args contain "pi-bg worker" or
-#   "pi-bg reviewer" (the wrapper lives for the whole run: pi + callback),
-#   excluding this process ($$). pi-bg-kill/-tail/
-#   -watchdog, pi-wait and other users' processes never match. The count
-#   scans /proc/<pid>/status + cmdline in this shell (no ps/grep
-#   children): a forked helper keeps this wrapper's argv until it execs,
-#   and a wrapper checking at the same instant would count it as a
-#   phantom run. At cap: one stderr line + exit 5, with no
-#   worktree/cgroup/run-record side effects. Fails open if /proc is
-#   unreadable (a cap check must never block dispatch):
+#   cache (2026-09-10 incident). The check runs BEFORE the agent's exec.
+#   Count = live tickets, one heartbeat file each (issue #123: the old
+#   /proc argv scan matched every process carrying "pi-bg
+#   worker|reviewer" - the launcher bash -c, the wrapper, the hb child,
+#   same-uid test stubs - so one live ticket counted as 2+ and the pinned
+#   cap 4 admitted ~1 real ticket). Each ticket creates
+#   $PI_BG_TMPDIR/pi-bg-<run_id>-hb at creation (just below this check) and
+#   its hb child touches it every PI_BG_HB_INTERVAL s for the whole run;
+#   a file touched within 3 intervals = one live ticket. One file per
+#   ticket regardless of process count, no /proc scan (no fork-window
+#   phantoms, no argv-shape dependence), stubs in other PI_BG_TMPDIRs are
+#   invisible, and this ticket's own file is excluded by run id (the
+#   snapshot re-exec sees its birth file). A trapped exit unlinks the
+#   file; a SIGKILLed ticket's file goes stale and drops out after the
+#   window. At cap: one stderr line + exit 5, with no
+#   worktree/cgroup/run-record side effects. Fails open if the artifact
+#   dir is missing/unreadable (a cap check must never block dispatch):
 #     [!] at cap (N/M), try again later or pi-bg-kill a ticket
 #
 # Session isolation (issue #56): the ticket runs in its OWN session +
@@ -168,9 +174,9 @@ esac
 export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
 
 # --- optional --worktree [ref] + --project <tag> (consumed before pi flags) ---
-# builtin-only on purpose: this zone must stay fork-free for the cap
-# check below (a forked child keeps this wrapper's argv until it execs;
-# a sibling wrapper scanning at the same instant would count it).
+# builtin-only on purpose: this zone stays fork-free. The cap check
+# below no longer scans processes (issue #123, heartbeat-file count), so
+# a forked helper can no longer be miscounted - the zone just stays lean.
 wt_ref=""
 wt_mode=0
 pj_tag=""
@@ -203,19 +209,21 @@ set -- "${args[@]+"${args[@]}"}"
 
 # --- concurrency cap (issue #41): refuse to start when this user already
 #     has $PI_BG_MAX_CONCURRENT live pi-bg worker/reviewer runs (0 =
-#     unlimited). Counted via the fleet-rule arg pattern (args contain
-#     "pi-bg worker" or "pi-bg reviewer"), scoped to this uid, excluding
-#     this process (it has not exec'd the agent yet). pi-bg-kill/-tail/
-#     -watchdog, pi-wait and other users' processes never match. The
-#     scan reads /proc/<pid>/status + cmdline in this shell (no
-#     ps/grep children) and runs in the fork-free zone above: a forked
-#     helper keeps this wrapper's argv until it execs, and a wrapper
-#     checking at the same instant would count it as a phantom run. A
-#     match whose parent has the identical cmdline (forked helper of
-#     ANOTHER wrapper, mid-exec) is skipped the same way.
+#     unlimited). Count = live tickets via heartbeat files (issue #123):
+#     the old /proc argv scan matched 2+ processes per live ticket (the
+#     wrapper, its hb child, the lingering launcher) plus any same-uid
+#     "pi-bg worker" stub (the cap tests spawn real ones), so the pinned
+#     cap admitted far fewer tickets than configured. A ticket's hb file
+#     ($PI_BG_TMPDIR/pi-bg-<run_id>-hb) is created at ticket creation
+#     (below) and touched every PI_BG_HB_INTERVAL while the ticket is
+#     alive; a file fresh within 3 intervals = one live ticket. No
+#     /proc scan: no argv-shape dependence, no fork-window phantoms, and
+#     other PI_BG_TMPDIRs (tests) are invisible. Self-exclusion by run
+#     id: the snapshot re-exec would otherwise count its own birth file.
 #     Runs before the worktree add, cgroup escape and run record so a
-#     refused dispatch leaves no side effects. Fails open if /proc is
-#     unreadable (a cap check must never block dispatch).
+#     refused dispatch leaves no side effects. Fails open if the
+#     artifact dir is missing/unreadable (a cap check must never block
+#     dispatch).
 # Per-box cap file (RCA #57 fix 2): when PI_BG_MAX_CONCURRENT is unset,
 # ~/.config/pi-dispatch/max-concurrent (one integer) overrides the fleet
 # default of 3. The env var still wins for per-dispatch overrides.
@@ -233,64 +241,34 @@ case "$max_c" in
     ;;
 esac
 if [ "$max_c" -gt 0 ]; then
-  # own uid from /proc/self/status ("Uid:\t<real>\t<eff>\t<saved>\t<fs>")
-  me_uid=""
-  while IFS= read -r _l; do
-    case "$_l" in
-      Uid:*) IFS=$' \t' read -r _u0 me_uid _ <<<"$_l"; break ;;
-    esac
-  done 2>/dev/null < /proc/self/status || true
+  # Fresh heartbeat files = live tickets (issue #123). Same uid scoping
+  # as before, by construction: each user's hb files live in that user's
+  # own $HOME/.pi-bg-art (or their PI_BG_TMPDIR), and no other user can
+  # write here. Two forks total (date + find), no /proc scan: the
+  # wrapper's launcher bash -c, its hb child, pi and the webhook post
+  # all share ONE file, so each live ticket counts exactly once. The
+  # window is 3 hb intervals: a live ticket touches every interval, a
+  # trapped exit unlinks, a SIGKILLed file expires within the window.
+  _cap_art="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+  _cap_int="${PI_BG_HB_INTERVAL:-30}"
+  case "$_cap_int" in
+    '' | *[!0-9]*) _cap_int=30 ;;
+  esac
+  [ "$_cap_int" -ge 1 ] || _cap_int=1
+  _cap_win=$(( _cap_int * 3 ))
+  # own run id (the snapshot re-exec passes PI_BG_RUN_ID; the original
+  # process has not computed run_id yet - same date-$$ formula below).
+  # Excluded so the snapshot's cap check does not count its own birth
+  # file (self-exclusion, was "$$" in the process scan).
+  our_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
   live=0
-  if [ -n "$me_uid" ]; then
-    for d in /proc/[0-9]*; do
-      pid="${d#/proc/}"
-      [ "$pid" = "$$" ] && continue
-      # gate on the Uid line: as non-root, other users' status is
-      # usually unreadable (loop below simply skips it); as root the
-      # comparison filters explicitly
-      uid_ok=0
-      while IFS= read -r _l; do
-        case "$_l" in
-          Uid:*)
-            IFS=$' \t' read -r _u0 _u1 _ <<<"$_l"
-            [ "$_u1" = "$me_uid" ] && uid_ok=1
-            break
-            ;;
-        esac
-      done 2>/dev/null < "$d/status"
-      [ "$uid_ok" = 1 ] || continue
-      mapfile -d '' _argv 2>/dev/null < "$d/cmdline" || continue
-      # Match on argv ELEMENTS (review F1): a launcher "bash -c" carries
-      # "pi-bg worker" inside one -c string, so a substring test over the
-      # joined argv double-counted it. Require an element whose basename is
-      # pi-bg immediately followed by a worker|reviewer element.
-      _match=0
-      _n=${#_argv[@]}
-      for ((i = 0; i < _n; i++)); do
-        if [ "${_argv[i]##*/}" = "pi-bg" ] && [ $((i + 1)) -lt "$_n" ]; then
-          case "${_argv[i + 1]}" in
-            worker | reviewer) _match=1 ;;
-          esac
-        fi
-      done
-      [ "$_match" = 1 ] || continue
-      # fork-window phantom: a child of a process with the IDENTICAL
-      # cmdline is a forked helper that has not exec'd yet (it keeps
-      # the parent's argv); a real run's parent (launcher, bun,
-      # nohup) always has a different cmdline
-      _stat=$(<"$d/stat") 2>/dev/null || _stat=""
-      _ppid=""
-      if [ -n "$_stat" ]; then
-        _tail="${_stat##*) }"
-        read -r _ _ppid _ <<<"$_tail"
-      fi
-      _pargv=()
-      [ -n "$_ppid" ] && mapfile -d '' _pargv 2>/dev/null < "/proc/$_ppid/cmdline"
-      if [ "${_pargv[*]}" != "${_argv[*]}" ]; then
-        live=$((live + 1))
-      fi
-    done
-  fi
+  _cap_cutoff=$(( $(date +%s) - _cap_win ))
+  while IFS= read -r _cap_hb; do
+    case "${_cap_hb##*/}" in
+      "pi-bg-${our_id}-hb") continue ;;
+    esac
+    live=$(( live + 1 ))
+  done < <(find "$_cap_art" -maxdepth 1 -type f -name 'pi-bg-*-hb' -newermt "@${_cap_cutoff}" 2>/dev/null)
   if [ "$live" -ge "$max_c" ]; then
     echo "[!] at cap (${live}/${max_c}), try again later or pi-bg-kill a ticket" >&2
     exit 5
