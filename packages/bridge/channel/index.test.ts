@@ -69,6 +69,7 @@ import extension, {
   runMidRunInterrupt,
   runShellPassthrough,
   runUsageLine,
+  setHandoffRestartArmed,
   setInterruptCtx,
   setProcessExitHookForTest,
   setRuntimeStateDir,
@@ -6547,6 +6548,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     (handlers as any) = {};
     clearAllCompacting();
     stopAllOpTicks();
+    setHandoffRestartArmed(false);
     process.env.HOME = oldHome;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -6661,6 +6663,30 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(shutdowns).toBe(0);
     expect(restarter).toEqual([]);
     expect(fs.existsSync(liveFile)).toBe(true); // file untouched
+  });
+
+  test("doc-written arm exempts the triggering restart from the fresh window (issue #85)", async () => {
+    writeSettings({ enabled: true, storeDir });
+    // session_before_compact just wrote a handover doc: it set BOTH the
+    // latest.md stamp (fresh window) AND the restart arm.
+    const docFile = path.join(storeDir, "latest.md");
+    fs.mkdirSync(storeDir, { recursive: true });
+    fs.writeFileSync(
+      docFile,
+      `# Handover\nupdated: ${new Date().toISOString()}\n`,
+    );
+    setHandoffRestartArmed(true); // what the doc write now does
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    // Restart fired DESPITE the fresh window (the arm exempts the triggering
+    // compact); the session rotated -> live file moved aside.
+    expect(shutdowns).toBe(1);
+    expect(restarter).toEqual(["pi.service"]);
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(marker.seeded).toBe(false);
+    expect(fs.existsSync(liveFile)).toBe(false);
   });
 
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {

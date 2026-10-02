@@ -646,6 +646,22 @@ export function isHandoffInFlight(): boolean {
 export function setHandoffInFlight(v: boolean): void {
   handoffInFlight = v;
 }
+/** True when buildHandover just wrote a doc in THIS process's current
+ *  compact. Set in session_before_compact (doc written), consumed by
+ *  maybeHandoffRestart on the resulting session_compact. The compact that
+ *  WROTE the doc must restart into a fresh session — its own write sets the
+ *  latest.md stamp, so without this arm the isHandoffFreshWindow loop-guard
+ *  would block the very restart that doc triggers (issue #85: compact -> NEW
+ *  session, /usage turns reset to 0). A restart is a new process, so the arm
+ *  is naturally absent in the seeded session; its first settle IS loop-gated
+ *  by the fresh window. */
+let handoffRestartArmed = false;
+export function isHandoffRestartArmed(): boolean {
+  return handoffRestartArmed;
+}
+export function setHandoffRestartArmed(v: boolean): void {
+  handoffRestartArmed = v;
+}
 /** Test seam: stub the handover LLM call in the session_before_compact
  *  wiring (null → default completeSimple path). */
 let handoverCompleteForTest: HandoverComplete | null = null;
@@ -2799,10 +2815,11 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
-    // Mechanism B (PR2): the size-gated restart gate runs AFTER the
-    // settle above (F1). No-op unless handoff is enabled AND the live
-    // session file exceeds restartFileCap (then: restart op, seeded
-    // fresh session on the respawn).
+    // Mechanism B: the restart gate runs AFTER the settle above (F1).
+    // No-op unless handoff is enabled; on a qualifying compact it restarts
+    // into a fresh seeded session (armed by the doc write in
+    // session_before_compact). No size gate — every handoff-qualifying
+    // compact rotates the session so /usage turns reset to 0 (issue #85).
     handoffRestartForSize(pi, ctx);
   });
   pi.on("session_compact_failed", (_event, ctx) => {
@@ -2854,6 +2871,11 @@ export default function (pi: ExtensionAPI) {
           signal: event.signal,
           complete: handoverCompleteForTest ?? undefined,
         });
+        // Doc written -> THIS compact must restart into a fresh session.
+        // Arm now (before returning) so maybeHandoffRestart, which runs on
+        // session_compact after this handler resolves, exempts itself from
+        // the fresh window this doc just set.
+        setHandoffRestartArmed(true);
         const tags = parsePriorTags(doc);
         return {
           compaction: {
@@ -3802,7 +3824,7 @@ export function archiveStaleSessions(liveFile: string): void {
     console.log(`[handoff] archived ${n} stale session file(s) in ${dir}`);
 }
 
-// ─── Handoff mechanism B: size-gated restart (design v2, PR2) ────────────
+// ─── Handoff mechanism B: restart-into-fresh-session (design v2) ────────
 // Registered on session_compact AFTER the settle ran (F1: the
 // compaction window is already closed when the gate decides, so the
 // restart op it opens cannot be swept by the settle it reacts to).
@@ -3848,8 +3870,13 @@ export async function maybeHandoffRestart(
   if (compactingChannels.get(ch.id)?.label === "compacting") return;
   // Fresh window: a handover doc was written <5 min ago (possibly with a
   // restart + seed still pending). Don't re-restart on the seeded
-  // session's first settle — it would loop.
-  if (isHandoffFreshWindow(settings.storeDir)) return;
+  // session's first settle — it would loop. The compact that just WROTE the
+  // doc is exempt: its own write set the window, and THAT compact is the
+  // restart the doc triggers (issue #85: compact -> NEW session, /usage
+  // turns -> 0). Consume the arm at this decision either way.
+  const armed = handoffRestartArmed;
+  handoffRestartArmed = false;
+  if (!armed && isHandoffFreshWindow(settings.storeDir)) return;
   let live: string | null = null;
   try {
     live = ctx.sessionManager?.getSessionFile?.() ?? null;
@@ -4410,9 +4437,14 @@ async function runChannelCommand(
         "resetting",
         "[new] new session (context cleared)",
       );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP, () =>
-        moveSessionFileAside(ctx, ctx.sessionManager?.getSessionFile?.()),
-      );
+      scheduleOpShutdown(pi, ctx, ch, placeholderP, () => {
+        const live = ctx.sessionManager?.getSessionFile?.();
+        moveSessionFileAside(ctx, live);
+        // Archive the OTHER stale .jsonl too: 'pi -c' (continueRecent) resumes
+        // the newest .jsonl, so without this a /reset can resume a superseded
+        // session (turns != 0) instead of a truly fresh one (issue #85).
+        if (live) archiveStaleSessions(live);
+      });
       return native
         ? { immediate: fence("[..] resetting...") }
         : { consumed: true };
