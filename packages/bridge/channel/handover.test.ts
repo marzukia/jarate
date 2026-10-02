@@ -42,9 +42,11 @@ import extension, {
   handleInbound,
   isCompacting,
   isHandoffInFlight,
+  isHandoffRestartArmed,
   moveSessionFileAside,
   opWindowLabel,
   setHandoffInFlight,
+  setHandoffRestartArmed,
   setHandoverCompleteForTest,
   setSystemdRestartHookForTest,
   stopAllOpTicks,
@@ -1231,6 +1233,7 @@ describe("session_before_compact wiring", () => {
   afterEach(() => {
     setHandoverCompleteForTest(null);
     setHandoffInFlight(false);
+    setHandoffRestartArmed(false);
     stopAllOpTicks();
     clearAllCompacting();
     clearDiscordStatesForTest();
@@ -1281,6 +1284,25 @@ describe("session_before_compact wiring", () => {
       ),
     ).toBe(true);
     expect(isHandoffInFlight()).toBe(false);
+  });
+
+  test("arms the restart when it writes a doc (issue #85: compact -> fresh session)", async () => {
+    setHandoverCompleteForTest(async () => PROSE);
+    expect(isHandoffRestartArmed()).toBe(false);
+    const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
+    expect(out).toBeDefined();
+    // A doc was written -> the triggering restart is armed, so it is exempt
+    // from the fresh window this doc just set (maybeHandoffRestart).
+    expect(isHandoffRestartArmed()).toBe(true);
+  });
+
+  test("does not arm the restart on the built-in path (no doc written)", async () => {
+    writeSettings({ channels: CHANNELS, handoff: { enabled: false } });
+    setHandoverCompleteForTest(async () => PROSE);
+    expect(isHandoffRestartArmed()).toBe(false);
+    const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
+    expect(out).toBeUndefined();
+    expect(isHandoffRestartArmed()).toBe(false); // no doc -> no arm
   });
 
   test("enabled + threshold: at/over HANDOFF_THRESHOLD → handover", async () => {
@@ -1536,6 +1558,7 @@ describe("auto-compact token-% gate", () => {
   afterEach(() => {
     setHandoverCompleteForTest(null);
     setHandoffInFlight(false);
+    setHandoffRestartArmed(false);
     stopAllOpTicks();
     clearAllCompacting();
     clearDiscordStatesForTest();
