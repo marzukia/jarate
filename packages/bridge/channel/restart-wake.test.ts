@@ -16,6 +16,7 @@ import {
   runRestartWake,
   selectInflight,
   WAKE_DEDUP_WINDOW_MS,
+  WAKE_TAG,
   type WakeTarget,
   writeCleanStop,
 } from "./restart-wake";
@@ -84,17 +85,27 @@ function fakeFetch(results: Array<number | Error>): {
 
 // ─── inflight summary builder (fixture run records) ──────────────────────
 
-describe("buildWakeMessage (issue #111)", () => {
-  test("clean + zero inflight = ONE short line, no list", () => {
+describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
+  test("clean + zero inflight = framed [ok] wake, [bg: tag first line", () => {
     expect(buildWakeMessage({ clean: true, runs: [], now: T0 })).toBe(
-      "[ok] back online (planned restart) - no in-flight pi-bg work",
+      [
+        WAKE_TAG,
+        "```",
+        "┌ restart wake",
+        "├ [ok] planned",
+        "└ no in-flight pi-bg work",
+        "```",
+      ].join("\n"),
     );
   });
 
-  test("unclean + zero inflight = ONE short line naming the class", () => {
-    expect(buildWakeMessage({ clean: false, runs: [], now: T0 })).toBe(
-      "[!] back online (unplanned restart - last turn may have been interrupted) - no in-flight pi-bg work",
+  test("unclean + zero inflight names the class in the frame", () => {
+    const lines = buildWakeMessage({ clean: false, runs: [], now: T0 }).split(
+      "\n",
     );
+    expect(lines[0]).toBe(WAKE_TAG);
+    expect(lines[3]).toBe("├ [!] unplanned - last turn interrupted");
+    expect(lines[4]).toBe("└ no in-flight pi-bg work");
   });
 
   test("terminal states are not inflight (done/killed ignored)", () => {
@@ -107,35 +118,31 @@ describe("buildWakeMessage (issue #111)", () => {
     );
   });
 
-  test("inflight list: ticket, profile, elapsed, cwd, task (fixture records)", () => {
+  test("inflight rows: ticket profile age, one row each (detail in /jobs)", () => {
     const runs = [
       rec({
         run: "20261001-103700-9",
         profile: "reviewer",
-        cwd: "/home/monky/.pi-bg-wt/jarate/20261001-103700-9",
         started: "2026-10-01T11:37:00Z", // 23m before T0
       }),
       rec({
         run: "20261001-115900-10",
         profile: "worker",
-        cwd: "/home/monky/projects/jarate",
         started: "2026-10-01T11:59:30Z", // 30s before T0
       }),
     ];
-    const taskFor = (id: string) =>
-      id === "20261001-103700-9"
-        ? "adversarially review pi-bg/20261001-103700-9 for issue #110"
-        : undefined; // second run: wrapper dead, no task text
-    const msg = buildWakeMessage({ clean: false, runs, taskFor, now: T0 });
-    const expected = [
-      "[!] back online (unplanned restart - last turn may have been interrupted) - 2 in-flight pi-bg run(s)",
-      "- 20261001-103700-9 reviewer 23m",
-      "  cwd /home/monky/.pi-bg-wt/jarate/20261001-103700-9",
-      "  task adversarially review pi-bg/20261001-103700-9 for issue #110",
-      "- 20261001-115900-10 worker 30s",
-      "  cwd /home/monky/projects/jarate",
-    ].join("\n");
-    expect(msg).toBe(expected);
+    expect(buildWakeMessage({ clean: false, runs, now: T0 })).toBe(
+      [
+        WAKE_TAG,
+        "```",
+        "┌ restart wake",
+        "├ [!] unplanned - last turn interrupted",
+        "├ 2 in-flight",
+        "├ 20261001-103700-9 reviewer 23m",
+        "└ 20261001-115900-10 worker 30s",
+        "```",
+      ].join("\n"),
+    );
   });
 
   test("oldest first, capped at MAX_INFLIGHT with a /jobs pointer", () => {
@@ -145,31 +152,25 @@ describe("buildWakeMessage (issue #111)", () => {
         started: `2026-10-01T11:${String(i).padStart(2, "0")}:00Z`,
       }),
     );
-    const msg = buildWakeMessage({ clean: true, runs, now: T0 });
-    const lines = msg.split("\n");
-    expect(lines[0]).toBe(
-      `[ok] back online (planned restart) - ${MAX_INFLIGHT} in-flight pi-bg run(s)`,
-    );
+    const lines = buildWakeMessage({ clean: true, runs, now: T0 }).split("\n");
     // oldest (i=0) listed first, newest (i>=10) dropped
-    expect(lines[1]).toBe("- 20261001-1100-0 worker 1h0m");
-    expect(lines).toContain(`- +2 more - see /jobs`);
+    expect(lines[4]).toBe(`├ ${MAX_INFLIGHT} in-flight`);
+    expect(lines[5]).toBe("├ 20261001-1100-0 worker 1h0m");
+    expect(lines).toContain(`└ +2 more - see /jobs`);
     expect(lines).not.toContain("20261001-1110-0");
     expect(lines).not.toContain("20261001-1111-0");
   });
 
-  test("task text clipped to ~80 chars, single line", () => {
-    const long = "x".repeat(200);
+  test("every frame line fits the 40-col budget (long profile clips)", () => {
     const msg = buildWakeMessage({
       clean: true,
-      runs: [rec({})],
-      taskFor: () => `${long}\nsecond line`,
+      runs: [rec({ profile: "x".repeat(40) })],
       now: T0,
     });
-    const taskLine = msg.split("\n").find((l) => l.startsWith("  task "));
-    expect(taskLine).toBe(`  task ${"x".repeat(80)}`);
+    for (const l of msg.split("\n")) expect(l.length).toBeLessThanOrEqual(40);
   });
 
-  test("missing profile / cwd / started degrade without crashing", () => {
+  test("missing profile / started degrade without crashing", () => {
     const msg = buildWakeMessage({
       clean: true,
       runs: [{ run: "20261001-110000-1", state: "running" } as RunRecord],
@@ -177,8 +178,13 @@ describe("buildWakeMessage (issue #111)", () => {
     });
     expect(msg).toBe(
       [
-        "[ok] back online (planned restart) - 1 in-flight pi-bg run(s)",
-        "- 20261001-110000-1 unknown 0s",
+        WAKE_TAG,
+        "```",
+        "┌ restart wake",
+        "├ [ok] planned",
+        "├ 1 in-flight",
+        "└ 20261001-110000-1 ? 0s",
+        "```",
       ].join("\n"),
     );
   });
@@ -373,7 +379,24 @@ describe("postWakeText (issue #111)", () => {
     expect(calls).toHaveLength(3);
   });
 
-  test("bot route dead falls through to webhook route", async () => {
+  test("webhook FIRST when both configured (the [bg: bus is the wake route)", async () => {
+    const { impl, calls } = fakeFetch([200]);
+    await expect(
+      postWakeText(
+        {
+          ...target,
+          botToken: "tok",
+          webhookUrl: "https://discord.com/api/webhooks/1/abc",
+        },
+        "hi",
+        { ...opts, fetchImpl: impl },
+      ),
+    ).resolves.toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://discord.com/api/webhooks/1/abc");
+  });
+
+  test("webhook dead falls through to bot route", async () => {
     const { impl, calls } = fakeFetch([500, 500, 500, 200]);
     await expect(
       postWakeText(
@@ -383,7 +406,9 @@ describe("postWakeText (issue #111)", () => {
       ),
     ).resolves.toBe(true);
     expect(calls).toHaveLength(4);
-    expect(calls[3].url).toBe("https://h/1");
+    expect(calls[3].url).toBe(
+      "https://discord.com/api/v10/channels/1545018100590846033/messages",
+    );
   });
 });
 
@@ -394,9 +419,17 @@ describe("runRestartWake (issue #111)", () => {
   const stateDir = () => path.join(tmp, ".tmp");
   const target: WakeTarget = { channelId: "1", botToken: "tok" };
   let log: string[];
+  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
     log = [];
+    // deterministic bus-webhook resolution (the real file is env-dependent)
+    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+  });
+
+  afterEach(() => {
+    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
+    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
   });
 
   test("reason != startup: no post, marker NOT consumed (hot reload)", async () => {
@@ -407,7 +440,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -423,7 +455,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target: null,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -432,7 +463,7 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("full wake: planned restart, 1 inflight, posted with summary", async () => {
+  test("full wake: planned restart, 1 inflight, framed, bus webhook first", async () => {
     writeCleanStop(stateDir(), new Date(T0 - 10_000));
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
     const { impl, calls } = fakeFetch([200]);
@@ -441,7 +472,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -450,9 +480,29 @@ describe("runRestartWake (issue #111)", () => {
     expect(r.reason).toBe("posted");
     expect(r.restartClass).toBe("planned");
     expect(calls).toHaveLength(1);
+    // the channel config has no webhookUrl -> the pi-bg bus resolves it,
+    // and the [bg: post is the FIRST route
+    expect(calls[0].url).toBe("https://bus.example/hook");
     const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toContain("[ok] back online (planned restart)");
-    expect(posted.content).toContain("- 20261001-113000-7 worker 23m");
+    expect(posted.content.startsWith(WAKE_TAG)).toBe(true);
+    expect(posted.content).toContain("├ [ok] planned");
+    expect(posted.content).toContain("└ 20261001-113000-7 worker 23m");
+    expect(posted.content).toContain("```\n┌ restart wake");
+  });
+
+  test("channel webhookUrl beats the resolved bus webhook", async () => {
+    writeCleanStop(stateDir(), new Date(T0 - 10_000));
+    const { impl, calls } = fakeFetch([200]);
+    await runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target: { ...target, webhookUrl: "https://ch.example/hook" },
+      now: T0,
+      fetchImpl: impl,
+      log: (l) => log.push(l),
+    });
+    expect(calls[0].url).toBe("https://ch.example/hook");
   });
 
   test("unclean + inflight message body matches the builder", async () => {
@@ -463,7 +513,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -472,9 +521,13 @@ describe("runRestartWake (issue #111)", () => {
     expect(r.restartClass).toBe("unclean");
     expect(r.message).toBe(
       [
-        "[!] back online (unplanned restart - last turn may have been interrupted) - 1 in-flight pi-bg run(s)",
-        "- 20261001-113000-7 worker 23m",
-        "  cwd /home/monky/projects/jarate",
+        WAKE_TAG,
+        "```",
+        "┌ restart wake",
+        "├ [!] unplanned - last turn interrupted",
+        "├ 1 in-flight",
+        "└ 20261001-113000-7 worker 23m",
+        "```",
       ].join("\n"),
     );
   });
@@ -486,7 +539,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -496,7 +548,6 @@ describe("runRestartWake (issue #111)", () => {
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0 + 30_000,
       fetchImpl: impl,
       log: (l) => log.push(l),
@@ -510,14 +561,16 @@ describe("runRestartWake (issue #111)", () => {
     const { impl } = fakeFetch([
       new Error("e1"),
       new Error("e2"),
-      new Error("e3"),
+      new Error("e3"), // bus webhook route: 3 attempts
+      new Error("e4"),
+      new Error("e5"),
+      new Error("e6"), // bot route: 3 attempts
     ]);
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
       target,
-      jobs: [],
       now: T0,
       fetchImpl: impl,
       postOpts: { backoffMs: 1, timeoutMs: 50 },
@@ -525,30 +578,5 @@ describe("runRestartWake (issue #111)", () => {
     });
     expect(r).toMatchObject({ posted: false, reason: "post-failed" });
     expect(log.join(" ")).toContain("post failed");
-  });
-
-  test("task text enriched from live wrappers (jobs by ticket id)", async () => {
-    writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
-    const { impl } = fakeFetch([200]);
-    const r = await runRestartWake({
-      reason: "startup",
-      stateDir: stateDir(),
-      runDir: runDir(),
-      target,
-      jobs: [
-        {
-          id: "20261001-113000-7",
-          age: "20:00",
-          profile: "worker",
-          task: "fix the thing",
-        },
-        { id: null, age: "01:00", profile: "worker", task: "unresolved" },
-      ],
-      now: T0,
-      fetchImpl: impl,
-      log: (l) => log.push(l),
-    });
-    expect(r.message).toContain("  task fix the thing");
-    expect(r.message).not.toContain("unresolved");
   });
 });
