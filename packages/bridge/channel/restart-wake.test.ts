@@ -6,6 +6,7 @@ import {
   buildWakeMessage,
   claimWake,
   cleanStopPath,
+  defaultDispatchWebhook,
   elapsedSeconds,
   elapsedStr,
   MAX_INFLIGHT,
@@ -167,7 +168,23 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
       runs: [rec({ profile: "x".repeat(40) })],
       now: T0,
     });
-    for (const l of msg.split("\n")) expect(l.length).toBeLessThanOrEqual(40);
+    for (const l of msg.split("\n"))
+      expect(Array.from(l).length).toBeLessThanOrEqual(40);
+  });
+
+  test("clip never splits a surrogate pair (emoji profile stays intact)", () => {
+    const emoji = "\u{1F600}"; // 2 code units, 1 code point
+    const msg = buildWakeMessage({
+      clean: true,
+      runs: [rec({ profile: emoji.repeat(30) })],
+      now: T0,
+    });
+    const loneSurrogate =
+      /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+    for (const l of msg.split("\n")) {
+      expect(Array.from(l).length).toBeLessThanOrEqual(40);
+      expect(l.match(loneSurrogate)).toBe(null);
+    }
   });
 
   test("missing profile / started degrade without crashing", () => {
@@ -214,6 +231,32 @@ describe("selectInflight / elapsed", () => {
     expect(elapsedStr(1500)).toBe("25m");
     expect(elapsedStr(3 * 3600 + 12 * 60)).toBe("3h12m");
     expect(elapsedStr(2 * 86400)).toBe("2d");
+  });
+});
+
+// ─── bus webhook resolution (file branch + env precedence) ─────────────
+
+describe("defaultDispatchWebhook", () => {
+  const savedEnv = process.env.PI_DISPATCH_WEBHOOK;
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
+    else process.env.PI_DISPATCH_WEBHOOK = savedEnv;
+  });
+
+  test("file branch: <home>/.config/pi-dispatch/webhook when env unset", () => {
+    delete process.env.PI_DISPATCH_WEBHOOK;
+    const p = path.join(tmp, ".config", "pi-dispatch");
+    fs.mkdirSync(p, { recursive: true });
+    fs.writeFileSync(path.join(p, "webhook"), "https://file.example/hook\n");
+    expect(defaultDispatchWebhook(tmp)).toBe("https://file.example/hook");
+  });
+
+  test("env beats file; env unset + missing file = null", () => {
+    process.env.PI_DISPATCH_WEBHOOK = "https://env.example/hook";
+    expect(defaultDispatchWebhook(tmp)).toBe("https://env.example/hook");
+    delete process.env.PI_DISPATCH_WEBHOOK;
+    expect(defaultDispatchWebhook(tmp)).toBe(null);
   });
 });
 
