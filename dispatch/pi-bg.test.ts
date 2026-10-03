@@ -3447,7 +3447,7 @@ echo pi-run-ok
     expect(stdinSection).toContain("STANDARD CONSTRAINTS");
   });
 
-  test("no marker + no task: a held-open stdin pipe does not wedge the run", async () => {
+  test("no marker + no task: usage error, and a held-open stdin pipe does not wedge", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const done = fx.runStdin(["worker"], undefined, true);
@@ -3456,18 +3456,71 @@ echo pi-run-ok
       new Promise<null>((res) => setTimeout(() => res(null), 20_000)),
     ]);
     expect(r).not.toBeNull();
-    expect(r!.code).toBe(0);
-    expect(r!.out).toContain("pi-run-ok");
+    expect(r!.code).toBe(2);
+    expect(r!.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
   });
 
-  test("dash form with empty stdin: constraints-only spawn, run completes", async () => {
+  test("dash form with empty stdin: usage error (no constraints-only runs)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    const paths = probePi(fx);
     const r = await fx.runStdin(["worker", "-"], "");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+  });
+});
+
+/**
+ * usage error: missing task (issue #115, incident 2026-10-03 ticket
+ * 20261003-093837, found by jimmy). A bare `pi-bg`, `pi-bg worker` with
+ * no task, or an all-whitespace task used to spawn an agent with an EMPTY
+ * task: wasted run record + cgroup + ticket + cap slot (and on pre-#118
+ * main it crashed at pi_args[-1] on the empty array). The guard exits 2
+ * BEFORE the cap scan, run record, cgroup escape and snapshot re-exec, so
+ * a probe leaves zero side effects (same contract as the --worktree /
+ * --project usage errors: rc 2, one stderr line, no record).
+ */
+describe("usage error: missing task exits 2 with no side effects", () => {
+  test("bare pi-bg: rc 2, usage on stderr, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run([]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("pi-bg worker (no task): rc 2, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("whitespace-only task: rc 2, no record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "   "]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("normal task still runs (guard does not over-fire)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "a real task"]);
     expect(r.code).toBe(0);
-    const log = fs.readFileSync(paths.log, "utf8");
-    const stdinSection = (log.split("STDIN:")[1] ?? "").trim();
-    expect(stdinSection.startsWith("STANDARD CONSTRAINTS")).toBe(true);
+    expect(r.out).toContain("pi-run-ok");
+    expect(fx.records()).toHaveLength(1);
   });
 });

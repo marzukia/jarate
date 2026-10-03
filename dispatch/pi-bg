@@ -227,9 +227,9 @@ set -- "${args[@]+"${args[@]}"}"
 #      the "-") re-reads the task from $PI_BG_TASK_FILE - the prompt
 #      file the original process writes below BEFORE the snapshot exec
 #      (its stdin is already drained, so cat would see EOF).
-#   3. no marker + no trailing positional: task stays empty (constraints
-#      only) and STDIN is NOT touched - a held-open pipe cannot wedge
-#      the launcher.
+#   3. no marker + no trailing positional: task stays empty and STDIN is
+#      NOT touched (a held-open pipe cannot wedge the launcher); the
+#      missing-task guard below turns the empty task into a usage error.
 # The prompt file itself is written right after BG_TMP exists (below):
 # that is the FIRST file the task lands in, before the run-record
 # python3 (the first real child) and before the snapshot exec.
@@ -247,6 +247,20 @@ if [ $# -ge 1 ] && [ "${@: -1}" = "-" ]; then
 elif [ $# -ge 1 ]; then
   task="${@: -1}"
   if [ $# -gt 1 ]; then set -- "${@:1:$#-1}"; else set --; fi
+fi
+
+# --- usage error: missing task (issue #115) ----------------------------
+# A bare `pi-bg` (or `pi-bg worker` with no task, an all-whitespace task,
+# or an empty stdin task) used to fall through and spawn an agent with an
+# EMPTY task: wasted run record + cgroup + ticket + cap slot (incident
+# 2026-10-03, ticket 20261003-093837; on pre-#118 main it crashed at
+# pi_args[-1] on the empty array). Die here: BEFORE the cap scan, run
+# record, cgroup escape and snapshot re-exec, so a probe leaves zero side
+# effects (same contract as the --worktree/--project usage errors above:
+# rc 2, one stderr line, no record).
+if [ -z "${task//[[:space:]]/}" ]; then
+  echo "pi-bg: missing task. usage: pi-bg {worker|reviewer} [pi flags] \"task\" | printf '%s' \"task\" | pi-bg {worker|reviewer} [pi flags] -" >&2
+  exit 2
 fi
 
 # --- concurrency cap (issue #41): refuse to start when this user already
