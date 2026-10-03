@@ -2,6 +2,13 @@
 # pi-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
 # usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
+#        the task can also ride stdin (agent-say marker form, keeps it out of
+#        argv for the whole run - issue #118):
+#        printf '%s' "$task" | pi-bg worker -
+#   task via STDIN (issue #118 — the launcher's blessed form; the "-" is
+#   the stdin marker, the task prose never sits in argv, so ps /
+#   /proc/<pid>/cmdline cannot leak it):
+#     cd <workdir> && printf '%s' "$task" | pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] -
 #   (workdir must be a git repo for --worktree; plain runs work anywhere)
 #   pi-bg --help prints this header.
 #
@@ -98,9 +105,12 @@
 #   bash-tool timeout that signals that PG kills a still-starting ticket
 #   (2026-09-13: nested tickets died rc=143 inside `git worktree add`).
 #   Blessed launch form (stays; now safe even if the tool call blocks in
-#   wait4() on the ticket until the harness timeout):
-#     cd <workdir> && nohup ~/scripts/pi-bg worker "task" > log 2>&1 & \
-#     sleep 4; head -1 log
+#   wait4() on the ticket until the harness timeout). Issue #118: the
+#   task rides STDIN (the trailing "-" marker), never argv — the wrapper
+#   + pi child argv are short stable strings, so ps cannot leak the
+#   prompt:
+#     cd <workdir> && printf '%s' "$task" | nohup ~/scripts/pi-bg worker - \
+#     > log 2>&1 & sleep 4; head -1 log
 #   pi-bg-kill compensates: it signals the ticket's process group in
 #   addition to the per-pid cgroup walk, so the whole session dies
 #   together and no pi child orphans.
@@ -207,6 +217,58 @@ while [ $# -gt 0 ]; do
 done
 set -- "${args[@]+"${args[@]}"}"
 
+# --- task capture (issue #118: no task prose in argv) ------------------
+# Two forms, plus the snapshot re-exec path:
+#   1. legacy: last positional arg: pi-bg worker "task" (any trailing
+#      positional is the task - unchanged legacy contract, dash or not)
+#   2. stdin:  trailing "-" marker (agent-say convention):
+#         printf '%s' "$task" | pi-bg [worker|reviewer] [flags] -
+#      The task is read from STDIN once, HERE: after --worktree/
+#      --project parsing and before the cap scan, the snapshot re-exec
+#      and ANY child, so nothing else can consume the pipe. On success
+#      stdin is drained to /dev/null: every later child (pi, webdrop,
+#      the webhook post) sees a deterministic already-consumed stream,
+#      and both re-execs inherit the drain. The snapshot re-exec (the
+#      whole script re-runs with the ORIGINAL argv, which still carries
+#      the "-") re-reads the task from $PI_BG_TASK_FILE - the prompt
+#      file the original process writes below BEFORE the snapshot exec
+#      (its stdin is already drained, so cat would see EOF).
+#   3. no marker + no trailing positional: task stays empty and STDIN is
+#      NOT touched (a held-open pipe cannot wedge the launcher); the
+#      missing-task guard below turns the empty task into a usage error.
+# The prompt file itself is written right after BG_TMP exists (below):
+# that is the FIRST file the task lands in, before the run-record
+# python3 (the first real child) and before the snapshot exec.
+task=""
+if [ $# -ge 1 ] && [ "${@: -1}" = "-" ]; then
+  if [ $# -gt 1 ]; then set -- "${@:1:$#-1}"; else set --; fi
+  if [ -n "${PI_BG_SNAP:-}" ] && [ -n "${PI_BG_TASK_FILE:-}" ] && [ -f "${PI_BG_TASK_FILE}" ]; then
+    # prompt file shape: line 1 = "# pi-bg <profile> task", line 2 blank,
+    # line 3+ = task (written by the original process)
+    task="$(tail -n +3 "${PI_BG_TASK_FILE}")"
+  else
+    task="$(cat)"
+    exec 0</dev/null
+  fi
+elif [ $# -ge 1 ]; then
+  task="${@: -1}"
+  if [ $# -gt 1 ]; then set -- "${@:1:$#-1}"; else set --; fi
+fi
+
+# --- usage error: missing task (issue #115) ----------------------------
+# A bare `pi-bg` (or `pi-bg worker` with no task, an all-whitespace task,
+# or an empty stdin task) used to fall through and spawn an agent with an
+# EMPTY task: wasted run record + cgroup + ticket + cap slot (incident
+# 2026-10-03, ticket 20261003-093837; on pre-#118 main it crashed at
+# pi_args[-1] on the empty array). Die here: BEFORE the cap scan, run
+# record, cgroup escape and snapshot re-exec, so a probe leaves zero side
+# effects (same contract as the --worktree/--project usage errors above:
+# rc 2, one stderr line, no record).
+if [ -z "${task//[[:space:]]/}" ]; then
+  echo "pi-bg: missing task. usage: pi-bg {worker|reviewer} [pi flags] \"task\" | printf '%s' \"task\" | pi-bg {worker|reviewer} [pi flags] -" >&2
+  exit 2
+fi
+
 # --- concurrency cap (issue #41): refuse to start when this user already
 #     has $PI_BG_MAX_CONCURRENT live pi-bg worker/reviewer runs (0 =
 #     unlimited). Count = live tickets via heartbeat files (issue #123):
@@ -309,6 +371,18 @@ export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 #     so every tool finds them. ---
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
+
+# --- prompt file (issue #118): the task persists to a per-run file
+# BEFORE any child runs (the run-record python3 is the first child below)
+# and BEFORE the snapshot re-exec (which re-reads it via PI_BG_TASK_FILE).
+# The wrapper and the pi child read the task from this file, never from
+# argv. The file also feeds the end-of-run webdrop prompt artifact (same
+# content the old late write produced); the exit trap still removes it
+# after the webdrop upload. 0600: the task may carry secrets (#118).
+PROMPT_F="$BG_TMP/pi-bg-${run_id}-prompt.md"
+{ printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$PROMPT_F" 2>/dev/null
+chmod 600 "$PROMPT_F" 2>/dev/null || true
+export PI_BG_TASK_FILE="$PROMPT_F"
 
 # --- issue #101: early bookkeeping (run record + heartbeat) at TICKET CREATION.
 #     The 20260928-095136-360941 wedge died between the cgroup-escape banner
@@ -458,8 +532,7 @@ if [ "$wt_mode" -eq 1 ]; then
   echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
 fi
 
-# task = last positional arg (early: the exit trap needs it)
-task="${@: -1}"
+# task: captured at arg parsing (issue #118 — argv carries no task prose)
 out=""; rc=1; purl=""; ourl=""
 
 # --- cgroup escape (automatic, persistent): move THIS process (and all
@@ -831,6 +904,7 @@ bg_on_exit() {
   rm -f "$BG_TMP/pi-bg-${run_id}-body.json" \
         "$BG_TMP/pi-bg-${run_id}-body-plain.json" \
         "$BG_TMP/pi-bg-${run_id}-prompt.md" \
+        "$BG_TMP/pi-bg-${run_id}-spawn.md" \
         "$BG_TMP/pi-bg-${run_id}-wb-resp.txt" 2>/dev/null || true
   # err.log is kept when out.md has no non-whitespace content (empty
   # output: the stderr tail is the only death reason, issue #57)
@@ -1273,15 +1347,21 @@ with open(f, "w") as fh:
 PY
 }
 
-# standard constraints: append to the final (task) argument of every run
-pi_args=( "$@" )
-pi_args[-1]+=$'\n\nSTANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Bound long commands with `timeout` (default 600s) unless the task says otherwise.'
+# standard constraints: appended to the task for every run. Issue #118:
+# the combined prompt goes to pi via the per-run spawn file (pi reads it
+# on stdin); the pi child's argv is a short stable flag string with no
+# task prose, so ps / /proc/<pid>/cmdline cannot leak the prompt.
+STD_CONSTRAINTS=$'STANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Bound long commands with `timeout` (default 600s) unless the task says otherwise.'
+pi_flags=( "$@" )
+SPAWN_F="$BG_TMP/pi-bg-${run_id}-spawn.md"
+{ printf '%s' "$task"; printf '\n\n%s' "$STD_CONSTRAINTS"; } > "$SPAWN_F" 2>/dev/null
+chmod 600 "$SPAWN_F" 2>/dev/null || true
 for attempt in 1 2 3; do
   att_start="$(date +%s)"
   if [ "$wt_mode" -eq 1 ]; then
-    ( cd "$wt_path" && exec pi -p --no-extensions "${pi_args[@]}" ) > "$rawf" 2> "$errf" &
+    ( cd "$wt_path" && exec pi -p --no-extensions "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" ) > "$rawf" 2> "$errf" &
   else
-    pi -p --no-extensions "${pi_args[@]}" > "$rawf" 2> "$errf" &
+    pi -p --no-extensions "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" > "$rawf" 2> "$errf" &
   fi
   pi_pid=$!
   wait "$pi_pid"; rc=$?; pi_pid=""
@@ -1336,9 +1416,8 @@ done
 
 # --- webdrop: full prompt + full output behind a link (channel gets a brief) ---
 # pf/of are always written: the exit trap uses out.md to detect a silent death
-pf="$BG_TMP/pi-bg-${run_id}-prompt.md"
+pf="$PROMPT_F"   # prompt file written at ticket creation (issue #118)
 of="$BG_TMP/pi-bg-${run_id}-out.md"
-{ printf '# pi-bg %s task\n\n' "$profile"; printf '%s\n' "$task"; } > "$pf"
 printf '%s\n' "$out" > "$of"
 if command -v webdrop >/dev/null 2>&1; then
   purl="$(webdrop "$pf" "pi-bg-${run_id}-prompt" --ttl 7d 2>/dev/null | tail -1)" || purl=""

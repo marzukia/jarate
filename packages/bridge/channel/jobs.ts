@@ -1,11 +1,15 @@
 // /jobs: in-flight pi-bg dispatches + recent-completed history (issue #14)
 //
-// In-flight: the pi-bg wrapper's command line carries profile + task, and the
+// In-flight: the pi-bg wrapper's command line carries the profile, and the
 // wrapper process exists only while the run is live, so `ps` is the reliable
-// in-flight marker (the prompt/out artifacts are written at run end). The
-// ticket id is NOT in the ps line; it is resolved per-pid from
-// /proc/<pid>/cgroup (the escape cgroup path ends in the run_id pi-bg
-// prints as the escape path). Unresolvable pid => id:null, never a crash.
+// in-flight marker (the prompt/out artifacts are written at run end). Since
+// issue #118 the TASK no longer rides the wrapper argv (it is piped to pi on
+// stdin and lands in the per-run prompt file first) — when the ps line has
+// no task (or only the `-` stdin marker), /jobs falls back to the first line
+// of pi-bg-<id>-prompt.md. The ticket id is NOT in the ps line; it is
+// resolved per-pid from /proc/<pid>/cgroup (the escape cgroup path ends in
+// the run_id pi-bg prints as the escape path). Unresolvable pid => id:null,
+// never a crash.
 //
 // History: assembled from the pi-bg-<ticket>-* artifacts pi-bg leaves
 // per run (in ~/.pi-bg-art, or $PI_BG_TMPDIR; legacy runs in /tmp are
@@ -54,6 +58,28 @@ export function ticketIdFromPid(
   return null;
 }
 
+// First display line of a run's task from its per-run prompt file
+// (issue #118 fallback for /jobs: the task is no longer in the wrapper
+// argv). Prompt format: "# pi-bg <profile> task\n\n<task>\n" — the task
+// body starts at line 3. Null when unreadable or empty.
+export function promptTask(
+  id: string,
+  tmpDirs: string[] = jobTmpDirs(),
+): string | null {
+  for (const d of tmpDirs) {
+    try {
+      const body = fs
+        .readFileSync(path.join(d, `pi-bg-${id}-prompt.md`), "utf8")
+        .split("\n");
+      const first = (body[2] ?? "").trim();
+      if (first) return first.slice(0, 70);
+    } catch {
+      // not in this dir; try the next
+    }
+  }
+  return null;
+}
+
 // ps etime: "MM:SS", "H:MM:SS", or "D-H:MM:SS" (procps). Raw seconds for
 // the dedup comparison; unparseable -> 0.
 function etimeToSecs(etime: string): number {
@@ -66,31 +92,38 @@ function etimeToSecs(etime: string): number {
   return 0;
 }
 
-// Match the wrapper line shape: <pid> <etime> <bash> <script-path> <profile> <task>
+// Match the wrapper line shape: <pid> <etime> <bash> <script-path> <profile> [<task>]
+// The task is OPTIONAL: since #118 the wrapper argv ends at the profile for
+// stdin-launched runs (legacy argv-task runs still match the old shape).
 // The script path is EITHER the installed symlink (.../scripts/pi-bg)
 // OR the per-run snapshot (.../.pi-bg-art/snap-<run_id>/pi-bg — the
 // deploy-swap guard re-execs from a hard-linked copy, 2026-09-15).
 // procRoot is overridable so the cgroup id resolution is testable with a
-// fake /proc (ticketIdFromPid pattern).
+// fake /proc (ticketIdFromPid pattern); tmpDirs feeds the prompt-file
+// task fallback.
 export function parseJobsFromPs(
   psOut: string,
   procRoot: string = "/proc",
+  tmpDirs: string[] = jobTmpDirs(),
 ): InflightJob[] {
   const out: InflightJob[] = [];
   for (const line of psOut.split("\n")) {
     const m = line
       .trim()
       .match(
-        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/pi-bg|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)\s+(.+)$/,
+        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/pi-bg|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
       );
     if (!m) continue;
-    const task = m[4]
-      .trim()
-      .replace(/^"+|"+$/g, "")
-      .split("\n")[0]
-      .slice(0, 70);
+    const id = ticketIdFromPid(Number(m[1]), procRoot);
+    // argv task (legacy form); the `-` marker means "task came on stdin".
+    const argvTask = (m[4] ?? "").trim().replace(/^"+|"+$/g, "");
+    let task =
+      argvTask !== "" && argvTask !== "-"
+        ? argvTask.split("\n")[0].slice(0, 70)
+        : "";
+    if (!task && id) task = promptTask(id, tmpDirs) ?? "";
     out.push({
-      id: ticketIdFromPid(Number(m[1]), procRoot),
+      id,
       age: m[2],
       profile: m[3],
       task,
@@ -133,7 +166,7 @@ export function collectInflightJobs(procRoot: string = "/proc"): InflightJob[] {
   } catch {
     return [];
   }
-  return parseJobsFromPs(raw, procRoot);
+  return parseJobsFromPs(raw, procRoot, jobTmpDirs());
 }
 
 export type JobState = "done" | "webhook-failed" | "killed" | "lost";

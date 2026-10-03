@@ -14,7 +14,7 @@ import {
 } from "./discord";
 import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
-import { writeHandover } from "./handover";
+import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
   bashToolEssential,
   buildInteractionHandler,
@@ -69,7 +69,9 @@ import extension, {
   runMidRunInterrupt,
   runShellPassthrough,
   runUsageLine,
+  setHandoffRestartArmed,
   setInterruptCtx,
+  setLiveKickoffStateHookForTest,
   setProcessExitHookForTest,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
@@ -4195,6 +4197,61 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     expect(JSON.parse(edit!.body).content).toContain("boom");
   });
 
+  test("type-3 (MESSAGE_COMPONENT) events route to the vault handlers, not the command path", async () => {
+    let patCalled = false;
+    let vaultCalled = false;
+    const h = buildInteractionHandler(
+      pi,
+      ctx,
+      ch,
+      "tok-i",
+      {
+        handlePatComponent: async () => {
+          patCalled = true;
+        },
+      },
+      {
+        handleVaultComponent: async () => {
+          vaultCalled = true;
+        },
+      },
+    );
+    await h({
+      id: "i3",
+      token: "tok123",
+      application_id: "app1",
+      channel_id: "888",
+      user: { id: "owner1" },
+      type: 3,
+      data: {
+        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
+      },
+    });
+    expect(patCalled).toBe(true);
+    expect(vaultCalled).toBe(true);
+    // The router itself made no network call — the component handlers own
+    // the ack (they no-op for non-matching custom_ids).
+    expect(calls.length).toBe(0);
+  });
+
+  test("command path with a missing name fails readable, not TypeError", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h({
+      id: "i4",
+      token: "t",
+      application_id: "app1",
+      channel_id: "888",
+      user: { id: "owner1" },
+      type: 2,
+      data: {},
+    }); // must not throw
+    const edit = calls.find((c) =>
+      c.url.endsWith("/webhooks/app1/t/messages/@original"),
+    );
+    expect(edit).toBeDefined();
+    expect(JSON.parse(edit!.body).content).toContain("unknown command");
+  });
+
   test("btw defers, sends to pi, and leaves the deferred message alone", async () => {
     let sent = false;
     pi.sendMessage = () => {
@@ -6547,6 +6604,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     (handlers as any) = {};
     clearAllCompacting();
     stopAllOpTicks();
+    setHandoffRestartArmed(false);
     process.env.HOME = oldHome;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -6663,6 +6721,30 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(liveFile)).toBe(true); // file untouched
   });
 
+  test("doc-written arm exempts the triggering restart from the fresh window (issue #85)", async () => {
+    writeSettings({ enabled: true, storeDir });
+    // session_before_compact just wrote a handover doc: it set BOTH the
+    // latest.md stamp (fresh window) AND the restart arm.
+    const docFile = path.join(storeDir, "latest.md");
+    fs.mkdirSync(storeDir, { recursive: true });
+    fs.writeFileSync(
+      docFile,
+      `# Handover\nupdated: ${new Date().toISOString()}\n`,
+    );
+    setHandoffRestartArmed(true); // what the doc write now does
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    handlers.session_compact?.({ type: "session_compact" }, ctx);
+    await waitOpShutdown();
+    // Restart fired DESPITE the fresh window (the arm exempts the triggering
+    // compact); the session rotated -> live file moved aside.
+    expect(shutdowns).toBe(1);
+    expect(restarter).toEqual(["pi.service"]);
+    const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
+    expect(marker.op).toBe("handoff");
+    expect(marker.seeded).toBe(false);
+    expect(fs.existsSync(liveFile)).toBe(false);
+  });
+
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
     writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
@@ -6711,27 +6793,41 @@ describe("handoff mechanism B (size-gated restart)", () => {
       finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
       seeded: false,
     });
+    // issue #134: the seed carries LIVE dispatch + board state (pinned here
+    // - real ps/board are environment-dependent), not doc-scraped prose.
+    setLiveKickoffStateHookForTest(() => ({
+      dispatchText:
+        "┌ jobs · 1 in flight\n┣ 20261003-081922-478435 worker · 01:07:43\n└",
+      todoBoard: "┌ todos · 1 open\n├ ship it\n└",
+    }));
 
-    await handlers.session_start?.(null, ctx);
+    try {
+      await handlers.session_start?.(null, ctx);
 
-    // the seed is a plain user message (never a channel-inbound: no
-    // Discord echo, no polluting the next handover's last-asks)
-    expect(seedMsgs).toHaveLength(1);
-    const lines = seedMsgs[0].split("\n");
-    expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
-    expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
-    expect(lines[3]).toBe("Last ask: 1. do the thing");
-    expect(lines[4]).toBe(
-      `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
-    );
-    // marker consumed: a second boot cannot re-seed
-    expect(fs.existsSync(markerPath())).toBe(false);
-    // placeholder replaced with the final line
-    expect(
-      edits().some((t) =>
-        t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
-      ),
-    ).toBe(true);
+      // the seed is a plain user message (never a channel-inbound: no
+      // Discord echo, no polluting the next handover's last-asks)
+      expect(seedMsgs).toHaveLength(1);
+      const lines = seedMsgs[0].split("\n");
+      expect(lines[1]).toBe("Mission: 1 open: ship it");
+      expect(lines[2]).toBe(
+        "In-flight: 20261003-081922-478435 worker · 01:07:43",
+      );
+      expect(lines[3]).toBe("Last ask: 1. do the thing");
+      expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
+      expect(lines[5]).toBe(
+        `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
+      );
+      // marker consumed: a second boot cannot re-seed
+      expect(fs.existsSync(markerPath())).toBe(false);
+      // placeholder replaced with the final line
+      expect(
+        edits().some((t) =>
+          t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+        ),
+      ).toBe(true);
+    } finally {
+      setLiveKickoffStateHookForTest(null);
+    }
   });
 
   test("ordinary boot (no marker): no seed, even with a doc in the store", async () => {

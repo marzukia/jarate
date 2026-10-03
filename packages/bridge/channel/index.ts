@@ -71,6 +71,8 @@ import {
   buildSeedKickoff,
   type HandoverComplete,
   isHandoffFreshWindow,
+  type KickoffLiveState,
+  liveKickoffState,
   loadPreviousHandover,
   parsePriorTags,
   resolveHandoffSettings,
@@ -81,6 +83,7 @@ import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
+import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
@@ -109,6 +112,7 @@ import {
   scheduleTask,
 } from "./tasks";
 import {
+  defaultHome,
   extractTodoLines,
   fit,
   isBgCallbackBody,
@@ -152,6 +156,7 @@ import {
   type UsageStats,
   usageFrame,
 } from "./usage";
+import { startVault, stopVault, type VaultHandle } from "./vault";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
 
@@ -161,6 +166,8 @@ let agentBusy = false;
 // PAT vault handles per channel (L4: once per process per socket path;
 // start on connect, stopPatVault on shutdown — refcounted internally).
 const patVaultHandles = new Map<string, PatVaultHandle>();
+// Generic vault handles per channel (same L4 refcount pattern).
+const vaultHandles = new Map<string, VaultHandle>();
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -642,6 +649,22 @@ export function isHandoffInFlight(): boolean {
 }
 export function setHandoffInFlight(v: boolean): void {
   handoffInFlight = v;
+}
+/** True when buildHandover just wrote a doc in THIS process's current
+ *  compact. Set in session_before_compact (doc written), consumed by
+ *  maybeHandoffRestart on the resulting session_compact. The compact that
+ *  WROTE the doc must restart into a fresh session — its own write sets the
+ *  latest.md stamp, so without this arm the isHandoffFreshWindow loop-guard
+ *  would block the very restart that doc triggers (issue #85: compact -> NEW
+ *  session, /usage turns reset to 0). A restart is a new process, so the arm
+ *  is naturally absent in the seeded session; its first settle IS loop-gated
+ *  by the fresh window. */
+let handoffRestartArmed = false;
+export function isHandoffRestartArmed(): boolean {
+  return handoffRestartArmed;
+}
+export function setHandoffRestartArmed(v: boolean): void {
+  handoffRestartArmed = v;
 }
 /** Test seam: stub the handover LLM call in the session_before_compact
  *  wiring (null → default completeSimple path). */
@@ -2068,7 +2091,7 @@ export default function (pi: ExtensionAPI) {
   );
 
   // ─── Startup / Shutdown ────────────────────────────────────────────────
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     sessionStartTs = Date.now();
     setInterruptCtx(ctx);
     workspaceRoot = ctx.cwd;
@@ -2156,9 +2179,19 @@ export default function (pi: ExtensionAPI) {
               stateDir: path.join(ctx.cwd, ".tmp"),
             });
             patVaultHandles.set(ch.id, vh);
+            // Generic vault: started alongside the PAT vault; state lives
+            // in ~/.jarate/vault (its own dir, L4 refcounted).
+            const vh2 = startVault({
+              pi,
+              ctx,
+              ch,
+              botToken: bt,
+              stateDir: path.join(ctx.cwd, ".tmp"),
+            });
+            vaultHandles.set(ch.id, vh2);
             setDiscordInteractionHandler(
               bt,
-              buildInteractionHandler(pi, ctx, ch, bt, vh),
+              buildInteractionHandler(pi, ctx, ch, bt, vh, vh2),
             );
           }
           // startupMessage is posted by the poller once the bot's own user
@@ -2176,6 +2209,40 @@ export default function (pi: ExtensionAPI) {
       consumeOpMarker(pi, ctx);
     } catch (e) {
       console.error("[op] marker settle failed:", sanitizeUnknownValue(e));
+    }
+
+    // Post-restart wake (issue #111, P0): on a real process start
+    // (reason "startup"), post ONE "back online" message — planned /
+    // unplanned restart class + the in-flight pi-bg summary — to the
+    // default channel. Fire-and-forget: never blocks or fails startup;
+    // no channel/token/webhook = silent no-op; two startups racing
+    // within 60s post once.
+    {
+      const wakeCh =
+        defaultCh ?? enabled.find((c) => c.type === "discord") ?? null;
+      // event?.reason: the test harness fires session_start(null, ctx);
+      // real pi always passes the event (reason "startup" on process start)
+      void runRestartWake({
+        reason: event?.reason,
+        stateDir: path.join(ctx.cwd, ".tmp"),
+        target:
+          wakeCh && (wakeCh.botToken || wakeCh.webhookUrl)
+            ? {
+                channelId: getDiscordChannelId(wakeCh.id) ?? wakeCh.channel,
+                botToken: wakeCh.botToken,
+                webhookUrl: wakeCh.webhookUrl,
+              }
+            : null,
+      })
+        .then((r) => {
+          if (r.posted)
+            console.log(
+              `[wake] posted restart wake (${r.restartClass}) to ${wakeCh?.id}`,
+            );
+        })
+        .catch((e) =>
+          console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
+        );
     }
 
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
@@ -2270,6 +2337,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    // Clean-stop marker (issue #111): the next process start classifies
+    // this stop as PLANNED; a crash that never runs this hook leaves no
+    // marker, so the wake says unplanned. In-process /new and /reload
+    // also fire this — harmless, the marker is only consumed on a real
+    // process start.
+    writeCleanStop(path.join(workspaceRoot, ".tmp"));
     if (typingTimer) {
       clearInterval(typingTimer);
       typingTimer = null;
@@ -2309,6 +2382,11 @@ export default function (pi: ExtensionAPI) {
         if (vh) {
           stopPatVault(vh);
           patVaultHandles.delete(ch.id);
+        }
+        const vh2 = vaultHandles.get(ch.id);
+        if (vh2) {
+          stopVault(vh2);
+          vaultHandles.delete(ch.id);
         }
         if (ch.botToken) {
           stopDiscordPresence(ch.botToken);
@@ -2781,10 +2859,11 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
-    // Mechanism B (PR2): the size-gated restart gate runs AFTER the
-    // settle above (F1). No-op unless handoff is enabled AND the live
-    // session file exceeds restartFileCap (then: restart op, seeded
-    // fresh session on the respawn).
+    // Mechanism B: the restart gate runs AFTER the settle above (F1).
+    // No-op unless handoff is enabled; on a qualifying compact it restarts
+    // into a fresh seeded session (armed by the doc write in
+    // session_before_compact). No size gate — every handoff-qualifying
+    // compact rotates the session so /usage turns reset to 0 (issue #85).
     handoffRestartForSize(pi, ctx);
   });
   pi.on("session_compact_failed", (_event, ctx) => {
@@ -2836,6 +2915,11 @@ export default function (pi: ExtensionAPI) {
           signal: event.signal,
           complete: handoverCompleteForTest ?? undefined,
         });
+        // Doc written -> THIS compact must restart into a fresh session.
+        // Arm now (before returning) so maybeHandoffRestart, which runs on
+        // session_compact after this handler resolves, exempts itself from
+        // the fresh window this doc just set.
+        setHandoffRestartArmed(true);
         const tags = parsePriorTags(doc);
         return {
           compaction: {
@@ -3244,17 +3328,25 @@ export function buildInteractionHandler(
   ch: ChannelConfig,
   botToken: string,
   vaultRef?: { handlePatComponent(d: any): Promise<void> } | null,
+  vault2Ref?: { handleVaultComponent(d: any): Promise<void> } | null,
 ): (d: any) => Promise<void> {
   return async (d: any) => {
-    // Type-4 (button) events go to the PAT vault. The .catch is the M1
-    // dispatch-side backstop: handlePatComponent never rejects by
+    // Type-4 (button) events go to the vaults. The .catch is the M1
+    // dispatch-side backstop: each component handler never rejects by
     // construction (top-level catch), but the gateway branch calls this
     // handler un-awaited inside a sync-only try/catch — an escaped
     // rejection would crash the whole bridge (Node 22 defaults to
     // unhandled-rejections=throw).
-    if (d?.type === 4) {
+    // MESSAGE_COMPONENT (button/select) events go to the vaults — type 3
+    // per the current Discord spec (it was 4 in the old numbering; the
+    // type-4 gate + missing INTERACTIONS intent is why every tap fell
+    // through to the slash-command path, RCA 2026-10-01).
+    if (d?.type === 3) {
       vaultRef
         ?.handlePatComponent(d)
+        .catch((e) => console.error("[interactions] vault handler failed:", e));
+      vault2Ref
+        ?.handleVaultComponent(d)
         .catch((e) => console.error("[interactions] vault handler failed:", e));
       return;
     }
@@ -3492,7 +3584,15 @@ function seedFromHandoffDoc(pi: ExtensionAPI, ctx: ExtensionContext): void {
     console.log("[handoff] no handover doc at boot - seed skipped");
     return;
   }
-  pi.sendUserMessage(buildSeedKickoff(doc, settings.storeDir));
+  // Live dispatch + board state (issue #134): the deterministic doc has no
+  // Mission/In-flight sections, so the seed reads the SAME sources the doc's
+  // State box renders - fresh at restart, not scraped from the doc.
+  const live = liveKickoffStateHook
+    ? liveKickoffStateHook(ctx.cwd)
+    : liveKickoffState(ctx.cwd);
+  pi.sendUserMessage(
+    buildSeedKickoff(doc, settings.storeDir, defaultHome(), live),
+  );
   console.log("[handoff] seeded fresh session from the handover doc");
 }
 
@@ -3511,6 +3611,16 @@ export function setSystemdRestartHookForTest(
   fn: ((unit: string) => void) | null,
 ): void {
   systemdRestartHook = fn;
+}
+
+let liveKickoffStateHook: ((cwd: string) => KickoffLiveState) | null = null;
+/** Override the live seed-state source (tests: no real ps / board around).
+ *  The boot-seed wiring calls liveKickoffState (ps + todo board), which is
+ *  environment-dependent — tests pin it with this hook. */
+export function setLiveKickoffStateHookForTest(
+  fn: ((cwd: string) => KickoffLiveState) | null,
+): void {
+  liveKickoffStateHook = fn;
 }
 
 let processExitHook: ((code: number) => void) | null = null;
@@ -3780,7 +3890,7 @@ export function archiveStaleSessions(liveFile: string): void {
     console.log(`[handoff] archived ${n} stale session file(s) in ${dir}`);
 }
 
-// ─── Handoff mechanism B: size-gated restart (design v2, PR2) ────────────
+// ─── Handoff mechanism B: restart-into-fresh-session (design v2) ────────
 // Registered on session_compact AFTER the settle ran (F1: the
 // compaction window is already closed when the gate decides, so the
 // restart op it opens cannot be swept by the settle it reacts to).
@@ -3826,8 +3936,13 @@ export async function maybeHandoffRestart(
   if (compactingChannels.get(ch.id)?.label === "compacting") return;
   // Fresh window: a handover doc was written <5 min ago (possibly with a
   // restart + seed still pending). Don't re-restart on the seeded
-  // session's first settle — it would loop.
-  if (isHandoffFreshWindow(settings.storeDir)) return;
+  // session's first settle — it would loop. The compact that just WROTE the
+  // doc is exempt: its own write set the window, and THAT compact is the
+  // restart the doc triggers (issue #85: compact -> NEW session, /usage
+  // turns -> 0). Consume the arm at this decision either way.
+  const armed = handoffRestartArmed;
+  handoffRestartArmed = false;
+  if (!armed && isHandoffFreshWindow(settings.storeDir)) return;
   let live: string | null = null;
   try {
     live = ctx.sessionManager?.getSessionFile?.() ?? null;
@@ -4121,6 +4236,11 @@ async function runChannelCommand(
             : "[!] owner only (no owner configured: set channels[].ownerUserId or ownerUserIds)",
         ),
       };
+  // Robustness: a misrouted event (no d.data.name) must fail with a
+  // readable line, not a TypeError (2026-10-01: a button tap crashed here
+  // before the type gate was fixed).
+  if (typeof name !== "string" || name.length === 0)
+    return { immediate: fence("[!] unknown command") };
   switch (name.toLowerCase()) {
     case "stop": {
       // /stop while compacting is owner-only (isOwner pattern): it aborts
@@ -4388,9 +4508,14 @@ async function runChannelCommand(
         "resetting",
         "[new] new session (context cleared)",
       );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP, () =>
-        moveSessionFileAside(ctx, ctx.sessionManager?.getSessionFile?.()),
-      );
+      scheduleOpShutdown(pi, ctx, ch, placeholderP, () => {
+        const live = ctx.sessionManager?.getSessionFile?.();
+        moveSessionFileAside(ctx, live);
+        // Archive the OTHER stale .jsonl too: 'pi -c' (continueRecent) resumes
+        // the newest .jsonl, so without this a /reset can resume a superseded
+        // session (turns != 0) instead of a truly fresh one (issue #85).
+        if (live) archiveStaleSessions(live);
+      });
       return native
         ? { immediate: fence("[..] resetting...") }
         : { consumed: true };

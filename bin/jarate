@@ -51,6 +51,10 @@
 #   JARATE_PAT_FILE_DIR PAT vault published-file dir (default $XDG_RUNTIME_DIR/jarate-pat)
 #   JARATE_PAT_PATS_DIR fine-grained token store (default ~/.config/marzukia-pats)
 #   JARATE_PAT_AUDIT_FILE audit log (default ~/.jarate/pat-audit.log)
+#   JARATE_VAULT_DIR      vault data dir (default ~/.jarate/vault; audit lives here)
+#   JARATE_VAULT_SOCKET_DIR vault socket dir (default $XDG_RUNTIME_DIR/jarate)
+#   JARATE_VAULT_FILE_DIR vault published-file dir (default $XDG_RUNTIME_DIR/jarate-vault)
+#   JARATE_VAULT_AUDIT_FILE vault audit log (default <vault dir>/audit.log)
 #   JARATE_PAT_TRANSPORT socket|file (bridge side; default socket)
 #   JARATE_PAT_RUN_TIMEOUT_S wrapper command cap in seconds (default 900)
 
@@ -62,7 +66,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status")
+COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status" "vault-request" "vault-run" "vault-status" "vault-revoke" "vault-audit")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -286,9 +290,17 @@ run_remote_probe() { # $1=name $2=uid $3=since
     echo "[jarate:probe] no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
     return 1
   fi
-  timeout "$TMO" sshpass -p "$pass" \
+  # issue #121: the password sits in NEITHER argv NOR the remote string:
+  #   - local: `sshpass -e` reads SSH_PASS from env (the SSH_PASS= prefix
+  #     is env, not argv; visible only to this user's /proc/<pid>/environ)
+  #   - the password rides ssh's STDIN exactly once (here-string, no argv);
+  #     the remote shell reads it into a variable, drops it in a 0600 temp
+  #     file and feeds `sudo -S < file` — never `echo '<pw>'` in remote argv
+  #   - $1/$3 are single-quoted in the remote string, $2 is a uid digit
+  SSH_PASS="$pass" timeout "$TMO" sshpass -e \
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-    "echo '$pass' | sudo -S -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'" 2>/dev/null
+    "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
+    <<<"$pass" 2>/dev/null
 }
 
 cmd_journal_errors() {
@@ -530,7 +542,12 @@ print(json.dumps({"scanned": scanned, "tagged": tagged, "skipped": skipped, "err
 jarate_scan() {
   local home="$1" b64="$2"; shift 2
   local envs="" kv owner host pass
-  for kv in "$@"; do envs="${envs:+$envs }$kv"; done
+  for kv in "$@"; do
+    # safe tokens only (the remote command is one quoted string; a token
+    # with spaces/globs would break the remote word-splitting)
+    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_+./:=:-]*$ ]] || { echo "jarate_scan: bad KEY=VAL token: $kv" >&2; return 1; }
+    envs="${envs:+$envs }$kv"
+  done
   if [ "$home" = "$HOME" ]; then
     timeout "$TMO" env PI_HOME="$home" $envs python3 -c \
       'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
@@ -543,9 +560,14 @@ jarate_scan() {
       return 1
     fi
     command -v sshpass >/dev/null 2>&1 || { echo "cross-user hop needs sshpass" >&2; return 1; }
-    timeout "$TMO" sshpass -p "$pass" \
+    # issue #121: same no-password-in-argv discipline as run_remote_probe
+    # (sshpass -e + password over ssh stdin once + 0600 remote file for
+    # sudo -S); $owner/$home/$b64 are quoted in the remote string, $envs
+    # tokens are validated above.
+    SSH_PASS="$pass" timeout "$TMO" sshpass -e \
       ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-      "echo '$pass' | sudo -S -u '$owner' bash -c 'PI_HOME=$home $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" $b64'" 2>/dev/null
+      "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$owner' bash -c 'PI_HOME=\"$home\" $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" \"$b64\"'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
+      <<<"$pass" 2>/dev/null
   fi
 }
 
@@ -1560,6 +1582,74 @@ cmd_pat_status() {
   exec "$jp" status "$@"
 }
 
+# ─── vault-* (generic credential vault) ─────────────────────────────────────
+# Thin dispatchers to the sibling `jarate-vault` (bun) — the only process
+# that ever sees a credential value. rc pass-through via exec:
+#   rc 0 ok | 1 vault error (JSON doc on stdout) | 2 usage
+
+find_jarate_vault() {
+  local d c
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${JARATE_VAULT_BIN:-}" "$d/jarate-vault" "$JARATE_ROOT/bin/jarate-vault"; do
+    if [ -n "$c" ] && [ -f "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_vault_request() {
+  local jv
+  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
+  if [ $# -eq 1 ]; then
+    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
+    #   github-pat marzukia/jarate:write one-shot needs a token for x
+    # jarate-vault re-splits it (shellWords) — pass through.
+    exec "$jv" request-raw "$1"
+  fi
+  exec "$jv" request "$@"
+}
+
+cmd_vault_run() {
+  local jv
+  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
+  [ $# -ge 1 ] || die_usage "vault-run: usage: jarate vault-run <request-id> -- <cmd> [args...]"
+  if [ $# -eq 1 ]; then
+    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
+    #   vau_x -- gh pr create -m "fix: x"
+    # first whitespace token = id, remainder = raw string for shellWords.
+    local tail="$1" id rest
+    id="${tail%% *}"
+    rest="${tail#* }"
+    [ "$rest" = "$tail" ] && rest=""
+    exec "$jv" run-raw "$id" "$rest"
+  fi
+  # Bash path: real argv, lossless — pass through untouched (keeps `--`).
+  exec "$jv" run "$@"
+}
+
+cmd_vault_status() {
+  local jv
+  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
+  [ $# -le 1 ] || die_usage "vault-status: usage: jarate vault-status [request-id]"
+  exec "$jv" status "$@"
+}
+
+cmd_vault_revoke() {
+  local jv
+  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
+  [ $# -eq 1 ] || die_usage "vault-revoke: usage: jarate vault-revoke <request-id>"
+  exec "$jv" revoke "$1"
+}
+
+cmd_vault_audit() {
+  local jv
+  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
+  [ $# -le 1 ] || die_usage "vault-audit: usage: jarate vault-audit [n]"
+  exec "$jv" audit "$@"
+}
+
 # ─── dispatch ─────────────────────────────────────────────────────────────────
 
 main() {
@@ -1573,7 +1663,9 @@ main() {
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "rag", "projects", "projects-backfill",
                      "agents-check", "agents-bless",
-                     "pat-request", "pat-run", "pat-status"]}'
+                     "pat-request", "pat-run", "pat-status",
+                     "vault-request", "vault-run", "vault-status",
+                     "vault-revoke", "vault-audit"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
@@ -1587,6 +1679,11 @@ main() {
     pat-request) cmd_pat_request "$@" ;;
     pat-run) cmd_pat_run "$@" ;;
     pat-status) cmd_pat_status "$@" ;;
+    vault-request) cmd_vault_request "$@" ;;
+    vault-run) cmd_vault_run "$@" ;;
+    vault-status) cmd_vault_status "$@" ;;
+    vault-revoke) cmd_vault_revoke "$@" ;;
+    vault-audit) cmd_vault_audit "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
@@ -1594,7 +1691,9 @@ main() {
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "rag", "projects", "projects-backfill",
                      "agents-check", "agents-bless",
-                     "pat-request", "pat-run", "pat-status"]}'
+                     "pat-request", "pat-run", "pat-status",
+                     "vault-request", "vault-run", "vault-status",
+                     "vault-revoke", "vault-audit"]}'
       exit 2
       ;;
   esac

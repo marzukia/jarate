@@ -235,6 +235,11 @@ describe("entrypoint", () => {
       "pat-request",
       "pat-run",
       "pat-status",
+      "vault-request",
+      "vault-run",
+      "vault-status",
+      "vault-revoke",
+      "vault-audit",
     ]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
@@ -1515,12 +1520,22 @@ function scanSshpass(f: Fixture, fail = false): void {
     fail
       ? "#!/bin/sh\necho 'ssh: refused' >&2\nexit 255\n"
       : `#!/bin/sh
+# emulate the remote hop: find the LAST "bash -c '<driver>'" payload in the
+# remote command string (issue #121 moved the password to ssh stdin + a 0600
+# temp file, so the sudo'd bash -c is no longer the final element) and run
+# it as the peer would. The driver is single-quote-free by construction.
 last=""
 for a in "$@"; do last="$a"; done
 q="'"
-rest="\${last#*"bash -c "$q}"
-driver="\${rest%"$q"}"
-exec sh -c "$driver"
+pat="bash -c $q"
+case "$last" in
+  *"$pat"*)
+    rest="\${last##*"$pat"}"
+    driver="\${rest%%$q*}"
+    exec sh -c "$driver"
+    ;;
+esac
+exit 0
 `,
   );
   fs.chmodSync(sp, 0o755);
@@ -2027,6 +2042,190 @@ describe("projects-backfill", () => {
       expect(r.code).toBe(2);
       expect(doc(r).error).toContain(frag);
     }
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── issue #121: cross-user password off argv ───────────────────────────
+// The password used to sit in argv twice per hop: local `sshpass -p '<pw>'`
+// AND remote `echo '<pw>' | sudo -S` (both ps-visible, unquoted). Now:
+// sshpass -e (SSH_PASS in env), the password rides ssh stdin exactly once
+// (here-string, no argv), the remote shell drops it in a 0600 temp file and
+// feeds `sudo -S < file`. hopStubs records every hop stage so the tests
+// can assert where the secret does and does not appear.
+describe("cross-user hop #121: password off argv", () => {
+  const PASS = "SECRETPW-JR-121";
+  type HopRec = {
+    sshpassArgs: string[];
+    sshPassEnv: string | null;
+    sshArgs: string[];
+    sshStdin: string;
+    sudoPw: string | null;
+  };
+
+  // sshpass/ssh/sudo/systemctl stubs that record argv + env + stdin, then
+  // emulate the remote side by running the remote command locally under the
+  // fake sudo (which verifies the password it was fed from the 0600 file).
+  function hopStubs(f: Fixture): HopRec {
+    const rec = path.join(f.tmp, "hop-rec.txt");
+    fs.writeFileSync(
+      path.join(f.bin, "sshpass"),
+      `#!/bin/sh
+{
+  printf -- '--sshpass-argv--\\n'
+  for a in "$@"; do printf '%s\\n' "$a"; done
+  printf 'SSH_PASS=%s\\n' "\${SSH_PASS:-}"
+} >> "$HOP_REC"
+exec ssh "$@"
+`,
+    );
+    fs.writeFileSync(
+      path.join(f.bin, "ssh"),
+      `#!/bin/sh
+{
+  printf -- '--ssh-argv--\\n'
+  for a in "$@"; do printf '%s\\n' "$a"; done
+  cat > "$HOP_STDIN"
+} >> "$HOP_REC"
+last=""
+for a in "$@"; do last="$a"; done
+sh -c "$last" < "$HOP_STDIN"
+`,
+    );
+    fs.writeFileSync(
+      path.join(f.bin, "sudo"),
+      `#!/bin/sh
+read -r _p
+printf '%s\\n' "$_p" > "$HOP_SUDOPW"
+[ "$_p" = "$HOP_EXPECT_PASS" ] || { echo "sudo: wrong password" >&2; exit 1; }
+[ "$1" = "-S" ] && shift
+[ "$1" = "-u" ] && shift 2
+exec "$@"
+`,
+    );
+    fs.writeFileSync(
+      path.join(f.bin, "systemctl"),
+      `#!/bin/sh
+[ "$1" = "--user" ] && [ "$2" = "is-enabled" ] && exit 0
+exit 1
+`,
+    );
+    for (const n of ["sshpass", "ssh", "sudo", "systemctl"])
+      fs.chmodSync(path.join(f.bin, n), 0o755);
+    return {
+      sshpassArgs: [],
+      sshArgs: [],
+      sshStdin: "",
+      sudoPw: null,
+    };
+  }
+
+  const readRec = (f: Fixture, r: HopRec): HopRec => {
+    const recFile = path.join(f.tmp, "hop-rec.txt");
+    const raw = fs.readFileSync(recFile, "utf8");
+    // the file is: --sshpass-argv-- <argv lines> SSH_PASS=<pw>
+    //               --ssh-argv-- <argv lines>
+    // (ssh stdin goes to <recFile>.stdin; the fake sudo's password to
+    // sudo-pw.txt)
+    const [passPart, sshPart] = raw.split("--ssh-argv--");
+    const passLines = (passPart.split("--sshpass-argv--")[1] ?? "")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    r.sshPassEnv = passLines.find((l) => l.startsWith("SSH_PASS=")) ?? null;
+    r.sshpassArgs = passLines.filter((l) => !l.startsWith("SSH_PASS="));
+    r.sshArgs = (sshPart ?? "").trim().split("\n").filter(Boolean);
+    // the remote command is the LAST ssh arg
+    r.sshStdin = fs.readFileSync(`${recFile}.stdin`, "utf8").trim();
+    r.sudoPw = fs.existsSync(path.join(f.tmp, "sudo-pw.txt"))
+      ? fs.readFileSync(path.join(f.tmp, "sudo-pw.txt"), "utf8").trim()
+      : null;
+    return r;
+  };
+
+  const hopEnv = (f: Fixture): Record<string, string> => ({
+    HOP_REC: path.join(f.tmp, "hop-rec.txt"),
+    HOP_STDIN: `${path.join(f.tmp, "hop-rec.txt")}.stdin`,
+    HOP_SUDOPW: path.join(f.tmp, "sudo-pw.txt"),
+    HOP_EXPECT_PASS: PASS,
+    JARATE_SUDO_PASS: PASS,
+  });
+
+  test("journal-errors peer probe: password in env + ssh stdin only, sudo fed from file", async () => {
+    const f = fixture();
+    const r0 = hopStubs(f);
+    const r = await f.run(
+      [
+        "journal-errors",
+        "--agent",
+        "peer-home",
+        "--since",
+        "2026-10-01T00:00:00Z",
+      ],
+      hopEnv(f),
+    );
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    // journal-errors rows key on `name` (not `agent`)
+    const peer = d.agents.find((a: any) => a.name === "peer-home");
+    // the hop worked end-to-end: fake sudo accepted the file-fed password
+    // and the peer's pi.service "is enabled" (stub systemctl)
+    expect(peer.source).toBe("ssh+sudo");
+    expect(peer.count).toBe(2);
+    expect(peer.warnings).toContain("W1 first warn");
+    const rec = readRec(f, r0);
+    // local stage: sshpass -e, password in SSH_PASS env, NOT in argv
+    expect(rec.sshpassArgs).toContain("-e");
+    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
+    expect(rec.sshPassEnv).toBe(`SSH_PASS=${PASS}`);
+    // remote command string: no password, no `echo '<pw>'`; new shape
+    const remote = rec.sshArgs[rec.sshArgs.length - 1];
+    expect(remote).not.toContain(PASS);
+    expect(remote).not.toMatch(/echo\s+'[^']*'/);
+    expect(remote).toContain("read -r pw");
+    expect(remote).toContain('sudo -S < "$pwf"');
+    // the password crossed ssh stdin exactly once, and sudo received it
+    expect(rec.sshStdin).toBe(PASS);
+    expect(rec.sudoPw).toBe(PASS);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("projects peer scan: same hygiene, scanner driver still runs as peer", async () => {
+    const f = fixture();
+    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-ddd.json", {
+      run: "ddd",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: {
+        input: 100,
+        output: 10,
+        cacheRead: 5,
+        cacheWrite: 1,
+        total: 115,
+      },
+      cost_usd: 0.01,
+    });
+    const r0 = hopStubs(f);
+    const r = await f.run(["projects", "--agent", "peer-home"], hopEnv(f));
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    // the scan actually ran under the (fake) sudo'd driver: 1 seeded record
+    expect(peer.source).toBe("ssh+sudo");
+    expect(peer.scanned).toBe(1);
+    expect(peer.error).toBeNull();
+    const rec = readRec(f, r0);
+    expect(rec.sshpassArgs).toContain("-e");
+    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
+    const remote = rec.sshArgs[rec.sshArgs.length - 1];
+    expect(remote).not.toContain(PASS);
+    expect(remote).toContain("read -r pw");
+    expect(remote).toContain('sudo -S < "$pwf"');
+    expect(rec.sshStdin).toBe(PASS);
+    expect(rec.sudoPw).toBe(PASS);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });

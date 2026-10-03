@@ -17,6 +17,7 @@
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
 #        ~/bin/jarate-pat    -> <jarate>/bin/jarate-pat   (PAT vault client)
+#        ~/bin/jarate-vault  -> <jarate>/bin/jarate-vault (generic credential vault client)
 #        ~/projects/recall   -> <jarate>/packages/recall   (only if the dest
 #                               is absent or already this symlink)
 #   5. seeds ~/.config/agent-fleet/peers.json (agent-say peer-name
@@ -124,6 +125,7 @@ link_into "$HOME/bin/agent-say"      "$JARATE_DIR/bin/agent-say"
 link_into "$HOME/bin/jarate-diff"    "$JARATE_DIR/bin/jarate-diff"
 link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 link_into "$HOME/bin/jarate-pat"     "$JARATE_DIR/bin/jarate-pat"
+link_into "$HOME/bin/jarate-vault"   "$JARATE_DIR/bin/jarate-vault"
 
 # --- 3a. PATH verification (issue #71) -------------------------------------
 # Assert every linked tool resolves in the unit's PATH. A missing dispatch
@@ -132,7 +134,7 @@ link_into "$HOME/bin/jarate-pat"     "$JARATE_DIR/bin/jarate-pat"
 # dispatch a job.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-for tool in pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog agent-say jarate jarate-pat jarate-diff; do
+for tool in pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog agent-say jarate jarate-pat jarate-diff jarate-vault; do
   if ! env -i PATH="$UNIT_PATH" command -v "$tool" >/dev/null 2>&1; then
     echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2
     PATH_FAIL=1

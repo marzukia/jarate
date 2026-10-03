@@ -30,8 +30,11 @@ const DISCORD_API = "https://discord.com/api/v10";
 export const POLL_INTERVAL_MS = 5_000;
 /** Backfill poll interval (ms) when the gateway is connected. */
 export const POLL_BACKFILL_MS = 60_000;
-/** Gateway intents: GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | GUILD_MESSAGE_CONTENT = 37377. */
-const GATEWAY_INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
+/** Gateway intents: GUILDS | INTERACTIONS | GUILD_MESSAGES | DIRECT_MESSAGES |
+ *  GUILD_MESSAGE_CONTENT. INTERACTIONS (1<<1) was missing — no
+ *  INTERACTION_CREATE ever arrived, so slash commands + vault buttons
+ *  were dead in production (RCA 2026-10-01). */
+const GATEWAY_INTENTS = 1 | (1 << 1) | (1 << 9) | (1 << 12) | (1 << 15);
 
 // ─── Private state per channel ─────────────────────────────────────────────
 
@@ -749,6 +752,7 @@ export async function sendDiscordMessage(
   raw: string,
   opts?: {
     components?: Array<Record<string, unknown>>;
+    embeds?: Array<Record<string, unknown>>;
     replyToMessageId?: string;
   },
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
@@ -765,6 +769,7 @@ export async function sendDiscordMessage(
       allowed_mentions: allowedMentionsFor(text),
     };
     if (opts?.components) base.components = opts.components;
+    if (opts?.embeds) base.embeds = opts.embeds;
     const replyToMessageId = opts?.replyToMessageId;
     const withRef = replyToMessageId
       ? { ...base, message_reference: { message_id: replyToMessageId } }
@@ -804,6 +809,7 @@ export async function sendDiscordMessage(
           content: text,
           allowed_mentions: allowedMentionsFor(text),
           ...(opts?.components ? { components: opts.components } : {}),
+          ...(opts?.embeds ? { embeds: opts.embeds } : {}),
         }),
       });
       if (resp.ok) return { success: true };
@@ -822,7 +828,10 @@ export async function editDiscordMessage(
   config: ChannelConfig,
   messageId: string,
   raw: string,
-  opts?: { components?: Array<Record<string, unknown>> },
+  opts?: {
+    components?: Array<Record<string, unknown>>;
+    embeds?: Array<Record<string, unknown>>;
+  },
 ): Promise<{ success: boolean; error?: string }> {
   if (config.type !== "discord")
     return { success: false, error: "Not a Discord channel" };
@@ -836,6 +845,7 @@ export async function editDiscordMessage(
       body: {
         content: text,
         ...(opts?.components ? { components: opts.components } : {}),
+        ...(opts?.embeds ? { embeds: opts.embeds } : {}),
       },
     });
     return { success: true };
@@ -1304,7 +1314,7 @@ function connectPresence(st: PresenceState): void {
           sanitizeSensitiveText(String(e)),
         );
       }
-    } else if (msg.op === 0 && msg.t === "INTERACTIONS_CREATE") {
+    } else if (msg.op === 0 && msg.t === "INTERACTION_CREATE") {
       // Dispatch log (PAT vault §0): makes type-4 (button) delivery
       // greppable — the parked /status RCA never had this line.
       console.log(

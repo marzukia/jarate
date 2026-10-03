@@ -65,6 +65,12 @@ function fixture() {
   delete env.PI_BG_HB_INTERVAL; // cap window must stay at the 30s default
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
+  // issue #118 vars: a suite running inside a pi-bg ticket inherits the
+  // parent's PI_BG_TASK_FILE (its prompt file) + SNAP_DIR; left in, a
+  // spawned test wrapper under the snapshot branch would re-read the
+  // PARENT's task. Hermeticize like the other PI_BG_* leaks.
+  delete env.PI_BG_TASK_FILE;
+  delete env.SNAP_DIR;
   // launcher's cwd (issue #66) is the same leak class: when the suite runs
   // inside a pi-bg ticket, PI_BG_LANCHED_CWD points at the launcher's dir
   // and pi-bg cd's back to it. Left in, a "non-git cwd" launch-fail test
@@ -122,6 +128,30 @@ function fixture() {
     return { code, out, err };
   };
 
+  // issue #118 stdin-launch helper: writes `stdin` to the wrapper's stdin
+  // (and closes it unless keepOpen), for the `pi-bg worker -` form.
+  const runStdin = async (
+    args: string[],
+    stdin?: string,
+    keepOpen = false,
+  ): Promise<RunResult> => {
+    const p = spawn(["bash", PI_BG, ...args], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "pipe",
+    });
+    if (stdin !== undefined) p.stdin?.write(stdin);
+    if (!keepOpen) p.stdin?.end();
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { code, out, err };
+  };
+
   const records = () =>
     fs
       .readdirSync(env.PI_DISPATCH_RECORD_DIR)
@@ -132,7 +162,7 @@ function fixture() {
         ),
       );
 
-  return { tmp, home, mainAgent, env, run, seedMainCreds, records };
+  return { tmp, home, mainAgent, env, run, runStdin, seedMainCreds, records };
 }
 
 /**
@@ -1048,7 +1078,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("below cap: all stubs start and complete", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10); // hardening margin, not the flake fix
     const base = countFreshHb(fx);
     const max = base + 3;
     const stubs = [1, 2, 3].map((i) =>
@@ -1092,16 +1122,12 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       expect(r.err).toMatch(
         /\[!\] at cap \(\d+\/\d+\), try again later or pi-bg-kill a ticket/,
       );
-      // a + b recorded their dispatch; the refused c left no record
-      expect(
-        await waitFor(() => {
-          try {
-            return fx.records().length === 2;
-          } catch {
-            return false; // record dir not created yet
-          }
-        }),
-      ).toBe(true);
+      // The run record is written at dispatch, before the stub pi launches.
+      // Collect a + b (waits for their exit) so the assertion no longer
+      // depends on a 15s poll deadline, and so a + b's exit traps complete
+      // before bun teardown kills the children. The refused c left no record.
+      await collect(a);
+      await collect(b);
       expect(fx.records()).toHaveLength(2);
     } finally {
       killStubs([a, b, ...(c ? [c] : [])], fx.tmp);
@@ -1174,7 +1200,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   test("PI_BG_MAX_CONCURRENT=0: unlimited (4 in flight, above default 3)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
-    sleepStubPi(fx, 3);
+    sleepStubPi(fx, 10); // hardening margin, not the flake fix
     const base = countFreshHb(fx);
     const stubs = [1, 2, 3, 4].map((i) =>
       spawnStub(fx, `cap t4 stub ${i}`, { PI_BG_MAX_CONCURRENT: "0" }),
@@ -3244,4 +3270,186 @@ describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () 
       server.stop(true);
     }
   }, 30_000);
+});
+
+// ─── issue #118: the task rides stdin, never argv ───────────────────────
+// The task text used to sit in the wrapper's argv (and the pi child's) for
+// the whole run: `ps -eo args` leaked it. Now the launcher form is
+// `printf '%s' "$task" | pi-bg worker -` (the agent-say `-` stdin marker):
+// pi-bg cats stdin ONCE (before any child, before the snapshot re-exec),
+// writes the per-run prompt file (0600), and spawns pi with a stable
+// flag-only argv, task + constraints on pi's stdin.
+//
+// probePi swaps in a stub `pi` that records, from INSIDE the live run:
+// its own argv, its parent (wrapper) cmdline, a whole-process-table grep
+// for the task marker, and its full stdin.
+describe("#118: task on stdin, not argv", () => {
+  type ProbePaths = { log: string };
+  const probePi = (fx: ReturnType<typeof fixture>): ProbePaths => {
+    const log = path.join(fx.tmp, "pi118-probe.txt");
+    const piPath = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piPath,
+      `#!/bin/sh
+{
+  printf 'ARGV:'
+  for a in "$@"; do printf ' [%s]' "$a"; done
+  printf '\\nPPID-CMD:'
+  tr '\\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null
+  printf '\\nPS-HIT:'
+  ps -eo args 2>/dev/null | grep 'PROSE-11[8]' || printf '(none)'
+  printf '\\nPROMPT:'
+  pf=$(ls "\${HOME}"/.pi-bg-art/pi-bg-*-prompt.md 2>/dev/null | head -1)
+  if [ -n "$pf" ]; then
+    printf ' MODE=%s BODY=%s' "$(stat -c %a "$pf")" "$(cat "$pf")"
+  else
+    printf ' (absent)'
+  fi
+  printf '\\nSTDIN:'
+  cat
+  printf '\\n'
+} > "${log}"
+echo pi-run-ok
+`,
+    );
+    fs.chmodSync(piPath, 0o755);
+    return { log };
+  };
+
+  test("dash form: pi argv flag-only, wrapper argv clean, ps table clean", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const r = await fx.runStdin(
+      ["worker", "-"],
+      "SECRET PROSE-118 fix the thing",
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    const log = fs.readFileSync(paths.log, "utf8");
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
+    const ppidLine = log.split("\n").find((l) => l.startsWith("PPID-CMD:"))!;
+    expect(ppidLine).toContain("pi-bg worker -");
+    expect(ppidLine).not.toContain("PROSE-118");
+    expect(log).toContain("PS-HIT:(none)");
+    // the task DID reach pi — on stdin, with the standard constraints
+    const stdinSection = log.split("STDIN:")[1] ?? "";
+    expect(stdinSection).toContain("SECRET PROSE-118 fix the thing");
+    expect(stdinSection).toContain("STANDARD CONSTRAINTS");
+  });
+
+  test("prompt file: in-flight artifact, 0600, canonical shape; removed at run end", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const task = "PROMPT-FILE-TASK-777";
+    const r = await fx.runStdin(["worker", "-"], task);
+    expect(r.code).toBe(0);
+    // in-flight (recorded by the stub pi while the wrapper is live):
+    // exactly the canonical prompt shape, mode 600. The BODY spans the
+    // prompt file's lines, so read the section up to the next marker.
+    const log = fs.readFileSync(paths.log, "utf8");
+    const promptSection = log.split("PROMPT:")[1]?.split("\nSTDIN:")[0] ?? "";
+    expect(promptSection).toContain("MODE=600");
+    expect(promptSection).toContain(`BODY=# pi-bg worker task\n\n${task}`);
+    // run end: the EXIT trap unlinks the prompt file (task text need not
+    // outlive the run on disk; the run record + out.md remain)
+    const art = path.join(fx.home, ".pi-bg-art");
+    const left = fs
+      .readdirSync(art)
+      .filter((f) => f.startsWith("pi-bg-") && f.endsWith("-prompt.md"));
+    expect(left).toHaveLength(0);
+  });
+
+  test("legacy argv form unchanged: task still reaches pi on stdin", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const r = await fx.run(["worker", "LEGACY PROSE-42 in argv form"]);
+    expect(r.code).toBe(0);
+    const log = fs.readFileSync(paths.log, "utf8");
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
+    const stdinSection = log.split("STDIN:")[1] ?? "";
+    expect(stdinSection).toContain("LEGACY PROSE-42 in argv form");
+    expect(stdinSection).toContain("STANDARD CONSTRAINTS");
+  });
+
+  test("no marker + no task: usage error, and a held-open stdin pipe does not wedge", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const done = fx.runStdin(["worker"], undefined, true);
+    const r = await Promise.race([
+      done,
+      new Promise<null>((res) => setTimeout(() => res(null), 20_000)),
+    ]);
+    expect(r).not.toBeNull();
+    expect(r!.code).toBe(2);
+    expect(r!.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+  });
+
+  test("dash form with empty stdin: usage error (no constraints-only runs)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.runStdin(["worker", "-"], "");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+  });
+});
+
+/**
+ * usage error: missing task (issue #115, incident 2026-10-03 ticket
+ * 20261003-093837, found by jimmy). A bare `pi-bg`, `pi-bg worker` with
+ * no task, or an all-whitespace task used to spawn an agent with an EMPTY
+ * task: wasted run record + cgroup + ticket + cap slot (and on pre-#118
+ * main it crashed at pi_args[-1] on the empty array). The guard exits 2
+ * BEFORE the cap scan, run record, cgroup escape and snapshot re-exec, so
+ * a probe leaves zero side effects (same contract as the --worktree /
+ * --project usage errors: rc 2, one stderr line, no record).
+ */
+describe("usage error: missing task exits 2 with no side effects", () => {
+  test("bare pi-bg: rc 2, usage on stderr, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run([]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("pi-bg worker (no task): rc 2, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("whitespace-only task: rc 2, no record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "   "]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    const recDir = path.join(fx.tmp, "records");
+    expect(fs.existsSync(recDir) ? fx.records() : []).toHaveLength(0);
+  });
+
+  test("normal task still runs (guard does not over-fire)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "a real task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(fx.records()).toHaveLength(1);
+  });
 });
