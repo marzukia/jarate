@@ -6,9 +6,8 @@
 //     or unplanned (marker absent/stale — the last stop never ran
 //     session_shutdown: crash, OOM, SIGKILL, power loss)
 //   - inflight summary: every pi-bg run record with state=running
-//     (~/.pi-dispatch/runs/*.json): ticket id, profile, elapsed, cwd,
-//     and best-effort task text from the live wrapper argv (after a real
-//     restart the wrappers are usually dead, so the task line is absent)
+//     (~/.pi-dispatch/runs/*.json): ticket id, profile, elapsed. cwd/
+//     task detail lives in /jobs (frame stays short per STYLE.md)
 //
 // Guards (issue #111):
 //   - never blocks startup: the caller fires and forgets (void + catch);
@@ -181,8 +180,10 @@ export function buildWakeMessage({
       const who =
         r.profile && String(r.profile).length > 0 ? String(r.profile) : "?";
       const line = `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`;
+      // clip on code points (never split a surrogate pair)
+      const cps = Array.from(line);
       rows.push(
-        line.length > ROW_MAX ? `${line.slice(0, ROW_MAX - 1)}…` : line,
+        cps.length > ROW_MAX ? `${cps.slice(0, ROW_MAX - 1).join("")}…` : line,
       );
     }
     if (more > 0) rows.push(`+${more} more - see /jobs`);
@@ -370,13 +371,15 @@ export async function postWakeText(
  *  ~/.config/pi-dispatch/webhook (the SAME source pi-bg's launcher reads;
  *  missing file = null). This is the route the framed wake posts through.
  */
-export function defaultDispatchWebhook(): string | null {
+export function defaultDispatchWebhook(
+  home: string = os.homedir(),
+): string | null {
   const env = process.env.PI_DISPATCH_WEBHOOK?.trim();
   if (env) return env;
   try {
     const raw = fs
       .readFileSync(
-        path.join(os.homedir(), ".config", "pi-dispatch", "webhook"),
+        path.join(home, ".config", "pi-dispatch", "webhook"),
         "utf8",
       )
       .trim();
@@ -451,7 +454,9 @@ export async function runRestartWake(
     fetchImpl: deps.fetchImpl ?? deps.postOpts?.fetchImpl,
   });
   if (!ok)
-    log("[wake] post failed (3 attempts, 15s each) - no wake in channel");
+    log(
+      "[wake] post failed (up to 2 routes x 3 attempts, 15s each) - no wake in channel",
+    );
   return {
     posted: ok,
     reason: ok ? "posted" : "post-failed",
