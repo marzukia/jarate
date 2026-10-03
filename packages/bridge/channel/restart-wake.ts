@@ -442,7 +442,7 @@ export async function runRestartWake(
   // else the pi-bg dispatch bus (the [bg: route that wakes the agent).
   const target: WakeTarget = {
     ...deps.target,
-    webhookUrl: deps.target.webhookUrl || defaultDispatchWebhook(),
+    webhookUrl: deps.target.webhookUrl || defaultDispatchWebhook() || undefined,
   };
   // egressText = the single egress choke point (docs/secret-censor.md):
   // ticket/task text comes from run records and can carry secrets.
