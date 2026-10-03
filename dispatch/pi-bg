@@ -201,6 +201,19 @@ while [ $# -gt 0 ]; do
 done
 set -- "${args[@]+"${args[@]}"}"
 
+# --- usage error: missing task (2026-10-03, ticket 20261003-093837) -----
+# A bare probe `pi-bg` (or `pi-bg worker` with no task) used to fall through
+# with an EMPTY task: profile defaulted to worker, then pi_args=("$@") was
+# empty and pi_args[-1]+=... crashed (bash: bad array subscript on an empty
+# array) -> 3 empty completions, an EMPTY ticket in the channel, a burned
+# cap slot. Die here: BEFORE the cap check, run record, cgroup escape and
+# snapshot, so a probe leaves zero side effects (same contract as the
+# --project usage errors above: rc 2, one stderr line).
+if [ "$#" -eq 0 ] || [ -z "${*//[[:space:]]/}" ]; then
+  echo "pi-bg: missing task. usage: pi-bg {worker|reviewer} \"task\" [--worktree ref] [--project tag]" >&2
+  exit 2
+fi
+
 # --- concurrency cap (issue #41): refuse to start when this user already
 #     has $PI_BG_MAX_CONCURRENT live pi-bg worker/reviewer runs (0 =
 #     unlimited). Counted via the fleet-rule arg pattern (args contain

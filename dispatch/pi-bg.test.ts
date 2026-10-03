@@ -825,6 +825,57 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
 });
 
 /**
+ * usage error: missing task (2026-10-03, ticket 20261003-093837).
+ * A bare probe `pi-bg` (or `pi-bg worker` with no task) used to fall through
+ * with an EMPTY task: profile defaulted to worker, pi_args=("$@") was empty
+ * and pi_args[-1]+=... crashed (bash: bad array subscript) -> 3 empty
+ * completions, an EMPTY ticket in the channel, a burned cap slot. The guard
+ * exits 2 BEFORE the cap check, run record, cgroup escape and snapshot, so
+ * a probe leaves zero side effects (same contract as the --project usage
+ * errors: rc 2, one stderr line, no record).
+ */
+describe("usage error: missing task exits 2 with no side effects", () => {
+  test("bare pi-bg: rc 2, usage on stderr, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run([]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    expect(fx.records()).toHaveLength(0);
+  });
+
+  test("pi-bg worker (no task): rc 2, no record, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    expect(fx.records()).toHaveLength(0);
+  });
+
+  test("whitespace-only task: rc 2, no record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "   "]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+    expect(fx.records()).toHaveLength(0);
+  });
+
+  test("normal task still runs (guard does not over-fire)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "a real task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(fx.records()).toHaveLength(1);
+  });
+});
+
+/**
  * #86: launch-fail webhook. A --worktree launch-fail (not a git repo /
  * worktree add failed) exits 3 BEFORE the run record + bg_on_exit register,
  * so the early trap must post the DIED callback itself. The capture hook's
