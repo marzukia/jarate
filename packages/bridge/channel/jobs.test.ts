@@ -11,6 +11,7 @@ import {
   jobsTail,
   jobsView,
   parseJobsFromPs,
+  promptTask,
   scanJobHistory,
   stateLabel,
   ticketIdFromPid,
@@ -180,6 +181,99 @@ describe("parseJobsFromPs dedup (wrapper + hb subshell)", () => {
       { id: null, age: "51:33", profile: "worker", task: TASK },
       { id: null, age: "50:39", profile: "worker", task: TASK },
     ]);
+  });
+});
+
+// ─── parseJobsFromPs: issue #118 (task left the wrapper argv) ─────────
+// Since #118 the wrapper cmdline ends at the profile for stdin-launched
+// runs (`... pi-bg worker -`); the task text rides pi's stdin and lands
+// in the per-run prompt file. /jobs must keep displaying the task via
+// that file, keyed off the cgroup-resolved ticket id.
+
+describe("parseJobsFromPs #118 (task via prompt-file fallback)", () => {
+  const RUN = "20260916-043323-3148427";
+  let procRoot: string;
+  let tmpDir: string;
+  beforeEach(() => {
+    procRoot = fs.mkdtempSync(path.join(os.tmpdir(), "proc-118-"));
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "jobs118-"));
+    const d = path.join(procRoot, "3148427");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      path.join(d, "cgroup"),
+      `0::/user.slice/user-1003.slice/user@1003.service/pi-bg/${RUN}\n`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(procRoot, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+  const promptFile = (id: string, body: string): void => {
+    fs.writeFileSync(
+      path.join(tmpDir, `pi-bg-${id}-prompt.md`),
+      `# pi-bg worker task\n\n${body}\n`,
+    );
+  };
+
+  test("dash-marker line: task from the prompt file (first line, 70 cap)", () => {
+    promptFile(RUN, "FIX THE THING first line\nsecond line never shown\n");
+    const ps = [
+      `3148427 51:33 /bin/bash /home/monky/.pi-bg-art/snap-${RUN}/pi-bg worker -`,
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps, procRoot, [tmpDir])).toEqual([
+      {
+        id: RUN,
+        age: "51:33",
+        profile: "worker",
+        task: "FIX THE THING first line",
+      },
+    ]);
+  });
+
+  test("legacy argv-task line: task from argv, prompt file never consulted", () => {
+    // tmpDir has no prompt file at all: a legacy line must not need one
+    const ps = [
+      `3148427 51:33 /bin/bash /home/monky/.pi-bg-art/snap-${RUN}/pi-bg worker LEGACY PROSE IN ARGV`,
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps, procRoot, [tmpDir])).toEqual([
+      {
+        id: RUN,
+        age: "51:33",
+        profile: "worker",
+        task: "LEGACY PROSE IN ARGV",
+      },
+    ]);
+  });
+
+  test("dash line, prompt file missing -> task empty (no crash)", () => {
+    const ps = [
+      `3148427 51:33 /bin/bash /home/monky/scripts/pi-bg worker -`,
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps, procRoot, [tmpDir])).toEqual([
+      { id: RUN, age: "51:33", profile: "worker", task: "" },
+    ]);
+  });
+
+  test("dash line, unresolved id -> no file lookup possible, task empty", () => {
+    const ps = [
+      `999 01:00 /bin/bash /home/monky/scripts/pi-bg worker -`,
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps, procRoot, [tmpDir])).toEqual([
+      { id: null, age: "01:00", profile: "worker", task: "" },
+    ]);
+  });
+
+  test("promptTask: null when absent / empty body; first line truncated at 70", () => {
+    expect(promptTask("19700101-000000-1", [tmpDir])).toBeNull();
+    promptFile("19700101-000001-1", "");
+    expect(promptTask("19700101-000001-1", [tmpDir])).toBeNull();
+    const long = "x".repeat(120);
+    promptFile("19700101-000002-2", `${long}\nrest\n`);
+    expect(promptTask("19700101-000002-2", [tmpDir])).toBe("x".repeat(70));
   });
 });
 

@@ -24,14 +24,21 @@ done
 cfg="${HOME}/.pi/agent/settings.json"
 token="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["botToken"])')"
 channel="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["channel"])')"
-botid="$(curl -s https://discord.com/api/v10/users/@me -H "Authorization: Bot ${token}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+# issue #120: the bot token never sits in curl's argv (a bare `ps` leaked
+# it). It rides a curl config fed on STDIN (`curl -K -`): the printf is a
+# bash builtin (no child argv to leak), only the config bytes cross the
+# pipe. Every curl is bounded: --max-time 15.
+discord_get() { # $1 = url
+  printf 'header = "Authorization: Bot %s"\n' "$token" \
+    | curl -s -K - --max-time 15 "$1"
+}
+botid="$(discord_get https://discord.com/api/v10/users/@me | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
 wa="$(head -1 "${HOME}/.config/pi-dispatch/webhook_author" 2>/dev/null || true)"
 [ -n "$wa" ] || { echo "webhook_author missing" >&2; exit 2; }
 
 end=$(( $(date +%s) + timeout ))
 while [ "$(date +%s)" -lt "$end" ]; do
-  msgs="$(curl -s "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50" \
-    -H "Authorization: Bot ${token}")"
+  msgs="$(discord_get "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50")"
   event="$(MSGS="$msgs" python3 - "$wa" "$botid" <<'EOF'
 import json, os, sys
 wa, bot = sys.argv[1], sys.argv[2]

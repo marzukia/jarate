@@ -141,9 +141,12 @@ if [ -z "$token" ]; then
   exit 1
 fi
 
-resp=$(curl -sS -X POST "https://discord.com/api/v10/channels/$channel/messages" \
-  -H "Authorization: Bot $token" -H "Content-Type: application/json" \
-  -d "$(jq -n --arg c "$msg" '{content: $c}')") || {
+# issue #120: the bot token never sits in curl's argv — it rides a curl
+# config on stdin (`curl -K -`); --max-time 15 bounds the call.
+resp=$(printf 'header = "Authorization: Bot %s"\n' "$token" \
+  | curl -sS -K - --max-time 15 -X POST "https://discord.com/api/v10/channels/$channel/messages" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg c "$msg" '{content: $c}')") || {
   echo "agent-say: curl failed" >&2
   exit 1
 }

@@ -76,6 +76,9 @@ turn — no polling, no held turn.
 # 1. dispatch (background; posts a webhook callback on exit)
 cd /path/to/workdir
 nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
+# task via stdin (issue #118: keeps the task out of process argv for the
+# whole run - the argv form above still works but the task is ps-visible):
+# printf '%s' "$task" | nohup ~/scripts/pi-bg worker - > stdout.log 2>&1 &
 
 # 2. reply to the human: "dispatched, I'll report when it lands" — end turn
 ```

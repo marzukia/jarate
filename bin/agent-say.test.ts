@@ -27,6 +27,7 @@ interface Fixture {
   home: string;
   bin: string;
   capture: string;
+  stdinCapture: string;
   env: Record<string, string>;
   setPeers: (obj: Record<string, string> | null) => void;
   run: (
@@ -41,6 +42,7 @@ function fixture(): Fixture {
   const home = path.join(tmp, "home");
   const bin = path.join(tmp, "bin");
   const capture = path.join(tmp, "curl-args.txt");
+  const stdinCapture = path.join(tmp, "curl-stdin.txt");
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
 
@@ -62,11 +64,12 @@ function fixture(): Fixture {
     }),
   );
 
-  // stub curl: record every arg (one per line), answer with a message id
+  // stub curl: record every arg (one per line) + the full stdin (issue #120:
+  // the token now rides a curl config on stdin, not argv), answer with a msg id
   const curl = path.join(bin, "curl");
   fs.writeFileSync(
     curl,
-    `#!/bin/sh\n{ for a in "$@"; do printf '%s\\n' "$a"; done; } > "$CURL_CAPTURE"\necho '{"id":"99"}'\n`,
+    `#!/bin/sh\n{ for a in "$@"; do printf '%s\\n' "$a"; done; } > "$CURL_CAPTURE"\ncat > "$CURL_STDIN_CAPTURE"\necho '{"id":"99"}'\n`,
   );
   fs.chmodSync(curl, 0o755);
 
@@ -79,6 +82,7 @@ function fixture(): Fixture {
   env.HOME = home;
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.CURL_CAPTURE = capture;
+  env.CURL_STDIN_CAPTURE = stdinCapture;
   delete env.PI_BOT_TOKEN;
 
   const peersFile = path.join(home, ".config", "agent-fleet", "peers.json");
@@ -117,7 +121,7 @@ function fixture(): Fixture {
     return { code, out, err };
   };
 
-  return { tmp, home, bin, capture, env, setPeers, run };
+  return { tmp, home, bin, capture, stdinCapture, env, setPeers, run };
 }
 
 const curlUrl = (capture: string): string =>
@@ -138,9 +142,17 @@ describe("agent-say peer resolution (#45)", () => {
     expect(curlUrl(f.capture)).toBe(
       "https://discord.com/api/v10/channels/1111111111111111111/messages",
     );
-    // the bot token from the fake settings.json was used
-    expect(fs.readFileSync(f.capture, "utf8")).toContain(
-      "Authorization: Bot tok-111",
+    // issue #120: the bot token from the fake settings.json is used, but it
+    // rides curl's STDIN (a -K - config), NOT curl's argv (a bare `ps` used
+    // to leak it)
+    const argv = fs.readFileSync(f.capture, "utf8");
+    expect(argv).not.toContain("tok-111");
+    expect(argv).not.toContain("Authorization");
+    expect(argv).toContain("-K");
+    expect(argv).toContain("--max-time");
+    expect(argv).toContain("15");
+    expect(fs.readFileSync(f.stdinCapture, "utf8")).toContain(
+      'header = "Authorization: Bot tok-111"',
     );
   });
 

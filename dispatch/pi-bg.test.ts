@@ -64,6 +64,12 @@ function fixture() {
   delete env.PI_BG_TMPDIR; // default-path tests must not inherit an override
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
+  // issue #118 vars: a suite running inside a pi-bg ticket inherits the
+  // parent's PI_BG_TASK_FILE (its prompt file) + SNAP_DIR; left in, a
+  // spawned test wrapper under the snapshot branch would re-read the
+  // PARENT's task. Hermeticize like the other PI_BG_* leaks.
+  delete env.PI_BG_TASK_FILE;
+  delete env.SNAP_DIR;
   // launcher's cwd (issue #66) is the same leak class: when the suite runs
   // inside a pi-bg ticket, PI_BG_LANCHED_CWD points at the launcher's dir
   // and pi-bg cd's back to it. Left in, a "non-git cwd" launch-fail test
@@ -121,6 +127,30 @@ function fixture() {
     return { code, out, err };
   };
 
+  // issue #118 stdin-launch helper: writes `stdin` to the wrapper's stdin
+  // (and closes it unless keepOpen), for the `pi-bg worker -` form.
+  const runStdin = async (
+    args: string[],
+    stdin?: string,
+    keepOpen = false,
+  ): Promise<RunResult> => {
+    const p = spawn(["bash", PI_BG, ...args], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "pipe",
+    });
+    if (stdin !== undefined) p.stdin?.write(stdin);
+    if (!keepOpen) p.stdin?.end();
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { code, out, err };
+  };
+
   const records = () =>
     fs
       .readdirSync(env.PI_DISPATCH_RECORD_DIR)
@@ -131,7 +161,7 @@ function fixture() {
         ),
       );
 
-  return { tmp, home, mainAgent, env, run, seedMainCreds, records };
+  return { tmp, home, mainAgent, env, run, runStdin, seedMainCreds, records };
 }
 
 describe("#29: missing role profile is seeded, then fail loud if no provider", () => {
@@ -3311,4 +3341,133 @@ describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () 
       server.stop(true);
     }
   }, 30_000);
+});
+
+// ─── issue #118: the task rides stdin, never argv ───────────────────────
+// The task text used to sit in the wrapper's argv (and the pi child's) for
+// the whole run: `ps -eo args` leaked it. Now the launcher form is
+// `printf '%s' "$task" | pi-bg worker -` (the agent-say `-` stdin marker):
+// pi-bg cats stdin ONCE (before any child, before the snapshot re-exec),
+// writes the per-run prompt file (0600), and spawns pi with a stable
+// flag-only argv, task + constraints on pi's stdin.
+//
+// probePi swaps in a stub `pi` that records, from INSIDE the live run:
+// its own argv, its parent (wrapper) cmdline, a whole-process-table grep
+// for the task marker, and its full stdin.
+describe("#118: task on stdin, not argv", () => {
+  type ProbePaths = { log: string };
+  const probePi = (fx: ReturnType<typeof fixture>): ProbePaths => {
+    const log = path.join(fx.tmp, "pi118-probe.txt");
+    const piPath = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piPath,
+      `#!/bin/sh
+{
+  printf 'ARGV:'
+  for a in "$@"; do printf ' [%s]' "$a"; done
+  printf '\\nPPID-CMD:'
+  tr '\\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null
+  printf '\\nPS-HIT:'
+  ps -eo args 2>/dev/null | grep 'PROSE-11[8]' || printf '(none)'
+  printf '\\nPROMPT:'
+  pf=$(ls "\${HOME}"/.pi-bg-art/pi-bg-*-prompt.md 2>/dev/null | head -1)
+  if [ -n "$pf" ]; then
+    printf ' MODE=%s BODY=%s' "$(stat -c %a "$pf")" "$(cat "$pf")"
+  else
+    printf ' (absent)'
+  fi
+  printf '\\nSTDIN:'
+  cat
+  printf '\\n'
+} > "${log}"
+echo pi-run-ok
+`,
+    );
+    fs.chmodSync(piPath, 0o755);
+    return { log };
+  };
+
+  test("dash form: pi argv flag-only, wrapper argv clean, ps table clean", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const r = await fx.runStdin(
+      ["worker", "-"],
+      "SECRET PROSE-118 fix the thing",
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    const log = fs.readFileSync(paths.log, "utf8");
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
+    const ppidLine = log.split("\n").find((l) => l.startsWith("PPID-CMD:"))!;
+    expect(ppidLine).toContain("pi-bg worker -");
+    expect(ppidLine).not.toContain("PROSE-118");
+    expect(log).toContain("PS-HIT:(none)");
+    // the task DID reach pi — on stdin, with the standard constraints
+    const stdinSection = log.split("STDIN:")[1] ?? "";
+    expect(stdinSection).toContain("SECRET PROSE-118 fix the thing");
+    expect(stdinSection).toContain("STANDARD CONSTRAINTS");
+  });
+
+  test("prompt file: in-flight artifact, 0600, canonical shape; removed at run end", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const task = "PROMPT-FILE-TASK-777";
+    const r = await fx.runStdin(["worker", "-"], task);
+    expect(r.code).toBe(0);
+    // in-flight (recorded by the stub pi while the wrapper is live):
+    // exactly the canonical prompt shape, mode 600. The BODY spans the
+    // prompt file's lines, so read the section up to the next marker.
+    const log = fs.readFileSync(paths.log, "utf8");
+    const promptSection = log.split("PROMPT:")[1]?.split("\nSTDIN:")[0] ?? "";
+    expect(promptSection).toContain("MODE=600");
+    expect(promptSection).toContain(`BODY=# pi-bg worker task\n\n${task}`);
+    // run end: the EXIT trap unlinks the prompt file (task text need not
+    // outlive the run on disk; the run record + out.md remain)
+    const art = path.join(fx.home, ".pi-bg-art");
+    const left = fs
+      .readdirSync(art)
+      .filter((f) => f.startsWith("pi-bg-") && f.endsWith("-prompt.md"));
+    expect(left).toHaveLength(0);
+  });
+
+  test("legacy argv form unchanged: task still reaches pi on stdin", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const r = await fx.run(["worker", "LEGACY PROSE-42 in argv form"]);
+    expect(r.code).toBe(0);
+    const log = fs.readFileSync(paths.log, "utf8");
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
+    const stdinSection = log.split("STDIN:")[1] ?? "";
+    expect(stdinSection).toContain("LEGACY PROSE-42 in argv form");
+    expect(stdinSection).toContain("STANDARD CONSTRAINTS");
+  });
+
+  test("no marker + no task: a held-open stdin pipe does not wedge the run", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const done = fx.runStdin(["worker"], undefined, true);
+    const r = await Promise.race([
+      done,
+      new Promise<null>((res) => setTimeout(() => res(null), 20_000)),
+    ]);
+    expect(r).not.toBeNull();
+    expect(r!.code).toBe(0);
+    expect(r!.out).toContain("pi-run-ok");
+  });
+
+  test("dash form with empty stdin: constraints-only spawn, run completes", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const paths = probePi(fx);
+    const r = await fx.runStdin(["worker", "-"], "");
+    expect(r.code).toBe(0);
+    const log = fs.readFileSync(paths.log, "utf8");
+    const stdinSection = (log.split("STDIN:")[1] ?? "").trim();
+    expect(stdinSection.startsWith("STANDARD CONSTRAINTS")).toBe(true);
+  });
 });
