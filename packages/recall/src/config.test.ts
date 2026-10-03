@@ -1,7 +1,59 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { loadDotEnv, parseDsn } from "./config";
+import { tmpdir, userInfo } from "node:os";
+import { defaultDsn, envConfig, loadDotEnv, parseDsn } from "./config";
+
+describe("defaultDsn ($USER default)", () => {
+  const saved = {
+    USER: process.env.USER,
+    LOGNAME: process.env.LOGNAME,
+  };
+  const restoreUser = () => {
+    if (saved.USER === undefined) delete process.env.USER;
+    else process.env.USER = saved.USER;
+    if (saved.LOGNAME === undefined) delete process.env.LOGNAME;
+    else process.env.LOGNAME = saved.LOGNAME;
+  };
+
+  test("uses $USER for the default DSN user", () => {
+    process.env.USER = "frank";
+    delete process.env.LOGNAME;
+    expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=frank");
+    restoreUser();
+  });
+
+  test("falls back to LOGNAME, then the OS user", () => {
+    delete process.env.USER;
+    process.env.LOGNAME = "monky";
+    expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=monky");
+    delete process.env.LOGNAME;
+    expect(defaultDsn()).toBe(
+      `host=127.0.0.1 dbname=rag user=${userInfo().username}`,
+    );
+    restoreUser();
+  });
+
+  test("envConfig: default DSN user = $USER; RAG_DSN still wins, unset fields fall back", () => {
+    process.env.USER = "frank";
+    const savedDsn = process.env.RAG_DSN;
+    delete process.env.RAG_DSN;
+    try {
+      expect(envConfig().dsn).toEqual({
+        host: "127.0.0.1",
+        database: "rag",
+        username: "frank",
+      });
+      process.env.RAG_DSN = "dbname=rag user=other";
+      // RAG_DSN still wins; fields it leaves unset stay undefined and
+      // fall back to PG* env vars / driver defaults, as before.
+      expect(envConfig().dsn).toEqual({ database: "rag", username: "other" });
+      expect(envConfig().dsn.host).toBeUndefined();
+    } finally {
+      if (savedDsn === undefined) delete process.env.RAG_DSN;
+      else process.env.RAG_DSN = savedDsn;
+    }
+  });
+});
 
 describe("parseDsn", () => {
   test("key=value form (psycopg style)", () => {
