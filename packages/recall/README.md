@@ -29,7 +29,7 @@ RAG_PROJECT=memory bun recall query "optional project filter"
 
 | var | default |
 |---|---|
-| `RAG_DSN` | `host=127.0.0.1 dbname=rag user=monky` (key=value or postgres:// URL) |
+| `RAG_DSN` | `host=127.0.0.1 dbname=rag user=$USER` (calling OS user; key=value or postgres:// URL) |
 | `RAG_EMBED_URL` | `http://localhost:11434/v1/embeddings` |
 | `RAG_EMBED_MODEL` | `nomic-embed-text` |
 | `RAG_PROJECT` | *(unset = search all projects)* |
