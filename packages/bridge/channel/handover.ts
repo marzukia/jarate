@@ -722,9 +722,14 @@ export function splitDoc(doc: string): DocParts {
   const chunks = body.split(/^(?=## )/m);
   const sections: DocSection[] = chunks.slice(1).map((c) => {
     const nl = c.indexOf("\n");
-    return nl === -1
-      ? { title: c.trim(), body: "" }
-      : { title: c.slice(0, nl).trim(), body: c.slice(nl + 1).trim() };
+    const line = nl === -1 ? c : c.slice(0, nl);
+    // The split keeps the "## " prefix in the chunk; strip it so
+    // assembleDoc's `## ${title}` round-trips to a SINGLE "## " (issue
+    // #134: every guarded doc rendered "## ## X" headers).
+    return {
+      title: line.replace(/^## /, "").trim(),
+      body: nl === -1 ? "" : c.slice(nl + 1).trim(),
+    };
   });
   return { header: (chunks[0] ?? "").trimEnd(), sections, tags };
 }
@@ -866,40 +871,6 @@ export function loadPreviousHandover(
   } catch {
     return null;
   }
-}
-
-/** 3-line digest of a doc for the boot-seed message (PR2 mechanism B,
- *  F4/F8): mission + in-flight + last ask. The "last ask" is the NEWEST
- *  (highest-numbered) entry - the section renders oldest->newest, and the
- *  pending question the agent must answer is the last one, not the first
- *  (MINOR-1). */
-export function parseKickoff(doc: string): string {
-  const { sections } = splitDoc(doc);
-  const firstLine = (match: (title: string) => boolean): string => {
-    const s = sections.find((x) => match(x.title));
-    if (!s) return NONE;
-    for (const line of s.body.split("\n")) {
-      const t = line.trim();
-      if (t && t !== NONE) return t.length > 160 ? `${t.slice(0, 157)}...` : t;
-    }
-    return NONE;
-  };
-  const lastAsk = (): string => {
-    const s = sections.find((x) => x.title.includes("user asks"));
-    if (!s) return NONE;
-    const numbered: string[] = [];
-    for (const line of s.body.split("\n")) {
-      const t = line.trim();
-      if (/^\d+\./.test(t))
-        numbered.push(t.length > 160 ? `${t.slice(0, 157)}...` : t);
-    }
-    return numbered.length ? numbered[numbered.length - 1] : NONE;
-  };
-  return (
-    `Mission: ${firstLine((t) => t.includes("Mission"))}\n` +
-    `In-flight: ${firstLine((t) => t.includes("In-flight"))}\n` +
-    `Last ask: ${lastAsk()}`
-  );
 }
 
 // ─── buildHandover (the orchestrator) ──────────────────────────────────────
@@ -1120,20 +1091,139 @@ export function isHandoffFreshWindow(
 }
 
 /**
- * The boot-seed message (F4/F8): a 3-line digest of the doc + a forced
- * read of latest.md + the pending-question instruction. Pure — the wiring
- * sends it via pi.sendUserMessage. The path is the EXPANDED absolute
- * storeDir so the agent's read tool takes it as-is.
+ * The boot-seed message (F4/F8): a 4-line digest (mission, in-flight,
+ * last ask, orchestrator priming) + a forced read of latest.md + the
+ * pending-question instruction. The wiring sends it via pi.sendUserMessage.
+ * The path is the EXPANDED absolute storeDir so the agent's read tool
+ * takes it as-is. Pass `live` for fresh dispatch/board state at restart
+ * time (see KickoffLiveState); without it the digest falls back to
+ * doc-scraping (pre-deterministic docs only).
  */
 export function buildSeedKickoff(
   doc: string,
   storeDir: string,
   home: string = defaultHome(),
+  live?: KickoffLiveState,
 ): string {
   const latest = path.join(expandHome(storeDir, home), "latest.md");
   return [
     "Context handed off: the previous session was compacted and the process restarted with a fresh, small context.",
-    parseKickoff(doc),
+    parseKickoff(doc, live),
     `Read ${latest} before continuing. Answer the last pending user question if any.`,
   ].join("\n");
+}
+
+// ─── Live seed state (issue #134: post-compact worker amnesia) ─────────────
+
+/**
+ * Live state the boot seed uses INSTEAD of doc-scraping for Mission /
+ * In-flight. The deterministic doc (renderDeterministic) has no Mission /
+ * In-flight prose sections — the LLM pass was retired — so scraping them
+ * always yielded (none) and the fresh session was told nothing was in
+ * flight, with an instruction pushing it straight to inline work.
+ * The seed therefore reads the SAME sources the doc's State box renders
+ * (jobsView text + the open todo board), fresh at restart time.
+ */
+export interface KickoffLiveState {
+  /** jobsView("text"); null/"" when unknown. */
+  dispatchText?: string | null;
+  /** renderBoardPlain of the board; null/"" when empty/unknown. */
+  todoBoard?: string | null;
+}
+
+/** Orchestrator priming: the fresh session must re-learn its role
+ *  (issue #134). Pinned by test. */
+export const ORCHESTRATOR_PRIME_LINE =
+  "ORCHESTRATOR: you have pi-bg workers (~/scripts/pi-bg). Resume in-flight dispatch and hand off context-hungry work - do not do it inline.";
+
+/** Live sources for the boot seed: the SAME calls buildHandover uses for
+ *  the doc's State box (safeJobsView / defaultTodoText). */
+export function liveKickoffState(cwd: string): KickoffLiveState {
+  return {
+    dispatchText: safeJobsView() || null,
+    todoBoard: defaultTodoText(cwd) || null,
+  };
+}
+
+/** One-line summary of a rendered plain todo board: the open count from
+ *  the header + the first 3 items (+N more). The board IS the mission.
+ *  Plain gutters: ┌ header, ├/┣/┤ items, └ close. */
+function boardSummaryLine(board: string): string {
+  const items: string[] = [];
+  let open = -1;
+  for (const raw of board.split("\n")) {
+    const t = raw.trim();
+    const h = t.match(/^┌ todos · (\d+) open$/);
+    if (h) {
+      open = Number(h[1]);
+      continue;
+    }
+    if (!t || t === "└") continue;
+    const m = t.match(/^[├┣┤] (.+)$/);
+    if (m) items.push(m[1]);
+  }
+  const shown = items.slice(0, 3);
+  const extra = items.length - shown.length;
+  const head = open >= 0 ? `${open} open` : `${items.length} todos`;
+  let line = shown.length ? `${head}: ${shown.join("; ")}` : head;
+  if (extra > 0) line += ` (+${extra} more)`;
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+/** In-flight line from a live jobsView("text") frame: the `┣ ` header
+ *  rows (id + profile + age), gutter stripped, "; "-joined. null = no
+ *  live data (caller falls back to doc-scraping); NONE = truly zero. */
+function liveInFlightLine(dispatchText?: string | null): string | null {
+  const t = (dispatchText ?? "").trim();
+  if (!t) return null;
+  const rows: string[] = [];
+  for (const raw of t.split("\n")) {
+    const l = raw.trim();
+    if (l.startsWith("┣ ")) rows.push(l.slice(2).trim());
+  }
+  return rows.length ? rows.join("; ") : NONE;
+}
+
+/**
+ * The boot-seed digest: 4 lines — Mission, In-flight, Last ask,
+ * ORCHESTRATOR. Mission/In-flight come from LIVE state when available
+ * (fresh data beats doc-scraping, issue #134); doc-scraping remains the
+ * fallback for pre-deterministic docs that still carry the LLM-era
+ * '1 · Mission' / '2 · In-flight (NOW)' sections. "last ask" is the
+ * NEWEST (highest-numbered) entry - the pending question the agent must
+ * answer is the last one, not the first (MINOR-1).
+ */
+export function parseKickoff(doc: string, live?: KickoffLiveState): string {
+  const { sections } = splitDoc(doc);
+  const firstLine = (match: (title: string) => boolean): string => {
+    const s = sections.find((x) => match(x.title));
+    if (!s) return NONE;
+    for (const line of s.body.split("\n")) {
+      const t = line.trim();
+      if (t && t !== NONE) return t.length > 160 ? `${t.slice(0, 157)}...` : t;
+    }
+    return NONE;
+  };
+  const lastAsk = (): string => {
+    const s = sections.find((x) => x.title.includes("user asks"));
+    if (!s) return NONE;
+    const numbered: string[] = [];
+    for (const line of s.body.split("\n")) {
+      const t = line.trim();
+      if (/^\d+\./.test(t))
+        numbered.push(t.length > 160 ? `${t.slice(0, 157)}...` : t);
+    }
+    return numbered.length ? numbered[numbered.length - 1] : NONE;
+  };
+  const board = (live?.todoBoard ?? "").trim();
+  const mission = board
+    ? boardSummaryLine(board)
+    : firstLine((t) => t.includes("Mission"));
+  const inFlight = liveInFlightLine(live?.dispatchText);
+  return (
+    `Mission: ${mission}\n` +
+    `In-flight: ${inFlight ?? firstLine((t) => t.includes("In-flight"))}\n` +
+    `Last ask: ${lastAsk()}\n` +
+    ORCHESTRATOR_PRIME_LINE
+  );
 }

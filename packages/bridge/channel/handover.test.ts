@@ -8,6 +8,7 @@ import {
   setChannelCursor,
 } from "./discord";
 import {
+  assembleDoc,
   buildHandover,
   buildHeader,
   buildLlmPrompt,
@@ -27,14 +28,17 @@ import {
   isHandoffFreshWindow,
   lastHandoffAt,
   loadPreviousHandover,
+  ORCHESTRATOR_PRIME_LINE,
   parseKickoff,
   parseLlmProse,
   parsePriorTags,
+  renderDeterministic,
   renderTemplate,
   resolveHandoffSettings,
   serializeTranscript,
   shouldHandoff,
   sizeGuard,
+  splitDoc,
   writeHandover,
 } from "./handover";
 import extension, {
@@ -650,6 +654,54 @@ describe("sizeGuard", () => {
   });
 });
 
+// ─── splitDoc / assembleDoc header round-trip (issue #134 double-##) ────────
+
+describe("splitDoc / assembleDoc headers (issue #134)", () => {
+  const doc = [
+    "# Handover - 2026-10-03 · session s · 246k tokens → handoff",
+    "",
+    "## Transcript (about to be compacted)",
+    "[user] x",
+    "",
+    "## State",
+    "- dispatch:",
+    "┌ jobs · none in flight",
+    "└",
+    "",
+    "## Last user asks",
+    "1. ask",
+    "",
+    "<read-files>\n</read-files>\n<modified-files>\n</modified-files>",
+  ].join("\n");
+  test("titles carry no '## ' prefix; round-trip keeps a single '## '", () => {
+    const parts = splitDoc(doc);
+    expect(parts.sections.map((s) => s.title)).toEqual([
+      "Transcript (about to be compacted)",
+      "State",
+      "Last user asks",
+    ]);
+    const out = assembleDoc(parts);
+    expect(out).not.toContain("## ##");
+    expect(out).toContain("## Transcript (about to be compacted)");
+    // stable: a second round-trip changes nothing
+    expect(assembleDoc(splitDoc(out))).toBe(out);
+  });
+  test("sizeGuard reassembly over budget → single-## headers, no '## ## '", () => {
+    const big = Array.from(
+      { length: 500 },
+      (_, i) => `line ${i} to burn space in the state box`,
+    ).join("\n");
+    const d = doc.replace(
+      "┌ jobs · none in flight",
+      `┌ jobs · none in flight\n${big}`,
+    );
+    expect(estTokens(d)).toBeGreaterThan(4_000);
+    const out = sizeGuard(d, 4_000);
+    expect(out).not.toContain("## ##");
+    expect(out).toContain("## State");
+  });
+});
+
 // ─── store: writeHandover / loadPreviousHandover ────────────────────────────
 
 describe("writeHandover + loadPreviousHandover", () => {
@@ -714,20 +766,135 @@ describe("parseKickoff", () => {
     "1. do the thing",
     "2. and this",
   ].join("\n");
-  test("3 lines: mission, in-flight, last ask (NEWEST)", () => {
+  test("4 lines: mission, in-flight, last ask (NEWEST) + orchestrator priming", () => {
     const k = parseKickoff(doc);
     const lines = k.split("\n");
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(4);
     expect(lines[0]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[1]).toBe("In-flight: Wiring the compact handler.");
     // MINOR-1: the pending ask is the newest (line 2), not the oldest.
     expect(lines[2]).toBe("Last ask: 2. and this");
+    // issue #134: the fresh session re-learns its orchestrator role.
+    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
   });
   test("missing sections → (none) lines", () => {
     const k = parseKickoff("# bare doc\nno sections");
     const lines = k.split("\n");
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(4);
     expect(lines[0]).toContain("(none)");
+    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+});
+
+// ─── issue #134: post-compact worker amnesia (live seed state) ───────────────
+
+describe("parseKickoff live state (issue #134)", () => {
+  // The deterministic doc shape: NO Mission / In-flight sections — the LLM
+  // prose was retired, so doc-scraping both always yielded (none).
+  const detDoc = [
+    "# Handover - 2026-10-03 · session s · 246k tokens → handoff",
+    "",
+    "## Transcript (about to be compacted)",
+    "[user] work the thing",
+    "",
+    "## State",
+    "- context: 246k / 262k tokens (94%)",
+    "- dispatch:",
+    "┌ jobs · 1 in flight",
+    "┣ 20261003-081922-478435 worker · 01:07:43",
+    "│ task line",
+    "└",
+    "- todos:",
+    "┌ todos · 2 open",
+    "├ ship the bridge",
+    "┣ wire the compact",
+    "└",
+    "",
+    "## Last user asks",
+    "1. first ask",
+    "2. Don't matter neon is down",
+  ].join("\n");
+  const jobsFrame = [
+    "┌ jobs · 1 in flight",
+    "┣ 20261003-081922-478435 worker · 01:07:43",
+    "│ task line",
+    "└",
+    "",
+    "┌ recent (newest first) · 1",
+    "├ ok · 2h · 20261003-010101-111111",
+    "└",
+  ].join("\n");
+  const board = [
+    "┌ todos · 2 open",
+    "├ ship the bridge",
+    "┣ wire the compact",
+    "└",
+  ].join("\n");
+
+  test("live dispatch frame → In-flight carries the ticket id", () => {
+    const k = parseKickoff(detDoc, {
+      dispatchText: jobsFrame,
+      todoBoard: board,
+    });
+    const lines = k.split("\n");
+    expect(lines[1]).toBe(
+      "In-flight: 20261003-081922-478435 worker · 01:07:43",
+    );
+    // last ask is preserved from the doc as before
+    expect(lines[2]).toBe("Last ask: 2. Don't matter neon is down");
+  });
+  test("live board → Mission is the open-board summary", () => {
+    const k = parseKickoff(detDoc, {
+      dispatchText: jobsFrame,
+      todoBoard: board,
+    });
+    expect(k.split("\n")[0]).toBe(
+      "Mission: 2 open: ship the bridge; wire the compact",
+    );
+  });
+  test("empty board + zero jobs → both (none)", () => {
+    const k = parseKickoff(detDoc, {
+      dispatchText: "┌ jobs · none in flight\n└",
+      todoBoard: "",
+    });
+    const lines = k.split("\n");
+    expect(lines[0]).toBe("Mission: (none)");
+    expect(lines[1]).toBe("In-flight: (none)");
+  });
+  test("deterministic doc without live state → (none) (the amnesia pin)", () => {
+    const k = parseKickoff(detDoc);
+    const lines = k.split("\n");
+    expect(lines[0]).toBe("Mission: (none)");
+    expect(lines[1]).toBe("In-flight: (none)");
+    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+  test("multiple in-flight jobs → '; '-joined on one line", () => {
+    const multi = [
+      "┌ jobs · 2 in flight",
+      "┣ 20261003-081922-478435 worker · 01:07:43",
+      "┣ 20261003-090000-123456 reviewer · 00:12:00",
+      "└",
+    ].join("\n");
+    const k = parseKickoff(detDoc, { dispatchText: multi, todoBoard: "" });
+    expect(k.split("\n")[1]).toBe(
+      "In-flight: 20261003-081922-478435 worker · 01:07:43; 20261003-090000-123456 reviewer · 00:12:00",
+    );
+  });
+  test("renderDeterministic doc + live state → seed carries the ticket id", () => {
+    const state = extractDeterministic(basePrep(), [], {
+      ...emptyCtx,
+      dispatchText: jobsFrame,
+      todoText: board,
+    });
+    const doc = renderDeterministic(
+      state,
+      serializeTranscript(basePrep()),
+      buildHeader(NOW, "s", 246_000),
+    );
+    const k = parseKickoff(doc, { dispatchText: jobsFrame, todoBoard: board });
+    expect(k).toContain("In-flight: 20261003-081922-478435 worker · 01:07:43");
+    expect(k).toContain("Mission: 2 open: ship the bridge; wire the compact");
+    expect(k).toContain(ORCHESTRATOR_PRIME_LINE);
   });
 });
 
@@ -788,13 +955,37 @@ describe("buildSeedKickoff (F4/F8)", () => {
     const home = "/home/monky";
     const k = buildSeedKickoff(doc, "~/.jarate/handovers", home);
     const lines = k.split("\n");
-    // preamble + 3-line digest + the read instruction
+    // preamble + 4-line digest + the read instruction
     expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
     expect(lines[3]).toBe("Last ask: 1. do the thing");
-    expect(lines[4]).toBe(
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[5]).toBe(
       `Read ${path.join(home, ".jarate", "handovers", "latest.md")} before continuing. Answer the last pending user question if any.`,
     );
+  });
+  test("live state → seed carries ticket id + orchestrator line (issue #134)", () => {
+    const detDoc = [
+      "# Handover - 2026-10-03 · session s · 246k tokens → handoff",
+      "",
+      "## State",
+      "- dispatch:",
+      "┌ jobs · 1 in flight",
+      "┣ 20261003-081922-478435 worker · 01:07:43",
+      "└",
+      "",
+      "## Last user asks",
+      "1. ask",
+    ].join("\n");
+    const k = buildSeedKickoff(detDoc, "/abs/handovers", "/home/monky", {
+      dispatchText:
+        "┌ jobs · 1 in flight\n┣ 20261003-081922-478435 worker · 01:07:43\n└",
+      todoBoard: "┌ todos · 1 open\n├ ship it\n└",
+    });
+    expect(k).toContain("In-flight: 20261003-081922-478435 worker · 01:07:43");
+    expect(k).toContain("Mission: 1 open: ship it");
+    expect(k).toContain(ORCHESTRATOR_PRIME_LINE);
+    expect(k).toContain("Last ask: 1. ask");
   });
   test("absolute storeDir is not re-expanded", () => {
     const k = buildSeedKickoff(doc, "/abs/handovers", "/home/monky");

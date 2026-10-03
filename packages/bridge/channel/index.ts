@@ -71,6 +71,8 @@ import {
   buildSeedKickoff,
   type HandoverComplete,
   isHandoffFreshWindow,
+  type KickoffLiveState,
+  liveKickoffState,
   loadPreviousHandover,
   parsePriorTags,
   resolveHandoffSettings,
@@ -109,6 +111,7 @@ import {
   scheduleTask,
 } from "./tasks";
 import {
+  defaultHome,
   extractTodoLines,
   fit,
   isBgCallbackBody,
@@ -3536,7 +3539,15 @@ function seedFromHandoffDoc(pi: ExtensionAPI, ctx: ExtensionContext): void {
     console.log("[handoff] no handover doc at boot - seed skipped");
     return;
   }
-  pi.sendUserMessage(buildSeedKickoff(doc, settings.storeDir));
+  // Live dispatch + board state (issue #134): the deterministic doc has no
+  // Mission/In-flight sections, so the seed reads the SAME sources the doc's
+  // State box renders - fresh at restart, not scraped from the doc.
+  const live = liveKickoffStateHook
+    ? liveKickoffStateHook(ctx.cwd)
+    : liveKickoffState(ctx.cwd);
+  pi.sendUserMessage(
+    buildSeedKickoff(doc, settings.storeDir, defaultHome(), live),
+  );
   console.log("[handoff] seeded fresh session from the handover doc");
 }
 
@@ -3555,6 +3566,16 @@ export function setSystemdRestartHookForTest(
   fn: ((unit: string) => void) | null,
 ): void {
   systemdRestartHook = fn;
+}
+
+let liveKickoffStateHook: ((cwd: string) => KickoffLiveState) | null = null;
+/** Override the live seed-state source (tests: no real ps / board around).
+ *  The boot-seed wiring calls liveKickoffState (ps + todo board), which is
+ *  environment-dependent — tests pin it with this hook. */
+export function setLiveKickoffStateHookForTest(
+  fn: ((cwd: string) => KickoffLiveState) | null,
+): void {
+  liveKickoffStateHook = fn;
 }
 
 let processExitHook: ((code: number) => void) | null = null;
