@@ -14,7 +14,7 @@ import {
 } from "./discord";
 import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
-import { writeHandover } from "./handover";
+import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
   bashToolEssential,
   buildInteractionHandler,
@@ -71,6 +71,7 @@ import extension, {
   runUsageLine,
   setHandoffRestartArmed,
   setInterruptCtx,
+  setLiveKickoffStateHookForTest,
   setProcessExitHookForTest,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
@@ -6737,27 +6738,41 @@ describe("handoff mechanism B (size-gated restart)", () => {
       finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
       seeded: false,
     });
+    // issue #134: the seed carries LIVE dispatch + board state (pinned here
+    // - real ps/board are environment-dependent), not doc-scraped prose.
+    setLiveKickoffStateHookForTest(() => ({
+      dispatchText:
+        "┌ jobs · 1 in flight\n┣ 20261003-081922-478435 worker · 01:07:43\n└",
+      todoBoard: "┌ todos · 1 open\n├ ship it\n└",
+    }));
 
-    await handlers.session_start?.(null, ctx);
+    try {
+      await handlers.session_start?.(null, ctx);
 
-    // the seed is a plain user message (never a channel-inbound: no
-    // Discord echo, no polluting the next handover's last-asks)
-    expect(seedMsgs).toHaveLength(1);
-    const lines = seedMsgs[0].split("\n");
-    expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
-    expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
-    expect(lines[3]).toBe("Last ask: 1. do the thing");
-    expect(lines[4]).toBe(
-      `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
-    );
-    // marker consumed: a second boot cannot re-seed
-    expect(fs.existsSync(markerPath())).toBe(false);
-    // placeholder replaced with the final line
-    expect(
-      edits().some((t) =>
-        t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
-      ),
-    ).toBe(true);
+      // the seed is a plain user message (never a channel-inbound: no
+      // Discord echo, no polluting the next handover's last-asks)
+      expect(seedMsgs).toHaveLength(1);
+      const lines = seedMsgs[0].split("\n");
+      expect(lines[1]).toBe("Mission: 1 open: ship it");
+      expect(lines[2]).toBe(
+        "In-flight: 20261003-081922-478435 worker · 01:07:43",
+      );
+      expect(lines[3]).toBe("Last ask: 1. do the thing");
+      expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
+      expect(lines[5]).toBe(
+        `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
+      );
+      // marker consumed: a second boot cannot re-seed
+      expect(fs.existsSync(markerPath())).toBe(false);
+      // placeholder replaced with the final line
+      expect(
+        edits().some((t) =>
+          t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+        ),
+      ).toBe(true);
+    } finally {
+      setLiveKickoffStateHookForTest(null);
+    }
   });
 
   test("ordinary boot (no marker): no seed, even with a doc in the store", async () => {
