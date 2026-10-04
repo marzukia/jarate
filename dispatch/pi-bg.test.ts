@@ -85,6 +85,11 @@ function fixture() {
   // user) must not make non-#41 tests hit "at cap"; #41 tests set
   // PI_BG_MAX_CONCURRENT explicitly per spawn.
   env.PI_BG_MAX_CONCURRENT = "0";
+  // issue #144 foreground-launch guard: the suite launches pi-bg ATTACHED
+  // (ambient SIGHUP disposition, not nohup's SIG_IGN). The internal
+  // caller bypass keeps every existing test on the nohup-path behavior;
+  // the #144 guard tests build their own env without it.
+  env.PI_BG_ALLOW_FOREGROUND = "1";
   // cgroup escape into a per-run temp dir, not the REAL user cgroup root
   // (issue: pi-bg cgroup-dir leak, 2026-09-14): every fixture spawn escaped
   // into /sys/fs/cgroup/.../user@N.service/pi-bg/, and an interrupted bun
@@ -3226,9 +3231,10 @@ describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () 
       fs.chmodSync(path.join(fx.tmp, "bin", "pi"), 0o755);
 
       // the mis-piped dispatcher (Franky's exact shape; nohup elided -
-      // stdin/stdout are the pipe either way). bash -c waits for the
-      // launcher (setsid re-exec does not fork: not a group leader), so
-      // p.exited covers the whole run.
+      // stdin/stdout are the pipe either way, and the #144 guard is
+      // bypassed via the fixture's PI_BG_ALLOW_FOREGROUND). bash -c
+      // waits for the launcher (setsid re-exec does not fork: not a
+      // group leader), so p.exited covers the whole run.
       const p = spawn(
         [
           "bash",
@@ -3452,4 +3458,160 @@ describe("usage error: missing task exits 2 with no side effects", () => {
     expect(r.out).toContain("pi-run-ok");
     expect(fx.records()).toHaveLength(1);
   });
+});
+
+// ─── issue #144: foreground-launch guard (nohup is the required form) ──
+// The launcher is the ticket's SUPERVISOR: it execs the pi child, waits
+// for the WHOLE run, posts the callback, then exits. A foreground caller
+// holds the launcher's pipes for the run's full duration (2026-10-05 RCA:
+// dispatch turns wedged 1-4 min = run lengths). The guard makes
+// foreground an explicit error: ticket line FIRST (#56 belt), stderr
+// error naming the nohup form, exit 4, sub-second, zero side effects (no
+// run record, no heartbeat). Detection = SIGHUP disposition: nohup(1)
+// sets SIG_IGN (bash keeps an inherited ignore and cannot reset it in a
+// non-interactive shell); a foreground shell has the default. Bypass:
+// PI_BG_ALLOW_FOREGROUND=1 exactly (internal callers/tests only).
+describe("#144: foreground-launch guard (nohup is the required form)", () => {
+  // Hermetic SIGHUP control: the suite's own disposition leaks into the
+  // child (the suite often runs under a nohup'd ticket, HUP already
+  // ignored). nohup(1) sets SIG_IGN for real; python3 resets an
+  // inherited ignore to SIG_DFL (non-interactive bash cannot) before
+  // exec'ing the script.
+  const PY_DFL_HUP =
+    "import os, signal, sys; " +
+    "signal.signal(signal.SIGHUP, signal.SIG_DFL); " +
+    'os.execvp("bash", ["bash", sys.argv[1]] + sys.argv[2:])';
+
+  const spawnGuard = (
+    fx: ReturnType<typeof fixture>,
+    hup: "default" | "ignore",
+    env: Record<string, string>,
+    args: string[],
+    stdin?: string,
+  ) => {
+    const cmd =
+      hup === "ignore"
+        ? ["nohup", "bash", PI_BG, ...args]
+        : ["python3", "-c", PY_DFL_HUP, PI_BG, ...args];
+    const p = spawn(cmd, {
+      env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "pipe",
+    });
+    if (stdin !== undefined) p.stdin?.write(stdin);
+    p.stdin?.end();
+    return p;
+  };
+
+  const collect = async (p: ReturnType<typeof spawnGuard>) => {
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { out, err, code };
+  };
+
+  // guard env: fixture env minus the internal-caller bypass, with an
+  // explicit artifact dir so the "no side effects" assertions have a
+  // known place to look (run records still land in the fixture records
+  // dir, which the guard path never creates).
+  const guardEnv = (fx: ReturnType<typeof fixture>) => {
+    const env = { ...fx.env };
+    delete env.PI_BG_ALLOW_FOREGROUND;
+    env.PI_BG_TMPDIR = path.join(fx.tmp, "art");
+    fs.mkdirSync(env.PI_BG_TMPDIR, { recursive: true });
+    return env;
+  };
+
+  const recDirOf = (fx: ReturnType<typeof fixture>) =>
+    path.join(fx.tmp, "records");
+
+  test("foreground (HUP default, no bypass): rc 4, sub-second, ticket first, no record, no hb, pi never runs", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const env = guardEnv(fx);
+    const t0 = Date.now();
+    const p = spawnGuard(fx, "default", env, ["worker", "guard task"]);
+    const { out, err, code } = await collect(p);
+    const elapsed = Date.now() - t0;
+
+    expect(code).toBe(4);
+    expect(elapsed).toBeLessThan(1000);
+    // #56 belt: the ticket line is the FIRST stdout line, so a dead
+    // foreground launch is identifiable by its first line
+    const first = out.trimStart().split("\n")[0];
+    expect(first).toMatch(/^\[pi-bg\] ticket \d{8}-\d{6}-\d+ profile=worker$/);
+    // the error names the nohup form with the real run id + dir
+    expect(err).toContain("foreground launch detected (issue #144)");
+    expect(err).toContain("nohup pi-bg worker");
+    const m = first.match(/\[pi-bg\] ticket (\S+)/);
+    if (!m) throw new Error("ticket line vanished from guard output");
+    const rid = m[1];
+    expect(err).toContain(`pi-bg-${rid}-launch.log`);
+    expect(err).toContain(env.PI_BG_TMPDIR);
+    // zero side effects: no run record, no heartbeat, no prompt file
+    expect(fs.existsSync(recDirOf(fx)) ? fx.records() : []).toHaveLength(0);
+    expect(fs.readdirSync(env.PI_BG_TMPDIR)).not.toContain(`pi-bg-${rid}-hb`);
+    expect(
+      fs.existsSync(path.join(env.PI_BG_TMPDIR, `pi-bg-${rid}-prompt.md`)),
+    ).toBe(false);
+    expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
+  }, 15_000);
+
+  test("nohup (HUP ignored, no bypass): full run passes end-to-end", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const p = spawnGuard(fx, "ignore", guardEnv(fx), ["worker", "nohup task"]);
+    const { out, err, code } = await collect(p);
+    expect(code).toBe(0);
+    expect(err).not.toContain("foreground launch detected");
+    expect(out).toContain("pi-run-ok");
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].state).toBe("done");
+  }, 30_000);
+
+  test("nohup + stdin task form (the dispatch shape): passes", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const p = spawnGuard(
+      fx,
+      "ignore",
+      guardEnv(fx),
+      ["worker", "-"],
+      "stdin nohup task",
+    );
+    const { out, code } = await collect(p);
+    expect(code).toBe(0);
+    expect(out).toContain("pi-run-ok");
+    expect(fx.records()).toHaveLength(1);
+  }, 30_000);
+
+  test("bypass PI_BG_ALLOW_FOREGROUND=1: foreground passes (internal callers)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // fx.env carries the bypass - the internal-caller form the rest of
+    // the suite uses
+    const p = spawnGuard(fx, "default", fx.env, ["worker", "bypass task"]);
+    const { out, code } = await collect(p);
+    expect(code).toBe(0);
+    expect(out).toContain("pi-run-ok");
+    expect(fx.records()).toHaveLength(1);
+  }, 30_000);
+
+  test("bypass value must be exactly 1 (other values = no bypass)", async () => {
+    for (const v of ["0", "yes", "2"]) {
+      const fx = fixture();
+      fx.seedMainCreds();
+      const env = { ...guardEnv(fx), PI_BG_ALLOW_FOREGROUND: v };
+      const p = spawnGuard(fx, "default", env, ["worker", "bypass task"]);
+      const { err, code } = await collect(p);
+      expect(code, `value ${v}`).toBe(4);
+      expect(err, `value ${v}`).toContain("foreground launch detected");
+      expect(fs.existsSync(recDirOf(fx)) ? fx.records() : []).toHaveLength(0);
+    }
+  }, 30_000);
 });
