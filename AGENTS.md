@@ -76,7 +76,8 @@ bash install.sh --dry-run          # installer regression check
    (`GH_TOKEN=$(cat ~/.config/marzukia-pat)`).
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
-   merge: `~/scripts/pi-bg reviewer "adversarially review <branch/PR> ..."`.
+   merge. Nohup form (foreground launch is rejected, rc 4, #144):
+   `nohup ~/scripts/pi-bg reviewer "adversarially review <branch/PR> ..." > review.log 2>&1 &`
 5. Merge only on PASS + green `ci` (biome + bridge jobs).
 
 ## Do-not-touch list
