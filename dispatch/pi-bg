@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # pi-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
-# usage: cd <workdir> && pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
+#
+# LAUNCH FORM (issue #144): NOHUP IS REQUIRED. The launcher is the ticket's
+# supervisor by design (execs the pi child, waits for the WHOLE run, posts
+# the callback, then exits), so a foreground caller holds the launcher's
+# pipes for the run's full duration. A foreground launch (SIGHUP not
+# ignored) is an explicit error: ticket line + stderr error + exit 4,
+# sub-second, before any run record or heartbeat.
+#   cd <workdir> && printf '%s' "$task" | nohup pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] - \
+#     > log 2>&1 & sleep 4; head -1 log
+# Bypass: PI_BG_ALLOW_FOREGROUND=1 (internal callers + tests only).
+#
+# usage: cd <workdir> && nohup pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task" > log 2>&1 &
 #        the task can also ride stdin (agent-say marker form, keeps it out of
 #        argv for the whole run - issue #118):
-#        printf '%s' "$task" | pi-bg worker -
-#   task via STDIN (issue #118 — the launcher's blessed form; the "-" is
-#   the stdin marker, the task prose never sits in argv, so ps /
-#   /proc/<pid>/cmdline cannot leak it):
-#     cd <workdir> && printf '%s' "$task" | pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] -
+#        cd <workdir> && printf '%s' "$task" | nohup pi-bg worker - > log 2>&1 &
+#   task via STDIN (issue #118 — the "-" is the stdin marker, the task
+#   prose never sits in argv, so ps / /proc/<pid>/cmdline cannot leak it):
+#     cd <workdir> && printf '%s' "$task" | nohup pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] - > log 2>&1 &
 #   (workdir must be a git repo for --worktree; plain runs work anywhere)
 #   pi-bg --help prints this header.
 #
@@ -104,11 +114,12 @@
 #   ticket's pi child stays in the LAUNCHER's PGID, so a harness
 #   bash-tool timeout that signals that PG kills a still-starting ticket
 #   (2026-09-13: nested tickets died rc=143 inside `git worktree add`).
-#   Blessed launch form (stays; now safe even if the tool call blocks in
-#   wait4() on the ticket until the harness timeout). Issue #118: the
-#   task rides STDIN (the trailing "-" marker), never argv — the wrapper
-#   + pi child argv are short stable strings, so ps cannot leak the
-#   prompt:
+#   Required launch form (issue #144): the nohup shape below; a
+#   foreground launch is an explicit error (guard near the top of this
+#   script: ticket line + exit 4, sub-second, no run record). Issue #118:
+#   the task rides STDIN (the trailing "-" marker), never argv — the
+#   wrapper + pi child argv are short stable strings, so ps cannot leak
+#   the prompt:
 #     cd <workdir> && printf '%s' "$task" | nohup ~/scripts/pi-bg worker - \
 #     > log 2>&1 & sleep 4; head -1 log
 #   pi-bg-kill compensates: it signals the ticket's process group in
@@ -265,8 +276,70 @@ fi
 # effects (same contract as the --worktree/--project usage errors above:
 # rc 2, one stderr line, no record).
 if [ -z "${task//[[:space:]]/}" ]; then
-  echo "pi-bg: missing task. usage: pi-bg {worker|reviewer} [pi flags] \"task\" | printf '%s' \"task\" | pi-bg {worker|reviewer} [pi flags] -" >&2
+  echo "pi-bg: missing task. usage: nohup pi-bg {worker|reviewer} [pi flags] \"task\" > log 2>&1 & | printf '%s' \"task\" | nohup pi-bg {worker|reviewer} [pi flags] - > log 2>&1 &" >&2
   exit 2
+fi
+
+# --- per-run switchboard session id (unique ledger entry per dispatch) ---
+# Computed BEFORE the cap scan: the foreground-launch guard (#144) and the
+# cap's self-exclusion both need the id here. Unique per run:
+# second-precision timestamp + this wrapper's own pid ($$).
+# Concurrent wrappers always have different pids, so per-run temp file
+# names (pi-bg-<run_id>*) can never collide. Shape constraint: the v3
+# embed headers carry the full rid inside the 32-col mobile budget
+# ("┌ fail · <rid>" is the longest header shape; the rc never fits and
+# stays in the title), so the pid must stay <= 7 digits - $$ does
+# (pid_max on these boxes is 4194304, 6-7 digits live). A hypothetical
+# 8-digit pid loses the rid head to the header clip (tail kept). The
+# 3-group numeric shape is preserved: the ticket validators in
+# pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
+run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
+export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
+
+# --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
+#     reference agent host is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
+#     /tmp lost every out.md and the watchdog re-flagged finished tickets as
+#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
+#     and the bridge /jobs history — keep all per-run files in the same place
+#     so every tool finds them. ---
+BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+mkdir -p "$BG_TMP" 2>/dev/null
+
+# --- foreground-launch guard (issue #144): nohup is the required form ---
+# The launcher is the ticket's SUPERVISOR by design: it execs the pi
+# child, waits for the WHOLE run, posts the completion callback, and
+# only then exits. A caller that launches it in the foreground therefore
+# holds the launcher's stdout/stderr pipes for the run's full duration
+# (a harness bash-tool call blocked in wait4() for the entire ticket;
+# 2026-10-05 RCA, issue #144), and a tool-call timeout aborts the
+# CALLER, not the ticket. Foreground was never "fast to return" - it is
+# a launch-form error.
+#
+# Detection: nohup(1) sets SIGHUP to SIG_IGN for its child before exec;
+# bash KEEPS an inherited ignore and cannot reset it in a non-interactive
+# shell (POSIX), so `trap -p HUP` is non-empty exactly when this launcher
+# arrived via nohup. The ignore also survives the setsid re-exec above
+# and every plain exec below. A foreground shell has the default
+# disposition: `trap -p HUP` prints nothing.
+#
+# Foreground + no bypass = explicit error BEFORE the cap scan, the run
+# record and the heartbeat: zero side effects (no pi-bg-<id>.json, no
+# -hb file), so nothing is left "running" and no #101 launch-fail
+# marking is needed. The ticket line prints FIRST (issue #56 belt: a
+# dead foreground launch must stay identifiable by its first log line),
+# then the error, then exit 4. Sub-second.
+#
+# Bypass: PI_BG_ALLOW_FOREGROUND=1 exactly (any other value = no
+# bypass). May be set by INTERNAL callers only - pi-bg's own tests and
+# code that launches it attached on purpose. Operator dispatches use
+# the nohup form.
+if [ "${PI_BG_ALLOW_FOREGROUND:-}" != "1" ] && [ -z "$(trap -p HUP)" ]; then
+  echo "[pi-bg] ticket $run_id profile=$profile" 2>/dev/null || true
+  {
+    echo "pi-bg: ERROR: foreground launch detected (issue #144). Use the nohup form:"
+    echo "  cd <workdir> && printf '%s' \"\$task\" | nohup pi-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
+  } >&2
+  exit 4
 fi
 
 # --- concurrency cap (issue #41): refuse to start when this user already
@@ -311,18 +384,18 @@ if [ "$max_c" -gt 0 ]; then
   # all share ONE file, so each live ticket counts exactly once. The
   # window is 3 hb intervals: a live ticket touches every interval, a
   # trapped exit unlinks, a SIGKILLed file expires within the window.
-  _cap_art="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+  _cap_art="$BG_TMP"
   _cap_int="${PI_BG_HB_INTERVAL:-30}"
   case "$_cap_int" in
     '' | *[!0-9]*) _cap_int=30 ;;
   esac
   [ "$_cap_int" -ge 1 ] || _cap_int=1
   _cap_win=$(( _cap_int * 3 ))
-  # own run id (the snapshot re-exec passes PI_BG_RUN_ID; the original
-  # process has not computed run_id yet - same date-$$ formula below).
-  # Excluded so the snapshot's cap check does not count its own birth
-  # file (self-exclusion, was "$$" in the process scan).
-  our_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
+  # own run id (run_id, computed above; the snapshot re-exec shares it
+  # via PI_BG_RUN_ID). Excluded so the snapshot's cap check does not
+  # count its own birth file (self-exclusion, was "$$" in the process
+  # scan).
+  our_id="$run_id"
   live=0
   _cap_cutoff=$(( $(date +%s) - _cap_win ))
   while IFS= read -r _cap_hb; do
@@ -348,29 +421,6 @@ fi
 # runs bash on a hard link outside the repo, so BASH_SOURCE there would
 # resolve the wrong root - the original process passes its own.
 JB_ROOT="${JB_ROOT_SNAPPED:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")")/.." 2>/dev/null && pwd)}"
-
-# --- per-run switchboard session id (unique ledger entry per dispatch) ---
-# Unique per run: second-precision timestamp + this wrapper's own pid ($$).
-# Concurrent wrappers always have different pids, so per-run temp file
-# names (pi-bg-<run_id>*) can never collide. Shape constraint: the v3
-# embed headers carry the full rid inside the 32-col mobile budget
-# ("┌ fail · <rid>" is the longest header shape; the rc never fits and
-# stays in the title), so the pid must stay <= 7 digits - $$ does
-# (pid_max on these boxes is 4194304, 6-7 digits live). A hypothetical
-# 8-digit pid loses the rid head to the header clip (tail kept). The
-# 3-group numeric shape is preserved: the ticket validators in
-# pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
-run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
-export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
-
-# --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
-#     reference agent host is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
-#     /tmp lost every out.md and the watchdog re-flagged finished tickets as
-#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
-#     and the bridge /jobs history — keep all per-run files in the same place
-#     so every tool finds them. ---
-BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
-mkdir -p "$BG_TMP" 2>/dev/null
 
 # --- prompt file (issue #118): the task persists to a per-run file
 # BEFORE any child runs (the run-record python3 is the first child below)
