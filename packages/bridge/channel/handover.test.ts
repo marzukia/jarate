@@ -27,6 +27,7 @@ import {
   type HandoverPreparation,
   isHandoffFreshWindow,
   lastHandoffAt,
+  liveKickoffState,
   loadPreviousHandover,
   ORCHESTRATOR_PRIME_LINE,
   parseKickoff,
@@ -55,6 +56,7 @@ import extension, {
   setSystemdRestartHookForTest,
   stopAllOpTicks,
 } from "./index";
+import { renderBoardPlain, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -766,23 +768,207 @@ describe("parseKickoff", () => {
     "1. do the thing",
     "2. and this",
   ].join("\n");
-  test("4 lines: mission, in-flight, last ask (NEWEST) + orchestrator priming", () => {
+  test("5 lines: mission, in-flight, last ask (NEWEST), scheduled + orchestrator priming", () => {
     const k = parseKickoff(doc);
     const lines = k.split("\n");
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[1]).toBe("In-flight: Wiring the compact handler.");
     // MINOR-1: the pending ask is the newest (line 2), not the oldest.
     expect(lines[2]).toBe("Last ask: 2. and this");
+    // issue #140: no live task store → (none); never doc-scraped.
+    expect(lines[3]).toBe("Scheduled: (none)");
     // issue #134: the fresh session re-learns its orchestrator role.
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
   });
   test("missing sections → (none) lines", () => {
     const k = parseKickoff("# bare doc\nno sections");
     const lines = k.split("\n");
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toContain("(none)");
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[3]).toBe("Scheduled: (none)");
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+});
+
+// ─── issue #140: boot seed loses pending scheduled tasks ────────────────────
+
+describe("parseKickoff scheduled tasks (issue #140)", () => {
+  // Pre-fix doc shape: no scheduled section anywhere, and the pending task
+  // only shows up as a CONSUMED [task] fire in the inbound asks.
+  const doc = [
+    "# Handover - 2026-10-04 · session s · 100k tokens → handoff",
+    "",
+    "## State",
+    "- dispatch:",
+    "  (none)",
+    "- todos:",
+    "  (none)",
+    "",
+    "## Last user asks",
+    "1. [task] one-shot task due 2026-10-04 06:00 UTC: fire the morning check",
+  ].join("\n");
+  const taskLine =
+    "- m3x2k9-ab12 · franky · at 2026-10-04T06:00:00.000Z · next 2026-10-04T06:00:00.000Z (in 5h) · check the build";
+
+  test("live.scheduledText present → Scheduled line verbatim", () => {
+    const k = parseKickoff(doc, { scheduledText: taskLine });
+    expect(k.split("\n")[3]).toBe(`Scheduled: ${taskLine}`);
+  });
+  test("multiple tasks → every line carried under Scheduled", () => {
+    const k = parseKickoff(doc, {
+      scheduledText: `${taskLine}\n- cron-1-x · franky · cron "0 6 * * *" (system tz) · next 2026-10-05T06:00:00.000Z (in 15h) · run the fleet check`,
+    });
+    const lines = k.split("\n");
+    expect(lines[3]).toBe(`Scheduled: ${taskLine}`);
+    expect(lines[4]).toContain("- cron-1-x ·");
+    expect(lines[5]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+  test("absent and explicit null → Scheduled: (none)", () => {
+    expect(parseKickoff(doc).split("\n")[3]).toBe("Scheduled: (none)");
+    expect(parseKickoff(doc, { scheduledText: null }).split("\n")[3]).toBe(
+      "Scheduled: (none)",
+    );
+    expect(parseKickoff(doc, { scheduledText: "" }).split("\n")[3]).toBe(
+      "Scheduled: (none)",
+    );
+  });
+  test("never doc-scraped: a doc State box with scheduled lines does not leak", () => {
+    const fakeDoc = [
+      "# Handover - 2026-10-04 · session s · 100k tokens → handoff",
+      "",
+      "## State",
+      "- scheduled:",
+      "- ghost-1 · franky · at 2026-10-04T06:00:00.000Z · next 2026-10-04T06:00:00.000Z (in 5h) · ghost prompt",
+    ].join("\n");
+    // no live state at all: doc-scraping would surface the ghost line
+    expect(parseKickoff(fakeDoc).split("\n")[3]).toBe("Scheduled: (none)");
+    // and the pre-fix doc without any scheduled section contributes nothing
+    expect(parseKickoff(doc).split("\n")[3]).toBe("Scheduled: (none)");
+  });
+});
+
+describe("boardSummaryLine open-only math (issue #140)", () => {
+  const doc = "# Handover - 2026-10-04 · session s · 100k tokens → handoff\n";
+  const t = (content: string, status: Todo["status"]): Todo => ({
+    content,
+    status,
+  });
+  // Fixtures are REAL renderBoardPlain output (review F1, #141): the old
+  // hand-written '├ ~~done~~' completed shape is the MARKED-UP todoLine,
+  // which renderBoardPlain never emits — a plain completed item renders as
+  // '├ done', indistinguishable from pending. That is exactly why the
+  // production Mission path reads structured openTodos, not this text.
+
+  test("structured path: 2 pending after 3 completed → open-only line (F1 repro)", () => {
+    // The reviewer's exact repro: completed items listed first (normal
+    // top-down work order). The string-parse fallback over the SAME board
+    // would show 'done one; done two; done three' as the mission.
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: { count: 2, items: ["open one", "open two"] },
+    });
+    expect(k.split("\n")[0]).toBe("Mission: 2 open: open one; open two");
+  });
+  test("structured path: 5 open + 2 completed + 1 cancelled → first 3 open (+2 more)", () => {
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("dropped one", "cancelled"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+      t("open three", "in_progress"),
+      t("open four", "pending"),
+      t("open five", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: {
+        count: 5,
+        items: ["open one", "open two", "open three", "open four", "open five"],
+      },
+    });
+    expect(k.split("\n")[0]).toBe(
+      "Mission: 5 open: open one; open two; open three (+2 more)",
+    );
+  });
+  test("structured path: all completed → '0 open'", () => {
+    const board = renderBoardPlain([
+      t("done one", "completed"),
+      t("done two", "completed"),
+    ]);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: { count: 0, items: [] },
+    });
+    expect(k.split("\n")[0]).toBe("Mission: 0 open");
+  });
+  test("fallback on REAL render: 6 open + 5 completed → '(+3 more)' open-only math", () => {
+    // no openTodos: the string-parse fallback over real renderer output.
+    // Open items listed first, so the shown list is open; the (+N more)
+    // math must be open-only (max(0, 6 - 3) = 3, not 11 - 3 = 8).
+    const todos: Todo[] = [
+      t("open one", "pending"),
+      t("open two", "pending"),
+      t("open three", "in_progress"),
+      t("open four", "pending"),
+      t("open five", "pending"),
+      t("open six", "pending"),
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("done four", "completed"),
+      t("done five", "completed"),
+    ];
+    const k = parseKickoff(doc, { todoBoard: renderBoardPlain(todos) });
+    expect(k.split("\n")[0]).toBe(
+      "Mission: 6 open: open one; open two; open three (+3 more)",
+    );
+  });
+  test("fallback KNOWN LIMIT pinned: completed shares the pending gutter", () => {
+    // Same board as the F1 repro, parsed as a string: the shown list
+    // surfaces completed items. The structured path (above) is what
+    // production uses; this pins the fallback's documented limit so it
+    // cannot silently regress again.
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    expect(parseKickoff(doc, { todoBoard: board }).split("\n")[0]).toBe(
+      "Mission: 2 open: done one; done two; done three",
+    );
+  });
+  test("fallback no header → item-count branch (synthetic shape)", () => {
+    // renderBoardPlain always emits a header; this synthetic no-header
+    // shape pins the fallback's count branch. Completed items are
+    // indistinguishable from pending here, so the count includes them
+    // (the same known limit, no-header variant).
+    const b = ["├ open a", "├ open b", "├ done c", "└"].join("\n");
+    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
+      "Mission: 3 todos: open a; open b; done c",
+    );
+  });
+  test("fallback: '├ ~~' no-op guard still strips marked-up strikethrough", () => {
+    // renderBoardPlain never emits ~~ (strikethrough is the marked-up
+    // todoLine only); the guard defends hand-written / doc-scraped
+    // marked-up strings.
+    const b = ["├ open a", "├ ~~done c~~", "└"].join("\n");
+    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
+      "Mission: 1 todos: open a",
+    );
   });
 });
 
@@ -866,7 +1052,7 @@ describe("parseKickoff live state (issue #134)", () => {
     const lines = k.split("\n");
     expect(lines[0]).toBe("Mission: (none)");
     expect(lines[1]).toBe("In-flight: (none)");
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
   });
   test("multiple in-flight jobs → '; '-joined on one line", () => {
     const multi = [
@@ -955,12 +1141,13 @@ describe("buildSeedKickoff (F4/F8)", () => {
     const home = "/home/monky";
     const k = buildSeedKickoff(doc, "~/.jarate/handovers", home);
     const lines = k.split("\n");
-    // preamble + 4-line digest + the read instruction
+    // preamble + 5-line digest + the read instruction
     expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
     expect(lines[3]).toBe("Last ask: 1. do the thing");
-    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
-    expect(lines[5]).toBe(
+    expect(lines[4]).toBe("Scheduled: (none)");
+    expect(lines[5]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[6]).toBe(
       `Read ${path.join(home, ".jarate", "handovers", "latest.md")} before continuing. Answer the last pending user question if any.`,
     );
   });
@@ -1242,6 +1429,170 @@ describe("buildHandover", () => {
       now: NOW,
     });
     expect(doc).toContain("## Transcript");
+  });
+
+  test("doc State box carries the pending task (issue #140)", async () => {
+    // HOME is tmp: write the task store the way tasks.test.ts does it.
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "tasks.json"),
+      JSON.stringify({
+        tasks: [
+          {
+            id: "m3x2k9-ab12",
+            channelId: "ch1",
+            channelName: "franky",
+            prompt: "fire the morning check",
+            kind: "at",
+            atMs: NOW.getTime() + 5 * 3600_000,
+            createdAt: NOW.getTime(),
+            nextFireAt: NOW.getTime() + 5 * 3600_000,
+            status: "pending",
+          },
+        ],
+      }),
+    );
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      pi,
+      settings: settings(),
+      now: NOW,
+    });
+    expect(doc).toContain("- scheduled:");
+    expect(doc).toContain("m3x2k9-ab12");
+    expect(doc).toContain("fire the morning check");
+    // the scheduled block sits after dispatch, before todos
+    const iDispatch = doc.indexOf("- dispatch:");
+    const iScheduled = doc.indexOf("- scheduled:");
+    const iTodos = doc.indexOf("- todos:");
+    expect(iDispatch).toBeGreaterThan(-1);
+    expect(iScheduled).toBeGreaterThan(iDispatch);
+    expect(iTodos).toBeGreaterThan(iScheduled);
+  });
+
+  test("empty task store → '- scheduled:' (none) in the doc State box", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      pi,
+      settings: settings(),
+      now: NOW,
+    });
+    expect(doc).toMatch(/- scheduled:\n {2}\(none\)/);
+  });
+});
+
+// ─── liveKickoffState: the task store enters the seed (issue #140) ─────────
+
+describe("liveKickoffState scheduled pipe (issue #140)", () => {
+  let tmp = "";
+  let oldHome = "";
+
+  const writeTasks = (tasks: unknown[]) => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), JSON.stringify({ tasks }));
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-live-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+  });
+
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("pending + claimed tasks → scheduledText, cap 5 lines", () => {
+    const t = (id: string) => ({
+      id,
+      channelId: "ch1",
+      channelName: "franky",
+      prompt: `prompt for ${id}`,
+      kind: "at",
+      atMs: NOW.getTime() + 60_000,
+      createdAt: NOW.getTime(),
+      nextFireAt: NOW.getTime() + 60_000,
+      status: "pending",
+    });
+    const tasks: unknown[] = Array.from({ length: 7 }, (_, i) =>
+      t(`task-${i}`),
+    );
+    tasks.push({
+      ...t("claimed-1"),
+      status: "claimed",
+      claimedAt: NOW.getTime(),
+    });
+    writeTasks(tasks);
+    const lines = (liveKickoffState(tmp).scheduledText ?? "").split("\n");
+    expect(lines).toHaveLength(5); // cap 5
+    expect(lines[0]).toContain("task-0");
+    expect(lines[0]).toContain("prompt for task-0");
+  });
+  test("empty store → null", () => {
+    writeTasks([]);
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("missing file → null (a missing store cannot break the seed)", () => {
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("corrupt store → null (a corrupt store cannot break the seed)", () => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), "{not json");
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("wrong-shape store → null", () => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), JSON.stringify({ nope: 1 }));
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("liveKickoffState: todoBoard + openTodos from ONE board load (F1)", () => {
+    // channel config scoped to the tmp cwd (one default channel, ch1)
+    const piDir = path.join(tmp, ".pi");
+    fs.mkdirSync(piDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(piDir, "settings.json"),
+      JSON.stringify({
+        channels: [{ id: "ch1", name: "franky", enabled: true, default: true }],
+      }),
+    );
+    const todos: Todo[] = [
+      { content: "done one", status: "completed" },
+      { content: "done two", status: "completed" },
+      { content: "open one", status: "pending" },
+      { content: "open two", status: "in_progress" },
+    ];
+    saveBoard({ channelId: "ch1", todos, updatedAt: "" }, tmp);
+    const live = liveKickoffState(tmp);
+    // todoBoard is the REAL renderBoardPlain text (completed = plain ├)
+    expect(live.todoBoard).toBe(renderBoardPlain(todos));
+    // openTodos: open only (pending | in_progress), board order
+    expect(live.openTodos).toEqual({
+      count: 2,
+      items: ["open one", "open two"],
+    });
+  });
+  test("liveKickoffState: empty board → todoBoard + openTodos both null", () => {
+    const piDir = path.join(tmp, ".pi");
+    fs.mkdirSync(piDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(piDir, "settings.json"),
+      JSON.stringify({
+        channels: [{ id: "ch1", name: "franky", enabled: true, default: true }],
+      }),
+    );
+    saveBoard({ channelId: "ch1", todos: [], updatedAt: "" }, tmp);
+    const live = liveKickoffState(tmp);
+    expect(live.todoBoard).toBeNull();
+    expect(live.openTodos).toBeNull();
   });
 });
 
