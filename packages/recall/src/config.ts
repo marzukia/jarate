@@ -1,8 +1,10 @@
 // Config: env knobs, DSN parsing, .env loading.
 //
 // Same env contract as the old Python pgrag scripts:
-//   RAG_DSN        "host=127.0.0.1 dbname=rag user=monky" (key=value) or
-//                  postgres:// URL. Default: the rag db on 127.0.0.1.
+//   RAG_DSN        "host=127.0.0.1 dbname=rag user=..." (key=value) or
+//                  postgres:// URL. Default: the rag db on 127.0.0.1, user =
+//                  the calling OS user ($USER), so each agent's own .pgpass
+//                  entry is used.
 //   RAG_EMBED_URL  Ollama OpenAI-compatible embeddings endpoint.
 //   RAG_EMBED_MODEL  must match the schema vector dim (768 = nomic-embed-text).
 //   RAG_PROJECT    optional per-project filter (query only).
@@ -10,6 +12,7 @@
 // not pinned here, same as psycopg did.
 
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export interface DsnOptions {
@@ -28,7 +31,15 @@ export interface RecallConfig {
   project: string | null;
 }
 
-export const DEFAULT_DSN = "host=127.0.0.1 dbname=rag user=monky";
+/** User for the default DSN: the calling OS user ($USER). */
+export function defaultDsnUser(): string {
+  return process.env.USER ?? process.env.LOGNAME ?? os.userInfo().username;
+}
+
+/** Default DSN: rag db on 127.0.0.1, user = the calling OS user. */
+export function defaultDsn(): string {
+  return `host=127.0.0.1 dbname=rag user=${defaultDsnUser()}`;
+}
 export const DEFAULT_EMBED_URL = "http://localhost:11434/v1/embeddings";
 export const DEFAULT_EMBED_MODEL = "nomic-embed-text";
 
@@ -108,7 +119,7 @@ export function envConfig(): RecallConfig {
   return {
     embedUrl: process.env.RAG_EMBED_URL ?? DEFAULT_EMBED_URL,
     embedModel: process.env.RAG_EMBED_MODEL ?? DEFAULT_EMBED_MODEL,
-    dsn: parseDsn(process.env.RAG_DSN ?? DEFAULT_DSN),
+    dsn: parseDsn(process.env.RAG_DSN ?? defaultDsn()),
     project: process.env.RAG_PROJECT ? process.env.RAG_PROJECT : null,
   };
 }
