@@ -940,23 +940,50 @@ function safeJobsView(): string {
     return "";
   }
 }
-function defaultTodoText(cwd: string): string {
+/** The bridge's live todo state in ONE board load: the plain-rendered
+ *  board text (the doc's State box) + the open items as structured data
+ *  (count = pending | in_progress, items = their content in board order).
+ *  liveKickoffState needs both and must not read the board twice. The
+ *  structured half exists because renderBoardPlain marks completed items
+ *  identically to pending — the text alone cannot be parsed back into
+ *  open-only items (review F1, #141). null/null when there is no channel,
+ *  no board, or the load fails — a broken board must not break compaction
+ *  or the seed. */
+function liveTodoState(cwd: string): {
+  text: string | null;
+  openTodos: { count: number; items: string[] } | null;
+} {
   try {
     const cfg = loadChannelConfig(cwd);
     const ch = cfg ? getDefaultChannel(cfg) : null;
-    if (!ch) return "";
+    if (!ch) return { text: null, openTodos: null };
     const board = loadBoard(ch.id);
-    if (!board || board.todos.length === 0) return "";
-    return renderBoardPlain(board.todos);
+    if (!board || board.todos.length === 0)
+      return { text: null, openTodos: null };
+    const open = board.todos.filter(
+      (t) => t.status === "pending" || t.status === "in_progress",
+    );
+    return {
+      text: renderBoardPlain(board.todos),
+      openTodos: { count: open.length, items: open.map((t) => t.content) },
+    };
   } catch {
-    return "";
+    return { text: null, openTodos: null };
   }
+}
+
+/** Plain-rendered board for the doc's State box; "" when none. */
+function defaultTodoText(cwd: string): string {
+  return liveTodoState(cwd).text ?? "";
 }
 /** issue #140: rendered scheduled-task lines (pending + claimed) from the
  *  bridge's task store — the THIRD durable state the old seed and doc
  *  never read. Cap 5 lines (formatTaskLine already cuts long prompts at
  *  60 chars); null when there are none or the store is unreadable — a
- *  missing file must not break compaction. */
+ *  missing file must not break compaction.
+ *  NOT channel-scoped: loadTasks lists EVERY channel's tasks. Safe under
+ *  the one-agent-per-HOME invariant (one channel per bridge process); would
+ *  need channelId scoping if that invariant changes (review F3, #141). */
 function safeScheduledTasks(): string | null {
   try {
     const lines = loadTasks()
@@ -1156,6 +1183,12 @@ export interface KickoffLiveState {
   scheduledText?: string | null;
   /** renderBoardPlain of the board; null/"" when empty/unknown. */
   todoBoard?: string | null;
+  /** Open todos (status pending | in_progress): count + content in board
+   *  order. The PRODUCTION source for the Mission line (issue #140,
+   *  review F1): renderBoardPlain marks completed items identically to
+   *  pending, so the rendered text cannot be parsed back into open-only
+   *  items. null when empty/unknown. */
+  openTodos?: { count: number; items: string[] } | null;
 }
 
 /** Orchestrator priming: the fresh session must re-learn its role
@@ -1164,23 +1197,33 @@ export const ORCHESTRATOR_PRIME_LINE =
   "ORCHESTRATOR: you have pi-bg workers (~/scripts/pi-bg). Resume in-flight dispatch and hand off context-hungry work - do not do it inline.";
 
 /** Live sources for the boot seed: the SAME calls buildHandover uses for
- *  the doc's State box (safeJobsView / defaultTodoText). */
+ *  the doc's State box (safeJobsView / safeScheduledTasks / liveTodoState).
+ *  The todo board is loaded ONCE (review F1, #141): the rendered text and
+ *  the structured open items must agree. */
 export function liveKickoffState(cwd: string): KickoffLiveState {
+  const todos = liveTodoState(cwd);
   return {
     dispatchText: safeJobsView() || null,
     scheduledText: safeScheduledTasks(),
-    todoBoard: defaultTodoText(cwd) || null,
+    todoBoard: todos.text,
+    openTodos: todos.openTodos,
   };
 }
 
-/** One-line summary of a rendered plain todo board: the open count from
- *  the header + the first 3 OPEN items (+N more). The board IS the mission.
- *  Plain gutters (renderBoardPlain): ┌ header, ├ pending / ┣ in-progress
- *  (open), ├ ~~...~~ completed and ┤ cancelled (NOT open), └ close.
+/** One-line summary of a rendered plain todo board — FALLBACK only (the
+ *  production Mission path is openTodosLine, structured data). The open
+ *  count from the header + the first 3 gutter items (+N more). The board
+ *  IS the mission. Plain gutters (renderBoardPlain): ┌ header, ├ pending /
+ *  ┣ in-progress (open), ├ completed — INDISTINGUISHABLE from pending in
+ *  the plain render (no ~~ strikethrough; that is the marked-up todoLine
+ *  only) — and ┤ cancelled (NOT open), └ close. KNOWN LIMIT (review F1,
+ *  #141): because completed shares the pending gutter, this string-parse
+ *  fallback's shown list MAY include completed items; the open count and
+ *  the (+N more) math are still open-only, taken from the header.
  *  issue #140: '(+N more)' counts OPEN items only — the old total (open +
  *  completed) made "6 open: 3 shown (+8 more)" read as 14 open. */
 function boardSummaryLine(board: string): string {
-  const items: string[] = []; // open items only
+  const items: string[] = [];
   let open = -1;
   for (const raw of board.split("\n")) {
     const t = raw.trim();
@@ -1192,7 +1235,10 @@ function boardSummaryLine(board: string): string {
     if (!t || t === "└") continue;
     const m = t.match(/^[├┣┤] (.+)$/);
     if (!m) continue;
-    if (t.startsWith("├ ~~") || t.startsWith("┤ ")) continue;
+    // ┤ = cancelled, never open. '├ ~~' is a no-op guard: renderBoardPlain
+    // never emits ~~ (strikethrough is the marked-up todoLine only), but a
+    // hand-written fixture or a future plain renderer might.
+    if (t.startsWith("┤ ") || t.startsWith("├ ~~")) continue;
     items.push(m[1]);
   }
   const shown = items.slice(0, 3);
@@ -1200,6 +1246,23 @@ function boardSummaryLine(board: string): string {
     open >= 0 ? Math.max(0, open - shown.length) : items.length - shown.length;
   const head = open >= 0 ? `${open} open` : `${items.length} todos`;
   let line = shown.length ? `${head}: ${shown.join("; ")}` : head;
+  if (extra > 0) line += ` (+${extra} more)`;
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+/** Mission line from STRUCTURED open-todo state — the production path
+ *  (issue #140, review F1): `${count} open` + the first 3 open items +
+ *  `(+N more)` for the hidden open ones. Built from live board data, never
+ *  from string parsing, so the shown list is genuinely open-only — the
+ *  plain render cannot mark completed items (they share the pending
+ *  gutter), which is why the boardSummaryLine fallback keeps a documented
+ *  known limit. */
+function openTodosLine(ot: { count: number; items: string[] }): string {
+  const shown = ot.items.slice(0, 3);
+  const extra = Math.max(0, ot.count - shown.length);
+  let line = shown.length
+    ? `${ot.count} open: ${shown.join("; ")}`
+    : `${ot.count} open`;
   if (extra > 0) line += ` (+${extra} more)`;
   return line.length > 200 ? `${line.slice(0, 197)}...` : line;
 }
@@ -1254,9 +1317,15 @@ export function parseKickoff(doc: string, live?: KickoffLiveState): string {
     return numbered.length ? numbered[numbered.length - 1] : NONE;
   };
   const board = (live?.todoBoard ?? "").trim();
-  const mission = board
-    ? boardSummaryLine(board)
-    : firstLine((t) => t.includes("Mission"));
+  const openTodos = live?.openTodos ?? null;
+  // Structured first (the production path): openTodos from liveKickoffState
+  // is genuinely open-only. The rendered-text fallback serves doc-scraping /
+  // no-live calls and may surface completed items (pinned by test).
+  const mission = openTodos
+    ? openTodosLine(openTodos)
+    : board
+      ? boardSummaryLine(board)
+      : firstLine((t) => t.includes("Mission"));
   const inFlight = liveInFlightLine(live?.dispatchText);
   const scheduled = (live?.scheduledText ?? "").trim();
   return (

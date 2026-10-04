@@ -56,6 +56,7 @@ import extension, {
   setSystemdRestartHookForTest,
   stopAllOpTicks,
 } from "./index";
+import { renderBoardPlain, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -849,49 +850,124 @@ describe("parseKickoff scheduled tasks (issue #140)", () => {
 
 describe("boardSummaryLine open-only math (issue #140)", () => {
   const doc = "# Handover - 2026-10-04 · session s · 100k tokens → handoff\n";
-  // renderBoardPlain shape: pending '├ c', in-progress '┣ c',
-  // completed '├ ~~c~~' — 6 open + 5 completed = 11 gutter items.
-  const board = [
-    "┌ todos · 6 open",
-    "├ open one",
-    "├ open two",
-    "┣ open three",
-    "├ open four",
-    "├ open five",
-    "├ open six",
-    "├ ~~done one~~",
-    "├ ~~done two~~",
-    "├ ~~done three~~",
-    "├ ~~done four~~",
-    "├ ~~done five~~",
-    "└",
-  ].join("\n");
-  test("6 open + 5 completed → '6 open: <3 open items> (+3 more)'", () => {
-    const k = parseKickoff(doc, { todoBoard: board });
-    // the old total-based math rendered '(+8 more)' (11 - 3) and read as
-    // 14 open; now the extra is open-only: max(0, 6 - 3) = 3.
+  const t = (content: string, status: Todo["status"]): Todo => ({
+    content,
+    status,
+  });
+  // Fixtures are REAL renderBoardPlain output (review F1, #141): the old
+  // hand-written '├ ~~done~~' completed shape is the MARKED-UP todoLine,
+  // which renderBoardPlain never emits — a plain completed item renders as
+  // '├ done', indistinguishable from pending. That is exactly why the
+  // production Mission path reads structured openTodos, not this text.
+
+  test("structured path: 2 pending after 3 completed → open-only line (F1 repro)", () => {
+    // The reviewer's exact repro: completed items listed first (normal
+    // top-down work order). The string-parse fallback over the SAME board
+    // would show 'done one; done two; done three' as the mission.
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: { count: 2, items: ["open one", "open two"] },
+    });
+    expect(k.split("\n")[0]).toBe("Mission: 2 open: open one; open two");
+  });
+  test("structured path: 5 open + 2 completed + 1 cancelled → first 3 open (+2 more)", () => {
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("dropped one", "cancelled"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+      t("open three", "in_progress"),
+      t("open four", "pending"),
+      t("open five", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: {
+        count: 5,
+        items: ["open one", "open two", "open three", "open four", "open five"],
+      },
+    });
+    expect(k.split("\n")[0]).toBe(
+      "Mission: 5 open: open one; open two; open three (+2 more)",
+    );
+  });
+  test("structured path: all completed → '0 open'", () => {
+    const board = renderBoardPlain([
+      t("done one", "completed"),
+      t("done two", "completed"),
+    ]);
+    const k = parseKickoff(doc, {
+      todoBoard: board,
+      openTodos: { count: 0, items: [] },
+    });
+    expect(k.split("\n")[0]).toBe("Mission: 0 open");
+  });
+  test("fallback on REAL render: 6 open + 5 completed → '(+3 more)' open-only math", () => {
+    // no openTodos: the string-parse fallback over real renderer output.
+    // Open items listed first, so the shown list is open; the (+N more)
+    // math must be open-only (max(0, 6 - 3) = 3, not 11 - 3 = 8).
+    const todos: Todo[] = [
+      t("open one", "pending"),
+      t("open two", "pending"),
+      t("open three", "in_progress"),
+      t("open four", "pending"),
+      t("open five", "pending"),
+      t("open six", "pending"),
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("done four", "completed"),
+      t("done five", "completed"),
+    ];
+    const k = parseKickoff(doc, { todoBoard: renderBoardPlain(todos) });
     expect(k.split("\n")[0]).toBe(
       "Mission: 6 open: open one; open two; open three (+3 more)",
     );
   });
-  test("shown items are open ones, never completed", () => {
-    // 2 open first, then completed items: only the open two are shown
-    const b = [
-      "┌ todos · 2 open",
-      "├ open a",
-      "├ open b",
-      "├ ~~done c~~",
-      "├ ~~done d~~",
-      "└",
-    ].join("\n");
-    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
-      "Mission: 2 open: open a; open b",
+  test("fallback KNOWN LIMIT pinned: completed shares the pending gutter", () => {
+    // Same board as the F1 repro, parsed as a string: the shown list
+    // surfaces completed items. The structured path (above) is what
+    // production uses; this pins the fallback's documented limit so it
+    // cannot silently regress again.
+    const todos: Todo[] = [
+      t("done one", "completed"),
+      t("done two", "completed"),
+      t("done three", "completed"),
+      t("open one", "pending"),
+      t("open two", "pending"),
+    ];
+    const board = renderBoardPlain(todos);
+    expect(parseKickoff(doc, { todoBoard: board }).split("\n")[0]).toBe(
+      "Mission: 2 open: done one; done two; done three",
     );
   });
-  test("no header → open-item count fallback, shown items still open", () => {
-    const b = ["├ open a", "├ open b", "├ ~~done c~~", "└"].join("\n");
+  test("fallback no header → item-count branch (synthetic shape)", () => {
+    // renderBoardPlain always emits a header; this synthetic no-header
+    // shape pins the fallback's count branch. Completed items are
+    // indistinguishable from pending here, so the count includes them
+    // (the same known limit, no-header variant).
+    const b = ["├ open a", "├ open b", "├ done c", "└"].join("\n");
     expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
-      "Mission: 2 todos: open a; open b",
+      "Mission: 3 todos: open a; open b; done c",
+    );
+  });
+  test("fallback: '├ ~~' no-op guard still strips marked-up strikethrough", () => {
+    // renderBoardPlain never emits ~~ (strikethrough is the marked-up
+    // todoLine only); the guard defends hand-written / doc-scraped
+    // marked-up strings.
+    const b = ["├ open a", "├ ~~done c~~", "└"].join("\n");
+    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
+      "Mission: 1 todos: open a",
     );
   });
 });
@@ -1465,6 +1541,58 @@ describe("liveKickoffState scheduled pipe (issue #140)", () => {
   });
   test("missing file → null (a missing store cannot break the seed)", () => {
     expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("corrupt store → null (a corrupt store cannot break the seed)", () => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), "{not json");
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("wrong-shape store → null", () => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), JSON.stringify({ nope: 1 }));
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("liveKickoffState: todoBoard + openTodos from ONE board load (F1)", () => {
+    // channel config scoped to the tmp cwd (one default channel, ch1)
+    const piDir = path.join(tmp, ".pi");
+    fs.mkdirSync(piDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(piDir, "settings.json"),
+      JSON.stringify({
+        channels: [{ id: "ch1", name: "franky", enabled: true, default: true }],
+      }),
+    );
+    const todos: Todo[] = [
+      { content: "done one", status: "completed" },
+      { content: "done two", status: "completed" },
+      { content: "open one", status: "pending" },
+      { content: "open two", status: "in_progress" },
+    ];
+    saveBoard({ channelId: "ch1", todos, updatedAt: "" }, tmp);
+    const live = liveKickoffState(tmp);
+    // todoBoard is the REAL renderBoardPlain text (completed = plain ├)
+    expect(live.todoBoard).toBe(renderBoardPlain(todos));
+    // openTodos: open only (pending | in_progress), board order
+    expect(live.openTodos).toEqual({
+      count: 2,
+      items: ["open one", "open two"],
+    });
+  });
+  test("liveKickoffState: empty board → todoBoard + openTodos both null", () => {
+    const piDir = path.join(tmp, ".pi");
+    fs.mkdirSync(piDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(piDir, "settings.json"),
+      JSON.stringify({
+        channels: [{ id: "ch1", name: "franky", enabled: true, default: true }],
+      }),
+    );
+    saveBoard({ channelId: "ch1", todos: [], updatedAt: "" }, tmp);
+    const live = liveKickoffState(tmp);
+    expect(live.todoBoard).toBeNull();
+    expect(live.openTodos).toBeNull();
   });
 });
 
