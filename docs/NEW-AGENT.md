@@ -235,7 +235,9 @@ Verification checklist (all must pass before declaring done):
 3. agent-say round trip from an existing agent into the new channel.
 4. agent-say the OTHER way (needs the bot-guild invites from step 0).
 5. One real pi-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
-   webhook + role profile + artifacts.
+   webhook + role profile + artifacts. Nohup form (foreground launch is
+   rejected with rc 4, issue #144):
+   `nohup ~/scripts/pi-bg worker "smoke test: reply OK" > smoke.log 2>&1 &`
 
 ## 8. Update every existing agent
 
