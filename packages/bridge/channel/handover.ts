@@ -37,6 +37,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { fmtTokensLC } from "./ctxwatch";
 import { jobsView } from "./jobs";
+import { formatTaskLine, loadTasks } from "./tasks";
 import { defaultHome, loadBoard, renderBoardPlain } from "./todos";
 import { getDefaultChannel, loadChannelConfig } from "./types";
 
@@ -142,6 +143,8 @@ export interface ParsedState {
   todoBoard: string;
   /** Rendered dispatch state ("" when unknown). */
   dispatchState: string;
+  /** Rendered scheduled-task lines ("" when none/unknown). */
+  scheduledTasks: string;
   contextLine: string;
   modelLabel: string;
   sessionStats: string;
@@ -157,6 +160,8 @@ export interface ExtractCtxState {
   contextUsage?: ContextUsage | null;
   modelLabel?: string | null;
   dispatchText?: string | null;
+  /** Rendered scheduled-task lines ("" or null when none/unknown). */
+  scheduledText?: string | null;
   todoText?: string | null;
 }
 
@@ -367,6 +372,7 @@ export function extractDeterministic(
     links: extractLinks(text),
     todoBoard: (ctxState.todoText ?? "").trim(),
     dispatchState: (ctxState.dispatchText ?? "").trim(),
+    scheduledTasks: (ctxState.scheduledText ?? "").trim(),
     contextLine: formatContextLine(
       ctxState.contextUsage ?? null,
       preparation.tokensBefore,
@@ -650,6 +656,8 @@ function renderState(s: ParsedState): string {
     `- session: ${s.sessionStats || "unknown"}`,
     "- dispatch:",
     s.dispatchState ? s.dispatchState : "  (none)",
+    "- scheduled:",
+    s.scheduledTasks ? s.scheduledTasks : "  (none)",
     "- todos:",
     s.todoBoard ? s.todoBoard : "  (none)",
   ];
@@ -944,6 +952,22 @@ function defaultTodoText(cwd: string): string {
     return "";
   }
 }
+/** issue #140: rendered scheduled-task lines (pending + claimed) from the
+ *  bridge's task store — the THIRD durable state the old seed and doc
+ *  never read. Cap 5 lines (formatTaskLine already cuts long prompts at
+ *  60 chars); null when there are none or the store is unreadable — a
+ *  missing file must not break compaction. */
+function safeScheduledTasks(): string | null {
+  try {
+    const lines = loadTasks()
+      .filter((t) => t.status === "pending" || t.status === "claimed")
+      .slice(0, 5)
+      .map((t) => formatTaskLine(t, t.channelName));
+    return lines.length ? lines.join("\n") : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Default LLM call: the SAME session model, the session's own auth.
  *  Auth via ctx.modelRegistry.getApiKeyAndHeaders(ctx.model) — the bridge
@@ -1037,6 +1061,7 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
     contextUsage: safeContextUsage(ctx),
     modelLabel: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
     dispatchText: safeJobsView(),
+    scheduledText: safeScheduledTasks(),
     todoText: defaultTodoText(ctx.cwd),
   });
   const now = args.now ?? new Date();
@@ -1091,8 +1116,8 @@ export function isHandoffFreshWindow(
 }
 
 /**
- * The boot-seed message (F4/F8): a 4-line digest (mission, in-flight,
- * last ask, orchestrator priming) + a forced read of latest.md + the
+ * The boot-seed message (F4/F8): a 5-line digest (mission, in-flight,
+ * last ask, scheduled, orchestrator priming) + a forced read of latest.md + the
  * pending-question instruction. The wiring sends it via pi.sendUserMessage.
  * The path is the EXPANDED absolute storeDir so the agent's read tool
  * takes it as-is. Pass `live` for fresh dispatch/board state at restart
@@ -1127,6 +1152,8 @@ export function buildSeedKickoff(
 export interface KickoffLiveState {
   /** jobsView("text"); null/"" when unknown. */
   dispatchText?: string | null;
+  /** formatTaskLine rows (pending + claimed, cap 5); null when none. */
+  scheduledText?: string | null;
   /** renderBoardPlain of the board; null/"" when empty/unknown. */
   todoBoard?: string | null;
 }
@@ -1141,15 +1168,19 @@ export const ORCHESTRATOR_PRIME_LINE =
 export function liveKickoffState(cwd: string): KickoffLiveState {
   return {
     dispatchText: safeJobsView() || null,
+    scheduledText: safeScheduledTasks(),
     todoBoard: defaultTodoText(cwd) || null,
   };
 }
 
 /** One-line summary of a rendered plain todo board: the open count from
- *  the header + the first 3 items (+N more). The board IS the mission.
- *  Plain gutters: ┌ header, ├/┣/┤ items, └ close. */
+ *  the header + the first 3 OPEN items (+N more). The board IS the mission.
+ *  Plain gutters (renderBoardPlain): ┌ header, ├ pending / ┣ in-progress
+ *  (open), ├ ~~...~~ completed and ┤ cancelled (NOT open), └ close.
+ *  issue #140: '(+N more)' counts OPEN items only — the old total (open +
+ *  completed) made "6 open: 3 shown (+8 more)" read as 14 open. */
 function boardSummaryLine(board: string): string {
-  const items: string[] = [];
+  const items: string[] = []; // open items only
   let open = -1;
   for (const raw of board.split("\n")) {
     const t = raw.trim();
@@ -1160,10 +1191,13 @@ function boardSummaryLine(board: string): string {
     }
     if (!t || t === "└") continue;
     const m = t.match(/^[├┣┤] (.+)$/);
-    if (m) items.push(m[1]);
+    if (!m) continue;
+    if (t.startsWith("├ ~~") || t.startsWith("┤ ")) continue;
+    items.push(m[1]);
   }
   const shown = items.slice(0, 3);
-  const extra = items.length - shown.length;
+  const extra =
+    open >= 0 ? Math.max(0, open - shown.length) : items.length - shown.length;
   const head = open >= 0 ? `${open} open` : `${items.length} todos`;
   let line = shown.length ? `${head}: ${shown.join("; ")}` : head;
   if (extra > 0) line += ` (+${extra} more)`;
@@ -1185,13 +1219,17 @@ function liveInFlightLine(dispatchText?: string | null): string | null {
 }
 
 /**
- * The boot-seed digest: 4 lines — Mission, In-flight, Last ask,
- * ORCHESTRATOR. Mission/In-flight come from LIVE state when available
- * (fresh data beats doc-scraping, issue #134); doc-scraping remains the
- * fallback for pre-deterministic docs that still carry the LLM-era
- * '1 · Mission' / '2 · In-flight (NOW)' sections. "last ask" is the
- * NEWEST (highest-numbered) entry - the pending question the agent must
- * answer is the last one, not the first (MINOR-1).
+ * The boot-seed digest: 5 lines — Mission, In-flight, Last ask,
+ * Scheduled, ORCHESTRATOR. Mission/In-flight come from LIVE state when
+ * available (fresh data beats doc-scraping, issue #134); doc-scraping
+ * remains the fallback for pre-deterministic docs that still carry the
+ * LLM-era '1 · Mission' / '2 · In-flight (NOW)' sections. "last ask" is
+ * the NEWEST (highest-numbered) entry - the pending question the agent
+ * must answer is the last one, not the first (MINOR-1). "Scheduled" is
+ * PIPED from the live task store, never doc-scraped (issue #140): a task
+ * the session itself scheduled is an outbound tool call, so it never
+ * appears in the inbound-only "Last 3 user asks" section, and pre-fix
+ * docs have no scheduled section at all — scraping could only fake data.
  */
 export function parseKickoff(doc: string, live?: KickoffLiveState): string {
   const { sections } = splitDoc(doc);
@@ -1220,10 +1258,12 @@ export function parseKickoff(doc: string, live?: KickoffLiveState): string {
     ? boardSummaryLine(board)
     : firstLine((t) => t.includes("Mission"));
   const inFlight = liveInFlightLine(live?.dispatchText);
+  const scheduled = (live?.scheduledText ?? "").trim();
   return (
     `Mission: ${mission}\n` +
     `In-flight: ${inFlight ?? firstLine((t) => t.includes("In-flight"))}\n` +
     `Last ask: ${lastAsk()}\n` +
+    `Scheduled: ${scheduled || NONE}\n` +
     ORCHESTRATOR_PRIME_LINE
   );
 }

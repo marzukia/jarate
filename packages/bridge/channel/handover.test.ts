@@ -27,6 +27,7 @@ import {
   type HandoverPreparation,
   isHandoffFreshWindow,
   lastHandoffAt,
+  liveKickoffState,
   loadPreviousHandover,
   ORCHESTRATOR_PRIME_LINE,
   parseKickoff,
@@ -766,23 +767,132 @@ describe("parseKickoff", () => {
     "1. do the thing",
     "2. and this",
   ].join("\n");
-  test("4 lines: mission, in-flight, last ask (NEWEST) + orchestrator priming", () => {
+  test("5 lines: mission, in-flight, last ask (NEWEST), scheduled + orchestrator priming", () => {
     const k = parseKickoff(doc);
     const lines = k.split("\n");
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[1]).toBe("In-flight: Wiring the compact handler.");
     // MINOR-1: the pending ask is the newest (line 2), not the oldest.
     expect(lines[2]).toBe("Last ask: 2. and this");
+    // issue #140: no live task store → (none); never doc-scraped.
+    expect(lines[3]).toBe("Scheduled: (none)");
     // issue #134: the fresh session re-learns its orchestrator role.
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
   });
   test("missing sections → (none) lines", () => {
     const k = parseKickoff("# bare doc\nno sections");
     const lines = k.split("\n");
-    expect(lines).toHaveLength(4);
+    expect(lines).toHaveLength(5);
     expect(lines[0]).toContain("(none)");
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[3]).toBe("Scheduled: (none)");
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+});
+
+// ─── issue #140: boot seed loses pending scheduled tasks ────────────────────
+
+describe("parseKickoff scheduled tasks (issue #140)", () => {
+  // Pre-fix doc shape: no scheduled section anywhere, and the pending task
+  // only shows up as a CONSUMED [task] fire in the inbound asks.
+  const doc = [
+    "# Handover - 2026-10-04 · session s · 100k tokens → handoff",
+    "",
+    "## State",
+    "- dispatch:",
+    "  (none)",
+    "- todos:",
+    "  (none)",
+    "",
+    "## Last user asks",
+    "1. [task] one-shot task due 2026-10-04 06:00 UTC: fire the morning check",
+  ].join("\n");
+  const taskLine =
+    "- m3x2k9-ab12 · franky · at 2026-10-04T06:00:00.000Z · next 2026-10-04T06:00:00.000Z (in 5h) · check the build";
+
+  test("live.scheduledText present → Scheduled line verbatim", () => {
+    const k = parseKickoff(doc, { scheduledText: taskLine });
+    expect(k.split("\n")[3]).toBe(`Scheduled: ${taskLine}`);
+  });
+  test("multiple tasks → every line carried under Scheduled", () => {
+    const k = parseKickoff(doc, {
+      scheduledText: `${taskLine}\n- cron-1-x · franky · cron "0 6 * * *" (system tz) · next 2026-10-05T06:00:00.000Z (in 15h) · run the fleet check`,
+    });
+    const lines = k.split("\n");
+    expect(lines[3]).toBe(`Scheduled: ${taskLine}`);
+    expect(lines[4]).toContain("- cron-1-x ·");
+    expect(lines[5]).toBe(ORCHESTRATOR_PRIME_LINE);
+  });
+  test("absent and explicit null → Scheduled: (none)", () => {
+    expect(parseKickoff(doc).split("\n")[3]).toBe("Scheduled: (none)");
+    expect(parseKickoff(doc, { scheduledText: null }).split("\n")[3]).toBe(
+      "Scheduled: (none)",
+    );
+    expect(parseKickoff(doc, { scheduledText: "" }).split("\n")[3]).toBe(
+      "Scheduled: (none)",
+    );
+  });
+  test("never doc-scraped: a doc State box with scheduled lines does not leak", () => {
+    const fakeDoc = [
+      "# Handover - 2026-10-04 · session s · 100k tokens → handoff",
+      "",
+      "## State",
+      "- scheduled:",
+      "- ghost-1 · franky · at 2026-10-04T06:00:00.000Z · next 2026-10-04T06:00:00.000Z (in 5h) · ghost prompt",
+    ].join("\n");
+    // no live state at all: doc-scraping would surface the ghost line
+    expect(parseKickoff(fakeDoc).split("\n")[3]).toBe("Scheduled: (none)");
+    // and the pre-fix doc without any scheduled section contributes nothing
+    expect(parseKickoff(doc).split("\n")[3]).toBe("Scheduled: (none)");
+  });
+});
+
+describe("boardSummaryLine open-only math (issue #140)", () => {
+  const doc = "# Handover - 2026-10-04 · session s · 100k tokens → handoff\n";
+  // renderBoardPlain shape: pending '├ c', in-progress '┣ c',
+  // completed '├ ~~c~~' — 6 open + 5 completed = 11 gutter items.
+  const board = [
+    "┌ todos · 6 open",
+    "├ open one",
+    "├ open two",
+    "┣ open three",
+    "├ open four",
+    "├ open five",
+    "├ open six",
+    "├ ~~done one~~",
+    "├ ~~done two~~",
+    "├ ~~done three~~",
+    "├ ~~done four~~",
+    "├ ~~done five~~",
+    "└",
+  ].join("\n");
+  test("6 open + 5 completed → '6 open: <3 open items> (+3 more)'", () => {
+    const k = parseKickoff(doc, { todoBoard: board });
+    // the old total-based math rendered '(+8 more)' (11 - 3) and read as
+    // 14 open; now the extra is open-only: max(0, 6 - 3) = 3.
+    expect(k.split("\n")[0]).toBe(
+      "Mission: 6 open: open one; open two; open three (+3 more)",
+    );
+  });
+  test("shown items are open ones, never completed", () => {
+    // 2 open first, then completed items: only the open two are shown
+    const b = [
+      "┌ todos · 2 open",
+      "├ open a",
+      "├ open b",
+      "├ ~~done c~~",
+      "├ ~~done d~~",
+      "└",
+    ].join("\n");
+    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
+      "Mission: 2 open: open a; open b",
+    );
+  });
+  test("no header → open-item count fallback, shown items still open", () => {
+    const b = ["├ open a", "├ open b", "├ ~~done c~~", "└"].join("\n");
+    expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
+      "Mission: 2 todos: open a; open b",
+    );
   });
 });
 
@@ -866,7 +976,7 @@ describe("parseKickoff live state (issue #134)", () => {
     const lines = k.split("\n");
     expect(lines[0]).toBe("Mission: (none)");
     expect(lines[1]).toBe("In-flight: (none)");
-    expect(lines[3]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
   });
   test("multiple in-flight jobs → '; '-joined on one line", () => {
     const multi = [
@@ -955,12 +1065,13 @@ describe("buildSeedKickoff (F4/F8)", () => {
     const home = "/home/monky";
     const k = buildSeedKickoff(doc, "~/.jarate/handovers", home);
     const lines = k.split("\n");
-    // preamble + 4-line digest + the read instruction
+    // preamble + 5-line digest + the read instruction
     expect(lines[1]).toBe("Mission: Ship the bridge with tests.");
     expect(lines[2]).toBe("In-flight: Wiring the compact handler.");
     expect(lines[3]).toBe("Last ask: 1. do the thing");
-    expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
-    expect(lines[5]).toBe(
+    expect(lines[4]).toBe("Scheduled: (none)");
+    expect(lines[5]).toBe(ORCHESTRATOR_PRIME_LINE);
+    expect(lines[6]).toBe(
       `Read ${path.join(home, ".jarate", "handovers", "latest.md")} before continuing. Answer the last pending user question if any.`,
     );
   });
@@ -1242,6 +1353,118 @@ describe("buildHandover", () => {
       now: NOW,
     });
     expect(doc).toContain("## Transcript");
+  });
+
+  test("doc State box carries the pending task (issue #140)", async () => {
+    // HOME is tmp: write the task store the way tasks.test.ts does it.
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "tasks.json"),
+      JSON.stringify({
+        tasks: [
+          {
+            id: "m3x2k9-ab12",
+            channelId: "ch1",
+            channelName: "franky",
+            prompt: "fire the morning check",
+            kind: "at",
+            atMs: NOW.getTime() + 5 * 3600_000,
+            createdAt: NOW.getTime(),
+            nextFireAt: NOW.getTime() + 5 * 3600_000,
+            status: "pending",
+          },
+        ],
+      }),
+    );
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      pi,
+      settings: settings(),
+      now: NOW,
+    });
+    expect(doc).toContain("- scheduled:");
+    expect(doc).toContain("m3x2k9-ab12");
+    expect(doc).toContain("fire the morning check");
+    // the scheduled block sits after dispatch, before todos
+    const iDispatch = doc.indexOf("- dispatch:");
+    const iScheduled = doc.indexOf("- scheduled:");
+    const iTodos = doc.indexOf("- todos:");
+    expect(iDispatch).toBeGreaterThan(-1);
+    expect(iScheduled).toBeGreaterThan(iDispatch);
+    expect(iTodos).toBeGreaterThan(iScheduled);
+  });
+
+  test("empty task store → '- scheduled:' (none) in the doc State box", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      pi,
+      settings: settings(),
+      now: NOW,
+    });
+    expect(doc).toMatch(/- scheduled:\n {2}\(none\)/);
+  });
+});
+
+// ─── liveKickoffState: the task store enters the seed (issue #140) ─────────
+
+describe("liveKickoffState scheduled pipe (issue #140)", () => {
+  let tmp = "";
+  let oldHome = "";
+
+  const writeTasks = (tasks: unknown[]) => {
+    const dir = path.join(tmp, ".pi", "agent", "tasks");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "tasks.json"), JSON.stringify({ tasks }));
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-live-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+  });
+
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("pending + claimed tasks → scheduledText, cap 5 lines", () => {
+    const t = (id: string) => ({
+      id,
+      channelId: "ch1",
+      channelName: "franky",
+      prompt: `prompt for ${id}`,
+      kind: "at",
+      atMs: NOW.getTime() + 60_000,
+      createdAt: NOW.getTime(),
+      nextFireAt: NOW.getTime() + 60_000,
+      status: "pending",
+    });
+    const tasks: unknown[] = Array.from({ length: 7 }, (_, i) =>
+      t(`task-${i}`),
+    );
+    tasks.push({
+      ...t("claimed-1"),
+      status: "claimed",
+      claimedAt: NOW.getTime(),
+    });
+    writeTasks(tasks);
+    const lines = (liveKickoffState(tmp).scheduledText ?? "").split("\n");
+    expect(lines).toHaveLength(5); // cap 5
+    expect(lines[0]).toContain("task-0");
+    expect(lines[0]).toContain("prompt for task-0");
+  });
+  test("empty store → null", () => {
+    writeTasks([]);
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
+  });
+  test("missing file → null (a missing store cannot break the seed)", () => {
+    expect(liveKickoffState(tmp).scheduledText).toBeNull();
   });
 });
 

@@ -6813,8 +6813,10 @@ describe("handoff mechanism B (size-gated restart)", () => {
         "In-flight: 20261003-081922-478435 worker · 01:07:43",
       );
       expect(lines[3]).toBe("Last ask: 1. do the thing");
-      expect(lines[4]).toBe(ORCHESTRATOR_PRIME_LINE);
-      expect(lines[5]).toBe(
+      // issue #140: the hook carries no scheduledText → (none)
+      expect(lines[4]).toBe("Scheduled: (none)");
+      expect(lines[5]).toBe(ORCHESTRATOR_PRIME_LINE);
+      expect(lines[6]).toBe(
         `Read ${storeDir}/latest.md before continuing. Answer the last pending user question if any.`,
       );
       // marker consumed: a second boot cannot re-seed
