@@ -80,6 +80,12 @@
 #   background child every 30s ($PI_BG_HB_INTERVAL test override); the
 #   exit trap kills it so it never outlives the run. The watchdog: live
 #   process + hb stale > 10 min = STALLED (a hung run, distinct from DEAD).
+# Per-command bash tool timeout (issue #142): PI_BG_CMD_TIMEOUT (default
+#   900 s) is the per-bash-call cap wired into every task prompt (this pi
+#   version has no bash-tool default; the constraint tells the model to
+#   pass the tool's `timeout` parameter, which kills the whole command
+#   tree at the limit). The resolved value is exported to the run and
+#   stored in the run record (cmdTimeout).
 # Run record state (issue #51): "running" at dispatch, "done" on every
 #   trapped exit, "killed" when jarate-bg-kill finalizes the ticket.
 # Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live jarate-bg
@@ -451,11 +457,33 @@ else
   delivery="none"
   echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with jarate-wait" >&2
 fi
+# --- per-command bash tool timeout (issue #142) ---------------------------
+# A wedged tool call (20261004-140606-286112: ssh -> docker exec -i held
+# open 5h51m) blocks the pi session forever: the callback fires on exit
+# only, so the hang is invisible until someone looks. This pi version has
+# NO bash-tool default timeout (tool schema: "optional, no default
+# timeout"; no settings/env/profile hook), so the cap is wired through the
+# task prompt: STD_CONSTRAINTS tells the model to pass the bash tool's
+# `timeout` parameter, which kills the WHOLE command tree at the limit and
+# returns a retryable `timeout:<N>` error instead of blocking the session.
+# PI_BG_CMD_TIMEOUT overrides per dispatch (env at launch); the resolved
+# value is exported (visible to the run's bash commands) and stored in the
+# run record (cmdTimeout) for audit + test.
+CMD_TIMEOUT="${PI_BG_CMD_TIMEOUT:-900}"
+case "$CMD_TIMEOUT" in
+  '' | *[!0-9]*)
+    echo "[!] PI_BG_CMD_TIMEOUT='$CMD_TIMEOUT' is not a positive integer, using 900" >&2
+    CMD_TIMEOUT=900
+    ;;
+esac
+[ "$CMD_TIMEOUT" -ge 1 ] || CMD_TIMEOUT=900
+export PI_BG_CMD_TIMEOUT="$CMD_TIMEOUT"
+
 rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 mkdir -p "$rec_dir" 2>/dev/null
 PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_PROJECT="$pj_tag" \
 PI_BG_REC_CWD="$(pwd)" \
-PI_BG_REC_DELIVERY="$delivery" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' \
+PI_BG_REC_DELIVERY="$delivery" PI_BG_REC_CMD_TIMEOUT="$CMD_TIMEOUT" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' \
   || echo "[pi-bg] WARNING: run-record write failed ($run_id) - watchdog blind spot (issue #101)" >&2
 import datetime, json, os, sys
 rec = {
@@ -465,6 +493,7 @@ rec = {
     "cwd": os.environ["PI_BG_REC_CWD"],
     "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "delivery": os.environ["PI_BG_REC_DELIVERY"],
+    "cmdTimeout": int(os.environ.get("PI_BG_REC_CMD_TIMEOUT", "900")),
     "state": "running",
 }
 with open(sys.argv[1], "w") as fh:
@@ -1427,7 +1456,11 @@ PY
 # the combined prompt goes to pi via the per-run spawn file (pi reads it
 # on stdin); the pi child's argv is a short stable flag string with no
 # task prose, so ps / /proc/<pid>/cmdline cannot leak the prompt.
-STD_CONSTRAINTS=$'STANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Bound long commands with `timeout` (default 600s) unless the task says otherwise.'
+# second line carries the resolved per-command timeout (issue #142): the
+# bash tool's `timeout` PARAMETER (pi kills the whole command tree at the
+# limit; a wedged ssh/docker-exec child returns a retryable error instead
+# of holding the session open for hours)
+STD_CONSTRAINTS=$'STANDARD CONSTRAINTS (all tasks):\n- Never run commands that need a TTY interactively: use plain `podman exec` / `docker exec` (no -it), redirect output. An interactive child hung a 9h dispatch on 2026-09-10.\n- Pass timeout: '"$CMD_TIMEOUT"' (seconds) on every bash tool call unless the task says otherwise. At the limit pi kills the whole command tree and returns a retryable error - a wedged child must not hang the session (issue #142).'
 pi_flags=( "$@" )
 SPAWN_F="$BG_TMP/pi-bg-${run_id}-spawn.md"
 { printf '%s' "$task"; printf '\n\n%s' "$STD_CONSTRAINTS"; } > "$SPAWN_F" 2>/dev/null
