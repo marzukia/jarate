@@ -404,12 +404,26 @@ describe("one-callback discipline", () => {
       const cb = f.fd.callbacksFor("i-app");
       expect(cb).toBe(1);
       expect(f.fd.callbackSpent.has("i-app")).toBe(true);
-      // The approved edit carries components: [] and the approved text.
+      // The approved edit carries components: [], the next-command content
+      // line, and the green approved embed (title + footer id + claim field).
       const edits = f.fd.messageEdits();
       expect(edits.length).toBe(1);
       expect(edits[0].body.components).toEqual([]);
-      expect(edits[0].body.content).toContain("[ok] PAT approved");
-      expect(edits[0].body.content).toContain(req.id);
+      expect(edits[0].body.content).toBe(`jarate pat-run ${req.id} -- <cmd>`);
+      const em = edits[0].body.embeds[0];
+      expect(em.title).toBe("PAT approved - monky");
+      expect(em.color).toBe(0x2ecc71);
+      expect(em.footer.text).toBe(req.id);
+      expect(em.fields).toContainEqual({
+        name: "scope",
+        value: "marzukia/jarate:write",
+        inline: true,
+      });
+      const claim = em.fields.find((x: any) => x.name === "claim");
+      expect(claim.inline).toBe(false);
+      expect(claim.value).toMatch(
+        /^claim by \d{2}:\d{2}:\d{2}Z \(\d+s, single use\)$/,
+      );
       // No followup needed on success, but the Thinking ack must be gone.
       expect(f.fd.followups().length).toBe(0);
       expect(f.fd.ackDeletes()).toBe(1);
@@ -521,8 +535,11 @@ describe("one-callback discipline", () => {
       const edits = f.fd.messageEdits();
       expect(edits.length).toBe(1);
       expect(edits[0].body.components).toEqual([]);
-      expect(edits[0].body.content).toContain("[denied] PAT request");
-      expect(edits[0].body.content).toContain("Owner");
+      expect(edits[0].body.content).toBe("denied by Owner");
+      const em = edits[0].body.embeds[0];
+      expect(em.title).toBe("PAT denied - monky");
+      expect(em.color).toBe(0xe74c3c);
+      expect(em.footer.text).toBe(req.id);
       expect(f.st.requests.get(req.id)!.state).toBe("denied");
       expect(f.st.requests.get(req.id)!.deniedBy).toBe(OWNER);
       expect(f.fd.ackDeletes()).toBe(1);
@@ -604,15 +621,29 @@ describe("state machine", () => {
     const f = mkVault();
     try {
       await f.h.ready;
-      // Request post shape.
+      // Request post shape: short content line + pending embed + buttons.
       const req = await makePending(f, "marzukia/jarate:write");
       const posts = f.fd.channelPosts();
       expect(posts.length).toBe(1);
       const posted = posts[0].body;
-      expect(posted.content).toContain("[pending] PAT request — monky");
-      expect(posted.content).toContain("scope: marzukia/jarate:write");
-      expect(posted.content).toContain("reason: open PR for #41");
-      expect(posted.content).toContain("[ Approve ] [ Deny ]");
+      expect(posted.content).toBe("tap Approve or Deny");
+      const em = posted.embeds[0];
+      expect(em.title).toBe("PAT request - monky");
+      expect(em.color).toBe(0xf1c40f);
+      expect(em.fields).toContainEqual({
+        name: "scope",
+        value: "marzukia/jarate:write",
+        inline: true,
+      });
+      expect(em.fields).toContainEqual({
+        name: "reason",
+        value: "open PR for #41",
+        inline: false,
+      });
+      expect(em.footer.text).toContain(req.id);
+      expect(em.footer.text).toMatch(
+        /^expires \d{2}:\d{2}:\d{2}Z \(1200ms\) · /,
+      );
       const btns = posted.components[0].components;
       expect(btns).toHaveLength(2);
       expect(btns[0]).toEqual({
@@ -685,6 +716,33 @@ describe("state machine", () => {
     }
   });
 
+  test("request embed keeps a markdown-heavy reason verbatim in its field", async () => {
+    const f = mkVault();
+    try {
+      const reason = "gh pr for _issue_42* with *stars* and snake_case ids";
+      const req = await makePending(
+        f,
+        "marzukia/jarate:write",
+        "monky",
+        reason,
+      );
+      const posted = f.fd.channelPosts()[0].body;
+      const em = posted.embeds[0];
+      const rf = em.fields.find((x: any) => x.name === "reason");
+      expect(rf).toBeDefined();
+      // The `_`/`*` must arrive UNMANGLED in the field value.
+      expect(rf.value).toBe(reason);
+      expect(rf.inline).toBe(false);
+      expect(em.title).toBe("PAT request - monky");
+      // The content line stays bare: no reason text, no hint line.
+      expect(posted.content).toBe("tap Approve or Deny");
+      expect(posted.content).not.toContain("Approve ] [ Deny");
+      expect(em.footer.text).toContain(req.id);
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("classic token (default scope) handoff", async () => {
     const f = mkVault();
     try {
@@ -722,7 +780,11 @@ describe("state machine", () => {
       const edits = f.fd.messageEdits();
       expect(edits.length).toBe(1);
       expect(edits[0].body.components).toEqual([]);
-      expect(edits[0].body.content).toContain("[expired] PAT request");
+      expect(edits[0].body.content).toBe("unanswered (1200ms)");
+      const em = edits[0].body.embeds[0];
+      expect(em.title).toBe("PAT expired - monky");
+      expect(em.color).toBe(0x95a5a6);
+      expect(em.footer.text).toBe(req.id);
       expect(f.auditLines().some((l) => l.includes("event=expire-ttl"))).toBe(
         true,
       );
@@ -744,6 +806,14 @@ describe("state machine", () => {
       expect(f.st.requests.get(req.id)!.state).toBe("expired");
       expect(f.st.requests.get(req.id)!.expiredKind).toBe("claim");
       expect(fs.existsSync(pub)).toBe(false);
+      const edits = f.fd.messageEdits();
+      expect(edits.length).toBe(2); // approve edit + claim-expired edit
+      const last = edits[edits.length - 1].body;
+      expect(last.components).toEqual([]);
+      expect(last.content).toBe("claim window missed");
+      expect(last.embeds[0].title).toBe("PAT expired - monky");
+      expect(last.embeds[0].color).toBe(0x95a5a6);
+      expect(last.embeds[0].footer.text).toBe(req.id);
       expect(f.auditLines().some((l) => l.includes("event=expire-claim"))).toBe(
         true,
       );
@@ -1006,7 +1076,7 @@ describe("robustness", () => {
       );
       expect(c).toContain(`path: ${p}`);
       expect(c).toContain(
-        "restore the file, then re-tap — or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
+        "restore the file, then re-tap - or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
       );
       // No transition, no publish, no censor registration.
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
@@ -1060,7 +1130,7 @@ describe("robustness", () => {
       );
       expect(c).toContain(`path: ${p}`);
       expect(c).toContain(
-        "restore the file, then re-tap — or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
+        "restore the file, then re-tap - or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
       );
       // No transition; the request stays pending for a re-tap after the
       // restore (the old bug: socket taps always succeeded, then the
@@ -1906,7 +1976,7 @@ describe("patRunBegin / patStatus unit", () => {
       expect(r.ok).toBe(false);
       // Executable error: names the path + the exact next command.
       expect(r.error).toBe(
-        `scope: token file missing: ${p} — restore the file, then re-run: ` +
+        `scope: token file missing: ${p} - restore the file, then re-run: ` +
           `\`jarate pat-run ${req.id} -- <cmd>\`; if the claim window has ` +
           `passed, re-request: \`jarate pat-request marzukia/jarate:write <reason>\``,
       );
@@ -1942,7 +2012,7 @@ describe("patRunBegin / patStatus unit", () => {
       });
       expect(r.ok).toBe(false);
       expect(r.error).toBe(
-        `scope: token shape invalid: ${p} — fix the token (one line, 0600), ` +
+        `scope: token shape invalid: ${p} - fix the token (one line, 0600), ` +
           `then re-run: \`jarate pat-run ${req.id} -- <cmd>\`; if the claim ` +
           `window has passed, re-request: \`jarate pat-request marzukia/jarate:write <reason>\``,
       );

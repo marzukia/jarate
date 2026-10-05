@@ -489,7 +489,7 @@ function settleTtl(st: PatVaultState, id: string): void {
   req.expiredKind = "ttl";
   audit(st, "expire-ttl", base(req));
   persist(st);
-  void editRequestMessage(st, req, ttlExpiredText(st, req));
+  void editRequestMessage(st, req, ttlExpiredText(st), [], "expired");
 }
 
 function settleClaim(st: PatVaultState, id: string): void {
@@ -500,7 +500,7 @@ function settleClaim(st: PatVaultState, id: string): void {
   if (st.transport === "file") unlinkPublished(st, id);
   audit(st, "expire-claim", base(req));
   persist(st);
-  void editRequestMessage(st, req, claimExpiredText(st, req));
+  void editRequestMessage(st, req, claimExpiredText(), [], "expired");
 }
 
 function armTtl(st: PatVaultState, req: PatRequest): void {
@@ -569,39 +569,76 @@ function buttonRow(id: string): Array<Record<string, unknown>> {
   ];
 }
 
-function postText(st: PatVaultState, req: PatRequest): string {
-  return [
-    `[pending] PAT request — ${req.agent}`,
-    `scope: ${req.scope}`,
-    `reason: ${req.reason}`,
-    `expires: ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)})`,
-    "[ Approve ] [ Deny ]",
-  ].join("\n");
+// ─── Discord message (embed) ───────────────────────────────────────────────
+// Mirrors vault.ts (2026-10-01, Andryo): request/status messages ship as a
+// Discord embed ("proper chat container"), not a wall of plain text. Content
+// line stays short + copyable; all detail lives in the embed.
+
+const EMBED_COLOR: Record<string, number> = {
+  pending: 0xf1c40f,
+  approved: 0x2ecc71,
+  denied: 0xe74c3c,
+  expired: 0x95a5a6,
+};
+
+/** Embed for the request/status message. `status` selects title + color.
+ *  The free-text reason rides in an embed field (mirrors vault.ts), so it
+ *  never sits bare in the content line. */
+function patEmbed(
+  st: PatVaultState,
+  req: PatRequest,
+  status: string,
+): Record<string, unknown> {
+  const fields: Array<Record<string, unknown>> = [
+    { name: "scope", value: String(req.scope), inline: true },
+  ];
+  if (status === "pending") {
+    fields.push({
+      name: "reason",
+      value: String(req.reason || "-"),
+      inline: false,
+    });
+  }
+  if (status === "approved") {
+    fields.push({
+      name: "claim",
+      value: `claim by ${timeOfDay(
+        req.claimDeadline ?? req.ttlDeadline,
+      )}Z (${Math.round(st.claimMs / 1000)}s, single use)`,
+      inline: false,
+    });
+  }
+  const titles: Record<string, string> = {
+    pending: `PAT request - ${req.agent}`,
+    approved: `PAT approved - ${req.agent}`,
+    denied: `PAT denied - ${req.agent}`,
+    expired: `PAT expired - ${req.agent}`,
+  };
+  let footer = req.id;
+  if (status === "pending")
+    footer = `expires ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)}) · ${req.id}`;
+  return {
+    title: titles[status] ?? titles.pending,
+    color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
+    fields,
+    footer: { text: footer },
+  };
 }
 
-function approvedText(st: PatVaultState, req: PatRequest): string {
-  return [
-    `[ok] PAT approved — ${req.agent} (${req.id})`,
-    `scope: ${req.scope}`,
-    `claim by ${timeOfDay(req.claimDeadline ?? req.ttlDeadline)}Z (${Math.round(
-      st.claimMs / 1000,
-    )}s, single use)`,
-    `jarate pat-run ${req.id} -- <cmd>`,
-  ].join("\n");
+function approvedText(req: PatRequest): string {
+  return `jarate pat-run ${req.id} -- <cmd>`;
 }
 
-function deniedText(req: PatRequest, username: string): string {
-  return `[denied] PAT request ${req.id} — ${username}`;
+function deniedText(username: string): string {
+  return `denied by ${username}`;
 }
 
-function ttlExpiredText(st: PatVaultState, req: PatRequest): string {
-  return `[expired] PAT request ${req.id} unanswered (${ttlMinutes(st)})`;
+function ttlExpiredText(st: PatVaultState): string {
+  return `unanswered (${ttlMinutes(st)})`;
 }
 
-function claimExpiredText(st: PatVaultState, req: PatRequest): string {
-  return `[expired] PAT ${req.id} not claimed within ${Math.round(
-    st.claimMs / 1000,
-  )}s`;
+function claimExpiredText(): string {
+  return "claim window missed";
 }
 
 /** Approve-tap followup for a dead scope token file: NON-ephemeral (the
@@ -630,7 +667,7 @@ function tapTokenFileText(
   return [
     `[!] approve blocked: ${label[chk.kind]} for ${req.scope}`,
     `path: ${p}`,
-    `${fix[chk.kind]} — or re-request: ` +
+    `${fix[chk.kind]} - or re-request: ` +
       `\`jarate pat-request ${req.scope} <reason>\``,
   ].join("\n");
 }
@@ -651,21 +688,25 @@ function runTokenFileError(
     shape: "fix the token (one line, 0600), then re-run",
   };
   return (
-    `scope: ${chk.error} — ${fix[chk.kind]}: ` +
+    `scope: ${chk.error} - ${fix[chk.kind]}: ` +
     `\`jarate pat-run ${req.id} -- <cmd>\`; if the claim window has ` +
     `passed, re-request: \`jarate pat-request ${req.scope} <reason>\``
   );
 }
 
-/** Edit the request's button message; components: [] kills the buttons. */
+/** Edit the request's button message; components: [] kills the buttons;
+ *  the embed is replaced in place so the color tracks the status. */
 async function editRequestMessage(
   st: PatVaultState,
   req: PatRequest,
   text: string,
+  components: Array<Record<string, unknown>> = [],
+  status: string = "pending",
 ): Promise<void> {
   if (!req.messageId) return;
   const res = await editDiscordMessage(st.ch, req.messageId, text, {
-    components: [],
+    components,
+    embeds: [patEmbed(st, req, status)],
   });
   if (!res.success) {
     console.error(`[pat-vault] edit failed for ${req.id}:`, res.error);
@@ -750,8 +791,9 @@ export async function patRequest(
   };
   st.requests.set(id, req);
 
-  const res = await sendDiscordMessage(st.ch, postText(st, req), {
+  const res = await sendDiscordMessage(st.ch, "tap Approve or Deny", {
     components: buttonRow(id),
+    embeds: [patEmbed(st, req, "pending")],
   });
   if (!res.success) {
     st.requests.delete(id);
@@ -1215,7 +1257,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         armClaim(st, req);
         audit(st, "approve", base(req), { user: uid });
         persist(st);
-        await editRequestMessage(st, req, approvedText(st, req));
+        await editRequestMessage(st, req, approvedText(req), [], "approved");
       } else {
         req.state = "denied";
         req.deniedBy = uid;
@@ -1224,7 +1266,9 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         await editRequestMessage(
           st,
           req,
-          deniedText(req, String(d.user?.username ?? uid)),
+          deniedText(String(d.user?.username ?? uid)),
+          [],
+          "denied",
         );
       }
       await deleteDeferredAck(st.botToken, d);
@@ -1258,7 +1302,7 @@ function load(st: PatVaultState): void {
         r.state = "expired";
         r.expiredKind = "ttl";
         audit(st, "recovered-expired", base(r));
-        void editRequestMessage(st, r, ttlExpiredText(st, r));
+        void editRequestMessage(st, r, ttlExpiredText(st), [], "expired");
       } else {
         armTtl(st, r);
       }
@@ -1268,7 +1312,7 @@ function load(st: PatVaultState): void {
         r.expiredKind = "claim";
         if (st.transport === "file") unlinkPublished(st, id);
         audit(st, "recovered-expired", base(r));
-        void editRequestMessage(st, r, claimExpiredText(st, r));
+        void editRequestMessage(st, r, claimExpiredText(), [], "expired");
       } else {
         armClaim(st, r);
       }
