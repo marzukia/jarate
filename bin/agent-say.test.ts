@@ -15,6 +15,7 @@
  *     channel usually do not address the peer)
  */
 import { describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,6 +27,7 @@ interface Fixture {
   tmp: string;
   home: string;
   bin: string;
+  rt: string;
   capture: string;
   stdinCapture: string;
   env: Record<string, string>;
@@ -43,8 +45,10 @@ function fixture(): Fixture {
   const bin = path.join(tmp, "bin");
   const capture = path.join(tmp, "curl-args.txt");
   const stdinCapture = path.join(tmp, "curl-stdin.txt");
+  const rt = path.join(tmp, "rt"); // isolated XDG_RUNTIME_DIR (outbox home)
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
+  fs.mkdirSync(rt, { recursive: true });
 
   // bot token source — .channel is the caller's own Discord channel id
   // (used by the self-channel guard to reject agent-say to yourself)
@@ -66,10 +70,13 @@ function fixture(): Fixture {
 
   // stub curl: record every arg (one per line) + the full stdin (issue #120:
   // the token now rides a curl config on stdin, not argv), answer with a msg id
+  // that INCREMENTS per call (99, 100, ...): a dedupe test re-running agent-say
+  // can tell a fresh POST (new id) from the receipt's id being re-echoed.
+  // APPENDS to the capture so POSTs are countable across re-runs.
   const curl = path.join(bin, "curl");
   fs.writeFileSync(
     curl,
-    `#!/bin/sh\n{ for a in "$@"; do printf '%s\\n' "$a"; done; } > "$CURL_CAPTURE"\ncat > "$CURL_STDIN_CAPTURE"\necho '{"id":"99"}'\n`,
+    `#!/bin/sh\n{ for a in "$@"; do printf '%s\\n' "$a"; done; } >> "$CURL_CAPTURE"\ncat > "$CURL_STDIN_CAPTURE"\nn=$(cat "$CURL_CALLS" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CURL_CALLS"\necho "{\\"id\\":\\"$((98+n))\\"}"\n`,
   );
   fs.chmodSync(curl, 0o755);
 
@@ -83,6 +90,8 @@ function fixture(): Fixture {
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.CURL_CAPTURE = capture;
   env.CURL_STDIN_CAPTURE = stdinCapture;
+  env.CURL_CALLS = path.join(tmp, "curl-calls.txt");
+  env.XDG_RUNTIME_DIR = rt;
   delete env.PI_BOT_TOKEN;
 
   const peersFile = path.join(home, ".config", "agent-fleet", "peers.json");
@@ -121,7 +130,7 @@ function fixture(): Fixture {
     return { code, out, err };
   };
 
-  return { tmp, home, bin, capture, stdinCapture, env, setPeers, run };
+  return { tmp, home, bin, rt, capture, stdinCapture, env, setPeers, run };
 }
 
 const curlUrl = (capture: string): string =>
@@ -131,6 +140,32 @@ const curlUrl = (capture: string): string =>
         .split("\n")
         .find((l) => l.startsWith("https://discord.com")) ?? "")
     : "";
+
+// count of POST lines captured across (possibly) several agent-say runs —
+// the dedupe tests' "was a second POST made" oracle
+const postCount = (capture: string): number =>
+  fs.existsSync(capture)
+    ? fs
+        .readFileSync(capture, "utf8")
+        .split("\n")
+        .filter((l) => l.startsWith("https://discord.com")).length
+    : 0;
+
+const outboxPath = (rt: string): string =>
+  path.join(rt, "jarate", "agent-say-outbox.jsonl");
+
+const readOutbox = (rt: string): Array<Record<string, unknown>> =>
+  fs.existsSync(outboxPath(rt))
+    ? fs
+        .readFileSync(outboxPath(rt), "utf8")
+        .trim()
+        .split("\n")
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l))
+    : [];
+
+const sha256 = (s: string): string =>
+  crypto.createHash("sha256").update(s).digest("hex");
 
 describe("agent-say peer resolution (#45)", () => {
   test("numeric channel id of a known peer sends", async () => {
@@ -355,5 +390,90 @@ describe("agent-say recipient reference nudge (2026-09-20 incident)", () => {
     );
     expect(r.code).toBe(0);
     expect(r.err).toContain("[warn]");
+  });
+});
+
+describe("agent-say outbox dedupe (2026-10-06 abort incident)", () => {
+  const PEERS: Record<string, string> = {
+    monky: "1111111111111111111",
+    frank: "2222222222222222222",
+  };
+
+  test("t1: first post writes an outbox receipt {channel, text_sha256, id, ts}", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    const r = await f.run(["1111111111111111111", "hello monky"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("sent 99");
+    expect(fs.existsSync(outboxPath(f.rt))).toBe(true);
+    const box = readOutbox(f.rt);
+    expect(box.length).toBe(1);
+    expect(box[0].channel).toBe("1111111111111111111");
+    expect(box[0].id).toBe("99");
+    expect(typeof box[0].ts).toBe("number");
+    // hash of the exact text that was sent (post-censor; censor is a no-op stub)
+    expect(box[0].text_sha256).toBe(sha256("hello monky"));
+  });
+
+  test("t2: identical channel+text within 60s -> no second POST, receipt id printed, rc 0", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    const r1 = await f.run(["1111111111111111111", "hello monky"]);
+    expect(r1.code).toBe(0);
+    expect(r1.out.trim()).toBe("sent 99");
+    expect(postCount(f.capture)).toBe(1);
+    const r2 = await f.run(["1111111111111111111", "hello monky"]);
+    expect(r2.code).toBe(0);
+    // identical shape + the RECEIPT's id (99) — a fresh POST would have
+    // answered 100, so this proves the receipt id was re-echoed, not a
+    // second post
+    expect(r2.out.trim()).toBe("sent 99");
+    expect(postCount(f.capture)).toBe(1);
+    // the dedupe path writes no second receipt
+    expect(readOutbox(f.rt).length).toBe(1);
+  });
+
+  test("t3: different text within the window still posts", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    expect((await f.run(["1111111111111111111", "hello monky"])).code).toBe(0);
+    const r2 = await f.run(["1111111111111111111", "hello monky, round two"]);
+    expect(r2.code).toBe(0);
+    expect(r2.out.trim()).toBe("sent 100");
+    expect(postCount(f.capture)).toBe(2);
+    expect(readOutbox(f.rt).length).toBe(2);
+  });
+
+  test("t4: receipt older than 60s is stale -> posts again", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    // seed a stale receipt (61s old) for the same channel + text
+    const box = outboxPath(f.rt);
+    fs.mkdirSync(path.dirname(box), { recursive: true });
+    fs.writeFileSync(
+      box,
+      JSON.stringify({
+        channel: "1111111111111111111",
+        text_sha256: sha256("hello monky"),
+        id: "77",
+        ts: Math.floor(Date.now() / 1000) - 61,
+      }) + "\n",
+    );
+    const r = await f.run(["1111111111111111111", "hello monky"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("sent 99"); // the fresh post, not the stale receipt (77)
+    expect(postCount(f.capture)).toBe(1);
+    // the fresh receipt was appended after the stale one
+    expect(readOutbox(f.rt).length).toBe(2);
+  });
+
+  test("t5: same text to a DIFFERENT channel still posts (dedupe is per-channel)", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    expect((await f.run(["1111111111111111111", "hello monky"])).code).toBe(0);
+    const r2 = await f.run(["2222222222222222222", "hello monky"]);
+    expect(r2.code).toBe(0);
+    expect(r2.out.trim()).toBe("sent 100");
+    expect(postCount(f.capture)).toBe(2);
   });
 });
