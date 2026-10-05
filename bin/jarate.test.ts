@@ -2353,10 +2353,10 @@ exit 1
       cost_usd: 0.01,
     });
     const r0 = hopStubs(f);
-    const r = await f.run(
-      ["projects", "--agent", ODD],
-      { ...hopEnv(f), JARATE_AGENT_HOMES: `${f.home}:${oddHome}` },
-    );
+    const r = await f.run(["projects", "--agent", ODD], {
+      ...hopEnv(f),
+      JARATE_AGENT_HOMES: `${f.home}:${oddHome}`,
+    });
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
