@@ -973,9 +973,25 @@ export async function runMidRunInterrupt(
       consumeQueuedAck(channelId, messageId);
       // Re-wake vehicle: this run's agent_end deferred to us, so if we are
       // dropped, no run exists to re-wake the deferred entries. Kick the
-      // oldest one now when idle (no-op while a run is active — its
+      // oldest one when idle (no-op while a run is active — its
       // agent_end owns delivery; the compaction-drain path covers
       // compaction-abort, drainQueuedAfterCompact).
+      // #124: the one-shot isIdle() check raced the agent_end handler
+      // window — pi clears the run flag only AFTER the awaited agent_end
+      // handler resolves (_emitAgentSettled), and /stop can land inside
+      // that window after the handler already deferred its re-wake to us.
+      // A check at the cancel instant then sees false, skips the kick, and
+      // the deferred entry orphans (the deferral is one-shot). Poll for
+      // settle (same cadence and cap as the settle loop above) so the
+      // kick lands on the first idle tick instead of at the cancel
+      // instant. The pop is atomic: if a run starts meanwhile, its
+      // agent_end owns the queue and the kick finds nothing — no
+      // double-wake.
+      if (!ctx.isIdle()) {
+        for (let i = 0; i < 4800 && !ctx.isIdle(); i++) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      }
       if (ctx.isIdle()) {
         const queued = popOldestQueuedInbound();
         if (queued)
