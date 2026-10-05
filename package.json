@@ -1,7 +1,7 @@
 {
   "name": "jarate",
   "private": true,
-  "description": "Monorepo for the pi + bridge agent stack: @jarate/bridge, pi-bg dispatch, agent-say, installer.",
+  "description": "Monorepo for the pi + bridge agent stack: @jarate/bridge, jarate-bg dispatch, agent-say, installer.",
   "license": "MIT",
   "workspaces": [
     "packages/*"

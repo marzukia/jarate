@@ -46,6 +46,23 @@ function run(
 // ─── parseJobsFromPs (moved from index.test.ts) ──────────────────────────
 
 describe("parseJobsFromPs (/jobs)", () => {
+  test("parses jarate-bg wrapper lines (#151 rename) + still parses pi-bg (shim era)", () => {
+    const ps = [
+      "4194003 00:11 /usr/bin/bash /home/monky/scripts/jarate-bg worker post-rename dispatch",
+      "4194004 00:12 /usr/bin/bash /home/monky/scripts/pi-bg worker shim-era dispatch",
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps)).toEqual([
+      {
+        id: null,
+        age: "00:11",
+        profile: "worker",
+        task: "post-rename dispatch",
+      },
+      { id: null, age: "00:12", profile: "worker", task: "shim-era dispatch" },
+    ]);
+  });
+
   test("parses wrapper lines: pid, age, profile, task; dead pid => id null", () => {
     const ps = [
       "4194001 00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
@@ -655,7 +672,9 @@ describe("pi-bg-tail", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(TAIL, [], env(home));
     expect(r.code).toBe(2);
-    expect(r.err).toContain("usage: pi-bg-tail");
+    // #151: TAIL is now the pi-bg-tail deprecation shim; the usage line
+    // comes from jarate-bg-tail (the deprecation line rides along in err).
+    expect(r.err).toContain("usage: jarate-bg-tail");
   });
 
   test("-f follows: emits current content, stays alive until killed", async () => {
@@ -807,7 +826,9 @@ describe("pi-bg-kill", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(KILL, [], env());
     expect(r.code).toBe(2);
-    expect(r.err).toContain("usage: pi-bg-kill");
+    // #151: KILL is now the pi-bg-kill deprecation shim; the usage line
+    // comes from jarate-bg-kill (the deprecation line rides along in err).
+    expect(r.err).toContain("usage: jarate-bg-kill");
   });
 });
 

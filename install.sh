@@ -7,11 +7,18 @@
 #   3. bun install in packages/bridge (deps only; node_modules is gitignored,
 #      machine-local)
 #   4. makes machine paths POINTERS (symlinks) into the checkout:
-#        ~/scripts/pi-bg     -> <jarate>/dispatch/pi-bg
-#        ~/scripts/pi-wait   -> <jarate>/dispatch/pi-wait
-#        ~/scripts/pi-bg-tail -> <jarate>/dispatch/pi-bg-tail
-#        ~/scripts/pi-bg-kill -> <jarate>/dispatch/pi-bg-kill
-#        ~/scripts/pi-bg-watchdog -> <jarate>/dispatch/pi-bg-watchdog
+#        dispatch family (issue #151) — 5 jarate-* entrypoints + 5 pi-*
+#        deprecation shims, each linked into BOTH ~/.local/bin and ~/scripts:
+#        {~/.local/bin,~/scripts}/jarate-bg      -> <jarate>/dispatch/jarate-bg
+#        {~/.local/bin,~/scripts}/jarate-wait    -> <jarate>/dispatch/jarate-wait
+#        {~/.local/bin,~/scripts}/jarate-bg-tail -> <jarate>/dispatch/jarate-bg-tail
+#        {~/.local/bin,~/scripts}/jarate-bg-kill -> <jarate>/dispatch/jarate-bg-kill
+#        {~/.local/bin,~/scripts}/jarate-bg-watchdog -> <jarate>/dispatch/jarate-bg-watchdog
+#        {~/.local/bin,~/scripts}/pi-bg          -> <jarate>/dispatch/pi-bg (shim)
+#        {~/.local/bin,~/scripts}/pi-wait        -> <jarate>/dispatch/pi-wait (shim)
+#        {~/.local/bin,~/scripts}/pi-bg-tail     -> <jarate>/dispatch/pi-bg-tail (shim)
+#        {~/.local/bin,~/scripts}/pi-bg-kill     -> <jarate>/dispatch/pi-bg-kill (shim)
+#        {~/.local/bin,~/scripts}/pi-bg-watchdog -> <jarate>/dispatch/pi-bg-watchdog (shim)
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
 #        ~/bin/agent-say     -> <jarate>/bin/agent-say
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
@@ -63,6 +70,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Canonicalize once (PR #155 review LOW-1): the 3a ownership check compares
+# readlink -f(resolved) against $JARATE_DIR, so a symlinked --jarate-dir
+# must be resolved here or every tool reports "stale symlink". GNU readlink
+# -f tolerates a non-existent leaf (the clone case below).
+JARATE_DIR="$(readlink -f "$JARATE_DIR")"
+
 run() {
   if [ "$DRY" = 1 ]; then
     echo "[dry-run] $*"
@@ -90,6 +103,33 @@ link_into() { # $1 = dest path, $2 = target
   echo "  link: $dest -> $target"
 }
 
+link_owned() { # $1 = dest path, $2 = target — issue #150: install.sh OWNS this
+  # name. Whatever is there (a stale symlink to an old checkout, a
+  # pi-dispatch-era file copy) is re-pointed, one auditable line per
+  # change; a fresh create prints a plain link line. Idempotent: a
+  # symlink already at the target is left alone ("unchanged").
+  local dest="$1" target="$2" state="new"
+  mkdir -p "$(dirname "$dest")"
+  if [ -L "$dest" ]; then
+    local cur; cur="$(readlink "$dest")"
+    if [ "$cur" = "$target" ]; then
+      echo "  link: $dest -> $target (unchanged)"
+      return
+    fi
+    state="stale symlink ($cur)"
+    run rm -f "$dest"
+  elif [ -e "$dest" ]; then
+    state="stale file"
+    run rm -f "$dest"
+  fi
+  run ln -s "$target" "$dest"
+  if [ "$state" = "new" ]; then
+    echo "  link: $dest -> $target"
+  else
+    echo "  link: re-pointed $dest ($state) -> $target"
+  fi
+}
+
 echo "== jarate bootstrap (dry-run=$DRY, user=$(id -un))"
 
 # --- 1. checkout -----------------------------------------------------------
@@ -115,11 +155,15 @@ else
 fi
 
 # --- 3. pointer links --------------------------------------------------------
-link_into "$HOME/scripts/pi-bg"      "$JARATE_DIR/dispatch/pi-bg"
-link_into "$HOME/scripts/pi-wait"    "$JARATE_DIR/dispatch/pi-wait"
-link_into "$HOME/scripts/pi-bg-tail" "$JARATE_DIR/dispatch/pi-bg-tail"
-link_into "$HOME/scripts/pi-bg-kill" "$JARATE_DIR/dispatch/pi-bg-kill"
-link_into "$HOME/scripts/pi-bg-watchdog" "$JARATE_DIR/dispatch/pi-bg-watchdog"
+# Dispatch family (issue #150 + #151): 5 jarate-* entrypoints + 5 pi-*
+# deprecation shims, linked into BOTH ~/.local/bin and ~/scripts. install.sh
+# OWNS these names: stale entries (pi-dispatch-era files, symlinks to old
+# checkouts) are re-pointed, one auditable line per change.
+for tool in jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog \
+            pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog; do
+  link_owned "$HOME/.local/bin/$tool" "$JARATE_DIR/dispatch/$tool"
+  link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
+done
 link_into "$HOME/scripts/jarate"     "$JARATE_DIR/bin/jarate"
 link_into "$HOME/bin/agent-say"      "$JARATE_DIR/bin/agent-say"
 link_into "$HOME/bin/jarate-diff"    "$JARATE_DIR/bin/jarate-diff"
@@ -127,21 +171,53 @@ link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 link_into "$HOME/bin/jarate-pat"     "$JARATE_DIR/bin/jarate-pat"
 link_into "$HOME/bin/jarate-vault"   "$JARATE_DIR/bin/jarate-vault"
 
-# --- 3a. PATH verification (issue #71) -------------------------------------
-# Assert every linked tool resolves in the unit's PATH. A missing dispatch
-# tool must never be a silent success: the callback is the only wake
-# mechanism, and if pi-bg is unreachable by name the agent can never
-# dispatch a job.
+# --- 3a. PATH verify (issue #71, #151) -------------------------------------
+# Assert every family member resolves in the unit's PATH AND is jarate-owned
+# (a symlink into this checkout). A missing tool, or a stale non-symlink
+# shadowing the name (e.g. an old pi-bg script in ~/.local/bin from before
+# the #151 rename), must never be a silent success: the callback is the only
+# wake mechanism, and if the wrapper is unreachable by name the agent can
+# never dispatch a job. Hard fail outside dry-run.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-for tool in pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog agent-say jarate jarate-pat jarate-diff jarate-vault; do
-  if ! env -i PATH="$UNIT_PATH" command -v "$tool" >/dev/null 2>&1; then
+FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog"
+for tool in $FAMILY_TOOLS agent-say jarate jarate-pat jarate-diff jarate-vault; do
+  resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
+  if [ -z "$resolved" ]; then
     echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2
     PATH_FAIL=1
+    continue
   fi
+  if [ -L "$resolved" ]; then
+    real="$(readlink -f "$resolved")"
+    case "$real" in
+      "$JARATE_DIR"/dispatch/*|"$JARATE_DIR"/bin/*) ;;
+      *) echo "  [!] PATH: $tool is a stale symlink: $resolved -> $real (want $JARATE_DIR)" >&2; PATH_FAIL=1; continue ;;
+    esac
+    # content marker (issue #150): the resolved copy must byte-match the
+    # checkout, so a shadow that survived the re-point fails install
+    # loudly instead of at dispatch time.
+    case "$tool" in
+      jarate-bg|jarate-wait|jarate-bg-tail|jarate-bg-kill|jarate-bg-watchdog|\
+      pi-bg|pi-wait|pi-bg-tail|pi-bg-kill|pi-bg-watchdog) ;;
+      *) continue ;;
+    esac
+    sum_installed="$(sha256sum "$resolved" 2>/dev/null | cut -d' ' -f1 || true)"
+    sum_repo="$(sha256sum "$JARATE_DIR/dispatch/$tool" 2>/dev/null | cut -d' ' -f1 || true)"
+    if [ -n "$sum_repo" ] && [ "$sum_installed" != "$sum_repo" ]; then
+      echo "  [!] PATH: $tool content mismatch: $resolved != $JARATE_DIR/dispatch/$tool" >&2
+      PATH_FAIL=1
+    fi
+    continue
+  fi
+  echo "  [!] PATH: $tool shadowed by non-symlink: $resolved (install.sh re-points family names; remove foreign tools)" >&2
+  PATH_FAIL=1
 done
 if [ "$PATH_FAIL" -eq 0 ]; then
   echo "  PATH: all dispatch tools resolvable in unit env"
+elif [ "$DRY" -eq 0 ]; then
+  echo "[!] install FAILED: dispatch family not fully resolvable in unit env" >&2
+  exit 1
 fi
 
 # recall: only adopt if the dest is absent or already our symlink (a live

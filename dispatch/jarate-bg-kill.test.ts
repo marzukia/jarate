@@ -1,5 +1,5 @@
 /**
- * dispatch/pi-bg-kill — v3 embed style (mockup3).
+ * dispatch/jarate-bg-kill — v3 embed style (mockup3).
  *
  * Runs the real bash script against a fake cgroup (PI_BG_CG_ROOT override)
  * with a real sleeping victim, captures the webhook payload, and asserts
@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "bun";
 
-const KILL = path.join(import.meta.dir, "pi-bg-kill");
+const KILL = path.join(import.meta.dir, "jarate-bg-kill");
 
 // Leak guard (issue: /tmp inode exhaustion, 2026-09-14): safety net for the
 // pibgkill-* fixture dir (the test's try/finally already removes it; this
@@ -23,7 +23,7 @@ afterEach(() => {
   }
 });
 
-describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
+describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
   test("kill posts a framed embed (no dingbat), pids + wait lines, <= 40 cols", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill-"));
     tmpDirs.push(tmp);
@@ -89,10 +89,10 @@ describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
       const lines = em.description.split("\n");
       expect(lines[0]).toBe("```bash");
       expect(lines[1]).toBe(`┌ killed · ${id}`);
-      // the "$ pi-bg-kill <rid>" line is 36 cols for this id: the rid head
+      // the "$ jarate-bg-kill <rid>" line is 36 cols for this id: the rid head
       // clips (tail kept - the pid end is the discriminator)
       // at the 40-col budget the full rid fits the command line (34 cols)
-      expect(lines[2]).toBe(`├ $ pi-bg-kill ${id}`);
+      expect(lines[2]).toBe(`├ $ jarate-bg-kill ${id}`);
       expect(lines.at(-2)).toBe("└");
       expect(lines.at(-1)).toBe("```");
       for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
@@ -109,13 +109,13 @@ describe("pi-bg-kill v3 embed: framed payload, 40-col budget", () => {
 });
 
 /**
- * #56: whole-session kill. pi-bg runs under setsid: the wrapper is the
+ * #56: whole-session kill. jarate-bg runs under setsid: the wrapper is the
  * session + process-group leader and the pi child shares its PGID.
- * pi-bg-kill must signal the session's process group, not just the per-pid
+ * jarate-bg-kill must signal the session's process group, not just the per-pid
  * cgroup walk - otherwise a group member that escaped the cgroup walk
  * (e.g. a child reparented away from the tree) would be orphaned.
  */
-describe("pi-bg-kill #56: session process-group kill", () => {
+describe("jarate-bg-kill #56: session process-group kill", () => {
   test("a group member outside the cgroup walk dies with the ticket", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill56-"));
     const home = path.join(tmp, "home");
@@ -191,14 +191,14 @@ describe("pi-bg-kill #56: session process-group kill", () => {
 
 /**
  * #86: short-id resolution. The strict full-id regex made the natural
- * cleanup call `pi-bg-kill 2332046` a silent exit-2 no-op (the incident
+ * cleanup call `jarate-bg-kill 2332046` a silent exit-2 no-op (the incident
  * loop had stderr on /dev/null and four live workers died un-killled).
  * A 7+ digit numeric arg must resolve against the run records: exactly
  * one match -> kill that ticket; 0 or 2+ matches -> exit 2 with a clear
  * error on stderr. Non-numeric junk -> exit 2 (the incident's literal
  * glob `20260925-*2332046*` was passed as a single arg).
  */
-describe("pi-bg-kill #86: short-id resolution (run records)", () => {
+describe("jarate-bg-kill #86: short-id resolution (run records)", () => {
   const FULL = "20260925-201500-2332046";
   const SUFFIX = "2332046";
 

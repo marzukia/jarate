@@ -8,7 +8,7 @@ actual work; most of it is waiting on npm.
 
 - [ ] A Discord bot token for the new agent (developer portal).
 - [ ] A Discord channel for the agent (id, e.g. `<channel-id>`).
-- [ ] A pi-bg callback webhook for that channel.
+- [ ] A jarate-bg callback webhook for that channel.
 - [ ] Switchboard key params: ctx budget (tokens), concurrency cap (1-8),
       priority (P0 senior, P1 new).
 - [ ] Who may talk to it: by default EVERYONE in the channel (no whitelist
@@ -69,7 +69,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 | file | contents |
 |---|---|
 | `~/.config/marzukia-pat` | the operator's PAT (copy from an existing agent, chmod 600) - GitHub for now |
-| `~/.config/pi-dispatch/webhook` | the pi-bg callback webhook, first line, chmod 600 |
+| `~/.config/pi-dispatch/webhook` | the jarate-bg callback webhook, first line, chmod 600 |
 | `~/.config/webdrop/config.toml` | copy from an existing agent |
 | `~/.hermes/.env` | copy from an existing agent (OPENROUTER key; credits may be $0 - the LLM does NOT use it, only image gen) |
 | `~/.pi/agent/secrets.env` | per-agent extension secrets, chmod 600 (e.g. `TAVILY_API_KEY` for the MCP bridge; keys are referenced from `settings.json` as `${VAR}`) |
@@ -177,25 +177,26 @@ sudo -u <name> bash -lc '
 ```
 
 install.sh (idempotent): `bun install` in the bridge, 8 pointer symlinks
-plus a conditional recall link - ~/scripts/{pi-bg, pi-wait, pi-bg-tail,
-pi-bg-kill, jarate}, ~/bin/{agent-say, jarate-diff, jarate}, and
+plus a conditional recall link - ~/scripts/{jarate-bg, jarate-wait, jarate-bg-tail,
+jarate-bg-kill, jarate-bg-watchdog, pi-bg, pi-wait, pi-bg-tail, pi-bg-kill,
+pi-bg-watchdog, jarate}, ~/bin/{agent-say, jarate-diff, jarate}, and
 ~/projects/recall (only if absent or already this symlink). The checkout IS
 the deployment - `git pull --ff-only` is the update procedure. Only bridge
 changes need a pi.service restart.
 
 ## 6. Role profiles - the OpenRouter 402 trap
 
-pi-bg runs workers/reviewers under `PI_CODING_AGENT_DIR=~/.pi/agent-<role>`.
+jarate-bg runs workers/reviewers under `PI_CODING_AGENT_DIR=~/.pi/agent-<role>`.
 Current code AUTO-SEEDS a missing role dir from the main profile: auth.json
 and models.json are copied, and a missing settings.json is generated from
 `dispatch/profiles/<role>.json` (thinking level, reserveTokens, keepRecentTokens)
 merged with the main agent's defaultProvider + defaultModel. Verified:
-running the repo's pi-bg with a fresh fake HOME seeds all three files
+running the repo's jarate-bg with a fresh fake HOME seeds all three files
 provider included.
 
 History (how a new agent 402'd on 2026-09-13): `JB_ROOT` was computed as
 `$(dirname "${BASH_SOURCE[0]}")/..` WITHOUT symlink resolution. The normal
-launch path is the `~/scripts/pi-bg` symlink (install.sh), so JB_ROOT
+launch path is the `~/scripts/jarate-bg` symlink (install.sh), so JB_ROOT
 resolved to the home dir, the template lookup
 `$JB_ROOT/dispatch/profiles/<role>.json` silently missed, and the role
 ended up with auth+models but NO settings.json. pi then fell back to its
@@ -234,10 +235,10 @@ Verification checklist (all must pass before declaring done):
    -> only 200s, rows accumulating.
 3. agent-say round trip from an existing agent into the new channel.
 4. agent-say the OTHER way (needs the bot-guild invites from step 0).
-5. One real pi-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
+5. One real jarate-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
    webhook + role profile + artifacts. Nohup form (foreground launch is
    rejected with rc 4, issue #144):
-   `nohup ~/scripts/pi-bg worker "smoke test: reply OK" > smoke.log 2>&1 &`
+   `nohup ~/scripts/jarate-bg worker "smoke test: reply OK" > smoke.log 2>&1 &`
 
 ## 8. Update every existing agent
 
@@ -275,7 +276,7 @@ github-invites, bootstrap-project).
 - Dispatch cap per agent: <operator> sets per agent (e.g. 3 for senior agents, 2 for new ones).
 - Fresh agents get latest bridge commands by pulling main + restarting their
   pi.service (new commands like /tasks, /diff only exist after the merge).
-- /tmp on the agent host is a 32G tmpfs: it wipes on reboot. pi-bg artifacts now
+- /tmp on the agent host is a 32G tmpfs: it wipes on reboot. jarate-bg artifacts now
   live in ~/.pi-bg-art (PR #35); anything else you park in /tmp is volatile.
 - OOM history: 13 Sep 2026, 11:24-11:49 kernel OOM slide wedged the box
   until a power reset (61 kills). Size new heavy units with memory caps.

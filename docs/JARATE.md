@@ -88,7 +88,7 @@ absolute UTC.
 
 - Discovery: self + every local user with a `/home/<u>` (uid > 900), each
   probed for a `pi.service` user unit. Peers are probed through the
-  `sshpass + sudo -u` hop (same pattern as pi-bg cross-user reads); a peer
+  `sshpass + sudo -u` hop (same pattern as jarate-bg cross-user reads); a peer
   without the unit is silently skipped.
 - Rows: `source` = `local` | `ssh+sudo`; `warnings` capped at 100 lines
   (`truncated` true when cut); row `error` set when the hop itself failed
@@ -146,7 +146,7 @@ One-call RAG query over project knowledge. Backend = the `recall` CLI
 
 ### `projects [--project TAG] [--since YYYY-MM-DD] [--agent NAME]`
 
-Per-project rollup of pi-bg run records (the `--project` tag, see
+Per-project rollup of jarate-bg run records (the `--project` tag, see
 DISPATCH.md) across every agent home on this host. Read-only. Scans
 `<home>/.pi-dispatch/runs/pi-bg-*.json` per agent; peers go through the
 same `sshpass + sudo -u` hop as journal-errors (a failing hop degrades that
@@ -239,7 +239,7 @@ itself is unreadable/missing (rc 1).
 ```
 
 - `drift:true` = manifest missing OR hash mismatch.
-- The pi-bg-watchdog sweep (15 min) is the consumer: one channel warning per
+- The jarate-bg-watchdog sweep (15 min) is the consumer: one channel warning per
   drifted hash, deduped via `~/.pi/agent/.agents-md-drift-warned`.
 
 ### `agents-bless [note]`
@@ -320,9 +320,9 @@ in the output.
   `jarate {cmd, args}` — the entrypoint is the single source of truth for
   the JSON shape; the tool spawns `$HOME/bin/jarate` (30s cap, process-group
   kill, 20k output cap) and returns the doc as text.
-- **pi-bg workers**: no extensions — they run the same entrypoint via plain
+- **jarate-bg workers**: no extensions — they run the same entrypoint via plain
   bash (`~/scripts/jarate`).
-- **pi-bg-watchdog**: runs `agents-check` every sweep (15 min) as the
+- **jarate-bg-watchdog**: runs `agents-check` every sweep (15 min) as the
   AGENTS.md drift tripwire; see DISPATCH.md.
 - **Deploy**: `install.sh` symlinks `~/bin/jarate` and `~/scripts/jarate`
   into the checkout (idempotent, `--dry-run` clean).

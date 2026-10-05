@@ -32,8 +32,13 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
 2. **bridge deps** — `bun install` in `packages/bridge` (node_modules is
    gitignored, machine-local).
 3. **pointer links** — symlinks, never copies:
-   - `~/scripts/pi-bg` -> `<jarate>/dispatch/pi-bg`
-   - `~/scripts/pi-wait` -> `<jarate>/dispatch/pi-wait`
+   - dispatch family (issue #151): each of `jarate-bg`, `jarate-wait`,
+     `jarate-bg-tail`, `jarate-bg-kill`, `jarate-bg-watchdog` and the five
+     `pi-*` deprecation shims is linked into BOTH `~/.local/bin` and
+     `~/scripts` -> `<jarate>/dispatch/<name>`. Post-install verify fails
+     the run (non-dry) if any of the 10 is missing or shadowed by a stale
+     non-symlink in the unit PATH.
+   - `~/scripts/jarate` -> `<jarate>/bin/jarate`
    - `~/bin/agent-say` -> `<jarate>/bin/agent-say`
    - `~/projects/recall` -> `<jarate>/packages/recall` (only if the dest is
      absent or already this symlink; replaces the old `pgrag` symlink)
@@ -50,7 +55,7 @@ Guarantees:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# done. pi-bg/pi-wait/agent-say/recall are symlinks - they update instantly.
+# done. jarate-bg/jarate-wait/agent-say/recall are symlinks - they update instantly.
 # Only bridge (channel/) changes need a pi.service restart.
 ```
 

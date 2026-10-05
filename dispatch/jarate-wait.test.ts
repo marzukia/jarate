@@ -1,5 +1,5 @@
 /**
- * dispatch/pi-wait — rc contract + issue #120 (bot token off curl's argv).
+ * dispatch/jarate-wait — rc contract + issue #120 (bot token off curl's argv).
  *
  * Runs the real bash script against a fake HOME (settings.json bot token +
  * channel, webhook_author) with a stub curl that records every call's argv
@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "bun";
 
-const PI_WAIT = path.join(import.meta.dir, "pi-wait");
+const PI_WAIT = path.join(import.meta.dir, "jarate-wait");
 const TOKEN = "tok-wait-111";
 const CHANNEL = "chan-111";
 const BOT_ID = "bot-1";
@@ -120,7 +120,7 @@ const calls = (capture: string): string[] =>
     .map((c) => c.trim())
     .filter(Boolean);
 
-describe("pi-wait rc contract", () => {
+describe("jarate-wait rc contract", () => {
   test("webhook callback message -> rc 0, prints CALLBACK + content", async () => {
     const f = fixture();
     f.setMsgs(
@@ -167,7 +167,7 @@ describe("pi-wait rc contract", () => {
   });
 });
 
-describe("pi-wait #120: token off curl's argv", () => {
+describe("jarate-wait #120: token off curl's argv", () => {
   test("token in curl stdin config on every call, never in any argv", async () => {
     const f = fixture();
     f.setMsgs(

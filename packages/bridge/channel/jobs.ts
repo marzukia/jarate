@@ -111,7 +111,7 @@ export function parseJobsFromPs(
     const m = line
       .trim()
       .match(
-        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/pi-bg|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
+        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/(?:pi-bg|jarate-bg)|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
       );
     if (!m) continue;
     const id = ticketIdFromPid(Number(m[1]), procRoot);

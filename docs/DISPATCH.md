@@ -6,10 +6,10 @@ lean by handing self-contained work to `worker` agents and verification to
 
 Components (all in this repo):
 
-- `dispatch/pi-bg` — dispatch a one-shot pi run on a role profile
-- `dispatch/pi-wait` — in-turn wait for the callback / a human message
-- `dispatch/pi-bg-tail` — read a run's live output (`pi-bg-tail <id> [lines] [-f]`)
-- `dispatch/pi-bg-kill` — cancel a run via its cgroup (`pi-bg-kill <id> [--dry-run]`)
+- `dispatch/jarate-bg` — dispatch a one-shot pi run on a role profile
+- `dispatch/jarate-wait` — in-turn wait for the callback / a human message
+- `dispatch/jarate-bg-tail` — read a run's live output (`jarate-bg-tail <id> [lines] [-f]`)
+- `dispatch/jarate-bg-kill` — cancel a run via its cgroup (`jarate-bg-kill <id> [--dry-run]`)
 - `bin/agent-say` — agent-to-agent messaging (post to a peer's channel)
 
 ## Roles
@@ -20,25 +20,25 @@ Components (all in this repo):
 | `reviewer` | 131k | xhigh | adversarial review, ranked findings, `VERDICT: PASS\|FAIL` |
 
 Profiles are separate pi homes: `~/.pi/agent-worker`, `~/.pi/agent-reviewer`
-(env `PI_CODING_AGENT_DIR`, set by `pi-bg` automatically).
+(env `PI_CODING_AGENT_DIR`, set by `jarate-bg` automatically).
 
-**Fresh machine** (issues #29/#30): `pi-bg` runs a profile doctor before
+**Fresh machine** (issues #29/#30): `jarate-bg` runs a profile doctor before
 every dispatch. A missing or empty role profile is auto-seeded from the
 main agent's `~/.pi/agent/{auth,models}.json` + the repo template
 `dispatch/profiles/<role>.json` (thinking level, ctx budget; provider/model
 inherited from the main agent's `settings.json`). If no provider creds
-resolve, `pi-bg` exits 4 with the files to copy — a missing credential is
+resolve, `jarate-bg` exits 4 with the files to copy — a missing credential is
 not misfiled as the empty-completion quirk. Each dispatch also writes a run
 record to `~/.pi-dispatch/runs/pi-bg-<id>.json` with `delivery:
 "webhook"|"none"`; when no webhook is configured (`$PI_DISPATCH_WEBHOOK`
-or `~/.config/pi-dispatch/webhook`), `pi-bg` warns at dispatch:
-`no completion callback; poll with pi-wait`. Override the record dir with
+or `~/.config/pi-dispatch/webhook`), `jarate-bg` warns at dispatch:
+`no completion callback; poll with jarate-wait`. Override the record dir with
 `$PI_DISPATCH_RECORD_DIR`.
 
 ## Fleet caps (vLLM queue protection)
 
 All agents share one vLLM endpoint (8 concurrent sequences max). Concurrent
-pi-bg dispatches = concurrent generation streams = queue depth.
+jarate-bg dispatches = concurrent generation streams = queue depth.
 
 - **monky: max 3** concurrent dispatches (workers + reviewers combined)
 - **frank: max 3**
@@ -53,15 +53,15 @@ before dispatching:
 ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l
 ```
 
-Enforced in code since 2026-09-13 (issue #41): `pi-bg` counts this user's
+Enforced in code since 2026-09-13 (issue #41): `jarate-bg` counts this user's
 live `pi-bg worker|reviewer` processes before exec'ing the agent and
 refuses at the cap with
-`[!] at cap (N/M), try again later or pi-bg-kill a ticket` + exit 5.
+`[!] at cap (N/M), try again later or jarate-bg-kill a ticket` + exit 5.
 `PI_BG_MAX_CONCURRENT` sets the cap (default 3; 0 = unlimited, operator
 escape hatch). The ps count above stays the manual cross-check.
 
 Per-box override (RCA #57 fix 2, 2026-09-14): when `PI_BG_MAX_CONCURRENT`
-is unset, `pi-bg` reads `~/.config/pi-dispatch/max-concurrent` (one integer,
+is unset, `jarate-bg` reads `~/.config/pi-dispatch/max-concurrent` (one integer,
 created per box) before falling back to the fleet default of 3. monky's box
 pins `2` — the fleet shares one vLLM endpoint and 3 concurrent dispatches
 starved the model stream (issue #57). The env var still wins for per-dispatch
@@ -75,10 +75,10 @@ turn — no polling, no held turn.
 ```bash
 # 1. dispatch (background; posts a webhook callback on exit)
 cd /path/to/workdir
-nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
+nohup ~/scripts/jarate-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
 # task via stdin (issue #118: keeps the task out of process argv for the
 # whole run - the argv form above still works but the task is ps-visible):
-# printf '%s' "$task" | nohup ~/scripts/pi-bg worker - > stdout.log 2>&1 &
+# printf '%s' "$task" | nohup ~/scripts/jarate-bg worker - > stdout.log 2>&1 &
 
 # 2. reply to the human: "dispatched, I'll report when it lands" — end turn
 ```
@@ -95,10 +95,10 @@ BASE=$(curl -s ".../channels/$CH/messages?limit=1" -H "Authorization: Bot $TOKEN
   | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["id"])')
 
 # 2. dispatch
-nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
+nohup ~/scripts/jarate-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.log
 
 # 3. wait in-turn (quiet poll, 5s interval)
-~/scripts/pi-wait --since "$BASE" --timeout 240
+~/scripts/jarate-wait --since "$BASE" --timeout 240
 #    exit 0 → callback content printed → act on it
 #    exit 2 → a human spoke → drop the wait, answer the human first
 #    exit 3 → timeout → report "still running", re-wait or drop to wake mode
@@ -107,10 +107,10 @@ nohup ~/scripts/pi-bg worker "task" > stdout.log 2>&1 & sleep 4; head -1 stdout.
 Double delivery by design: the callback also posts to the channel; the wake
 copy gets a one-liner ack, no re-work.
 
-## pi-bg internals
+## jarate-bg internals
 
 ```
-pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
+jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task"
 ```
 
 - Task = last positional argument. Pass-through `pi` flags allowed (the task
@@ -130,7 +130,7 @@ pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task
 
 An orchestrator restart must not kill in-flight dispatches. systemd kills a
 unit's whole cgroup subtree on `stop`; a sibling cgroup under the user slice
-survives. `pi-bg` therefore moves **this process** (and all children, including
+survives. `jarate-bg` therefore moves **this process** (and all children, including
 the later webhook post) into:
 
 ```
@@ -151,25 +151,25 @@ child sat in the LAUNCHER's process group, and a harness bash-tool timeout
 signals that group (`kill -TERM/-KILL -pgid`). The 2026-09-13 incident: nested
 tickets died rc=143 inside `git worktree add`.
 
-`pi-bg` now re-execs itself once under `setsid` (guarded by `$PI_BG_SETSID`):
+`jarate-bg` now re-execs itself once under `setsid` (guarded by `$PI_BG_SETSID`):
 the wrapper becomes session + process-group leader and the pi child inherits
 both, so no signal aimed at the launcher's PGID can reach the ticket. The
 cgroup escape above isolates the cgroup axis; setsid isolates the PGID axis.
 
 - **Blessed launch form** (stays; now safe even if the tool call blocks in
   `wait4()` on the ticket until the harness timeout):
-  `cd <workdir> && nohup ~/scripts/pi-bg worker "task" > log 2>&1 & sleep 4; head -1 log`
-- **Belt**: `pi-bg` prints the ticket id line BEFORE the slow
+  `cd <workdir> && nohup ~/scripts/jarate-bg worker "task" > log 2>&1 & sleep 4; head -1 log`
+- **Belt**: `jarate-bg` prints the ticket id line BEFORE the slow
   `git worktree add` / cgroup escape, so `head -1 log` returns immediately
   and a dead ticket leaves an identifiable first log line.
-- **Kill compensation**: `pi-bg-kill` signals the ticket's process group in
+- **Kill compensation**: `jarate-bg-kill` signals the ticket's process group in
   addition to the per-pid cgroup walk, so the whole session dies together and
   no pi child orphans.
-- `pi-bg --help` prints the header with this guidance.
+- `jarate-bg --help` prints the header with this guidance.
 
 ### Worktrees (isolated runs)
 
-`pi-bg worker --worktree <ref> "task"` runs the agent in a fresh git worktree
+`jarate-bg worker --worktree <ref> "task"` runs the agent in a fresh git worktree
 instead of the live checkout — use it when the task edits files and you don't
 want it touching the working tree (or when two workers share a repo).
 
@@ -194,7 +194,7 @@ cap check, so a bad tag never touches the run record or the worktree).
 Untagged runs get `"project": null` in the record.
 
 On exit (terminal state or normal completion, before the callback build),
-`pi-bg` attributes the run's cost to the record:
+`jarate-bg` attributes the run's cost to the record:
 
 - **Tokens:** sum of assistant `usage` blocks in the run's session file
   (the profile's sessions dir, files newer than run start). `total` =
@@ -228,7 +228,7 @@ JARATE.md).
 
 ### Callback protocol
 
-On completion, `pi-bg` posts to the Discord webhook:
+On completion, `jarate-bg` posts to the Discord webhook:
 
 - Webhook URL: `$PI_DISPATCH_WEBHOOK` or first line of
   `~/.config/pi-dispatch/webhook`. File absent = no callback (stdout is always
@@ -261,7 +261,7 @@ Per-run artifacts in `~/.pi-bg-art/` — persistent, survives reboot (`/tmp`
 on the agent host is a tmpfs that a reboot wipes; 2026-09-13: a wiped
 `/tmp` lost every `out.md` and the watchdog re-flagged ~15 finished tickets
 as DEAD). `$PI_BG_TMPDIR` still overrides the dir. For one release,
-`pi-bg-watchdog` and `pi-bg-tail` also check the legacy `/tmp` location so
+`jarate-bg-watchdog` and `jarate-bg-tail` also check the legacy `/tmp` location so
 runs started before the upgrade still resolve. Data source for `/jobs`
 history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 
@@ -275,21 +275,21 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 - `pi-bg-<id>-wb-status` — success-path webhook HTTP code + time
   (recorded at post time; the response body stays in `pi-bg-<id>-wb-resp.txt`)
 - `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail
-- `pi-bg-<id>-killed` — pi-bg-kill marker (the watchdog skips such tickets)
+- `pi-bg-<id>-killed` — jarate-bg-kill marker (the watchdog skips such tickets)
 
 ### tail / kill (in-flight control)
 
-- `pi-bg-tail <id> [lines] [-f]` — last N lines (default 40) of
+- `jarate-bg-tail <id> [lines] [-f]` — last N lines (default 40) of
   `~/.pi-bg-art/pi-bg-<id>-raw.out` (legacy `/tmp` for pre-upgrade runs),
   optional follow. No live output = exit 2.
-- `pi-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
+- `jarate-bg-kill <id> [--dry-run]` — resolves the run's escape cgroup
   (`…/user@<uid>.service/pi-bg/<id>/`), dry-run prints the process tree,
   real kill sends SIGTERM to every member AND the ticket's process group
-  (issue #56: pi-bg runs under setsid; the wrapper leads the ticket session,
+  (issue #56: jarate-bg runs under setsid; the wrapper leads the ticket session,
   so `-pgid` covers session processes that escaped the cgroup walk), waits
   `$PI_BG_KILL_WAIT` (10s), then SIGKILL via `cgroup.kill` (per-pid +
   per-group fallback). Posts a `KILLED`
-  embed (same webhook URL source as pi-bg; dead letter on post failure).
+  embed (same webhook URL source as jarate-bg; dead letter on post failure).
   Precise by construction: only the run's cgroup subtree dies.
 
 ### AGENTS.md drift tripwire (watchdog, alert-only)
@@ -312,9 +312,9 @@ in `~/AGENTS.md`) against the hash manifest `~/.pi/agent/.agents-md-hash`
   New content, new hash, drift clears; a further unapproved edit warns
   again (different hash).
 
-## pi-wait internals
+## jarate-wait internals
 
-`pi-wait --since <message-id> [--timeout 300] [--check 5]` polls
+`jarate-wait --since <message-id> [--timeout 300] [--check 5]` polls
 `GET /channels/<id>/messages?after=<since>` (5s default interval) and classifies
 the first new message:
 
@@ -353,7 +353,7 @@ for agents, not people: for a human in your own channel, just reply.
 - **Do it inline** when the task is tiny (a few seconds, <1 screen of output)
   — dispatch has ~20s overhead.
 - **Default to fire-and-forget for anything non-trivial:** dispatch, confirm,
-  end turn, let the callback wake you. In-turn `pi-wait` is the exception
+  end turn, let the callback wake you. In-turn `jarate-wait` is the exception
   (short task, answer must land in this turn). A polling loop in the channel
   reads as "stuck" to the human — the operator's call, 2026-09-08.
 
@@ -361,7 +361,7 @@ for agents, not people: for a human in your own channel, just reply.
 
 The human beats every wait.
 
-- `pi-wait` exits 2 on any human message → end the turn fast, the message is
+- `jarate-wait` exits 2 on any human message → end the turn fast, the message is
   already queued.
 - Keep waits ≤ 240s and rare — see decision rules. Default = no wait at all.
 - One wait at a time per turn (one pair of hands). Multiple workers: dispatch

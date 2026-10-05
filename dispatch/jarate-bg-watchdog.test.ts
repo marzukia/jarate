@@ -1,5 +1,5 @@
 /**
- * dispatch/pi-bg-watchdog — AGENTS.md drift tripwire (2026-09-14).
+ * dispatch/jarate-bg-watchdog — AGENTS.md drift tripwire (2026-09-14).
  *
  * Runs the real bash watchdog against a fake HOME with the REAL bin/jarate
  * symlinked in ($HOME/bin/jarate is what the watchdog calls). Asserts the
@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "bun";
 
-const WD = path.join(import.meta.dir, "pi-bg-watchdog");
+const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
 const JARATE = path.join(import.meta.dir, "..", "bin", "jarate");
 
 type Post = { embeds: Array<{ title: string; description: string }> };
@@ -412,7 +412,7 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
 });
 
 /**
- * #57: SILENT classification. The pi-bg wrapper records its final exit
+ * #57: SILENT classification. The jarate-bg wrapper records its final exit
  * code (-rc, EXIT trap) and its one silent-death relaunch (-retry1, kept
  * when the retry did not recover). rc=1 + no out.md + unconsumed retry1
  * = the #57 idle-timeout failure mode, reported distinctly from generic
@@ -509,7 +509,7 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       for (const em of f.posts.map((p) => p.embeds[0])) {
         expect(em.title).toBe("DEAD \u00b7 watchdog sweep");
         // note tail-clips; the head (classification) survives
-        expect(em.description).toContain("no live pi-bg process");
+        expect(em.description).toContain("no live process");
         for (const line of codeLines(em)) {
           expect(line.length).toBeLessThanOrEqual(32);
         }

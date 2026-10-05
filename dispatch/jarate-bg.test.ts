@@ -1,5 +1,5 @@
 /**
- * dispatch/pi-bg — fresh-machine doctor tests (issues #29, #30).
+ * dispatch/jarate-bg — fresh-machine doctor tests (issues #29, #30).
  *
  * Runs the real bash script against a fake HOME + a fake `pi` on PATH and
  * asserts on loud failure / warning text and the run record.
@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "bun";
 
-const PI_BG = path.join(import.meta.dir, "pi-bg");
+const PI_BG = path.join(import.meta.dir, "jarate-bg");
 
 // Leak guard (issue: /tmp inode exhaustion, 2026-09-14): every fixture
 // mkdtemp dir is tracked and force-removed in a file-level afterEach, so a
@@ -290,8 +290,8 @@ describe("#29: missing role profile is seeded, then fail loud if no provider", (
   });
 });
 
-describe("#37: JB_ROOT resolves symlinks (normal launch is ~/scripts/pi-bg)", () => {
-  test("pi-bg launched via a symlink still seeds settings.json from the repo template", async () => {
+describe("#37: JB_ROOT resolves symlinks (normal launch is ~/scripts/jarate-bg)", () => {
+  test("jarate-bg launched via a symlink still seeds settings.json from the repo template", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     // mimic install.sh: a bin dir under the fake HOME holding a symlink
@@ -300,7 +300,7 @@ describe("#37: JB_ROOT resolves symlinks (normal launch is ~/scripts/pi-bg)", ()
     // would silently miss.
     const linkDir = path.join(fx.home, "scripts");
     fs.mkdirSync(linkDir, { recursive: true });
-    const link = path.join(linkDir, "pi-bg");
+    const link = path.join(linkDir, "jarate-bg");
     fs.symlinkSync(PI_BG, link);
     expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
     const r = await runScript(
@@ -431,7 +431,7 @@ describe("#30: no webhook => loud warning at dispatch + run record delivery=none
     fx.seedMainCreds();
     const r = await fx.run(["worker", "test task"]);
     expect(r.code).toBe(0);
-    expect(r.err).toContain("no completion callback; poll with pi-wait");
+    expect(r.err).toContain("no completion callback; poll with jarate-wait");
     expect(r.err).toContain(".config/pi-dispatch/webhook");
     const recs = fx.records();
     expect(recs.length).toBe(1);
@@ -512,9 +512,9 @@ describe("persistent artifact dir: ~/.pi-bg-art default (2026-09-13 reboot fix)"
   });
 });
 
-const WD = path.join(import.meta.dir, "pi-bg-watchdog");
+const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
 
-const KILL = path.join(import.meta.dir, "pi-bg-kill");
+const KILL = path.join(import.meta.dir, "jarate-bg-kill");
 
 // fake ids in year 2099: never collide with real tickets in /tmp
 const TID = (n: number) => `20991231-235959-${n}`;
@@ -679,7 +679,7 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
   }, 60_000);
 });
 
-const TAIL = path.join(import.meta.dir, "pi-bg-tail");
+const TAIL = path.join(import.meta.dir, "jarate-bg-tail");
 
 describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
   test("raw.out in PI_BG_TMPDIR -> shown", async () => {
@@ -784,7 +784,7 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       const em = cap.embeds[0];
       expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
       assertFrame(em, `┌ ok · ${runId}`);
-      expect(em.description).toContain("├ $ pi-bg worker --worktree");
+      expect(em.description).toContain("├ $ jarate-bg worker --worktree");
       // branch = "pi-bg/<rid>" is 25 cols; at the 40-col budget the kv
       // vbudget (29) fits it whole - no clip
       expect(em.description).toContain(`├ branch : pi-bg/${runId}`);
@@ -828,7 +828,7 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
       // at 40 the rc DOES fit the header (9 + 19 + 7 = 35): it ships
       // in the header AND the title
       assertFrame(em, `┌ fail · ${runId} (rc=3)`);
-      expect(em.description).toContain("├ $ pi-bg worker");
+      expect(em.description).toContain("├ $ jarate-bg worker");
       expect(em.description).toContain("├ cwd    : ");
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
@@ -1125,7 +1125,7 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
       const r = await collect(c);
       expect(r.code).toBe(5);
       expect(r.err).toMatch(
-        /\[!\] at cap \(\d+\/\d+\), try again later or pi-bg-kill a ticket/,
+        /\[!\] at cap \(\d+\/\d+\), try again later or jarate-bg-kill a ticket/,
       );
       // The run record is written at dispatch, before the stub pi launches.
       // Collect a + b (waits for their exit) so the assertion no longer
@@ -3186,7 +3186,7 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
 });
 
 describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () => {
-  // Franky's dispatch shape: nohup pi-bg ... 2>&1 | head -2. head -2
+  // Franky's dispatch shape: nohup jarate-bg ... 2>&1 | head -2. head -2
   // consumes the ticket + worktree banners and EXITS; the launcher's 3rd
   // stdout write (the cgroup-escape line) then hits SIGPIPE. Default bash
   // dispo = die WITHOUT running the EXIT trap: no DIED webhook, no dead
@@ -3417,7 +3417,7 @@ echo pi-run-ok
  * --project usage errors: rc 2, one stderr line, no record).
  */
 describe("usage error: missing task exits 2 with no side effects", () => {
-  test("bare pi-bg: rc 2, usage on stderr, no record, pi never runs", async () => {
+  test("bare jarate-bg: rc 2, usage on stderr, no record, pi never runs", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const r = await fx.run([]);
@@ -3546,7 +3546,7 @@ describe("#144: foreground-launch guard (nohup is the required form)", () => {
     expect(first).toMatch(/^\[pi-bg\] ticket \d{8}-\d{6}-\d+ profile=worker$/);
     // the error names the nohup form with the real run id + dir
     expect(err).toContain("foreground launch detected (issue #144)");
-    expect(err).toContain("nohup pi-bg worker");
+    expect(err).toContain("nohup jarate-bg worker");
     const m = first.match(/\[pi-bg\] ticket (\S+)/);
     if (!m) throw new Error("ticket line vanished from guard output");
     const rid = m[1];
