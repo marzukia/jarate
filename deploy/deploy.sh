@@ -220,6 +220,12 @@ main() {
   # Machine-local deps (node_modules is gitignored). Matches install.sh.
   bun install --cwd "$REPO/packages/bridge" || die "bun install (packages/bridge) failed"
 
+  # Machine pointers (~/.local/bin + ~/scripts dispatch family, bin links):
+  # install.sh is the only owner of those symlinks, and a roll that leaves
+  # them stale/missing breaks dispatch (the callback is the only wake).
+  # Fatal like every other step: fail loud, roll back.
+  bash "$REPO/install.sh" --jarate-dir "$REPO" || die "install.sh (machine links) failed"
+
   # Pre-deploy verification. Fails abort BEFORE any restart.
   # typecheck is jarate's check (biome lint runs in CI; typecheck+test is the
   # gate here). No build step exists for jarate — checkout IS the deployment.
