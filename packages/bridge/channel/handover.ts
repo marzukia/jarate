@@ -362,9 +362,12 @@ export function extractDeterministic(
   };
   // fileOps Set iteration is first-seen (oldest) order → reverse for
   // newest-first; span files are newer than prior-doc files.
+  // read=read-only invariant (PR #156 F4a): a prior-doc read that is
+  // MODIFIED in the current span leaves the read list entirely.
+  const spanModSet = new Set<string>(spanModified);
   const readFiles = uniq([
     ...spanRead.reverse().filter((f) => !modifiedSet.has(f)),
-    ...prior.readFiles,
+    ...prior.readFiles.filter((f) => !spanModSet.has(f)),
   ]).slice(0, FILE_TAG_CAP);
   const modifiedFiles = uniq([
     ...spanModified.reverse(),
