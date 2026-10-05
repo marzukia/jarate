@@ -55,5 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - name: Install bridge deps
+        # dispatch tests import bridge predicates (isBgWebhook, #159 A1)
+        run: cd packages/bridge && bun install
       - name: Test
         run: cd dispatch && bun test
