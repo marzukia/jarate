@@ -1546,8 +1546,12 @@ describe("setup", () => {
 
 /**
  * sshpass stub for the scan hop: the last arg is the remote command
- * `echo 'pass' | sudo -S -u 'owner' bash -c '<driver>'` — strip through
- * `bash -c '` and the trailing quote, then run the driver in this shell.
+ * `... sudo -S -u '<owner>' bash -c '<driver>' _ '<home>' '<b64>' ...` —
+ * strip through `bash -c '`, restore the driver's positional args (the
+ * sq-escaped home/b64 after the `_` placeholder; #121 injection path),
+ * then run the driver as the peer would. The driver is single-quote-free
+ * by construction; issue #121 moved the password to ssh stdin + a 0600
+ * temp file, so the sudo'd bash -c is not the final element.
  */
 function scanSshpass(f: Fixture, fail = false): void {
   const sp = path.join(f.bin, "sshpass");
@@ -1557,9 +1561,8 @@ function scanSshpass(f: Fixture, fail = false): void {
       ? "#!/bin/sh\necho 'ssh: refused' >&2\nexit 255\n"
       : `#!/bin/sh
 # emulate the remote hop: find the LAST "bash -c '<driver>'" payload in the
-# remote command string (issue #121 moved the password to ssh stdin + a 0600
-# temp file, so the sudo'd bash -c is no longer the final element) and run
-# it as the peer would. The driver is single-quote-free by construction.
+# remote command string, strip the known tail ("; rc=$?; ...") and eval the
+# positional args back (they are sq-escaped shell code), then run the driver.
 last=""
 for a in "$@"; do last="$a"; done
 q="'"
@@ -1568,7 +1571,10 @@ case "$last" in
   *"$pat"*)
     rest="\${last##*"$pat"}"
     driver="\${rest%%$q*}"
-    exec sh -c "$driver"
+    pos="\${rest#*"$q"}"
+    pos="\${pos%%'; rc='*}"
+    eval "set -- $pos"
+    exec sh -c "$driver" "$@"
     ;;
 esac
 exit 0
@@ -2109,6 +2115,7 @@ describe("cross-user hop #121: password off argv", () => {
     sshArgs: string[];
     sshStdin: string;
     sudoPw: string | null;
+    sudoArgs: string[];
   };
 
   // sshpass/ssh/sudo/systemctl stubs that record argv + env + stdin, then
@@ -2143,6 +2150,7 @@ sh -c "$last" < "$HOP_STDIN"
     fs.writeFileSync(
       path.join(f.bin, "sudo"),
       `#!/bin/sh
+{ for a in "$@"; do printf '%s\\n' "$a"; done; } > "$HOP_SUDOARGV"
 read -r _p
 printf '%s\\n' "$_p" > "$HOP_SUDOPW"
 [ "$_p" = "$HOP_EXPECT_PASS" ] || { echo "sudo: wrong password" >&2; exit 1; }
@@ -2165,6 +2173,7 @@ exit 1
       sshArgs: [],
       sshStdin: "",
       sudoPw: null,
+      sudoArgs: [],
     };
   }
 
@@ -2188,6 +2197,12 @@ exit 1
     r.sudoPw = fs.existsSync(path.join(f.tmp, "sudo-pw.txt"))
       ? fs.readFileSync(path.join(f.tmp, "sudo-pw.txt"), "utf8").trim()
       : null;
+    r.sudoArgs = fs.existsSync(path.join(f.tmp, "sudo-argv.txt"))
+      ? fs
+          .readFileSync(path.join(f.tmp, "sudo-argv.txt"), "utf8")
+          .trim()
+          .split("\n")
+      : [];
     return r;
   };
 
@@ -2195,9 +2210,13 @@ exit 1
     HOP_REC: path.join(f.tmp, "hop-rec.txt"),
     HOP_STDIN: `${path.join(f.tmp, "hop-rec.txt")}.stdin`,
     HOP_SUDOPW: path.join(f.tmp, "sudo-pw.txt"),
+    HOP_SUDOARGV: path.join(f.tmp, "sudo-argv.txt"),
     HOP_EXPECT_PASS: PASS,
     JARATE_SUDO_PASS: PASS,
   });
+
+  // one value carrying quote + $ + backtick in a single token
+  const ODD = "ODD'1$2`3";
 
   test("journal-errors peer probe: password in env + ssh stdin only, sudo fed from file", async () => {
     const f = fixture();
@@ -2274,6 +2293,96 @@ exit 1
     expect(remote).toContain('sudo -S < "$pwf"');
     expect(rec.sshStdin).toBe(PASS);
     expect(rec.sudoPw).toBe(PASS);
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("injection: odd peer name survives to the sudo -u slot (journal-errors)", async () => {
+    const f = fixture();
+    // peer home whose basename carries quote + $ + backtick
+    const oddHome = path.join(f.tmp, ODD);
+    const r0 = hopStubs(f);
+    const r = await f.run(
+      ["journal-errors", "--agent", ODD, "--since", "2026-10-01T00:00:00Z"],
+      { ...hopEnv(f), JARATE_AGENT_HOMES: `${f.home}:${oddHome}` },
+    );
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    const peer = d.agents.find((a: any) => a.name === ODD);
+    // the hop ran end-to-end despite the odd name: fake sudo accepted the
+    // file-fed password, stub systemctl/journalctl produced the marker + 2
+    // warnings
+    expect(peer.source).toBe("ssh+sudo");
+    expect(peer.count).toBe(2);
+    expect(peer.error).toBeNull();
+    const rec = readRec(f, r0);
+    // (a) sshpass -e + SSHPASS env, no -p, no password in sshpass argv
+    expect(rec.sshpassArgs).toContain("-e");
+    expect(rec.sshpassArgs).not.toContain("-p");
+    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
+    expect(rec.sshPassEnv).toBe(`SSHPASS=${PASS}`);
+    // (b) password in NO argv: local ssh args (incl. the remote string)
+    expect(rec.sshArgs.every((a) => !a.includes(PASS))).toBe(true);
+    expect(rec.sshStdin).toBe(PASS);
+    // (c) the odd value reached the sudo line INTACT (stub-captured argv)
+    const uIdx = rec.sudoArgs.indexOf("-u");
+    expect(uIdx).toBeGreaterThan(-1);
+    expect(rec.sudoArgs[uIdx + 1]).toBe(ODD);
+    // the since positional (inner bash -c "$1") is intact too
+    expect(rec.sudoArgs).toContain("2026-10-01T00:00:00Z");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("injection: odd home survives to PI_HOME + sudo line (projects scan)", async () => {
+    const f = fixture();
+    // peer home whose basename carries quote + $ + backtick; a run record
+    // is planted UNDER it so a mangled PI_HOME yields a different scanned
+    const oddHome = path.join(f.tmp, "scan-odd", ODD);
+    plantRecord(oddHome, "pi-bg-odd.json", {
+      run: "odd",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: {
+        input: 100,
+        output: 10,
+        cacheRead: 5,
+        cacheWrite: 1,
+        total: 115,
+      },
+      cost_usd: 0.01,
+    });
+    const r0 = hopStubs(f);
+    const r = await f.run(["projects", "--agent", ODD], {
+      ...hopEnv(f),
+      JARATE_AGENT_HOMES: `${f.home}:${oddHome}`,
+    });
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    const peer = d.agents.find((a: any) => a.agent === ODD);
+    // end-to-end proof PI_HOME arrived intact: the scanner listed exactly
+    // the odd dir and found the one planted record
+    expect(peer.source).toBe("ssh+sudo");
+    expect(peer.scanned).toBe(1);
+    expect(peer.error).toBeNull();
+    const rec = readRec(f, r0);
+    expect(rec.sshpassArgs).toContain("-e");
+    expect(rec.sshpassArgs).not.toContain("-p");
+    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
+    // (b) password in NO argv, local or remote
+    expect(rec.sshArgs.every((a) => !a.includes(PASS))).toBe(true);
+    expect(rec.sshStdin).toBe(PASS);
+    // (c) owner + home reached the sudo line INTACT (stub-captured argv):
+    // -u <owner> ... bash -c <script> _ <home> <b64>
+    const uIdx = rec.sudoArgs.indexOf("-u");
+    expect(uIdx).toBeGreaterThan(-1);
+    expect(rec.sudoArgs[uIdx + 1]).toBe(ODD);
+    const cIdx = rec.sudoArgs.indexOf("-c");
+    expect(cIdx).toBeGreaterThan(-1);
+    expect(rec.sudoArgs[cIdx + 2]).toBe("_");
+    expect(rec.sudoArgs[cIdx + 3]).toBe(oddHome);
+    expect(rec.sudoArgs[cIdx + 4]).not.toBe("");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
