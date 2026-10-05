@@ -50,7 +50,7 @@ Not in the bridge process, but censored via the **jarate-censor CLI**
 caller (any error = pass through). Wired in where the out-of-bridge
 egress lives:
 
-- `dispatch/pi-bg` — the webhook callback embed's `task` and `result`
+- `dispatch/jarate-bg` — the webhook callback embed's `task` and `result`
   fields (truncated task text + raw worker output, the primary leak
   surface) and the legacy plain-text fallback body are all run through
   `jarate-censor` before the POST.
@@ -59,7 +59,7 @@ egress lives:
 
 Known open (residual gaps, not covered by any process today):
 
-- **webdrop artifacts** — pi-bg uploads the FULL prompt + output files
+- **webdrop artifacts** — jarate-bg uploads the FULL prompt + output files
   to webdrop; only the link lands in Discord. The files are readable by
   anyone with the URL. Acceptable while the TTL is 7d + random slugs;
   censoring them needs a webdrop-side hook.
@@ -68,7 +68,7 @@ Known open (residual gaps, not covered by any process today):
   wired the same one-line way (`printf '%s' "$msg" | bun <jarate>/bin/jarate-censor`).
   The guarantee scope is: **every Discord egress in this repo routes
   through `censor()`** — asserted for the bridge at source level (the
-  chokepoint test) and structurally for pi-bg/agent-say (both post only
+  chokepoint test) and structurally for jarate-bg/agent-say (both post only
   the censored strings).
 
 ## Redaction strategy

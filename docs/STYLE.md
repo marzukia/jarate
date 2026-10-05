@@ -36,7 +36,7 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 3.3 No walls of text. Short paragraphs, one idea each.
 3.4 Code: only when it is code. Numbers/ids in prose stay bare.
 
-## 4 Tool output (jarate + pi-bg)
+## 4 Tool output (jarate + jarate-bg)
 4.1 jarate stdout: ONE JSON document, snake_case, no color, no emoji.
     (docs/JARATE.md)
 4.2 Slash commands: bracketed tag + one line, fenced only when the

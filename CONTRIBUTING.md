@@ -59,7 +59,7 @@ See AGENTS.md § Style. (operator, 2026-09-10)
 (`VERDICT: PASS`) before merge.** Dispatch:
 
 ```bash
-nohup ~/scripts/pi-bg reviewer "Adversarial review of PR <#> / branch <name>
+nohup ~/scripts/jarate-bg reviewer "Adversarial review of PR <#> / branch <name>
 in <repo>. Read the diff vs main. Check: behavior changes, test coverage,
 install.sh idempotency, live-box safety (no settings.json/piscord checkout
 edits, no pi restarts). End with VERDICT: PASS or VERDICT: FAIL and ranked

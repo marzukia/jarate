@@ -13,8 +13,8 @@ What it ships:
 - **`packages/bridge`** — the Discord bridge for pi (`@jarate/bridge`):
   channels, slash commands, threading, chunking, acks, send-file, agent-to-agent
   exemption.
-- **`dispatch/`** — orchestration: `pi-bg` (one-shot worker/reviewer runs with
-  git worktrees, cgroup escape, Discord webhook callbacks) + `pi-wait`
+- **`dispatch/`** — orchestration: `jarate-bg` (one-shot worker/reviewer runs with
+  git worktrees, cgroup escape, Discord webhook callbacks) + `jarate-wait`
   (in-turn wait).
 - **`packages/recall`** — shared RAG on Postgres + pgvector (`bun recall
   ingest|query`). TS port of the old Python pgrag; same db, no migration.
@@ -32,7 +32,7 @@ the source of truth.
 | `packages/bridge/` | `@jarate/bridge` — Discord bridge for pi (TypeScript, bun, strict tsc; 300+ tests) |
 | `packages/bridge/skills/` | pi skill (`channel`) that ships with the bridge |
 | `packages/recall/` | `@jarate/recall` — RAG CLI (`bun recall ingest\|query`), `schema.sql` (dim 768, nomic-embed-text) |
-| `dispatch/` | `pi-bg` (dispatch worker/reviewer, worktrees, cgroup escape, webhook), `pi-wait` (in-turn wait) |
+| `dispatch/` | `jarate-bg` (dispatch worker/reviewer, worktrees, cgroup escape, webhook), `jarate-wait` (in-turn wait) |
 | `bin/agent-say` | agent-to-agent Discord messaging |
 | `templates/` | newrepo boilerplate (repo governance) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
@@ -64,7 +64,7 @@ npm install -g @earendil-works/pi-coding-agent bun
 #    (SERVERS, SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES —
 #     see packages/bridge/channel/discord.ts GATEWAY_INTENTS), invite bot
 
-# 3. bootstrap (symlinks pi-bg/pi-wait/agent-say/recall into the checkout)
+# 3. bootstrap (symlinks jarate-bg/jarate-wait/agent-say/recall into the checkout)
 git clone https://github.com/marzukia/jarate.git ~/projects/jarate
 ~/projects/jarate/install.sh
 
@@ -111,7 +111,7 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
         |  pi (coding agent)        |  ~/.pi/agent  (settings.json, AGENTS.md)
         |  orchestrator turn loop   |
         +-------------+-------------+
-                      |  pi-bg worker|reviewer [--worktree <ref>] "task"
+                      |  jarate-bg worker|reviewer [--worktree <ref>] "task"
                       v
         +---------------------------+
         |  role profiles            |  ~/.pi/agent-worker, ~/.pi/agent-reviewer
@@ -128,9 +128,9 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
 - **bridge → Discord**: polls inbound messages, injects a `<channel-ctx>`
   block, forwards agent output back (chunked, threaded, ping-suppressed).
   Bot traffic is exempt (no echo loops).
-- **pi-bg dispatch loop**: the orchestrator keeps its KV lean by handing
+- **jarate-bg dispatch loop**: the orchestrator keeps its KV lean by handing
   context-hungry work to worker/reviewer profiles. Default flow is
-  fire-and-forget — the webhook callback is the wake. In-turn `pi-wait`
+  fire-and-forget — the webhook callback is the wake. In-turn `jarate-wait`
   is the opt-in exception (short task, human beats every wait).
   Full protocol: [docs/DISPATCH.md](docs/DISPATCH.md).
 - **recall**: every RAG query goes through the single `search()` SQL

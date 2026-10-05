@@ -10,7 +10,8 @@ agent stack). Read this before touching anything.
   copies of this dir.
 - `packages/recall/` — `@jarate/recall`, the RAG CLI (`bun recall ingest|query`).
   TS port of the old Python pgrag (removed 2026-09-10); db `rag` unchanged.
-- `dispatch/` — `pi-bg`, `pi-wait` bash scripts (the orchestration machinery).
+- `dispatch/` — `jarate-bg`, `jarate-wait` bash scripts (+ `pi-*` deprecation
+  shims; the orchestration machinery).
 - `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
 - `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook), PAT-VAULT.md (PAT vault runbook).
@@ -77,7 +78,7 @@ bash install.sh --dry-run          # installer regression check
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
    merge. Nohup form (foreground launch is rejected, rc 4, #144):
-   `nohup ~/scripts/pi-bg reviewer "adversarially review <branch/PR> ..." > review.log 2>&1 &`
+   `nohup ~/scripts/jarate-bg reviewer "adversarially review <branch/PR> ..." > review.log 2>&1 &`
 5. Merge only on PASS + green `ci` (biome + bridge jobs).
 
 ## Do-not-touch list

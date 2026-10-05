@@ -72,15 +72,15 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | *delete a queued message* | owner | the queued entry (and its interrupt) is dropped |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
-| `/jobs` | anyone | list `pi-bg` dispatches: in-flight + recent history (`json` for JSON) |
+| `/jobs` | anyone | list `jarate-bg` dispatches: in-flight + recent history (`json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session\|last]` | anyone | token usage: current session (default), lifetime across all session files, or the last completed run |
 | `/context [N]` | anyone | what is eating the window: top-N items by token ESTIMATE (char/4, no model, no pricing) + category totals (user/assistant/tool) + biggest eater; N default 10, max 40 |
 | `/new-worktree [ref]` | owner | create a git worktree for this session's repo at `$PI_BG_WT_DIR/<repo>/<ticket>` (branch `pi-bg/<ticket>`), one at a time |
 | `/merge-worktree [squash]` | owner | merge the active worktree's branch into the live checkout's current branch, then remove worktree + branch; `squash` = one commit |
-| `/jobs kill <id>` | owner | kill an in-flight `pi-bg` run (wraps `pi-bg-kill`) |
-| `/jobs tail <id> [--n N]` | owner | tail a run's live output (wraps `pi-bg-tail`; N capped at 200, shown lines at 40) |
+| `/jobs kill <id>` | owner | kill an in-flight `jarate-bg` run (wraps `jarate-bg-kill`) |
+| `/jobs tail <id> [--n N]` | owner | tail a run's live output (wraps `jarate-bg-tail`; N capped at 200, shown lines at 40) |
 | `/reset` | owner | abort the run and restart the pi session |
 | `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
@@ -191,7 +191,7 @@ the tool for "do this next, but don't interrupt what you're doing".
 ### /btw
 
 ```
-/btw what's the exit code convention in pi-wait?
+/btw what's the exit code convention in jarate-wait?
 ```
 
 Side question answered briefly while the main run continues. A trailing
@@ -380,14 +380,14 @@ stay under the 40-col budget:
 The `json` format keeps the raw machine-readable object (states un-compressed,
 plus the success-path webhook HTTP code when recorded).
 
-`kill` and `tail` wrap the dispatch scripts (`pi-bg-kill <id>`,
-`pi-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
+`kill` and `tail` wrap the dispatch scripts (`jarate-bg-kill <id>`,
+`jarate-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
 and the tail file is owned by the dispatch user. Output is fenced; tail
 shows the last N lines (default 40, cap 200), notes dropped lines
 (`[..] 60 earlier lines`), and hard-wraps lines to the 40-col budget.
 
-Companion bins (installed like `pi-bg`): `pi-bg-tail <id> [lines] [-f]`
-reads a run's live output; `pi-bg-kill <id> [--dry-run]` cancels a run via
+Companion bins (installed like `jarate-bg`): `jarate-bg-tail <id> [lines] [-f]`
+reads a run's live output; `jarate-bg-kill <id> [--dry-run]` cancels a run via
 its cgroup and posts a `KILLED` webhook event.
 
 ### /new-worktree + /merge-worktree
@@ -402,7 +402,7 @@ Owner only. Gives the MAIN interactive session the same worktree flow the
 dispatch workers get (`--worktree`): the worktree lands at
 `$PI_BG_WT_DIR/<repo>/<ticket>` (default `~/.pi-bg-wt`), branch
 `pi-bg/<ticket>`, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, same shape as
-`pi-bg`). One worktree per repo at a time; state in `<repo>/.tmp/worktree.json`.
+`jarate-bg`). One worktree per repo at a time; state in `<repo>/.tmp/worktree.json`.
 
 - `new-worktree` refuses when one is already active, and answers `[!]` when
   the cwd is not a git repo.
