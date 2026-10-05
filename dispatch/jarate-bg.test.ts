@@ -946,7 +946,7 @@ describe("#86: launch-fail webhook", () => {
       ).toBeDefined();
       expect(emb.author.name).toBe(`pi-bg ticket \u00b7 ${rid}`);
       expect(emb.description).toContain(`\u250c died \u00b7 ${rid}`);
-      expect(emb.description).toContain("$ pi-bg worker --worktree");
+      expect(emb.description).toContain("$ jarate-bg worker --worktree");
       const result = emb.fields?.find((f: any) => f.name === "result");
       expect(result?.value).toContain(
         "launch-fail: --worktree needs a git repo",
