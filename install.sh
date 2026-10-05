@@ -73,8 +73,15 @@ done
 # Canonicalize once (PR #155 review LOW-1): the 3a ownership check compares
 # readlink -f(resolved) against $JARATE_DIR, so a symlinked --jarate-dir
 # must be resolved here or every tool reports "stale symlink". GNU readlink
-# -f tolerates a non-existent leaf (the clone case below).
-JARATE_DIR="$(readlink -f "$JARATE_DIR")"
+# -f tolerates a missing LEAF (the clone case below) but needs every PARENT
+# component to exist; on a fresh HOME the parents are missing too, so fall
+# back to the raw path when canonicalization fails (the clone below then
+# creates the tree under it).
+JARATE_DIR_RAW="$JARATE_DIR"
+JARATE_DIR="$(readlink -f "$JARATE_DIR" 2>/dev/null || true)"
+if [ -z "$JARATE_DIR" ]; then
+  JARATE_DIR="$JARATE_DIR_RAW"
+fi
 
 run() {
   if [ "$DRY" = 1 ]; then
