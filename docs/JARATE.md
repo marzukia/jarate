@@ -94,7 +94,11 @@ absolute UTC.
   (`truncated` true when cut); row `error` set when the hop itself failed
   (row `warnings` = `null` then).
 - `ok:false` when any agent row errored or no agents matched `--agent`.
-- Hop env: `JARATE_SSH_HOST` (default `admin@127.0.0.1`),
+- Hop env: `JARATE_SSH_HOST` (explicit override: `user@host` as-is, a bare
+  user becomes `user@127.0.0.1`). When unset the target is DERIVED (#147):
+  the unique local user with uid > 900, a home, a login shell, and
+  sudo-group membership (`wheel` on Fedora, `sudo` on Debian/Ubuntu). 0 or
+  >1 candidates -> ok:false doc naming them + the exact override command.
   `JARATE_SUDO_PASS` (env, else `~/.config/sudo-pass` 0600 file - never a
   literal in code), `JARATE_AGENT_HOMES` (test
   override: colon-separated home list).
@@ -298,7 +302,7 @@ in the output.
 | `JARATE_TOKEN_COST` | explicit path to pi-token-cost.py |
 | `JARATE_CTX_LIMIT` | fallback context limit when models.json has none |
 | `JARATE_AGENT_HOMES` | colon-separated agent home list (skips auto-discovery) |
-| `JARATE_SSH_HOST` / `JARATE_SUDO_PASS` | peer-hop identity / password |
+| `JARATE_SSH_HOST` / `JARATE_SUDO_PASS` | peer-hop target override (derived when unset) / password |
 | `JARATE_RECALL_CLI` | explicit path to the recall CLI |
 | `JARATE_AGENTS_MD` | explicit AGENTS.md path (else `~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md`) |
 | `JARATE_ROOT` | repo root for the bundled recall (auto-detected otherwise) |

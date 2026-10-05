@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { shellWords } from "../../../bin/shell-words";
 
 /** 30s cap, overridable for tests. */
 export function jarateTimeoutMs(): number {
@@ -47,8 +48,27 @@ export function runJarate(
   const jarate = path.join(env.HOME ?? "", "bin", "jarate");
   return new Promise((resolve) => {
     let p: ReturnType<typeof spawn>;
+    // One flag grammar (#148): the tool's single args string is re-split
+    // with the SAME shellWords parser the vault/pat tool paths use, so the
+    // entrypoint sees real argv (quoted values, --flag=value, two-word
+    // re-joins). Unparseable -> executable JSON doc, no spawn.
+    let argv: string[];
     try {
-      p = spawn(jarate, [cmd, args], { env, detached: true });
+      argv = [cmd, ...shellWords(args)];
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      resolve({
+        out: JSON.stringify({
+          ok: false,
+          error: `jarate: args not parseable: ${why}. Re-send with balanced quotes, e.g. jarate ${cmd} --since "<value>"`,
+        }),
+        code: 2,
+        timedOut: false,
+      });
+      return;
+    }
+    try {
+      p = spawn(jarate, argv, { env, detached: true });
     } catch (e) {
       resolve({
         out: `spawn failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -169,7 +189,8 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       }),
       args: Type.Optional(
         Type.String({
-          description: "space-separated args for the subcommand (may be empty)",
+          description:
+            'args for the subcommand, space-separated (may be empty). Values with spaces go in double quotes; `--flag value` and `--flag=value` both work. Example: --since "2026-10-05 00:00:00"',
         }),
       ),
     }),
