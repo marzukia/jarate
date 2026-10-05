@@ -132,6 +132,17 @@ if [ -f "$AS_ROOT/bin/jarate-censor" ] && command -v bun >/dev/null 2>&1; then
   censored="$(printf '%s' "$msg" | bun "$AS_ROOT/bin/jarate-censor" 2>/dev/null)" && msg="$censored"
 fi
 
+# Outbox (2026-10-06 abort incident): a mid-run kill can land between
+# curl POST-completion and the "sent" print; the agent re-runs agent-say
+# with the same text and double-posts. Record each successful send as a
+# receipt and dedupe an identical channel + text re-run within
+# DEDUPE_WINDOW seconds (skip the POST, print the receipt's id). Receipt
+# writes are best-effort: a failure warns once, never changes rc.
+DEDUPE_WINDOW=60
+AS_RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+AS_OUTBOX="$AS_RT/jarate/agent-say-outbox.jsonl"
+msg_sha="$(printf '%s' "$msg" | sha256sum 2>/dev/null | awk '{print $1}')" || msg_sha=""
+
 token="${PI_BOT_TOKEN:-}"
 if [ -z "$token" ] && [ -f "$HOME/.pi/agent/settings.json" ]; then
   token=$(jq -r '[.channels[]? | select(.type == "discord") | .botToken // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json")
@@ -139,6 +150,22 @@ fi
 if [ -z "$token" ]; then
   echo "agent-say: no bot token (set PI_BOT_TOKEN or add a discord channel to ~/.pi/agent/settings.json)" >&2
   exit 1
+fi
+
+# Idempotent re-run check (pre-POST): a receipt for the same channel +
+# text within DEDUPE_WINDOW seconds -> skip the POST and print the
+# receipt's id in the identical "sent <id>" shape (callers cannot tell
+# the difference). Unreadable file / partial line / jq failure = miss =
+# post as normal (dedupe is an optimization, never a blocker).
+if [ -n "$msg_sha" ] && [ -f "$AS_OUTBOX" ]; then
+  now="$(date +%s)"
+  dedup_id="$(jq -rs --arg c "$channel" --arg h "$msg_sha" --argjson now "$now" --argjson w "$DEDUPE_WINDOW" \
+    '[.[] | select(.channel == $c and .text_sha256 == $h and .ts <= $now and ($now - .ts) <= $w)] | last | .id // empty' \
+    "$AS_OUTBOX" 2>/dev/null || true)"
+  if [ -n "$dedup_id" ]; then
+    echo "sent $dedup_id"
+    exit 0
+  fi
 fi
 
 # issue #120: the bot token never sits in curl's argv — it rides a curl
@@ -155,5 +182,15 @@ id=$(jq -r '.id // empty' <<<"$resp")
 if [ -z "$id" ]; then
   echo "agent-say: discord error: $(jq -c '.' <<<"$resp")" >&2
   exit 1
+fi
+
+# Outbox receipt: written only on a true success (error bodies were
+# rejected above), best-effort — a failed write warns, rc stays 0.
+if [ -n "$msg_sha" ]; then
+  if ! { mkdir -p "${AS_OUTBOX%/*}" 2>/dev/null \
+      && jq -cn --arg c "$channel" --arg h "$msg_sha" --arg i "$id" --argjson t "$(date +%s)" \
+        '{channel: $c, text_sha256: $h, id: $i, ts: $t}' >>"$AS_OUTBOX" 2>/dev/null; }; then
+    echo "agent-say: [warn] outbox receipt write failed ($AS_OUTBOX)" >&2
+  fi
 fi
 echo "sent $id"
