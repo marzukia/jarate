@@ -324,3 +324,31 @@ describe("jarate-wait #117: rc contract holds when curl fails", () => {
     expect(r.err).toContain("cannot fetch bot id");
   });
 });
+
+describe("jarate-wait #166 review LOW: poll parse noise stays off stderr", () => {
+  test("non-array poll body (429 JSON) -> no traceback, rc 3 timeout", async () => {
+    const f = fixture();
+    // Discord 429 shape: a JSON object, not a message array
+    f.setMsgs(
+      JSON.stringify({ message: "You are being rate limited", retry_after: 1 }),
+    );
+    const r = await f.run(["--since", "100", "--timeout", "3", "--check", "1"]);
+    expect(r.code).toBe(3);
+    expect(r.out).toContain("timeout");
+    // base printed a full python AttributeError traceback per poll
+    expect(r.err).not.toContain("Traceback (most recent call last)");
+    expect(r.err).not.toContain("AttributeError");
+    expect(r.err).not.toContain("JSONDecodeError");
+  });
+
+  test("HTML error body (502) -> no traceback, rc 3 timeout", async () => {
+    const f = fixture();
+    f.setMsgs("<html><body>502 Bad Gateway</body></html>\n");
+    const r = await f.run(["--since", "100", "--timeout", "3", "--check", "1"]);
+    expect(r.code).toBe(3);
+    expect(r.out).toContain("timeout");
+    // base printed a full python JSONDecodeError traceback per poll
+    expect(r.err).not.toContain("Traceback (most recent call last)");
+    expect(r.err).not.toContain("JSONDecodeError");
+  });
+});

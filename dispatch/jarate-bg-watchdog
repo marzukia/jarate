@@ -129,7 +129,10 @@ cg_kill_guarded() {
     echo "[pi-bg-watchdog] warning: $d not empty (live PIDs), skipping cgroup.kill" >&2
     return 1
   fi
-  echo 1 > "$d/cgroup.kill" 2>/dev/null || true
+  # #164 review LOW: group the redirect so a missing dir is silent -
+  # bare `> file 2>/dev/null` prints the open-failure error (redirects are
+  # processed L-to-R, stderr is only dropped after the file open fails).
+  { echo 1 > "$d/cgroup.kill"; } 2>/dev/null || true
   return 0
 }
 

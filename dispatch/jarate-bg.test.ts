@@ -1248,12 +1248,15 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
   }, 30_000);
 
   // --- issue #123 verification (cap counts TICKETS, not processes) ---
-  // Each live ticket = wrapper + pi child = 2 processes. The pre-fix /proc
-  // argv scan counted both (plus same-uid stubs), so a pinned cap 4
-  // admitted ~1 real ticket. The fix counts fresh hb files instead: one
-  // file per ticket, windowed at 3 x PI_BG_HB_INTERVAL (90s default).
+  // Each live stub ticket = 4 processes (wrapper bash, hb child, sh-pi,
+  // sleep); 2 of them (wrapper + hb child, identical argv) match the
+  // pre-fix /proc argv scan (basename pi-bg + worker). The old scan
+  // counted those 2 (plus same-uid stubs), so a pinned cap 4 admitted
+  // ~1 real ticket. The fix counts fresh hb files instead: one file per
+  // ticket, windowed at 3 x PI_BG_HB_INTERVAL (90s default); the assert
+  // below pins the hb-FILE count (exactly 2 for 2 tickets), not procs.
 
-  test("2 live tickets (2 procs each) count as 2; cap admits up to max", async () => {
+  test("2 live tickets count as 2 (hb files, not procs); cap admits up to max", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sleepStubPi(fx, 10);
