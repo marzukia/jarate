@@ -599,7 +599,12 @@ function patEmbed(
       inline: false,
     });
   }
-  if (status === "approved") {
+  // claim deadline: approved (the run window) AND expired (vault's
+  // always-present pattern: the deadline must stay visible after the
+  // claim-expired edit replaces the approved embed - pr-b3 review LOW-1).
+  // Value falls back to ttlDeadline when claimDeadline is unset (ttl-expired
+  // was never approved).
+  if (status === "approved" || status === "expired") {
     fields.push({
       name: "claim",
       value: `claim by ${timeOfDay(

@@ -7,7 +7,7 @@
  *
  * /context parses the channel's ACTIVE session file (same discovery as
  * /usage: caller-resolved ctx session file, else findSessionFile(cwd)) and
- * reports, in one 32-col framed block:
+ * reports, in one 40-col framed block:
  *   - top-N items by token ESTIMATE (default 10, `/context 20` accepts a
  *     count, capped at 40 to stay under Discord's 2000-char message limit)
  *   - totals by category (user / assistant / tool)

@@ -496,6 +496,23 @@ describe("styleGuard", () => {
     expect(styleGuard(frame)).toBe(frame);
   });
 
+  test("tagged fence: >40-col body stays VERBATIM (A2 wraps only UNTAGGED)", () => {
+    // Language-tagged fences pass through untouched: wrapFenceLine's
+    // continuation indent would break code semantics (same rule as
+    // wrapFenceLines). Regression pin for the A2 sweep: the >40 wrap
+    // applies to UNTAGGED existing fences, never to tagged ones.
+    const codeLine =
+      "def f(enable_prompt_tokens_details: bool, cached_tokens: int) -> bool:";
+    expect(codeLine.length).toBeGreaterThan(40);
+    const tagged = `\`\`\`python\n${codeLine}\n\`\`\``;
+    expect(styleGuard(tagged)).toBe(tagged);
+    // contrast: the same >40 line in an UNTAGGED fence wraps to the budget
+    const untagged = styleGuard(`\`\`\`\n${codeLine}\n\`\`\``);
+    expect(untagged).not.toBe(`\`\`\`\n${codeLine}\n\`\`\``);
+    for (const l of untagged.split("\n").slice(1, -1))
+      expect(l.length).toBeLessThanOrEqual(40);
+  });
+
   test("idempotent: styleGuard(styleGuard(x)) === styleGuard(x)", () => {
     const inputs = [
       "[ok] compacted: 153k -> 36k",
