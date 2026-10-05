@@ -142,7 +142,7 @@ Optional, runbooks in this repo:
   ~/.pi/agent/extensions/` + a `tavilyApiKey` in settings.json `mcp[]`
   (key in the query string; restart after)
 - **Peers** — [NEW-AGENT.md](NEW-AGENT.md) §8: invite bots to each other's
-  guilds + `peerBotIds` in settings.json; `bin/agent-say` for messaging
+  guilds + `peerBotIds`/`peerChannels` in settings.json; `bin/agent-say` for messaging
 - **Fleet ops** — [DISPATCH.md](DISPATCH.md): caps, worktrees, `jarate-wait`
 
 ## 5. Verification checklist

@@ -100,7 +100,8 @@ node is system-wide (/usr/bin/node) - no per-user step.
     "ack": false,
     "bufferFileOnly": false,
     "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>",
-    "peerBotIds": ["<every other agent's bot user id>"]
+    "peerBotIds": ["<every other agent's bot user id>"],
+    "peerChannels": { "<peer bot user id>": "<their channel id>" }
   }],
   "mcp": [{ "name": "tavily", "url": "<shared tavily mcp url from an existing agent>" }],
   "defaultThinkingLevel": "medium",
@@ -247,7 +248,9 @@ For each existing agent (monky, frank, jimmy, ...):
   priority, onboard date).
 - `~/.pi/agent/settings.json` channel block: add the new bot's user id to
   `peerBotIds` (otherwise agent-say from the new agent is silently dropped
-  by the other-bot filter).
+  by the other-bot filter) AND map its user id to its channel id in
+  `peerChannels` (the peer-visibility feature: the [fwd] auto-forward
+  needs to know where to relay replies to that peer's message).
 - `~/.config/agent-fleet/peers.json` on every existing agent: add the new
   agent. agent-say validates targets against this file (unknown numeric
   ids exit 4, peer names must exist as keys) and the file is never

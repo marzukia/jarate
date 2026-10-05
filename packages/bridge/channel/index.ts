@@ -1120,6 +1120,13 @@ const lastInboundIds = new Map<string, string>();
 // validation set for <reply-to:MSGID> on the message_end early-send path
 // (event.messages is not available there). Updated on every sendToPi.
 const runInboundIds = new Map<string, string[]>();
+// Recent inbound message metadata by message id (all channels): author id
+// + body, so an egress reply's <reply-to:MSGID> target can be classified
+// (peer agent vs human) and loop-guarded ([fwd]-marked target). Recorded
+// in handleInbound (the one inbound funnel: gateway, poll, queued re-wake).
+// Bounded; oldest entries drop off.
+const inboundMeta = new Map<string, { authorId?: string; body: string }>();
+const INBOUND_META_CAP = 200;
 // Set when /stop or a mid-run interrupt aborts a run, so agent_end does not
 // post the abort's errorMessage as if it were a model/API failure (A2).
 let userStoppedRun = false;
@@ -1892,8 +1899,8 @@ const earlySent = new WeakSet<object>();
 
 // ─── Inbound message custom type ─────────────────────────────────────────
 // Sent via pi.sendMessage(); the LLM sees the full content (with <channel-ctx>),
-// while the TUI renders only the type/name title + message body.
-const CHANNEL_MSG_TYPE = "channel-inbound";
+// while the TUI renders only the type/name title + message body. Exported for tests.
+export const CHANNEL_MSG_TYPE = "channel-inbound";
 
 interface ChannelMessageDetails {
   title: string; // e.g. "discord/Discord Main"
@@ -2799,6 +2806,10 @@ export default function (pi: ExtensionAPI) {
             );
         } catch {}
       }
+      // Peer auto-forward (b): the final is threaded to a peer agent's
+      // message (tagged or default last-inbound) — relay it to the
+      // peer's channel. One hop + 60 s identical-text dedupe inside.
+      if (replyTo) await forwardPeerReply(ch, rt.text, replyTo);
       // SPEC B: the final is out — delete the ephemeral live-text message
       // (best effort; the agent_end delete is the safety net for runs
       // whose final never reaches this path).
@@ -3168,6 +3179,10 @@ export default function (pi: ExtensionAPI) {
             );
         } catch {}
       }
+      // Peer auto-forward (b): same rule as the message_end path — a
+      // final delivered here (not caught by the early send) that
+      // targets a peer agent's message is relayed to the peer channel.
+      if (f.replyTo) await forwardPeerReply(ch, f.text, f.replyTo);
       // Clear the ack even when every chunk failed, so a failed reply
       // does not leave a stale 👀 on the user's message.
       if (ch.type === "discord" && f.replyTo) {
@@ -3272,6 +3287,39 @@ export function buildRepliedMessageBlock(rm?: {
   return `This message was a reply to message\n\n<replied-message${author}>\n${escapePromptText(rm.text)}\n</replied-message>`;
 }
 
+/** c1: <channel-ctx> line for peer-agent inbounds. The model has no
+ *  other signal that the sender is a peer (a peer message arrives like
+ *  any channel message), so the hint states where a normal reply lands
+ *  (this channel only), the one case the bridge auto-forwards (a reply
+ *  threaded to the peer's message), and the general tool (agent-say).
+ *  Present ONLY for peer-authored messages. Used while a peerChannels
+ *  mapping exists for the peer; see PEER_SENDER_HINT_NO_FWD for the
+ *  pre-configuration window. */
+export const PEER_SENDER_HINT =
+  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only; the peer sees it ONLY when your reply targets their message (the bridge auto-forwards that one hop). For anything else, use agent-say <their channel>.";
+
+/** c1: no-forward variant of PEER_SENDER_HINT, used while ch.peerChannels
+ *  has no mapping for this peer (the pre-configuration window). The
+ *  bridge cannot auto-forward in that state (no target channel — the
+ *  forward no-ops with reason "no-channel"), so the hint must not promise
+ *  the one hop: a threaded reply does NOT reach the peer, and agent-say
+ *  is the only path (the 2026-10-05 RCA failure mode is a model that
+ *  threads a reply and assumes the peer saw it). */
+export const PEER_SENDER_HINT_NO_FWD =
+  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
+
+/** c1: true when the inbound is authored by a known peer bot. Bg-webhook
+ *  tickets ([bg: prefix) are excluded even if their author id matches —
+ *  those are machine wakes, not a peer speaking. */
+export function isPeerInbound(
+  ch: ChannelConfig | undefined,
+  msg: ChannelMessage,
+): boolean {
+  const peerIds = ch?.peerBotIds ?? [];
+  if (!msg.fromId || !peerIds.includes(msg.fromId)) return false;
+  return !msg.body.trimStart().startsWith("[bg:");
+}
+
 function buildChannelContext(
   ch: ChannelConfig | undefined,
   msg: ChannelMessage,
@@ -3302,6 +3350,17 @@ function buildChannelContext(
     "Attribute precisely: when a <replied-message> block is present, the author of that block is the one who SPOKE the quoted words. Do not restate their statement as if it were the current sender's, and do not attribute their words to anyone else. Name the actual speaker when you reference what they said.",
     "To reply to a specific person's message, prefix your reply with <reply-to:MSGID> using their id from the [msgId=...] markers in this message (each part of a rapid-fire burst carries its own marker, including parts outside this block) or from the msgId= attribute of this block; the reply threads to that message and the tag is stripped before sending.",
   ];
+  if (isPeerInbound(ch, msg) && msg.fromId) {
+    // State-aware: the auto-forward clause is true only while a
+    // peerChannels mapping exists for this peer. Until the operator adds
+    // it, a threaded reply dies in-channel (the RCA failure mode), so the
+    // hint must say the peer does NOT see it.
+    lines.push(
+      ch?.peerChannels?.[msg.fromId]
+        ? PEER_SENDER_HINT
+        : PEER_SENDER_HINT_NO_FWD,
+    );
+  }
   if (ch?.instructions) lines.push(ch.instructions);
   if (opts?.btw) lines.push(BTW_HINT);
   lines.push("</channel-ctx>");
@@ -3314,6 +3373,120 @@ function buildChannelContext(
   const todoBlock =
     board && board.todos.length > 0 ? todoBoardContextBlock(board.todos) : "";
   return todoBlock ? `${block}\n\n${todoBlock}` : block;
+}
+
+// ─── Peer reply auto-forward (b) ──────────────────────────────────────
+// An in-channel reply that TARGETS a peer agent's message (threaded to
+// it, whether via <reply-to:MSGID> or the default last-inbound
+// threading) is relayed to the peer's channel through the agent-say
+// egress path: POST /channels/<peer>/messages with our own bot token.
+// Model-independent: it keys off the reply target's author, not on any
+// token the model emits. One hop: the relay carries the [fwd] marker
+// and a reply threaded to a [fwd]-marked message is never relayed again
+// (A->B->A echo guard). Identical relays to the same peer within
+// PEER_FWD_DEDUPE_MS are dropped (retry double-post guard).
+
+/** Leading marker on auto-forwarded peer replies (loop guard token). */
+export const FWD_MARKER = "[fwd] ";
+/** Identical-text dedupe window for peer auto-forwards (ms). */
+export const PEER_FWD_DEDUPE_MS = 60_000;
+/** targetChannel + text -> timestamp of the last forwarded post. */
+const peerFwdAt = new Map<string, number>();
+
+/** Record an inbound's author id + body for reply-target classification.
+ *  Bounded: the oldest entry drops off when the cap is exceeded. */
+export function recordInboundMeta(
+  messageId: string,
+  authorId: string | undefined,
+  body: string,
+): void {
+  inboundMeta.set(messageId, { authorId, body });
+  while (inboundMeta.size > INBOUND_META_CAP) {
+    const oldest = inboundMeta.keys().next().value;
+    if (oldest === undefined) break;
+    inboundMeta.delete(oldest);
+  }
+}
+
+/** Clear peer-forward state (tests only). */
+export function resetPeerFwdForTest(): void {
+  inboundMeta.clear();
+  peerFwdAt.clear();
+}
+
+/** Snapshot of peerFwdAt (tests only). */
+export function peerFwdSnapshotForTest(): [string, number][] {
+  return Array.from(peerFwdAt.entries());
+}
+
+/** Drop peerFwdAt entries whose age reaches the dedupe window. An entry
+ *  that old can no longer trigger a dedupe (the check is
+ *  `now - t < PEER_FWD_DEDUPE_MS`), so keeping it is a pure leak; pruning
+ *  on write keeps the map bounded to in-window forwards. */
+function prunePeerFwd(now: number): void {
+  for (const [key, t] of peerFwdAt) {
+    if (now - t >= PEER_FWD_DEDUPE_MS) peerFwdAt.delete(key);
+  }
+}
+
+/**
+ * Auto-forward an in-channel reply that targets a peer agent's message.
+ * Posts "[fwd] <text>" to the peer's channel. No-op (forwarded:false)
+ * when: no target / no bot token, the reply itself is already marked,
+ * the target is unknown (not in the recent-inbound map), the target's
+ * author is not a configured peer bot, the target carries the [fwd]
+ * marker (loop guard), no peer channel is configured for that bot, the
+ * peer channel is our own, or an identical forward to that channel
+ * landed within PEER_FWD_DEDUPE_MS (dedupe). Best effort: a failed post
+ * never rejects.
+ */
+export async function forwardPeerReply(
+  ch: ChannelConfig,
+  text: string,
+  replyTo: string | undefined,
+  now = Date.now(),
+): Promise<{ forwarded: boolean; reason?: string }> {
+  try {
+    if (!replyTo || ch.type !== "discord" || !ch.botToken)
+      return { forwarded: false, reason: "no-target" };
+    if (text.startsWith(FWD_MARKER))
+      return { forwarded: false, reason: "already-marked" };
+    const meta = inboundMeta.get(replyTo);
+    if (!meta) return { forwarded: false, reason: "unknown-target" };
+    const authorId = meta.authorId;
+    if (!authorId || !(ch.peerBotIds ?? []).includes(authorId))
+      return { forwarded: false, reason: "not-peer" };
+    if (meta.body.startsWith(FWD_MARKER))
+      return { forwarded: false, reason: "loop-guard" };
+    const targetChannel = ch.peerChannels?.[authorId];
+    if (!targetChannel) return { forwarded: false, reason: "no-channel" };
+    if (targetChannel === ch.channel)
+      return { forwarded: false, reason: "own-channel" };
+    const key = `${targetChannel}\n${text}`;
+    const last = peerFwdAt.get(key);
+    if (last !== undefined && now - last < PEER_FWD_DEDUPE_MS)
+      return { forwarded: false, reason: "dedupe" };
+    // Discord content cap headroom: the in-channel path chunks at 1900,
+    // the relay is a single post — clip over-long replies (tail lost,
+    // marker + head kept).
+    const capped = text.length > 1900 ? `${text.slice(0, 1897)}...` : text;
+    const r = await sendDiscordMessage(
+      { ...ch, id: `${ch.id}::fwd`, channel: targetChannel },
+      `${FWD_MARKER}${capped}`,
+    );
+    if (!r.success) {
+      console.error(
+        `[channel] peer forward failed: ${sanitizeSensitiveText(r.error || "")}`,
+      );
+      return { forwarded: false, reason: "send-failed" };
+    }
+    prunePeerFwd(now);
+    peerFwdAt.set(key, now);
+    return { forwarded: true };
+  } catch (e) {
+    console.error(`[channel] peer forward failed: ${sanitizeUnknownValue(e)}`);
+    return { forwarded: false, reason: "error" };
+  }
 }
 
 // ─── Native slash-command handler (INTERACTIONS_CREATE) ───────────────────
@@ -5516,7 +5689,10 @@ export async function handleInbound(
   // instead of dereferencing `ch` further down.
   if (!ch) return;
   lastActiveChannel = ch;
-  if (msg.messageId) lastInboundIds.set(ch.id, msg.messageId);
+  if (msg.messageId) {
+    lastInboundIds.set(ch.id, msg.messageId);
+    recordInboundMeta(msg.messageId, msg.fromId, msg.body);
+  }
   resetFinalRepeats(ch.id); // a new inbound user message restarts the repetition counter
 
   // Update status to show active channel

@@ -20,6 +20,7 @@ import extension, {
   buildInteractionHandler,
   buildRepliedMessageBlock,
   buildRestartCommand,
+  CHANNEL_MSG_TYPE,
   channelError,
   chunkText,
   clearAllCompacting,
@@ -32,9 +33,11 @@ import extension, {
   deliverDueTasks,
   deliverDueWakes,
   earlySendText,
+  FWD_MARKER,
   failurePostText,
   fence,
   fileOnlyPrompt,
+  forwardPeerReply,
   handleInbound,
   hasOwnerConfigured,
   heldChannels,
@@ -43,6 +46,7 @@ import extension, {
   isEssentialToolCall,
   isHeld,
   isOwnerUser,
+  isPeerInbound,
   isVerbose,
   LIVE_TEXT_PLACEHOLDER,
   LIVE_TEXT_THROTTLE_MS,
@@ -50,9 +54,13 @@ import extension, {
   matchCommand,
   midTurnQueues,
   opWindowLabel,
+  PEER_FWD_DEDUPE_MS,
+  PEER_SENDER_HINT,
+  PEER_SENDER_HINT_NO_FWD,
   parseReplyTo,
   parseUndoCount,
   parseVerboseLevel,
+  peerFwdSnapshotForTest,
   pendingAttachments,
   pendingInterrupts,
   popChannelQueuedInbound,
@@ -64,6 +72,7 @@ import extension, {
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
+  resetPeerFwdForTest,
   resetRuntimeStateForTest,
   runFrame,
   runMidRunInterrupt,
@@ -804,6 +813,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   afterEach(async () => {
     clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+    resetPeerFwdForTest(); // peer-forward dedupe + inbound meta leak guard
     jest.useRealTimers();
     // Drop leftover re-wake state BEFORE the cleanup agent_end, or it would
     // start an in-flight re-wake whose sendToPi continuation leaks into the
@@ -893,6 +903,263 @@ describe("extension handlers (A1/A2/A4)", () => {
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     const body = JSON.parse(post!.body);
     expect(body.message_reference?.message_id).toBe("111");
+  });
+
+  // ─── Peer agent visibility (c1 + b) ─────────────────────────────────
+  // c1: peer-authored inbounds carry a <channel-ctx> hint (the model's
+  // only signal that the sender is a peer). b: a final threaded to a
+  // peer's message is auto-forwarded to the peer's channel (one hop,
+  // [fwd]-marked, 60 s identical-text dedupe).
+
+  // Peer variant: the author id is in the peer settings' peerBotIds.
+  const inboundPeer = (body: string, id: string): ChannelMessage => ({
+    ...inbound(body, id),
+    from: "peer",
+    fromId: "peer-1",
+  });
+
+  // Settings variant for the peer-visibility tests: one configured peer
+  // bot (peer-1) with a known peer channel (998).
+  const peerSettings = (extra: Record<string, unknown> = {}) =>
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "uid",
+            ack: true,
+            peerBotIds: ["peer-1"],
+            peerChannels: { "peer-1": "998" },
+            ...extra,
+          },
+        ],
+      }),
+    );
+
+  test("c1: peer-authored inbound carries the peer hint in channel-ctx", async () => {
+    peerSettings();
+    await handleInbound(pi, inboundPeer("monky: do X", "101"), ctx);
+    const content = sent.at(-1)!.m.content;
+    expect(content).toContain("<channel-ctx");
+    expect(content).toContain(PEER_SENDER_HINT);
+  });
+
+  test("c1: human inbound and [bg: webhook ticket do not carry the peer hint", async () => {
+    peerSettings();
+    await handleInbound(pi, inbound("hello human", "102"), ctx);
+    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
+    await handleInbound(
+      pi,
+      inboundPeer("[bg:worker:OK] task 42 done", "103"),
+      ctx,
+    );
+    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
+  });
+
+  test("c1: isPeerInbound classifies on peerBotIds + fromId", () => {
+    const ch = {
+      id: "ch1",
+      name: "Test",
+      type: "discord" as const,
+      enabled: true,
+      channel: "ch1",
+      peerBotIds: ["peer-1"],
+    };
+    const base = inbound("x", "1");
+    expect(isPeerInbound(ch, { ...base, fromId: "peer-1" })).toBe(true);
+    expect(isPeerInbound(ch, base)).toBe(false); // human fromId
+    expect(isPeerInbound(ch, { ...base, fromId: undefined })).toBe(false);
+    expect(isPeerInbound(undefined, { ...base, fromId: "peer-1" })).toBe(false); // no config
+  });
+
+  test("b: final threaded to a peer message is forwarded once to the peer channel", async () => {
+    peerSettings();
+    await handleInbound(pi, inboundPeer("do X", "111"), ctx);
+    await handlers.turn_start(null, ctx);
+    const stepFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "<reply-to:111>\nok, on it" }],
+    };
+    await handlers.message_end({ message: stepFinal }, ctx);
+
+    const own = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    const ownBody = JSON.parse(own[own.length - 1]!.body);
+    expect(ownBody.content).toBe("ok, on it");
+    expect(ownBody.message_reference?.message_id).toBe("111"); // threads in-channel as before
+    const fwd = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
+    );
+    expect(fwd.length).toBe(1); // forwarded exactly once
+    const fwdBody = JSON.parse(fwd[0]!.body);
+    expect(fwdBody.content).toBe(`${FWD_MARKER}ok, on it`);
+    expect(fwdBody.message_reference).toBeUndefined(); // plain post, no thread
+  });
+
+  test("b: untagged final (default last-inbound thread) to a peer is forwarded", async () => {
+    peerSettings();
+    await handleInbound(pi, inboundPeer("do X", "121"), ctx);
+    await handlers.turn_start(null, ctx);
+    const stepFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "on it, no tag" }],
+    };
+    await handlers.message_end({ message: stepFinal }, ctx);
+    const fwd = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
+    );
+    expect(fwd.length).toBe(1);
+    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}on it, no tag`);
+  });
+
+  test("b: reply threaded to a [fwd]-marked peer message is NOT re-forwarded (loop guard)", async () => {
+    peerSettings();
+    await handleInbound(pi, inboundPeer(`${FWD_MARKER}ok, on it`, "131"), ctx);
+    await handlers.turn_start(null, ctx);
+    const stepFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "<reply-to:131>\ngot it, working" }],
+    };
+    await handlers.message_end({ message: stepFinal }, ctx);
+
+    const own = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    const ownBody = JSON.parse(own[own.length - 1]!.body);
+    expect(ownBody.content).toBe("got it, working");
+    expect(ownBody.message_reference?.message_id).toBe("131"); // reply still lands in-channel
+    const fwd = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
+    );
+    expect(fwd.length).toBe(0); // loop guard: one hop only
+  });
+
+  test("b: reply to a human message is NOT forwarded", async () => {
+    peerSettings();
+    await handleInbound(pi, inbound("hello human", "141"), ctx);
+    await handlers.turn_start(null, ctx);
+    const stepFinal = {
+      role: "assistant",
+      content: [{ type: "text", text: "<reply-to:141>\nhi" }],
+    };
+    await handlers.message_end({ message: stepFinal }, ctx);
+    const fwd = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
+    );
+    expect(fwd.length).toBe(0);
+  });
+
+  test("b: agent_end final threaded to a peer message is forwarded", async () => {
+    peerSettings();
+    await handleInbound(pi, inboundPeer("do X", "151"), ctx);
+    const final = {
+      role: "assistant",
+      content: [{ type: "text", text: "done, shipped" }],
+    };
+    await handlers.agent_end(
+      {
+        messages: [
+          {
+            customType: CHANNEL_MSG_TYPE,
+            details: { messageId: "151" },
+            content: "",
+          },
+          final,
+        ],
+      },
+      ctx,
+    );
+    const own = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    const ownBody = JSON.parse(own[own.length - 1]!.body);
+    expect(ownBody.content).toBe("done, shipped");
+    expect(ownBody.message_reference?.message_id).toBe("151");
+    const fwd = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
+    );
+    expect(fwd.length).toBe(1);
+    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}done, shipped`);
+  });
+
+  test("b: identical text to the same peer within 60 s is deduped, after is not", async () => {
+    peerSettings();
+    const ch = loadChannelConfig(tmp)[0]!;
+    await handleInbound(pi, inboundPeer("do X", "161"), ctx);
+    const t0 = 1_000_000;
+    const r1 = await forwardPeerReply(ch, "same reply", "161", t0);
+    expect(r1).toEqual({ forwarded: true });
+    const r2 = await forwardPeerReply(
+      ch,
+      "same reply",
+      "161",
+      t0 + PEER_FWD_DEDUPE_MS - 1_000,
+    );
+    expect(r2).toEqual({ forwarded: false, reason: "dedupe" });
+    const r3 = await forwardPeerReply(
+      ch,
+      "same reply",
+      "161",
+      t0 + PEER_FWD_DEDUPE_MS + 1_000,
+    );
+    expect(r3).toEqual({ forwarded: true });
+  });
+
+  test("b: peer reply with no configured peer channel is not forwarded", async () => {
+    peerSettings({ peerChannels: undefined });
+    await handleInbound(pi, inboundPeer("do X", "171"), ctx);
+    const ch = loadChannelConfig(tmp)[0]!;
+    expect(ch.peerChannels).toBeUndefined();
+    const r = await forwardPeerReply(ch, "orphan reply", "171");
+    expect(r).toEqual({ forwarded: false, reason: "no-channel" });
+  });
+
+  test("c1: peer hint is state-aware - forward clause only while peerChannels is set", async () => {
+    peerSettings(); // peerChannels: { "peer-1": "998" }
+    await handleInbound(pi, inboundPeer("monky: do X", "184"), ctx);
+    const mapped = sent.at(-1)!.m.content;
+    expect(mapped).toContain(PEER_SENDER_HINT);
+    expect(mapped).toContain("auto-forwards that one hop");
+    expect(mapped).not.toContain(PEER_SENDER_HINT_NO_FWD);
+
+    peerSettings({ peerChannels: undefined }); // mapping absent
+    await handleInbound(pi, inboundPeer("monky: do Y", "185"), ctx);
+    const unmapped = sent.at(-1)!.m.content;
+    expect(unmapped).toContain(PEER_SENDER_HINT_NO_FWD);
+    expect(unmapped).toContain("use agent-say"); // agent-say directive present
+    expect(unmapped).not.toContain("auto-forwards that one hop");
+    expect(unmapped).not.toContain(PEER_SENDER_HINT);
+  });
+
+  test("b: peerFwdAt prunes entries at the dedupe window on write", async () => {
+    peerSettings();
+    const ch = loadChannelConfig(tmp)[0]!;
+    await handleInbound(pi, inboundPeer("do X", "191"), ctx);
+    const t0 = 1_000_000;
+    // Plant two entries via the clock stub: one that will age out, one
+    // still inside the window.
+    expect(await forwardPeerReply(ch, "stale text", "191", t0)).toEqual({
+      forwarded: true,
+    });
+    expect(
+      await forwardPeerReply(ch, "fresh text", "191", t0 + 50_000),
+    ).toEqual({ forwarded: true });
+    // Third write at t0 + 60s: the stale entry (age = window) is pruned,
+    // the fresh one (10s old) is kept.
+    expect(
+      await forwardPeerReply(ch, "new text", "191", t0 + PEER_FWD_DEDUPE_MS),
+    ).toEqual({ forwarded: true });
+    const snap = peerFwdSnapshotForTest();
+    const keys = snap.map(([k]) => k);
+    expect(keys).not.toContain(`998\nstale text`); // stale is gone
+    expect(keys).toContain(`998\nfresh text`); // fresh kept
+    expect(keys).toContain(`998\nnew text`); // new present
+    expect(snap).toHaveLength(2);
   });
 
   test("A2: agent_end posts [!] + errorMessage on a failed run", async () => {

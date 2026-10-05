@@ -53,6 +53,12 @@ export interface ChannelConfig {
   /** Bot user IDs exempt from the other-bot filter — peer agents posting
    *  into this channel via agent-say (discord only). */
   peerBotIds?: string[];
+  /** Peer agent channel map: bot user ID -> that peer's Discord channel
+   *  ID (the channel the peer's agent listens on — the same target
+   *  agent-say posts to). Keys are a subset of `peerBotIds`. Lets the
+   *  bridge auto-forward an in-channel reply that targets a peer's
+   *  message (discord only). Unset = no auto-forward, c1 hint only. */
+  peerChannels?: Record<string, string>;
 }
 
 /** Settings shape: channels live under settings.channels. */
@@ -190,7 +196,19 @@ function normalizeChannel(raw: any): ChannelConfig {
     peerBotIds: Array.isArray(raw.peerBotIds)
       ? raw.peerBotIds.filter((x: any) => typeof x === "string")
       : undefined,
+    peerChannels: normalizePeerChannels(raw.peerChannels),
   };
+}
+
+/** peerChannels: bot user id -> peer channel id. Non-string pairs and
+ *  empty values are dropped; empty result = unset. */
+function normalizePeerChannels(raw: any): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "string" && v.length > 0) out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
