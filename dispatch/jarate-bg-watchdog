@@ -34,14 +34,16 @@
 #       > PI_BG_PRUNE_DAYS (default 7) are pruned: the ticket's artifact
 #       files (persistent dir + legacy /tmp) and the record itself are
 #       deleted. Live tickets (cgroup member / worktree cwd) keep theirs.
-#   4c. cwd-ticket sweep (issue #86): non-worktree runs (no --worktree)
-#       leave no dir under $WT_DIR and were invisible to DEAD detection.
-#       Run records with state=running whose cgroup dir is empty (no
-#       processes - "stale") AND whose heartbeat is stale > STALL_MIN min
-#       are DEAD: same dead webhook payload + dead log as the worktree
-#       sweep, record marked state=killed, empty cgroup reaped via the
-#       guarded cgroup.kill (cgroup.kill is only ever written when
-#       cgroup.procs is empty - issue #86).
+#   4c. cwd-ticket sweep (issue #86, #116): non-worktree runs (no
+#       --worktree) leave no dir under $WT_DIR and were invisible to DEAD
+#       detection. Run records with state=running whose cgroup is empty
+#       (no processes - "stale") OR whose cgroup dir is already gone
+#       (reaped by the empty-cgroup reaper or never created - issue #116)
+#       AND whose heartbeat is stale > STALL_MIN min are DEAD: same dead
+#       webhook payload + dead log as the worktree sweep, record marked
+#       state=killed, empty cgroup reaped via the guarded cgroup.kill
+#       (cgroup.kill is only ever written when cgroup.procs is empty -
+#       issue #86).
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -388,9 +390,14 @@ done
 #
 # DEAD (cwd) = ALL of:
 #   - run record state=running (the wrapper's exit trap never ran)
-#   - the ticket cgroup dir exists and is EMPTY (no member in
-#     cgroup.procs/threads - "stale" means no processes; a live member
-#     keeps the ticket out of this sweep)
+#   - the ticket cgroup is EMPTY (no member in cgroup.procs/threads -
+#     "stale" means no processes; a live member keeps the ticket out of
+#     this sweep) OR its dir is ABSENT. A missing dir is a reap (the
+#     empty-cgroup reaper, manual cleanup) or an escape that never
+#     happened - NOT a fresh-start signal once the heartbeat is stale
+#     (issue #116: the reaper rmdir'd the dir in the fresh-hb window,
+#     ate this sweep's evidence, and the DEAD post never fired for ~2/3
+#     of qualifying SIGKILLed cwd runs)
 #   - the heartbeat file is stale > STALL_MIN min (fresh hb = healthy;
 #     absent hb = pre-upgrade run, not judgeable -> never flagged here)
 # On DEAD: post the dead webhook (same payload as the worktree sweep),
@@ -404,14 +411,21 @@ if [ -d "$rec_dir" ]; then
     [ -n "$rt" ] || continue
     [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
     cg="$CG_DIR/$rt"
-    [ -d "$cg" ] || continue          # no escape dir -> not judgeable here
-    cg_has_members "$cg" && continue  # live member -> not stale
+    if [ -d "$cg" ]; then
+      cg_has_members "$cg" && continue  # live member -> not stale
+      cg_state="empty"
+    else
+      # issue #116: no dir = reaped (this sweep's empty-cgroup reaper, or
+      # manual cleanup) or cgroup escape never happened. Both are judgeable:
+      # the dir itself is not the evidence, the record + heartbeat are.
+      cg_state="reaped"
+    fi
     hb_stale "$rt" || continue        # fresh/absent hb -> not DEAD
     has_out "$rt" && continue         # completed normally (record unclosed)
     has_killed "$rt" && continue      # jarate-bg-kill already reported it
     already_dead "$rt" && continue    # flagged earlier today
     if [ "$DRY" -eq 1 ]; then
-      echo "[pi-bg-watchdog] dry-run: would flag cwd ticket DEAD $rt (cgroup empty, hb stale)"
+      echo "[pi-bg-watchdog] dry-run: would flag cwd ticket DEAD $rt (cgroup $cg_state, hb stale)"
       continue
     fi
     # last activity = the heartbeat mtime: the hb child touched it every
@@ -420,7 +434,11 @@ if [ -d "$rec_dir" ]; then
     [ -f "$hb_f" ] || hb_f="$LEGACY_TMP/pi-bg-${rt}-hb"
     hbm="$(stat -c %Y "$hb_f" 2>/dev/null)" || hbm=""
     last="$(date -u -d "@${hbm:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || last="unknown"
-    reason="cwd run: cgroup empty, heartbeat stale > ${STALL_MIN} min (issue #86)"
+    if [ "$cg_state" = "reaped" ]; then
+      reason="cwd run: cgroup reaped (dir gone), heartbeat stale > ${STALL_MIN} min (issue #116)"
+    else
+      reason="cwd run: cgroup empty, heartbeat stale > ${STALL_MIN} min (issue #86)"
+    fi
     echo "[pi-bg-watchdog] DEAD cwd/$rt (last activity $last, $reason)"
     DT+=("$rt"); DREPO+=("cwd"); DP+=("${rcwd:--}")
     DLAST+=("$last"); DREAS+=("$reason"); DTYPE+=("DEAD")
