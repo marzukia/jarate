@@ -18,20 +18,101 @@ function makeJarateHome(script: string): string {
 const envFor = (home: string) =>
   ({ ...process.env, HOME: home }) as NodeJS.ProcessEnv;
 
+// Stub jarate that echoes back the argv it received, '|' separated, so the
+// test asserts the exact word split the bridge performed (#148).
+const argvStub =
+  's=""; for a in "$@"; do if [ -n "$s" ]; then s="$s|$a"; else s="$a"; fi; done; printf \'{"ok":true,"argv":"%s"}\' "$s"';
+
 describe("runJarate", () => {
-  test("spawns $HOME/bin/jarate with cmd + args, keeps stdout", async () => {
-    const home = makeJarateHome(
-      'printf \'{"ok":true,"cmd":"%s","args":"%s"}\' "$1" "$2"',
+  test("spawns $HOME/bin/jarate with cmd + shellWords(args) as separate argv (#148)", async () => {
+    const home = makeJarateHome(argvStub);
+    const r = await runJarate(
+      "journal-errors",
+      "--since 2026-10-05T00:00:00Z",
+      {
+        env: envFor(home),
+      },
     );
-    const r = await runJarate("ctx-report", "--profile main", {
-      env: envFor(home),
-    });
     expect(r.code).toBe(0);
-    expect(r.timedOut).toBe(false);
     const d = JSON.parse(r.out);
     expect(d.ok).toBe(true);
-    expect(d.cmd).toBe("ctx-report");
-    expect(d.args).toBe("--profile main");
+    expect(d.argv).toBe("journal-errors|--since|2026-10-05T00:00:00Z");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("--flag=value stays one word (CLI desugars it itself)", async () => {
+    const home = makeJarateHome(argvStub);
+    const r = await runJarate(
+      "journal-errors",
+      "--since=2026-10-05T00:00:00Z",
+      {
+        env: envFor(home),
+      },
+    );
+    const d = JSON.parse(r.out);
+    expect(d.argv).toBe("journal-errors|--since=2026-10-05T00:00:00Z");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("quoted two-word value -> ONE argv word (CLI re-joins it)", async () => {
+    const home = makeJarateHome(argvStub);
+    const r = await runJarate(
+      "journal-errors",
+      '--since "2026-10-05 00:00:00"',
+      {
+        env: envFor(home),
+      },
+    );
+    const d = JSON.parse(r.out);
+    expect(d.argv).toBe("journal-errors|--since|2026-10-05 00:00:00");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("unquoted two-word value -> three argv words (CLI re-joins it)", async () => {
+    const home = makeJarateHome(argvStub);
+    const r = await runJarate("journal-errors", "--since 2026-10-05 00:00:00", {
+      env: envFor(home),
+    });
+    const d = JSON.parse(r.out);
+    expect(d.argv).toBe("journal-errors|--since|2026-10-05|00:00:00");
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("empty / whitespace-only args -> no extra argv words", async () => {
+    const home = makeJarateHome(argvStub);
+    for (const args of ["", "   "]) {
+      const r = await runJarate("ctx-report", args, { env: envFor(home) });
+      const d = JSON.parse(r.out);
+      expect(d.argv).toBe("ctx-report");
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("unbalanced quote -> executable JSON doc, no spawn", async () => {
+    const home = makeJarateHome(`touch "$(dirname "$0")/spawned"; ${argvStub}`);
+    const r = await runJarate(
+      "journal-errors",
+      '--since "2026-10-05 00:00:00',
+      {
+        env: envFor(home),
+      },
+    );
+    const d = JSON.parse(jarateText(r));
+    expect(d.ok).toBe(false);
+    expect(d.error).toContain("jarate: args not parseable:");
+    expect(d.error).toContain("unterminated double quote");
+    expect(d.error).toContain('jarate journal-errors --since "<value>"');
+    expect(fs.existsSync(path.join(home, "bin", "spawned"))).toBe(false);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  test("memory-grep --root= is reachable (value flag, not swallowed)", async () => {
+    const home = makeJarateHome(argvStub);
+    const r = await runJarate("memory-grep", "--root=/tmp/somewhere needle", {
+      env: envFor(home),
+    });
+    const d = JSON.parse(r.out);
+    expect(d.argv).toBe("memory-grep|--root=/tmp/somewhere|needle");
     fs.rmSync(home, { recursive: true, force: true });
   });
 

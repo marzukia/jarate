@@ -145,6 +145,11 @@ find_token_cost() {
 cmd_ctx_report() {
   local profile="main"
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148): split at the
+    # FIRST =, known flags only.
+    case "$1" in
+      --profile=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --profile) [ $# -ge 2 ] || die_usage "ctx-report: --profile needs a value"; profile="$2"; shift ;;
       *) die_usage "ctx-report: unknown arg: $1" ;;
@@ -305,13 +310,18 @@ run_remote_probe() { # $1=name $2=uid $3=since
 
 cmd_journal_errors() {
   local agent_filter=""
+  local sv=""
   local since
   since="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" # default: 1h back, absolute
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148)
+    case "$1" in
+      --since=*|--agent=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --since)
         [ $# -ge 2 ] || die_usage "journal-errors: --since needs a value"
-        local sv="$2"
+        sv="$2"
         # journalctl's canonical absolute form "YYYY-MM-DD HH:MM:SS" arrives
         # as two words after arg re-join; re-join it here.
         if [[ "$sv" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ $# -ge 3 ] \
@@ -574,6 +584,10 @@ jarate_scan() {
 cmd_projects() {
   local project="" since="" agent_filter="" h name src out recs err row
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148)
+    case "$1" in
+      --project=*|--since=*|--agent=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --project)
         [ $# -ge 2 ] || die_usage "projects: --project needs a value"
@@ -740,6 +754,11 @@ cmd_projects_backfill() {
   local agent_filter="" dry=0 runid tag h name src out scan err row
   local -a sets=()
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148): the value may
+    # itself contain '=' (e.g. --set=run-2=tag) — split at the FIRST =.
+    case "$1" in
+      --agent=*|--set=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --agent)
         [ $# -ge 2 ] || die_usage "projects-backfill: --agent needs a value"
@@ -863,6 +882,10 @@ cmd_memory_grep() {
   local root="$HOME/memory" mode="fixed" ci="-i"
   local -a qw=()
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148)
+    case "$1" in
+      --root=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --root) [ $# -ge 2 ] || die_usage "memory-grep: --root needs a value"; root="$2"; shift ;;
       --regex) mode="regex" ;;
@@ -972,6 +995,10 @@ cmd_rag() {
   local project=""
   local -a qw=()
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148)
+    case "$1" in
+      --project=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --project) [ $# -ge 2 ] || die_usage "rag: --project needs a value"; project="$2"; shift ;;
       -*) die_usage "rag: unknown flag: $1" ;;
@@ -1183,6 +1210,11 @@ cmd_setup() {
 
   local usage='setup: usage: jarate setup <bot-token> <channel-id> [--yes] [--owner UID] [--name N] [--jarate-dir D] [--webhook-url U] [--model-base URL] [--model-id ID] [--model-key KEY] [--model-headers JSON] [--no-units] [--no-verify]'
   while [ $# -gt 0 ]; do
+    # --flag=value -> --flag value (one flag grammar, #148)
+    case "$1" in
+      --owner=*|--name=*|--jarate-dir=*|--webhook-url=*|--model-base=*|--model-id=*|--model-key=*|--model-headers=*)
+        set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
+    esac
     case "$1" in
       --yes) SETUP_DRY=0 ;;
       --dry-run) SETUP_DRY=1 ;;
