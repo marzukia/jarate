@@ -283,6 +283,19 @@ describe("extractDeterministic", () => {
     expect(s.readFiles).not.toContain("/home/monky/code/app/src/c.ts");
     expect(s.readFiles).toContain("/home/monky/code/app/src/a.ts");
   });
+  test("prior read file modified in the current span leaves the read list (F4a invariant, PR #156 LOW)", () => {
+    const p = {
+      ...basePrep(),
+      fileOps: {
+        ...basePrep().fileOps,
+        edited: new Set(["/home/monky/code/app/src/old1.ts"]),
+      },
+    };
+    const s = extractDeterministic(p, [], { ...emptyCtx, priorDoc: PRIOR_DOC });
+    expect(s.readFiles).not.toContain("/home/monky/code/app/src/old1.ts");
+    expect(s.readFiles).toContain("/home/monky/code/app/src/old2.ts");
+    expect(s.modifiedFiles).toContain("/home/monky/code/app/src/old1.ts");
+  });
   test("no prior doc → current fileOps only, newest first", () => {
     const s = extractDeterministic(basePrep(), [], emptyCtx);
     expect(s.readFiles).toEqual(["/home/monky/code/app/src/a.ts"]);
