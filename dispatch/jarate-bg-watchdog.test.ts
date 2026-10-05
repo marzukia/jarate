@@ -482,7 +482,7 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
         expect(line.length).toBeLessThanOrEqual(40);
       }
       // closing fence on its own line: the last content line is exactly
-      // the 32-col line measured above (not content + "```")
+      // the 40-col line measured above (not content + "```")
       expect(em.description.endsWith("\n```")).toBe(true);
       // deadlog carries the SILENT reason
       const deadlog = path.join(f.home, ".pi-bg-deadlog");
@@ -547,7 +547,7 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       const em = f.posts[0].embeds[0];
       expect(em.title).toBe("pi-bg \u00b7 4 dead tickets swept");
       for (const n of [4, 5, 6, 7]) {
-        // two lines per ticket: full ticket (head-clipped to 32) + kind
+        // two lines per ticket: full ticket (head-clipped to 30) + kind
         expect(em.description).toContain(`${TID(n)}`);
       }
       expect(em.description).toContain("  SILENT \u00b7 last ");
