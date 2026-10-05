@@ -12,13 +12,37 @@
  * bridge module loads (wired via [test] preload in bunfig.toml), so all
  * test socket creation lands in the tmp dir. The live directory is
  * preserved in JARETE_TEST_LIVE_XDG for regression assertions
- * (channel/socket-isolation.test.ts). The tmp dir is removed on exit.
+ * (channel/socket-isolation.test.ts).
+ *
+ * Cleanup: `process.on("exit")` NEVER fires under `bun test` (verified
+ * 2026-10-06, bun 1.4.0 — it does fire for `bun script.ts`), so the
+ * per-run tmp dir is actually reclaimed by the stale sweep below: every
+ * preload start removes prior-run dirs older than 1h (concurrent live
+ * runs protected by the age bound). systemd tmpfiles on /tmp is the
+ * backstop. The exit handler stays for non-test invocations.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 if (!process.env.JARETE_TEST_LIVE_XDG) {
+  const t = tmpdir();
+  try {
+    const now = Date.now();
+    for (const name of readdirSync(t)) {
+      if (!name.startsWith("jarate-test-xdg-")) continue;
+      const p = join(t, name);
+      try {
+        if (now - statSync(p).mtimeMs > 3_600_000) {
+          rmSync(p, { recursive: true, force: true });
+        }
+      } catch {
+        // raced or unreadable: skip
+      }
+    }
+  } catch {
+    // tmpdir unreadable: sweep is best-effort
+  }
   const live =
     process.env.XDG_RUNTIME_DIR ??
     join("/run/user", String(process.getuid?.() ?? 0));
@@ -32,7 +56,7 @@ if (!process.env.JARETE_TEST_LIVE_XDG) {
     try {
       rmSync(isolated, { recursive: true, force: true });
     } catch {
-      // best effort: tmp reaps the rest
+      // inert under bun test (see header); sweep + tmpfiles reclaim it
     }
   });
 }
