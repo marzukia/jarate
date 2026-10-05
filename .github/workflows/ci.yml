@@ -5,9 +5,19 @@ on:
   push:
     branches: [main]
 
+# CI wall fix (2026-10-05, monky ranked fixes 2+5): the marzukia Free-plan
+# account cap is 20 concurrent hosted jobs across all repos; dispatch waves
+# of 6-8 PR runs x 5 jobs queue beyond it and queued jobs get cancelled at
+# ~15 min. Same-ref cancel-in-progress frees slots for the newest code;
+# per-job timeout-minutes stops a hung job holding a slot for hours.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   biome:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -18,6 +28,7 @@ jobs:
 
   bridge:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -30,6 +41,7 @@ jobs:
 
   recall:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -43,6 +55,7 @@ jobs:
 
   bin:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -52,6 +65,7 @@ jobs:
 
   test:  # job name satisfies branch-protection required check "test"
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
