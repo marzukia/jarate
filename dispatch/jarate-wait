@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pi-wait — poll the monky Discord channel for the next bus event (in-turn wait)
-# usage: pi-wait --since <message-id> [--timeout 300] [--check 5]
+# jarate-wait — poll the monky Discord channel for the next bus event (in-turn wait)
+# usage: jarate-wait --since <message-id> [--timeout 300] [--check 5]
 # exits:
 #   0 = webhook callback arrived  → prints its content
 #   2 = human message arrived     → prints "human: <name>" (break early)
@@ -13,6 +13,7 @@ set -euo pipefail
 since=""; timeout=300; check=5
 while [ $# -gt 0 ]; do
   case "$1" in
+    -h|--help) sed -n '2,/^set -euo pipefail$/{ /^set -euo pipefail$/d; p }' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --since) since="$2"; shift 2 ;;
     --timeout) timeout="$2"; shift 2 ;;
     --check) check="$2"; shift 2 ;;

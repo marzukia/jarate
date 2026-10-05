@@ -1,5 +1,5 @@
 [Unit]
-Description=Run pi-bg watchdog sweep every 15 min
+Description=Run jarate-bg watchdog sweep every 15 min
 
 [Timer]
 OnBootSec=5min

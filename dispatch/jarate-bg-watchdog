@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# pi-bg-watchdog — periodic sweep for dead pi-bg dispatches (lost callbacks)
+# jarate-bg-watchdog — periodic sweep for dead jarate-bg dispatches (lost callbacks)
 #
-# GAP covered: pi-bg posts its Discord callback from a hardened EXIT path
-# (issue #14), but SIGKILL/OOM cannot be trapped. When the pi-bg shell dies
+# GAP covered: jarate-bg posts its Discord callback from a hardened EXIT path
+# (issue #14), but SIGKILL/OOM cannot be trapped. When the jarate-bg shell dies
 # untrapably, no callback is posted and the worktree under
 # ~/.pi-bg-wt/<repo>/<ticket>/ lingers with the cgroup escape dir behind it.
 #
@@ -13,7 +13,7 @@
 #          /sys/fs/cgroup/.../pi-bg/<ticket>/cgroup.procs|threads, OR
 #        - any same-user process whose cwd IS the worktree dir (covers the
 #          cgroup-escape-unavailable fallback). A cmdline grep for the ticket
-#          id is deliberately NOT used: a live pi-bg whose TASK TEXT happens
+#          id is deliberately NOT used: a live jarate-bg whose TASK TEXT happens
 #          to mention the id would mask a dead ticket (false negative).
 #   3. skip tickets that completed normally: out.md exists and is non-empty
 #      (default $HOME/.pi-bg-art — persistent; legacy /tmp is checked too,
@@ -22,9 +22,9 @@
 #      DESIGN so the orchestrator can diff it; the callback was posted
 #   4. if the dir mtime is older than 20 min and the ticket is not already
 #      in today's dead letter log -> post a DEAD webhook (same url source
-#      and embed format as pi-bg) and append ~/.pi-bg-deadlog
+#      and embed format as jarate-bg) and append ~/.pi-bg-deadlog
 #   4a. STALLED (issue #52): a LIVE ticket whose heartbeat file
-#       ($PI_BG_TMPDIR/pi-bg-<id>-hb, touched every 30s by the pi-bg
+#       ($PI_BG_TMPDIR/pi-bg-<id>-hb, touched every 30s by the jarate-bg
 #       wrapper) is stale > PI_BG_STALL_MIN (default 10) min -> post a
 #       STALLED webhook + dead log line. Distinct from DEAD: the process
 #       exists, the run is hung (hung tool, wedged model call). One alert
@@ -47,7 +47,7 @@
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
 #      never blocks. jarate missing/unreadable -> skip silently.
 #
-# config (same source as pi-bg):
+# config (same source as jarate-bg):
 #   $PI_DISPATCH_WEBHOOK or first line of ~/.config/pi-dispatch/webhook
 #   (no webhook configured = sweep still runs, posts skipped)
 # env:
@@ -62,7 +62,7 @@
 set -uo pipefail
 
 WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
-# persistent artifact dir (same default as pi-bg); /tmp is a tmpfs on the
+# persistent artifact dir (same default as jarate-bg); /tmp is a tmpfs on the
 # reference agent host and a reboot wipes it (2026-09-13 DEAD-flood). LEGACY_TMP is
 # checked as a fallback for one release (pre-upgrade runs).
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
@@ -84,6 +84,7 @@ WT_PRUNE_DAYS="${PI_BG_WT_PRUNE_DAYS:-7}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    -h|--help) sed -n '2,/^set -uo pipefail$/{ /^set -uo pipefail$/d; p }' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --quiet)   QUIET=1; shift ;;
     --dry-run) DRY=1; shift ;;
     --age-min) AGE_MIN="$2"; shift 2 ;;
@@ -91,7 +92,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# PI_BG_CG_ROOT overrides the cgroup base (same hook as pi-bg + pi-bg-kill);
+# PI_BG_CG_ROOT overrides the cgroup base (same hook as jarate-bg + jarate-bg-kill);
 # tests point the sweep at a per-run fake root instead of the real user slice.
 CG_DIR="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg"
 today="$(date -u +%Y-%m-%d)"
@@ -162,15 +163,15 @@ has_deadletter() {
   local t="$1"
   [ -f "$BG_TMP/pi-bg-${t}-webhook-failed" ] || [ -f "$LEGACY_TMP/pi-bg-${t}-webhook-failed" ]
 }
-# started marker (pi-bg writes it at ticket creation, removes on exit):
+# started marker (jarate-bg writes it at ticket creation, removes on exit):
 # distinguishes "ran and was lost" from "never actually started"
 has_started() {
   local t="$1"
   [ -f "$BG_TMP/pi-bg-${t}-started" ]
 }
 
-# record_done <ticket>: the run record reached a terminal state (pi-bg
-# marks state=done on every trapped exit, pi-bg-kill marks killed). A
+# record_done <ticket>: the run record reached a terminal state (jarate-bg
+# marks state=done on every trapped exit, jarate-bg-kill marks killed). A
 # ticket whose wrapper ran its exit trap COMPLETED - if no out.md exists
 # the callback was lost or mislabeled (deploy-swap deaths, 2026-09-15),
 # not a lost process. The sweep must not re-flag it DEAD.
@@ -208,7 +209,7 @@ prune_live() {
   cg_has_members "$CG_DIR/$t"
 }
 
-# issue #57 artifacts (written by the pi-bg wrapper): -rc holds the final
+# issue #57 artifacts (written by the jarate-bg wrapper): -rc holds the final
 # exit code (EXIT trap), -retry1 marks the one silent-death relaunch (kept
 # when the retry did not recover, removed when it did). The watchdog uses
 # both to split DEAD into DEAD (generic: SIGKILL/OOM/...) and SILENT
@@ -220,7 +221,7 @@ rc_of() {
   tr -d '[:space:]' < "$BG_TMP/pi-bg-${1}-rc" 2>/dev/null
 }
 
-# wd_post <body-file>: same retry shape as pi-bg bg_post (3 attempts)
+# wd_post <body-file>: same retry shape as jarate-bg bg_post (3 attempts)
 wd_post() {
   local body="$1" code i
   [ -n "$webhook" ] || return 1
@@ -236,7 +237,7 @@ wd_post() {
 
 # wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason> <kind>
 # kind: DEAD (generic) or SILENT (issue #57 idle-timeout death)
-# embed format mirrors pi-bg bg_build (author header, bash meta block,
+# embed format mirrors jarate-bg bg_build (author header, bash meta block,
 # footer). Code lines are clipped to FRAME_W (32, docs/STYLE.md 2.3):
 # the wt path head-clips (the ticket at the path tail is the discriminator),
 # reason/note tail-clip (the classification leads). The full ticket stays
@@ -262,16 +263,16 @@ def kv(key, val, width=6, vbudget=23, head=False):
 kind = E('KIND') or 'DEAD'
 note = ("silent death (issue #57): rc=1, no output, retry1 did not recover"
         if kind == 'SILENT' else
-        "no live pi-bg process, no completion report - callback lost (SIGKILL/OOM)")
+        "no live process, no completion report - callback lost (SIGKILL/OOM)")
 meta = [kv("repo", E('REPO')),
         kv("wt", E('PATH'), head=True),
         kv("last", E('LAST')),
         kv("reason", E('REASON')),
         kv("note", note)]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('T')}"},
-         "color": 15105570,  # orange, same as pi-bg DIED
+         "color": 15105570,  # orange, same as jarate-bg DIED
          "title": f"{kind} \u00b7 watchdog sweep",
-         "description": "```bash\n" + "\n".join(meta) + "\n```",  # fence on its own line (pi-bg pattern)
+         "description": "```bash\n" + "\n".join(meta) + "\n```",  # fence on its own line (jarate-bg pattern)
          "footer": {"text": "pi-bg watchdog"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 json.dump({"embeds": [embed]}, sys.stdout)
@@ -323,7 +324,7 @@ for d in "$WT_DIR"/*/*/; do
     continue
   fi
   # 2) normal completion (out.md written) -> callback was posted, worktree kept by design;
-  #    killed on purpose (pi-bg-kill marker) -> not a lost callback. Both
+  #    killed on purpose (jarate-bg-kill marker) -> not a lost callback. Both
   #    checked in the persistent dir AND legacy /tmp (one release of overlap).
   if has_out "$t" || has_killed "$t" || record_done "$t"; then continue; fi
   # 3) recent activity -> give it time
@@ -374,7 +375,7 @@ done
 # On DEAD: post the dead webhook (same payload as the worktree sweep),
 # append the dead log (same today-dedupe), reap the empty cgroup via the
 # guarded cgroup.kill, and mark the record state=killed (same audit path
-# as pi-bg-kill, so the record stops lying "running").
+# as jarate-bg-kill, so the record stops lying "running").
 rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 cwd_found=0
 if [ -d "$rec_dir" ]; then
@@ -386,7 +387,7 @@ if [ -d "$rec_dir" ]; then
     cg_has_members "$cg" && continue  # live member -> not stale
     hb_stale "$rt" || continue        # fresh/absent hb -> not DEAD
     has_out "$rt" && continue         # completed normally (record unclosed)
-    has_killed "$rt" && continue      # pi-bg-kill already reported it
+    has_killed "$rt" && continue      # jarate-bg-kill already reported it
     already_dead "$rt" && continue    # flagged earlier today
     if [ "$DRY" -eq 1 ]; then
       echo "[pi-bg-watchdog] dry-run: would flag cwd ticket DEAD $rt (cgroup empty, hb stale)"
@@ -408,7 +409,7 @@ if [ -d "$rec_dir" ]; then
     cg_kill_guarded "$cg"
     rm -f "$cg/cgroup.procs" "$cg/cgroup.kill" 2>/dev/null
     rmdir "$cg" 2>/dev/null
-    # mark the record killed (issue #51 audit path, same as pi-bg-kill):
+    # mark the record killed (issue #51 audit path, same as jarate-bg-kill):
     # audit-only, never breaks the sweep
     PI_BG_REC_STATE="killed" python3 - "$rec_dir/pi-bg-${rt}.json" <<'PY' 2>/dev/null || true
 import datetime, json, os, sys
@@ -523,7 +524,7 @@ lines.append("wt kept: ~/.pi-bg-wt (prune 7d)")
 embed = {"author": {"name": "pi-bg watchdog"},
          "color": 15105570,
          "title": f"pi-bg \u00b7 {count} dead tickets swept",
-         "description": "```bash\n" + "\n".join(lines) + "\n```",  # fence on its own line (pi-bg pattern)
+         "description": "```bash\n" + "\n".join(lines) + "\n```",  # fence on its own line (jarate-bg pattern)
          "footer": {"text": "pi-bg watchdog (digest)"},
          "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
 json.dump({"embeds": [embed]}, sys.stdout)
@@ -563,7 +564,7 @@ for r in os.environ.get("WD_LIST", "").splitlines():
 if count > 10:
     lines.append(f"... {count - 10} more: ~/.pi-bg-deadlog")
 lines.append(clip_end(f"process alive; hb stale >{mins} min", FRAME_W))
-lines.append("pi-bg-kill <ticket> to cancel")
+lines.append("jarate-bg-kill <t> to cancel")
 embed = {"author": {"name": "pi-bg watchdog"},
          "color": 15158332,  # red: alive but stuck (DEAD is orange)
          "title": f"{count} stalled \u00b7 watchdog sweep",
@@ -656,8 +657,8 @@ fi
 #     leave run records + artifacts that are never cleared. Records
 #     untouched for > PRUNE_DAYS are pruned: the ticket's artifact files
 #     (persistent dir + legacy /tmp) and the record itself are deleted.
-#     The record mtime is the age clock: pi-bg marks state=done on every
-#     trapped exit and pi-bg-kill marks state=killed (both refresh the
+#     The record mtime is the age clock: jarate-bg marks state=done on every
+#     trapped exit and jarate-bg-kill marks state=killed (both refresh the
 #     mtime), so a stale mtime means an untrappable death or a record that
 #     was never closed. Live tickets keep theirs (prune_live above).
 pruned_state=0

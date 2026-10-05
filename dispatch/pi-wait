@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pi-wait — deprecated shim (jarate #151): forwards to jarate-wait.
+# One stderr line; stdout + rc pass through untouched (the ticket line
+# must stay the first stdout line).
+echo "pi-wait: deprecated, use jarate-wait (jarate #151)" >&2
+exec "$(dirname "$(readlink -f "$0")")/jarate-wait" "$@"

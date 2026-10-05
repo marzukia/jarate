@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-bg — one-shot pi agent on a role profile (no Discord presence)
+# jarate-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
 #
 # LAUNCH FORM (issue #144): NOHUP IS REQUIRED. The launcher is the ticket's
@@ -8,19 +8,19 @@
 # pipes for the run's full duration. A foreground launch (SIGHUP not
 # ignored) is an explicit error: ticket line + stderr error + exit 4,
 # sub-second, before any run record or heartbeat.
-#   cd <workdir> && printf '%s' "$task" | nohup pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] - \
+#   cd <workdir> && printf '%s' "$task" | nohup jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] - \
 #     > log 2>&1 & sleep 4; head -1 log
 # Bypass: PI_BG_ALLOW_FOREGROUND=1 (internal callers + tests only).
 #
-# usage: cd <workdir> && nohup pi-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task" > log 2>&1 &
+# usage: cd <workdir> && nohup jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task" > log 2>&1 &
 #        the task can also ride stdin (agent-say marker form, keeps it out of
 #        argv for the whole run - issue #118):
-#        cd <workdir> && printf '%s' "$task" | nohup pi-bg worker - > log 2>&1 &
+#        cd <workdir> && printf '%s' "$task" | nohup jarate-bg worker - > log 2>&1 &
 #   task via STDIN (issue #118 — the "-" is the stdin marker, the task
 #   prose never sits in argv, so ps / /proc/<pid>/cmdline cannot leak it):
-#     cd <workdir> && printf '%s' "$task" | nohup pi-bg [worker|reviewer] [--worktree <ref>] [pi flags...] - > log 2>&1 &
+#     cd <workdir> && printf '%s' "$task" | nohup jarate-bg [worker|reviewer] [--worktree <ref>] [pi flags...] - > log 2>&1 &
 #   (workdir must be a git repo for --worktree; plain runs work anywhere)
-#   pi-bg --help prints this header.
+#   jarate-bg --help prints this header.
 #
 # --worktree [ref]: run the agent in a fresh git worktree instead of the live
 #   checkout. ref defaults to HEAD (only consumed as ref when more args
@@ -58,7 +58,7 @@
 #     relaunched ONCE; a <ticket>.retry1 marker is written before the
 #     relaunch so a second silent death reports a normal FAIL instead of
 #     looping. Leftover SILENT tickets are classified distinctly from
-#     generic DEAD by the pi-bg-watchdog sweep.
+#     generic DEAD by the jarate-bg-watchdog sweep.
 #   - DEGENERATE completion (issue #57 class B, 2026-09-23): rc=0 with a
 #     repetition-loop output (the model loops on a collapsed vocabulary,
 #     e.g. HTML fragments) is DETECTED, not shipped as an OK callback: the
@@ -69,7 +69,7 @@
 #     or degenerate review), not OK. Empty-output deaths carry the actual
 #     reason (last session errorMessage, else stderr tail) in the brief.
 #   - dead letter: final post failure writes $PI_BG_TMPDIR/pi-bg-<id>-webhook-failed
-#     (PI_BG_TMPDIR default ~/.pi-bg-art; honored by pi-bg-tail/-kill/-watchdog//jobs)
+#     (PI_BG_TMPDIR default ~/.pi-bg-art; honored by jarate-bg-tail/-kill/-watchdog//jobs)
 # Fresh machine (issue #29): a missing/empty role profile is seeded from the
 #   main agent's ~/.pi/agent/{auth,models}.json + the repo template
 #   dispatch/profiles/<role>.json (settings). Still no provider => exit 4
@@ -81,8 +81,8 @@
 #   exit trap kills it so it never outlives the run. The watchdog: live
 #   process + hb stale > 10 min = STALLED (a hung run, distinct from DEAD).
 # Run record state (issue #51): "running" at dispatch, "done" on every
-#   trapped exit, "killed" when pi-bg-kill finalizes the ticket.
-# Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live pi-bg
+#   trapped exit, "killed" when jarate-bg-kill finalizes the ticket.
+# Concurrency cap (issue #41): at most $PI_BG_MAX_CONCURRENT live jarate-bg
 #   runs per user (0 = unlimited, operator escape hatch). Fleet default is
 #   3; a per-box override file ~/.config/pi-dispatch/max-concurrent (one
 #   integer) applies when the env var is unset (RCA #57 fix 2: monky's box
@@ -105,11 +105,11 @@
 #   window. At cap: one stderr line + exit 5, with no
 #   worktree/cgroup/run-record side effects. Fails open if the artifact
 #   dir is missing/unreadable (a cap check must never block dispatch):
-#     [!] at cap (N/M), try again later or pi-bg-kill a ticket
+#     [!] at cap (N/M), try again later or jarate-bg-kill a ticket
 #
 # Session isolation (issue #56): the ticket runs in its OWN session +
 #   process group (a guarded setsid re-exec at the top of the script).
-#   The launcher's tool call runs `nohup pi-bg ... &` from a bash the
+#   The launcher's tool call runs `nohup jarate-bg ... &` from a bash the
 #   harness spawned DETACHED (own session + PGID); without setsid the
 #   ticket's pi child stays in the LAUNCHER's PGID, so a harness
 #   bash-tool timeout that signals that PG kills a still-starting ticket
@@ -120,9 +120,9 @@
 #   the task rides STDIN (the trailing "-" marker), never argv — the
 #   wrapper + pi child argv are short stable strings, so ps cannot leak
 #   the prompt:
-#     cd <workdir> && printf '%s' "$task" | nohup ~/scripts/pi-bg worker - \
+#     cd <workdir> && printf '%s' "$task" | nohup ~/scripts/jarate-bg worker - \
 #     > log 2>&1 & sleep 4; head -1 log
-#   pi-bg-kill compensates: it signals the ticket's process group in
+#   jarate-bg-kill compensates: it signals the ticket's process group in
 #   addition to the per-pid cgroup walk, so the whole session dies
 #   together and no pi child orphans.
 #
@@ -134,7 +134,7 @@
 set -uo pipefail
 
 # --- SIGPIPE hardening (#101 follow-up, Franky's BUG-2 RCA, 2026-09-29) -----
-# A dispatcher pipes the launcher: nohup pi-bg ... 2>&1 | head -2. head
+# A dispatcher pipes the launcher: nohup jarate-bg ... 2>&1 | head -2. head
 # consumes the ticket + worktree banners and EXITS; the launcher's next
 # stdout write (the cgroup-escape line) then hits SIGPIPE. bash's default
 # SIGPIPE dispo dies WITHOUT running the EXIT trap: no DIED webhook, no
@@ -214,10 +214,10 @@ while [ $# -gt 0 ]; do
       # usage errors here: rc 2, one stderr line, no side effects (the run
       # record, worktree add and cgroup escape all happen after this zone)
       shift
-      [ $# -ge 1 ] || { echo "pi-bg: --project needs a value (tag: [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
-      [ -z "$pj_tag" ] || { echo "pi-bg: --project given twice (one tag per run)" >&2; exit 2; }
+      [ $# -ge 1 ] || { echo "jarate-bg: --project needs a value (tag: [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
+      [ -z "$pj_tag" ] || { echo "jarate-bg: --project given twice (one tag per run)" >&2; exit 2; }
       pj_tag="$1"
-      [[ "$pj_tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "pi-bg: invalid --project tag: $pj_tag (want [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
+      [[ "$pj_tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || { echo "jarate-bg: invalid --project tag: $pj_tag (want [a-z0-9][a-z0-9-]{0,31})" >&2; exit 2; }
       shift
       ;;
     *)
@@ -230,10 +230,10 @@ set -- "${args[@]+"${args[@]}"}"
 
 # --- task capture (issue #118: no task prose in argv) ------------------
 # Two forms, plus the snapshot re-exec path:
-#   1. legacy: last positional arg: pi-bg worker "task" (any trailing
+#   1. legacy: last positional arg: jarate-bg worker "task" (any trailing
 #      positional is the task - unchanged legacy contract, dash or not)
 #   2. stdin:  trailing "-" marker (agent-say convention):
-#         printf '%s' "$task" | pi-bg [worker|reviewer] [flags] -
+#         printf '%s' "$task" | jarate-bg [worker|reviewer] [flags] -
 #      The task is read from STDIN once, HERE: after --worktree/
 #      --project parsing and before the cap scan, the snapshot re-exec
 #      and ANY child, so nothing else can consume the pipe. On success
@@ -267,7 +267,7 @@ elif [ $# -ge 1 ]; then
 fi
 
 # --- usage error: missing task (issue #115) ----------------------------
-# A bare `pi-bg` (or `pi-bg worker` with no task, an all-whitespace task,
+# A bare `jarate-bg` (or `jarate-bg worker` with no task, an all-whitespace task,
 # or an empty stdin task) used to fall through and spawn an agent with an
 # EMPTY task: wasted run record + cgroup + ticket + cap slot (incident
 # 2026-10-03, ticket 20261003-093837; on pre-#118 main it crashed at
@@ -276,7 +276,7 @@ fi
 # effects (same contract as the --worktree/--project usage errors above:
 # rc 2, one stderr line, no record).
 if [ -z "${task//[[:space:]]/}" ]; then
-  echo "pi-bg: missing task. usage: nohup pi-bg {worker|reviewer} [pi flags] \"task\" > log 2>&1 & | printf '%s' \"task\" | nohup pi-bg {worker|reviewer} [pi flags] - > log 2>&1 &" >&2
+  echo "jarate-bg: missing task. usage: nohup jarate-bg {worker|reviewer} [pi flags] \"task\" > log 2>&1 & | printf '%s' \"task\" | nohup jarate-bg {worker|reviewer} [pi flags] - > log 2>&1 &" >&2
   exit 2
 fi
 
@@ -292,14 +292,14 @@ fi
 # (pid_max on these boxes is 4194304, 6-7 digits live). A hypothetical
 # 8-digit pid loses the rid head to the header clip (tail kept). The
 # 3-group numeric shape is preserved: the ticket validators in
-# pi-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
+# jarate-bg-tail/-kill match ^[0-9]{8}-[0-9]{6}-[0-9]+$.
 run_id="${PI_BG_RUN_ID:-$(date -u +%Y%m%d-%H%M%S)-$$}"
 export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 
 # --- per-run artifact dir: default ~/.pi-bg-art (persistent — /tmp on the
 #     reference agent host is a 32G tmpfs that a reboot wipes; 2026-09-13: a wiped
 #     /tmp lost every out.md and the watchdog re-flagged finished tickets as
-#     DEAD). PI_BG_TMPDIR is honored by pi-bg-tail, pi-bg-kill, pi-bg-watchdog
+#     DEAD). PI_BG_TMPDIR is honored by jarate-bg-tail, jarate-bg-kill, jarate-bg-watchdog
 #     and the bridge /jobs history — keep all per-run files in the same place
 #     so every tool finds them. ---
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
@@ -330,20 +330,20 @@ mkdir -p "$BG_TMP" 2>/dev/null
 # then the error, then exit 4. Sub-second.
 #
 # Bypass: PI_BG_ALLOW_FOREGROUND=1 exactly (any other value = no
-# bypass). May be set by INTERNAL callers only - pi-bg's own tests and
+# bypass). May be set by INTERNAL callers only - jarate-bg's own tests and
 # code that launches it attached on purpose. Operator dispatches use
 # the nohup form.
 if [ "${PI_BG_ALLOW_FOREGROUND:-}" != "1" ] && [ -z "$(trap -p HUP)" ]; then
   echo "[pi-bg] ticket $run_id profile=$profile" 2>/dev/null || true
   {
-    echo "pi-bg: ERROR: foreground launch detected (issue #144). Use the nohup form:"
-    echo "  cd <workdir> && printf '%s' \"\$task\" | nohup pi-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
+    echo "jarate-bg: ERROR: foreground launch detected (issue #144). Use the nohup form:"
+    echo "  cd <workdir> && printf '%s' \"\$task\" | nohup jarate-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
   } >&2
   exit 4
 fi
 
 # --- concurrency cap (issue #41): refuse to start when this user already
-#     has $PI_BG_MAX_CONCURRENT live pi-bg worker/reviewer runs (0 =
+#     has $PI_BG_MAX_CONCURRENT live jarate-bg worker/reviewer runs (0 =
 #     unlimited). Count = live tickets via heartbeat files (issue #123):
 #     the old /proc argv scan matched 2+ processes per live ticket (the
 #     wrapper, its hb child, the lingering launcher) plus any same-uid
@@ -405,14 +405,14 @@ if [ "$max_c" -gt 0 ]; then
     live=$(( live + 1 ))
   done < <(find "$_cap_art" -maxdepth 1 -type f -name 'pi-bg-*-hb' -newermt "@${_cap_cutoff}" 2>/dev/null)
   if [ "$live" -ge "$max_c" ]; then
-    echo "[!] at cap (${live}/${max_c}), try again later or pi-bg-kill a ticket" >&2
+    echo "[!] at cap (${live}/${max_c}), try again later or jarate-bg-kill a ticket" >&2
     exit 5
   fi
 fi
 
 # repo root (script lives in <repo>/dispatch) - profile templates + censor.
 # Resolve symlinks first (issue #37): the normal launch is the
-# ~/scripts/pi-bg symlink install.sh creates, and with the unresolved link
+# ~/scripts/jarate-bg symlink install.sh creates, and with the unresolved link
 # path JB_ROOT would be $HOME, so the settings.json seed lookup at
 # $JB_ROOT/dispatch/profiles/<role>.json silently missed (fresh role got
 # auth+models but no settings.json -> pi fell back to its built-in
@@ -449,7 +449,7 @@ if [ -n "$webhook" ]; then
   delivery="webhook"
 else
   delivery="none"
-  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with pi-wait" >&2
+  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with jarate-wait" >&2
 fi
 rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 mkdir -p "$rec_dir" 2>/dev/null
@@ -508,8 +508,8 @@ if [ -z "${PI_BG_SNAP:-}" ]; then echo "[pi-bg] ticket $run_id profile=$profile"
 
 # --- deploy-swap guard (2026-09-15, ticket 20260915-011025-3740387) -----
 # bash keeps reading this script from DISK for the whole run. A jarate
-# deploy (git pull in the checkout that ~/scripts/pi-bg symlinks into)
-# swaps dispatch/pi-bg while a long wrapper is parked in `wait` (a 15-min
+# deploy (git pull in the checkout that ~/scripts/jarate-bg symlinks into)
+# swaps dispatch/jarate-bg while a long wrapper is parked in `wait` (a 15-min
 # review): the resumed read lands on a stale offset in the NEW content
 # and dies mid-run (bash syntax error, exit 2) - the review was complete
 # (report + PASS on disk) but the wrapper never posted its callback and
@@ -566,7 +566,7 @@ webhook="${webhook:-}"
 if [ "$wt_mode" -eq 1 ]; then
   ref="${wt_ref:-HEAD}"
   top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "pi-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
+    echo "jarate-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
     mark_launch_fail "launch-fail: not a git repo"
     [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then hcode=$(python3 -c '\''import json,sys;print(json.dumps({"content":"[!] pi-bg "+sys.argv[1]+" DIED (launch): --worktree needs a git repo (cwd="+sys.argv[2]+")"}))'\'' "$run_id" "$(pwd)" | curl -s -o /dev/null -w '\''%{http_code}'\'' -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- 2>/dev/null); case "${hcode:-000}" in 2*) ;; *) echo "launch-fail DIED webhook post failed http=${hcode:-000} when=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${run_id}-webhook-failed" 2>/dev/null ;; esac; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null; rm -f "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null' EXIT
     exit 3; }
@@ -575,7 +575,7 @@ if [ "$wt_mode" -eq 1 ]; then
   wt_branch="pi-bg/$id"
   wt_repo="$(basename "$top")"
   if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
-    echo "pi-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
+    echo "jarate-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
     mark_launch_fail "launch-fail: worktree add failed ref=$ref"
     [ -n "$webhook" ] && trap 'if [ "${BG_CB_DONE:-0}" -eq 0 ] && [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then hcode=$(python3 -c '\''import json,sys;print(json.dumps({"content":"[!] pi-bg "+sys.argv[1]+" DIED (launch): worktree add failed (ref="+sys.argv[2]+")"}))'\'' "$run_id" "$ref" | curl -s -o /dev/null -w '\''%{http_code}'\'' -X POST "$webhook" -H "Content-Type: application/json" --max-time 15 -d @- 2>/dev/null); case "${hcode:-000}" in 2*) ;; *) echo "launch-fail DIED webhook post failed http=${hcode:-000} when=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${run_id}-webhook-failed" 2>/dev/null ;; esac; fi; rm -rf "${SNAP_DIR:-}" 2>/dev/null; rm -f "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null' EXIT
     exit 3; fi
@@ -591,7 +591,7 @@ out=""; rc=1; purl=""; ourl=""
 #     systemd kills a unit's whole cgroup subtree on stop; a sibling cgroup
 #     under the user slice survives. Fallback: run in place if cgroup v2
 #     delegation is unavailable (mkdir/proc write fails).
-#     PI_BG_CG_ROOT overrides the cgroup base (test hook; pi-bg-kill honors
+#     PI_BG_CG_ROOT overrides the cgroup base (test hook; jarate-bg-kill honors
 #     the same var). ---
 CG_PARENT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 ESCAPE_CG="$CG_PARENT/pi-bg/${run_id}"
@@ -676,12 +676,12 @@ PY
 fi
 if ! profile_seeded "$PI_CODING_AGENT_DIR"; then
   {
-    echo "pi-bg: profile '$profile' has no provider at $PI_CODING_AGENT_DIR (auth.json/models.json missing or empty)"
-    echo "pi-bg: fix: seed credentials, e.g."
+    echo "jarate-bg: profile '$profile' has no provider at $PI_CODING_AGENT_DIR (auth.json/models.json missing or empty)"
+    echo "jarate-bg: fix: seed credentials, e.g."
     echo "  cp -L ${HOME}/.pi/agent/auth.json ${HOME}/.pi/agent/models.json $PI_CODING_AGENT_DIR/"
     echo "  (or run the main agent once to log in), then re-dispatch."
     if [ -n "$JB_ROOT" ] && [ -f "$JB_ROOT/dispatch/profiles/${profile}.json" ]; then
-      echo "pi-bg: settings template: $JB_ROOT/dispatch/profiles/${profile}.json"
+      echo "jarate-bg: settings template: $JB_ROOT/dispatch/profiles/${profile}.json"
     fi
   } >&2
   rm -f "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null
@@ -817,7 +817,7 @@ elif status == "DIED":
     title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = hdr("died", rid); color = ORANGE
 else:
     title = f"{prof} \u00b7 EMPTY \u00b7 {dstr}"; header = hdr("empty", rid); color = RED
-desc_lines = [header, f"\u251c $ pi-bg {prof}{ ' --worktree' if E('WORKTREE') == '1' else ''}"]
+desc_lines = [header, f"\u251c $ jarate-bg {prof}{ ' --worktree' if E('WORKTREE') == '1' else ''}"]
 if E("WORKTREE") == "1":
     desc_lines.append(kv("repo", E("REPO")))
     desc_lines.append(kv("wt", E("WT"), head=True))
@@ -898,7 +898,7 @@ PY
 # leaves, so the dir is empty and rmdir succeeds. Without the self-move-out
 # the rmdir always fails (348 leaked empty dirs, 2026-09-11). Guarded: a
 # missing/non-empty dir must never break the exit path. SIGKILLed wrappers
-# can't run this at all — pi-bg-kill reaps the drained cgroup dir itself.
+# can't run this at all — jarate-bg-kill reaps the drained cgroup dir itself.
 bg_on_exit() {
   local ec=$?
   # heartbeat child (issue #52): stop it FIRST so its in-flight sleep can't
@@ -909,7 +909,7 @@ bg_on_exit() {
     hb_pid=""
   fi
   # run record: terminal state (issue #51). Written BEFORE the cgroup drain
-  # on purpose: pi-bg-kill only finalizes "killed" after the drain confirms
+  # on purpose: jarate-bg-kill only finalizes "killed" after the drain confirms
   # empty, so "done" is guaranteed first and an operator kill ends up
   # "killed". (SIGKILL skips this whole trap; the watchdog prunes by age.)
   bg_mark_record "done"
@@ -922,7 +922,7 @@ bg_on_exit() {
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
     reason="$(bg_death_reason)"
     bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
-      "no output captured - pi-bg exited before completion (exit=$ec)${reason:+; reason: $reason}" "$ec" ""
+      "no output captured - jarate-bg exited before completion (exit=$ec)${reason:+; reason: $reason}" "$ec" ""
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
   fi
   if [ "$ESCAPE_ACTIVE" -eq 1 ]; then
@@ -944,7 +944,7 @@ bg_on_exit() {
   # temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the run's
   # scratch files are unlinked on every trapped exit path (normal, error,
   # INT, TERM - the INT/TERM traps funnel into this EXIT trap). Kept:
-  # out.md (completion marker: watchdog + /jobs), raw.out (pi-bg-tail spool
+  # out.md (completion marker: watchdog + /jobs), raw.out (jarate-bg-tail spool
   # + /jobs "run started"), wb-status (webhook audit: /jobs),
   # webhook-failed (dead letter: watchdog + /jobs), and err.log when
   # out.md is non-empty. err.log is KEPT on empty output: the stderr tail
@@ -1023,7 +1023,7 @@ bg_prune_session() {
 #     so it never outlives the run. The child also self-terminates when the
 #     wrapper dies untrappably (SIGKILL): the loop checks the wrapper's pid
 #     ($$ inside a subshell is the parent's) each tick. Forked AFTER the
-#     cgroup escape so it lands in the ticket cgroup (pi-bg-kill signals it
+#     cgroup escape so it lands in the ticket cgroup (jarate-bg-kill signals it
 #     with the rest of the tree). Started right before the EXIT trap is
 #     registered below, so every exit from this point on is trapped;
 #     hb_pid="" guards bg_on_exit either way.

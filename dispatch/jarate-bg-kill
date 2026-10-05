@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# pi-bg-kill — cancel an in-flight pi-bg worker via its cgroup (issue #15)
+# jarate-bg-kill — cancel an in-flight jarate-bg worker via its cgroup (issue #15)
 #
-# pi-bg moves each run into its own cgroup at dispatch (the escape path is
+# jarate-bg moves each run into its own cgroup at dispatch (the escape path is
 # printed on stdout): /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.
 # service/pi-bg/<ticket-id>/. Killing via the cgroup is precise: only this
 # run's process tree dies, nothing else.
-# usage: pi-bg-kill <ticket-id|short-suffix> [--dry-run]
+# usage: jarate-bg-kill <ticket-id|short-suffix> [--dry-run]
 #   ticket id is YYYYMMDD-HHMMSS-NNNNN; a 7+ digit suffix is resolved via
 #   the run records (~/.pi-dispatch/runs) when it matches exactly one run
 #   --dry-run  print the process tree that WOULD be killed; change nothing
 # real kill: SIGTERM to every member AND the ticket's process group (issue
-# #56: pi-bg runs under setsid - the wrapper is the session leader, the pi
+# #56: jarate-bg runs under setsid - the wrapper is the session leader, the pi
 # child shares its PGID; signaling a group-leader member's -pgid covers
 # session processes that escaped the cgroup walk and keeps the pi child
 # from orphaning), wait $PI_BG_KILL_WAIT (default 10s) polling every 0.5s,
 # then SIGKILL (cgroup.kill + per-pid + per-group fallback). Posts a
-# kind=kill webhook event (same URL source as pi-bg) so the dispatch
+# kind=kill webhook event (same URL source as jarate-bg) so the dispatch
 # channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed (the watchdog
 # skips killed tickets) + the run record ($PI_DISPATCH_RECORD_DIR,
 # default ~/.pi-dispatch/runs) is marked state=killed (issue #51).
@@ -28,7 +28,7 @@ BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
-# run records (issue #51 + #86 short-id resolution): the same dir pi-bg
+# run records (issue #51 + #86 short-id resolution): the same dir jarate-bg
 # writes state=running/done/killed records into. Defined up front: the id
 # validator below resolves short ids against it.
 REC_DIR="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
@@ -46,10 +46,10 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-[ -n "$id" ] || { echo "usage: pi-bg-kill <ticket-id> [--dry-run]" >&2; exit 2; }
+[ -n "$id" ] || { echo "usage: jarate-bg-kill <ticket-id> [--dry-run]" >&2; exit 2; }
 if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
   # Short id (issue #86): the strict full-id regex used to be the only
-  # accepted form, so the natural cleanup call `pi-bg-kill 2332046` exited
+  # accepted form, so the natural cleanup call `jarate-bg-kill 2332046` exited
   # 2; with the caller's stderr on /dev/null (as the incident loop had it)
   # that was a silent no-op and four live workers died un-killled. A
   # 7+ digit numeric arg is resolved against the run records: the ticket
@@ -65,20 +65,20 @@ if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
     done
     case "${#matches[@]}" in
       1)
-        echo "pi-bg-kill: short id $id -> ${matches[0]} (run record)" >&2
+        echo "jarate-bg-kill: short id $id -> ${matches[0]} (run record)" >&2
         id="${matches[0]}"
         ;;
       0)
-        echo "pi-bg-kill: no run record in $REC_DIR matches short id '$id' (want the full id, or a unique 7+ digit suffix)" >&2
+        echo "jarate-bg-kill: no run record in $REC_DIR matches short id '$id' (want the full id, or a unique 7+ digit suffix)" >&2
         exit 2
         ;;
       *)
-        echo "pi-bg-kill: short id '$id' is ambiguous, matches: ${matches[*]} (use the full id)" >&2
+        echo "jarate-bg-kill: short id '$id' is ambiguous, matches: ${matches[*]} (use the full id)" >&2
         exit 2
         ;;
     esac
   else
-    echo "pi-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix resolved from $REC_DIR)" >&2
+    echo "jarate-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix resolved from $REC_DIR)" >&2
     exit 2
   fi
 fi
@@ -86,7 +86,7 @@ fi
 # temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the
 # kill-body.json webhook payload is scratch. The EXIT trap unlinks it on
 # every trapped exit path (normal, error, INT, TERM - the INT/TERM traps
-# funnel into this EXIT trap), so a failing or killed pi-bg-kill leaves no
+# funnel into this EXIT trap), so a failing or killed jarate-bg-kill leaves no
 # payload behind. Kept: the -killed marker and the kill-webhook-failed dead
 # letter (the watchdog and /jobs history read them).
 trap 'rm -f "$BG_TMP/pi-bg-${id:-}-kill-body.json" 2>/dev/null' EXIT
@@ -95,7 +95,7 @@ trap 'exit 143' TERM
 
 CG="$CG_ROOT/pi-bg/$id"
 if [ ! -d "$CG" ]; then
-  echo "pi-bg-kill: no cgroup for ticket '$id' ($CG missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
+  echo "jarate-bg-kill: no cgroup for ticket '$id' ($CG missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
   exit 2
 fi
 
@@ -182,7 +182,7 @@ pids0="$(list_tree | sort -un | tr '\n' ' ')"
 # 2026-09-15 incident).
 t0="$(date +%s)"
 
-# issue #56: pi-bg runs under setsid, so a group-leader member of the tree
+# issue #56: jarate-bg runs under setsid, so a group-leader member of the tree
 # leads the ticket's session (pgid == sid == its pid). Signal those process
 # groups too, so every session process dies with the ticket even if it
 # escaped the cgroup walk - a wrapper-only kill would orphan the pi child.
@@ -212,7 +212,7 @@ if [ "$gone" -eq 0 ]; then
   if [ -z "$(cg_procs)" ]; then
     echo 1 > "$CG/cgroup.kill" 2>/dev/null || true
   else
-    echo "pi-bg-kill: warning: $CG not empty (live PIDs), skipping cgroup.kill - per-pid SIGKILL only" >&2
+    echo "jarate-bg-kill: warning: $CG not empty (live PIDs), skipping cgroup.kill - per-pid SIGKILL only" >&2
   fi
   for p in $pids0; do kill -KILL "$p" 2>/dev/null; done
   for g in $gl; do kill -KILL "-$g" 2>/dev/null; done
@@ -240,7 +240,7 @@ printf '%s killed %s by %s after %ss; pids: %s\n' \
 # mark the run record killed (issue #51): the wrapper's exit trap has
 # already marked it "done" (its trap runs before the drain confirms); for
 # an operator kill "killed" is the final state. Same audit-only posture
-# as pi-bg: a missing/corrupt record never breaks the kill path.
+# as jarate-bg: a missing/corrupt record never breaks the kill path.
 if [ -f "$REC_DIR/pi-bg-${id}.json" ]; then
   PI_BG_REC_STATE="killed" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
 import datetime, json, os, sys
@@ -255,7 +255,7 @@ json.dump(rec, open(p, "w"), indent=2)
 PY
 fi
 
-# --- kind=kill webhook event (same URL source + embed shape as pi-bg) ---
+# --- kind=kill webhook event (same URL source + embed shape as jarate-bg) ---
 webhook="${PI_DISPATCH_WEBHOOK:-}"
 if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
   webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
@@ -285,13 +285,13 @@ rid = E("T")
 # is a framed block (box-drawing + ASCII + middle dot), <= FRAME_W cols.
 title = "pi-bg " + rid + " \u00b7 KILLED"
 meta = [rid_line("\u250c killed \u00b7 ", rid),
-        rid_line("\u251c $ pi-bg-kill ", rid),
+        rid_line("\u251c $ jarate-bg-kill ", rid),
         "\u251c " + "pids".ljust(5) + " : " + clip_end(E("PIDS"), 21),
         "\u251c " + "wait".ljust(5) + " : " + E("DUR") + "s (TERM->KILL)",
         "\u251c " + "state".ljust(5) + " : killed on request",
         "\u2514"]
 embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
-         "color": 15105570,  # orange, same as pi-bg DIED
+         "color": 15105570,  # orange, same as jarate-bg DIED
          "title": title,
          "description": "```bash\n" + "\n".join(meta) + "\n```",
          "footer": {"text": "pi-bg kill"},
@@ -310,11 +310,11 @@ PY
       printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
         "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
-      echo "pi-bg-kill: webhook FAILED (http=$code) - dead letter: $BG_TMP/pi-bg-${id}-kill-webhook-failed" >&2
+      echo "jarate-bg-kill: webhook FAILED (http=$code) - dead letter: $BG_TMP/pi-bg-${id}-kill-webhook-failed" >&2
     fi
     rm -f "$bodyf"
   fi
 fi
 
-echo "pi-bg-kill: killed $id after ${dur}s (pids: $pids0)"
+echo "jarate-bg-kill: killed $id after ${dur}s (pids: $pids0)"
 exit 0

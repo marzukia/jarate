@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pi-bg-tail — deprecated shim (jarate #151): forwards to jarate-bg-tail.
+# One stderr line; stdout + rc pass through untouched (the ticket line
+# must stay the first stdout line).
+echo "pi-bg-tail: deprecated, use jarate-bg-tail (jarate #151)" >&2
+exec "$(dirname "$(readlink -f "$0")")/jarate-bg-tail" "$@"

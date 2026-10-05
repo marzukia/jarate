@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# pi-bg-tail — read a pi-bg worker's live output without opening files (issue #16)
+# jarate-bg-tail — read a jarate-bg worker's live output without opening files (issue #16)
 #
-# pi-bg tees every run's live output to $HOME/.pi-bg-art/pi-bg-<id>-raw.out
+# jarate-bg tees every run's live output to $HOME/.pi-bg-art/pi-bg-<id>-raw.out
 # (legacy /tmp for pre-upgrade runs; PI_BG_TMPDIR overrides), so an
 # in-flight run can be watched at any point (removes the blind spot where
 # only the webhook summary survived).
-# usage: pi-bg-tail <ticket-id> [lines] [-f]
+# usage: jarate-bg-tail <ticket-id> [lines] [-f]
 #   lines  how many lines to show (default 40)
 #   -f     follow (tail -f)
-# ticket ids are pi-bg run_ids: YYYYMMDD-HHMMSS-NNNNN
+# ticket ids are jarate-bg run_ids: YYYYMMDD-HHMMSS-NNNNN
 # exits: 0 = ok, 2 = bad usage / unknown ticket
 set -uo pipefail
 
@@ -31,9 +31,9 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-[ -n "$id" ] || { echo "usage: pi-bg-tail <ticket-id> [lines] [-f]" >&2; exit 2; }
+[ -n "$id" ] || { echo "usage: jarate-bg-tail <ticket-id> [lines] [-f]" >&2; exit 2; }
 if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
-  echo "pi-bg-tail: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
+  echo "jarate-bg-tail: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
   exit 2
 fi
 
@@ -43,7 +43,7 @@ if [ ! -f "$rawf" ] && [ -f "/tmp/pi-bg-${id}-raw.out" ]; then
   rawf="/tmp/pi-bg-${id}-raw.out"
 fi
 if [ ! -f "$rawf" ]; then
-  echo "pi-bg-tail: no live output for ticket '$id' ($rawf missing) — unknown ticket, or the run never started" >&2
+  echo "jarate-bg-tail: no live output for ticket '$id' ($rawf missing) — unknown ticket, or the run never started" >&2
   exit 2
 fi
 

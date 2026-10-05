@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# pi-bg-kill — deprecated shim (jarate #151): forwards to jarate-bg-kill.
+# One stderr line; stdout + rc pass through untouched (the ticket line
+# must stay the first stdout line).
+echo "pi-bg-kill: deprecated, use jarate-bg-kill (jarate #151)" >&2
+exec "$(dirname "$(readlink -f "$0")")/jarate-bg-kill" "$@"
