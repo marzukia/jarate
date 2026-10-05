@@ -366,6 +366,20 @@ agent_homes() {
 # Remote probe for a peer agent home: prints [jarate:pi] as the first line
 # only if that user has pi.service enabled, followed by the warning lines.
 # Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
+
+# sq <s> — POSIX single-quote escape: emit <s> wrapped in single quotes,
+# each ' rewritten as '\'' . The output is shell CODE that any POSIX sh
+# parses back to the literal <s> (quote, $, backtick, space, glob-safe).
+# Used to embed values in the hop's remote command string (issue #121):
+# the remote string is one double-quoted local string, so $(sq ...) is
+# evaluated locally and substituted verbatim at the outer remote-shell
+# level — never inside another single-quoted region (nested sq would
+# break; pass such values as bash -c positionals instead, see below).
+sq() {
+  local s="$1"
+  printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
 run_remote_probe() { # $1=name $2=uid $3=since
   local host="$HOP_TARGET"
   local pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
@@ -379,10 +393,11 @@ run_remote_probe() { # $1=name $2=uid $3=since
   #   - the password rides ssh's STDIN exactly once (here-string, no argv);
   #     the remote shell reads it into a variable, drops it in a 0600 temp
   #     file and feeds `sudo -S < file` — never `echo '<pw>'` in remote argv
-  #   - $1/$3 are single-quoted in the remote string, $2 is a uid digit
+  #   - $1/$3 are sq()-escaped in the remote string (quote/$/backtick safe,
+  #     #121 injection path), $2 is a uid digit
   SSHPASS="$pass" timeout "$TMO" sshpass -e \
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-    "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
+    "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u $(sq "$1") bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ $(sq "$3"); rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
     <<<"$pass" 2>/dev/null
 }
 
@@ -651,11 +666,13 @@ jarate_scan() {
     command -v sshpass >/dev/null 2>&1 || { echo "cross-user hop needs sshpass" >&2; return 1; }
     # issue #121: same no-password-in-argv discipline as run_remote_probe
     # (sshpass -e + password over ssh stdin once + 0600 remote file for
-    # sudo -S); $owner/$home/$b64 are quoted in the remote string, $envs
-    # tokens are validated above.
+    # sudo -S); $owner is sq()-escaped at the sudo -u slot, $home/$b64 are
+    # sq()-escaped bash -c positionals (the inner script refers to them as
+    # "$1"/"$2" — sq output must not sit inside the inner single-quoted
+    # region), $envs tokens are validated above.
     SSHPASS="$pass" timeout "$TMO" sshpass -e \
       ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-      "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$owner' bash -c 'PI_HOME=\"$home\" $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" \"$b64\"'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
+      "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u $(sq "$owner") bash -c 'PI_HOME=\"\$1\" $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" \"\$2\"' _ $(sq "$home") $(sq "$b64"); rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
       <<<"$pass" 2>/dev/null
   fi
 }
