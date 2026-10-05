@@ -28,9 +28,10 @@ token besides the one child it spawns).
   `default` or `<owner>/<repo>:<perm>` where perm is `read` or `write`,
   owner 1-39 chars, repo 1-100 chars (`[A-Za-z0-9_.-]`).
 - File content: exactly one line, token only.
-- Tokens are read **at handoff** (socket mode) or **at approve** (file
-  mode) — NOT at request time. Operator rotation takes effect with no
-  bridge restart; the next run uses the new token.
+- Tokens are read **at approve** (both transports — a dead file blocks
+  the tap with a visible in-channel error) and **at handoff** (socket
+  mode, rotation-aware) — NOT at request time. Operator rotation takes
+  effect with no bridge restart; the next run uses the new token.
 - Known scopes = `default` + recursive listing of the pats dir. A request
   with an unknown scope is rejected before any Discord post.
 
@@ -60,9 +61,12 @@ Token shape is validated on every handoff:
   handoff. The old token stays live on GitHub until its expiry — revoke
   it in the web UI if the box was not trusted.
 - Drop: delete the file. The scope disappears from the known list at the
-  next request; pending/approved requests for it fail at run time with
-  `scope: token file missing ...` (the request stays `approved`; restore
-  the file and retry inside the claim window).
+  next request; a pending request's approve tap is blocked with a
+  non-ephemeral channel followup naming the file + the exact next
+  command (restore it, then re-tap — or re-request), and approved
+  requests fail at run time with the executable
+  `scope: token file missing: <path> — ...` error (the request stays
+  `approved`; restore the file and re-run inside the claim window).
 
 ## Commands
 
@@ -99,8 +103,12 @@ $ echo $?   # the child's exit code
   passes through). rc 124 is a command timeout, not a vault error.
 - Vault errors (command never ran) are rc 1 + JSON doc:
   `state: pending (awaiting approval)`, `state: expired at ...`,
-  `state: already used`, `unknown id`, `scope: token file missing ...`,
-  `file missing: <path>` (file mode).
+  `state: already used`, `unknown id`,
+  `scope: token file missing: <path> — restore the file, then re-run:
+  `jarate pat-run <id> -- <cmd>`; ...` (also `token file empty` /
+  `token shape invalid` variants),
+  `file missing: <path>` (file mode). The error carries the exact next
+  command — copy it.
 - The id is single-use: one approve = one run. Re-running the same id
   gets `state: already used`.
 
@@ -184,16 +192,21 @@ Inspect: `tail -20 ~/.jarate/pat-audit.log | jq .`.
 | `budget: 5 approvals in last hour; next slot ...` rc 1 | rolling budget cap | wait for the hour to roll |
 | `scope: unknown '...' (known: ...)` rc 1 | no token file for that scope | create the file (above), retry |
 | `state: already used` rc 1 | the id was run | re-request a fresh id |
-| `scope: token file missing for ...` rc 1 (request stays approved) | store file deleted between approve and run | restore file, retry inside the 60s claim window; else re-request |
+| `scope: token file missing: <path> — ...` rc 1 (request stays approved) | store file missing/empty/bad-shape between approve and run | copy the exact next command from the error doc: fix + re-run this id, or re-request past the 60s claim window |
+| approve tap: non-ephemeral `[!] approve blocked: token file ... for <scope>` in the channel (no state change) | store file missing/empty/bad-shape at tap time (both transports) | restore/fix the file, then re-tap — or re-request (the followup names the exact command) |
 | exit 124, no JSON, partial output | command hit the 900s cap | make the command faster / split it; re-request |
 | `file missing: <path>` rc 1 (file mode) | bridge restarted between publish and read (boot sweep) | retry inside the claim window (re-approve republishes); else re-request |
 | double tap / stale copy of the button message | dedupe by `d.id` + state check | ephemeral `already handled` / `not found or already handled`; nothing consumed |
 | non-owner taps | deliverable ephemeral `[!] only the owner...` | owner taps later within TTL |
 | vault request-only (run lines get `vault unavailable`) | socket dir not writable / EADDRINUSE twice | fix dir perms, restart bridge |
 
-Every tap gets visible feedback (message edit and/or ephemeral
-followup); a tap never crashes the bridge (`handlePatComponent` never
-rejects; the dispatch line carries a `.catch` backstop).
+Every tap gets visible feedback: a message edit on success/deny/expire,
+an ephemeral followup on gate failures, and — a dead token file at
+approve time — a NON-ephemeral channel followup naming scope + file +
+the exact next command (the request stays pending; re-tap after the
+fix). A tap never crashes the bridge (`handlePatComponent` never
+rejects; an error followup is an outcome, not a rejection; the
+dispatch line carries a `.catch` backstop).
 
 ## Onboarding a new agent box
 
@@ -217,7 +230,9 @@ rejects; the dispatch line carries a `.catch` backstop).
 1. Only the bridge reads a PAT file (at handoff/approve, approved scope
    only).
 2. Only the owner's tap mutates a request; every other tap is
-   ephemeral-replied + audit-logged, state untouched.
+   replied + audit-logged, state untouched (gate failures get an
+   ephemeral reply; a dead token file at approve time gets a
+   non-ephemeral followup naming the file + next command).
 3. One tap = one token = one command; the id is single-use.
 4. The token is in at most 3 places at once: bridge memory, the bun
    wrapper, one child's env. Never in argv, never in a file (socket
