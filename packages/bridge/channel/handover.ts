@@ -10,7 +10,7 @@
  *   1-2, 4-6, 8 (Mission, In-flight, Blockers, Decisions, Follow-ups,
  *   Gotchas) + Done (condensed)        → LLM prose over the filled skeleton
  *   3 Done is LLM prose (retirement)
- *   7 References, 9 State, 10 Last 3 user asks → deterministic (no LLM)
+ *   7 References, 9 State, 10 Last user asks → deterministic (no LLM)
  *   plus <read-files>/<modified-files> tags   → deterministic, CUMULATIVE:
  *   prior doc tags ∪ current span fileOps (review F9)
  *
@@ -29,11 +29,12 @@ import type {
   UserMessage,
 } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import type {
-  ContextUsage,
-  ExtensionAPI,
-  ExtensionContext,
-  SessionEntry,
+import {
+  type ContextUsage,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type SessionEntry,
+  sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { fmtTokensLC } from "./ctxwatch";
 import { jobsView } from "./jobs";
@@ -282,18 +283,34 @@ export function stripPromptFraming(s: string): string {
 // ─── Prior doc + file tags (cumulative, F9) ────────────────────────────────
 
 /** Parse <read-files>/<modified-files> tags out of a prior doc. One path
- *  per line; missing/empty blocks → empty arrays. */
+ *  per line; missing/empty blocks → empty arrays.
+ *
+ *  Anchors each tag to its LAST occurrence — the doc's own footer is always
+ *  the last block — so a transcript scrape of handover.ts source mid-doc
+ *  cannot win (RCA F4a: an old doc's footer contained the literal
+ *  `\n${list(s.readFiles)}` text from such a scrape, and the first-match
+ *  parse re-rendered it, self-perpetuating). Uninterpolated template lines
+ *  are dropped as paths. */
 export function parsePriorTags(doc: string | null): {
   readFiles: string[];
   modifiedFiles: string[];
 } {
   const pick = (tag: string): string[] => {
-    const m = (doc ?? "").match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
-    if (!m) return [];
-    return m[1]
+    const text = doc ?? "";
+    const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "g");
+    let last: string | null = null;
+    for (const m of text.matchAll(re)) last = m[1];
+    if (last == null) return [];
+    return last
       .split("\n")
       .map((l) => l.trim())
-      .filter((l) => l.length > 0 && l !== "(none)");
+      .filter(
+        (l) =>
+          l.length > 0 &&
+          l !== "(none)" &&
+          !l.includes("${") &&
+          !l.startsWith("\\"),
+      );
   };
   return {
     readFiles: pick("read-files"),
@@ -309,46 +326,78 @@ const TICKET_RE = /\b(\d{8}-\d{6}-\d+)\b/g;
 const WORKTREE_PATH_RE = /(?:~|\/[\w.-]+)+\/\.pi-bg-wt\/[^\s"'<>)\]`,;]+/g;
 const WORKTREE_BRANCH_RE = /\bpi-bg\/(\d{8}-\d{6}-\d+)/g;
 
-/** Deterministic extraction (pure): file tags (cumulative), PR/issue/
- *  ticket refs, worktree paths + branches, links, last-3 user asks,
- *  context/model/session lines. No LLM anywhere in here. */
+/** File-tag list cap (RCA F4a): ~10 paths per tag, newest first. */
+const FILE_TAG_CAP = 10;
+
+/** Deterministic extraction (pure): file tags (cumulative, capped, newest
+ *  first), PR/issue/ticket refs, worktree paths + branches, links, last
+ *  user asks (human only), context/model/session lines. No LLM in here. */
 export function extractDeterministic(
   preparation: HandoverPreparation,
   branchEntries: SessionEntry[],
   ctxState: ExtractCtxState,
 ): ParsedState {
-  // File tags: prior doc ∪ current span (F9) — fileOps alone only covers
-  // the NEW span and would drop the cumulative list.
+  // File tags: prior doc ∪ current span (F9), NEWEST FIRST, capped (RCA
+  // F4a) — fileOps alone only covers the NEW span and would drop the
+  // cumulative list; the cap keeps the footer small, newest paths win.
   const prior = parsePriorTags(ctxState.priorDoc);
-  const read = new Set<string>([
-    ...prior.readFiles,
-    ...preparation.fileOps.read,
-  ]);
-  const modified = new Set<string>([
-    ...prior.modifiedFiles,
+  const spanRead = [...preparation.fileOps.read];
+  const spanModified = [
     ...preparation.fileOps.written,
     ...preparation.fileOps.edited,
+  ];
+  const modifiedSet = new Set<string>([
+    ...spanModified,
+    ...prior.modifiedFiles,
   ]);
-  for (const f of modified) read.delete(f); // pi convention: read = read-only
+  const uniq = (items: string[]): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const it of items) {
+      if (!it || seen.has(it)) continue;
+      seen.add(it);
+      out.push(it);
+    }
+    return out;
+  };
+  // fileOps Set iteration is first-seen (oldest) order → reverse for
+  // newest-first; span files are newer than prior-doc files.
+  const readFiles = uniq([
+    ...spanRead.reverse().filter((f) => !modifiedSet.has(f)),
+    ...prior.readFiles,
+  ]).slice(0, FILE_TAG_CAP);
+  const modifiedFiles = uniq([
+    ...spanModified.reverse(),
+    ...prior.modifiedFiles,
+  ]).slice(0, FILE_TAG_CAP);
 
-  // Reference corpus: the summarization span + the asks.
-  const corpus: string[] = [
+  // Reference windows (RCA F4b): the old full-span corpus kept refs and
+  // worktrees cited by work the session had already moved on from. refs +
+  // links come from the LAST ~50% of the span; worktree paths from the
+  // LAST ~20 messages. Empty span falls back to the inbound bodies.
+  const spanTexts = [
     ...preparation.messagesToSummarize.map(msgText),
     ...preparation.turnPrefixMessages.map(msgText),
   ];
-  for (const e of branchEntries) {
-    if (e.type === "custom_message") {
-      const body = inboundBody(e);
-      if (body) corpus.push(body);
-    }
-  }
-  const text = corpus.join("\n");
+  const inboundCorpus = branchEntries
+    .filter((e) => e.type === "custom_message")
+    .map((e) => inboundBody(e))
+    .filter(Boolean)
+    .join("\n");
+  const refText = spanTexts.length
+    ? spanTexts.slice(Math.floor(spanTexts.length / 2)).join("\n")
+    : inboundCorpus;
+  const wtText = spanTexts.length
+    ? spanTexts.slice(-20).join("\n")
+    : inboundCorpus;
 
-  // Last 3 user asks: channel-inbound custom entries (details.body),
-  // fallback to user-role messages in the summarization span.
+  // Last user asks (RCA F3): HUMAN channel inbounds only, last 2 — the old
+  // list read like a pi-bg server log (Beepy <embed> webhooks, [bg:
+  // heartbeats, bridge-injected wakes). Fallback: user-role span messages.
   const asks: string[] = [];
   for (const e of branchEntries) {
     if (e.type === "custom_message" && e.customType === "channel-inbound") {
+      if (!isHumanInbound(e)) continue;
       const body = stripPromptFraming(inboundBody(e));
       if (body) asks.push(body);
     }
@@ -365,11 +414,11 @@ export function extractDeterministic(
   }
 
   return {
-    readFiles: [...read].sort(),
-    modifiedFiles: [...modified].sort(),
-    refs: extractRefs(text),
-    worktrees: extractWorktrees(text),
-    links: extractLinks(text),
+    readFiles,
+    modifiedFiles,
+    refs: extractRefs(refText),
+    worktrees: extractWorktrees(wtText),
+    links: extractLinks(refText),
     todoBoard: (ctxState.todoText ?? "").trim(),
     dispatchState: (ctxState.dispatchText ?? "").trim(),
     scheduledTasks: (ctxState.scheduledText ?? "").trim(),
@@ -383,7 +432,7 @@ export function extractDeterministic(
       ctxState.sessionEntryCount ?? null,
     ),
     lastUserAsks: asks
-      .slice(-3)
+      .slice(-2)
       .map((a) => (a.length > 280 ? `${a.slice(0, 277)}...` : a)),
   };
 }
@@ -467,39 +516,161 @@ export function formatSessionStats(
 const MSG_CAP = 4_000;
 const TRANSCRIPT_CAP = 60_000;
 
-/** Serialize the about-to-be-summarized span for the LLM (deterministic,
- *  role-labelled, capped). */
-export function serializeTranscript(p: HandoverPreparation): string {
-  const msgs = [
+/**
+ * Serialize the transcript for the doc (RCA F2 — pi-compaction-lossy-rca.md
+ * §5). The old code walked the span oldest→newest and cut at
+ * TRANSCRIPT_CAP, silently dropping the NEWEST work — the very state the
+ * session was in at compaction. The doc must always contain the current
+ * state, so:
+ *
+ *   1. pi-prep's KEPT TAIL (entries at/after firstKeptEntryId — see
+ *      keptTailMessages) is serialized first, in full, chronological. The
+ *      restart drops it from pi's context (pi boots from the LLM summary),
+ *      so this doc is the only surviving copy of it.
+ *   2. The older span (messagesToSummarize + turnPrefixMessages) then fills
+ *      the remaining TRANSCRIPT_CAP, walking newest→oldest. The kept subset
+ *      renders chronological, with a marker where the oldest messages were
+ *      dropped.
+ *
+ * Each message is still capped at MSG_CAP.
+ */
+export function serializeTranscript(
+  p: HandoverPreparation,
+  keptTail: HandoverMessage[] = [],
+): string {
+  const span = [
     ...(p.messagesToSummarize ?? []),
     ...(p.turnPrefixMessages ?? []),
   ];
-  const lines: string[] = [];
-  let total = 0;
-  for (const m of msgs) {
-    const text = msgText(m).trim();
-    if (!text) continue;
-    const role =
-      m?.role === "assistant"
-        ? "assistant"
-        : m?.role === "toolResult"
-          ? "tool"
-          : "user";
-    let body = text;
-    if (body.length > MSG_CAP) body = `${body.slice(0, MSG_CAP)}\n…[truncated]`;
-    const line = `[${role}] ${body}`;
-    if (total + line.length > TRANSCRIPT_CAP) {
-      lines.push("…[transcript truncated]");
+
+  // 1) kept tail — full, chronological. If the tail alone overflows the cap,
+  //    drop from the OLDEST tail side (newest state survives).
+  const allTail = keptTail
+    .map(formatTranscriptLine)
+    .filter((l): l is string => l != null);
+  let tailLines = allTail;
+  let total = tailLines.reduce((n, l) => n + l.length + 1, 0);
+  while (tailLines.length > 1 && total > TRANSCRIPT_CAP) {
+    total -= tailLines[0].length + 1;
+    tailLines = tailLines.slice(1);
+  }
+  const tailDropped = allTail.length - tailLines.length;
+
+  // 2) span — newest first, filling the remainder of the cap.
+  const spanLines: string[] = [];
+  let spanTruncated = false;
+  for (let i = span.length - 1; i >= 0; i--) {
+    const line = formatTranscriptLine(span[i]);
+    if (!line) continue;
+    if (total + line.length + 1 > TRANSCRIPT_CAP) {
+      spanTruncated = true;
       break;
     }
-    lines.push(line);
-    total += line.length;
+    spanLines.push(line);
+    total += line.length + 1;
   }
-  return lines.join("\n");
+  spanLines.reverse(); // render chronological in the doc
+
+  const out: string[] = [];
+  if (tailLines.length > 0) {
+    if (tailDropped > 0)
+      out.push(
+        `…[kept tail truncated: ${tailDropped} oldest kept entries dropped]`,
+      );
+    out.push(...tailLines);
+  }
+  if (spanLines.length > 0) {
+    if (tailLines.length > 0) out.push("…[older span]");
+    if (spanTruncated) out.push("…[transcript truncated]");
+    out.push(...spanLines);
+  }
+  return out.join("\n");
+}
+
+/** One transcript line: `[role] body`, per-message capped. null = none. */
+function formatTranscriptLine(
+  m: HandoverMessage | null | undefined,
+): string | null {
+  const text = msgText(m).trim();
+  if (!text) return null;
+  const role =
+    m?.role === "assistant"
+      ? "assistant"
+      : m?.role === "toolResult"
+        ? "tool"
+        : "user";
+  let body = text;
+  if (body.length > MSG_CAP) body = `${body.slice(0, MSG_CAP)}\n…[truncated]`;
+  return `[${role}] ${body}`;
+}
+
+/**
+ * pi-prep's KEPT TAIL as context messages (RCA F2): the branch entries at/
+ * after preparation.firstKeptEntryId — the newest work pi keeps in context
+ * across the compaction. The restart still drops it (pi boots from the LLM
+ * summary, not the tail), so the handover doc carries it in full. Returns
+ * [] when the id is not on the branch (safe: span-only doc).
+ */
+export function keptTailMessages(
+  preparation: HandoverPreparation,
+  branchEntries: SessionEntry[],
+): HandoverMessage[] {
+  if (branchEntries.length === 0) return [];
+  const idx = branchEntries.findIndex(
+    (e) => e.id === preparation.firstKeptEntryId,
+  );
+  if (idx < 0) return [];
+  const out: HandoverMessage[] = [];
+  for (let i = idx; i < branchEntries.length; i++) {
+    for (const m of sessionEntryToContextMessages(branchEntries[i])) {
+      out.push(m as HandoverMessage);
+    }
+  }
+  return out;
+}
+
+/**
+ * Sender of a channel-inbound entry (RCA F3): the `sender=` (rooms) or
+ * `from=` (1:1) attribute of the <channel-ctx> block, which is always the
+ * FIRST line of the entry's content. null when the entry carries no
+ * channel-ctx — bridge-injected prompts (sleep wakes, task fires, restart
+ * wakes) are sent as plain text.
+ */
+export function inboundSender(e: SessionEntry): string | null {
+  const content = msgText(e as unknown as HandoverMessage);
+  const firstLine = content.split("\n", 1)[0];
+  if (!firstLine.startsWith("<channel-ctx")) return null;
+  const m =
+    firstLine.match(/\bsender="([^"]*)"/) ??
+    firstLine.match(/\bfrom="([^"]*)"/);
+  return m ? m[1].trim() : null;
+}
+
+/** Non-human senders on channel inbounds: the Beepy relay webhook (pi-bg
+ *  callbacks, [bg: heartbeats). Case-insensitive. */
+const NON_HUMAN_SENDERS = new Set(["beepy"]);
+
+/**
+ * True when a channel-inbound entry is a HUMAN ask (RCA F3 — the "Last user
+ * asks" list used to read like a pi-bg server log):
+ *  - carries a <channel-ctx> sender (bridge-injected wakes don't)
+ *  - the sender is not the bot relay (Beepy)
+ *  - the body has free text: not empty, not a pi-bg <embed>, not a [bg:
+ *    heartbeat, not a bare <todo-board> block (stripped already).
+ */
+export function isHumanInbound(e: SessionEntry): boolean {
+  const sender = inboundSender(e);
+  if (sender == null) return false;
+  if (NON_HUMAN_SENDERS.has(sender.toLowerCase())) return false;
+  const body = stripPromptFraming(inboundBody(e));
+  if (!body || body === "(empty)") return false;
+  if (body.startsWith("<embed>")) return false;
+  if (body.startsWith("[bg:")) return false;
+  return true;
 }
 
 export const HANDOVER_SYSTEM_PROMPT = `You write the handover doc sections for an AI agent session that is being compacted.
-The deterministic sections (References, State, Last 3 user asks, file tags) are already filled and EXACT — never restate or correct them.
+The deterministic sections (References, State, Last user asks, file tags) are already filled and EXACT — never restate or correct them.
 
 Write ONLY these sections. Each starts with its marker alone on one line:
 [MISSION] What the agent works toward overall. 1-3 terse lines.
@@ -625,7 +796,7 @@ const SECTION_TITLES = [
   "7 · References",
   "8 · Gotchas & Constraints",
   "9 · State (machine)",
-  "10 · Last 3 user asks",
+  "10 · Last user asks",
 ] as const;
 
 function pad2(n: number): string {
@@ -1066,7 +1237,7 @@ export function renderDeterministic(
   const or = (s: string) => (s.trim() ? s.trim() : "(none)");
   return [
     header,
-    `## Transcript (about to be compacted)\n${or(transcript)}`,
+    `## Transcript (current state first)\n${or(transcript)}`,
     `## References\n${renderReferences(state)}`,
     `## State\n${renderState(state)}`,
     `## Last user asks\n${renderLastAsks(state)}`,
@@ -1093,7 +1264,10 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
   });
   const now = args.now ?? new Date();
   const header = buildHeader(now, safeSessionId(ctx), preparation.tokensBefore);
-  const transcript = serializeTranscript(preparation);
+  const transcript = serializeTranscript(
+    preparation,
+    keptTailMessages(preparation, branchEntries),
+  );
   let doc = renderDeterministic(state, transcript, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
   writeHandover(doc, { storeDir: settings.storeDir, now });
