@@ -3,8 +3,9 @@
  * exactly one command, after exactly one human button tap.
  *
  * Security invariants (design v4 §11):
- *   1. Only the bridge reads a PAT file — at handoff (socket mode) or at
- *      approve (file mode, to publish).
+ *   1. Only the bridge reads a PAT file — at approve (both transports:
+ *      dead-file gate; file mode also publishes) and at handoff (socket
+ *      mode, rotation-aware).
  *   2. Only an owner's tap mutates a request; every other tap gets an
  *      ephemeral reply and an audit line, state untouched.
  *   3. One tap = one token = one command. `handed-off` is terminal.
@@ -294,18 +295,73 @@ function tokenFileFor(st: PatVaultState, scope: string): string {
   return path.join(st.patsDir, scope);
 }
 
+/** Kinded token-file failure: the message ALWAYS names the path.
+ *  `code` distinguishes missing vs empty vs unreadable (design §3). */
+export class TokenFileError extends Error {
+  readonly code: "missing" | "empty" | "unreadable";
+  constructor(code: "missing" | "empty" | "unreadable", message: string) {
+    super(message);
+    this.name = "TokenFileError";
+    this.code = code;
+  }
+}
+
 /** Read the scope token file: one line, token only, trailing newline
- *  trimmed. Throws on ENOENT/EACCES/empty (design §3). */
+ *  trimmed. Throws a TokenFileError naming the path — missing vs empty
+ *  vs unreadable, never a raw fs message (design §3). */
 export function readScopeToken(st: PatVaultState, scope: string): string {
   const p = tokenFileFor(st, scope);
-  const raw = fs.readFileSync(p, "utf-8");
+  let raw: string;
+  try {
+    raw = fs.readFileSync(p, "utf-8");
+  } catch (e: any) {
+    if (e?.code === "ENOENT") {
+      throw new TokenFileError("missing", `token file missing: ${p}`);
+    }
+    throw new TokenFileError(
+      "unreadable",
+      `token file unreadable (${e?.code ?? "read error"}): ${p}`,
+    );
+  }
   const token = raw.split("\n")[0].trim();
-  if (!token) throw new Error(`empty token file: ${p}`);
+  if (!token) throw new TokenFileError("empty", `token file empty: ${p}`);
   return token;
 }
 
 export function validateTokenShape(token: string): boolean {
   return TOKEN_RE.test(token);
+}
+
+export type TokenFileIssue = "missing" | "empty" | "unreadable" | "shape";
+
+/** Non-throwing pre-check: read + shape-validate the scope token file.
+ *  The tap handler (both transports) and the socket run handoff use this
+ *  to build their visible, executable errors — the reader copies the
+ *  next command, does not think (one doc out, executable errors). */
+export function checkScopeToken(
+  st: PatVaultState,
+  scope: string,
+):
+  | { ok: true; token: string }
+  | { ok: false; kind: TokenFileIssue; error: string } {
+  const p = tokenFileFor(st, scope);
+  let token: string;
+  try {
+    token = readScopeToken(st, scope);
+  } catch (e: any) {
+    if (e instanceof TokenFileError) {
+      return { ok: false, kind: e.code, error: e.message };
+    }
+    return {
+      ok: false,
+      kind: "unreadable",
+      error: `token file unreadable: ${p} (${String(e?.message ?? e)})`,
+    };
+  }
+  if (!validateTokenShape(token)) {
+    return { ok: false, kind: "shape", error: `token shape invalid: ${p}` };
+  }
+  return { ok: true, token };
 }
 
 function tokenKind(token: string): "classic" | "fine" {
@@ -548,6 +604,59 @@ function claimExpiredText(st: PatVaultState, req: PatRequest): string {
   )}s`;
 }
 
+/** Approve-tap followup for a dead scope token file: NON-ephemeral (the
+ *  channel sees it even if the tapper misses it), names scope + file
+ *  path + the exact next command. No state transition — the request
+ *  stays pending for a re-tap after the fix (M1: an error followup is
+ *  an outcome, not a rejection). */
+function tapTokenFileText(
+  st: PatVaultState,
+  req: PatRequest,
+  chk: { kind: TokenFileIssue; error: string },
+): string {
+  const p = tokenFileFor(st, req.scope);
+  const label: Record<TokenFileIssue, string> = {
+    missing: "token file missing",
+    empty: "token file empty",
+    unreadable: "token file unreadable",
+    shape: "token shape invalid",
+  };
+  const fix: Record<TokenFileIssue, string> = {
+    missing: "restore the file, then re-tap",
+    empty: "write the token (one line, 0600), then re-tap",
+    unreadable: `fix file perms (chmod 600 ${p}), then re-tap`,
+    shape: "fix the token (one line, 0600), then re-tap",
+  };
+  return [
+    `[!] approve blocked: ${label[chk.kind]} for ${req.scope}`,
+    `path: ${p}`,
+    `${fix[chk.kind]} — or re-request: ` +
+      `\`jarate pat-request ${req.scope} <reason>\``,
+  ].join("\n");
+}
+
+/** Run handoff error (socket mode): the one-doc error string carries
+ *  scope + file path + the exact next command — fix + re-run this id,
+ *  or re-request if the claim window has passed. */
+function runTokenFileError(
+  st: PatVaultState,
+  req: PatRequest,
+  chk: { kind: TokenFileIssue; error: string },
+): string {
+  const p = tokenFileFor(st, req.scope);
+  const fix: Record<TokenFileIssue, string> = {
+    missing: "restore the file, then re-run",
+    empty: "write the token (one line, 0600), then re-run",
+    unreadable: `fix file perms (chmod 600 ${p}), then re-run`,
+    shape: "fix the token (one line, 0600), then re-run",
+  };
+  return (
+    `scope: ${chk.error} — ${fix[chk.kind]}: ` +
+    `\`jarate pat-run ${req.id} -- <cmd>\`; if the claim window has ` +
+    `passed, re-request: \`jarate pat-request ${req.scope} <reason>\``
+  );
+}
+
 /** Edit the request's button message; components: [] kills the buttons. */
 async function editRequestMessage(
   st: PatVaultState,
@@ -724,21 +833,12 @@ export function patRunBegin(st: PatVaultState, line: any): PatRunBeginResult {
   }
 
   // socket mode: fresh-read the token at handoff (rotation-aware).
-  let token: string;
-  try {
-    token = readScopeToken(st, req.scope);
-  } catch {
-    audit(st, "handoff-error", base(req), {
-      err: `token file missing for ${req.scope}`,
-    });
-    return { ok: false, error: `scope: token file missing for ${req.scope}` };
+  const chk = checkScopeToken(st, req.scope);
+  if (!chk.ok) {
+    audit(st, "handoff-error", base(req), { err: chk.error });
+    return { ok: false, error: runTokenFileError(st, req, chk) };
   }
-  if (!validateTokenShape(token)) {
-    audit(st, "handoff-error", base(req), {
-      err: `token shape invalid for ${req.scope}`,
-    });
-    return { ok: false, error: `scope: token shape invalid for ${req.scope}` };
-  }
+  const token = chk.token;
   const kind = tokenKind(token);
   // Single use by construction: the state flip happens before the token
   // line is flushed — a second run on the same id gets `already used`.
@@ -1068,40 +1168,36 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       // 8. Transition (the only place state mutates).
       const now = st.now();
       if (verb === "approve") {
+        // Pre-check the scope token file (BOTH transports). A dead file
+        // is a visible outcome: a NON-ephemeral followup naming scope +
+        // path + the exact next command. No state transition — the
+        // request stays pending for a re-tap after the fix (M1: an
+        // error followup is an outcome, not a rejection). Socket mode
+        // still fresh-reads at handoff (rotation-aware); this gate only
+        // makes a dead file visible at tap time.
+        const chk = checkScopeToken(st, req.scope);
+        if (!chk.ok) {
+          audit(st, "vault-error", base(req), { user: uid, err: chk.error });
+          await sendInteractionFollowup(
+            st.botToken,
+            d,
+            tapTokenFileText(st, req, chk),
+          );
+          await deleteDeferredAck(st.botToken, d);
+          return;
+        }
         if (st.transport === "file") {
-          // File mode reads the token NOW (to publish). Missing file =
-          // error outcome: no transition — the request stays pending so
-          // the owner can re-tap after the file is restored (M1 named
-          // pre-check: specific message, not the generic vault error).
-          let token: string;
-          try {
-            token = readScopeToken(st, req.scope);
-            if (!validateTokenShape(token))
-              throw new Error(`token shape invalid for ${req.scope}`);
-          } catch {
-            audit(st, "vault-error", base(req), { err: "token file missing" });
-            await sendInteractionFollowup(
-              st.botToken,
-              d,
-              "[!] token file missing",
-              {
-                ephemeral: true,
-              },
-            );
-            await deleteDeferredAck(st.botToken, d);
-            return;
-          }
           // No run-time handoff in file mode: the censor window opens at
           // approve (N5) and drops at claimDeadline + grace.
-          st.secrets.register([token]);
-          publishTokenFile(st, req.id, token);
+          st.secrets.register([chk.token]);
+          publishTokenFile(st, req.id, chk.token);
           track(
             st,
             req.id,
             setTimeout(
               () => {
                 try {
-                  st.secrets.drop([token]);
+                  st.secrets.drop([chk.token]);
                 } catch {
                   // github pattern backstop
                 }

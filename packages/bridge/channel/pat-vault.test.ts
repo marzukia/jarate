@@ -30,6 +30,7 @@ import {
   patRequest,
   patRunBegin,
   patStatus,
+  readScopeToken,
   startPatVault,
   stopPatVault,
 } from "./pat-vault";
@@ -986,18 +987,27 @@ describe("robustness", () => {
     }
   });
 
-  test("file-mode approve with missing token file (M1): stays pending, specific message", async () => {
+  test("approve tap with missing token file (file transport): non-ephemeral followup, stays pending, re-tap works", async () => {
     const f = mkVault({ transport: "file" });
     try {
       const req = await makePending(f, "marzukia/jarate:write");
-      fs.unlinkSync(path.join(f.patsDir, "marzukia", "jarate:write"));
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.unlinkSync(p);
       await f.h.handlePatComponent(
         mkD("i-mf", `pat:approve:${req.id}`, { message_id: req.messageId }),
       );
       const fu = f.fd.followups();
       expect(fu.length).toBe(1);
-      expect(fu[0].body.content).toBe("[!] token file missing");
-      expect(fu[0].body.flags).toBe(64);
+      // Non-ephemeral: the channel sees it (no flags field).
+      expect(fu[0].body.flags).toBeUndefined();
+      const c = fu[0].body.content;
+      expect(c.split("\n")[0]).toBe(
+        "[!] approve blocked: token file missing for marzukia/jarate:write",
+      );
+      expect(c).toContain(`path: ${p}`);
+      expect(c).toContain(
+        "restore the file, then re-tap — or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
+      );
       // No transition, no publish, no censor registration.
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
       expect(f.st.requests.get(req.id)!.approvedAt).toBeUndefined();
@@ -1011,18 +1021,15 @@ describe("robustness", () => {
           .some(
             (l) =>
               l.includes("event=vault-error") &&
-              l.includes("err=token file missing"),
+              l.includes(`err=token file missing: ${p}`),
           ),
       ).toBe(true);
       expect(f.fd.ackDeletes()).toBe(1);
+      expect(f.fd.messageEdits().length).toBe(0);
       // Restore the file, re-tap within the TTL -> normal approve.
-      fs.writeFileSync(
-        path.join(f.patsDir, "marzukia", "jarate:write"),
-        `${FINE_TOKEN}\n`,
-        {
-          mode: 0o600,
-        },
-      );
+      fs.writeFileSync(p, `${FINE_TOKEN}\n`, {
+        mode: 0o600,
+      });
       await f.h.handlePatComponent(
         mkD("i-mf2", `pat:approve:${req.id}`, { message_id: req.messageId }),
       );
@@ -1030,6 +1037,112 @@ describe("robustness", () => {
       expect(fs.existsSync(path.join(fileDirOf(f), `pat-${req.id}`))).toBe(
         true,
       );
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("approve tap with missing token file (socket transport): non-ephemeral followup, stays pending", async () => {
+    const f = mkVault(); // socket is the default
+    try {
+      const req = await makePending(f, "marzukia/jarate:write");
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.unlinkSync(p);
+      await f.h.handlePatComponent(
+        mkD("i-ms", `pat:approve:${req.id}`, { message_id: req.messageId }),
+      );
+      const fu = f.fd.followups();
+      expect(fu.length).toBe(1);
+      expect(fu[0].body.flags).toBeUndefined();
+      const c = fu[0].body.content;
+      expect(c.split("\n")[0]).toBe(
+        "[!] approve blocked: token file missing for marzukia/jarate:write",
+      );
+      expect(c).toContain(`path: ${p}`);
+      expect(c).toContain(
+        "restore the file, then re-tap — or re-request: `jarate pat-request marzukia/jarate:write <reason>`",
+      );
+      // No transition; the request stays pending for a re-tap after the
+      // restore (the old bug: socket taps always succeeded, then the
+      // request just expired after the 60s claim window — fully silent).
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(f.st.requests.get(req.id)!.approvedAt).toBeUndefined();
+      expect(f.fd.messageEdits().length).toBe(0);
+      expect(f.fd.ackDeletes()).toBe(1);
+      expect(
+        f
+          .auditLines()
+          .some(
+            (l) =>
+              l.includes("event=vault-error") &&
+              l.includes(`err=token file missing: ${p}`),
+          ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("approve tap with empty token file: non-ephemeral followup names empty + path", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f, "marzukia/jarate:write");
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.writeFileSync(p, ""); // zero bytes
+      await f.h.handlePatComponent(
+        mkD("i-me", `pat:approve:${req.id}`, { message_id: req.messageId }),
+      );
+      const fu = f.fd.followups();
+      expect(fu.length).toBe(1);
+      expect(fu[0].body.flags).toBeUndefined();
+      const c = fu[0].body.content;
+      expect(c.split("\n")[0]).toBe(
+        "[!] approve blocked: token file empty for marzukia/jarate:write",
+      );
+      expect(c).toContain(`path: ${p}`);
+      expect(c).toContain("write the token (one line, 0600), then re-tap");
+      expect(c).toContain("jarate pat-request marzukia/jarate:write <reason>");
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(f.fd.ackDeletes()).toBe(1);
+      // Whitespace-only is empty too.
+      fs.writeFileSync(p, "  \n");
+      await f.h.handlePatComponent(
+        mkD("i-me2", `pat:approve:${req.id}`, { message_id: req.messageId }),
+      );
+      const fu2 = f.fd.followups();
+      expect(fu2.length).toBe(2);
+      expect(fu2[1].body.content.split("\n")[0]).toBe(
+        "[!] approve blocked: token file empty for marzukia/jarate:write",
+      );
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("approve tap with bad-shape token: non-ephemeral followup names shape + path", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f, "marzukia/jarate:write");
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.writeFileSync(p, "not-a-token\n");
+      await f.h.handlePatComponent(
+        mkD("i-mb", `pat:approve:${req.id}`, { message_id: req.messageId }),
+      );
+      const fu = f.fd.followups();
+      expect(fu.length).toBe(1);
+      expect(fu[0].body.flags).toBeUndefined();
+      const c = fu[0].body.content;
+      expect(c.split("\n")[0]).toBe(
+        "[!] approve blocked: token shape invalid for marzukia/jarate:write",
+      );
+      expect(c).toContain(`path: ${p}`);
+      expect(c).toContain("fix the token (one line, 0600), then re-tap");
+      expect(c).toContain("jarate pat-request marzukia/jarate:write <reason>");
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      // Nothing censored, nothing published.
+      expect(getRuntimeSecrets()).not.toContain("not-a-token");
+      expect(f.fd.ackDeletes()).toBe(1);
     } finally {
       f.cleanup();
     }
@@ -1775,14 +1888,52 @@ describe("patRunBegin / patStatus unit", () => {
     }
   });
 
-  test("socket-mode run with missing token file: handoff-error, state stays approved", async () => {
+  test("socket-mode run with missing token file: handoff-error carries path + exact commands", async () => {
     const f = mkVault();
     try {
       const req = await makePending(f, "marzukia/jarate:write");
       await f.h.handlePatComponent(
         mkD("i-hf", `pat:approve:${req.id}`, { message_id: req.messageId }),
       );
-      fs.unlinkSync(path.join(f.patsDir, "marzukia", "jarate:write"));
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.unlinkSync(p);
+      const r = patRunBegin(f.st, {
+        id: req.id,
+        agent: "monky",
+        cmd: ["true"],
+        timeout_s: 10,
+      });
+      expect(r.ok).toBe(false);
+      // Executable error: names the path + the exact next command.
+      expect(r.error).toBe(
+        `scope: token file missing: ${p} — restore the file, then re-run: ` +
+          `\`jarate pat-run ${req.id} -- <cmd>\`; if the claim window has ` +
+          `passed, re-request: \`jarate pat-request marzukia/jarate:write <reason>\``,
+      );
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+      expect(
+        f
+          .auditLines()
+          .some(
+            (l) =>
+              l.includes("event=handoff-error") &&
+              l.includes(`err=token file missing: ${p}`),
+          ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("socket-mode run with bad-shape token: handoff-error names shape + path", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f, "marzukia/jarate:write");
+      await f.h.handlePatComponent(
+        mkD("i-hs", `pat:approve:${req.id}`, { message_id: req.messageId }),
+      );
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.writeFileSync(p, "not-a-token\n"); // corrupted after approve
       const r = patRunBegin(f.st, {
         id: req.id,
         agent: "monky",
@@ -1791,12 +1942,32 @@ describe("patRunBegin / patStatus unit", () => {
       });
       expect(r.ok).toBe(false);
       expect(r.error).toBe(
-        "scope: token file missing for marzukia/jarate:write",
+        `scope: token shape invalid: ${p} — fix the token (one line, 0600), ` +
+          `then re-run: \`jarate pat-run ${req.id} -- <cmd>\`; if the claim ` +
+          `window has passed, re-request: \`jarate pat-request marzukia/jarate:write <reason>\``,
       );
       expect(f.st.requests.get(req.id)!.state).toBe("approved");
-      expect(
-        f.auditLines().some((l) => l.includes("event=handoff-error")),
-      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("readScopeToken distinguishes missing vs empty with the path", () => {
+    const f = mkVault();
+    try {
+      const p = path.join(f.patsDir, "marzukia", "jarate:write");
+      fs.unlinkSync(p);
+      expect(() => readScopeToken(f.st, "marzukia/jarate:write")).toThrow(
+        new RegExp(`token file missing: ${p}`),
+      );
+      fs.writeFileSync(p, "");
+      expect(() => readScopeToken(f.st, "marzukia/jarate:write")).toThrow(
+        new RegExp(`token file empty: ${p}`),
+      );
+      fs.writeFileSync(p, `${FINE_TOKEN}\n`);
+      expect(readScopeToken(f.st, "marzukia/jarate:write")).toBe(FINE_TOKEN);
+      // default scope resolves to defaultPatFile
+      expect(readScopeToken(f.st, "default")).toBe(CLASSIC_TOKEN);
     } finally {
       f.cleanup();
     }
