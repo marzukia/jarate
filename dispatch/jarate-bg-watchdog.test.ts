@@ -566,8 +566,9 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
  * $PI_BG_WT_DIR, so the worktree sweep never saw them: 2026-09-25 four
  * SIGKILLed cwd workers kept state=running records + stale heartbeats and
  * the watchdog found "0 dead, 0 stalled". DEAD (cwd) = record
- * state=running AND ticket cgroup dir exists and is empty (no processes -
- * "stale" means no processes) AND heartbeat stale > STALL_MIN min.
+ * state=running AND ticket cgroup empty (no processes - "stale" means
+ * no processes) OR cgroup dir already reaped/absent (#116) AND
+ * heartbeat stale > STALL_MIN min.
  * On DEAD: dead webhook (same payload as the worktree sweep), dead log,
  * cgroup reaped via the guarded cgroup.kill, record marked state=killed.
  */
@@ -673,22 +674,24 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
     }
   }, 30_000);
 
-  test("controls: fresh hb / live cgroup / done record / missing cgroup -> not flagged", async () => {
+  test("controls: fresh hb / live cgroup / done record / no hb -> not flagged; reaped dir -> flagged (#116)", async () => {
     const f = fixture();
     try {
       bless(f);
       const t1 = plant(f, 2, { hbAgeMin: 1 }); // fresh hb -> healthy
       const t2 = plant(f, 3, { hbAgeMin: 15, cg: "live" }); // live member
       const t3 = plant(f, 4, { state: "done", hbAgeMin: 15 }); // completed
-      const t4 = plant(f, 5, { hbAgeMin: 15, cg: "missing" }); // no escape dir
+      const t4 = plant(f, 5, { hbAgeMin: 15, cg: "missing" }); // reaped dir -> DEAD (#116)
       const t5 = plant(f, 6, { hbAgeMin: 15 }); // control: genuinely DEAD
+      const t6 = plant(f, 7, { cg: "missing" }); // reaped dir, no hb -> not judgeable
       const r = await f.run();
       expect(r.code).toBe(0);
       expect(r.out).toContain(`DEAD cwd/${t5}`);
-      for (const t of [t1, t2, t3, t4]) {
+      expect(r.out).toContain(`DEAD cwd/${t4}`); // #116: missing dir is a reap
+      for (const t of [t1, t2, t3, t6]) {
         expect(r.out).not.toContain(`DEAD cwd/${t}`);
       }
-      expect(f.posts).toHaveLength(1);
+      expect(f.posts).toHaveLength(2);
       expect(JSON.parse(fs.readFileSync(recFile(f, t1), "utf8")).state).toBe(
         "running",
       );
@@ -699,10 +702,13 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
         "done",
       );
       expect(JSON.parse(fs.readFileSync(recFile(f, t4), "utf8")).state).toBe(
-        "running",
+        "killed",
       );
       expect(JSON.parse(fs.readFileSync(recFile(f, t5), "utf8")).state).toBe(
         "killed",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t6), "utf8")).state).toBe(
+        "running",
       );
       // live cgroup dir survives (sweep + reaper both skip members)
       expect(fs.existsSync(cgDir(f, t2))).toBe(true);
@@ -751,6 +757,152 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       // age prune - the point here is exactly ONE flag, no double post
       expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
         "running",
+      );
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+});
+
+/**
+ * #116: cwd-sweep vs cgroup-reaper race. A SIGKILLed long cwd run leaves an
+ * EMPTY cgroup dir while the heartbeat is still fresh (< STALL_MIN). A
+ * sweep landing in that window skips the ticket (hb fresh) and its
+ * reaper rmdirs the empty aged dir. Pre-fix, the NEXT sweep saw no cgroup
+ * dir (`[ -d "$cg" ] || continue`) and never flagged DEAD: the record sat
+ * state=running until the 7-day prune, no webhook, no dead log, no wake
+ * (~2/3 of qualifying deaths with the 15-min timer). Post-fix the missing
+ * dir is a reap, not a fresh-start signal: DEAD still fires.
+ */
+describe("watchdog #116: cwd-sweep vs cgroup-reaper race", () => {
+  const TID = (n: number) => `20991231-235956-${500 + n}`;
+  const recFile = (f: { home: string }, t: string) =>
+    path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`);
+  const cgDir = (f: { tmp: string }, t: string) =>
+    path.join(f.tmp, "cg", "pi-bg", t);
+  const hbFile = (f: { art: string }, t: string) =>
+    path.join(f.art, `pi-bg-${t}-hb`);
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  reaper-race test\n`,
+    );
+
+  /** Plant a cwd ticket: running record + aged empty cgroup + aged hb. */
+  const plant = (
+    f: { home: string; tmp: string; art: string },
+    t: string,
+    hbAgeMin: number,
+  ) => {
+    const recDir = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${t}.json`),
+      JSON.stringify(
+        {
+          run: t,
+          profile: "worker",
+          project: null,
+          cwd: path.join(f.tmp, "workdir"),
+          started: "2026-09-25T10:00:00Z",
+          delivery: "webhook",
+          state: "running",
+        },
+        null,
+        2,
+      ),
+    );
+    fs.mkdirSync(cgDir(f, t), { recursive: true });
+    const old = new Date(Date.now() - 10 * 60 * 1000); // > REAPER_MIN_AGE 300s
+    fs.utimesSync(cgDir(f, t), old, old);
+    fs.writeFileSync(hbFile(f, t), "");
+    const hbOld = new Date(Date.now() - hbAgeMin * 60 * 1000);
+    fs.utimesSync(hbFile(f, t), hbOld, hbOld);
+  };
+
+  test("reaper eats the dir in the fresh-hb window; next sweep still posts DEAD, kills record", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(1);
+      // pass 1: died 1 min ago -> hb fresh (DEAD window closed), cgroup dir
+      // empty + aged (reaper window open). This is the race pass.
+      plant(f, t, 1);
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).not.toContain(`DEAD cwd/${t}`); // hb fresh: not yet
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(cgDir(f, t))).toBe(false); // reaper ate the dir
+      // pre-#116, the sweep's evidence was gone here and the record sat
+      // state=running until the 7-day prune with no alert ever
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "running",
+      );
+      // pass 2: heartbeat crosses the STALL_MIN line -> DEAD fires
+      // despite the missing cgroup dir
+      const stale = new Date(Date.now() - 15 * 60 * 1000);
+      fs.utimesSync(hbFile(f, t), stale, stale);
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`DEAD cwd/${t}`);
+      expect(r2.out).toContain(
+        "cgroup reaped (dir gone), heartbeat stale > 10 min (issue #116)",
+      );
+      expect(r2.out).toContain("1 cwd ticket(s) flagged");
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe("DEAD \u00b7 watchdog sweep");
+      for (const line of codeLines(em)) {
+        expect(line.length).toBeLessThanOrEqual(40);
+      }
+      // record marked killed (stops lying "running")
+      const rec = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
+      expect(rec.state).toBe("killed");
+      expect(rec.finished).toBeDefined();
+      // dead log line (dedupe key for the next sweep)
+      const deadlog = path.join(f.home, ".pi-bg-deadlog");
+      expect(fs.readFileSync(deadlog, "utf8")).toContain(` ${t} cwd `);
+      // pass 3: deduped, no re-post
+      const r3 = await f.run();
+      expect(r3.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(r3.out).not.toContain(`DEAD cwd/${t}`);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("control: fresh-hb window WITHOUT a reaped dir stays not-DEAD (no over-flag)", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(2);
+      // same shape as the race pass 1, but the cgroup dir is YOUNG (<
+      // REAPER_MIN_AGE): the reaper's #101 guard skips it, the sweep
+      // skips it (fresh hb) -> no flag, dir kept
+      plant(f, t, 1);
+      fs.rmSync(cgDir(f, t), { recursive: true });
+      fs.mkdirSync(cgDir(f, t)); // fresh mtime = now
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).not.toContain(`DEAD cwd/${t}`);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        "skipped 1 young cgroup dir(s) (age < 300s, issue #101)",
+      );
+      // then kill it: stale hb + live member is impossible after death,
+      // so just age the dir too -> reaped -> DEAD on the next sweep
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      fs.utimesSync(cgDir(f, t), old, old);
+      const r1b = await f.run();
+      expect(r1b.out).toContain(`reaped empty cgroup ${cgDir(f, t)}`);
+      expect(fs.existsSync(cgDir(f, t))).toBe(false);
+      const stale = new Date(Date.now() - 15 * 60 * 1000);
+      fs.utimesSync(hbFile(f, t), stale, stale);
+      const r2 = await f.run();
+      expect(r2.out).toContain(`DEAD cwd/${t}`);
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "killed",
       );
     } finally {
       f.close();
