@@ -46,6 +46,23 @@ function run(
 // ─── parseJobsFromPs (moved from index.test.ts) ──────────────────────────
 
 describe("parseJobsFromPs (/jobs)", () => {
+  test("parses jarate-bg wrapper lines (#151 rename) + still parses pi-bg (shim era)", () => {
+    const ps = [
+      "4194003 00:11 /usr/bin/bash /home/monky/scripts/jarate-bg worker post-rename dispatch",
+      "4194004 00:12 /usr/bin/bash /home/monky/scripts/pi-bg worker shim-era dispatch",
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps)).toEqual([
+      {
+        id: null,
+        age: "00:11",
+        profile: "worker",
+        task: "post-rename dispatch",
+      },
+      { id: null, age: "00:12", profile: "worker", task: "shim-era dispatch" },
+    ]);
+  });
+
   test("parses wrapper lines: pid, age, profile, task; dead pid => id null", () => {
     const ps = [
       "4194001 00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
