@@ -733,6 +733,25 @@ describe("extension handlers (A1/A2/A4)", () => {
   let msgN = 0;
   const realFetch = globalThis.fetch;
 
+  // Bounded clock-time flush for the fire-and-forget re-wake kick
+  // (cancel branch, index.ts): the kick's send chain needs real
+  // event-loop turns that competing macrotasks steal under load, so a
+  // fixed setImmediate-hop budget flakes (MEDIUM-1, review 3005244).
+  // All real clocks are faked under jest.useFakeTimers (Date/performance/
+  // hrtime move with advanceTimersByTime), so the budget is virtual
+  // clock time: 25ms steps (settle-tick cadence) interleaved with a real
+  // loop turn. Exits as soon as cond() holds or 20s of clock elapses.
+  // (20s = 800 ticks: instrumented kick chains need 1-6 ticks normally,
+  // up to 147 under 20-process load — the send chain's real localhost
+  // fetches stretch across many loop turns when the CPU is contended.)
+  // Only call under fake timers.
+  const flushUntil = async (cond: () => boolean, budgetMs = 20000) => {
+    for (let used = 0; used < budgetMs && !cond(); used += 25) {
+      jest.advanceTimersByTime(25);
+      await new Promise<void>((r) => setImmediate(r));
+    }
+  };
+
   const inbound = (body: string, id: string): ChannelMessage => ({
     channelId: "ch1",
     channelName: "Test",
@@ -2062,15 +2081,21 @@ describe("extension handlers (A1/A2/A4)", () => {
       ctx.abort = () => {
         abortCount += 1;
       }; // does not settle immediately
+      // Relative zero-asserts (MEDIUM-1, review 3005244): a late
+      // send/abort leaked from a prior test lands in this test's shared
+      // `sent` binding / abortCount — only GROWTH during this test's
+      // window counts.
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
       await handleInbound(pi, inbound("first", "m1"), ctx);
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      expect(abortCount).toBe(1);
+      expect(abortCount).toBe(baseAborts + 1);
       // /stop during the settle window: drops m1 AND consumes the flag
       await handleInbound(pi, inbound("/stop", "m2"), ctx);
       jest.advanceTimersByTime(25);
       await Promise.resolve();
-      expect(sent.length).toBe(0);
+      expect(sent.length).toBe(baseSends);
       // Run still active; m3 is queued and armed. While m1's cancel poll
       // still holds the in-flight flag (it waits for the settle so its
       // re-wake kick cannot race the agent_end window, #124), m3's
@@ -2083,12 +2108,12 @@ describe("extension handlers (A1/A2/A4)", () => {
       idle = true;
       jest.advanceTimersByTime(25);
       await Promise.resolve();
-      for (let i = 0; i < 25 && sent.length === 0; i++) {
-        await new Promise<void>((r) => setImmediate(r));
-      }
-      expect(sent.length).toBe(1);
-      expect(sent[0].m.details.messageId).toBe("m3");
-      expect(abortCount).toBe(2); // m1's abort + /stop's abort; m3 no-abort
+      await flushUntil(() =>
+        sent.some((s) => s.m?.details?.messageId === "m3"),
+      );
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent.some((s) => s.m?.details?.messageId === "m3")).toBe(true);
+      expect(abortCount).toBe(baseAborts + 2); // m1's abort + /stop's abort
       // m3's armed interrupt (4x delay while the flag was held) later
       // finds pi idle and the queue empty: no double send, no spurious
       // abort.
@@ -2096,8 +2121,8 @@ describe("extension handlers (A1/A2/A4)", () => {
       await Promise.resolve();
       for (let i = 0; i < 10; i++)
         await new Promise<void>((r) => setImmediate(r));
-      expect(sent.length).toBe(1);
-      expect(abortCount).toBe(2);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(abortCount).toBe(baseAborts + 2);
     });
 
     test("/status shows the armed interrupt state", async () => {
@@ -2331,14 +2356,19 @@ describe("extension handlers (A1/A2/A4)", () => {
     test("/stop in the deferral window re-wakes the cross-channel queued entry (cancel-branch kick)", async () => {
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       expect(idle).toBe(false);
+      // Relative zero-asserts (MEDIUM-1, review 3005244): a late send
+      // from a prior test can land in this test's shared `sent` binding
+      // — only GROWTH during this test's window counts.
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
       // 1. m1 (ch1) arrives mid-run: queued, interrupt armed.
       await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
       // 2. m1's interrupt fires: abort in flight, settle polling — the
       //    run is still active, so no send yet.
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      expect(abortCount).toBe(1);
-      expect(sent.length).toBe(0);
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends);
       // 3. m2 (ch2) arrives mid-settle: queued in a DIFFERENT channel —
       //    the entry the deferred agent_end should re-wake.
       await handleInbound(pi, inboundCh("m2 body", "m2", "ch2"), ctx);
@@ -2347,7 +2377,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       //    flight: the re-wake DEFERS — m2 stays queued, no run starts,
       //    no send.
       await handlers.agent_end({ messages: [] }, ctx);
-      expect(sent.length).toBe(0);
+      expect(sent.length).toBe(baseSends);
       expect(midTurnQueues.get("ch2")?.length).toBe(1);
       // 5. The run settles and /stop on ch1 wins the race: the interrupt
       //    send is dropped at the next settle tick. /stop clears only
@@ -2357,38 +2387,43 @@ describe("extension handlers (A1/A2/A4)", () => {
       await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
       jest.advanceTimersByTime(25);
       await Promise.resolve();
-      expect(sent.length).toBe(0); // m1's send never happened
+      expect(sent.length).toBe(baseSends); // m1's send never happened
       expect(midTurnQueues.has("ch1")).toBe(false);
-      // The cancel branch's re-wake kick runs handleInbound for m2; that
-      // chain awaits memoryToc's fs read before sending — under fake
-      // timers the read completes on an event-loop turn (setImmediate),
-      // not a microtask flush.
-      for (let i = 0; i < 25 && sent.length === 0; i++) {
-        await new Promise<void>((r) => setImmediate(r));
-      }
+      // The cancel branch's re-wake kick runs handleInbound for m2
+      // fire-and-forget: wait for it on the bounded clock-time budget
+      // (flushUntil), not a fixed hop count.
+      await flushUntil(() =>
+        sent.some((s) => s.m?.details?.messageId === "m2"),
+      );
       // 6. m2 was re-woken by the cancel branch: no orphaned entry with a
       //    stale [queued] ack (fails without the kick).
       expect(sent.some((s) => s.m?.details?.messageId === "m2")).toBe(true);
       expect(midTurnQueues.has("ch2")).toBe(false);
+      expect(sent.length).toBe(baseSends + 1);
       // m2's own armed interrupt now finds pi idle and the queue empty:
       // no double send, no spurious abort.
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      expect(sent.length).toBe(1);
-      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(abortCount).toBe(baseAborts + 1);
     });
 
     test("/stop INSIDE the agent_end handler window re-wakes the cross-channel entry exactly once (#124)", async () => {
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       expect(idle).toBe(false);
+      // Relative zero-asserts (MEDIUM-1, review 3005244): a late send
+      // from a prior test can land in this test's shared `sent` binding
+      // — only GROWTH during this test's window counts.
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
       // 1. m1 (ch1) arrives mid-run: queued, interrupt armed.
       await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
       // 2. m1's interrupt fires: abort in flight, settle polling — the
       //    run is still active, so no send yet.
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      expect(abortCount).toBe(1);
-      expect(sent.length).toBe(0);
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends);
       // 3. m2 (ch2) arrives mid-settle: queued in a DIFFERENT channel —
       //    the entry the deferred agent_end should re-wake.
       await handleInbound(pi, inboundCh("m2 body", "m2", "ch2"), ctx);
@@ -2447,10 +2482,10 @@ describe("extension handlers (A1/A2/A4)", () => {
         //    check skips the kick here and orphans m2 — #124). /stop also
         //    re-aborts: from its view the run is still active.
         await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
-        expect(abortCount).toBe(2);
+        expect(abortCount).toBe(baseAborts + 2);
         jest.advanceTimersByTime(25);
         await Promise.resolve();
-        expect(sent.length).toBe(0); // m1's send never happened
+        expect(sent.length).toBe(baseSends); // m1's send never happened
         expect(midTurnQueues.has("ch1")).toBe(false);
         expect(midTurnQueues.get("ch2")?.length).toBe(1); // still queued
         // 6. The handler finishes; pi clears the run flag.
@@ -2458,23 +2493,25 @@ describe("extension handlers (A1/A2/A4)", () => {
         await ae;
         idle = true;
         // 7. The cancel-branch kick must fire on the next settle tick —
-        //    exactly once for m2 (the atomic pop is the dedupe).
-        jest.advanceTimersByTime(25);
-        for (let i = 0; i < 25 && sent.length === 0; i++) {
-          await new Promise<void>((r) => setImmediate(r));
-        }
+        //    exactly once for m2 (the atomic pop is the dedupe). The
+        //    kick is fire-and-forget: wait for m2 on the bounded
+        //    clock-time budget (flushUntil), not a fixed hop count
+        //    (MEDIUM-1, review 3005244).
+        await flushUntil(() =>
+          sent.some((s) => s.m?.details?.messageId === "m2"),
+        );
         const m2Sends = sent.filter((s) => s.m?.details?.messageId === "m2");
         expect(m2Sends.length).toBe(1);
         expect(midTurnQueues.has("ch2")).toBe(false);
-        expect(sent.length).toBe(1); // m2 is the only send, ever
+        expect(sent.length).toBe(baseSends + 1); // m2 is the only send
         // 8. No double-wake: m2's own armed interrupt fires into an idle
         //    session with an empty queue — no second send, no abort.
         jest.advanceTimersByTime(interruptStepTimeoutMs());
         await Promise.resolve();
         for (let i = 0; i < 10; i++)
           await new Promise<void>((r) => setImmediate(r));
-        expect(sent.length).toBe(1);
-        expect(abortCount).toBe(2);
+        expect(sent.length).toBe(baseSends + 1);
+        expect(abortCount).toBe(baseAborts + 2);
       } finally {
         console.log = realLog;
         globalThis.fetch = prevFetch;
@@ -2484,26 +2521,33 @@ describe("extension handlers (A1/A2/A4)", () => {
     test("/stop in the settle window with nothing queued: no wake (cancel-branch kick finds an empty queue)", async () => {
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       expect(idle).toBe(false);
+      // Relative zero-asserts (MEDIUM-1, review 3005244): a late send
+      // from the prior test's fire-and-forget kick can land in this
+      // test's shared `sent` binding after its `sent = []` reset (the
+      // leak is documented in the outer afterEach comment) and fail an
+      // absolute 0. Only GROWTH during this test's own window counts.
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
       // m1 (ch1) arrives mid-run: queued, interrupt armed. No other
       // channel's entry exists — the only line is m1's.
       await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       await Promise.resolve();
-      expect(abortCount).toBe(1);
-      expect(sent.length).toBe(0);
+      expect(abortCount).toBe(baseAborts + 1); // m1's interrupt aborted
+      expect(sent.length).toBe(baseSends); // settling: no send yet
       // /stop while the settle wait is pending; the run settles on the
       // next tick. The cancel branch's kick must find an empty queue.
       await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
       idle = true;
       jest.advanceTimersByTime(25);
       await Promise.resolve();
-      expect(sent.length).toBe(0); // m1 dropped, nothing else: no wake
+      expect(sent.length).toBe(baseSends); // m1 dropped, nothing else: no wake
       expect(midTurnQueues.has("ch1")).toBe(false);
       // More settle ticks: still nothing to wake, no stray send.
       jest.advanceTimersByTime(interruptStepTimeoutMs());
       for (let i = 0; i < 10; i++)
         await new Promise<void>((r) => setImmediate(r));
-      expect(sent.length).toBe(0);
+      expect(sent.length).toBe(baseSends);
     });
   });
 
