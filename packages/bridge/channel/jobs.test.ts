@@ -655,7 +655,9 @@ describe("pi-bg-tail", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(TAIL, [], env(home));
     expect(r.code).toBe(2);
-    expect(r.err).toContain("usage: pi-bg-tail");
+    // #151: TAIL is now the pi-bg-tail deprecation shim; the usage line
+    // comes from jarate-bg-tail (the deprecation line rides along in err).
+    expect(r.err).toContain("usage: jarate-bg-tail");
   });
 
   test("-f follows: emits current content, stays alive until killed", async () => {
@@ -807,7 +809,9 @@ describe("pi-bg-kill", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(KILL, [], env());
     expect(r.code).toBe(2);
-    expect(r.err).toContain("usage: pi-bg-kill");
+    // #151: KILL is now the pi-bg-kill deprecation shim; the usage line
+    // comes from jarate-bg-kill (the deprecation line rides along in err).
+    expect(r.err).toContain("usage: jarate-bg-kill");
   });
 });
 
