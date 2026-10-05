@@ -1,10 +1,13 @@
 /**
- * dispatch/jarate-wait — rc contract + issue #120 (bot token off curl's argv).
+ * dispatch/jarate-wait — rc contract (#117) + issue #120 (token off argv).
  *
  * Runs the real bash script against a fake HOME (settings.json bot token +
  * channel, webhook_author) with a stub curl that records every call's argv
- * AND stdin. Since #120 the token rides a curl config on stdin (`curl -K -`),
- * never argv; every curl carries --max-time 15.
+ * AND stdin and can be told to fail (CURL_FAIL_ME / CURL_FAIL_MSGS).
+ * Since #120 the token rides a curl config on stdin (`curl -K -`), never
+ * argv; every curl carries --max-time 15 --connect-timeout 5. #117: curl
+ * failures must not end the wait with an arbitrary rc — the contract
+ * (0 = callback, 2 = human, 3 = timeout) holds.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -32,7 +35,10 @@ interface Fixture {
   msgsFile: string;
   env: Record<string, string>;
   setMsgs: (json: string) => void;
-  run: (args: string[]) => Promise<{ code: number; out: string; err: string }>;
+  run: (
+    args: string[],
+    overrides?: Record<string, string>,
+  ) => Promise<{ code: number; out: string; err: string }>;
 }
 
 function fixture(): Fixture {
@@ -56,9 +62,13 @@ function fixture(): Fixture {
     `${WA_ID}\n`,
   );
   fs.writeFileSync(msgsFile, "[]\n");
+  const msgsCount = path.join(tmp, "curl-msgs-count");
+  fs.writeFileSync(msgsCount, "0\n");
 
   // stub curl: appends each call's argv (one per line) + stdin to the
   // captures; answers /users/@me with the bot id, messages with the file.
+  // Failure injection (issue #117): CURL_FAIL_ME makes every /users/@me
+  // call exit 7; CURL_FAIL_MSGS=<n> makes the first n messages polls exit 7.
   const curl = path.join(bin, "curl");
   fs.writeFileSync(
     curl,
@@ -71,8 +81,19 @@ cat >> "$CURL_STDIN_CAPTURE"
 last=""
 for a in "$@"; do last="$a"; done
 case "$last" in
-  *"/users/@me"*) printf '{"id":"%s"}\\n' "${BOT_ID}" ;;
-  *) cat "$CURL_MSGS" 2>/dev/null || true ;;
+  *"/users/@me"*)
+    if [ -n "\${CURL_FAIL_ME:-}" ]; then exit 7; fi
+    printf '{"id":"%s"}\\n' "${BOT_ID}"
+    ;;
+  *)
+    if [ -n "\${CURL_FAIL_MSGS:-}" ]; then
+      n=$(cat "$CURL_MSGS_COUNT" 2>/dev/null || printf 0)
+      n=$((n + 1))
+      printf '%s\\n' "$n" > "$CURL_MSGS_COUNT"
+      if [ "$n" -le "$CURL_FAIL_MSGS" ]; then exit 7; fi
+    fi
+    cat "$CURL_MSGS" 2>/dev/null || true
+    ;;
 esac
 `,
   );
@@ -84,12 +105,14 @@ esac
   env.CURL_CAPTURE = capture;
   env.CURL_STDIN_CAPTURE = stdinCapture;
   env.CURL_MSGS = msgsFile;
+  env.CURL_MSGS_COUNT = msgsCount;
 
   const run = async (
     args: string[],
+    overrides?: Record<string, string>,
   ): Promise<{ code: number; out: string; err: string }> => {
     const p = spawn(["bash", PI_WAIT, ...args], {
-      env,
+      env: { ...env, ...overrides },
       cwd: tmp,
       stdout: "pipe",
       stderr: "pipe",
@@ -232,9 +255,10 @@ describe("jarate-wait #120: token off curl's argv", () => {
     for (const call of argvCalls) {
       expect(call).not.toContain(TOKEN);
       expect(call).not.toContain("Authorization");
-      // bounded call + config-on-stdin form
+      // bounded call + config-on-stdin form (#117: connect bounded too)
       expect(call).toContain("--max-time");
       expect(call).toContain("15");
+      expect(call).toContain("--connect-timeout");
       expect(call).toContain("-K");
     }
     // the header actually reached curl on stdin
@@ -253,5 +277,50 @@ describe("jarate-wait #120: token off curl's argv", () => {
     expect(msgCall).toContain(
       `https://discord.com/api/v10/channels/${CHANNEL}/messages?after=42&limit=50`,
     );
+  });
+});
+
+describe("jarate-wait #117: rc contract holds when curl fails", () => {
+  test("every poll fails -> rc 3 timeout (not curl's rc 7/28)", async () => {
+    const f = fixture();
+    const r = await f.run(
+      ["--since", "100", "--timeout", "2", "--check", "1"],
+      { CURL_FAIL_MSGS: "99" },
+    );
+    expect(r.code).toBe(3);
+    expect(r.out).toContain("timeout");
+  });
+
+  test("transient poll failures then callback -> rc 0 (loop survives)", async () => {
+    const f = fixture();
+    f.setMsgs(
+      JSON.stringify([
+        {
+          id: "m-cb",
+          webhook_id: "wh",
+          author: { id: WA_ID },
+          content: "late cb",
+        },
+      ]),
+    );
+    // first two polls exit 7; the third must find the callback
+    const r = await f.run(
+      ["--since", "100", "--timeout", "20", "--check", "1"],
+      { CURL_FAIL_MSGS: "2" },
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("CALLBACK m-cb");
+    expect(r.out).toContain("late cb");
+  });
+
+  test("startup bot-id fetch keeps failing -> rc 3 + stderr diagnostic", async () => {
+    const f = fixture();
+    const r = await f.run(
+      ["--since", "100", "--timeout", "30", "--check", "1"],
+      { CURL_FAIL_ME: "1" },
+    );
+    expect(r.code).toBe(3);
+    expect(r.out).toContain("timeout");
+    expect(r.err).toContain("cannot fetch bot id");
   });
 });
