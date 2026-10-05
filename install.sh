@@ -70,6 +70,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Canonicalize once (PR #155 review LOW-1): the 3a ownership check compares
+# readlink -f(resolved) against $JARATE_DIR, so a symlinked --jarate-dir
+# must be resolved here or every tool reports "stale symlink". GNU readlink
+# -f tolerates a non-existent leaf (the clone case below).
+JARATE_DIR="$(readlink -f "$JARATE_DIR")"
+
 run() {
   if [ "$DRY" = 1 ]; then
     echo "[dry-run] $*"
