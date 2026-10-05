@@ -21,6 +21,8 @@ interface Fixture {
   tmp: string;
   home: string;
   bin: string;
+  getentPasswd: string;
+  getentWheel: string;
   env: Record<string, string>;
   run: (
     args: string[],
@@ -91,6 +93,40 @@ function fixture(): Fixture {
     ].join("\n"),
   );
   fs.chmodSync(rg, 0o755);
+
+  // stub getent: canned passwd + group for the hop-target derivation
+  // (issue #147) — hermetic on every machine. Base = ONE candidate
+  // ("operator", uid 1000, bash, in wheel); "svc" (uid 1001, nologin)
+  // must never be a candidate. The 0/2-candidate tests rewrite the two
+  // files before running.
+  const getentPasswd = path.join(tmp, "getent.passwd");
+  const getentWheel = path.join(tmp, "getent.wheel");
+  fs.writeFileSync(
+    getentPasswd,
+    [
+      "root:x:0:0:root:/root:/usr/sbin/nologin",
+      "operator:x:1000:1000:Operator:/home/operator:/bin/bash",
+      "svc:x:1001:1001:svc account:/home/svc:/usr/sbin/nologin",
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(getentWheel, "wheel:x:10:operator\n");
+  const ge = path.join(bin, "getent");
+  fs.writeFileSync(
+    ge,
+    `#!/bin/sh
+if [ \${1:-} = "group" ] && [ \${2:-} = "wheel" ]; then
+  if [ -f "${getentWheel}" ]; then cat "${getentWheel}"; else exit 2; fi
+elif [ \${1:-} = "group" ]; then
+  exit 2
+elif [ \${1:-} = "passwd" ]; then
+  if [ -z \${2:-} ]; then cat "${getentPasswd}"; else exit 2; fi
+else
+  exit 2
+fi
+`,
+  );
+  fs.chmodSync(ge, 0o755);
 
   // stub pi-token-cost.py (python3 -r JSON)
   const ptc = path.join(home, "scripts", "pi-token-cost.py");
@@ -208,7 +244,7 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
     return { code, out, err };
   };
 
-  return { tmp, home, bin, env, run };
+  return { tmp, home, bin, env, run, getentPasswd, getentWheel };
 }
 
 const doc = (r: RunResult) => JSON.parse(r.out);
@@ -2049,7 +2085,7 @@ describe("projects-backfill", () => {
 // ─── issue #121: cross-user password off argv ───────────────────────────
 // The password used to sit in argv twice per hop: local `sshpass -p '<pw>'`
 // AND remote `echo '<pw>' | sudo -S` (both ps-visible, unquoted). Now:
-// sshpass -e (SSH_PASS in env), the password rides ssh stdin exactly once
+// sshpass -e (SSHPASS in env), the password rides ssh stdin exactly once
 // (here-string, no argv), the remote shell drops it in a 0600 temp file and
 // feeds `sudo -S < file`. hopStubs records every hop stage so the tests
 // can assert where the secret does and does not appear.
@@ -2074,7 +2110,7 @@ describe("cross-user hop #121: password off argv", () => {
 {
   printf -- '--sshpass-argv--\\n'
   for a in "$@"; do printf '%s\\n' "$a"; done
-  printf 'SSH_PASS=%s\\n' "\${SSH_PASS:-}"
+  printf 'SSHPASS=%s\\n' "\${SSHPASS:-}"
 } >> "$HOP_REC"
 exec ssh "$@"
 `,
@@ -2123,7 +2159,7 @@ exit 1
   const readRec = (f: Fixture, r: HopRec): HopRec => {
     const recFile = path.join(f.tmp, "hop-rec.txt");
     const raw = fs.readFileSync(recFile, "utf8");
-    // the file is: --sshpass-argv-- <argv lines> SSH_PASS=<pw>
+    // the file is: --sshpass-argv-- <argv lines> SSHPASS=<pw>
     //               --ssh-argv-- <argv lines>
     // (ssh stdin goes to <recFile>.stdin; the fake sudo's password to
     // sudo-pw.txt)
@@ -2132,8 +2168,8 @@ exit 1
       .trim()
       .split("\n")
       .filter(Boolean);
-    r.sshPassEnv = passLines.find((l) => l.startsWith("SSH_PASS=")) ?? null;
-    r.sshpassArgs = passLines.filter((l) => !l.startsWith("SSH_PASS="));
+    r.sshPassEnv = passLines.find((l) => l.startsWith("SSHPASS=")) ?? null;
+    r.sshpassArgs = passLines.filter((l) => !l.startsWith("SSHPASS="));
     r.sshArgs = (sshPart ?? "").trim().split("\n").filter(Boolean);
     // the remote command is the LAST ssh arg
     r.sshStdin = fs.readFileSync(`${recFile}.stdin`, "utf8").trim();
@@ -2175,10 +2211,10 @@ exit 1
     expect(peer.count).toBe(2);
     expect(peer.warnings).toContain("W1 first warn");
     const rec = readRec(f, r0);
-    // local stage: sshpass -e, password in SSH_PASS env, NOT in argv
+    // local stage: sshpass -e, password in SSHPASS env, NOT in argv
     expect(rec.sshpassArgs).toContain("-e");
     expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
-    expect(rec.sshPassEnv).toBe(`SSH_PASS=${PASS}`);
+    expect(rec.sshPassEnv).toBe(`SSHPASS=${PASS}`);
     // remote command string: no password, no `echo '<pw>'`; new shape
     const remote = rec.sshArgs[rec.sshArgs.length - 1];
     expect(remote).not.toContain(PASS);
@@ -2349,6 +2385,102 @@ describe("#148 --flag=value (one flag grammar)", () => {
     const r2 = await f.run(["ctx-report", "--bogus=1"]);
     expect(r2.code).toBe(2);
     expect(doc(r2).error).toContain("unknown arg: --bogus=1");
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+});
+
+// ─── issue #147: hop target derived, not configured ───────────────────────
+// The sshpass/sudo hop target is DERIVED (unique local user with uid > 900,
+// a home, a login shell, sudo-group membership) unless JARATE_SSH_HOST
+// overrides it. The fixture getent stub (see fixture()) makes the
+// derivation hermetic: base = one candidate "operator" (uid 1000, bash,
+// wheel), "svc" (uid 1001, nologin) is never a candidate.
+describe("#147 hop target (derived, not configured)", () => {
+  // make the ssh hop fail so the row's error names the hop target
+  function failSsh(f: Fixture) {
+    fs.writeFileSync(path.join(f.bin, "sshpass"), "#!/bin/sh\nexit 3\n");
+    fs.chmodSync(path.join(f.bin, "sshpass"), 0o755);
+  }
+
+  test("single candidate -> derived operator@127.0.0.1", async () => {
+    const f = fixture();
+    failSsh(f);
+    const r = await f.run(["journal-errors", "--agent", "peer-home"]);
+    const d = doc(r);
+    const peer = d.agents.find((a: any) => a.name === "peer-home");
+    expect(peer.error).toBe(
+      "cross-user hop failed (sshpass/sudo via operator@127.0.0.1)",
+    );
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("override user@host wins as-is", async () => {
+    const f = fixture();
+    failSsh(f);
+    const r = await f.run(["journal-errors", "--agent", "peer-home"], {
+      JARATE_SSH_HOST: "admin@10.2.0.9",
+    });
+    const d = doc(r);
+    const peer = d.agents.find((a: any) => a.name === "peer-home");
+    expect(peer.error).toBe(
+      "cross-user hop failed (sshpass/sudo via admin@10.2.0.9)",
+    );
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("override bare user -> user@127.0.0.1", async () => {
+    const f = fixture();
+    failSsh(f);
+    const r = await f.run(["journal-errors", "--agent", "peer-home"], {
+      JARATE_SSH_HOST: "franky",
+    });
+    const d = doc(r);
+    const peer = d.agents.find((a: any) => a.name === "peer-home");
+    expect(peer.error).toBe(
+      "cross-user hop failed (sshpass/sudo via franky@127.0.0.1)",
+    );
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("zero candidates -> ok:false doc, candidates: none, exact override", async () => {
+    const f = fixture();
+    fs.writeFileSync(f.getentWheel, "wheel:x:10:\n");
+    const r = await f.run(["journal-errors"]);
+    expect(r.code).toBe(2);
+    const d = doc(r);
+    expect(d.ok).toBe(false);
+    expect(d.error).toContain("cannot derive operator (candidates: none)");
+    expect(d.error).toContain("wheel/sudo");
+    expect(d.error).toContain(
+      "JARATE_SSH_HOST=<user>@127.0.0.1 jarate journal-errors",
+    );
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("two candidates -> ok:false doc naming both + pick-one override", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      f.getentPasswd,
+      [
+        "root:x:0:0:root:/root:/usr/sbin/nologin",
+        "operator:x:1000:1000:Operator:/home/operator:/bin/bash",
+        "agentpeer:x:1001:1001:Peer:/home/agentpeer:/bin/zsh",
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(f.getentWheel, "wheel:x:10:agentpeer,operator\n");
+    const r = await f.run(["projects", "--project", "x"]);
+    expect(r.code).toBe(2);
+    const d = doc(r);
+    expect(d.ok).toBe(false);
+    // candidates sorted by uid, comma+space separated
+    expect(d.error).toContain(
+      "cannot derive operator (candidates: operator, agentpeer)",
+    );
+    // pick-one names the LOWEST-uid candidate first
+    expect(d.error).toContain(
+      "JARATE_SSH_HOST=operator@127.0.0.1 jarate projects",
+    );
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });

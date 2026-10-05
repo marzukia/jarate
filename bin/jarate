@@ -38,7 +38,11 @@
 #   JARATE_TOKEN_COST   path to pi-token-cost.py (default: ~/scripts, then repo)
 #   JARATE_CTX_LIMIT    context limit fallback when models.json has none
 #   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
-#   JARATE_SSH_HOST     cross-user hop target (default admin@127.0.0.1)
+#   JARATE_SSH_HOST     cross-user hop target OVERRIDE (user@host as-is; a
+#                       bare user becomes user@127.0.0.1). When unset the
+#                       target is DERIVED (issue #147): the unique local user
+#                       with uid > 900, a home, a login shell, and
+#                       sudo-group membership (wheel/sudo)
 #   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
 #   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
 #   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
@@ -80,6 +84,74 @@ die() {
 die_usage() {
   jq -cn --arg ts "$(ts_now)" --arg e "$1" '{ok: false, ts: $ts, error: $e}'
   exit 2
+}
+
+# ─── cross-user hop target (issue #147: derived, not configured) ───────────
+# HOP_TARGET — the ssh target of the sshpass/sudo hop, resolved once and
+# cached. Priority:
+#   1. JARATE_SSH_HOST explicit override — "user@host" kept as-is; a bare
+#      user becomes "user@127.0.0.1".
+#   2. Derivation: the UNIQUE local user with uid > 900, a home, a login
+#      shell (not nologin), and sudo-group membership (wheel on Fedora,
+#      sudo on Debian/Ubuntu; if both groups exist, either counts).
+# 0 or >1 candidates -> executable ok:false doc (rc 2) naming the
+# candidates and the exact override command. Call once per command,
+# directly (not in $(...)) so the doc reaches stdout.
+HOP_TARGET=""
+hop_target() { # $1 = invoked cmd (named in the override doc)
+  local cmd="${1:-jarate}"
+  [ -n "$HOP_TARGET" ] && return 0
+  if [ -n "${JARATE_SSH_HOST:-}" ]; then
+    case "$JARATE_SSH_HOST" in
+      *@*) HOP_TARGET="$JARATE_SSH_HOST" ;;
+      *) HOP_TARGET="${JARATE_SSH_HOST}@127.0.0.1" ;;
+    esac
+    return 0
+  fi
+  local g line members m
+  local -a sudo_users=()
+  for g in wheel sudo; do
+    if line="$(getent group "$g" 2>/dev/null)"; then
+      members="${line##*:}"
+      for m in ${members//,/ }; do
+        sudo_users+=("$m")
+      done
+    fi
+  done
+  local u _p _u _g rest shell _h
+  local -a cands=()
+  while IFS=: read -r u _p _u _g rest; do
+    [ -n "$u" ] || continue
+    [ "$_u" -gt 900 ] 2>/dev/null || continue
+    # home + shell are the LAST two fields (gecos may contain ':')
+    shell="${rest##*:}"
+    _h="${rest%:*}"
+    _h="${_h##*:}"
+    [ -n "$_h" ] || continue
+    case "$shell" in *nologin*) continue ;; esac
+    for m in "${sudo_users[@]}"; do
+      if [ "$m" = "$u" ]; then
+        cands+=("$_u:$u")
+        break
+      fi
+    done
+  done < <(getent passwd)
+  local n="${#cands[@]}"
+  if [ "$n" -eq 1 ]; then
+    HOP_TARGET="${cands[0]##*:}@127.0.0.1"
+    return 0
+  fi
+  local names="" first=""
+  if [ "$n" -gt 1 ]; then
+    local sorted
+    sorted="$(printf '%s\n' "${cands[@]}" | sort -t: -k1,1n)"
+    names="$(printf '%s\n' "$sorted" | cut -d: -f2 | paste -sd, - | sed 's/,/, /g')"
+    first="$(printf '%s\n' "$sorted" | head -n 1 | cut -d: -f2)"
+  fi
+  if [ "$n" -eq 0 ]; then
+    die_usage "jarate: cannot derive operator (candidates: none). No local user has uid>900 + home + login shell + sudo group (wheel/sudo). Set the hop target for this run: JARATE_SSH_HOST=<user>@127.0.0.1 jarate $cmd"
+  fi
+  die_usage "jarate: cannot derive operator (candidates: $names). More than one local user has uid>900 + home + login shell + sudo group (wheel/sudo). Pick one for this run: JARATE_SSH_HOST=${first}@127.0.0.1 jarate $cmd"
 }
 
 # since_is_abs <value> — 0 if $1 is an absolute journalctl datetime.
@@ -271,8 +343,8 @@ agent_homes() {
     IFS=':' read -r -a AGENT_HOMES <<<"$JARATE_AGENT_HOMES"
   else
     AGENT_HOMES=("$HOME")
-    local ssh_user="${JARATE_SSH_HOST:-admin@127.0.0.1}"
-    ssh_user="${ssh_user%%@*}"
+    # the hop user (derived; see hop_target, issue #147) is not an agent
+    local ssh_user="${HOP_TARGET%%@*}"
     local self="$(id -un)"
     local u uid
     while IFS=: read -r u _ _ uid _ _ _; do
@@ -289,20 +361,20 @@ agent_homes() {
 # only if that user has pi.service enabled, followed by the warning lines.
 # Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
 run_remote_probe() { # $1=name $2=uid $3=since
-  local host="${JARATE_SSH_HOST:-admin@127.0.0.1}"
+  local host="$HOP_TARGET"
   local pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
   if [ -z "$pass" ]; then
     echo "[jarate:probe] no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
     return 1
   fi
   # issue #121: the password sits in NEITHER argv NOR the remote string:
-  #   - local: `sshpass -e` reads SSH_PASS from env (the SSH_PASS= prefix
+  #   - local: `sshpass -e` reads SSHPASS from env (the SSHPASS= prefix
   #     is env, not argv; visible only to this user's /proc/<pid>/environ)
   #   - the password rides ssh's STDIN exactly once (here-string, no argv);
   #     the remote shell reads it into a variable, drops it in a 0600 temp
   #     file and feeds `sudo -S < file` — never `echo '<pw>'` in remote argv
   #   - $1/$3 are single-quoted in the remote string, $2 is a uid digit
-  SSH_PASS="$pass" timeout "$TMO" sshpass -e \
+  SSHPASS="$pass" timeout "$TMO" sshpass -e \
     ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
     "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$1' bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ '$3'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
     <<<"$pass" 2>/dev/null
@@ -338,6 +410,7 @@ cmd_journal_errors() {
     shift
   done
 
+  hop_target journal-errors
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -366,7 +439,7 @@ cmd_journal_errors() {
       uid="$(getent passwd "$name" 2>/dev/null | cut -d: -f3)"
       text="$(run_remote_probe "$name" "$uid" "$since")" || rc=$?
       if [ "$rc" -ne 0 ]; then
-        err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
+        err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
       elif [ -z "$text" ] || [ "${text%%$'\n'*}" != "[jarate:pi]" ]; then
         # no pi.service for this user -> not an agent, skip the row
         included=$((included - 1))
@@ -563,7 +636,7 @@ jarate_scan() {
       'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
   else
     owner="${home##*/}"
-    host="${JARATE_SSH_HOST:-admin@127.0.0.1}"
+    host="$HOP_TARGET"
     pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
     if [ -z "$pass" ]; then
       echo "no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
@@ -574,7 +647,7 @@ jarate_scan() {
     # (sshpass -e + password over ssh stdin once + 0600 remote file for
     # sudo -S); $owner/$home/$b64 are quoted in the remote string, $envs
     # tokens are validated above.
-    SSH_PASS="$pass" timeout "$TMO" sshpass -e \
+    SSHPASS="$pass" timeout "$TMO" sshpass -e \
       ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
       "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u '$owner' bash -c 'PI_HOME=\"$home\" $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" \"$b64\"'; rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
       <<<"$pass" 2>/dev/null
@@ -606,6 +679,7 @@ cmd_projects() {
     esac
   done
 
+  hop_target projects
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -632,7 +706,7 @@ cmd_projects() {
     elif [ "$h" = "$HOME" ]; then
       err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
+      err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
@@ -779,6 +853,7 @@ cmd_projects_backfill() {
     esac
   done
 
+  hop_target projects-backfill
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -814,7 +889,7 @@ cmd_projects_backfill() {
     elif [ "$h" = "$HOME" ]; then
       err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via ${JARATE_SSH_HOST:-admin@127.0.0.1})"
+      err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
