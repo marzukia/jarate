@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # jarate-wait — poll the monky Discord channel for the next bus event (in-turn wait)
 # usage: jarate-wait --since <message-id> [--timeout 300] [--check 5]
-# exits:
+# exits (rc contract, issue #117):
 #   0 = webhook callback arrived  → prints its content
 #   2 = human message arrived     → prints "human: <name>" (break early)
 #   3 = timeout                   → prints "timeout"
+# #117: a failed poll must not end the wait with an arbitrary rc (curl 28,
+# python 1) under set -e. Transient curl/python errors inside the poll loop
+# skip that poll and the wait runs to the deadline (rc 3). If the startup
+# bot-id fetch keeps failing after retries, the wait also ends rc 3, with a
+# stderr diagnostic (nothing arrived; the caller reports / re-waits / drops).
 # config (all from ~/.pi/agent/settings.json, no secrets in this repo):
 #   bot token + channel id from channels[0]
 #   webhook author id from ~/.config/pi-dispatch/webhook_author
@@ -31,16 +36,35 @@ channel="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"]
 # pipe. Every curl is bounded: --max-time 15.
 discord_get() { # $1 = url
   printf 'header = "Authorization: Bot %s"\n' "$token" \
-    | curl -s -K - --max-time 15 "$1"
+    | curl -s -K - --max-time 15 --connect-timeout 5 "$1"
 }
-botid="$(discord_get https://discord.com/api/v10/users/@me | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')"
+# #117: the startup fetch retries (a hung/stalled TLS read is bounded by
+# --max-time/--connect-timeout) and a final failure maps to rc 3 instead of
+# leaking curl's rc under set -e.
+botid=""
+for i in 1 2 3; do
+  body="$(discord_get https://discord.com/api/v10/users/@me)" || body=""
+  if [ -n "$body" ]; then
+    botid="$(printf '%s' "$body" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])' 2>/dev/null)" || botid=""
+  fi
+  if [ -n "$botid" ]; then break; fi
+  [ "$i" -lt 3 ] && sleep 2
+done
+[ -n "$botid" ] || {
+  echo "jarate-wait: cannot fetch bot id (discord unreachable?)" >&2
+  echo "timeout"; exit 3
+}
 wa="$(head -1 "${HOME}/.config/pi-dispatch/webhook_author" 2>/dev/null || true)"
 [ -n "$wa" ] || { echo "webhook_author missing" >&2; exit 2; }
 
 end=$(( $(date +%s) + timeout ))
 while [ "$(date +%s)" -lt "$end" ]; do
-  msgs="$(discord_get "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50")"
-  event="$(MSGS="$msgs" python3 - "$wa" "$botid" <<'EOF'
+  # #117: a failed poll (curl rc, or Discord answering with a non-JSON body
+  # that breaks the parse) skips this iteration; the deadline still bounds
+  # the wait, so the rc contract (0/2/3) holds.
+  event=""
+  if msgs="$(discord_get "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50")"; then
+    event="$(MSGS="$msgs" python3 - "$wa" "$botid" <<'EOF'
 import json, os, sys
 wa, bot = sys.argv[1], sys.argv[2]
 for m in json.loads(os.environ["MSGS"]):
@@ -71,7 +95,8 @@ for m in json.loads(os.environ["MSGS"]):
     print("2\t" + m["id"] + "\t" + name)
     break
 EOF
-)"
+    )" || event=""
+  fi
   if [ -n "$event" ]; then
     code="${event%%$'\t'*}"
     rest="${event#*$'\t'}"
