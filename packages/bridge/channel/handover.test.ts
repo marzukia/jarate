@@ -288,18 +288,13 @@ describe("extractDeterministic", () => {
       ...basePrep(),
       fileOps: {
         ...basePrep().fileOps,
-        edited: new Set([
-          "/home/monky/projects/jarate/packages/bridge/channel/handover.ts",
-        ]),
+        edited: new Set(["/home/monky/code/app/src/old1.ts"]),
       },
     };
     const s = extractDeterministic(p, [], { ...emptyCtx, priorDoc: PRIOR_DOC });
-    expect(s.readFiles).not.toContain(
-      "/home/monky/projects/jarate/packages/bridge/channel/handover.ts",
-    );
-    expect(s.modifiedFiles).toContain(
-      "/home/monky/projects/jarate/packages/bridge/channel/handover.ts",
-    );
+    expect(s.readFiles).not.toContain("/home/monky/code/app/src/old1.ts");
+    expect(s.readFiles).toContain("/home/monky/code/app/src/old2.ts");
+    expect(s.modifiedFiles).toContain("/home/monky/code/app/src/old1.ts");
   });
   test("no prior doc → current fileOps only, newest first", () => {
     const s = extractDeterministic(basePrep(), [], emptyCtx);
