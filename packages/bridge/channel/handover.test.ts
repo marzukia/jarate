@@ -25,10 +25,14 @@ import {
   HANDOFF_FRESH_WINDOW_MS,
   type HandoffSettings,
   type HandoverPreparation,
+  inboundSender,
   isHandoffFreshWindow,
+  isHumanInbound,
+  keptTailMessages,
   lastHandoffAt,
   liveKickoffState,
   loadPreviousHandover,
+  msgText,
   ORCHESTRATOR_PRIME_LINE,
   parseKickoff,
   parseLlmProse,
@@ -206,6 +210,46 @@ describe("parsePriorTags", () => {
     expect(t.readFiles).toEqual(["/x/y.ts"]);
     expect(t.modifiedFiles).toEqual([]);
   });
+  test("anchors to the LAST occurrence, not the first (RCA F4a)", () => {
+    // A transcript scrape of handover.ts source mid-doc can contain the
+    // tag text with a dummy body; the doc's own footer is always last.
+    const doc = [
+      "## Transcript (current state first)",
+      "<read-files>",
+      "/scrapped/first.ts",
+      "</read-files>",
+      "...",
+      "<read-files>",
+      "/real/footer.ts",
+      "</read-files>",
+    ].join("\n");
+    expect(parsePriorTags(doc).readFiles).toEqual(["/real/footer.ts"]);
+  });
+  test("drops uninterpolated template lines (RCA F4a live bug)", () => {
+    // The live 2026-10-05 doc carried the literal footer text below —
+    // a template that never interpolated. It must not survive as a path.
+    // ("$" + "{..." keeps the placeholder literal out of a template lint.)
+    const readLit = "\\n" + "$" + "{list(s.readFiles)}";
+    const modifiedLit = "\\n" + "$" + "{list(s.modifiedFiles)}";
+    const doc = [
+      "<read-files>",
+      readLit,
+      "/home/monky/projects/jarate/packages/bridge/channel/handover.ts",
+      "</read-files>",
+      "<modified-files>",
+      modifiedLit,
+      "/home/monky/projects/jarate/packages/bridge/channel/index.ts",
+      "</modified-files>",
+    ].join("\n");
+    expect(parsePriorTags(doc)).toEqual({
+      readFiles: [
+        "/home/monky/projects/jarate/packages/bridge/channel/handover.ts",
+      ],
+      modifiedFiles: [
+        "/home/monky/projects/jarate/packages/bridge/channel/index.ts",
+      ],
+    });
+  });
 });
 
 // ─── extractDeterministic ───────────────────────────────────────────────────
@@ -239,19 +283,45 @@ describe("extractDeterministic", () => {
     expect(s.readFiles).not.toContain("/home/monky/code/app/src/c.ts");
     expect(s.readFiles).toContain("/home/monky/code/app/src/a.ts");
   });
-  test("no prior doc → current fileOps only", () => {
+  test("no prior doc → current fileOps only, newest first", () => {
     const s = extractDeterministic(basePrep(), [], emptyCtx);
     expect(s.readFiles).toEqual(["/home/monky/code/app/src/a.ts"]);
+    // c.ts was edited after b.ts was written → c first (RCA F4a ordering)
     expect(s.modifiedFiles).toEqual([
-      "/home/monky/code/app/src/b.ts",
       "/home/monky/code/app/src/c.ts",
+      "/home/monky/code/app/src/b.ts",
     ]);
   });
-  test("refs: PR #ids + pi-bg ticket ids, deduped", () => {
-    const s = extractDeterministic(basePrep(), [], emptyCtx);
+  test("file tags are capped at 10, newest first (RCA F4a)", () => {
+    const p = basePrep();
+    p.fileOps.read = new Set(
+      Array.from({ length: 12 }, (_, i) => `/r/f${i}.ts`),
+    );
+    p.fileOps.edited = new Set();
+    p.fileOps.written = new Set();
+    const s = extractDeterministic(p, [], emptyCtx);
+    expect(s.readFiles).toHaveLength(10);
+    expect(s.readFiles[0]).toBe("/r/f11.ts"); // newest first
+    expect(s.readFiles[9]).toBe("/r/f2.ts"); // oldest kept
+  });
+  test("refs: PR #ids + pi-bg ticket ids, deduped, LAST ~50% of span (RCA F4b)", () => {
+    // 8-message span: the refs in the OLDEST half are the work the session
+    // moved on from — they must drop out of References.
+    const p = basePrep();
+    p.messagesToSummarize = Array.from({ length: 8 }, (_, i) => ({
+      role: "user",
+      content:
+        i < 4
+          ? `old half ${i} PR #41 ticket 20260101-000000-1111111`
+          : `new half ${i} PR #42 ticket 20260923-021858-3964667`,
+    })) as any;
+    p.turnPrefixMessages = [];
+    const s = extractDeterministic(p, [], emptyCtx);
     expect(s.refs).toContain("#42");
     expect(s.refs).toContain("20260923-021858-3964667");
     expect(s.refs.filter((r) => r === "#42")).toHaveLength(1);
+    expect(s.refs).not.toContain("#41");
+    expect(s.refs).not.toContain("20260101-000000-1111111");
   });
   test("worktrees: paths + pi-bg/<id> branches", () => {
     const s = extractDeterministic(
@@ -273,11 +343,34 @@ describe("extractDeterministic", () => {
     );
     expect(s.worktrees).toContain("pi-bg/20260923-021858-3964667");
   });
-  test("links: deduped, trailing punctuation stripped", () => {
+  test("worktrees: only the LAST ~20 messages (RCA F4b)", () => {
+    const p = basePrep();
+    p.messagesToSummarize = Array.from({ length: 25 }, (_, i) => ({
+      role: "user",
+      content:
+        i < 5
+          ? `old worktree /home/monky/.pi-bg-wt/jarate/20260101-000000-1111111 pi-bg/20260101-000000-1111111`
+          : `new worktree /home/monky/.pi-bg-wt/jarate/20260923-021858-3964667 pi-bg/20260923-021858-3964667`,
+    })) as any;
+    p.turnPrefixMessages = [];
+    const s = extractDeterministic(p, [], emptyCtx);
+    expect(s.worktrees).toContain("pi-bg/20260923-021858-3964667");
+    expect(s.worktrees).toContain(
+      "/home/monky/.pi-bg-wt/jarate/20260923-021858-3964667",
+    );
+    expect(s.worktrees).not.toContain("pi-bg/20260101-000000-1111111");
+    expect(s.worktrees).not.toContain(
+      "/home/monky/.pi-bg-wt/jarate/20260101-000000-1111111",
+    );
+  });
+  test("links: deduped, trailing punctuation stripped (in the refs window)", () => {
+    // The refs window is the LAST ~50% of the span — put the links in the
+    // newest message (the turn prefix) so they are in scope.
     const s = extractDeterministic(
       {
         ...basePrep(),
-        messagesToSummarize: [
+        messagesToSummarize: [{ role: "user", content: "first msg" }],
+        turnPrefixMessages: [
           {
             role: "user",
             content:
@@ -290,42 +383,60 @@ describe("extractDeterministic", () => {
     );
     expect(s.links).toEqual(["https://example.com/a", "https://example.com/b"]);
   });
-  test("last user asks: channel-inbound details.body, channel-ctx stripped, last 3", () => {
+  // Real channel-inbound entries carry the full prompt text in `content`
+  // (channel-ctx block as the FIRST line) plus the clean body in
+  // `details.body`. Machine inbounds (Beepy webhook, [bg: heartbeats) come
+  // through the same customType; bridge-injected wakes carry no channel-ctx.
+  const inb = (i: number, from: string | null, body: string) => ({
+    id: `e${i}`,
+    type: "custom_message",
+    customType: "channel-inbound",
+    timestamp: i,
+    content:
+      from != null
+        ? `<channel-ctx type="discord" name="test" from="${from}" msgId="m${i}">ctx</channel-ctx>\n\n${body}`
+        : body,
+    details: { body },
+  });
+  test("last user asks: HUMAN inbounds only, last 2 (RCA F3)", () => {
     const entries = [
-      {
-        id: "e1",
-        type: "custom_message",
-        customType: "channel-inbound",
-        timestamp: 1,
-        details: {
-          body: '<channel-ctx type="discord">junk</channel-ctx>first ask',
-        },
-      },
-      {
-        id: "e2",
-        type: "custom_message",
-        customType: "channel-inbound",
-        timestamp: 2,
-        details: { body: "second ask" },
-      },
-      {
-        id: "e3",
-        type: "custom_message",
-        customType: "channel-inbound",
-        timestamp: 3,
-        details: { body: "third ask" },
-      },
-      {
-        id: "e4",
-        type: "custom_message",
-        customType: "channel-inbound",
-        timestamp: 4,
-        details: { body: "fourth ask" },
-      },
+      inb(1, "andy", "first ask"),
+      // Beepy relay (pi-bg webhook): machine, even with free text
+      inb(
+        2,
+        "Beepy",
+        "<embed>\nAuthor: pi-bg ticket · OK\n```bash\n[ok] pass\n```</embed>",
+      ),
+      inb(3, "Beepy", "[bg: heartbeat] 1 in-flight"),
+      // bridge-injected (no channel-ctx): not a human ask
+      inb(
+        4,
+        null,
+        "[task] one-shot task due 2026-10-04 06:00 UTC: fire the morning check",
+      ),
+      // human, empty body (file-only message): not an ask
+      inb(5, "andy", "(empty)"),
+      inb(6, "andy", "second ask"),
+      inb(7, "andy", "third ask"),
+      inb(8, "andy", "fourth ask"),
     ];
     const s = extractDeterministic(basePrep(), entries as any, emptyCtx);
-    expect(s.lastUserAsks).toEqual(["second ask", "third ask", "fourth ask"]);
-    expect(s.lastUserAsks[0]).not.toContain("channel-ctx");
+    expect(s.lastUserAsks).toEqual(["third ask", "fourth ask"]);
+    // the ctx block never leaks into an ask
+    expect(s.lastUserAsks.join("\n")).not.toContain("channel-ctx");
+  });
+  test("last user asks: (none) when no human inbounds (RCA F3)", () => {
+    const p = basePrep();
+    p.messagesToSummarize = [];
+    p.turnPrefixMessages = [];
+    const entries = [
+      inb(1, "Beepy", "<embed>x</embed>"),
+      inb(2, null, "[bg: restart-wake] session restarted"),
+    ];
+    const s = extractDeterministic(p, entries as any, emptyCtx);
+    expect(s.lastUserAsks).toEqual([]);
+    const doc = renderDeterministic(s, "", buildHeader(NOW, "s", 100_000));
+    expect(doc).toContain("## Last user asks\n(none)");
   });
   test("last user asks: fallback to user-role messages when no inbound entries", () => {
     const s = extractDeterministic(basePrep(), [], emptyCtx);
@@ -401,6 +512,178 @@ describe("serializeTranscript", () => {
     });
     const t = serializeTranscript(p);
     expect(t).toContain("…[truncated]");
+  });
+  test("kept tail is serialized FIRST, in full (RCA F2)", () => {
+    const p = basePrep();
+    p.firstKeptEntryId = "keep-1";
+    const tail = keptTailMessages(p, [
+      {
+        id: "sum-1",
+        type: "message",
+        message: { role: "user", content: "old summarized" },
+      } as any,
+      {
+        id: "keep-1",
+        type: "message",
+        message: { role: "user", content: "kept work A" },
+      } as any,
+      {
+        id: "keep-2",
+        type: "message",
+        message: { role: "assistant", content: "kept work B" },
+      } as any,
+    ]);
+    expect(tail.map((m) => msgText(m))).toEqual(["kept work A", "kept work B"]);
+    const t = serializeTranscript(p, tail);
+    // tail before span, chronological inside the tail
+    const iTailA = t.indexOf("[user] kept work A");
+    const iTailB = t.indexOf("[assistant] kept work B");
+    const iSpan = t.indexOf("[user] fix the bug in PR #42");
+    expect(iTailA).toBeGreaterThan(-1);
+    expect(iTailA).toBeLessThan(iTailB);
+    expect(iTailB).toBeLessThan(iSpan);
+    expect(t).toContain("…[older span]");
+    // the entry BEFORE firstKeptEntryId is summarized span content, not tail
+    expect(t).not.toContain("old summarized");
+  });
+  test("span over 60K: NEWEST span messages kept, oldest dropped (RCA F2)", () => {
+    const p = basePrep();
+    p.messagesToSummarize = Array.from({ length: 120 }, (_, i) => ({
+      role: "user",
+      content: `span msg ${i} ${"x".repeat(600)}`,
+    })) as any;
+    p.turnPrefixMessages = [];
+    const t = serializeTranscript(p);
+    // newest span message survives; oldest is cut
+    expect(t).toContain("span msg 119 ");
+    expect(t).not.toContain("span msg 0 ");
+    expect(t).toContain("…[transcript truncated]");
+    // chronological order is preserved within the kept subset
+    expect(t.indexOf("span msg 118 ")).toBeLessThan(t.indexOf("span msg 119 "));
+    // the doc stays under the cap
+    expect(t.length).toBeLessThanOrEqual(60_000 + 64);
+  });
+  test("tail alone over 60K: oldest tail entries dropped, newest kept (RCA F2)", () => {
+    const p = basePrep();
+    p.messagesToSummarize = [];
+    p.turnPrefixMessages = [];
+    p.firstKeptEntryId = "k0";
+    const entries = Array.from({ length: 120 }, (_, i) => ({
+      id: `k${i}`,
+      type: "message",
+      message: { role: "user", content: `tail msg ${i} ${"y".repeat(600)}` },
+    })) as any;
+    const tail = keptTailMessages(p, entries);
+    expect(tail).toHaveLength(120);
+    const t = serializeTranscript(p, tail);
+    expect(t).toContain("tail msg 119 ");
+    expect(t).not.toContain("tail msg 0 ");
+    expect(t).toMatch(
+      /…\[kept tail truncated: \d+ oldest kept entries dropped\]/,
+    );
+  });
+});
+
+// ─── inbound sender + human filter (RCA F3) ─────────────────────────────────
+
+describe("inboundSender / isHumanInbound (RCA F3)", () => {
+  const inb = (from: string | null, body: string, content?: string) => ({
+    id: "e1",
+    type: "custom_message",
+    customType: "channel-inbound",
+    timestamp: 1,
+    content:
+      content ??
+      (from != null
+        ? `<channel-ctx type="discord" from="${from}">ctx</channel-ctx>\n\n${body}`
+        : body),
+    details: { body },
+  });
+  test("1:1 from= attribute", () => {
+    expect(inboundSender(inb("andy", "hi") as any)).toBe("andy");
+  });
+  test("room sender= attribute wins over from=", () => {
+    const e = inb(
+      null,
+      "hi",
+      `<channel-ctx type="discord" name="fleet" room="general" sender="cain" msgId="m1">ctx</channel-ctx>\n\nhi`,
+    );
+    expect(inboundSender(e as any)).toBe("cain");
+  });
+  test("no channel-ctx (bridge-injected wake) → null", () => {
+    expect(
+      inboundSender(inb(null, "[bg: restart-wake] session restarted") as any),
+    ).toBeNull();
+  });
+  test("human free text → true", () => {
+    expect(isHumanInbound(inb("andy", "ship it") as any)).toBe(true);
+  });
+  test("Beepy relay → false (case-insensitive)", () => {
+    expect(isHumanInbound(inb("BEEPY", "hello") as any)).toBe(false);
+  });
+  test("<embed> body → false", () => {
+    expect(
+      isHumanInbound(inb("andy", "<embed>\nAuthor: pi-bg</embed>") as any),
+    ).toBe(false);
+  });
+  test("[bg: heartbeat body → false", () => {
+    expect(
+      isHumanInbound(inb("andy", "[bg: heartbeat] 1 in-flight") as any),
+    ).toBe(false);
+  });
+  test("empty body / (empty) → false", () => {
+    expect(isHumanInbound(inb("andy", "") as any)).toBe(false);
+    expect(isHumanInbound(inb("andy", "(empty)") as any)).toBe(false);
+  });
+  test("todo-board-only body → false (framing stripped)", () => {
+    expect(
+      isHumanInbound(
+        inb("andy", "<todo-board>\n├ done thing\n</todo-board>") as any,
+      ),
+    ).toBe(false);
+  });
+  test("no channel-ctx → false even with free text", () => {
+    expect(isHumanInbound(inb(null, "fire the morning check") as any)).toBe(
+      false,
+    );
+  });
+});
+
+// ─── keptTailMessages edge cases (RCA F2) ──────────────────────────────────
+
+describe("keptTailMessages (RCA F2)", () => {
+  test("firstKeptEntryId not on the branch → [] (span-only doc)", () => {
+    const p = basePrep();
+    p.firstKeptEntryId = "no-such-id";
+    expect(
+      keptTailMessages(p, [
+        {
+          id: "other",
+          type: "message",
+          message: { role: "user", content: "x" },
+        } as any,
+      ]),
+    ).toEqual([]);
+  });
+  test("no branch entries → []", () => {
+    expect(keptTailMessages(basePrep(), [])).toEqual([]);
+  });
+  test("custom_message tail entries project to context messages", () => {
+    const p = basePrep();
+    p.firstKeptEntryId = "c1";
+    const tail = keptTailMessages(p, [
+      {
+        id: "c1",
+        type: "custom_message",
+        customType: "channel-inbound",
+        timestamp: 1,
+        content:
+          '<channel-ctx type="discord" from="andy">ctx</channel-ctx>\n\ntail ask',
+        details: { body: "tail ask" },
+      } as any,
+    ]);
+    expect(tail).toHaveLength(1);
+    expect(msgText(tail[0])).toContain("tail ask");
   });
 });
 
@@ -520,7 +803,7 @@ describe("renderTemplate", () => {
       "7 · References",
       "8 · Gotchas & Constraints",
       "9 · State (machine)",
-      "10 · Last 3 user asks",
+      "10 · Last user asks",
     ];
     let last = -1;
     for (const t of titles) {
@@ -639,7 +922,7 @@ describe("sizeGuard", () => {
       "7 · References",
       "8 · Gotchas & Constraints",
       "9 · State (machine)",
-      "10 · Last 3 user asks",
+      "10 · Last user asks",
     ]) {
       expect(out).toContain(`## ${t}`);
     }
@@ -1368,6 +1651,46 @@ describe("buildHandover", () => {
     // the actual user/assistant/tool text from the span is in the doc
     expect(doc).toContain("fix the bug in PR #42"); // user ask
     expect(doc).toContain("ok, reading /home/monky/code/app/src/a.ts"); // assistant reply
+  });
+  test("deterministic: kept tail is carried into the doc in full (RCA F2)", async () => {
+    const p = basePrep();
+    p.firstKeptEntryId = "keep-tail-1";
+    const doc = await buildHandover({
+      preparation: p,
+      branchEntries: [
+        {
+          id: "summarized-1",
+          type: "message",
+          message: { role: "user", content: "old summarized work" },
+        } as any,
+        {
+          id: "keep-tail-1",
+          type: "message",
+          message: { role: "user", content: "kept work A" },
+        } as any,
+        {
+          id: "keep-tail-2",
+          type: "message",
+          message: { role: "assistant", content: "kept work B" },
+        } as any,
+      ],
+      ctx,
+      pi,
+      settings: settings(),
+      now: NOW,
+    });
+    // new deterministic section title: the doc leads with current state
+    expect(doc).toContain("## Transcript (current state first)");
+    // the kept tail (dropped from pi's context by the restart) is in the doc
+    expect(doc).toContain("[user] kept work A");
+    expect(doc).toContain("[assistant] kept work B");
+    expect(doc).toContain("…[older span]");
+    // tail before span, and the summarized entry stays out of the tail
+    const iTail = doc.indexOf("kept work A");
+    const iSpan = doc.indexOf("fix the bug in PR #42");
+    expect(iTail).toBeGreaterThan(-1);
+    expect(iTail).toBeLessThan(iSpan);
+    expect(doc).not.toContain("old summarized work");
   });
 
   test("deterministic: prior tags flow into the new doc", async () => {
