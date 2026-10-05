@@ -2071,17 +2071,33 @@ describe("extension handlers (A1/A2/A4)", () => {
       jest.advanceTimersByTime(25);
       await Promise.resolve();
       expect(sent.length).toBe(0);
-      // Run still active; m3 is queued and armed — its interrupt must be
-      // delivered (the flag consumed by m1's drop must not kill it)
+      // Run still active; m3 is queued and armed. While m1's cancel poll
+      // still holds the in-flight flag (it waits for the settle so its
+      // re-wake kick cannot race the agent_end window, #124), m3's
+      // interrupt is DEFERRED like any in-flight one (re-armed, long
+      // delay) — not dropped. Its delivery is guaranteed by the settle
+      // the poll is waiting for.
       await handleInbound(pi, inbound("third", "m3"), ctx);
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(3);
+      // The run settles: m1's cancel poll exits and kicks m3 (the oldest
+      // queued entry) — delivered exactly once, no second abort.
       idle = true;
       jest.advanceTimersByTime(25);
       await Promise.resolve();
+      for (let i = 0; i < 25 && sent.length === 0; i++) {
+        await new Promise<void>((r) => setImmediate(r));
+      }
       expect(sent.length).toBe(1);
       expect(sent[0].m.details.messageId).toBe("m3");
+      expect(abortCount).toBe(2); // m1's abort + /stop's abort; m3 no-abort
+      // m3's armed interrupt (4x delay while the flag was held) later
+      // finds pi idle and the queue empty: no double send, no spurious
+      // abort.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
+      await Promise.resolve();
+      for (let i = 0; i < 10; i++)
+        await new Promise<void>((r) => setImmediate(r));
+      expect(sent.length).toBe(1);
+      expect(abortCount).toBe(2);
     });
 
     test("/status shows the armed interrupt state", async () => {
@@ -2360,6 +2376,134 @@ describe("extension handlers (A1/A2/A4)", () => {
       await Promise.resolve();
       expect(sent.length).toBe(1);
       expect(abortCount).toBe(1);
+    });
+
+    test("/stop INSIDE the agent_end handler window re-wakes the cross-channel entry exactly once (#124)", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      expect(idle).toBe(false);
+      // 1. m1 (ch1) arrives mid-run: queued, interrupt armed.
+      await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
+      // 2. m1's interrupt fires: abort in flight, settle polling — the
+      //    run is still active, so no send yet.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0);
+      // 3. m2 (ch2) arrives mid-settle: queued in a DIFFERENT channel —
+      //    the entry the deferred agent_end should re-wake.
+      await handleInbound(pi, inboundCh("m2 body", "m2", "ch2"), ctx);
+      expect(midTurnQueues.get("ch2")?.length).toBe(1);
+      // 4. The aborted run's agent_end starts carrying a real final: the
+      //    re-wake DEFERS (interrupt in flight), then the handler suspends
+      //    on the final's Discord POST. That models the real pi ordering:
+      //    the deferral decision is made, but pi clears the run flag only
+      //    in _emitAgentSettled — AFTER the awaited handler resolves. The
+      //    orphan window is exactly this suspension.
+      let resolveFinal: (() => void) | undefined;
+      const finalGate = new Promise<void>((r) => (resolveFinal = r));
+      const prevFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: any, init?: any) => {
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        const isFinalPost =
+          init?.method === "POST" &&
+          typeof body?.content === "string" &&
+          body.content.includes("final answer");
+        if (isFinalPost) await finalGate;
+        return prevFetch(url, init);
+      }) as any;
+      const logs: string[] = [];
+      const realLog = console.log;
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      };
+      try {
+        const ae = handlers.agent_end(
+          {
+            messages: [
+              {
+                role: "assistant",
+                content: [{ type: "text", text: "final answer" }],
+              },
+            ],
+          },
+          ctx,
+        );
+        // Flush until the deferral decision has run (observable: the
+        // deferral log). The handler then sits on the gated final POST —
+        // in flight, flag still held, isIdle still false.
+        for (
+          let i = 0;
+          i < 100 && !logs.some((l) => l.includes("re-wake deferred"));
+          i++
+        ) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        expect(logs.some((l) => l.includes("re-wake deferred"))).toBe(true);
+        await new Promise<void>((r) => setImmediate(r));
+        expect(idle).toBe(false); // pi has not cleared the run flag yet
+        expect(midTurnQueues.get("ch2")?.length).toBe(1); // deferral held
+        // 5. /stop on ch1 lands INSIDE the handler window: the settle tick
+        //    sees the cancel with isIdle still FALSE (the old one-shot
+        //    check skips the kick here and orphans m2 — #124). /stop also
+        //    re-aborts: from its view the run is still active.
+        await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
+        expect(abortCount).toBe(2);
+        jest.advanceTimersByTime(25);
+        await Promise.resolve();
+        expect(sent.length).toBe(0); // m1's send never happened
+        expect(midTurnQueues.has("ch1")).toBe(false);
+        expect(midTurnQueues.get("ch2")?.length).toBe(1); // still queued
+        // 6. The handler finishes; pi clears the run flag.
+        resolveFinal!();
+        await ae;
+        idle = true;
+        // 7. The cancel-branch kick must fire on the next settle tick —
+        //    exactly once for m2 (the atomic pop is the dedupe).
+        jest.advanceTimersByTime(25);
+        for (let i = 0; i < 25 && sent.length === 0; i++) {
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        const m2Sends = sent.filter((s) => s.m?.details?.messageId === "m2");
+        expect(m2Sends.length).toBe(1);
+        expect(midTurnQueues.has("ch2")).toBe(false);
+        expect(sent.length).toBe(1); // m2 is the only send, ever
+        // 8. No double-wake: m2's own armed interrupt fires into an idle
+        //    session with an empty queue — no second send, no abort.
+        jest.advanceTimersByTime(interruptStepTimeoutMs());
+        await Promise.resolve();
+        for (let i = 0; i < 10; i++)
+          await new Promise<void>((r) => setImmediate(r));
+        expect(sent.length).toBe(1);
+        expect(abortCount).toBe(2);
+      } finally {
+        console.log = realLog;
+        globalThis.fetch = prevFetch;
+      }
+    });
+
+    test("/stop in the settle window with nothing queued: no wake (cancel-branch kick finds an empty queue)", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      expect(idle).toBe(false);
+      // m1 (ch1) arrives mid-run: queued, interrupt armed. No other
+      // channel's entry exists — the only line is m1's.
+      await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(0);
+      // /stop while the settle wait is pending; the run settles on the
+      // next tick. The cancel branch's kick must find an empty queue.
+      await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(0); // m1 dropped, nothing else: no wake
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      // More settle ticks: still nothing to wake, no stray send.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      for (let i = 0; i < 10; i++)
+        await new Promise<void>((r) => setImmediate(r));
+      expect(sent.length).toBe(0);
     });
   });
 
