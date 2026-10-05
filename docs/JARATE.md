@@ -158,7 +158,7 @@ agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
   "since": null, "project": null, "warn": null,
   "projects": [
     {"project": "nestfinder", "runs": 12, "workers": 10, "reviewers": 2,
-     "tokens": {"input": 100, "output": 50, "cacheRead": 200, "cacheWrite": 5, "total": 350},
+     "tokens": {"input": 100, "output": 50, "cache_read": 200, "cache_write": 5, "total": 350},
      "cost_usd": 0.12345, "cost_covered": 12,
      "first": "2026-09-01T00:00:00Z", "last": "2026-09-18T00:00:00Z"}
   ],

@@ -286,9 +286,9 @@ rid = E("T")
 title = "pi-bg " + rid + " \u00b7 KILLED"
 meta = [rid_line("\u250c killed \u00b7 ", rid),
         rid_line("\u251c $ jarate-bg-kill ", rid),
-        "\u251c " + "pids".ljust(5) + " : " + clip_end(E("PIDS"), 21),
-        "\u251c " + "wait".ljust(5) + " : " + E("DUR") + "s (TERM->KILL)",
-        "\u251c " + "state".ljust(5) + " : killed on request",
+        "\u251c " + "pids".ljust(6) + " : " + clip_end(E("PIDS"), 29),
+        "\u251c " + "wait".ljust(6) + " : " + E("DUR") + "s (TERM->KILL)",
+        "\u251c " + "state".ljust(6) + " : killed on request",
         "\u2514"]
 embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
          "color": 15105570,  # orange, same as jarate-bg DIED

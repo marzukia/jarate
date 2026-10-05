@@ -104,6 +104,12 @@ import {
 } from "./types";
 import { performUndo } from "./undo";
 
+/** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
+ *  40-col budget (word boundaries, 2-space continuation indent). These
+ *  assertions predate the wrap; collapse wrap-newlines back to a single
+ *  space on the RECEIVED side before matching. */
+const unwarped = (s: string) => s.replace(/\n +/g, " ");
+
 describe("chunkText", () => {
   test("short fenced block is unchanged", () => {
     const text = "```js\nconst x = 1\n```";
@@ -4624,7 +4630,9 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact second", "m2"), ctx);
     expect(
       channelPosts().some((t) =>
-        t.includes("[queued] compact (run in progress), replaces earlier"),
+        unwarped(t).includes(
+          "[queued] compact (run in progress), replaces earlier",
+        ),
       ),
     ).toBe(true);
     await handlers.agent_end({ messages: [] }, ctx);
@@ -4641,7 +4649,7 @@ describe("compact: defer mid-run + always report", () => {
     expect(opts).toBeNull();
     expect(
       channelPosts().some((t) =>
-        t.includes("[queued] compact (compact already in progress)"),
+        unwarped(t).includes("[queued] compact (compact already in progress)"),
       ),
     ).toBe(true);
     handlers.session_compact?.(
@@ -5066,7 +5074,7 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact", "m4", "ch2"), ctx);
     expect(
       channelPosts("ch2").some((t) =>
-        t.includes("[queued] compact (compact already in progress)"),
+        unwarped(t).includes("[queued] compact (compact already in progress)"),
       ),
     ).toBe(true);
     jest.useRealTimers();
@@ -5989,6 +5997,15 @@ describe("tasks (integration)", () => {
       await handleInbound(pi, inbound(cmds[i], `m${i}`), ctx);
       const c = replyContent();
       expect(c.startsWith("```"), `${cmds[i]} -> ${c.slice(0, 50)}`).toBe(true);
+      // A2 (polish sweep): the 40-col budget applies INSIDE the fence too
+      // (STYLE.md 2.7). Pre-fenced command output (/help, /tasks list, ...)
+      // must leave the guard already wrapped - assert every line.
+      for (const line of c.split("\n")) {
+        expect(
+          line.length <= 40,
+          `${cmds[i]} -> ${line.length} cols: ${line}`,
+        ).toBe(true);
+      }
     }
   });
 
@@ -6017,7 +6034,7 @@ describe("tasks (integration)", () => {
       now: NOW + 1,
     });
     await handleInbound(pi, inbound("/tasks list", "m1"), ctx);
-    const content = replyContent();
+    const content = unwarped(replyContent());
     expect(content).toContain("2 pending tasks (of 2 total):");
     expect(content).toContain(one.id);
     expect(content).toContain("check the build");
@@ -6049,7 +6066,7 @@ describe("tasks (integration)", () => {
     await handleInbound(pi, inbound("/tasks cancel", "m2"), ctx);
     expect(replyContent()).toBe(fence("[!] usage: /tasks cancel <id>"));
     await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence("[!] usage: /tasks [list | add | reschedule | cancel]"),
     );
   });
@@ -6061,7 +6078,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(replyContent()).toContain("[ok] task");
-    expect(replyContent()).toContain("cancel with /tasks cancel");
+    expect(unwarped(replyContent())).toContain("cancel with /tasks cancel");
     const tasks = loadTasks(tmp);
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({
@@ -6097,7 +6114,7 @@ describe("tasks (integration)", () => {
       inbound('/tasks add "run the fleet check" 0 6 * * * UTC', "m1"),
       ctx,
     );
-    expect(replyContent()).toContain('cron "0 6 * * *" (UTC)');
+    expect(unwarped(replyContent())).toContain('cron "0 6 * * *" (UTC)');
     const t = loadTasks(tmp)[0];
     expect(t).toMatchObject({
       channelId: "ch1",
@@ -6134,7 +6151,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(replyContent()).toContain("[ok] rescheduled");
-    expect(replyContent()).toContain(
+    expect(unwarped(replyContent())).toContain(
       'cron "0 9 * * 1-5" (Australia/Melbourne)',
     );
     const after = loadTasks(tmp)[0];
@@ -6207,38 +6224,40 @@ describe("tasks (integration)", () => {
     );
     // form errors -> usage line
     await handleInbound(pi, inbound("/tasks add", "m1"), ctx);
-    expect(replyContent()).toBe(addUsage);
+    expect(unwarped(replyContent())).toBe(addUsage);
     await handleInbound(
       pi,
       inbound("/tasks add check the build 30", "m2"), // unquoted prompt
       ctx,
     );
-    expect(replyContent()).toBe(addUsage);
+    expect(unwarped(replyContent())).toBe(addUsage);
     await handleInbound(pi, inbound('/tasks add "x"', "m3"), ctx); // no spec
-    expect(replyContent()).toBe(addUsage);
+    expect(unwarped(replyContent())).toBe(addUsage);
     await handleInbound(pi, inbound('/tasks add "x" 30 UTC', "m4"), ctx);
-    expect(replyContent()).toBe(addUsage); // 2 tokens: not any form
+    expect(unwarped(replyContent())).toBe(addUsage); // 2 tokens: not any form
     await handleInbound(pi, inbound("/tasks reschedule", "m5"), ctx);
-    expect(replyContent()).toBe(resUsage);
+    expect(unwarped(replyContent())).toBe(resUsage);
     await handleInbound(pi, inbound(`/tasks reschedule ${t.id}`, "m6"), ctx);
-    expect(replyContent()).toBe(resUsage); // missing spec
+    expect(unwarped(replyContent())).toBe(resUsage); // missing spec
     // content errors -> one [!] line (from parseTaskSpec / rescheduleTask)
     await handleInbound(pi, inbound('/tasks add "" 30', "m7"), ctx);
-    expect(replyContent()).toBe(fence("[!] prompt is required"));
+    expect(unwarped(replyContent())).toBe(fence("[!] prompt is required"));
     await handleInbound(pi, inbound('/tasks add "x" 0', "m8"), ctx);
-    expect(replyContent()).toBe(fence("[!] minutes must be greater than 0"));
+    expect(unwarped(replyContent())).toBe(
+      fence("[!] minutes must be greater than 0"),
+    );
     await handleInbound(pi, inbound('/tasks add "x" 99999', "m9"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence("[!] minutes too large (max 43200 = 30d)"),
     );
     await handleInbound(pi, inbound('/tasks add "x" yesterday', "m10"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence(
         '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
       ),
     );
     await handleInbound(pi, inbound('/tasks add "x" 99 * * * *', "m11"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
     );
     await handleInbound(
@@ -6246,7 +6265,7 @@ describe("tasks (integration)", () => {
       inbound('/tasks add "x" 0 6 * * * Not/AZone', "m12"),
       ctx,
     );
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence(
         '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
       ),
@@ -6256,7 +6275,7 @@ describe("tasks (integration)", () => {
       inbound(`/tasks reschedule ${t.id} 99 * * * *`, "m13"),
       ctx,
     );
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
     );
     // seed untouched, nothing scheduled on any path above
@@ -8083,7 +8102,7 @@ describe("/diff (issue #7)", () => {
     await handleInbound(pi, inbound("/diff", "dm1"), ctx);
     // #87: the viewer URL ships bare after the fence (clickable), the
     // status line stays fenced
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       `${fence("[ok] working tree · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
     );
     const up = fetchCalls.find((c) =>
@@ -8116,7 +8135,7 @@ describe("/diff (issue #7)", () => {
 
   test("/diff with unresolvable arg replies usage", async () => {
     await handleInbound(pi, inbound("/diff hello\nworld", "dm3"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence(
         "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
       ),
@@ -8126,7 +8145,7 @@ describe("/diff (issue #7)", () => {
   test("/diff without webdrop config reports the gap", async () => {
     fs.rmSync(path.join(tmp, ".config"), { recursive: true, force: true });
     await handleInbound(pi, inbound("/diff", "dm4"), ctx);
-    expect(replyContent()).toBe(
+    expect(unwarped(replyContent())).toBe(
       fence(
         "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
       ),
@@ -8476,7 +8495,7 @@ describe("wave 2c bridge commands", () => {
     ).toBeNull();
   });
 
-  test("runFrame: trailing line sits before the closing bar, <= 32 cols", () => {
+  test("runFrame: trailing line sits before the closing bar, <= 40 cols", () => {
     const frame = runFrame(
       "done",
       ["bash bun test"],
@@ -8489,7 +8508,7 @@ describe("wave 2c bridge commands", () => {
     expect(lines[1]).toBe("│ └ bash bun test");
     expect(lines[2]).toBe("│ ~219.4k tok · ~$0.096");
     expect(lines[3]).toBe("└");
-    for (const l of lines) expect([...l].length).toBeLessThanOrEqual(32);
+    for (const l of lines) expect([...l].length).toBeLessThanOrEqual(40);
   });
 
   test("message_end posts the [ctx] boundary notice, once per 10% step (#13)", async () => {
@@ -8676,28 +8695,28 @@ describe("wave 2c bridge commands", () => {
     expect(loadWorktreeStateFile()).toBeNull();
     // owner: creates the worktree
     await handleInbound(pi, inbound("/new-worktree", "m2"), ctx);
-    const ok = posts().find((t) => t.includes("[ok] worktree "));
+    const ok = posts().find((t) => unwarped(t).includes("[ok] worktree "));
     expect(ok).toBeDefined();
     expect(ok!.startsWith("```")).toBe(true);
-    expect(ok).toContain("branch pi-bg/");
-    expect(ok).toContain(path.join(tmp, "wt"));
+    expect(unwarped(ok!)).toContain("branch pi-bg/");
+    expect(unwarped(ok!).replace(/ /g, "")).toContain(path.join(tmp, "wt"));
     const st = loadWorktreeStateFile();
     expect(st).not.toBeNull();
     expect(st!.branch).toMatch(/^pi-bg\/\d{8}-\d{6}-\d{4}$/);
     expect(st!.path).toBe(path.join(tmp, "wt", path.basename(tmp), st!.id));
     // a second /new-worktree while one is active: refused
     await handleInbound(pi, inbound("/new-worktree", "m3"), ctx);
-    expect(posts().some((t) => t.includes("[!] worktree already active"))).toBe(
-      true,
-    );
+    expect(
+      posts().some((t) => unwarped(t).includes("[!] worktree already active")),
+    ).toBe(true);
     // work on the worktree, then merge
     fs.writeFileSync(path.join(st!.path, "feature.txt"), "x\n");
     git(st!.path, "add", "feature.txt");
     git(st!.path, "commit", "-m", "feat");
     await handleInbound(pi, inbound("/merge-worktree", "m4"), ctx);
-    const merged = posts().find((t) => t.includes("[ok] merged "));
+    const merged = posts().find((t) => unwarped(t).includes("[ok] merged "));
     expect(merged).toBeDefined();
-    expect(merged).toContain("into main (merge)");
+    expect(unwarped(merged!)).toContain("into main (merge)");
     expect(fs.existsSync(path.join(tmp, "feature.txt"))).toBe(true);
     expect(fs.existsSync(st!.path)).toBe(false);
     expect(git(tmp, "branch", "--list", st!.branch)).toBe("");
@@ -8707,11 +8726,13 @@ describe("wave 2c bridge commands", () => {
   test("/new-worktree: non-git repo is a [!] line; /merge-worktree with no state", async () => {
     // no git repo in tmp
     await handleInbound(pi, inbound("/new-worktree", "m1"), ctx);
-    expect(posts().some((t) => t.includes("[!] not a git repo"))).toBe(true);
+    expect(
+      posts().some((t) => unwarped(t).includes("[!] not a git repo")),
+    ).toBe(true);
     await handleInbound(pi, inbound("/merge-worktree", "m2"), ctx);
-    expect(posts().some((t) => t.includes("[!] no active worktree"))).toBe(
-      true,
-    );
+    expect(
+      posts().some((t) => unwarped(t).includes("[!] no active worktree")),
+    ).toBe(true);
   });
 
   function loadWorktreeStateFile() {

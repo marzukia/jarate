@@ -156,11 +156,12 @@ fi
 
 # --- 3. pointer links --------------------------------------------------------
 # Dispatch family (issue #150 + #151): 5 jarate-* entrypoints + 5 pi-*
-# deprecation shims, linked into BOTH ~/.local/bin and ~/scripts. install.sh
-# OWNS these names: stale entries (pi-dispatch-era files, symlinks to old
-# checkouts) are re-pointed, one auditable line per change.
+# deprecation shims + pi-postcheck.sh (polish sweep C1), linked into BOTH
+# ~/.local/bin and ~/scripts. install.sh OWNS these names: stale entries
+# (pi-dispatch-era files, symlinks to old checkouts) are re-pointed, one
+# auditable line per change.
 for tool in jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog \
-            pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog; do
+            pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh; do
   link_owned "$HOME/.local/bin/$tool" "$JARATE_DIR/dispatch/$tool"
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
@@ -180,7 +181,7 @@ link_into "$HOME/bin/jarate-vault"   "$JARATE_DIR/bin/jarate-vault"
 # never dispatch a job. Hard fail outside dry-run.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog"
+FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh"
 for tool in $FAMILY_TOOLS agent-say jarate jarate-pat jarate-diff jarate-vault; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
@@ -199,7 +200,7 @@ for tool in $FAMILY_TOOLS agent-say jarate jarate-pat jarate-diff jarate-vault; 
     # loudly instead of at dispatch time.
     case "$tool" in
       jarate-bg|jarate-wait|jarate-bg-tail|jarate-bg-kill|jarate-bg-watchdog|\
-      pi-bg|pi-wait|pi-bg-tail|pi-bg-kill|pi-bg-watchdog) ;;
+      pi-bg|pi-wait|pi-bg-tail|pi-bg-kill|pi-bg-watchdog|pi-postcheck.sh) ;;
       *) continue ;;
     esac
     sum_installed="$(sha256sum "$resolved" 2>/dev/null | cut -d' ' -f1 || true)"

@@ -30,6 +30,12 @@
 #   pat-request <scope> <reason>  ask the channel owner for a GitHub PAT (JSON doc; rc 0/1/2)
 #   pat-run <id> -- <cmd> [args]  run one command under the approved token (child rc; 124 on cap)
 #   pat-status [id]               read-only PAT request state (never prints the token)
+#   vault-request <kind> <name> <level> [flags] <reason...>
+#                               ask the channel owner for a credential (JSON doc; rc 0/1/2)
+#   vault-run <id> -- <cmd> [args]  run one command under the approved credential (child rc; 124 on cap)
+#   vault-status [id]             read-only vault request state (never prints the credential)
+#   vault-revoke <id>             revoke an approved request
+#   vault-audit [n]               last n audit-log entries (default 20)
 #
 # Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
 # Callers use $HOME/bin/jarate — do not rely on PATH.
@@ -754,8 +760,11 @@ for a in agents:
             continue
         b = buckets.setdefault(proj, {
             "runs": 0, "workers": 0, "reviewers": 0,
-            "tokens": {"input": 0, "output": 0, "cacheRead": 0,
-                       "cacheWrite": 0, "total": 0},
+            # C6 (polish sweep): OUTPUT keys are snake_case (the JSON
+            # discipline above). Run RECORDS stay camelCase - no
+            # historical migration; the sum loop maps the names.
+            "tokens": {"input": 0, "output": 0, "cache_read": 0,
+                       "cache_write": 0, "total": 0},
             "costs": [], "first": None, "last": None,
         })
         b["runs"] += 1
@@ -767,7 +776,10 @@ for a in agents:
         t = r.get("tokens")
         if isinstance(t, dict):
             for k in b["tokens"]:
-                v = t.get(k)
+                # records carry camelCase; the output keys are snake_case
+                src = ("cacheRead" if k == "cache_read"
+                       else "cacheWrite" if k == "cache_write" else k)
+                v = t.get(src)
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     b["tokens"][k] += v
         c = r.get("cost_usd")
@@ -786,8 +798,8 @@ for a in agents:
 if pfilter and pfilter not in buckets:
     buckets[pfilter] = {
         "runs": 0, "workers": 0, "reviewers": 0,
-        "tokens": {"input": 0, "output": 0, "cacheRead": 0,
-                   "cacheWrite": 0, "total": 0},
+        "tokens": {"input": 0, "output": 0, "cache_read": 0,
+                   "cache_write": 0, "total": 0},
         "costs": [], "first": None, "last": None,
     }
 rows = []

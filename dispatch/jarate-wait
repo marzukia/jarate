@@ -48,7 +48,24 @@ for m in json.loads(os.environ["MSGS"]):
     if a == bot:
         continue  # my own messages
     if m.get("webhook_id") and a == wa:
-        print("0\t" + m["id"] + "\t" + (m.get("content") or ""))
+        # B1 (polish sweep): an embed-only callback (pi-bg Variant D)
+        # carries no top-level content. Serialize the first embed the
+        # way the bridge does (title + description + fields) so the
+        # waiting agent gets the framed result, not an empty detail line.
+        c = m.get("content") or ""
+        if not c:
+            e = (m.get("embeds") or [{}])[0]
+            lines = []
+            if e.get("title"):
+                lines.append(e["title"])
+            if e.get("description"):
+                lines.append(e["description"])
+            for f in e.get("fields") or []:
+                nm = f.get("name") or ""
+                if nm:
+                    lines.append(nm + ": " + (f.get("value") or ""))
+            c = "\n".join(lines)
+        print("0\t" + m["id"] + "\t" + c)
         break
     name = m.get("author", {}).get("global_name") or m.get("author", {}).get("username", "")
     print("2\t" + m["id"] + "\t" + name)

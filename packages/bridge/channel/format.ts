@@ -639,13 +639,24 @@ export function styleGuard(md: string): string {
     const line = lines[i]!;
     const open = fenceRun(line);
     if (open > 0) {
-      // existing fence: pass delimiter + body through verbatim; the
-      // closer is the first fence line at least as long as the opener
-      // (a ``` line nested in a ```` fence is body, not a closer)
+      // existing fence: pass delimiter + body through; the closer is the
+      // first fence line at least as long as the opener (a ``` line nested
+      // in a ```` fence is body, not a closer). A2 (polish sweep): the body
+      // of an UNTAGGED existing fence is wrapped to the 40-col budget the
+      // same way the fence this pass creates is (command builders like
+      // /help, /tasks list, /sleep list emit pre-fenced >40-col lines).
+      // Language-tagged fences stay verbatim: the continuation indent
+      // breaks code semantics (same rule as wrapFenceLines).
+      const lang = line.trimStart().slice(open).trim().split(/\s+/)[0] || "";
       out.push(line);
       i++;
       while (i < lines.length && fenceRun(lines[i]!) < open) {
-        out.push(lines[i]!);
+        const bl = lines[i]!;
+        if (lang === "" && bl.length > FRAME_COL_MAX) {
+          out.push(...wrapFenceLine(bl, FRAME_COL_MAX));
+        } else {
+          out.push(bl);
+        }
         i++;
       }
       if (i < lines.length) {

@@ -503,15 +503,19 @@ export function formatSessionStats(
   entryCount: number | null,
 ): string {
   if (!sessionFile) return "unknown";
-  let sizeMB = "";
+  // C5 (polish sweep): build each stat as a self-contained paren group.
+  // The old form left a stray ")" when statSync failed ("/path)" or
+  // "/path, 123 entries)") - the close paren belonged to the size group
+  // but the group was absent.
+  let stats = "";
   try {
     const size = fs.statSync(sessionFile).size;
-    sizeMB = ` (${(size / (1024 * 1024)).toFixed(1)}MB`;
+    stats = ` (${(size / (1024 * 1024)).toFixed(1)}MB)`;
   } catch {
-    sizeMB = "";
+    // stat failed: omit the size, keep the path clean
   }
-  const entries = entryCount != null ? `, ${entryCount} entries` : "";
-  return `${sessionFile}${sizeMB}${entries})`;
+  const entries = entryCount != null ? ` (${entryCount} entries)` : "";
+  return `${sessionFile}${stats}${entries}`;
 }
 
 // ─── Transcript + LLM prompt ────────────────────────────────────────────────
@@ -931,13 +935,17 @@ const GUARD_PROTECTED = [
   "State (machine)",
   "user asks",
 ];
-/** Condense order: retired/cheap-to-lose content first. */
+/** Condense order: retired/cheap-to-lose content first. Transcript is LAST
+ *  (B2, polish sweep): it is the raw conversation content, not prose
+ *  metadata - only the actual exchange gets condensed, and only after
+ *  every LLM section is already at its 40% floor. */
 const GUARD_CONDENSE_ORDER = [
   "Done",
   "Open follow-ups",
   "Blockers",
   "Decisions & Rationale",
   "Mission",
+  "Transcript",
 ];
 
 function condenseBody(body: string): string {

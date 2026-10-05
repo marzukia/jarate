@@ -1184,7 +1184,7 @@ export function setHeld(chId: string, on: boolean): void {
 /**
  * v3 message style (mockup3, 2026-09-13): state glyphs ┘ ┣ ├ ┤, `·`
  * separators, ASCII words, no emoji/arrows/em-dashes/dingbats, and every
- * rendered line fits the 32-col mobile budget (FRAME_COL_MAX).
+ * rendered line fits the 40-col mobile budget (FRAME_COL_MAX).
  */
 
 /** Hard mobile budget for rendered frame lines (mockup3). */
@@ -1403,7 +1403,7 @@ export function runFrame(
  *  `│ ~219.9k tok · ~$0.042` (lowercase k, 3-decimal est. cost, same
  *  pricing as ~/scripts/pi-token-cost.py). null when the run carried no
  *  billable usage. Already carries the `│ ` prefix; the frame clips it
- *  to the 32-col budget. */
+ *  to the 40-col budget. */
 export function runUsageLine(s: UsageStats): string | null {
   const total = s.input + s.output + s.cacheRead + s.cacheWrite;
   if (total <= 0) return null;
@@ -3092,7 +3092,7 @@ export default function (pi: ExtensionAPI) {
         const secs = Math.round((Date.now() - runStartedAt) / 1000);
         const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
         // #40: run usage as the trailing frame line (append-only, before
-        // the closing bar; same 32-col budget as every other line).
+        // the closing bar; same 40-col budget as every other line).
         const trailing = runUsageLine(runStats) ?? undefined;
         // live-frame unification: the morph edits the SAME working message
         // in place — only the header flips. fence() keeps the box glyphs
@@ -4448,7 +4448,7 @@ async function runChannelCommand(
       // #48: what is eating the window: top-N items by token ESTIMATE
       // (char/4, no model, no pricing) + category totals. Read-only, open
       // to all like /usage. Session discovery is the same /undo path;
-      // frame (32-col budget) is built by renderContext, errors are one
+      // frame (40-col budget) is built by renderContext, errors are one
       // [!] line, no stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
@@ -4937,7 +4937,7 @@ async function runChannelCommand(
           .map((b) => {
             const name = names.get(b.channelId) || b.channelId;
             const open = openCount(b.todos);
-            // header fits the 32-col budget: channel names run up to
+            // header fits the 40-col budget: channel names run up to
             // 100 chars, so clip the name (never the count or glyph)
             const suffix = ` · ${open} open`;
             return `┌ ${fit(name, FRAME_COL_MAX - 2 - suffix.length)}${suffix}\n${b.todos

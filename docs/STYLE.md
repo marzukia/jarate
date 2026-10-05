@@ -2,7 +2,8 @@
 
 Applies to: monky Discord replies, pi-bg embeds, slash-command output.
 Source of truth for the format rules; AGENTS.md "Voice" points here.
-Last revised: 2026-09-15 (frame gap rule + injection decision).
+Last revised: 2026-10-05 (2.3a raw-log exception; 4.2 rewritten to defer
+to 2.7 - PENDING APPROVAL).
 
 ## 1 Language
 1.1 Serious / task talk: ASD-STE100. Simple words, short sentences,
@@ -19,7 +20,7 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
     continue with two spaces. Both gutters are 2 cols. (operator 2026-09-16,
     screenshot: bare 2-space wraps under ├ read as detached.)
 2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on the operator's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
-2.3a A frame is for SHORT machine state only (a few lines: status, a single command result, a small box). Do NOT put long lists, tables, or triage inside a frame - the monospace box wraps at ~31 cols in Discord's normal (non-zoomed) view and becomes unreadable. For content longer than ~6 lines or with many rows, use plain bullets (no box) instead. If a frame must carry more, keep every row <= ~30 cols so it survives the normal view.
+2.3a A frame is for SHORT machine state only (a few lines: status, a single command result, a small box). Do NOT put long lists, tables, or triage inside a frame - the monospace box wraps at ~31 cols in Discord's normal (non-zoomed) view and becomes unreadable. For content longer than ~6 lines or with many rows, use plain bullets (no box) instead. If a frame must carry more, keep every row <= ~30 cols so it survives the normal view. Exception (2026-10-05, polish sweep C9): a RAW LOG LINE (systemd/journal error) inside a fence is hard-capped at 160 chars, not wrapped - wrapping would mangle the line the operator is grepping for; pi-postcheck applies this cap.
 2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra context, follow-ups, or prose go BEFORE the frame, never after. (A line after `└` breaks the box and reads as detached.)
 2.5 Blank line before a fence: yes. Blank line after a fence: only if the
     message ends. If text must follow the fence, use a SINGLE newline
@@ -39,8 +40,11 @@ Last revised: 2026-09-15 (frame gap rule + injection decision).
 ## 4 Tool output (jarate + jarate-bg)
 4.1 jarate stdout: ONE JSON document, snake_case, no color, no emoji.
     (docs/JARATE.md)
-4.2 Slash commands: bracketed tag + one line, fenced only when the
-    content is multi-line. (docs/COMMANDS.md tag table)
+4.2 Slash commands: defer to 2.7 - EVERY /command reply ships in a code
+    fence (success, error, and usage paths alike); bracketed tag + short
+    lines inside. (docs/COMMANDS.md tag table) [PENDING APPROVAL
+    2026-10-05, polish sweep D1: the old "fenced only when the content is
+    multi-line" clause contradicted 2.7, which superseded it.]
 4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
     (docs/DISPATCH.md)
 4.4 Machine output posted to Discord (script errors, command output,

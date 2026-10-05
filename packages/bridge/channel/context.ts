@@ -22,8 +22,9 @@
  * entry id, the same guard as /usage's assistant dedup. Non-conversation
  * entries (session, compaction, model_change, ...) are not counted.
  *
- * The frame obeys the 32-col mobile budget (FRAME_COL_MAX): box-drawing,
- * ASCII tags, no emoji.
+ * The frame obeys the 40-col mobile budget (FRAME_COL_MAX); item rows
+ * are laid out at 32 or under for compactness. Box-drawing, ASCII tags,
+ * no emoji.
  */
 
 import { FRAME_COL_MAX } from "./frame";
@@ -71,7 +72,7 @@ function ctxHeader(shown: number, total: number, tok: string): string {
   return `┌ top ${shown}/${mm} · total ${tok}`;
 }
 
-/** Compact age: 45s / 12m / 3h12m / 1d3h (max 6 chars, 32-col budget).
+/** Compact age: 45s / 12m / 3h12m / 1d3h (max 6 chars, 32-col row layout).
  *  Zero sub-units drop: 1h not 1h0m. */
 export function fmtAge(ms: number): string {
   let s = Math.floor(ms / 1000);
@@ -237,7 +238,8 @@ export async function scanContextFile(file: string): Promise<CtxScan> {
 
 /**
  * Build the /context frame (WITHOUT the outer code fence — the caller
- * wraps it). Every line stays within the 32-col mobile budget.
+ * wraps it). Every line stays within the 40-col mobile budget (rows are
+ * laid out at 32 or under).
  *
  * @param scan    parsed session items
  * @param n       requested top-N (already validated)
@@ -252,7 +254,7 @@ export function formatContext(
   const shown = Math.min(n, items.length);
   const L: string[] = [];
   L.push("[context] est tokens (char/4)");
-  // header re-layout (32-col budget): "top 5/5" + k-form total; the
+  // header re-layout (32-col row layout): "top 5/5" + k-form total; the
   // old "top 5 of 1234 items" breached 32 with M in the thousands
   L.push(ctxHeader(shown, items.length, fmtTokens(estTokens(totalChars))));
   const date =
