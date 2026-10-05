@@ -61,10 +61,13 @@ end=$(( $(date +%s) + timeout ))
 while [ "$(date +%s)" -lt "$end" ]; do
   # #117: a failed poll (curl rc, or Discord answering with a non-JSON body
   # that breaks the parse) skips this iteration; the deadline still bounds
-  # the wait, so the rc contract (0/2/3) holds.
+  # the wait, so the rc contract (0/2/3) holds. #166 review LOW: python
+  # parse errors are suppressed (2>/dev/null, same as the startup fetch)
+  # so a sustained 429/502 prints no traceback per poll - stdout and the
+  # rc contract are untouched.
   event=""
   if msgs="$(discord_get "https://discord.com/api/v10/channels/${channel}/messages?after=${since}&limit=50")"; then
-    event="$(MSGS="$msgs" python3 - "$wa" "$botid" <<'EOF'
+    event="$(MSGS="$msgs" python3 - "$wa" "$botid" 2>/dev/null <<'EOF'
 import json, os, sys
 wa, bot = sys.argv[1], sys.argv[2]
 for m in json.loads(os.environ["MSGS"]):
