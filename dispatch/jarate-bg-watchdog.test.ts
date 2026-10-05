@@ -1005,3 +1005,190 @@ describe("watchdog #52: STALLED classification (live process, stale hb)", () => 
     }
   }, 30_000);
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// #142: HUNG detection (alive tree, quiet session)
+//
+// The exit-only webhook makes a hung pi invisible: the hb child keeps
+// touching while the wrapper lives, so DEAD (needs the process gone) and
+// STALLED (needs the hb stale) both miss a session wedged in a bash tool
+// call (incident 20261004-140606-286112: 5h51m, fresh hb, tree alive).
+// HUNG = alive + profile session jsonl unwritten > PI_BG_HUNG_MIN (30).
+// One HUNG per run (record flag, written only after a successful post),
+// never kills (a later DIED must still fire).
+describe("#142: HUNG detection (alive tree, quiet session)", () => {
+  const HT = (n: number) => `2026010${n}-030405-999`;
+
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  #142 hung test\n`,
+    );
+
+  // plant a cwd-run ticket: run record (started 2h ago, state=running),
+  // ticket cgroup, profile session jsonl, heartbeat file
+  const plant = (
+    f: ReturnType<typeof fixture>,
+    t: string,
+    o: { jsonlAgeMin: number; hbAgeMin: number; livePid?: string | null },
+  ): void => {
+    const recDir = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${t}.json`),
+      JSON.stringify({
+        run: t,
+        profile: "worker",
+        project: null,
+        cwd: f.tmp, // cwd run: pi launched in the launcher cwd
+        started: new Date(Date.now() - 2 * 60 * 60 * 1000)
+          .toISOString()
+          .replace(".000Z", "Z"),
+        delivery: "webhook",
+        state: "running",
+      }),
+    );
+    const cg = path.join(f.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(
+      path.join(cg, "cgroup.procs"),
+      o.livePid ? `${o.livePid}\n` : "",
+    );
+    // age the cgroup dir past the reaper's young guard (5m)
+    const old = new Date(Date.now() - 30 * 60 * 1000);
+    fs.utimesSync(cg, old, old);
+    // profile session jsonl for the run's pi cwd (same slug as jarate-bg)
+    const slug = `--${f.tmp.slice(1).replace(/\//g, "-")}--`;
+    const sd = path.join(f.home, ".pi", "agent-worker", "sessions", slug);
+    fs.mkdirSync(sd, { recursive: true });
+    const jf = path.join(sd, "sess.jsonl");
+    fs.writeFileSync(jf, "{}\n");
+    const jm = new Date(Date.now() - o.jsonlAgeMin * 60 * 1000);
+    fs.utimesSync(jf, jm, jm);
+    // heartbeat file
+    const hb = path.join(f.art, `pi-bg-${t}-hb`);
+    fs.writeFileSync(hb, "");
+    const hm = new Date(Date.now() - o.hbAgeMin * 60 * 1000);
+    fs.utimesSync(hb, hm, hm);
+  };
+
+  const rec = (f: ReturnType<typeof fixture>, t: string) =>
+    JSON.parse(
+      fs.readFileSync(
+        path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+
+  test("live process + 35m-quiet jsonl + fresh hb -> HUNG post, flag, no kill", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      bless(f);
+      const t = HT(1);
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(f, t, { jsonlAgeMin: 35, hbAgeMin: 0, livePid: String(sleep.pid) });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`HUNG cwd/${t}`);
+      expect(f.posts).toHaveLength(1);
+      const e = f.posts[0].embeds[0];
+      // title carries HUNG + run id; red = alive but stuck (as STALLED)
+      expect(e.title).toBe(`HUNG · ${t}`);
+      expect(e.color).toBe(15158332);
+      expect(e.author.name).toBe(`pi-bg ticket · ${t}`);
+      // evidence: run id, the sleep child (hang candidate), silence age
+      expect(e.description).toContain(t);
+      expect(e.description).toContain("sleep");
+      expect(e.description).toContain("no session write");
+      for (const line of e.description.split("\n")) {
+        if (line.startsWith("```")) continue;
+        expect(
+          Array.from(line).length,
+          `frame line too wide: ${line}`,
+        ).toBeLessThanOrEqual(40);
+      }
+      // once-flag set in the run record; state untouched (no kill)
+      expect(rec(f, t).hungNotified).toBe(true);
+      expect(rec(f, t).state).toBe("running");
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
+
+  test("fresh jsonl (1m) + live process -> not HUNG, no flag", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      bless(f);
+      const t = HT(2);
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(f, t, { jsonlAgeMin: 1, hbAgeMin: 0, livePid: String(sleep.pid) });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("HUNG cwd/");
+      expect(f.posts).toHaveLength(0);
+      expect(rec(f, t).hungNotified).toBeUndefined();
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
+
+  test("dead process + quiet jsonl -> DIED path owns it, no HUNG", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = HT(3);
+      plant(f, t, { jsonlAgeMin: 35, hbAgeMin: 15, livePid: null });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // the dead cwd ticket is a DIED (cwd sweep), not a HUNG
+      expect(r.out).toContain(`DEAD cwd/${t}`);
+      expect(r.out).not.toContain("HUNG cwd/");
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].embeds[0].title).toBe("DEAD · watchdog sweep");
+      // record marked killed by the cwd sweep; no hungNotified
+      expect(rec(f, t).state).toBe("killed");
+      expect(rec(f, t).hungNotified).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("no repost: second sweep sees the hungNotified flag", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      bless(f);
+      const t = HT(4);
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(f, t, { jsonlAgeMin: 35, hbAgeMin: 0, livePid: String(sleep.pid) });
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`HUNG cwd/${t}`);
+      expect(f.posts).toHaveLength(1);
+      // sweep again: same conditions, flag set -> detected, not reposted
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`HUNG cwd/${t}`);
+      expect(f.posts).toHaveLength(1);
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
+});

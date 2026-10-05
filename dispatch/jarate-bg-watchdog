@@ -44,6 +44,19 @@
 #       state=killed, empty cgroup reaped via the guarded cgroup.kill
 #       (cgroup.kill is only ever written when cgroup.procs is empty -
 #       issue #86).
+#   4d. HUNG (issue #142): a LIVE run whose profile session jsonl has no
+#       write for > PI_BG_HUNG_MIN (default 30) min. DEAD needs the process
+#       gone; STALLED needs the hb stale - but the hb child keeps touching
+#       while the wrapper lives, so a pi session wedged in a bash tool
+#       call (20261004-140606-286112: pi -> bash -> sshpass -> ssh, 5h51m,
+#       fresh hb, tree alive) was invisible. HUNG posts a red embed (same
+#       webhook/channel as DIED) with run id, last jsonl write, silence
+#       age, last hb time, and the longest-lived process in the pi tree
+#       (pstree - the hang candidate). At most ONE HUNG per run: a
+#       hungNotified flag in the run record (written only after a
+#       successful post, so a dead webhook retries next sweep). NEVER
+#       kills: HUNG informs + wakes; if the process later dies the
+#       existing DIED path fires unchanged.
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -54,6 +67,8 @@
 #   (no webhook configured = sweep still runs, posts skipped)
 # env:
 #   PI_BG_STALL_MIN    stale-heartbeat threshold, min (default 10, issue #52)
+#   PI_BG_HUNG_MIN     stale-session-write threshold, min (default 30,
+#                      issue #142)
 #   PI_BG_PRUNE_DAYS   run-record prune age, days (default 7, 0 = off, #51)
 #   PI_BG_WT_PRUNE_DAYS killed-worktree prune age, days (default 7, 0 = off)
 # args:
@@ -485,6 +500,247 @@ PY
 fi
 [ "$cwd_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $cwd_found dead cwd ticket(s)"
 
+# ─── HUNG sweep (issue #142): alive tree, quiet session ────────────────────────
+# HUNG = ALL of:
+#   - run record state=running WITHOUT the hungNotified flag (at most ONE
+#     HUNG per run; the flag is written only after a successful post, so a
+#     dead webhook retries on the next sweep - drift pattern)
+#   - the process tree is ALIVE: a ticket-cgroup member, or a same-user
+#     process in the ticket's worktree dir (same liveness as is_live)
+#   - the profile session jsonl for the run's pi cwd (newest after the
+#     record's started ts, same discovery as jarate-bg bg_session_file)
+#     has no write for > HUNG_MIN min (default 30, PI_BG_HUNG_MIN)
+# On HUNG: red embed (same webhook + post path as DIED; red = alive but
+# stuck, as STALLED - DEAD is orange) + stdout line. NEVER kills: HUNG
+# informs + wakes; the existing DIED path fires unchanged if the process
+# later dies (the flag does not touch state).
+HUNG_MIN="${PI_BG_HUNG_MIN:-30}"
+case "$HUNG_MIN" in
+  '' | *[!0-9]*) HUNG_MIN=30 ;;
+esac
+[ "$HUNG_MIN" -ge 1 ] || HUNG_MIN=30
+
+# cg_members <ticket>: pids held by the ticket cgroup. Fake-file test
+# roots (plain cgroup.procs files) read the same way as cgroupfs.
+cg_members() {
+  local d="$CG_DIR/$1"
+  { cat "$d/cgroup.procs" 2>/dev/null; cat "$d/cgroup.threads" 2>/dev/null; } | tr -s '[:space:]' '\n' | grep -E '^[0-9]+$'
+}
+
+# hung_root <ticket>: the process to hang-tree from = the OLDEST member.
+# In a real run the wrapper joined the ticket cgroup first (then pi, then
+# the hb child), so it is the oldest; the pstree from it covers the whole
+# tree. A leaked pi (wrapper gone) or a test cgroup with a bare child
+# degrades gracefully: the oldest member stands in. No members -> prints
+# nothing (caller degrades gracefully).
+hung_root() {
+  local t="$1" p e root et
+  root=""; et=-1
+  for p in $(cg_members "$t"); do
+    e="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')" || continue
+    [ -n "$e" ] && [ "$e" -gt "$et" ] && { et="$e"; root="$p"; }
+  done
+  [ -n "$root" ] && echo "$root"
+  return 0
+}
+
+# hung_child <root>: the hang candidate in the root's tree. Longest-lived
+# process among the root's DESCENDANTS (the wrapper itself is bookkeeping,
+# not the hang - skip it when descendants exist); the root stands in when
+# it has no descendants (a bare hung pi, or a test cgroup). Prints
+# "<pid> <comm> <etimes-s> <cmdline>"; nothing when the root is gone.
+hung_child() {
+  local root="$1" p c e best="" beste=-1
+  # one pass over /proc for the whole-box ppid map. comm (field 2 of
+  # /proc/<pid>/stat, parenthesized) may contain spaces, so strip through
+  # the LAST ')' (greedy) and take $2 of the remainder (state $1, ppid $2)
+  local ppid_map
+  ppid_map="$(awk '{ line = $0; sub(/^.*) /, "", line); split(line, a, " "); if (a[2] != "") print FILENAME, a[2] }' /proc/[0-9]*/stat 2>/dev/null \
+    | sed -E 's|^/proc/([0-9]+)/stat[[:space:]]+(.*)$|\1 \2|')"
+  local -A kids=()
+  while read -r c e; do
+    [ -n "$c" ] && [ -n "$e" ] && kids["$e"]+=" $c"
+  done <<< "$ppid_map"
+  local -a stack=("$root")
+  local seen=""  # descendants only (root excluded: bookkeeping)
+  while [ "${#stack[@]}" -gt 0 ]; do
+    p="${stack[0]}"; stack=("${stack[@]:1}")
+    for c in ${kids["$p"]:-}; do
+      case " $seen " in *" $c "*) continue ;; esac
+      seen+="$c "
+      stack+=("$c")
+    done
+  done
+  if [ -z "${seen// /}" ]; then
+    seen="$root"  # no descendants: the root itself is the candidate
+  fi
+  for p in $seen; do
+    [ -d "/proc/$p" ] || continue
+    e="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')" || continue
+    [ -n "$e" ] && [ "$e" -gt "$beste" ] && { beste="$e"; best="$p"; }
+  done
+  [ -n "$best" ] || return 0
+  local comm cmd
+  comm="$(ps -o comm= -p "$best" 2>/dev/null | head -1)"
+  cmd="$(tr '\0' ' ' < "/proc/$best/cmdline" 2>/dev/null | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')"
+  printf '%s %s %s %s\n' "$best" "${comm:-?}" "$beste" "${cmd:-${comm:-?}}"
+}
+
+# wd_build_hung <body-file> <ticket> <repo> <jsonl-last> <silent-min> <hb-last>
+# <child-line> <child-cmd> <tree>
+# Frame obeys the 40-col mobile budget (FRAME_W, docs/STYLE.md 2.3); the
+# raw pstree wraps to the 29-col value budget with the 2.2 continuation
+# gutter. Title carries HUNG + run id (task spec); the full ticket also
+# stays in the author name (pi-bg convention).
+wd_build_hung() {
+  local bodyfile="$1" t="$2" repo="$3" jlast="$4" silent="$5" hblast="$6" child="$7" ccmd="$8" tree="$9"
+  WD_H_T="$t" WD_H_REPO="$repo" WD_H_JLAST="$jlast" WD_H_SILENT="$silent" \
+  WD_H_HB="$hblast" WD_H_CHILD="$child" WD_H_CMD="$ccmd" WD_H_TREE="$tree" \
+  python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("WD_H_" + k, "")
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
+VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def kv(key, val):
+    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
+def wrap(s, width):
+    out = []
+    for line in str(s).splitlines():
+        while len(line) > width:
+            out.append(line[:width])
+            line = line[width:]
+        out.append(line)
+    return out
+t = E('T')
+lines = ["\u250c hung \u00b7 " + t,
+         "\u251c $ jarate-bg-watchdog",
+         kv("repo", E('REPO') or "cwd"),
+         kv("jsonl", E('JLAST')),
+         kv("silent", str(E('SILENT')) + "m no session write"),
+         kv("hb", E('HB')),
+         kv("child", E('CHILD')),
+         kv("cmd", E('CMD'))]
+tree = [l for l in wrap(E('TREE'), VAL_W) if l]
+if tree:
+    lines.append("\u251c tree   : " + clip_end(tree[0], VAL_W))
+    for cont in tree[1:]:
+        lines.append("\u2502 " + clip_end(cont, VAL_W - 1))
+lines.append("\u2514")
+embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
+         "color": 15158332,  # red: alive but stuck (as STALLED; DEAD is orange)
+         "title": f"HUNG \u00b7 {t}",
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg watchdog (hung)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+}
+
+hung_found=0
+if [ -d "$rec_dir" ]; then
+  while IFS=$'\t' read -r rt rprof rcwd rstart; do
+    [ -n "$rt" ] || continue
+    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [ -n "$rstart" ] || continue    # no started ts -> session not discoverable
+    # worktree run? the ticket dir under $WT_DIR (same layout as the main
+    # sweep) - liveness + the pi cwd (pi runs in the worktree, not the
+    # launcher cwd)
+    wt=""; repo="cwd"
+    for cand in "$WT_DIR"/*/"$rt"; do
+      if [ -d "$cand" ]; then wt="$cand"; repo="$(basename "$(dirname "$cand")")"; break; fi
+    done
+    is_live "$rt" "$wt" || continue  # dead run -> DIED paths own it
+    piscwd="$wt"; [ -n "$piscwd" ] || piscwd="$rcwd"
+    [ -n "$piscwd" ] || continue
+    slug="--${piscwd#/}"; slug="${slug//\//-}--"
+    sd="$HOME/.pi/agent-${rprof}/sessions/$slug"
+    jf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$rstart" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    [ -n "$jf" ] || continue         # no session file -> not judgeable
+    jmt="$(stat -c %Y "$jf" 2>/dev/null)" || continue
+    now_h="$(date +%s)"
+    age=$(( now_h - jmt ))
+    [ "$age" -gt $(( HUNG_MIN * 60 )) ] || continue
+    # evidence: last jsonl write, silence age, last hb time, hang candidate
+    jlast="$(date -u -d "@$jmt" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || jlast="unknown"
+    silent_min=$(( age / 60 ))
+    hb_f="$BG_TMP/pi-bg-${rt}-hb"
+    [ -f "$hb_f" ] || hb_f="$LEGACY_TMP/pi-bg-${rt}-hb"
+    if [ -f "$hb_f" ]; then
+      hbm="$(stat -c %Y "$hb_f" 2>/dev/null)" || hbm=""
+      hblast="$(date -u -d "@${hbm:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || hblast="unknown"
+    else
+      hblast="unknown"
+    fi
+    child_fmt="unknown"; ccmd="unknown"; treeout=""
+    root="$(hung_root "$rt")"
+    if [ -n "$root" ]; then
+      childline="$(hung_child "$root")"
+      if [ -n "$childline" ]; then
+        cpid="${childline%% *}"; _rest="${childline#* }"
+        ccomm="${_rest%% *}"; _rest="${_rest#* }"
+        cet="${_rest%% *}"; ccmd="${_rest#* }"
+        child_fmt="${cpid} ${ccomm} up $(( ${cet:-0} / 60 ))m"
+      fi
+      if command -v pstree >/dev/null 2>&1; then
+        treeout="$(pstree -p "$root" 2>/dev/null)" || treeout=""
+      fi
+      [ -n "$treeout" ] || treeout="$childline"
+    fi
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would flag HUNG $repo/$rt (jsonl ${silent_min}m stale)"
+      continue
+    fi
+    echo "[pi-bg-watchdog] HUNG $repo/$rt (jsonl last $jlast, ${silent_min}m silent, child $child_fmt)"
+    # post now (no digest: per-box concurrency caps bound the count; each
+    # embed carries per-run evidence). Quiet = detect + log, no post, no
+    # flag (HUNG is not dead-log deduped: a dead-log line would suppress
+    # the later DIED post for the same ticket).
+    if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
+      bodyf="$BG_TMP/pi-bg-watchdog-hung-body.json"
+      wd_build_hung "$bodyf" "$rt" "$repo" "$jlast" "$silent_min" "$hblast" "$child_fmt" "$ccmd" "$treeout"
+      if [ -s "$bodyf" ]; then
+        if wd_post "$bodyf"; then
+          # once-flag only after a successful post (drift pattern): a dead
+          # webhook retries on the next sweep
+          python3 - "$rec_dir/pi-bg-${rt}.json" <<'PY' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["hungNotified"] = True
+json.dump(rec, open(p, "w"), indent=2)
+PY
+        fi
+      fi
+      rm -f "$bodyf"
+    fi
+    hung_found=$((hung_found + 1))
+  done < <(python3 - "$rec_dir" <<'PY' 2>/dev/null
+import glob, json, os, sys
+d = sys.argv[1]
+for f in sorted(glob.glob(os.path.join(d, "pi-bg-*.json"))):
+    try:
+        rec = json.load(open(f))
+    except Exception:
+        continue
+    if rec.get("state") != "running":
+        continue
+    if rec.get("hungNotified"):
+        continue
+    run = str(rec.get("run") or "")
+    if not run:
+        continue
+    print(f"{run}\t{rec.get('profile') or 'worker'}\t{rec.get('cwd') or ''}\t{rec.get('started') or ''}")
+PY
+  )
+fi
+[ "$hung_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $hung_found hung ticket(s)"
+
 # ─── empty cgroup reaper (2026-09-14, issue: pi-bg cgroup-dir leak) ─────────
 # A ticket dir that holds no process is a leak: a live run always keeps at
 # least the wrapper shell in its escape cgroup. Untrappable deaths (bun
@@ -726,5 +982,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0
