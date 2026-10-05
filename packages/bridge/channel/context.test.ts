@@ -312,12 +312,12 @@ describe("formatContext", () => {
     );
   });
 
-  test("every line stays within the 32-col mobile budget", async () => {
+  test("every line stays within the 40-col mobile budget", async () => {
     const s = await fiveItemScan();
     const now = Date.parse(T0) + 3600_000;
     const text = formatContext(s, CONTEXT_MAX_N, now);
     for (const line of text.split("\n"))
-      expect(line.length).toBeLessThanOrEqual(32);
+      expect(line.length).toBeLessThanOrEqual(40);
   });
 
   test("biggest line worst case: assistant toolCall + 999K stays <= 32", () => {

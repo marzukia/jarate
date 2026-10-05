@@ -10,6 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "bun";
+import { isBgWebhook } from "../packages/bridge/channel/discord";
 
 const PI_BG = path.join(import.meta.dir, "jarate-bg");
 
@@ -891,15 +892,18 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
 });
 
 /**
- * #86: launch-fail webhook. A --worktree launch-fail (not a git repo /
- * worktree add failed) exits 3 BEFORE the run record + bg_on_exit register,
- * so the early trap must post the DIED callback itself. The capture hook's
- * req.json() 500s on a non-JSON body (body stays null), so a captured body
- * is proof the payload is valid JSON - the Discord 400/50109 shape check.
+ * #86 + A1 (polish sweep): launch-fail webhook. A --worktree launch-fail
+ * (not a git repo / worktree add failed) exits 3 BEFORE the run record +
+ * bg_on_exit register, so bg_launch_fail posts the standard bg_build DIED
+ * embed itself - the payload's embed author ("pi-bg ticket · <rid>") is
+ * what isBgWebhook accepts on the bridge side, so the callback wakes the
+ * orchestrator. The capture hook's req.json() 500s on a non-JSON body
+ * (body stays null), so a captured body is proof the payload is valid JSON
+ * - the Discord 400/50109 shape check.
  */
 describe("#86: launch-fail webhook", () => {
   const capture = () => {
-    let body: { content: string } | null = null;
+    let body: any = null;
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -915,7 +919,7 @@ describe("#86: launch-fail webhook", () => {
     };
   };
 
-  test("not a git repo: rc 3 + DIED (launch) body is valid JSON with ticket id", async () => {
+  test("not a git repo: rc 3 + DIED embed payload passes isBgWebhook", async () => {
     const fx = fixture();
     const hook = capture();
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
@@ -927,13 +931,27 @@ describe("#86: launch-fail webhook", () => {
       expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
       const cap = hook.getBody();
       if (!cap) throw new Error("webhook not captured (or body was not JSON)");
-      expect(cap.content).toMatch(/DIED \(launch\)/);
-      expect(cap.content).toContain("[!] pi-bg");
       // ticket id: printed on the first stdout line, shape ^\d{8}-\d{6}-\d+$
       const m = r.out.match(/^\[pi-bg\] ticket (\S+)/);
       if (!m) throw new Error("no ticket line on stdout");
-      expect(m[1]).toMatch(/^\d{8}-\d{6}-\d+$/);
-      expect(cap.content).toContain(m[1]);
+      const rid = m[1] ?? "";
+      expect(rid).toMatch(/^\d{8}-\d{6}-\d+$/);
+      // A1: embed payload, not raw text - the embed author is the
+      // isBgWebhook discriminator (webhook_id is added by Discord on
+      // inbound, so the test supplies it).
+      const emb = cap.embeds?.[0];
+      expect(
+        emb,
+        `payload must be an embed: ${JSON.stringify(cap).slice(0, 200)}`,
+      ).toBeDefined();
+      expect(emb.author.name).toBe(`pi-bg ticket \u00b7 ${rid}`);
+      expect(emb.description).toContain(`\u250c died \u00b7 ${rid}`);
+      expect(emb.description).toContain("$ pi-bg worker --worktree");
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain(
+        "launch-fail: --worktree needs a git repo",
+      );
+      expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;
@@ -941,7 +959,7 @@ describe("#86: launch-fail webhook", () => {
     }
   });
 
-  test("git repo + bad ref: rc 3 + body has worktree add failed + ref name", async () => {
+  test("git repo + bad ref: rc 3 + embed result field has worktree add failed + ref name", async () => {
     const fx = fixture();
     const sh = (cmd: string) =>
       execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
@@ -961,8 +979,14 @@ describe("#86: launch-fail webhook", () => {
       expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
       const cap = hook.getBody();
       if (!cap) throw new Error("webhook not captured (or body was not JSON)");
-      expect(cap.content).toContain("worktree add failed");
-      expect(cap.content).toContain(ref);
+      const emb = cap.embeds?.[0];
+      expect(emb).toBeDefined();
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain(
+        `launch-fail: worktree add failed ref=${ref}`,
+      );
+      expect(emb.author.name).toMatch(/^pi-bg ticket \u00b7 \d{8}-\d{6}-\d+$/);
+      expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;

@@ -96,10 +96,10 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       expect(lines.at(-2)).toBe("└");
       expect(lines.at(-1)).toBe("```");
       for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
-      expect(em.description).toContain("├ pids  : ");
+      expect(em.description).toContain("├ pids   : ");
       // wait seconds include list_tree's /proc scan time -> match shape only
-      expect(em.description).toMatch(/├ wait {2}: \d+s \(TERM->KILL\)/);
-      expect(em.description).toContain("├ state : killed on request");
+      expect(em.description).toMatch(/├ wait {3}: \d+s \(TERM->KILL\)/);
+      expect(em.description).toContain("├ state  : killed on request");
     } finally {
       victim.kill("SIGKILL");
       server.stop(true);

@@ -112,8 +112,17 @@ describe("watchdog AGENTS.md drift tripwire (alert-only, one warn per hash)", ()
       expect(f.posts).toHaveLength(1);
       const em = f.posts[0].embeds[0];
       expect(em.title).toBe("AGENTS.md drift");
+      // C9 (polish sweep): the raw drift line is fenced (not clipped to
+      // the 160 cap) and word-wrapped to the 40-col budget; the em-dash
+      // is an ASCII " - " (B3).
       expect(em.description).toBe(
-        `AGENTS.md drift: ${h8} since 2026-09-14T00:00:00Z \u2014 review + re-bless: jarate agents-bless "note"`,
+        [
+          "```",
+          `AGENTS.md drift: ${h8} since`,
+          `2026-09-14T00:00:00Z - review +`,
+          're-bless: jarate agents-bless "note"',
+          "```",
+        ].join("\n"),
       );
       // state = full drifted hash (dedupe key)
       expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
@@ -195,7 +204,8 @@ describe("watchdog AGENTS.md drift tripwire (alert-only, one warn per hash)", ()
       expect(f.posts).toHaveLength(1);
       const mtime = Math.floor(fs.statSync(f.agentsMd()).mtimeMs / 1000) * 1000;
       const ts = new Date(mtime).toISOString().replace(".000Z", "Z");
-      expect(f.posts[0].embeds[0].description).toContain(`since ${ts}`);
+      // wrapped fence: the ts leads its own line (C9)
+      expect(f.posts[0].embeds[0].description).toContain(`${ts} - review +`);
       expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
         f.sha("# law v1\n"),
       );
@@ -465,11 +475,11 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       // title drops the rid (24 chars cannot fit in 32 with the kind);
       // the full ticket stays in the author name (pi-bg convention)
       expect(em.title).toBe("SILENT \u00b7 watchdog sweep");
-      // note tail-clips to the 23-col value budget (head kept)
+      // note tail-clips to the 29-col value budget (head kept)
       expect(em.description).toContain("note   : silent death (issue");
-      // 32-col law: every code line of the embed fits the mobile budget
+      // 40-col law: every frame line of the embed fits the mobile budget
       for (const line of codeLines(em)) {
-        expect(line.length).toBeLessThanOrEqual(32);
+        expect(line.length).toBeLessThanOrEqual(40);
       }
       // closing fence on its own line: the last content line is exactly
       // the 32-col line measured above (not content + "```")
@@ -511,7 +521,7 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
         // note tail-clips; the head (classification) survives
         expect(em.description).toContain("no live process");
         for (const line of codeLines(em)) {
-          expect(line.length).toBeLessThanOrEqual(32);
+          expect(line.length).toBeLessThanOrEqual(40);
         }
         expect(em.description.endsWith("\n```")).toBe(true);
       }
@@ -542,7 +552,7 @@ describe("watchdog #57: SILENT classification (rc=1, no output, retry1)", () => 
       }
       expect(em.description).toContain("  SILENT \u00b7 last ");
       for (const line of codeLines(em)) {
-        expect(line.length).toBeLessThanOrEqual(32);
+        expect(line.length).toBeLessThanOrEqual(40);
       }
       expect(em.description.endsWith("\n```")).toBe(true);
     } finally {
@@ -642,7 +652,7 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       expect(em.description).toContain("repo   : cwd");
       expect(em.description).toContain("cwd run: cgroup empty");
       for (const line of codeLines(em)) {
-        expect(line.length).toBeLessThanOrEqual(32);
+        expect(line.length).toBeLessThanOrEqual(40);
       }
       // record marked killed (stops lying "running")
       const rec = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
@@ -742,6 +752,102 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
         "running",
       );
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+});
+
+/**
+ * #52: STALLED classification (issue #52). A LIVE ticket (cgroup member)
+ * whose heartbeat is stale > STALL_MIN min is hung, not dead: distinct
+ * red embed (DEAD is orange), one alert per ticket per day (dead log
+ * dedupe), no record state change (the run is alive).
+ */
+describe("watchdog #52: STALLED classification (live process, stale hb)", () => {
+  const TID = (n: number) => `20991231-235957-${600 + n}`;
+
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  stalled test\n`,
+    );
+
+  test("live cgroup + stale hb -> STALLED embed (red), deduped, no re-post", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(1);
+      // worktree dir (fresh mtime is fine: liveness is checked first)
+      const wt = path.join(f.tmp, "wt", "jarate", t);
+      fs.mkdirSync(wt, { recursive: true });
+      // live member in the ticket cgroup (fake root: plain file;
+      // CG_DIR = $PI_BG_CG_ROOT/pi-bg, same layout as the reaper tests)
+      const cg = path.join(f.tmp, "cg", "pi-bg", t);
+      fs.mkdirSync(cg, { recursive: true });
+      fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+      // stale heartbeat (15 min > STALL_MIN 10)
+      const hb = path.join(f.art, `pi-bg-${t}-hb`);
+      fs.writeFileSync(hb, "");
+      const old = new Date(Date.now() - 15 * 60 * 1000);
+      fs.utimesSync(hb, old, old);
+
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`STALLED jarate/${t}`);
+      expect(r.out).toContain("> 10 min stale");
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      // distinct from DEAD: red (alive but stuck), count title
+      expect(em.title).toBe("1 stalled \u00b7 watchdog sweep");
+      expect(em.color).toBe(15158332);
+      expect(em.author.name).toBe("pi-bg watchdog");
+      // list row: ticket (head-clipped to ~30) + minuted hb ts + state
+      expect(em.description).toContain(t);
+      expect(em.description).toContain("  hb last ");
+      expect(em.description).toContain("process alive; hb stale >10m");
+      expect(em.description).toContain("jarate-bg-kill");
+      for (const line of codeLines(em)) {
+        expect(line.length).toBeLessThanOrEqual(40);
+      }
+      expect(em.description.endsWith("\n```")).toBe(true);
+      // the live cgroup survives (this is not a DEAD reap)
+      expect(fs.existsSync(cg)).toBe(true);
+      // dead log line carries the stalled reason (dedupe key)
+      const deadlog = path.join(f.home, ".pi-bg-deadlog");
+      expect(fs.readFileSync(deadlog, "utf8")).toContain(
+        "stalled: live process",
+      );
+      // second sweep: deduped, no re-post
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(r2.out).not.toContain(`STALLED jarate/${t}`);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("controls: fresh hb / no hb -> not stalled", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      for (const n of [2, 3]) {
+        const t = TID(n);
+        const wt = path.join(f.tmp, "wt", "jarate", t);
+        fs.mkdirSync(wt, { recursive: true });
+        const cg = path.join(f.tmp, "cg", "pi-bg", t);
+        fs.mkdirSync(cg, { recursive: true });
+        fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+      }
+      // t2: fresh heartbeat -> healthy
+      const hb2 = path.join(f.art, `pi-bg-${TID(2)}-hb`);
+      fs.writeFileSync(hb2, "");
+      // t3: no heartbeat file at all -> pre-upgrade run, not judgeable
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("STALLED jarate/");
+      expect(f.posts).toHaveLength(0);
     } finally {
       f.close();
     }

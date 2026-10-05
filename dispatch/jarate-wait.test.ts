@@ -139,6 +139,55 @@ describe("jarate-wait rc contract", () => {
     expect(r.out).toContain("worker done: all green");
   });
 
+  test("B1: embed-only callback (no content) -> serialized embed detail, rc 0", async () => {
+    const f = fixture();
+    f.setMsgs(
+      JSON.stringify([
+        {
+          id: "m-emb",
+          webhook_id: "wh-1",
+          author: { id: WA_ID },
+          // pi-bg Variant D payload: no top-level content, framed result
+          // lives in the embed
+          embeds: [
+            {
+              title: "done \u00b7 20991231-235959-1",
+              description: "```\nok: 12 pass, 0 fail\n```",
+              fields: [{ name: "result", value: "all green" }],
+            },
+          ],
+        },
+      ]),
+    );
+    const r = await f.run(["--since", "100", "--timeout", "5", "--check", "1"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("CALLBACK m-emb");
+    // serialization order: title, description, fields (name: value)
+    const detail = r.out.split("CALLBACK m-emb\n")[1];
+    expect(detail).toContain("done \u00b7 20991231-235959-1");
+    expect(detail).toContain("ok: 12 pass, 0 fail");
+    expect(detail).toContain("result: all green");
+  });
+
+  test("B1: content + embeds -> content wins (no double print)", async () => {
+    const f = fixture();
+    f.setMsgs(
+      JSON.stringify([
+        {
+          id: "m-both",
+          webhook_id: "wh-1",
+          author: { id: WA_ID },
+          content: "plain body",
+          embeds: [{ title: "emb", description: "desc" }],
+        },
+      ]),
+    );
+    const r = await f.run(["--since", "100", "--timeout", "5", "--check", "1"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("plain body");
+    expect(r.out).not.toContain("desc");
+  });
+
   test("own bot message is skipped, next human message -> rc 2", async () => {
     const f = fixture();
     f.setMsgs(

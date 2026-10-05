@@ -159,7 +159,7 @@ export function openCount(todos: Todo[]): number {
  * ├ pending, ┣ in-progress (bold), ├ done (strikethrough), ┤ cancelled.
  * Done keeps ├ (not ┘) so the vertical pipe stays connected through
  * mid-list completed items; the frame closes on its own └ row.
- * Content is clipped so the rendered line fits the 32-col mobile budget.
+ * Content is clipped so the rendered line fits the 40-col mobile budget.
  */
 export function todoLine(t: Todo): string {
   const c = fit(t.content, TODO_CONTENT_MAX);
