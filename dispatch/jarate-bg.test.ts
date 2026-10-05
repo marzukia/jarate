@@ -1247,6 +1247,177 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
     }
   }, 30_000);
 
+  // --- issue #123 verification (cap counts TICKETS, not processes) ---
+  // Each live ticket = wrapper + pi child = 2 processes. The pre-fix /proc
+  // argv scan counted both (plus same-uid stubs), so a pinned cap 4
+  // admitted ~1 real ticket. The fix counts fresh hb files instead: one
+  // file per ticket, windowed at 3 x PI_BG_HB_INTERVAL (90s default).
+
+  test("2 live tickets (2 procs each) count as 2; cap admits up to max", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 10);
+    const base = countFreshHb(fx);
+    const max = base + 2;
+    const a = spawnStub(fx, "cap t123 a", {
+      PI_BG_MAX_CONCURRENT: String(max),
+    });
+    const b = spawnStub(fx, "cap t123 b", {
+      PI_BG_MAX_CONCURRENT: String(max),
+    });
+    let c: ReturnType<typeof spawn> | undefined;
+    try {
+      // both stubs in flight: EXACTLY 2 fresh hb files, not 4 (the wrapper
+      // + sleeping pi of each ticket must collapse to one count)
+      expect(await waitFor(() => countFreshHb(fx) - base === 2)).toBe(true);
+      // at max: the 3rd dispatch is refused even though 4+ "pi-bg worker"
+      // processes are live
+      c = spawnStub(fx, "cap t123 c", {
+        PI_BG_MAX_CONCURRENT: String(max),
+      });
+      const rc = await collect(c);
+      expect(rc.code).toBe(5);
+      expect(rc.err).toMatch(
+        /\[!\] at cap \(\d+\/\d+\), try again later or jarate-bg-kill a ticket/,
+      );
+      // a + b were admitted: the cap admits up to max real tickets
+      const results = await Promise.all([a, b].map(collect));
+      for (const r of results) {
+        expect(r.code).toBe(0);
+        expect(r.out).toContain("pi-run-ok");
+        expect(r.err).not.toContain("at cap");
+      }
+    } finally {
+      killStubs([a, b, ...(c ? [c] : [])], fx.tmp);
+    }
+  }, 30_000);
+
+  test("stale hb files (120s, outside the 3x30s window) never block a slot", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // two SIGKILLed tickets' hb files, 120s old (> 3 x 30s window): they
+    // sit in the artifact dir but the mtime window must exclude them
+    const art = path.join(fx.tmp, "home", ".pi-bg-art");
+    fs.mkdirSync(art, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    for (const id of ["20990101-000001-1", "20990101-000002-2"]) {
+      const hb = path.join(art, `pi-bg-${id}-hb`);
+      fs.writeFileSync(hb, "");
+      fs.utimesSync(hb, old, old);
+    }
+    expect(countFreshHb(fx)).toBe(0); // mirror agrees: stale = 0
+    // cap 1: only fresh files could refuse this dispatch
+    fx.env.PI_BG_MAX_CONCURRENT = "1";
+    const r = await fx.run(["worker", "cap t123 stale"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(r.err).not.toContain("at cap");
+  }, 15_000);
+
+  test("fresh fake hb files count: 2 fresh + cap 2 -> refused, no record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // window boundary, other direction: hb files touched just now DO count
+    const art = path.join(fx.tmp, "home", ".pi-bg-art");
+    fs.mkdirSync(art, { recursive: true });
+    for (const id of ["20990101-000003-3", "20990101-000004-4"]) {
+      fs.writeFileSync(path.join(art, `pi-bg-${id}-hb`), "");
+    }
+    expect(countFreshHb(fx)).toBe(2); // mirror agrees: fresh = 2
+    fx.env.PI_BG_MAX_CONCURRENT = "2"; // == live count -> at cap
+    const r = await fx.run(["worker", "cap t123 fresh"]);
+    expect(r.code).toBe(5);
+    expect(r.err).toMatch(/\[!\] at cap \(2\/2\)/);
+    // the refused dispatch left no run record (no state=running zombie);
+    // the record dir does not exist at all (the cap check runs before any
+    // bookkeeping), which is the strongest form of "no record"
+    const recDir = fx.env.PI_DISPATCH_RECORD_DIR;
+    const recs = fs.existsSync(recDir)
+      ? fs.readdirSync(recDir).filter((f) => f.endsWith(".json"))
+      : [];
+    expect(recs).toHaveLength(0);
+  }, 15_000);
+
+  test("stub ticket under another PI_BG_TMPDIR does not count", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    sleepStubPi(fx, 8);
+    // the issue's stub shape: a real jarate-bg run under a fake fixture
+    // dir (/tmp/pibg-test-*), same uid - its hb file lands in its own
+    // PI_BG_TMPDIR and must be invisible to this fixture's cap count
+    const altArt = path.join(fx.tmp, "alt-art");
+    const stub = spawn(["bash", PI_BG, "worker", "cap t123 alt stub"], {
+      env: { ...fx.env, PI_BG_TMPDIR: altArt },
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // wait for the stub's hb file in ITS dir (the stub is live)
+      const t0 = Date.now();
+      let liveInAlt = false;
+      while (!liveInAlt && Date.now() - t0 < 8000) {
+        try {
+          liveInAlt = fs
+            .readdirSync(altArt)
+            .some((f) => /^pi-bg-.+-hb$/.test(f));
+        } catch {
+          /* dir not created yet */
+        }
+        if (!liveInAlt) await Bun.sleep(100);
+      }
+      expect(liveInAlt).toBe(true);
+      const base = countFreshHb(fx); // default-dir view: stub invisible
+      // cap = base + 1: a stub-counting regression (2 procs) would refuse
+      fx.env.PI_BG_MAX_CONCURRENT = String(base + 1);
+      const r = await fx.run(["worker", "cap t123 main"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("pi-run-ok");
+      expect(r.err).not.toContain("at cap");
+    } finally {
+      killStubs([stub], fx.tmp);
+    }
+  }, 30_000);
+
+  test("bare same-uid 'pi-bg worker' argv stubs do not count (no /proc scan)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // the pre-fix scan matched any same-uid process whose argv carried an
+    // element basename 'pi-bg' followed by 'worker'|'reviewer' - spawn two
+    // such stubs (no hb file at all) and prove a cap = base + 1 dispatch
+    // still gets through
+    const stubDir = path.join(fx.tmp, "stub");
+    fs.mkdirSync(stubDir);
+    const stubBg = path.join(stubDir, "pi-bg");
+    fs.writeFileSync(stubBg, "#!/bin/sh\nsleep 8\n");
+    fs.chmodSync(stubBg, 0o755);
+    const s1 = spawn(["bash", stubBg, "worker", "stub a"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const s2 = spawn(["bash", stubBg, "worker", "stub b"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      await Bun.sleep(400); // let the stubs appear in ps
+      const base = countFreshHb(fx);
+      fx.env.PI_BG_MAX_CONCURRENT = String(base + 1);
+      const r = await fx.run(["worker", "cap t123 argv"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("pi-run-ok");
+      expect(r.err).not.toContain("at cap");
+    } finally {
+      for (const s of [s1, s2]) {
+        try {
+          s.kill("TERM");
+        } catch {
+          /* already dead */
+        }
+      }
+    }
+  }, 15_000);
+
   // Other-user exclusion needs root (spawn a matching process as nobody).
   // Skipped - not root-testable - on unprivileged runners.
   const hasSetpriv = (() => {
