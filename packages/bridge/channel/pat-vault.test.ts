@@ -814,6 +814,16 @@ describe("state machine", () => {
       expect(last.embeds[0].title).toBe("PAT expired - monky");
       expect(last.embeds[0].color).toBe(0x95a5a6);
       expect(last.embeds[0].footer.text).toBe(req.id);
+      // claim-by deadline survives the claim-expired edit (vault's
+      // always-present pattern; pr-b3 review LOW-1): the approved embed
+      // was replaced, so the window must stay visible on the expired one.
+      const claim = (last.embeds[0].fields as any[]).find(
+        (x) => x.name === "claim",
+      );
+      expect(claim.inline).toBe(false);
+      expect(claim.value).toMatch(
+        /^claim by \d{2}:\d{2}:\d{2}Z \(\d+s, single use\)$/,
+      );
       expect(f.auditLines().some((l) => l.includes("event=expire-claim"))).toBe(
         true,
       );
