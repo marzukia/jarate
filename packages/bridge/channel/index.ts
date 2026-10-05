@@ -532,6 +532,11 @@ const interruptingChannels = new Set<string>();
 // /restart while the settle wait was running — the pending send is dropped
 // (consistent with those commands dropping queued mid-turn inbounds).
 const interruptCancelled = new Set<string>();
+// #84: the in-flight interrupt's entry is spliced OUT of midTurnQueues,
+// so this registry (channelId -> queued messageId) is the only way
+// session_shutdown can find its "[..] interrupting… Ns" ack line to
+// clear. Cleared in the same finally as interruptingChannels.
+const interruptInFlight = new Map<string, string>();
 let interruptHandler: ((channelId: string, messageId: string) => void) | null =
   null;
 let interruptCtx: ExtensionContext | null = null;
@@ -603,6 +608,7 @@ export function clearAllInterrupts(): void {
   pendingInterrupts.clear();
   interruptingChannels.clear();
   interruptCancelled.clear();
+  interruptInFlight.clear();
 }
 
 // ─── Compaction window (per channel) ─────────────────────────────────────
@@ -918,6 +924,7 @@ export async function runMidRunInterrupt(
     return;
   }
   interruptingChannels.add(channelId);
+  interruptInFlight.set(channelId, messageId);
   console.log(
     `[channel] mid-run interrupt: aborting current step, then sending ${messageId}`,
   );
@@ -1040,6 +1047,7 @@ export async function runMidRunInterrupt(
     );
   } finally {
     interruptingChannels.delete(channelId);
+    interruptInFlight.delete(channelId);
     // Fallback: if the tick was never armed (no ack) or settle raced, drop it.
     stopOpTick(`interrupt:${channelId}`);
   }
@@ -1368,7 +1376,7 @@ export function isEssentialToolCall(toolName: string, input: any): boolean {
 /** Run-frame header state (live-frame unification, operator 2026-09-13):
  *  the in-run "working" message and the end-of-run message are the SAME
  *  frame; only the header flips working -> done/failed in place. */
-export type RunFrameState = "working" | "done" | "failed";
+export type RunFrameState = "working" | "done" | "failed" | "stopped";
 
 /** Max sub-step lines in the run frame (older calls overflow to the +N line). */
 export const RUN_FRAME_MAX_STEPS = 8;
@@ -2397,6 +2405,89 @@ export default function (pi: ExtensionAPI) {
         console.log(
           `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
         );
+    }
+    // #84 (remaining path; franky evidence 2026-10-05): a shutdown while a
+    // run is still active (handoff restart mid-run, crash, deploy) never
+    // fires agent_end — the ONLY place the working frame gets its terminal
+    // morph/delete — so the box stays frozen mid-count in the channel.
+    // Close it here with the SAME rules as agent_end (0 shown calls ->
+    // delete, else morph to a terminal state), before the disconnects
+    // below drop the channel state REST resolution needs.
+    if (
+      runOpen &&
+      statusMsgId &&
+      statusChannelId &&
+      statusMsgAt >= runStartedAt
+    ) {
+      const fch = channels.find(
+        (c) => c.id === statusChannelId && c.type === "discord",
+      );
+      if (fch) {
+        stopOpTick(`working:${statusChannelId}`); // no further tick edits
+        const lvl = verboseLevel(fch);
+        const shown = (
+          lvl === 1
+            ? toolCallsThisTurn.filter((c) => c.essential)
+            : toolCallsThisTurn
+        ).map((c) => c.action);
+        if (shown.length === 0) {
+          shutdownDeletes.push(
+            deleteDiscordMessage(fch, statusMsgId).catch(() => {}),
+          );
+        } else {
+          const secs = Math.round((Date.now() - runStartedAt) / 1000);
+          shutdownDeletes.push(
+            editDiscordMessage(
+              fch,
+              statusMsgId,
+              fence(runFrame("stopped", shown, shown.length, secs)),
+            ).catch(() => {}),
+          );
+        }
+        statusMsgId = null;
+        statusMsgAt = 0;
+      }
+    }
+    // SPEC B live text: agent_end's deleteLiveText never runs on a dying
+    // process — the ephemeral line would stay frozen in the channel.
+    if (liveTextMsgId && liveTextChannelId) {
+      const lch = channels.find(
+        (c) => c.id === liveTextChannelId && c.type === "discord",
+      );
+      if (lch) {
+        const id = liveTextMsgId;
+        shutdownDeletes.push(deleteDiscordMessage(lch, id).catch(() => {}));
+        liveTextMsgId = null;
+        liveTextChannelId = null;
+        liveTextAt = 0;
+        liveTextShown = null;
+        liveTextLatest = null;
+        liveTextArmed = false;
+      }
+    }
+    // In-flight interrupt: its entry was spliced OUT of midTurnQueues
+    // (invisible to the drain above), and its "[..] interrupting… Ns" line
+    // IS the queued ack — consume it so the line does not freeze (the
+    // entry's text is lost with the process; there is nothing to redeliver).
+    for (const [channelId, messageId] of interruptInFlight)
+      consumeQueuedAck(channelId, messageId, shutdownDeletes);
+    // Open compact window (no op marker to settle it on respawn): a
+    // mid-compact crash would otherwise leave the ticking "[..] compacting…"
+    // line frozen. Restart-class op windows are settled by the respawn's
+    // op marker instead — leave them.
+    for (const [id, e] of compactingChannels) {
+      if (e.label !== "compacting") continue;
+      const t = opTicks.get(`compact:${id}`);
+      if (!t) continue;
+      clearInterval(t.timer);
+      opTicks.delete(`compact:${id}`);
+      shutdownDeletes.push(
+        editDiscordMessage(
+          t.ch,
+          t.msgId,
+          fence("[!] compact interrupted - restart"),
+        ).catch(() => {}),
+      );
     }
     for (const ch of channels) {
       if (ch.type === "discord") {
