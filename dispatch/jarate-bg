@@ -89,7 +89,8 @@
 # No webhook (issue #30): loud warning at dispatch + a run record in
 #   ~/.pi-dispatch/runs/pi-bg-<id>.json marked "delivery":"none".
 # Heartbeat (issue #52): $PI_BG_TMPDIR/pi-bg-<id>-hb is touched by a
-#   background child every 30s ($PI_BG_HB_INTERVAL test override); the
+#   background child from ticket creation (launcher window included)
+#   every 30s ($PI_BG_HB_INTERVAL test override); the
 #   exit trap kills it so it never outlives the run. The watchdog: live
 #   process + hb stale > 10 min = STALLED (a hung run, distinct from DEAD).
 # Per-command bash tool timeout (issue #142): PI_BG_CMD_TIMEOUT (default
@@ -531,6 +532,74 @@ PY
 # early heartbeat (#52 + #101): the ticket is visible to the watchdog from birth
 : > "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null || true
 
+# --- heartbeat child from birth (issue #52) ------------------------------
+# The touch loop starts HERE, at ticket creation - not after the cgroup
+# escape. The launcher window (git worktree add on a big repo, escape,
+# profile doctor) can exceed STALL_MIN: with no periodic touches a live
+# ticket looked STALLED (worktree sweep: live cgroup + stale hb) or its
+# stale hb hid the DEAD verdict (the cwd sweep judges on hb age). The
+# child is a plain bash subshell (no python): cheap, and it self-terminates
+# when the wrapper dies untrappably (the loop checks the wrapper pid -
+# $$ inside a subshell is the parent's, and the snapshot re-exec below
+# KEEPS the wrapper pid, so the check survives it) each tick.
+# Snapshot re-exec adoption: PI_BG_HB_PID is exported, so the re-exec'd
+# incarnation re-runs this block and re-adopts the same child instead of
+# forking a second one. The cgroup join after the escape below moves the
+# child into the ticket cgroup (jarate-bg-kill signals it with the tree).
+HB_INTERVAL="${PI_BG_HB_INTERVAL:-30}"
+hb_f="$BG_TMP/pi-bg-${run_id}-hb"
+# hb_ppid <pid>: the /proc/<pid>/stat ppid ("" when the pid is gone or
+# unreadable). Read builtin, no fork; the same 'pid (comm)' strip as
+# jarate-bg-kill's children_of (comm may contain spaces).
+hb_ppid() {
+  local s=""
+  IFS= read -r s 2>/dev/null < "/proc/$1/stat" || true
+  [ -n "$s" ] || return 1
+  s="${s#*) }"
+  set -- $s
+  [ -n "${2:-}" ] && printf '%s' "$2"
+}
+# Adopt only when PI_BG_HB_PID is OUR hb child: its /proc ppid is us ($$).
+# The snapshot re-exec keeps the wrapper pid, so the child forked by the
+# first incarnation is still ours there (the only adoption path). A nested
+# jarate-bg launched from pi inherits PI_BG_HB_PID from the parent
+# wrapper's env - and PI_BG_SNAP leaks the same way, so gating on
+# PI_BG_SNAP alone is not enough (review #183 F2). There the ppid is the
+# PARENT's wrapper pid, not ours: we fork our own child. A nested adoption
+# would let our exit trap kill the parent's hb child - false STALLED on
+# both tickets.
+if [ -n "${PI_BG_HB_PID:-}" ] && [ "$(hb_ppid "$PI_BG_HB_PID")" = "$$" ]; then
+  hb_pid="$PI_BG_HB_PID" # adopted across the snapshot re-exec
+else
+  (
+    trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 143' TERM INT
+    s=""
+    while kill -0 "$$" 2>/dev/null; do
+      touch "$hb_f" 2>/dev/null
+      sleep "$HB_INTERVAL" &
+      s=$!
+      wait "$s" 2>/dev/null
+    done
+  ) &
+  hb_pid=$!
+  export PI_BG_HB_PID="$hb_pid"
+fi
+
+# bg_early_exit: every exit before the full bg_on_exit registers below
+# (launch-fail exit 3, profile-fail exit 4) must kill the hb child - its
+# touch recreates the deleted hb file, leaving a phantom live ticket in
+# the concurrency cap. Cleans the per-run snapshot dir too (bg_on_exit
+# takes over both duties on registration).
+bg_early_exit() {
+  if [ -n "${hb_pid:-}" ]; then
+    kill "$hb_pid" 2>/dev/null
+    wait "$hb_pid" 2>/dev/null
+    hb_pid=""
+  fi
+  [ -n "${SNAP_DIR:-}" ] && rm -rf "$SNAP_DIR" 2>/dev/null
+}
+trap bg_early_exit EXIT
+
 # mark_launch_fail <reason>: run record state=killed on a --worktree
 # launch-fail (issue #101 follow-up). The record was written state=running
 # at ticket creation above, but the launch-fail exits below run BEFORE the
@@ -589,13 +658,11 @@ if [ -z "${PI_BG_SNAP:-}" ] && [ "${PI_BG_NOSNAP:-0}" != "1" ]; then
   fi
   rm -rf "$_snapdir" 2>/dev/null || true
 fi
-# Snapshot process path (the original process exec'd away above): until the
-# full bg_on_exit trap registers below, a minimal trap keeps the per-run
-# snapshot from leaking on early exits (provider check, worktree fail).
-# bg_on_exit replaces this on registration and cleans the same dir.
-if [ -n "${SNAP_DIR:-}" ]; then
-  trap 'rm -rf "${SNAP_DIR}" 2>/dev/null' EXIT
-fi
+# Snapshot re-exec note (the original process exec'd away above): the
+# hb child forked at ticket creation survives the exec (same parent pid),
+# and PI_BG_HB_PID carried it to this incarnation, where the block at
+# ticket creation re-adopted it. bg_early_exit (set there) owns the
+# per-run snapshot cleanup until bg_on_exit registers below.
 
 wt_path=""
 wt_branch=""
@@ -633,7 +700,12 @@ run_start_epoch="${PI_BG_RUN_START_EPOCH:-$(date +%s)}"
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
 #   issue #14) and $BG_WB_RESP kept as the last response body.
-# final failure: dead-letter file + stderr note, return 1.
+# final failure: dead-letter file + stderr note, return 1. The letter is
+#   SELF-CONTAINED (issue #53): the JSON body is embedded after the
+#   `--- body json ---` marker so the watchdog can re-post it on a later
+#   sweep even after the body file is gone (the exit trap's tmp cleanup
+#   deletes it). The `body     : <path>` line stays for humans and as the
+#   pre-#53 letter shape.
 bg_post() {
   local body="$1" code i
   [ -n "$webhook" ] || return 1
@@ -651,7 +723,9 @@ bg_post() {
     printf 'http     : %s (3 attempts)\n' "$code"
     printf 'when     : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'response : %s\n' "$(head -c 300 "$BG_WB_RESP" 2>/dev/null)"
-    printf 'body     : %s\n' "$body"; } > "$BG_DEAD"
+    printf 'body     : %s\n' "$body"
+    printf -- '--- body json ---\n'
+    cat "$body" 2>/dev/null; } > "$BG_DEAD"
   echo "[pi-bg] webhook FAILED (http=$code) - dead letter: $BG_DEAD" >&2
   return 1
 }
@@ -866,6 +940,15 @@ ESCAPE_CG="$CG_PARENT/pi-bg/${run_id}"
 ESCAPE_ACTIVE=0
 if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/dev/null; then
   ESCAPE_ACTIVE=1
+  # #52 hb-from-birth: the hb child was forked before the escape (caller
+  # cgroup) - join it to the ticket cgroup so jarate-bg-kill signals it
+  # with the rest of the tree. APPEND (not overwrite): a real cgroupfs
+  # treats any write as a move, but the test fake root is a plain file
+  # that jarate-bg-kill's list_tree reads, and overwriting would drop the
+  # wrapper from the tree. If the join fails (delegation quirk) the child
+  # stays in the caller cgroup: the trap reaps it with the wrapper, and a
+  # SIGKILLed wrapper leaves it to self-terminate on its next tick.
+  [ -n "${hb_pid:-}" ] && echo "$hb_pid" >> "$ESCAPE_CG/cgroup.procs" 2>/dev/null
   echo "[pi-bg] cgroup escape active: $ESCAPE_CG" 2>/dev/null || true
 else
   rmdir "$ESCAPE_CG" 2>/dev/null
@@ -1033,8 +1116,14 @@ bg_on_exit() {
   # #57): the trap runs on every trapped exit (normal/INT/TERM/error);
   # a SIGKILLed wrapper leaves no rc file (watchdog then says DEAD).
   printf '%s\n' "$ec" > "$BG_TMP/pi-bg-${run_id}-rc" 2>/dev/null || true
+  # #51 sticky terminal: a manual kill writes the -killed marker BEFORE
+  # the TERM (jarate-bg-kill), so this trap sees it and stays quiet -
+  # the kill script's CANCELLED embed is the one and only terminal embed
+  # for a manual kill. Without this a graceful TERM produced DIED +
+  # KILLED for the same cancellation.
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
-     [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
+     [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ] && \
+     [ ! -f "$BG_TMP/pi-bg-${run_id}-killed" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
     reason="$(bg_death_reason)"
     bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
@@ -1131,33 +1220,13 @@ bg_prune_session() {
   return 0
 }
 
-# --- heartbeat (issue #52): long workers emit no signal between dispatch
-#     and completion; the watchdog tells dead-from-alive only by process
-#     existence, so a stalled-but-alive run (hung tool, wedged model call)
-#     looks healthy until it dies. A background child touches <id>-hb
-#     every ${HB_INTERVAL}s; bg_on_exit kills it (and its in-flight sleep)
-#     so it never outlives the run. The child also self-terminates when the
-#     wrapper dies untrappably (SIGKILL): the loop checks the wrapper's pid
-#     ($$ inside a subshell is the parent's) each tick. Forked AFTER the
-#     cgroup escape so it lands in the ticket cgroup (jarate-bg-kill signals it
-#     with the rest of the tree). Started right before the EXIT trap is
-#     registered below, so every exit from this point on is trapped;
-#     hb_pid="" guards bg_on_exit either way.
-HB_INTERVAL="${PI_BG_HB_INTERVAL:-30}"
-hb_f="$BG_TMP/pi-bg-${run_id}-hb"
-touch "$hb_f" 2>/dev/null || true
-hb_pid=""
-(
-  trap '[ -n "$s" ] && kill "$s" 2>/dev/null; exit 143' TERM INT
-  s=""
-  while kill -0 "$$" 2>/dev/null; do
-    touch "$hb_f" 2>/dev/null
-    sleep "$HB_INTERVAL" &
-    s=$!
-    wait "$s" 2>/dev/null
-  done
-) &
-hb_pid=$!
+# --- heartbeat (issue #52): the touch child forked at ticket creation
+#     (above, right after the hb file's birth touch) is the liveness
+#     signal for the whole run, launcher window included. bg_on_exit
+#     kills it (and its in-flight sleep) so it never outlives the run;
+#     hb_pid (or "" before any fork) guards it. The child joins the
+#     ticket cgroup at the escape above, so jarate-bg-kill signals it
+#     with the rest of the tree.
 
 trap bg_on_exit EXIT
 trap 'exit 130' INT

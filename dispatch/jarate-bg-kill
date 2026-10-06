@@ -18,7 +18,14 @@
 # kind=kill webhook event (same URL source as jarate-bg) so the dispatch
 # channel sees it. Marker: $PI_BG_TMPDIR/pi-bg-<id>-killed (the watchdog
 # skips killed tickets) + the run record ($PI_DISPATCH_RECORD_DIR,
-# default ~/.pi-dispatch/runs) is marked state=killed (issue #51).
+# default ~/.pi-dispatch/runs) is marked state=cancelled (issue #51
+# sticky terminal: manual kill = the CANCELLED class, distinct from
+# state=killed, the watchdog/launch-fail audit path). The marker is
+# written BEFORE the signals: the wrapper's exit trap (running
+# concurrently with the drain poll) suppresses its own DIED post when it
+# sees the marker, so a manual kill fires exactly one terminal embed.
+# The CANCELLED embed post failure writes a dead letter
+# (pi-bg-<id>-kill-webhook-failed, self-contained since #53).
 # env: PI_BG_CG_ROOT (cgroup base, test override), PI_BG_KILL_WAIT,
 #      PI_BG_TMPDIR, PI_DISPATCH_WEBHOOK, PI_BG_WB_BACKOFF (test: 0 = no backoff)
 # exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
@@ -90,8 +97,27 @@ fi
 # payload behind. Kept: the -killed marker and the kill-webhook-failed dead
 # letter (the watchdog and /jobs history read them).
 trap 'rm -f "$BG_TMP/pi-bg-${id:-}-kill-body.json" 2>/dev/null' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# INT/TERM (review #183 F5): an interrupted kill drops the PROVISIONAL
+# marker (kill-in-progress). It only exists to suppress the wrapper's DIED
+# post, and the wrapper is still draining in parallel - with the marker
+# gone the wrapper posts DIED (pre-interrupt behavior) instead of the
+# ticket ending with ZERO terminal embeds (marker suppressed DIED, record
+# closed done, no CANCELLED post yet). Re-running jarate-bg-kill then
+# posts CANCELLED (empty cgroup, instant drain). The FINAL marker (after
+# the drain) survives the interrupt: it is the has_killed evidence +
+# worktree auto-prune input. The drop rescues DIED mainly in the
+# deferred-trap/fast-interrupt case: the trap fires immediately from
+# wait, so a mid-drain Ctrl-C usually lands after the wrapper's DIED
+# suppression has already happened.
+kill_interrupt() {
+  local rc="$1"
+  if grep -q 'kill-in-progress' "$BG_TMP/pi-bg-${id:-}-killed" 2>/dev/null; then
+    rm -f "$BG_TMP/pi-bg-${id:-}-killed" 2>/dev/null
+  fi
+  exit "$rc"
+}
+trap 'kill_interrupt 130' INT
+trap 'kill_interrupt 143' TERM
 
 CG="$CG_ROOT/pi-bg/$id"
 if [ ! -d "$CG" ]; then
@@ -172,8 +198,15 @@ if [ "$dry" -eq 1 ]; then
 fi
 
 # --- SIGTERM, wait, escalate to SIGKILL ---
+# #51 sticky terminal: the -killed marker is written BEFORE the signals
+# (provisional duration) so the wrapper's exit trap - which runs
+# concurrently with our drain poll - suppresses its DIED post. The final
+# line (real duration) rewrites it below.
 pids0="$(list_tree | sort -un | tr '\n' ' ')"
 [ -n "$pids0" ] || pids0="(none in cgroup)"
+printf '%s kill-in-progress %s by %s after 0s; pids: %s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(id -un)" "$pids0" \
+  > "$BG_TMP/pi-bg-${id}-killed"
 # t0 AFTER list_tree: KILL_WAIT is the grace window after the TERM, not
 # after script start. list_tree scans /proc and can take seconds on a
 # loaded host; timing from start expired the grace before the TERM was
@@ -237,12 +270,14 @@ printf '%s killed %s by %s after %ss; pids: %s\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$id" "$(id -un)" "$dur" "$pids0" \
   > "$BG_TMP/pi-bg-${id}-killed"
 
-# mark the run record killed (issue #51): the wrapper's exit trap has
-# already marked it "done" (its trap runs before the drain confirms); for
-# an operator kill "killed" is the final state. Same audit-only posture
-# as jarate-bg: a missing/corrupt record never breaks the kill path.
+# mark the run record cancelled (issue #51 sticky terminal): a manual
+# kill is the CANCELLED class, distinct from state=killed (watchdog audit
+# / launch-fail). The wrapper's exit trap has already marked it "done"
+# (its trap runs during our drain poll); "cancelled" is the final state.
+# Same audit-only posture as jarate-bg: a missing/corrupt record never
+# breaks the kill path.
 if [ -f "$REC_DIR/pi-bg-${id}.json" ]; then
-  PI_BG_REC_STATE="killed" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
+  PI_BG_REC_STATE="cancelled" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
 import datetime, json, os, sys
 p = sys.argv[1]
 try:
@@ -283,12 +318,12 @@ def rid_line(prefix, rid):
 rid = E("T")
 # v3 style (mockup3, 2026-09-13): no dingbat in the title; the description
 # is a framed block (box-drawing + ASCII + middle dot), <= FRAME_W cols.
-title = "pi-bg " + rid + " \u00b7 KILLED"
-meta = [rid_line("\u250c killed \u00b7 ", rid),
+title = "pi-bg " + rid + " \u00b7 CANCELLED"
+meta = [rid_line("\u250c cancelled \u00b7 ", rid),
         rid_line("\u251c $ jarate-bg-kill ", rid),
         "\u251c " + "pids".ljust(6) + " : " + clip_end(E("PIDS"), 29),
         "\u251c " + "wait".ljust(6) + " : " + E("DUR") + "s (TERM->KILL)",
-        "\u251c " + "state".ljust(6) + " : killed on request",
+        "\u251c " + "state".ljust(6) + " : cancelled on request",
         "\u2514"]
 embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
          "color": 15105570,  # orange, same as jarate-bg DIED
@@ -307,9 +342,13 @@ PY
       [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
     done
     if [ "$ok" -eq 0 ]; then
-      printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
-        "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
+      # self-contained letter (issue #53): the watchdog re-posts it on a
+      # later sweep. The body is embedded NOW (rm -f below would dangle
+      # a `body     : <path>` reference).
+      { printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
+          "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf -- '--- body json ---\n'
+        cat "$bodyf" 2>/dev/null; } > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
       echo "jarate-bg-kill: webhook FAILED (http=$code) - dead letter: $BG_TMP/pi-bg-${id}-kill-webhook-failed" >&2
     fi
     rm -f "$bodyf"

@@ -1,9 +1,12 @@
 /**
- * dispatch/jarate-bg-kill — v3 embed style (mockup3).
+ * dispatch/jarate-bg-kill — v3 embed style (mockup3) + #51 CANCELLED class.
  *
  * Runs the real bash script against a fake cgroup (PI_BG_CG_ROOT override)
  * with a real sleeping victim, captures the webhook payload, and asserts
- * the framed description stays inside the 40-col mobile budget.
+ * the framed description stays inside the 40-col mobile budget. A manual
+ * kill is the CANCELLED terminal state (issue #51): the embed says
+ * CANCELLED and the run record ends state=cancelled (distinct from
+ * state=killed, the watchdog/launch-fail audit path).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -44,6 +47,25 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       },
     });
 
+    // run record: the kill must end it state=cancelled (#51 CANCELLED
+    // class, distinct from state=killed). Seeded state=done: the wrapper's
+    // exit trap writes "done" during the drain poll, the kill finalizes.
+    const recDir = path.join(tmp, "records");
+    fs.mkdirSync(recDir, { recursive: true });
+    const recFile = path.join(recDir, `pi-bg-${id}.json`);
+    fs.writeFileSync(
+      recFile,
+      JSON.stringify({
+        run: id,
+        profile: "worker",
+        project: null,
+        cwd: tmp,
+        started: "2026-09-13T12:00:00Z",
+        delivery: "webhook",
+        state: "done",
+      }),
+    );
+
     // victim: a real sleeping process "inside" the fake cgroup
     const victim = spawn(["sleep", "300"], {
       stdout: "ignore",
@@ -56,6 +78,7 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       HOME: home,
       PI_BG_CG_ROOT: cgRoot,
       PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_RECORD_DIR: recDir,
       PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
       PI_BG_WB_BACKOFF: "0",
       PI_BG_KILL_WAIT: "1",
@@ -82,13 +105,13 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
 
       if (!body) throw new Error(`webhook not captured (stderr: ${err})`);
       const em = body.embeds[0];
-      expect(em.title).toBe(`pi-bg ${id} · KILLED`);
+      expect(em.title).toBe(`pi-bg ${id} · CANCELLED`);
       for (const ch of ["⛔", "✓", "✗", "⚠", "→", "—"]) {
         expect(em.title + em.description).not.toContain(ch);
       }
       const lines = em.description.split("\n");
       expect(lines[0]).toBe("```bash");
-      expect(lines[1]).toBe(`┌ killed · ${id}`);
+      expect(lines[1]).toBe(`┌ cancelled · ${id}`);
       // the "$ jarate-bg-kill <rid>" line is 36 cols for this id: the rid head
       // clips (tail kept - the pid end is the discriminator)
       // at the 40-col budget the full rid fits the command line (34 cols)
@@ -99,10 +122,88 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       expect(em.description).toContain("├ pids   : ");
       // wait seconds include list_tree's /proc scan time -> match shape only
       expect(em.description).toMatch(/├ wait {3}: \d+s \(TERM->KILL\)/);
-      expect(em.description).toContain("├ state  : killed on request");
+      expect(em.description).toContain("├ state  : cancelled on request");
+      // #51: the run record ends state=cancelled ("cancelled" is the
+      // final state for a manual kill, over the wrapper's "done")
+      expect(JSON.parse(fs.readFileSync(recFile, "utf8")).state).toBe(
+        "cancelled",
+      );
     } finally {
       victim.kill("SIGKILL");
       server.stop(true);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
+ * #53: self-contained kill dead letter. When the CANCELLED post fails all
+ * 3 attempts the kill writes a dead letter; it now embeds the JSON body
+ * after the `--- body json ---` marker (the body file is rm -f'd right
+ * after), so the watchdog can re-post the CANCELLED on a later sweep.
+ */
+describe("jarate-bg-kill #53: self-contained dead letter", () => {
+  test("post failure: the kill letter embeds the CANCELLED body", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill53-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00009";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    const victim = spawn(["sleep", "300"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      // port 9 (discard): conn refused -> all 3 attempts 000
+      PI_DISPATCH_WEBHOOK: "http://127.0.0.1:9/dl",
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "1",
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    try {
+      expect(code).toBe(0);
+      expect(out).toContain(`killed ${id}`);
+      expect(err).toContain("webhook FAILED");
+      const letterPath = path.join(
+        tmp,
+        "art",
+        `pi-bg-${id}-kill-webhook-failed`,
+      );
+      expect(fs.existsSync(letterPath)).toBe(true);
+      const letter = fs.readFileSync(letterPath, "utf8");
+      expect(letter).toContain(`ticket   : ${id}`);
+      expect(letter).toContain("event    : kill");
+      expect(letter).toContain("http     : 000 (3 attempts)");
+      const marker = "--- body json ---";
+      expect(letter).toContain(marker);
+      // the embedded body is the CANCELLED embed, valid JSON
+      const bodyJson = letter.split(marker).slice(1).join(marker).trim();
+      const parsed = JSON.parse(bodyJson) as { embeds: { title: string }[] };
+      expect(parsed.embeds[0].title).toBe(`pi-bg ${id} \u00b7 CANCELLED`);
+    } finally {
+      victim.kill("SIGKILL");
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   }, 30_000);
@@ -344,4 +445,99 @@ describe("jarate-bg-kill #86: short-id resolution (run records)", () => {
     expect(r.err).not.toContain("short id");
     s.close();
   });
+});
+
+/**
+ * review #183 F5: an operator interrupt during the drain (INT/TERM to
+ * jarate-bg-kill) used to leave the PROVISIONAL (kill-in-progress) marker
+ * in place: the wrapper's exit trap - running concurrently with the drain
+ * poll - suppressed its DIED post on sight of it, and the kill exited
+ * before the CANCELLED post + record finalize, so the ticket ended with
+ * ZERO terminal embeds. The INT/TERM path now drops the provisional
+ * marker (the wrapper posts DIED - pre-interrupt behavior); a second full
+ * run of jarate-bg-kill posts CANCELLED (empty cgroup, instant drain).
+ */
+describe("jarate-bg-kill interrupt: provisional marker dropped (review F5)", () => {
+  test("SIGINT mid-drain: exit 130, marker gone, no CANCELLED post", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkillint-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00015";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    let posted = false;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posted = true;
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    // victim that ignores TERM: holds the drain open (the interrupt
+    // lands mid-poll, long before KILL_WAIT)
+    const victim = spawn(
+      ["bash", "-c", 'trap "" TERM; while :; do sleep 0.2; done'],
+      { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+    );
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const marker = path.join(tmp, "art", `pi-bg-${id}-killed`);
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "10", // the drain window the interrupt lands in
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // wait for the provisional marker (written BEFORE the TERM)
+      const t0 = Date.now();
+      while (!fs.existsSync(marker)) {
+        if (Date.now() - t0 > 10_000) {
+          throw new Error(`provisional marker never appeared: ${marker}`);
+        }
+        await Bun.sleep(50);
+      }
+      expect(fs.readFileSync(marker, "utf8")).toContain("kill-in-progress");
+      // interrupt mid-drain (the victim ignores TERM: still polling)
+      p.kill("SIGINT");
+      const [out, err] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      if (code !== 130) {
+        throw new Error(`expected 130, got ${code}\nOUT: ${out}\nERR: ${err}`);
+      }
+      // the provisional marker is dropped: the wrapper (still draining in
+      // parallel) no longer sees it and posts DIED - the ticket never
+      // ends with zero terminal embeds
+      expect(fs.existsSync(marker)).toBe(false);
+      // the kill exited before the CANCELLED post + record finalize
+      expect(posted).toBe(false);
+    } finally {
+      try {
+        victim.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      server.stop(true);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 40_000);
 });
