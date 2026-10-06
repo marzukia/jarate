@@ -2934,6 +2934,83 @@ describe("extension handlers (A1/A2/A4)", () => {
         await new Promise<void>((r) => setImmediate(r));
       expect(sent.length).toBe(baseSends);
     });
+
+    test("/stop twice during the cancel poll does not drop the next same-channel interrupt (#167 LOW-2)", async () => {
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      expect(idle).toBe(false);
+      // Relative zero-asserts (MEDIUM-1, review 3005244): a late send
+      // from a prior test can land in this test's shared `sent` binding
+      // after its reset and fail an absolute 0. Only GROWTH during this
+      // test's own window counts.
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      const ackFlush = async () => {
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      };
+      // 1. Run active. m1 arrives mid-run: queued, interrupt armed.
+      await handleInbound(pi, inboundCh("m1 body", "m1"), ctx);
+      await ackFlush(); // ack post resolves -> tick can arm on the ack id
+      // 2. m1's interrupt fires: abort, settle polling (the slow-settle
+      //    mock keeps the run active).
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends); // settling: no send yet
+      // 3. /stop#1 while the settle wait is pending: the cancel branch
+      //    drops m1, CONSUMES the flag, then polls for settle (not idle).
+      await handleInbound(pi, inboundCh("/stop", "m2"), ctx);
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(baseSends); // m1's send dropped
+      expect(abortCount).toBe(baseAborts + 2); // /stop#1's own abort
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      // 4. /stop#2 lands DURING the cancel poll (the in-flight flag is
+      //    still held, so /stop re-sets interruptCancelled). This re-set
+      //    has no consumer: the cancel branch already consumed /stop#1's.
+      await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
+      expect(abortCount).toBe(baseAborts + 3); // /stop#2's own abort
+      // 5. The aborted run never settles: the cancel poll hits its
+      //    120 s cap (4800 x 25 ms), skips the kick, and releases the
+      //    channel. The run is STILL active (cap corner, INFO-3), so a
+      //    later interrupt fires against a run that predates /stop#2 with
+      //    no sendToPi in between to clear the stale flag.
+      for (let i = 0; i < 4800; i++) {
+        jest.advanceTimersByTime(25);
+        await Promise.resolve();
+      }
+      expect(idle).toBe(false); // the run outlived the poll cap
+      // 6. m4 arrives mid-run: queued, interrupt armed (normal delay: no
+      //    interrupt in flight anymore).
+      await handleInbound(pi, inboundCh("m4 body", "m4"), ctx);
+      await ackFlush();
+      // 7. m4's interrupt fires while the run is still active. Without
+      //    the fix the stale /stop#2 flag makes the settle loop exit
+      //    immediately and m4 is dropped once (message + ack). With the
+      //    fix the flag was swept when the first interrupt released the
+      //    channel, so m4 waits for the settle and is delivered.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 4); // m4's interrupt aborted
+      expect(sent.length).toBe(baseSends); // still settling
+      // 8. The run settles: m4's interrupt must deliver, not drop.
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      await flushUntil(() =>
+        sent.some((s) => s.m?.details?.messageId === "m4"),
+      );
+      const m4Sends = sent.filter((s) => s.m?.details?.messageId === "m4");
+      expect(m4Sends.length).toBe(1);
+      expect(sent.length).toBe(baseSends + 1); // m4 is the only send
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      // 9. No double-wake: more settle ticks find nothing queued.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      for (let i = 0; i < 10; i++)
+        await new Promise<void>((r) => setImmediate(r));
+      expect(sent.length).toBe(baseSends + 1);
+      expect(abortCount).toBe(baseAborts + 4);
+    });
   });
 
   describe("queue control (. queue suffix, edit, delete)", () => {

@@ -1069,6 +1069,16 @@ export async function runMidRunInterrupt(
   } finally {
     interruptingChannels.delete(channelId);
     interruptInFlight.delete(channelId);
+    // #167 LOW-2: /stop, /reset or /restart landing while the cancel branch
+    // polls for settle re-sets the flag AFTER the cancel branch consumed it.
+    // That re-set has no consumer left: the NEXT same-channel interrupt's
+    // settle loop exits immediately on it and drops that interrupt (message
+    // + ack) before the flag is finally consumed. Sweep it when the
+    // interrupt releases the channel: at this point every set is either
+    // already consumed (cancel branch) or stale (re-set during the poll).
+    // The success and cap paths run synchronously from the settle-loop
+    // exit, so they cannot leave a live flag behind.
+    interruptCancelled.delete(channelId);
     // Fallback: if the tick was never armed (no ack) or settle raced, drop it.
     stopOpTick(`interrupt:${channelId}`);
   }
