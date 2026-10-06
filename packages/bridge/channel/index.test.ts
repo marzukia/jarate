@@ -8896,31 +8896,47 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     // ~15s: watchdog fires — process still alive, same window entry open
     jest.advanceTimersByTime(2);
     await flush(10);
-    // the drained inbound's fs I/O (memory toc) needs real event-loop
-    // turns, which microtask flushing alone never yields. The readFile is
-    // scheduled mid-advanceTimersByTime, so its completion can also ride a
-    // 0ms timer that only fires on a further clock advance (or on
-    // useRealTimers in afterEach). A fixed flush/immediate budget is
-    // load-sensitive and flaked under box load; poll instead, alternating
-    // real yields and small clock nudges (bounded; the next armed timer is
-    // 5s away, so +1ms steps cannot trip anything else).
-    for (let i = 0; i < 200; i++) {
-      const drainedNow = sent.find(
-        (s) =>
-          s.m.customType === "channel-inbound" &&
-          s.m.details?.body?.includes("hello"),
-      );
-      if (drainedNow) break;
-      await new Promise((r) => setImmediate(r));
-      jest.advanceTimersByTime(1);
-      await flush(5);
-    }
+    // The watchdog SYNCHRONOUSLY closed the window, deleted the op marker,
+    // and posted the RESOLVED unit (the fetch mock records the post when
+    // invoked). The re-waked inbound is in flight but parked on a REAL fs
+    // read (memory toc): under fake timers its completion only arrives if
+    // it happens to ride a 0ms fake timer, which is load/cold-cache
+    // sensitive and flaked (issue #63: fresh-HOME runs fail
+    // `expect(drained).toBeDefined()` ~1 in 4). So settle every
+    // fake-timer assertion here first, then switch to REAL timers and let
+    // the re-wake's fs I/O complete on the real event loop — the same
+    // pattern the compaction fallback-timer test above uses.
     expect(isCompacting("ch1")).toBe(false); // op window closed
     expect(
       channelPosts().some((t) =>
         t.includes("[!] restart failed - check unit pi.service"),
       ),
     ).toBe(true); // RESOLVED unit name in the channel
+    // no stale marker left to settle some future boot
+    expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
+    // F7 (PR2): the failed restart KILLS the process (delayed 500ms,
+    // after the post lands) so systemd Restart=always actually respawns
+    // 'pi -c' — a live process leaves the unit "active" forever.
+    // The 500ms nudge trips only the exit: the next armed op tick is 5s
+    // out.
+    expect(exits).toEqual([]);
+    jest.advanceTimersByTime(500);
+    await flush(10);
+    expect(exits).toEqual([1]);
+    // Real timers: bounded poll of real event-loop turns until the
+    // parked readFile completes and the message reaches pi.
+    jest.useRealTimers();
+    for (let i = 0; i < 200; i++) {
+      if (
+        sent.some(
+          (s) =>
+            s.m.customType === "channel-inbound" &&
+            s.m.details?.body?.includes("hello"),
+        )
+      )
+        break;
+      await tick();
+    }
     // queued inbound drained through pi (replay, not re-queue)
     const drained = sent.find(
       (s) =>
@@ -8929,15 +8945,6 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     expect(drained).toBeDefined();
     expect(midTurnQueues.get("ch1")?.length ?? 0).toBe(0);
-    // no stale marker left to settle some future boot
-    expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
-    // F7 (PR2): the failed restart KILLS the process (delayed 500ms,
-    // after the post lands) so systemd Restart=always actually respawns
-    // 'pi -c' — a live process leaves the unit "active" forever.
-    expect(exits).toEqual([]);
-    jest.advanceTimersByTime(500);
-    await flush(10);
-    expect(exits).toEqual([1]);
   });
 });
 
