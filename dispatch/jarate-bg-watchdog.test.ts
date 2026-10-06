@@ -923,6 +923,31 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
 
   test("held record: re-flagged daily until the retry fires (stays running)", async () => {
     const f = fixture();
+    // Scrub the ambient PI_BG_* leak vars (mirrors retryFixture's list,
+    // plus PI_BG_HB_PID): the bare fixture only scrubs PI_SERVICE/
+    // JARATE_AGENTS_MD, and inside a jarate-bg wrapper the launched
+    // retry run inherits the wrapper's env. That made this test green
+    // by accident in wrapper envs and deterministically red in a clean
+    // env (review #183 F1). Without the scrub the launched run takes
+    // the PI_BG_TASK_FILE branch and reads the wrapper's prompt as its
+    // task - or, on CI, dies "missing task" before the record write.
+    for (const k of [
+      "PI_BG_SETSID",
+      "PI_BG_SNAP",
+      "PI_BG_RUN_ID",
+      "PI_BG_TASK_FILE",
+      "PI_BG_HB_PID",
+      "SNAP_DIR",
+      "PI_BG_LANCHED_CWD",
+      "PI_BG_HB_INTERVAL",
+      "PI_BG_CMD_TIMEOUT",
+      "PI_BG_PRUNE_AGE_H",
+      "PI_BG_KEEP_SESSION",
+      "PI_BG_PRUNE_SESSIONS",
+      "PI_BG_RUN_START_EPOCH",
+    ]) {
+      delete f.env[k];
+    }
     try {
       bless(f);
       const t = TID(2);
@@ -930,16 +955,25 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
       fs.mkdirSync(wt, { recursive: true });
       age(wt, 30);
       plantRunning(f, t);
-      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-prompt.md`), "retry me\n");
+      // canonical 3-line shape jarate-bg writes itself: the retry
+      // launch extracts the task with `tail -n +3` (jarate-bg-watchdog:
+      // 483), so a 1-line prompt comes out EMPTY -> "missing task" exit 2
+      // before the run-record write -> the DISPATCH below never lands.
+      fs.writeFileSync(
+        path.join(f.art, `pi-bg-${t}-prompt.md`),
+        "# pi-bg worker task\n\nretry me\n",
+      );
       // cap 1 with one "live" ticket (fresh hb file, no record)
       fs.writeFileSync(path.join(f.art, `pi-bg-${TID(9)}-hb`), "");
       const over = {
         PI_BG_LAUNCHER: JB,
         PI_BG_MAX_CONCURRENT: "1",
-        // CI load pushed the retry launch past the 8s PI_BG_RETRY_WAIT
-        // boundary (run 37473320280): the self-heal "back to held" is
-        // correct, but this test asserts DISPATCH. The #110 fixture sets
-        // the same override; use a generous value here.
+        // Headroom, not the fix. Both CI reds (37473320280 at 8s,
+        // 37484172676 at 30s) were the same non-timing cause: the
+        // 1-line prompt (empty after `tail -n +3`) plus the ambient
+        // PI_BG_* leak in wrapper envs - fixed above. 30s is kept as
+        // headroom for a slow clean-env launch (worktree add, cgroup
+        // escape); the production default stays 8s.
         PI_BG_RETRY_WAIT: "30",
       };
       const r1 = await f.run([], over);

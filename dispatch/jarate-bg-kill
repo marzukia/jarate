@@ -105,7 +105,10 @@ trap 'rm -f "$BG_TMP/pi-bg-${id:-}-kill-body.json" 2>/dev/null' EXIT
 # closed done, no CANCELLED post yet). Re-running jarate-bg-kill then
 # posts CANCELLED (empty cgroup, instant drain). The FINAL marker (after
 # the drain) survives the interrupt: it is the has_killed evidence +
-# worktree auto-prune input, and the wrapper is past its DIED window.
+# worktree auto-prune input. The drop rescues DIED mainly in the
+# deferred-trap/fast-interrupt case: the trap fires immediately from
+# wait, so a mid-drain Ctrl-C usually lands after the wrapper's DIED
+# suppression has already happened.
 kill_interrupt() {
   local rc="$1"
   if grep -q 'kill-in-progress' "$BG_TMP/pi-bg-${id:-}-killed" 2>/dev/null; then
