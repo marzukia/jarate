@@ -5171,6 +5171,45 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     expect(content).toContain("p/m1");
     expect(content).toContain("p/m2");
   });
+
+  test("owner-only command from a non-owner is refused on the interaction path (#169)", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(d("status", { user: { id: "not-owner" } }));
+    // defer first, then the refusal edits the deferred message
+    expect(JSON.parse(calls[0].body).type).toBe(5);
+    const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
+    expect(edit).toBeDefined();
+    const content = JSON.parse(edit!.body).content;
+    expect(content).toContain("[!] owner only");
+    expect(content).not.toContain("ctx "); // no session state leaked
+  });
+
+  test("no owner configured: the interaction refusal names the misconfiguration (#169)", async () => {
+    const chNoOwner = { ...ch, ownerUserId: undefined };
+    const h = buildInteractionHandler(pi, ctx, chNoOwner, "tok-i");
+    await h(d("status", { user: { id: "u1" } }));
+    const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
+    expect(JSON.parse(edit!.body).content).toContain("no owner configured");
+  });
+
+  test("raw command lines pass the same styleGuard sweep as text replies (#169)", async () => {
+    // /usage last with no completed run returns a bare [!] line (no fence
+    // in the command) — the interaction edit must carry it fenced +
+    // 40-col, exactly like the text path (STYLE.md 2.7).
+    const raw = "[!] no completed run yet (run one first)";
+    const saved = (lastRunUsage as { value: any }).value;
+    (lastRunUsage as { value: any }).value = null;
+    try {
+      const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+      await h(d("usage", { options: [{ name: "scope", value: "last" }] }));
+      const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
+      const content = JSON.parse(edit!.body).content;
+      expect(content).toBe(styleGuard(raw));
+      expect(content.startsWith("```")).toBe(true); // sweep fenced it
+    } finally {
+      (lastRunUsage as { value: any }).value = saved;
+    }
+  });
 });
 
 describe("compact: defer mid-run + always report", () => {
