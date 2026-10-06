@@ -8456,7 +8456,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     expect(marker.op).toBe("undo");
     expect(marker.finalText).toContain(
-      "[ok] undone: conversation (re-running)",
+      "[ok] undone: 2 turns + conversation (re-running q2)",
     );
   });
 

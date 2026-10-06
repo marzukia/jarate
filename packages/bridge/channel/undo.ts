@@ -969,6 +969,10 @@ function undoAck(
  * ONE restart covers all N turns. Parks a one-level redo record.
  * N > chain length -> one [!] line, no action (validated before any
  * state changes).
+ *
+ * Output: N=1 keeps the legacy ack byte-identical. N>1 names how many
+ * turns were rolled back and where the session now points — the kept
+ * trigger, which is re-run on restart (F1), truncated to 70 chars.
  */
 export function performUndo(sessionFile: string | null, n = 1): UndoResult {
   if (n > 1) {
@@ -1013,8 +1017,9 @@ export function performUndo(sessionFile: string | null, n = 1): UndoResult {
   }
   // F1: park the re-run trigger. The kept trigger is now the last line.
   let reRun = false;
+  let keptText: string | null = null;
   if (removed && removed.length > 0 && sessionFile) {
-    const keptText = (() => {
+    keptText = (() => {
       try {
         const kept = fs
           .readFileSync(sessionFile, "utf8")
@@ -1059,10 +1064,23 @@ export function performUndo(sessionFile: string | null, n = 1): UndoResult {
       `[undo] redo record write failed: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
-  const text =
-    undoAck(files, (removed?.length ?? 0) > 0, skipped) +
-    (reRun ? " (re-running)" : "");
-  return { text, restarted: (removed?.length ?? 0) > 0, reRun };
+  const conversation = (removed?.length ?? 0) > 0;
+  let text: string;
+  if (n > 1 && conversation) {
+    // N>1: confirm the turn count + where the session now points (the
+    // kept trigger, re-run on restart). N=1 stays on the legacy ack.
+    const parts = [`${n} turns`];
+    if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+    parts.push("conversation");
+    text = `[ok] undone: ${parts.join(" + ")}`;
+    if (skipped > 0) text += ` (kept ${skipped} >20MB file, not restored)`;
+    if (reRun && keptText)
+      text += ` (re-running ${keptText.replace(/\s+/g, " ").slice(0, 70)})`;
+  } else {
+    text =
+      undoAck(files, conversation, skipped) + (reRun ? " (re-running)" : "");
+  }
+  return { text, restarted: conversation, reRun };
 }
 
 /** /redo: reapply the undone run (one level deep). */
