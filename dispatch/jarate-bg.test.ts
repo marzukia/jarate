@@ -3813,3 +3813,80 @@ describe("#144: foreground-launch guard (nohup is the required form)", () => {
     }
   }, 30_000);
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// #142: per-command bash tool timeout
+//
+// This pi version has no bash-tool default timeout (tool schema: "optional,
+// no default timeout"; no settings/env/profile hook), so the cap is wired
+// through the task prompt: STD_CONSTRAINTS tells the model to pass the
+// bash tool's `timeout` parameter (pi kills the whole command tree at the
+// limit, returns a retryable error). PI_BG_CMD_TIMEOUT overrides per
+// dispatch (env at launch); the resolved value is exported to the run's
+// environment and stored in the run record (cmdTimeout) for audit.
+describe("#142: per-command bash tool timeout", () => {
+  // stub pi that records, from INSIDE the live run: PI_BG_CMD_TIMEOUT and
+  // its own full stdin (task + constraints)
+  const timeoutPi = (fx: ReturnType<typeof fixture>) => {
+    const log = path.join(fx.tmp, "pi142-probe.txt");
+    const piPath = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piPath,
+      `#!/bin/sh
+{
+  printf 'ENV: '
+  printf '%s' "\${PI_BG_CMD_TIMEOUT:-unset}"
+  printf '\\nSTDIN:'
+  cat
+  printf '\\n'
+} > "${log}"
+echo pi-run-ok
+`,
+    );
+    fs.chmodSync(piPath, 0o755);
+    return { log };
+  };
+
+  test("default 900s: prompt constraint, exported env, run record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const p = timeoutPi(fx);
+    const r = await fx.runStdin(["worker", "-"], "TIMEOUT-DEFAULT task");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    const log = fs.readFileSync(p.log, "utf8");
+    expect(log.split("\n")[0]).toBe("ENV: 900");
+    const stdinSection = log.split("STDIN:")[1] ?? "";
+    expect(stdinSection).toContain("Pass timeout: 900 (seconds)");
+    expect(stdinSection).toContain("bash tool call");
+    expect(fx.records()[0].cmdTimeout).toBe(900);
+  }, 30_000);
+
+  test("PI_BG_CMD_TIMEOUT override at launch", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const p = timeoutPi(fx);
+    fx.env.PI_BG_CMD_TIMEOUT = "3600";
+    const r = await fx.runStdin(["worker", "-"], "TIMEOUT-OVERRIDE task");
+    expect(r.code).toBe(0);
+    const log = fs.readFileSync(p.log, "utf8");
+    expect(log.split("\n")[0]).toBe("ENV: 3600");
+    expect(log.split("STDIN:")[1] ?? "").toContain(
+      "Pass timeout: 3600 (seconds)",
+    );
+    expect(fx.records()[0].cmdTimeout).toBe(3600);
+  }, 30_000);
+
+  test("non-integer PI_BG_CMD_TIMEOUT: warn + fall back to 900", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const p = timeoutPi(fx);
+    fx.env.PI_BG_CMD_TIMEOUT = "banana";
+    const r = await fx.runStdin(["worker", "-"], "TIMEOUT-BADVAL task");
+    expect(r.code).toBe(0);
+    expect(r.err).toContain("PI_BG_CMD_TIMEOUT='banana'");
+    const log = fs.readFileSync(p.log, "utf8");
+    expect(log.split("\n")[0]).toBe("ENV: 900");
+    expect(fx.records()[0].cmdTimeout).toBe(900);
+  }, 30_000);
+});
