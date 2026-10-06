@@ -102,6 +102,11 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
           PI_BG_TMPDIR: join(tmp, "art"),
           PI_BG_CG_ROOT: join(tmp, "cg"),
           PI_BG_WT_DIR: join(tmp, "wt"),
+          // the OOM section (issue #191 M1) reads $PI_BG_OOM_ROOT for
+          // the in-scope slices: keep it on the fake (slice-less) root or
+          // the first-sight line lands on stdout and the one-line
+          // contract below breaks (failing control for this env)
+          PI_BG_OOM_ROOT: join(tmp, "oom"),
           PATH: process.env.PATH ?? "",
         },
       });

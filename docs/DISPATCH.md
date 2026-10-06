@@ -349,6 +349,42 @@ jsonl) to verify the run resumed - there was no event for the kill.
   watchdog's CHILD-LEFT (separate class, both may fire the same day)
   confirms the departure on the next sweep.
 
+### Agent OOM signature (watchdog, issue #191 M1)
+
+Kernel OOM lines don't persist to the system journal on hydrogen (proven
+2026-10-07: zero kernel OOM entries for the 2026-10-04 incident window
+while monky's slice carried `oom_kill=32`). The slice cgroup counters are
+the only durable OOM record, so every sweep reads `memory.events` and
+alerts on DELTA, not level.
+
+- **Roster**: the sweep's own uid + every `uid [webhook]` line of
+  `$HOME/.config/jarate/fleet-agents` (watchdog is the only in-tree
+  consumer; `#` comments and junk lines tolerated, uids deduped). The
+  webhook column is parsed but not yet used - per-agent routing is M2.
+- **Read**: `$PI_BG_OOM_ROOT/user-<uid>.slice/memory.events` (env seam,
+  default `/sys/fs/cgroup/user.slice`; unit tests run against a fake root
+  plus one first-sight probe against the runner's own real slice) +
+  `memory.max` / `memory.peak` for alert context. Keys matched exactly
+  (`oom` vs `oom_kill` vs `oom_group_kill`).
+- **Baseline**: `$PI_DISPATCH_RECORD_DIR/oom-baseline.json` (same
+  state-location pattern as the run records; survives restarts):
+  `{"<uid>": {"oom_kill": N, "oom": N, "at": iso, "last_alert_epoch": s?}}`.
+  First sight = quiet baseline - a historical counter (monky's 32) never
+  alerts. A positive `oom_kill` delta posts the OOM-ALERT; the baseline
+  advances ONLY after a successful post (dead webhook -> the grown delta
+  re-posts next sweep; no dead-letter file - the cgroup counter IS the
+  dead letter). Counter regression (slice cgroup recreated, e.g. session
+  rebuild) = quiet re-baseline, the dedupe stamp drops. Max 1 ALERT per
+  uid per 60 min (`$PI_BG_OOM_DEDUPE_MIN`, default 60; 0 = off); a
+  suppressed delta accumulates and ships with the next fired alert.
+- **Finding, not page**: `[bg: agent-watch] OOM: user-<uid>.slice
+  oom_kill +N (T total since baseline B)` content (wakes the operator
+  channel via the webhook marker) + red 40-col frame (uid, kill/oom
+  deltas with totals, max, peak with GiB conversion). M1 restarts nothing
+  and changes no MemoryMax; absent slices are skipped (M2's liveness
+  markers classify dead session vs quiet agent). `--quiet` = detect + log,
+  no post, no baseline advance; `--dry-run` = print only.
+
 ### AGENTS.md drift tripwire (watchdog, alert-only)
 
 `~/.pi/agent/AGENTS.md` is prompt-level law: changes require the operator's

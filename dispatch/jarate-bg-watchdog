@@ -100,6 +100,27 @@
 #       ALIVE). --dry-run: would-emit lines, no record/dead-log changes.
 #       Caveat: a change that happens AND reverts between two sweeps is
 #       missed (15-min timer) - the event is the next-sweep view.
+#   4h. agent OOM signature (issue #191, M1): kernel OOM lines do not
+#       persist to the system journal (proven on hydrogen 2026-10-07, 0
+#       kernel OOM entries for the 2026-10-04 incident window); the slice
+#       cgroup counters are the only durable OOM record. Each sweep reads
+#       $PI_BG_OOM_ROOT/user-<uid>.slice/memory.events for the in-scope
+#       uids (own uid + the ~/.config/jarate/fleet-agents roster) and
+#       compares oom_kill/oom against the persisted baseline ($rec_dir/
+#       oom-baseline.json, survives restarts). Positive oom_kill delta
+#       -> OOM-ALERT post ([bg: agent-watch] content prefix wakes the
+#       channel; embed carries delta + absolute counters + memory.max +
+#       memory.peak). Baseline semantics (dead-letter pattern): first
+#       sight of a uid = quiet baseline (the historical counter never
+#       alerts by itself); the baseline advances ONLY after a successful
+#       post (dead webhook -> the same delta re-posts next sweep, no
+#       dead-letter file needed: the finding is re-derivable from cgroup
+#       + baseline); counter regression (slice cgroup recreated after a
+#       session restart) = quiet re-baseline; max 1 ALERT per uid per
+#       60 min (PI_BG_OOM_DEDUPE_MIN, dedupe state in the same file,
+#       written only after a successful post). FINDING only (M1): no
+#       auto-restart, no MemoryMax changes, no liveness paging (M2 adds
+#       the live markers + fleet liveness sweep).
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -123,6 +144,12 @@
 #   PI_BG_WATCHDOG_RETRY =1 runs the DEAD auto-retry (decision, dispatch,
 #                      held section) even under --quiet; POSTS stay
 #                      suppressed (issue #110, review F2). Default 0.
+#   PI_BG_OOM_ROOT     cgroup root for the slice OOM reads (issue #191
+#                      M1; default /sys/fs/cgroup/user.slice; the test
+#                      hook points it at a fake root with plain-file
+#                      memory.events, same pattern as PI_BG_CG_ROOT)
+#   PI_BG_OOM_DEDUPE_MIN  max one OOM ALERT per uid per N min (default
+#                      60, 0 = off; issue #191 M1)
 # args:
 #   --quiet   log-only mode: append to dead log, post no webhooks
 #             (use for the first run after install to baseline existing
@@ -1589,6 +1616,261 @@ if [ -n "$webhook" ]; then
   done
 fi
 
+# ─── agent OOM signature (issue #191, M1) ────────────────────────────────────
+# Kernel OOM text did not persist to the system journal (hydrogen
+# 2026-10-07: 0 kernel OOM entries for the 2026-10-04 incident window);
+# the slice cgroup counters are the only durable OOM record. READ-ONLY
+# here: memory.events / memory.max / memory.peak of the in-scope agent
+# slices, delta-based against $OOM_BASELINE (survives restarts, same
+# state location as the run records). The sweep is ticket-shaped;
+# without this section a slice OOM storm with no in-flight tickets
+# produces zero watchdog events (the 2026-10-04 monky incident: 31+ OOM
+# kills, pi dark 33 min, discovered by accident).
+#
+# Baseline semantics (dead-letter pattern, issue #191 spec):
+#   - first sight of a uid -> quiet baseline (a historical oom_kill=32
+#     never alerts by itself; a quiet box stays quiet)
+#   - positive oom_kill delta -> OOM-ALERT post (delta + absolute
+#     counters + memory.max + memory.peak)
+#   - the baseline advances ONLY after a successful post: a dead
+#     webhook keeps the baseline, so the same (grown) delta re-posts on
+#     the next sweep. No dead-letter file: the finding is re-derivable
+#     from the cgroup + the baseline every sweep.
+#   - counter regression (current < baseline: the slice cgroup was
+#     recreated after a session restart) -> quiet re-baseline
+#   - max 1 ALERT per uid per OOM_DEDUPE_MIN min; the dedupe timestamp
+#     is written only after a successful post (drift tripwire pattern)
+#   - --quiet: detect + log, no post, no baseline advance (the delta
+#     stays and posts on the next non-quiet sweep, as HUNG)
+#   - --dry-run: print, change nothing
+# FINDING only (M1): no auto-restart, no MemoryMax changes, no marker /
+# liveness paging (M2: live markers + fleet liveness sweep).
+OOM_ROOT="${PI_BG_OOM_ROOT:-/sys/fs/cgroup/user.slice}"
+OOM_DEDUPE_MIN="${PI_BG_OOM_DEDUPE_MIN:-60}"
+case "$OOM_DEDUPE_MIN" in
+  '' | *[!0-9]*) OOM_DEDUPE_MIN=60 ;;
+esac
+OOM_BASELINE="$rec_dir/oom-baseline.json"
+oom_found=0
+oom_suppressed=0
+
+# wd_oom_roster: in-scope uids, one per line (own uid first, deduped):
+# own uid + the fleet-agents roster (~/.config/jarate/fleet-agents,
+# "<uid> <webhook>" per line, # comments; the webhook column is M2's
+# per-agent paging - M1 posts every finding to the box operator
+# webhook). Missing/unreadable file = own uid only (non-orchestrator
+# boxes run zero-config).
+wd_oom_roster() {
+  local own
+  own="$(id -u)"
+  {
+    printf '%s\n' "$own"
+    if [ -f "${HOME}/.config/jarate/fleet-agents" ]; then
+      awk '!/^[[:space:]]*#/ && $1 ~ /^[0-9]+$/ {print $1}' \
+        "${HOME}/.config/jarate/fleet-agents" 2>/dev/null
+    fi
+  } | awk '!seen[$0]++'
+}
+
+# wd_oom_read <uid>: "<oom_kill> <oom>" from the slice memory.events.
+# Prints nothing when the slice dir or the events file is absent or
+# unreadable (session gone / perms / old kernel without the file) or a
+# counter is missing - the caller skips (not judgeable, the no-hb rule).
+# Real cgroupfs and the plain-file test root (PI_BG_OOM_ROOT) parse the
+# same way (key-exact match: "oom" must not pick up "oom_kill").
+wd_oom_read() {
+  local uid="$1" d
+  d="$OOM_ROOT/user-${uid}.slice"
+  [ -r "$d/memory.events" ] || return 0
+  awk '$1=="oom_kill" {k=$2} $1=="oom" {o=$2} END {if (k != "" && o != "") print k, o}' \
+    "$d/memory.events" 2>/dev/null
+  return 0
+}
+
+# wd_oom_base_get <uid>: "<oom_kill> <oom> <last_alert-epoch|->"; prints
+# nothing when the entry is absent (or the file is missing/corrupt).
+wd_oom_base_get() {
+  python3 - "$OOM_BASELINE" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+p, uid = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+e = d.get(uid)
+if not isinstance(e, dict) or not isinstance(e.get("oom_kill"), int) \
+        or not isinstance(e.get("oom"), int):
+    sys.exit(0)
+la = e.get("last_alert_epoch")
+print(e["oom_kill"], e["oom"], la if isinstance(la, int) else "-")
+PY
+}
+
+# wd_oom_base_set <uid> <oom_kill> <oom> <last_alert-epoch|->: update
+# one uid entry, keep the others (missing file = first write). Audit-
+# only: a python failure never breaks the sweep. last_alert="-" drops
+# the dedupe timestamp (first sight / re-baseline: new counter era).
+wd_oom_base_set() {
+  local uid="$1" k="$2" o="$3" la="$4"
+  [ "$la" = "-" ] && la=""
+  mkdir -p "$(dirname "$OOM_BASELINE")" 2>/dev/null
+  PI_OOM_UID="$uid" PI_OOM_K="$k" PI_OOM_O="$o" PI_OOM_LA="$la" \
+  python3 - "$OOM_BASELINE" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+uid = os.environ["PI_OOM_UID"]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+e = d.get(uid) or {}
+e["oom_kill"] = int(os.environ["PI_OOM_K"])
+e["oom"] = int(os.environ["PI_OOM_O"])
+e["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+if os.environ["PI_OOM_LA"]:
+    e["last_alert_epoch"] = int(os.environ["PI_OOM_LA"])
+else:
+    e.pop("last_alert_epoch", None)
+d[uid] = e
+json.dump(d, open(p, "w"), indent=2)
+PY
+}
+
+# wd_build_oom <body-file> <uid> <delta-kill> <total-kill> <base-kill>
+#   <delta-oom> <total-oom> <base-oom> <memory.max> <memory.peak>
+# OOM-ALERT finding (issue #191 M1). The body carries BOTH the
+# [bg: agent-watch] content (the webhook wake marker, isBgWebhook) and
+# the 40-col frame embed (delta + absolute counters + memory.max +
+# memory.peak, the spec's post content). memory.max "max" (uncapped)
+# passes through; byte values get a GiB rendering.
+wd_build_oom() {
+  local bodyfile="$1" uid="$2" dk="$3" tk="$4" bk="$5" doo="$6" to="$7" bo="$8" mx="$9" pk="${10}"
+  WD_O_UID="$uid" WD_O_DK="$dk" WD_O_TK="$tk" WD_O_BK="$bk" WD_O_DO="$doo" \
+  WD_O_TO="$to" WD_O_BO="$bo" WD_O_MAX="$mx" WD_O_PEAK="$pk" \
+  python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("WD_O_" + k, "")
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
+VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def kv(key, val):
+    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
+def gib(s):
+    try:
+        n = int(s)
+    except ValueError:
+        return s or "n/a"  # "max" (uncapped) or empty (no memory.peak)
+    return f"{n} ({n / 2**30:.1f}G)"
+uid = E("UID")
+lines = ["\u250c oom \u00b7 user-" + uid + ".slice",
+         "\u251c $ jarate-bg-watchdog",
+         kv("uid", uid),
+         kv("kill", f"+{E('DK')} ({E('TK')} total, base {E('BK')})"),
+         kv("oom", f"+{E('DO')} ({E('TO')} total, base {E('BO')})"),
+         kv("max", gib(E("MAX"))),
+         kv("peak", gib(E("PEAK"))),
+         kv("note", "agent-slice OOM kills"),
+         "\u2514"]
+content = (f"[bg: agent-watch] OOM: user-{uid}.slice oom_kill "
+           f"+{E('DK')} ({E('TK')} total since baseline {E('BK')})")
+embed = {"author": {"name": "pi-bg watchdog"},
+         "color": 15158332,  # red: kills in the agent slice (DEAD is orange)
+         "title": f"OOM-ALERT \u00b7 user-{uid}.slice",
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg watchdog (oom, issue #191)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"content": content, "embeds": [embed]}, sys.stdout)
+PY
+}
+
+if [ -d "$OOM_ROOT" ]; then
+  for uid in $(wd_oom_roster); do
+    [ -n "$uid" ] || continue
+    counters="$(wd_oom_read "$uid")"
+    oomk="${counters%% *}"
+    oomo="${counters##* }"
+    case "${oomk}${oomo}" in '' | *[!0-9]*) continue ;; esac
+    base_line="$(wd_oom_base_get "$uid")"
+    if [ -z "$base_line" ]; then
+      # first sight: quiet baseline (the historical counter, e.g.
+      # monky's oom_kill=32, never alerts by itself)
+      if [ "$DRY" -eq 1 ]; then
+        echo "[pi-bg-watchdog] dry-run: would baseline user-${uid}.slice (oom_kill=${oomk} oom=${oomo})"
+      else
+        wd_oom_base_set "$uid" "$oomk" "$oomo" "-"
+        echo "[pi-bg-watchdog] oom baseline: user-${uid}.slice (oom_kill=${oomk} oom=${oomo})"
+      fi
+      continue
+    fi
+    bk="${base_line%% *}"
+    rest="${base_line#* }"
+    bo="${rest%% *}"
+    bla="${rest##* }"
+    dk=$(( oomk - bk ))
+    doo=$(( oomo - bo ))
+    if [ "$dk" -lt 0 ] || [ "$doo" -lt 0 ]; then
+      # counter regression: the slice cgroup was recreated (session
+      # restart wiped the counters) - re-baseline quietly, no alert
+      if [ "$DRY" -eq 1 ]; then
+        echo "[pi-bg-watchdog] dry-run: would re-baseline user-${uid}.slice (counter regression: oom_kill ${bk} -> ${oomk})"
+      else
+        wd_oom_base_set "$uid" "$oomk" "$oomo" "-"
+        echo "[pi-bg-watchdog] oom re-baseline: user-${uid}.slice (counter regression: oom_kill ${bk} -> ${oomk}, oom ${bo} -> ${oomo})"
+      fi
+      continue
+    fi
+    [ "$dk" -ge 1 ] || continue  # no new kills since the baseline
+    # 60-min alert dedupe (spec false-positive budget): the timestamp is
+    # written only after a successful post, so a suppressed window
+    # accumulates and the next allowed sweep posts the full delta
+    if [ "$bla" != "-" ] && [ -n "$bla" ] && [ "$OOM_DEDUPE_MIN" -gt 0 ]; then
+      oom_age_min=$(( ( $(date +%s) - bla ) / 60 ))
+      if [ "$oom_age_min" -lt "$OOM_DEDUPE_MIN" ]; then
+        echo "[pi-bg-watchdog] oom user-${uid}.slice: oom_kill +${dk} suppressed (last alert ${oom_age_min}m ago < ${OOM_DEDUPE_MIN}m)"
+        oom_suppressed=$(( oom_suppressed + 1 ))
+        continue
+      fi
+    fi
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would post OOM-ALERT user-${uid}.slice (oom_kill +${dk}, ${oomk} total)"
+      continue
+    fi
+    if [ "$QUIET" -eq 1 ]; then
+      # the quiet contract is zero posts: no post, no baseline advance
+      # (the delta stays and posts on the next non-quiet sweep, as HUNG)
+      echo "[pi-bg-watchdog] quiet: OOM user-${uid}.slice oom_kill +${dk} not posted (no baseline advance)"
+      continue
+    fi
+    if [ -z "$webhook" ]; then
+      echo "[pi-bg-watchdog] oom user-${uid}.slice: oom_kill +${dk} - no webhook configured (no baseline advance)"
+      continue
+    fi
+    oom_max="$(tr -d '[:space:]' < "$OOM_ROOT/user-${uid}.slice/memory.max" 2>/dev/null)" || oom_max=""
+    oom_peak="$(tr -d '[:space:]' < "$OOM_ROOT/user-${uid}.slice/memory.peak" 2>/dev/null)" || oom_peak=""
+    bodyf="$BG_TMP/pi-bg-watchdog-oom-body.json"
+    wd_build_oom "$bodyf" "$uid" "$dk" "$oomk" "$bk" "$doo" "$oomo" "$bo" "$oom_max" "$oom_peak"
+    if [ -s "$bodyf" ]; then
+      if wd_post "$bodyf"; then
+        wd_oom_base_set "$uid" "$oomk" "$oomo" "$(date +%s)"
+        echo "[pi-bg-watchdog] OOM user-${uid}.slice: oom_kill +${dk} (${oomk} total, base ${bk}), oom +${doo} (${oomo} total)"
+        oom_found=$(( oom_found + 1 ))
+      else
+        # dead webhook: baseline NOT advanced - the same (grown) delta
+        # re-posts on the next sweep (dead-letter pattern; no letter
+        # file: the finding is re-derivable from cgroup + baseline)
+        echo "[pi-bg-watchdog] OOM post failed for user-${uid}.slice - baseline kept, retries next sweep" >&2
+      fi
+    else
+      echo "[pi-bg-watchdog] OOM embed build failed for user-${uid}.slice - baseline kept" >&2
+    fi
+    rm -f "$bodyf"
+  done
+fi
+[ "$oom_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $oom_found agent OOM finding(s)"
+[ "$oom_suppressed" -gt 0 ] && echo "[pi-bg-watchdog] deduped $oom_suppressed OOM alert(s) (${OOM_DEDUPE_MIN}m window)"
+
 # ─── AGENTS.md drift tripwire (2026-09-14, alert-only) ────────────────────────
 # Manifest: ~/.pi/agent/.agents-md-hash (<sha256>  <ts>  <note>). The check
 # itself never blocks; this section only decides whether to post. One warning
@@ -1712,5 +1994,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed, $oom_found agent OOM finding(s), $oom_suppressed OOM alert(s) deduped (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS oom_dedupe_min=$OOM_DEDUPE_MIN)"
 exit 0
