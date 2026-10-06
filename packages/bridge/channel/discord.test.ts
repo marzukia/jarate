@@ -2,11 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { WebSocketServer } from "ws";
 import { clearRegistryCache } from "./censor";
 import {
   allowedMentionsFor,
   clearDiscordStatesForTest,
   connectDiscord,
+  connectDiscordPresence,
   deferInteraction,
   disconnectDiscord,
   editInteractionMessage,
@@ -28,10 +30,13 @@ import {
   registerDiscordCommands,
   resolveChannelId,
   respondToInteraction,
+  SLASH_COMMANDS,
   seedChannelStateForTest,
   sendDiscordMessage,
   sendFilesToDiscord,
   setChannelCursor,
+  setDiscordInteractionHandler,
+  stopDiscordPresence,
   suppressAutoReact,
 } from "./discord";
 
@@ -869,6 +874,84 @@ test("registerDiscordCommands skips cleanly with no guilds", async () => {
   });
   await registerDiscordCommands("tok-dm");
   expect(seen.some((u) => u.includes("/commands"))).toBe(false);
+});
+
+// issue #169 — the socket/handler seam, hermetically: a fake gateway
+// WebSocketServer stands in for Discord. Proves (1) IDENTIFY requests the
+// INTERACTIONS intent (the original parking bug: without it, the server
+// never sends INTERACTION_CREATE frames) and (2) a type-1
+// INTERACTION_CREATE frame on the wire reaches the handler registered via
+// setDiscordInteractionHandler. This test fails against the pre-5431caed
+// code (missing intent bit + event name INTERACTIONS_CREATE, plural).
+test("gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the handler (#169)", async () => {
+  const token = "tok-seam-169";
+  const wss = new WebSocketServer({ port: 0 });
+  const port = (wss.address() as { port: number }).port;
+  const identified: any[] = [];
+  const frames: any[] = [];
+  wss.on("connection", (sock) => {
+    sock.on("message", (data: any) => {
+      const m = JSON.parse(String(data));
+      frames.push(m);
+      if (m.op === 2) {
+        identified.push(m.d);
+        sock.send(
+          JSON.stringify({ op: 10, d: { heartbeat_interval: 41000, seq: 1 } }),
+        );
+        sock.send(
+          JSON.stringify({
+            op: 0,
+            s: 2,
+            t: "READY",
+            d: { user: { id: "bot9" }, session_id: "sess9" },
+          }),
+        );
+        sock.send(
+          JSON.stringify({
+            op: 0,
+            s: 3,
+            t: "INTERACTION_CREATE",
+            d: {
+              type: 1,
+              id: "ix9",
+              token: "ixtok",
+              application_id: "app9",
+              channel_id: "888",
+              guild_id: "g9",
+              user: { id: "u9" },
+              data: { id: "cmd9", name: "help" },
+            },
+          }),
+        );
+      } else if (m.op === 11) {
+        sock.send(JSON.stringify({ op: 1, d: m.d }));
+      }
+    });
+  });
+
+  const received: any[] = [];
+  setDiscordInteractionHandler(token, (d) => received.push(d));
+  const savedGateway = process.env.DISCORD_GATEWAY_URL;
+  process.env.DISCORD_GATEWAY_URL = `ws://127.0.0.1:${port}`;
+
+  try {
+    await connectDiscordPresence(token);
+    // poll: the frame lands right after READY
+    const t0 = Date.now();
+    while (received.length === 0 && Date.now() - t0 < 5000) await tick(25);
+
+    expect(identified.length).toBe(1);
+    expect(identified[0].intents & 0x2, "INTERACTIONS intent bit").toBe(0x2);
+    expect(received.length).toBe(1);
+    expect(received[0].data.name).toBe("help");
+    expect(received[0].type).toBe(1);
+    expect(received[0].channel_id).toBe("888");
+  } finally {
+    if (savedGateway === undefined) delete process.env.DISCORD_GATEWAY_URL;
+    else process.env.DISCORD_GATEWAY_URL = savedGateway;
+    stopDiscordPresence(token);
+    wss.close();
+  }
 });
 
 test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @original (P0)", async () => {

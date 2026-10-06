@@ -1143,7 +1143,11 @@ export function getDiscordStates(): Map<string, DiscordState> {
 
 // ─── Gateway presence + typing ───────────────────────────────────────────
 
-const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+// Lazy read: tests (and local gateways) override via DISCORD_GATEWAY_URL.
+function gatewayUrl(): string {
+  return process.env.DISCORD_GATEWAY_URL ?? DEFAULT_GATEWAY_URL;
+}
 
 interface PresenceState {
   token: string;
@@ -1201,7 +1205,7 @@ function connectPresence(st: PresenceState): void {
   if (st.stopped) return;
   let ws: WebSocket;
   try {
-    ws = new WebSocket(GATEWAY_URL);
+    ws = new WebSocket(gatewayUrl());
   } catch {
     setTimeout(() => connectPresence(st), 5000);
     return;
