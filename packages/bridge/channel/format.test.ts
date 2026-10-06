@@ -5,6 +5,7 @@ import {
   escapeBackticksInCodeBlocks,
   escapeDiscordFormatting,
   formatMarkdownTables,
+  hoistFencedUrls,
   limitHeadingDepth,
   mdToDiscord,
   serializeEmbeds,
@@ -443,6 +444,88 @@ describe("hoistFencedUrls", () => {
   test("no url in fence -> unchanged", () => {
     const out = mdToDiscord("```\njust code here\n```");
     expect(out).toContain("```\njust code here\n```");
+  });
+
+  // issue #87: links in existing fences render as literal [label](url)
+  // text or monospace strings - hoist them so Discord links them
+
+  test("md link in fence -> hoisted, rendered as a link (#87)", () => {
+    const out = mdToDiscord("```\n[report](https://drop.junkyard.sh/abc)\n```");
+    // fence dropped (links-only), link re-emitted in the bridge's
+    // `label (<url>)` form - clickable, and stable on a second pass
+    expect(out).toBe("report (<https://drop.junkyard.sh/abc>)");
+  });
+
+  test("md link with trailing period in fence -> hoisted (#87)", () => {
+    const out = mdToDiscord("```\n[report](https://x.test/a).\n```");
+    expect(out).toBe("report (<https://x.test/a>)");
+  });
+
+  test("backticked url in fence -> hoisted bare (#87)", () => {
+    // the pipeline escapes fence-body backticks first (\`url\`); the
+    // hoisted line carries no backtick, no backslash
+    const out = mdToDiscord("```\n`https://drop.junkyard.sh/abc`\n```");
+    expect(out).toBe("https://drop.junkyard.sh/abc");
+  });
+
+  test("autolink in fence -> hoisted bare (#87)", () => {
+    const out = mdToDiscord("```\n<https://x.test/file>\n```");
+    expect(out).toBe("https://x.test/file");
+  });
+
+  test("mixed prose+url line in untagged fence -> url hoisted, rest stays (#87)", () => {
+    const out = mdToDiscord("```\nreport: https://drop.junkyard.sh/abc\n```");
+    expect(out).toBe("```\nreport:\n```\nhttps://drop.junkyard.sh/abc");
+  });
+
+  test("machine line with url in existing fence -> url hoisted (#87)", () => {
+    const out = mdToDiscord(
+      "```\n[ok] uploaded https://drop.junkyard.sh/abc\n```",
+    );
+    expect(out).toBe("```\n[ok] uploaded\n```\nhttps://drop.junkyard.sh/abc");
+  });
+
+  test("two urls on one fence line -> each shipped once, no duplicate (#87)", () => {
+    const out = mdToDiscord(
+      "```\nsee https://a.test/x and https://b.test/y\n```",
+    );
+    expect(out).toBe("```\nsee and\n```\nhttps://a.test/x\nhttps://b.test/y");
+  });
+
+  test("backticked url mixed with prose in fence -> span removed, no dangling backslash (#87)", () => {
+    const out = mdToDiscord("```\nsee `https://x.test/file` ok\n```");
+    expect(out).toBe("```\nsee ok\n```\nhttps://x.test/file");
+  });
+
+  test("tagged fence: mixed url line is code, left alone (#87)", () => {
+    const input = "```bash\ncurl https://x.test/file\n```";
+    expect(mdToDiscord(input)).toBe(input);
+  });
+
+  test("quoted url in untagged fence (JSON) stays fenced (#87)", () => {
+    const input = '```\n{\n  "url": "https://x.test/a"\n}\n```';
+    expect(mdToDiscord(input)).toBe(input);
+  });
+
+  test("unclosed fence with url -> no undefined line (#87)", () => {
+    expect(hoistFencedUrls("```\nhttps://x.test/a")).toBe("https://x.test/a");
+    expect(hoistFencedUrls("```\ncode\nhttps://x.test/a")).toBe(
+      "```\ncode\nhttps://x.test/a",
+    );
+  });
+
+  test("idempotent through the full pipeline (#87)", () => {
+    const inputs = [
+      "```\n[report](https://x.test/a)\n```",
+      "```\n`https://x.test/a`\n```",
+      "```\n<https://x.test/a>\n```",
+      "```\nreport: https://x.test/a\n```",
+      "```\n[ok] uploaded https://x.test/a\n```",
+    ];
+    for (const input of inputs) {
+      const once = mdToDiscord(input);
+      expect(mdToDiscord(once)).toBe(once);
+    }
   });
 });
 
