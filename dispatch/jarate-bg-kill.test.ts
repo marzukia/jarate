@@ -446,3 +446,98 @@ describe("jarate-bg-kill #86: short-id resolution (run records)", () => {
     s.close();
   });
 });
+
+/**
+ * review #183 F5: an operator interrupt during the drain (INT/TERM to
+ * jarate-bg-kill) used to leave the PROVISIONAL (kill-in-progress) marker
+ * in place: the wrapper's exit trap - running concurrently with the drain
+ * poll - suppressed its DIED post on sight of it, and the kill exited
+ * before the CANCELLED post + record finalize, so the ticket ended with
+ * ZERO terminal embeds. The INT/TERM path now drops the provisional
+ * marker (the wrapper posts DIED - pre-interrupt behavior); a second full
+ * run of jarate-bg-kill posts CANCELLED (empty cgroup, instant drain).
+ */
+describe("jarate-bg-kill interrupt: provisional marker dropped (review F5)", () => {
+  test("SIGINT mid-drain: exit 130, marker gone, no CANCELLED post", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkillint-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00015";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    let posted = false;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posted = true;
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    // victim that ignores TERM: holds the drain open (the interrupt
+    // lands mid-poll, long before KILL_WAIT)
+    const victim = spawn(
+      ["bash", "-c", 'trap "" TERM; while :; do sleep 0.2; done'],
+      { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+    );
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const marker = path.join(tmp, "art", `pi-bg-${id}-killed`);
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "10", // the drain window the interrupt lands in
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      // wait for the provisional marker (written BEFORE the TERM)
+      const t0 = Date.now();
+      while (!fs.existsSync(marker)) {
+        if (Date.now() - t0 > 10_000) {
+          throw new Error(`provisional marker never appeared: ${marker}`);
+        }
+        await Bun.sleep(50);
+      }
+      expect(fs.readFileSync(marker, "utf8")).toContain("kill-in-progress");
+      // interrupt mid-drain (the victim ignores TERM: still polling)
+      p.kill("SIGINT");
+      const [out, err] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      if (code !== 130) {
+        throw new Error(`expected 130, got ${code}\nOUT: ${out}\nERR: ${err}`);
+      }
+      // the provisional marker is dropped: the wrapper (still draining in
+      // parallel) no longer sees it and posts DIED - the ticket never
+      // ends with zero terminal embeds
+      expect(fs.existsSync(marker)).toBe(false);
+      // the kill exited before the CANCELLED post + record finalize
+      expect(posted).toBe(false);
+    } finally {
+      try {
+        victim.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      server.stop(true);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 40_000);
+});

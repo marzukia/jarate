@@ -872,6 +872,55 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
     }
   }, 30_000);
 
+  test("cross-day after record prune: the worktree dir cannot outlive the record", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(5);
+      // SIGKILLed worktree ticket: no kill marker (the worktree
+      // auto-prune's gate), record closed state=killed by the flag
+      // sweep, record + dir now 8 days old (> PRUNE_DAYS default 7):
+      // the run-state prune claims the record this sweep. Pre-fix the
+      // dir survived the record and the sweep re-flagged DEAD every
+      // UTC day after (fresh terminal embed; review #183 F3).
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true });
+      const old = new Date(Date.now() - 8 * 86_400_000);
+      fs.utimesSync(wt, old, old);
+      plantRunning(f, t);
+      const rec = recFile(f, t);
+      fs.writeFileSync(
+        rec,
+        fs
+          .readFileSync(rec, "utf8")
+          .replace(/"state": "running"/, '"state": "killed"'),
+      );
+      fs.utimesSync(rec, old, old);
+
+      // sweep 1: the prune runs - record AND worktree dir go together
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      // record_done guard: the closed record is not flagged on the
+      // prune sweep itself
+      expect(r1.out).not.toContain(`DEAD jarate/${t}`);
+      expect(r1.out).toContain(`pruned run state ${t}`);
+      expect(r1.out).toContain(`pruned worktree ${wt}`);
+      expect(fs.existsSync(rec)).toBe(false);
+      expect(fs.existsSync(wt)).toBe(false);
+      expect(f.posts).toHaveLength(0);
+
+      // sweep 2: no deadlog line was ever written (nothing flagged),
+      // so the per-day dedupe is not what suppresses a re-flag here -
+      // the dir itself is gone
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`DEAD jarate/${t}`);
+      expect(f.posts).toHaveLength(0);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
   test("held record: re-flagged daily until the retry fires (stays running)", async () => {
     const f = fixture();
     try {
@@ -887,6 +936,11 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
       const over = {
         PI_BG_LAUNCHER: JB,
         PI_BG_MAX_CONCURRENT: "1",
+        // CI load pushed the retry launch past the 8s PI_BG_RETRY_WAIT
+        // boundary (run 37473320280): the self-heal "back to held" is
+        // correct, but this test asserts DISPATCH. The #110 fixture sets
+        // the same override; use a generous value here.
+        PI_BG_RETRY_WAIT: "30",
       };
       const r1 = await f.run([], over);
       expect(r1.code).toBe(0);
@@ -2386,6 +2440,29 @@ describe("#53: dead-letter consumption", () => {
       expect(r.out).toContain(`dry-run: would re-post dead letter ${t}`);
       expect(f.posts).toHaveLength(0);
       expect(fs.existsSync(lp)).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--quiet: letters kept, zero posts (quiet contract, review F4)", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(11);
+    const lp = plantLetter(f, t, "cb", DIED_BODY);
+    try {
+      const r = await f.run(["--quiet"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`quiet: dead letter ${t} kept (no post)`);
+      expect(f.posts).toHaveLength(0); // quiet contract: no posts
+      expect(fs.existsSync(lp)).toBe(true); // kept for the next sweep
+      // the next NON-quiet sweep consumes it (exactly-once still holds)
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`dead letter ${t}: re-posted`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toEqual(DIED_BODY);
+      expect(fs.existsSync(lp)).toBe(false);
     } finally {
       f.close();
     }

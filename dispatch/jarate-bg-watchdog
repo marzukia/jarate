@@ -1314,7 +1314,9 @@ fi
 # wakes the channel (queue-only, issues #177/#179), the embed lands in the
 # /jobs history. On success: the ticket's wb-status gets a re-post note
 # and the letter is deleted (exactly-once). On failure: the letter stays
-# for the next sweep. No lock (house style: one 15-min timer per box; a
+# for the next sweep. Under --quiet the letters are kept, not re-posted
+# (the quiet contract is zero posts, review #183 F4) - they fire on the
+# next non-quiet sweep. No lock (house style: one 15-min timer per box; a
 # double sweep double-posts at most, the [bg: dedupe in the bridge keeps
 # that to one wake).
 dl_consumed=0
@@ -1342,6 +1344,13 @@ if [ -n "$webhook" ]; then
     fi
     if [ "$DRY" -eq 1 ]; then
       echo "[pi-bg-watchdog] dry-run: would re-post dead letter $dl_t"
+      continue
+    fi
+    if [ "$QUIET" -eq 1 ]; then
+      # the quiet contract is zero posts (header): keep the letter for
+      # the next non-quiet sweep (exactly-once is per post, not per
+      # sweep; review #183 F4)
+      echo "[pi-bg-watchdog] quiet: dead letter $dl_t kept (no post)"
       continue
     fi
     dl_bodyf="$BG_TMP/pi-bg-${dl_t}-dl-body.json"
@@ -1444,7 +1453,11 @@ fi
 #     refresh the mtime), so a stale mtime means an untrappable death or a
 #     record that was never closed. Live tickets keep theirs (prune_live
 #     above). Sweep-flagged deaths end state=killed (sticky terminal,
-#     issue #51) - pruned here, never re-flagged.
+#     issue #51) - pruned here WITH the ticket's worktree dir, so the
+#     dir cannot outlive the record: a SIGKILLed worktree ticket has no
+#     kill marker (the worktree auto-prune's gate), and with the record
+#     gone the sweep's guards all pass - DEAD re-flag + a fresh terminal
+#     embed every UTC day while the dir exists (review #183 F3).
 pruned_state=0
 if [ "$PRUNE_DAYS" -gt 0 ]; then
   rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
@@ -1463,6 +1476,17 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
     rm -f "$BG_TMP"/pi-bg-"$t"-* 2>/dev/null
     rm -f "$LEGACY_TMP"/pi-bg-"$t"-* 2>/dev/null
     rm -f "$rf"
+    # close the loop (review #183 F3): remove the ticket's worktree dir
+    # with the record. prune_live (above) already confirmed the ticket is
+    # dead (no cgroup member, no process in the dir) - the is_live guard
+    # the sweep itself relies on. Same removal ladder as the worktree
+    # auto-prune: git worktree remove --force, rmdir for bare dirs.
+    for wtd in "$WT_DIR"/*/"$t"; do
+      [ -d "$wtd" ] || continue
+      if git -C "$wtd" worktree remove --force "$wtd" 2>/dev/null || rmdir "$wtd" 2>/dev/null; then
+        echo "[pi-bg-watchdog] pruned worktree $wtd (record gone, ticket dead)"
+      fi
+    done
     echo "[pi-bg-watchdog] pruned run state $t"
     pruned_state=$((pruned_state + 1))
   done
