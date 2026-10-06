@@ -42,6 +42,7 @@ import extension, {
   hasOwnerConfigured,
   heldChannels,
   interruptStepTimeoutMs,
+  isBgInbound,
   isCompacting,
   isEssentialToolCall,
   isHeld,
@@ -1940,10 +1941,11 @@ describe("extension handlers (A1/A2/A4)", () => {
     // 3s window expired mid-REST-POST and killed the very agent-say call
     // that was messaging that peer (pre-spawn "Operation aborted").
     // Fix: a peer-authored mid-run inbound (isPeerInbound) arms at the
-    // 4x window like the other in-flight-armed paths; humans and [bg:
-    // machine wakes keep the 3s default. The queued message always has
-    // the guaranteed re-wake as fallback, so the longer window only
-    // changes WHEN the interrupt cuts in, never WHETHER it delivers.
+    // 4x window like the other in-flight-armed paths; humans keep the 3s
+    // default; [bg: machine wakes arm nothing from #177 on (queue-only).
+    // The queued message always has the guaranteed re-wake as fallback,
+    // so the longer window only changes WHEN the interrupt cuts in, never
+    // WHETHER it delivers.
 
     test("peer mid-run inbound arms the 4x in-flight window, not the 3s default (#165)", async () => {
       peerSettings(); // peerBotIds: [peer-1]
@@ -1995,21 +1997,27 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(abortCount).toBe(baseAborts + 1);
     });
 
-    test("[bg: peer-authored wake keeps the 3s default (machine wake, not peer speech) (#165)", async () => {
+    test("[bg: peer-authored wake is queue-only, arms nothing (#177, supersedes the #165 3s pin)", async () => {
       peerSettings();
       await handlers.session_start?.(null, ctx); // configRoot for peer lookup
       expect(idle).toBe(false);
       const baseAborts = abortCount;
+      const baseSends = sent.length;
       const wake = { ...inboundPeer("[bg:etl] ticket", "bm1"), from: "bg" };
       await handleInbound(pi, wake, ctx);
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
-      ).toBeLessThanOrEqual(1);
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      // Queue-only: not the 3s default, not the 12s peer window.
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 4);
       await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("bm1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
     test("peer inbound with no run in flight delivers directly, arms no interrupt (#165)", async () => {
@@ -2416,6 +2424,178 @@ describe("extension handlers (A1/A2/A4)", () => {
           c.url.includes(`/channels/ch1/messages/${ackId}`),
       ).length;
       expect(ackPatchesAfter).toBe(patchesBefore);
+    });
+  });
+
+  describe("mid-run interrupt (#177 [bg: queue-only)", () => {
+    // #177: [bg:-prefixed webhook inbounds (pi-bg callbacks, dead-letter
+    // alerts, ETL alerts) ride the re-wake queue and deliver at agent_end;
+    // they arm NO mid-run interrupt — the queue already guarantees
+    // delivery, the interrupt only jumps the line, and a machine alert is
+    // never more urgent than the in-flight turn. Human 3s arming and
+    // peer-bot 12s arming (#165/#175) are untouched; a later human cut-in
+    // still arms even with a [bg: entry queued ahead of it.
+    let abortCount: number;
+    let idle: boolean;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      abortCount = 0;
+      idle = false;
+      // Model the real session: abort kills the run and it settles (idle).
+      ctx.isIdle = () => idle;
+      ctx.abort = () => {
+        abortCount += 1;
+        idle = true;
+      };
+      setInterruptCtx(ctx);
+    });
+
+    afterEach(() => {
+      clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+      resetRuntimeStateForTest(); // sessionStartTs/held/verbose: no leaks
+      setInterruptCtx(null);
+      clearAllInterrupts();
+      pendingInterrupts.clear();
+      queuedAcks.clear();
+      jest.useRealTimers();
+    });
+
+    test("isBgInbound classifies on the [bg: prefix (leading whitespace ok)", () => {
+      expect(isBgInbound(inbound("[bg:worker:OK] x", "1"))).toBe(true);
+      expect(isBgInbound(inbound("  [bg:etl] y", "2"))).toBe(true);
+      expect(isBgInbound(inbound("[bg] no colon", "3"))).toBe(false);
+      expect(isBgInbound(inbound("plain", "4"))).toBe(false);
+      expect(isBgInbound(inbound("see [bg: ticket", "5"))).toBe(false);
+    });
+
+    test("[bg: inbound mid-run: no interrupt armed (timer count unchanged), delivered at agent_end via re-wake", async () => {
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      const baseTimers = pendingInterrupts.size;
+      await handleInbound(
+        pi,
+        inbound("[bg:worker:OK] task 42 done", "bm1"),
+        ctx,
+      );
+      // Queued for the guaranteed re-wake...
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // ...but nothing armed: the timer count is unchanged.
+      expect(pendingInterrupts.size).toBe(baseTimers);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      // The 3s point (and beyond) passes with no abort, no early delivery.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 2);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.body).toBe(
+        "[bg:worker:OK] task 42 done",
+      );
+      expect(sent[baseSends].m.details.messageId).toBe("bm1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("[bg: inbound idle: immediate delivery, nothing queued or armed (regression pin)", async () => {
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      idle = true; // no run in flight
+      await handleInbound(
+        pi,
+        inbound("[bg:worker:OK] task 43 done", "bm2"),
+        ctx,
+      );
+      // Straight to pi as a fresh run: the delivery path is unchanged.
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("bm2");
+      // Nothing pending to fire later.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 2);
+      await Promise.resolve();
+      expect(sent.length).toBe(baseSends + 1);
+      expect(abortCount).toBe(baseAborts);
+    });
+
+    test("human inbound mid-run: 3s arm (regression pin)", async () => {
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inbound("human mid-run", "hm1"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      const armed = pendingInterrupts.get("ch1")?.[0];
+      expect(armed).toBeDefined();
+      expect(armed!.messageId).toBe("hm1");
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
+      ).toBeLessThanOrEqual(1);
+      // Fires at the 3s point: the quick cut-in is intact.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("hm1");
+    });
+
+    test("peer bot speech mid-run: 12s arm (regression pin, #175)", async () => {
+      peerSettings(); // peerBotIds: [peer-1]
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      const armed = pendingInterrupts.get("ch1")?.[0];
+      expect(armed).toBeDefined();
+      expect(armed!.messageId).toBe("pm1");
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
+      ).toBeLessThanOrEqual(1);
+      // The 3s point passes with NO abort: the in-flight run gets its
+      // head start.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The 12s window fires on schedule.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("pm1");
+    });
+
+    test("human arriving mid-run after a [bg: was queued: still arms (the queue does not suppress later human cuts)", async () => {
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      // 1. [bg: wake lands mid-run: queued, no arm.
+      await handleInbound(
+        pi,
+        inbound("[bg:worker:OK] task 44 done", "bm1"),
+        ctx,
+      );
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      // 2. Human arrives while the [bg: is queued: the cut-in still arms.
+      await handleInbound(pi, inbound("human cut", "hm1"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(2);
+      const armed = pendingInterrupts
+        .get("ch1")
+        ?.find((p) => p.messageId === "hm1");
+      expect(armed).toBeDefined();
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
+      ).toBeLessThanOrEqual(1);
+      // 3. The 3s point fires: the HUMAN's message is force-delivered...
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("hm1");
+      // ...and the [bg: entry stays queued for its agent_end re-wake.
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("bm1");
     });
   });
 
