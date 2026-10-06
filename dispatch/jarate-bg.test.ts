@@ -97,6 +97,11 @@ function fixture() {
   // caller bypass keeps every existing test on the nohup-path behavior;
   // the #144 guard tests build their own env without it.
   env.PI_BG_ALLOW_FOREGROUND = "1";
+  // issue #145: daemonize is off for the whole suite too - the tests
+  // await the launcher's exit and assert on its inline output, so they
+  // pin the legacy inline topology (the #145 describe builds its own
+  // env with daemonize on).
+  env.PI_BG_DAEMONIZE = "0";
   // cgroup escape into a per-run temp dir, not the REAL user cgroup root
   // (issue: pi-bg cgroup-dir leak, 2026-09-14): every fixture spawn escaped
   // into /sys/fs/cgroup/.../user@N.service/pi-bg/, and an interrupted bun
@@ -4266,6 +4271,185 @@ describe("#144: foreground-launch guard (nohup is the required form)", () => {
       expect(err, `value ${v}`).toContain("foreground launch detected");
       expect(fs.existsSync(recDirOf(fx)) ? fx.records() : []).toHaveLength(0);
     }
+  }, 30_000);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// #145: daemonize after registration (foreground launch returns in seconds)
+//
+// The #144 guard throws on the attached SIGHUP-default shape. #145 adds
+// the other half: every HUP-default shape that PASSES the guard
+// (bypass, warn, or unattached) daemonizes after ticket registration,
+// so the launcher exits 0 within seconds and the run continues detached
+// (own session, reparented to systemd). nohup (SIGHUP SIG_IGN) stays
+// inline - unchanged topology. PI_BG_DAEMONIZE=0 pins the legacy inline
+// topology (the fixture's knob; the rest of this suite awaits the
+// launcher's exit on inline output).
+describe("#145: daemonize after registration", () => {
+  // Hermetic SIGHUP default (same leak as #144: the suite often runs
+  // under a nohup'd ticket with HUP already ignored).
+  const PY_DFL_HUP =
+    "import os, signal, sys; " +
+    "signal.signal(signal.SIGHUP, signal.SIG_DFL); " +
+    'os.execvp("bash", ["bash", sys.argv[1]] + sys.argv[2:])';
+  // Detached shape: own process group before exec (the cron / systemd /
+  // job-control shape - SIGHUP default but NOT waiting on us).
+  const PY_DFL_HUP_PG =
+    "import os, signal, sys; " +
+    "signal.signal(signal.SIGHUP, signal.SIG_DFL); " +
+    "os.setpgrp(); " +
+    'os.execvp("bash", ["bash", sys.argv[1]] + sys.argv[2:])';
+
+  const spawnWith = (
+    fx: ReturnType<typeof fixture>,
+    cmd: string[],
+    env: Record<string, string>,
+  ) => {
+    const p = spawn(cmd, {
+      env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return p;
+  };
+
+  const collect = async (p: ReturnType<typeof spawnWith>) => {
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    return { out, err, code };
+  };
+
+  const waitFor = async (fn: () => boolean, ms = 15_000): Promise<boolean> => {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (fn()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return fn();
+  };
+
+  // slow stub pi: the run takes ~3s, so a launcher that still blocks on
+  // the run takes >= 3s while the daemonized one returns in < 1.5s
+  const slowPi = (fx: ReturnType<typeof fixture>) => {
+    const p = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(p, "#!/bin/sh\nsleep 3\necho pi-run-ok\n");
+    fs.chmodSync(p, 0o755);
+  };
+
+  const artOf = (fx: ReturnType<typeof fixture>) =>
+    path.join(fx.tmp, "home", ".pi-bg-art");
+
+  const ticketId = (out: string) => out.match(/ticket (\S+) profile=/)?.[1];
+
+  const runDone = (fx: ReturnType<typeof fixture>, id: string): boolean => {
+    const rc = path.join(artOf(fx), `pi-bg-${id}-rc`);
+    if (!fs.existsSync(rc) || fs.readFileSync(rc, "utf-8").trim() !== "0")
+      return false;
+    const rec = fx.records().find((r) => r.run === id);
+    return rec?.state === "done";
+  };
+
+  test("attached + bypass: daemonizes after registration, returns in seconds, run completes detached", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    slowPi(fx);
+    const env = { ...fx.env }; // PI_BG_ALLOW_FOREGROUND=1, daemonize on
+    delete env.PI_BG_DAEMONIZE;
+    const t0 = Date.now();
+    const p = spawnWith(
+      fx,
+      ["python3", "-c", PY_DFL_HUP, PI_BG, "worker", "daemon task"],
+      env,
+    );
+    const { out, err, code } = await collect(p);
+    const elapsed = Date.now() - t0;
+    expect(code).toBe(0);
+    expect(out).toMatch(/ticket \S+ profile=worker/);
+    expect(out).toContain("daemonized");
+    // the daemon child's stdout is off the caller's pipes (launcher log)
+    expect(out).not.toContain("pi-run-ok");
+    expect(err).not.toContain("foreground launch detected");
+    // returned in seconds, NOT after the ~3s run
+    expect(elapsed).toBeLessThan(1500);
+    const id = ticketId(out) ?? "";
+    expect(id).not.toBe("");
+    // the detached run completes on its own, artifacts intact
+    expect(await waitFor(() => runDone(fx, id))).toBe(true);
+    expect(
+      fs.readFileSync(
+        path.join(artOf(fx), `pi-bg-${id}-launcher.log`),
+        "utf-8",
+      ),
+    ).toContain("pi-run-ok");
+  }, 30_000);
+
+  test("attached + PI_BG_FOREGROUND_GUARD=warn: warning on stderr, run continues detached", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    slowPi(fx);
+    const env = { ...fx.env };
+    delete env.PI_BG_ALLOW_FOREGROUND; // the guard must see the shape
+    delete env.PI_BG_DAEMONIZE;
+    env.PI_BG_FOREGROUND_GUARD = "warn";
+    const t0 = Date.now();
+    const p = spawnWith(
+      fx,
+      ["python3", "-c", PY_DFL_HUP, PI_BG, "worker", "warn task"],
+      env,
+    );
+    const { out, err, code } = await collect(p);
+    const elapsed = Date.now() - t0;
+    expect(code).toBe(0); // warn does not throw
+    expect(err).toContain("WARNING");
+    expect(err).toContain("foreground launch detected");
+    expect(out).toContain("daemonized");
+    expect(elapsed).toBeLessThan(1500);
+    const id = ticketId(out) ?? "";
+    expect(id).not.toBe("");
+    expect(await waitFor(() => runDone(fx, id))).toBe(true);
+  }, 30_000);
+
+  test("PI_BG_DAEMONIZE=0: legacy inline topology (launcher waits on the run)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const env = { ...fx.env }; // PI_BG_ALLOW_FOREGROUND=1 + PI_BG_DAEMONIZE=0
+    const p = spawnWith(
+      fx,
+      ["python3", "-c", PY_DFL_HUP, PI_BG, "worker", "inline task"],
+      env,
+    );
+    const { out, code } = await collect(p);
+    expect(code).toBe(0);
+    expect(out).not.toContain("daemonized");
+    // inline: the pi run's output IS on the caller's pipes
+    expect(out).toContain("pi-run-ok");
+  }, 30_000);
+
+  test("detached non-nohup shape (own process group): no guard throw, daemonizes, completes", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    slowPi(fx);
+    const env = { ...fx.env };
+    delete env.PI_BG_ALLOW_FOREGROUND; // no bypass: the guard must not fire
+    delete env.PI_BG_DAEMONIZE;
+    const t0 = Date.now();
+    const p = spawnWith(
+      fx,
+      ["python3", "-c", PY_DFL_HUP_PG, PI_BG, "worker", "detached task"],
+      env,
+    );
+    const { out, err, code } = await collect(p);
+    const elapsed = Date.now() - t0;
+    expect(code).toBe(0);
+    expect(err).not.toContain("foreground launch detected");
+    expect(elapsed).toBeLessThan(1500);
+    const id = ticketId(out) ?? "";
+    expect(id).not.toBe("");
+    expect(await waitFor(() => runDone(fx, id))).toBe(true);
   }, 30_000);
 });
 
