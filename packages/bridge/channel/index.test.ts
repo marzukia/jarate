@@ -10592,9 +10592,6 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     expect(f2.delivered).toContain("2000");
   });
 });
-    });
-  });
-});
 
 // ── #84: stale placeholder settlement (all exit paths) ──────────────────
 //
@@ -11127,6 +11124,11 @@ describe("#84: placeholder settlement (all exit paths)", () => {
 
     const { handlers2, sent2 } = secondInstance();
     simulateProcessDeathForTest(); // the queue ENTRY is gone with the process
+    // #186 reality: queueMidTurnInbound mirrors the entry into the rewake
+    // file, and the startup drain restores it — in which case the drain
+    // OWNS the ack (settled at delivery). Drop the mirror to test the
+    // orphaned-ack settle path (the line is settled at startup instead).
+    fs.rmSync(path.join(tmp, ".tmp", "rewake-ch1.json"), { force: true });
     await handlers2.session_start?.({ reason: "startup" }, ctx);
     await flush();
 
