@@ -139,10 +139,9 @@ async function roundtrip(
  *  A plain empty file — a process that dies mid-serve leaves its socket
  *  entry behind, and a connect to it fails (what the probe keys off).
  *  NB: not server.close() — bun unlinks the path on clean close. */
-function makeStaleSocket(p: string): number {
+function makeStaleSocket(p: string): void {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, "");
-  return fs.lstatSync(p).ino;
 }
 
 describe("issue #128 fix 2: bindSocket probes before unlink", () => {
@@ -254,7 +253,7 @@ describe("issue #128 fix 2: bindSocket probes before unlink", () => {
     const socketDir = path.join(tmp, "sock");
     setEnv("JARATE_VAULT_SOCKET_DIR", socketDir);
     const P = path.join(socketDir, "vault.sock");
-    const inoStale = makeStaleSocket(P);
+    makeStaleSocket(P);
     expect(fs.existsSync(P), "stale entry must survive").toBe(true);
 
     const h = startVault({
@@ -277,9 +276,10 @@ describe("issue #128 fix 2: bindSocket probes before unlink", () => {
         h.vault.server,
         "bind over the leftover must succeed",
       ).not.toBeNull();
-      expect(fs.lstatSync(P).ino, "leftover entry was not replaced").not.toBe(
-        inoStale,
-      );
+      expect(
+        fs.statSync(P).isSocket(),
+        "stale regular-file entry was replaced by a socket",
+      ).toBe(true);
       const r = await roundtrip(P, { op: "vstatus", agent: "monky" });
       expect(r.ok, "rebound socket must serve").toBe(true);
     } finally {
@@ -294,7 +294,7 @@ describe("issue #128 fix 2: bindSocket probes before unlink", () => {
     const socketDir = path.join(tmp, "sock");
     setEnv("JARATE_PAT_DIR", socketDir);
     const P = path.join(socketDir, "pat.sock");
-    const inoStale = makeStaleSocket(P);
+    makeStaleSocket(P);
     expect(fs.existsSync(P), "stale entry must survive").toBe(true);
 
     const h = startPatVault({
@@ -315,9 +315,10 @@ describe("issue #128 fix 2: bindSocket probes before unlink", () => {
         h.vault.server,
         "bind over the leftover must succeed",
       ).not.toBeNull();
-      expect(fs.lstatSync(P).ino, "leftover entry was not replaced").not.toBe(
-        inoStale,
-      );
+      expect(
+        fs.statSync(P).isSocket(),
+        "stale regular-file entry was replaced by a socket",
+      ).toBe(true);
       const r = await roundtrip(P, { op: "status", agent: "monky" });
       expect(r.ok, "rebound socket must serve").toBe(true);
     } finally {
