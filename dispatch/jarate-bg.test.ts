@@ -66,6 +66,12 @@ function fixture() {
   delete env.PI_BG_HB_INTERVAL; // cap window must stay at the 30s default
   delete env.PI_BG_RUN_ID;
   delete env.PI_BG_SNAP;
+  // #52 hb-from-birth adoption: a suite running inside a pi-bg ticket
+  // leaks PI_BG_HB_PID (the parent's hb child). Left in, a spawned test
+  // wrapper would ADOPT that child (kill -0 succeeds) instead of forking
+  // its own, and kill the parent's hb child on exit - a false STALLED on
+  // the outer ticket. Hermeticize like the other PI_BG_* leaks.
+  delete env.PI_BG_HB_PID;
   // issue #118 vars: a suite running inside a pi-bg ticket inherits the
   // parent's PI_BG_TASK_FILE (its prompt file) + SNAP_DIR; left in, a
   // spawned test wrapper under the snapshot branch would re-read the
@@ -355,10 +361,14 @@ describe("cgroup escape: self-drain + rmdir on exit; PI_BG_TMPDIR plumbing", () 
       const ids = fs.readdirSync(escDir);
       for (const id of ids) {
         const f = path.join(escDir, id, "cgroup.procs");
-        if (
-          fs.existsSync(f) &&
-          fs.readFileSync(f, "utf8").trim() === String(p.pid)
-        ) {
+        // #52 hb-from-birth: the file holds the wrapper AND the hb child
+        // (the join appends on the fake root) - "contains", not "equals"
+        const content = fs
+          .readFileSync(f, "utf8")
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+        if (content.includes(String(p.pid))) {
           runId = id;
           sawEscapePid = true;
           break;
@@ -2432,6 +2442,205 @@ describe("#52: heartbeat (hb artifact, created at dispatch, gone on exit)", () =
         /* already dead */
       }
     }
+  }, 40_000);
+});
+
+describe("#52: hb-from-birth (launcher window is liveness-covered)", () => {
+  // The touch child used to fork AFTER the cgroup escape, so the launcher
+  // window (git worktree add on a big repo, escape, profile doctor) had no
+  // periodic touches: a live ticket in that window > STALL_MIN looked
+  // STALLED (worktree sweep: live cgroup + stale hb) or its stale hb hid
+  // the DEAD verdict (cwd sweep judges on hb age). The child now forks at
+  // ticket creation, is adopted across the snapshot re-exec via
+  // PI_BG_HB_PID, and joins the ticket cgroup after the escape.
+
+  const gitInit = (fx: { tmp: string; env: Record<string, string> }) => {
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+  };
+
+  const pidAlive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("slow `git worktree add`: the hb ticks inside the launcher window", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_HB_INTERVAL = "1";
+    fx.env.PI_BG_NOSNAP = "1"; // skip the re-exec; this test is about the window
+    fs.mkdirSync(art, { recursive: true });
+    gitInit(fx);
+    // fake git: `worktree add` sleeps 4s and stamps the window bounds
+    const gitBin = path.join(fx.tmp, "bin", "git");
+    fs.writeFileSync(
+      gitBin,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then',
+        `  date +%s%3N > ${path.join(fx.tmp, "git-start")}`,
+        "  sleep 4",
+        `  date +%s%3N > ${path.join(fx.tmp, "git-end")}`,
+        "fi",
+        'exec /usr/bin/git "$@"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(gitBin, 0o755);
+    const p = spawn(
+      ["bash", PI_BG, "worker", "--worktree", "main", "slow add task"],
+      { env: fx.env, cwd: fx.tmp, stdout: "pipe", stderr: "pipe" },
+    );
+    // record every observed hb touch (mtime change) until the file is
+    // gone (the exit trap removes it - run finished)
+    const ticks: number[] = [];
+    let lastM = 0;
+    const poll = (async () => {
+      const t0 = Date.now();
+      let goneSince = 0;
+      while (Date.now() - t0 < 30000) {
+        let present = false;
+        try {
+          const files = fs.readdirSync(art).filter((f) => f.endsWith("-hb"));
+          if (files.length === 1) {
+            present = true;
+            const m = fs.statSync(path.join(art, files[0])).mtimeMs;
+            if (m !== lastM) {
+              ticks.push(Date.now());
+              lastM = m;
+            }
+          }
+        } catch {
+          /* dir not there yet */
+        }
+        if (!present) {
+          goneSince = goneSince || Date.now();
+          if (Date.now() - goneSince > 2000) break; // gone 2s = child dead too
+        } else {
+          goneSince = 0;
+        }
+        await Bun.sleep(150);
+      }
+    })();
+    try {
+      const [out, err] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      if (code !== 0) {
+        throw new Error(`pi-bg exited ${code}\nOUT: ${out}\nERR: ${err}`);
+      }
+      expect(out).toContain("pi-run-ok");
+      await poll;
+      const gs = Number(
+        fs.readFileSync(path.join(fx.tmp, "git-start"), "utf8"),
+      );
+      const ge = Number(fs.readFileSync(path.join(fx.tmp, "git-end"), "utf8"));
+      // at least one tick strictly inside the 4s git window (1s interval
+      // -> 2+ expected); the birth touch predates the window, the pi
+      // phase postdates it - neither can fake this
+      const inWin = ticks.filter((t) => t > gs + 400 && t < ge - 400);
+      expect(inWin.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 60_000);
+
+  test("snapshot re-exec: one hb child, joined to the ticket cgroup", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fs.mkdirSync(art, { recursive: true });
+    // pi stub: while alive (inside the ticket cgroup) it copies the
+    // ticket's cgroup.procs (fake root: a plain file), liveness-checks
+    // every pid in it (the hb child must be alive DURING the run; after
+    // the run the wrapper's exit trap has reaped it), and records its
+    // own PPID (the wrapper)
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        "sleep 1",
+        'for f in "$PI_BG_CG_ROOT"/pi-bg/*/cgroup.procs; do',
+        '  [ -f "$f" ] || continue',
+        `  cp "$f" ${path.join(fx.tmp, "cg-copy")}`,
+        `  : > ${path.join(fx.tmp, "cg-live")}`,
+        '  for pid in $(cat "$f"); do',
+        `    kill -0 "$pid" 2>/dev/null && echo "$pid" >> ${path.join(fx.tmp, "cg-live")}`,
+        "  done",
+        `  echo "$PPID" > ${path.join(fx.tmp, "cg-ppid")}`,
+        "done",
+        "echo pi-run-ok",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+    const r = await fx.run(["worker", "re-exec hb task"]);
+    expect(r.code).toBe(0);
+    // the snapshot re-exec happened (default: PI_BG_NOSNAP unset) and the
+    // re-exec'd process adopted the child forked by its first incarnation
+    expect(fs.existsSync(path.join(fx.tmp, "cg-copy"))).toBe(true);
+    const copy = fs
+      .readFileSync(path.join(fx.tmp, "cg-copy"), "utf8")
+      .trim()
+      .split("\n");
+    // exactly wrapper + hb child: no double fork (adoption), no missing
+    // join
+    expect(copy).toHaveLength(2);
+    const wrapper = Number(
+      fs.readFileSync(path.join(fx.tmp, "cg-ppid"), "utf8").trim(),
+    );
+    expect(copy).toContain(String(wrapper));
+    const child = Number(copy.find((x) => x !== String(wrapper)));
+    // the child was alive during the run (it is the hb toucher) and reaped
+    // by the wrapper's exit trap after it (no orphan re-touching a deleted
+    // hb file)
+    const live = fs
+      .readFileSync(path.join(fx.tmp, "cg-live"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    expect(live).toContain(String(child));
+    await Bun.sleep(500);
+    expect(pidAlive(child)).toBe(false);
+  }, 40_000);
+
+  test("launch-fail: the hb child dies with the wrapper (no phantom ticket)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_HB_INTERVAL = "1";
+    fs.mkdirSync(art, { recursive: true });
+    gitInit(fx);
+    const r = await fx.run(["worker", "--worktree", "nosuchref", "fail task"]);
+    expect(r.code).toBe(3);
+    // the launch-fail path removed the hb file AND its early trap killed
+    // the child: a live child would re-touch the file within its 1s
+    // interval (phantom live ticket in the concurrency cap)
+    const hbFiles = () => fs.readdirSync(art).filter((f) => f.endsWith("-hb"));
+    expect(hbFiles()).toHaveLength(0);
+    await Bun.sleep(2500);
+    expect(hbFiles()).toHaveLength(0);
   }, 40_000);
 });
 
