@@ -533,8 +533,12 @@ export function hoistFencedUrls(md: string): string {
       if (!tagged) {
         const urls = extractMachineUrls(bl);
         if (urls.length > 0) {
+          // remove end-first: later splices must not shift earlier indices
           let r = bl;
-          for (const u of urls) r = r.slice(0, u.start) + r.slice(u.end);
+          for (let k = urls.length - 1; k >= 0; k--) {
+            const u = urls[k]!;
+            r = r.slice(0, u.start) + r.slice(u.end);
+          }
           r = r.replace(/[ \t]+/g, " ").trim();
           if (/\w/.test(r)) kept.push(r);
           for (const u of urls) hoisted.push(u.url);

@@ -485,6 +485,13 @@ describe("hoistFencedUrls", () => {
     expect(out).toBe("```\n[ok] uploaded\n```\nhttps://drop.junkyard.sh/abc");
   });
 
+  test("two urls on one fence line -> each shipped once, no duplicate (#87)", () => {
+    const out = mdToDiscord(
+      "```\nsee https://a.test/x and https://b.test/y\n```",
+    );
+    expect(out).toBe("```\nsee and\n```\nhttps://a.test/x\nhttps://b.test/y");
+  });
+
   test("backticked url mixed with prose in fence -> span removed, no dangling backslash (#87)", () => {
     const out = mdToDiscord("```\nsee `https://x.test/file` ok\n```");
     expect(out).toBe("```\nsee ok\n```\nhttps://x.test/file");
