@@ -2554,3 +2554,400 @@ describe("#53: dead-letter consumption", () => {
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// #143: mid-run events (child-left / sess-write). The after-intervention
+// case: a dispatched run is alive but its cgroup membership changed
+// (an external kill of a wedged child) or its session jsonl advanced (pi
+// wrote again). Additive status lines - no state change, never
+// DEAD/HUNG/retry. Dedupe per ticket per class per UTC day in the dead
+// log; the DEAD/STALLED dedupe ignores event lines.
+// ---------------------------------------------------------------------------
+describe("#143: mid-run events (child-left / sess-write)", () => {
+  type F = ReturnType<typeof fixture>;
+
+  // manifest matching the fixture's AGENTS.md content -> no drift post
+  const bless = (f: F) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-10-06T00:00:00Z  #143 events test\n`,
+    );
+
+  // distinct tickets; the NNNNN run-id part is unique per suffix query
+  const ET = (n: number): string => `2026101${n}-050607-95143${n}7`;
+
+  // Plant a live cwd run: backdated record (started 2h ago, running),
+  // fake cgroup (dir aged 30min - past the reaper guard) with the given
+  // member pids (REAL live processes in the test), a session jsonl with
+  // an explicit backdated mtime, a fresh heartbeat (no STALLED).
+  // Returns the session jsonl path (the test advances it).
+  const plant = (
+    f: F,
+    t: string,
+    pids: string[],
+    jsonlAgeSec: number,
+  ): string => {
+    const recDir = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${t}.json`),
+      JSON.stringify({
+        run: t,
+        profile: "worker",
+        project: null,
+        cwd: f.tmp,
+        started: new Date(Date.now() - 2 * 60 * 60 * 1000)
+          .toISOString()
+          .replace(".000Z", "Z"),
+        delivery: "webhook",
+        state: "running",
+      }),
+    );
+    const cg = path.join(f.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(
+      path.join(cg, "cgroup.procs"),
+      pids.length ? `${pids.join("\n")}\n` : "",
+    );
+    const old = new Date(Date.now() - 30 * 60 * 1000);
+    fs.utimesSync(cg, old, old);
+    const slug = `--${f.tmp.slice(1).replace(/\//g, "-")}--`;
+    const sd = path.join(f.home, ".pi", "agent-worker", "sessions", slug);
+    fs.mkdirSync(sd, { recursive: true });
+    const jf = path.join(sd, "sess.jsonl");
+    fs.writeFileSync(jf, "{}\n");
+    fs.utimesSync(
+      jf,
+      new Date(Date.now() - jsonlAgeSec * 1000),
+      new Date(Date.now() - jsonlAgeSec * 1000),
+    );
+    // fresh heartbeat (a live run, not a stalled one)
+    fs.writeFileSync(path.join(f.art, `pi-bg-${t}-hb`), "");
+    return jf;
+  };
+
+  const setProcs = (f: F, t: string, pids: string[]): void =>
+    fs.writeFileSync(
+      path.join(f.tmp, "cg", "pi-bg", t, "cgroup.procs"),
+      pids.length ? `${pids.join("\n")}\n` : "",
+    );
+
+  const rec = (f: F, t: string): Record<string, unknown> =>
+    JSON.parse(
+      fs.readFileSync(
+        path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`),
+        "utf8",
+      ),
+    );
+
+  const deadlog = (f: F): string => {
+    const p = path.join(f.home, ".pi-bg-deadlog");
+    return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+  };
+
+  const frameLines = (s: string): string[] =>
+    s
+      .replace(/^```bash\n/, "")
+      .replace(/\n```$/, "")
+      .split("\n");
+
+  // (a)+(b) external kill of a grandchild between sweeps -> exactly one
+  // CHILD-LEFT line + one post, then nothing (dedupe) on the next sweep;
+  // the run stays running (no DEAD/HUNG side effects).
+  test("kill between sweeps -> one child-left line, next sweep quiet", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(1);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    let g: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      g = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const gp = g.pid;
+      plant(f, t, [String(w.pid), String(gp)], 300);
+      // sweep 1: first sight = baseline only, no event
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).not.toContain("CHILD-LEFT");
+      expect(r1.out).not.toContain("SESS-WRITE");
+      expect(f.posts).toHaveLength(0);
+      expect(rec(f, t).cgPids).toEqual([w.pid, gp]);
+      expect(typeof rec(f, t).sessMtime).toBe("number");
+      // the operator kill (cgroupfs drops the pid on exit)
+      g.kill("SIGKILL");
+      await g.exited;
+      g = null;
+      setProcs(f, t, [String(w.pid)]);
+      // sweep 2: exactly one CHILD-LEFT line + one post
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`CHILD-LEFT cwd/${t}`);
+      expect((r2.out.match(/CHILD-LEFT/g) ?? []).length).toBe(1);
+      expect(r2.out).toContain(String(gp));
+      expect(r2.out).toContain("1 mid-run event(s)");
+      // no run class fired: the run is alive (w is a cgroup member)
+      expect(r2.out).not.toContain("DEAD cwd/");
+      expect(r2.out).not.toContain("HUNG cwd/");
+      expect(rec(f, t).state).toBe("running");
+      expect(rec(f, t).hungNotified).toBeUndefined();
+      // post shape: green embed, sweep author, 40-col frame
+      expect(f.posts).toHaveLength(1);
+      const e = f.posts[0].embeds[0];
+      expect(e.title).toBe(`CHILD-LEFT \u00b7 ${t}`);
+      expect(e.author?.name).toBe(`pi-bg ticket \u00b7 ${t}`);
+      expect(e.color).toBe(3066993);
+      for (const line of frameLines(e.description)) {
+        expect(line.length).toBeLessThanOrEqual(40);
+      }
+      expect(e.description).toContain(String(gp));
+      // dead-log receipt (house style: date ticket repo ts reason)
+      const dl = deadlog(f);
+      expect(dl).toMatch(
+        new RegExp(
+          `^\\d{4}-\\d{2}-\\d{2} ${t} cwd \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z child-left: pids ${gp} left cgroup$`,
+          "m",
+        ),
+      );
+      // sweep 3: nothing new (baseline refreshed + class deduped)
+      const r3 = await f.run();
+      expect(r3.code).toBe(0);
+      expect(r3.out).not.toContain("CHILD-LEFT");
+      expect(f.posts).toHaveLength(1);
+      expect(rec(f, t).state).toBe("running");
+    } finally {
+      w?.kill("SIGKILL");
+      g?.kill("SIGKILL");
+      await Promise.all([w?.exited, g?.exited]);
+      f.close();
+    }
+  }, 30_000);
+
+  // (c) session jsonl advance while the wrapper is quiet -> at most one
+  // SESS-WRITE per class per day; the line names the previous write time.
+  test("session advance while quiet -> one sess-write line, then dedupe", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(2);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      // explicit backdates (no same-second races): T0 < T1 < T2, all past
+      const now = Math.floor(Date.now() / 1000);
+      const T0 = now - 300;
+      const T1 = now - 240;
+      const T2 = now - 180;
+      const jf = plant(f, t, [String(w.pid)], 300); // mtime = ~T0
+      fs.utimesSync(jf, new Date(T0 * 1000), new Date(T0 * 1000));
+      const r1 = await f.run();
+      expect(r1.out).not.toContain("SESS-WRITE");
+      const base0 = rec(f, t).sessMtime as number;
+      expect(base0).toBe(T0);
+      // pi wrote again (the run resumed after the kill)
+      fs.appendFileSync(jf, '{"type":"message"}\n');
+      fs.utimesSync(jf, new Date(T1 * 1000), new Date(T1 * 1000));
+      const r2 = await f.run();
+      expect(r2.out).toContain(`SESS-WRITE cwd/${t}`);
+      expect((r2.out.match(/SESS-WRITE/g) ?? []).length).toBe(1);
+      expect(r2.out).toContain(
+        new Date(T0 * 1000).toISOString().replace(".000Z", "Z"),
+      );
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].embeds[0].title).toBe(`SESS-WRITE \u00b7 ${t}`);
+      expect(deadlog(f)).toMatch(
+        new RegExp(
+          `^\\d{4}-\\d{2}-\\d{2} ${t} cwd .* sess-write: session jsonl wrote \\(was `,
+          "m",
+        ),
+      );
+      // a second advance: the diff exists (T2 > T1) but the class was
+      // already logged today -> no line, no post
+      fs.appendFileSync(jf, '{"type":"message2"}\n');
+      fs.utimesSync(jf, new Date(T2 * 1000), new Date(T2 * 1000));
+      const r3 = await f.run();
+      expect(r3.out).not.toContain("SESS-WRITE");
+      expect(f.posts).toHaveLength(1);
+    } finally {
+      w?.kill("SIGKILL");
+      await w?.exited;
+      f.close();
+    }
+  }, 30_000);
+
+  // (d) healthy run: two sweeps, nothing new (no lines, no posts, no
+  // dead log), baseline stored.
+  test("healthy run -> nothing new across sweeps", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(3);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(f, t, [String(w.pid)], 300);
+      const r1 = await f.run();
+      const r2 = await f.run();
+      for (const r of [r1, r2]) {
+        expect(r.code).toBe(0);
+        expect(r.out).not.toContain("CHILD-LEFT");
+        expect(r.out).not.toContain("SESS-WRITE");
+      }
+      expect(f.posts).toHaveLength(0);
+      expect(deadlog(f)).toBe("");
+      expect(r2.out).toContain("0 mid-run event(s)");
+      expect(rec(f, t).cgPids).toEqual([w.pid]);
+    } finally {
+      w?.kill("SIGKILL");
+      await w?.exited;
+      f.close();
+    }
+  }, 30_000);
+
+  // (e) --quiet: the log line is still emitted (local record), no post.
+  test("--quiet -> log line present, no post", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(4);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    let g: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      g = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const gp = g.pid;
+      plant(f, t, [String(w.pid), String(gp)], 300);
+      await f.run(); // baseline
+      g.kill("SIGKILL");
+      await g.exited;
+      g = null;
+      setProcs(f, t, [String(w.pid)]);
+      const r = await f.run(["--quiet"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`CHILD-LEFT cwd/${t}`);
+      expect(r.out).toContain(String(gp));
+      expect(f.posts).toHaveLength(0);
+      expect(deadlog(f)).toMatch(/child-left: pids .* left cgroup/);
+      expect(rec(f, t).state).toBe("running");
+    } finally {
+      w?.kill("SIGKILL");
+      g?.kill("SIGKILL");
+      await Promise.all([w?.exited, g?.exited]);
+      f.close();
+    }
+  }, 30_000);
+
+  // --dry-run: would-emit line only, no state (the baseline survives, so
+  // the next real sweep still sees the diff and emits).
+  test("--dry-run -> would-emit line, no state, next sweep emits", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(5);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    let g: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      g = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const gp = g.pid;
+      plant(f, t, [String(w.pid), String(gp)], 300);
+      await f.run(); // baseline
+      g.kill("SIGKILL");
+      await g.exited;
+      g = null;
+      setProcs(f, t, [String(w.pid)]);
+      const r2 = await f.run(["--dry-run"]);
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`dry-run: would emit CHILD-LEFT cwd/${t}`);
+      expect(f.posts).toHaveLength(0);
+      expect(deadlog(f)).toBe("");
+      // baseline untouched by the dry sweep
+      expect(rec(f, t).cgPids).toEqual([w.pid, gp]);
+      // the real sweep still sees the diff
+      const r3 = await f.run();
+      expect(r3.out).toContain(`CHILD-LEFT cwd/${t}`);
+      expect(f.posts).toHaveLength(1);
+    } finally {
+      w?.kill("SIGKILL");
+      g?.kill("SIGKILL");
+      await Promise.all([w?.exited, g?.exited]);
+      f.close();
+    }
+  }, 30_000);
+
+  // an event line today must not suppress a real death later today
+  // (already_dead ignores event classes).
+  test("child-left event does not suppress the later DEAD flag", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(6);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    let g: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      g = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(f, t, [String(w.pid), String(g.pid)], 300);
+      await f.run(); // baseline
+      g.kill("SIGKILL");
+      await g.exited;
+      g = null;
+      setProcs(f, t, [String(w.pid)]);
+      const r2 = await f.run();
+      expect(r2.out).toContain(`CHILD-LEFT cwd/${t}`);
+      // now the whole run dies: wrapper gone, cgroup drained, hb stale
+      w.kill("SIGKILL");
+      await w.exited;
+      w = null;
+      setProcs(f, t, []);
+      const stale = new Date(Date.now() - 20 * 60 * 1000);
+      fs.utimesSync(path.join(f.art, `pi-bg-${t}-hb`), stale, stale);
+      const r3 = await f.run();
+      expect(r3.code).toBe(0);
+      expect(r3.out).toContain(`DEAD cwd/${t}`);
+      // child-left post (r2) + DEAD digest (r3)
+      expect(f.posts).toHaveLength(2);
+      expect(f.posts[1].embeds[0].title).toBe("DEAD \u00b7 watchdog sweep");
+      expect(rec(f, t).state).toBe("killed");
+    } finally {
+      w?.kill("SIGKILL");
+      g?.kill("SIGKILL");
+      await Promise.all([w?.exited, g?.exited]);
+      f.close();
+    }
+  }, 30_000);
+});

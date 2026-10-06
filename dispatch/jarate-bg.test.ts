@@ -4529,3 +4529,284 @@ echo pi-run-ok
     expect(fx.records()[0].cmdTimeout).toBe(900);
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// #143: jarate-bg signal — mid-run intervention + receipt. The incident:
+// an operator killed a wedged grandchild by hand, then POLLED (sleep +
+// tail of the session jsonl) to verify the run resumed. This subcommand
+// signals the run's cgroup tree (per-pid, never the process group - that
+// is jarate-bg-kill) and emits the receipt on the same event path as the
+// watchdog's mid-run events: stdout line + dead-log line (class
+// "signal") + webhook post (green embed, sweep author).
+// ---------------------------------------------------------------------------
+describe("#143: jarate-bg signal (mid-run intervention receipt)", () => {
+  type F = ReturnType<typeof fixture>;
+
+  const ST = (n: number): string => `2026100${n}-141516-95143${n}7`;
+
+  // webhook capture (the fixture deletes PI_DISPATCH_WEBHOOK; the script
+  // falls back to ~/.config/pi-dispatch/webhook)
+  const server = () => {
+    const posts: Array<{ embeds: Array<any> }> = [];
+    const s = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push(await req.json());
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      posts,
+      url: `http://127.0.0.1:${s.port}/hook`,
+      close: () => s.stop(true),
+    };
+  };
+
+  const plant = (fx: F, t: string, memberPids: string[]): string => {
+    const recDir = fx.env.PI_DISPATCH_RECORD_DIR;
+    fs.mkdirSync(recDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(recDir, `pi-bg-${t}.json`),
+      JSON.stringify({
+        run: t,
+        profile: "worker",
+        project: null,
+        cwd: fx.tmp,
+        started: new Date(Date.now() - 2 * 60 * 60 * 1000)
+          .toISOString()
+          .replace(".000Z", "Z"),
+        delivery: "webhook",
+        state: "running",
+      }),
+    );
+    const cg = path.join(fx.env.PI_BG_CG_ROOT, "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(
+      path.join(cg, "cgroup.procs"),
+      memberPids.length ? `${memberPids.join("\n")}\n` : "",
+    );
+    return cg;
+  };
+
+  const deadlog = (fx: F): string => {
+    const p = path.join(fx.home, ".pi-bg-deadlog");
+    return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+  };
+
+  const frameLines = (s: string): string[] =>
+    s
+      .replace(/^```bash\n/, "")
+      .replace(/\n```$/, "")
+      .split("\n");
+
+  // (f) TERM kills the cgroup tree - the /proc walk finds the descendant
+  // (only the parent is a cgroup member in the fake root) - and emits
+  // the receipt: stdout + dead log + webhook (the event format).
+  test("TERM kills the tree + emits the receipt (rc 0)", async () => {
+    const fx = fixture();
+    const srv = server();
+    let parent: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const t = ST(1);
+      const childPidFile = path.join(fx.tmp, "child-pid");
+      parent = Bun.spawn(
+        ["bash", "-c", `sleep 300 & echo $! > ${childPidFile}; wait`],
+        { stdout: "ignore", stderr: "ignore" },
+      );
+      for (let i = 0; i < 50 && !fs.existsSync(childPidFile); i++) {
+        await Bun.sleep(50);
+      }
+      const childPid = fs.readFileSync(childPidFile, "utf8").trim();
+      plant(fx, t, [String(parent.pid)]);
+      const cfg = path.join(fx.home, ".config", "pi-dispatch");
+      fs.mkdirSync(cfg, { recursive: true });
+      fs.writeFileSync(path.join(cfg, "webhook"), `${srv.url}\n`);
+
+      const r = await fx.run(["signal", t, "TERM"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`[pi-bg] signal TERM -> ${t}`);
+      expect(r.out).toContain("all signaled members gone");
+      // the whole tree died (parent from the cgroup file, child from the
+      // /proc walk)
+      expect(fs.existsSync(`/proc/${parent.pid}`)).toBe(false);
+      expect(fs.existsSync(`/proc/${childPid}`)).toBe(false);
+      // dead-log receipt (house line shape; class "signal" prefix)
+      expect(deadlog(fx)).toMatch(
+        new RegExp(
+          `^\\d{4}-\\d{2}-\\d{2} ${t} cwd \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z signal: TERM sent to pids ${parent.pid} ${childPid} by \\w+; all signaled members gone after \\d+s$`,
+          "m",
+        ),
+      );
+      // webhook receipt: the same event format as the watchdog's
+      // mid-run events (green, sweep author, 40-col frame) and it must
+      // pass the bridge's isBgWebhook exemption (wakes the channel)
+      expect(srv.posts).toHaveLength(1);
+      const e = srv.posts[0].embeds[0];
+      expect(e.title).toBe(`SIGNAL \u00b7 ${t}`);
+      expect(e.author?.name).toBe(`pi-bg ticket \u00b7 ${t}`);
+      expect(e.color).toBe(3066993);
+      for (const line of frameLines(e.description)) {
+        expect(line.length).toBeLessThanOrEqual(40);
+      }
+      expect(e.description).toContain(childPid);
+      expect(isBgWebhook({ ...srv.posts[0], webhook_id: "123" })).toBe(true);
+      // no terminal-class side effects: the record is untouched
+      const rec = fx.records().find((r) => r.run === t);
+      expect(rec.state).toBe("running");
+      expect(
+        fs.existsSync(path.join(fx.home, ".pi-bg-art", `pi-bg-${t}-killed`)),
+      ).toBe(false);
+    } finally {
+      parent?.kill("SIGKILL");
+      await parent?.exited;
+      srv.close();
+    }
+  }, 30_000);
+
+  // a member that ignores TERM outlives the drain wait: rc 3 + the
+  // receipt says so (the orchestrator reads the result - no re-look).
+  test("signal-ignoring member -> rc 3 + still-alive receipt", async () => {
+    const fx = fixture();
+    const srv = server();
+    let parent: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const t = ST(2);
+      const childPidFile = path.join(fx.tmp, "child-pid");
+      parent = Bun.spawn(
+        // the trap is set AFTER the fork: a background child inherits
+        // the parent's ignored dispositions across fork (a trap-before-
+        // fork parent would make the child ignore TERM too)
+        [
+          "bash",
+          "-c",
+          `sleep 300 & echo $! > ${childPidFile}; trap '' TERM; wait; sleep 300`,
+        ],
+        { stdout: "ignore", stderr: "ignore" },
+      );
+      for (let i = 0; i < 50 && !fs.existsSync(childPidFile); i++) {
+        await Bun.sleep(50);
+      }
+      const childPid = fs.readFileSync(childPidFile, "utf8").trim();
+      plant(fx, t, [String(parent.pid)]);
+      const cfg = path.join(fx.home, ".config", "pi-dispatch");
+      fs.mkdirSync(cfg, { recursive: true });
+      fs.writeFileSync(path.join(cfg, "webhook"), `${srv.url}\n`);
+      fx.env.PI_BG_SIGNAL_WAIT = "2";
+
+      const r = await fx.run(["signal", t, "TERM"]);
+      expect(r.code).toBe(3);
+      expect(r.out).toContain(`[pi-bg] signal TERM -> ${t}`);
+      expect(r.out).toContain("still alive after");
+      // the plain child died, the ignoring parent survived
+      expect(fs.existsSync(`/proc/${childPid}`)).toBe(false);
+      expect(fs.existsSync(`/proc/${parent.pid}`)).toBe(true);
+      expect(deadlog(fx)).toMatch(
+        /signal: TERM sent to pids .* still alive after \d+s: /,
+      );
+      expect(srv.posts).toHaveLength(1);
+      expect(srv.posts[0].embeds[0].description).toContain("still alive after");
+      parent.kill("SIGKILL");
+      await parent.exited;
+      parent = null;
+    } finally {
+      parent?.kill("SIGKILL");
+      await parent?.exited;
+      srv.close();
+    }
+  }, 30_000);
+
+  // short-id resolution (unique 7+ digit suffix in the record dir)
+  test("short id resolves to the full ticket", async () => {
+    const fx = fixture();
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const t = ST(3);
+      w = Bun.spawn(["sleep", "300"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(fx, t, [String(w.pid)]);
+      const short = t.slice(-7);
+      const r = await fx.run(["signal", short, "TERM"]);
+      expect(r.code).toBe(0);
+      expect(r.err).toContain(`short id ${short} -> ${t}`);
+      expect(r.out).toContain(`[pi-bg] signal TERM -> ${t}`);
+      expect(fs.existsSync(`/proc/${w.pid}`)).toBe(false);
+      w = null;
+    } finally {
+      w?.kill("SIGKILL");
+      await w?.exited;
+    }
+  }, 30_000);
+
+  // --dry-run: lists the tree, signals nothing, no receipt side effects
+  test("--dry-run -> tree listed, nothing signaled", async () => {
+    const fx = fixture();
+    const srv = server();
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const t = ST(4);
+      w = Bun.spawn(["sleep", "300"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      plant(fx, t, [String(w.pid)]);
+      const cfg = path.join(fx.home, ".config", "pi-dispatch");
+      fs.mkdirSync(cfg, { recursive: true });
+      fs.writeFileSync(path.join(cfg, "webhook"), `${srv.url}\n`);
+      const r = await fx.run(["signal", t, "TERM", "--dry-run"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(
+        `process tree for ${t} (would be signaled TERM):`,
+      );
+      expect(r.out).toContain(String(w.pid));
+      expect(r.out).toContain("dry-run: no signal sent");
+      expect(fs.existsSync(`/proc/${w.pid}`)).toBe(true);
+      expect(srv.posts).toHaveLength(0);
+      expect(deadlog(fx)).toBe("");
+      w.kill("SIGKILL");
+      await w.exited;
+      w = null;
+    } finally {
+      w?.kill("SIGKILL");
+      await w?.exited;
+      srv.close();
+    }
+  }, 30_000);
+
+  // unknown ticket: no cgroup dir -> rc 2, no side effects
+  test("unknown ticket -> rc 2, no side effects", async () => {
+    const fx = fixture();
+    const srv = server();
+    try {
+      const t = ST(5);
+      const cfg = path.join(fx.home, ".config", "pi-dispatch");
+      fs.mkdirSync(cfg, { recursive: true });
+      fs.writeFileSync(path.join(cfg, "webhook"), `${srv.url}\n`);
+      const r = await fx.run(["signal", t, "TERM"]);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain(`no cgroup for ticket '${t}'`);
+      expect(srv.posts).toHaveLength(0);
+      expect(deadlog(fx)).toBe("");
+    } finally {
+      srv.close();
+    }
+  }, 30_000);
+
+  // usage errors: missing args / bad signal -> rc 2, no side effects
+  test("usage errors -> rc 2", async () => {
+    const fx = fixture();
+    try {
+      const r1 = await fx.run(["signal", ST(6)]);
+      expect(r1.code).toBe(2);
+      expect(r1.err).toContain("usage:");
+      const r2 = await fx.run(["signal", ST(6), "BANG"]);
+      expect(r2.code).toBe(2);
+      expect(r2.err).toContain("unknown signal");
+      expect(deadlog(fx)).toBe("");
+    } finally {
+      // fixture close is handled by the global afterEach
+    }
+  }, 30_000);
+});
