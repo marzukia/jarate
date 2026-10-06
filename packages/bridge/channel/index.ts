@@ -399,7 +399,14 @@ export function queueMidTurnInbound(
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
-  if (armInterrupt) {
+  // #177: [bg: machine wakes are queue-only. The re-wake queue already
+  // guarantees agent_end delivery; the interrupt only jumps the line, and
+  // a machine alert is never more urgent than the in-flight turn — so it
+  // never arms one. isPeerInbound excludes [bg: bodies from the 12s
+  // branch; this extends that exclusion to no arming at all. (2026-10-06
+  // incident: a reviewer callback posted mid-turn armed the 3s interrupt,
+  // was never consumed, and was lost at compact.)
+  if (armInterrupt && !isBgInbound(msg)) {
     // Two 4x (12s) cases, both "let the in-flight work finish". The
     // message is queued with a guaranteed re-wake either way, so the
     // longer window only changes WHEN the interrupt cuts in:
@@ -415,8 +422,7 @@ export function queueMidTurnInbound(
     //    pre-spawn kill of monky's agent-say by the very peer message it
     //    answered). 12s lets the call complete; if it still drags past
     //    12s the interrupt fires and the re-wake owns delivery.
-    // Human senders keep the 3s default (quick cut-in); [bg: machine
-    // wakes keep it too (isPeerInbound excludes them).
+    // Human senders keep the 3s default (quick cut-in).
     const delay =
       interruptingChannels.has(channelId) ||
       isPeerInbound(resolveChannel(channelId), msg)
@@ -3430,6 +3436,14 @@ export const PEER_SENDER_HINT =
 export const PEER_SENDER_HINT_NO_FWD =
   "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
 
+/** #177: true when the inbound is a [bg:-prefixed machine wake (pi-bg
+ *  callback, dead-letter alert, ETL alert). Machine wakes are never more
+ *  urgent than the in-flight turn: they ride the re-wake queue and deliver
+ *  at agent_end, and arm no mid-run interrupt (queue-only, #177). */
+export function isBgInbound(msg: ChannelMessage): boolean {
+  return msg.body.trimStart().startsWith("[bg:");
+}
+
 /** c1: true when the inbound is authored by a known peer bot. Bg-webhook
  *  tickets ([bg: prefix) are excluded even if their author id matches —
  *  those are machine wakes, not a peer speaking. */
@@ -3439,7 +3453,7 @@ export function isPeerInbound(
 ): boolean {
   const peerIds = ch?.peerBotIds ?? [];
   if (!msg.fromId || !peerIds.includes(msg.fromId)) return false;
-  return !msg.body.trimStart().startsWith("[bg:");
+  return !isBgInbound(msg);
 }
 
 function buildChannelContext(
