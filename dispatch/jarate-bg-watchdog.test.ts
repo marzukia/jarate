@@ -62,6 +62,13 @@ function fixture() {
   env.PI_BG_TMPDIR = path.join(tmp, "art");
   // keep the sweep (incl. the empty-cgroup reaper) off the real cgroup fs
   env.PI_BG_CG_ROOT = path.join(tmp, "cg");
+  // keep the OOM signature section (issue #191 M1) off the real cgroup fs:
+  // the fake root has no slices by default -> the section is a no-op
+  env.PI_BG_OOM_ROOT = path.join(tmp, "oom");
+  // pin the baseline/run-record location to the fake HOME (clean-env
+  // lesson: the OOM tests must not inherit an ambient
+  // $PI_DISPATCH_RECORD_DIR from the harness box)
+  env.PI_DISPATCH_RECORD_DIR = path.join(home, ".pi-dispatch", "runs");
   env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
   delete env.PI_SERVICE;
   delete env.JARATE_AGENTS_MD;
@@ -2950,4 +2957,495 @@ describe("#143: mid-run events (child-left / sess-write)", () => {
       f.close();
     }
   }, 30_000);
+});
+// ────────────────────────────────────────────────────────────────────────────
+// #191 M1: agent OOM signature (slice memory.events delta)
+//
+// Kernel OOM text did not persist to the system journal (proven on
+// hydrogen 2026-10-07: 0 kernel OOM entries for the 2026-10-04 incident
+// window); the slice cgroup counters are the only durable OOM record. The
+// sweep reads $PI_BG_OOM_ROOT/user-<uid>.slice/memory.events for the
+// in-scope uids (own uid + the fleet-agents roster; the fixture's fake
+// root is the spec's test seam - unit tests never read real cgroups),
+// compares oom_kill/oom against the persisted baseline
+// ($PI_DISPATCH_RECORD_DIR/oom-baseline.json, survives restarts), and
+// posts an OOM-ALERT ([bg: agent-watch] content prefix + 40-col frame) on
+// a positive oom_kill delta. Baseline semantics: first sight = quiet
+// baseline (the historical counter never alerts); the baseline advances
+// ONLY after a successful post (dead webhook -> same grown delta re-posts
+// next sweep); counter regression (slice recreated) = quiet re-baseline;
+// max 1 ALERT per uid per 60 min (dedupe state in the same file, written
+// only after a successful post). FINDING only (M1): no auto-restart, no
+// MemoryMax changes, no marker/liveness logic (M2).
+// ────────────────────────────────────────────────────────────────────────────
+describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
+  const OWN = os.userInfo().uid; // the test runner's uid (frank = 1002 on hydrogen)
+  const PEER = OWN === 1003 ? 1004 : 1003; // fleet-roster uid (fake slice)
+
+  type OomEvents = { oom?: number; oom_kill?: number; max?: number };
+  type OomEntry = { oom_kill: number; oom: number; last_alert_epoch?: number };
+
+  /** Base fixture + slice helpers on the fake OOM root. */
+  const oomFixture = () => {
+    const f = fixture();
+    const oomRoot = f.env.PI_BG_OOM_ROOT as string;
+    const recDir = f.env.PI_DISPATCH_RECORD_DIR as string;
+    // no drift post under the OOM tests: bless the fixture AGENTS.md
+    // (the sweep runs `jarate agents-check` on every run when bun is on
+    // PATH - CI and this box both are)
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-10-06T00:00:00Z  #191 M1 oom test\n`,
+    );
+    const slice = (uid: number) => {
+      const d = path.join(oomRoot, `user-${uid}.slice`);
+      fs.mkdirSync(d, { recursive: true });
+      return d;
+    };
+    // same key set as the real file (incl. oom_group_kill: the parser
+    // must pick "oom", not "oom_kill", by exact key match)
+    const events = (uid: number, e: OomEvents) => {
+      const d = slice(uid);
+      fs.writeFileSync(
+        path.join(d, "memory.events"),
+        `${[
+          `low 0`,
+          `high 0`,
+          `max ${e.max ?? 0}`,
+          `oom ${e.oom ?? 0}`,
+          `oom_kill ${e.oom_kill ?? 0}`,
+          `oom_group_kill 0`,
+        ].join("\n")}\n`,
+      );
+    };
+    const setMax = (uid: number, s: string) => {
+      fs.writeFileSync(path.join(slice(uid), "memory.max"), `${s}\n`);
+    };
+    const setPeak = (uid: number, s: string) => {
+      fs.writeFileSync(path.join(slice(uid), "memory.peak"), `${s}\n`);
+    };
+    const baselineFile = path.join(recDir, "oom-baseline.json");
+    const seedBaseline = (entries: Record<string, OomEntry>) => {
+      fs.mkdirSync(recDir, { recursive: true });
+      fs.writeFileSync(baselineFile, JSON.stringify(entries, null, 2));
+    };
+    const baseline = (): Record<string, OomEntry> =>
+      JSON.parse(fs.readFileSync(baselineFile, "utf8"));
+    const fleet = (lines: string[]) => {
+      const d = path.join(f.home, ".config", "jarate");
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, "fleet-agents"), `${lines.join("\n")}\n`);
+    };
+    return {
+      ...f,
+      oomRoot,
+      recDir,
+      slice,
+      events,
+      setMax,
+      setPeak,
+      baselineFile,
+      seedBaseline,
+      baseline,
+      fleet,
+    };
+  };
+
+  test("first sight baselines quietly: the historical counter never alerts (the 32-kill rule)", async () => {
+    const f = oomFixture();
+    try {
+      f.events(OWN, { oom: 63, oom_kill: 32 });
+      f.setMax(OWN, "25769803776");
+      f.setPeak(OWN, "22764904448");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0); // quiet: a historical 32 never alerts
+      expect(r.out).toContain(
+        `oom baseline: user-${OWN}.slice (oom_kill=32 oom=63)`,
+      );
+      const b = f.baseline();
+      expect(b[String(OWN)].oom_kill).toBe(32);
+      expect(b[String(OWN)].oom).toBe(63);
+      expect(b[String(OWN)].last_alert_epoch).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("positive oom_kill delta -> OOM-ALERT post ([bg: agent-watch], delta + totals + max + peak), baseline advances", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
+      f.events(OWN, { oom: 5, oom_kill: 2 });
+      f.setMax(OWN, "25769803776");
+      f.setPeak(OWN, "22764904448");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      const body = f.posts[0];
+      // the content prefix is the webhook wake marker (isBgWebhook)
+      expect(body.content).toBe(
+        `[bg: agent-watch] OOM: user-${OWN}.slice oom_kill +2 (2 total since baseline 0)`,
+      );
+      const em = body.embeds[0];
+      expect(em.title).toBe(`OOM-ALERT \u00b7 user-${OWN}.slice`);
+      expect(em.author?.name).toBe("pi-bg watchdog");
+      expect(em.color).toBe(15158332); // red: kills in the agent slice
+      expect(em.footer?.text).toBe("pi-bg watchdog (oom, issue #191)");
+      const lines = codeLines(em);
+      for (const want of [
+        `\u250c oom \u00b7 user-${OWN}.slice`,
+        `\u251c kill   : +2 (2 total, base 0)`,
+        `\u251c oom    : +5 (5 total, base 0)`,
+        `\u251c max    : 25769803776 (24.0G)`,
+        `\u251c peak   : 22764904448 (21.2G)`,
+      ]) {
+        expect(lines).toContain(want);
+      }
+      // the frame obeys the 40-col mobile budget (docs/STYLE.md 2.3)
+      for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+      // baseline advanced AFTER the successful post, dedupe stamp set
+      const b = f.baseline();
+      expect(b[String(OWN)].oom_kill).toBe(2);
+      expect(b[String(OWN)].oom).toBe(5);
+      expect(b[String(OWN)].last_alert_epoch).toBeGreaterThan(0);
+      expect(r.out).toContain(
+        `OOM user-${OWN}.slice: oom_kill +2 (2 total, base 0), oom +5 (5 total)`,
+      );
+      expect(r.out).toContain("flagged 1 agent OOM finding(s)");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("no new kills (delta 0) -> no re-post, entry untouched", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 2, oom: 5 } });
+      f.events(OWN, { oom: 5, oom_kill: 2 });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).not.toContain("OOM user-");
+      const b = f.baseline();
+      expect(b[String(OWN)].last_alert_epoch).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post failure keeps the baseline: next sweep re-posts the grown delta (dead-letter pattern)", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
+      f.events(OWN, { oom: 2, oom_kill: 1 });
+      // webhook down: connection refused, 3 attempts + backoff
+      const r1 = await f.run([], {
+        PI_DISPATCH_WEBHOOK: "http://127.0.0.1:1/none",
+      });
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.err).toContain(
+        `OOM post failed for user-${OWN}.slice - baseline kept, retries next sweep`,
+      );
+      // baseline NOT advanced (the dead-letter rule)
+      expect(f.baseline()[String(OWN)].oom_kill).toBe(0);
+      // the storm keeps killing while the webhook is down; it comes back
+      f.events(OWN, { oom: 7, oom_kill: 3 });
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      // the accumulated delta is reported (nothing was lost)
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] OOM: user-${OWN}.slice oom_kill +3 (3 total since baseline 0)`,
+      );
+      expect(f.baseline()[String(OWN)].oom_kill).toBe(3);
+      expect(f.baseline()[String(OWN)].oom).toBe(7);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("60-min dedupe: a second alert inside the window is suppressed; the next posts the accumulated delta", async () => {
+    const f = oomFixture();
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      f.seedBaseline({
+        [String(OWN)]: { oom_kill: 0, oom: 0, last_alert_epoch: now - 600 },
+      });
+      f.events(OWN, { oom: 2, oom_kill: 1 });
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(`oom user-${OWN}.slice: oom_kill +1 suppressed`);
+      expect(r1.out).toContain("deduped 1 OOM alert(s) (60m window)");
+      // suppressed = no post = no baseline advance, dedupe stamp kept
+      const b1 = f.baseline();
+      expect(b1[String(OWN)].oom_kill).toBe(0);
+      expect(b1[String(OWN)].last_alert_epoch).toBe(now - 600);
+      // window elapses (70 min); the storm added 2 more kills meanwhile
+      f.seedBaseline({
+        [String(OWN)]: { oom_kill: 0, oom: 0, last_alert_epoch: now - 4200 },
+      });
+      f.events(OWN, { oom: 6, oom_kill: 3 });
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toContain(
+        "oom_kill +3 (3 total since baseline 0)",
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  test("counter regression (slice cgroup recreated) -> quiet re-baseline, no alert", async () => {
+    const f = oomFixture();
+    const now = Math.floor(Date.now() / 1000);
+    try {
+      f.seedBaseline({
+        [String(OWN)]: { oom_kill: 32, oom: 63, last_alert_epoch: now - 100 },
+      });
+      f.events(OWN, { oom: 0, oom_kill: 0 });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `oom re-baseline: user-${OWN}.slice (counter regression: oom_kill 32 -> 0, oom 63 -> 0)`,
+      );
+      // new counter era: rebaselined, dedupe stamp dropped
+      const b = f.baseline();
+      expect(b[String(OWN)].oom_kill).toBe(0);
+      expect(b[String(OWN)].last_alert_epoch).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("slice absent (session gone) -> skipped, no post, entry kept (M2 owns the session class)", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 1, oom: 2 } });
+      // no user-<OWN>.slice dir at all
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).not.toContain("OOM user-");
+      const b = f.baseline();
+      expect(b[String(OWN)].oom_kill).toBe(1);
+      expect(b[String(OWN)].oom).toBe(2);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fleet-agents roster: a peer slice's OOM posts to the box operator webhook (webhook column is M2's)", async () => {
+    const f = oomFixture();
+    try {
+      f.fleet([
+        "# hydrogen fleet",
+        `${PEER} https://hook.example/peer`,
+        "garbage line",
+        `${OWN} https://hook.example/self`,
+      ]);
+      f.seedBaseline({
+        [String(OWN)]: { oom_kill: 0, oom: 0 },
+        [String(PEER)]: { oom_kill: 0, oom: 0 },
+      });
+      f.events(OWN, { oom: 0, oom_kill: 0 });
+      f.events(PEER, { oom: 9, oom_kill: 4 });
+      f.setMax(PEER, "max"); // uncapped slice passes through as "max"
+      f.setPeak(PEER, "1073741824");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1); // only the peer's delta
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe(`OOM-ALERT \u00b7 user-${PEER}.slice`);
+      const lines = codeLines(em);
+      expect(lines).toContain(`\u251c max    : max`);
+      expect(lines).toContain(`\u251c peak   : 1073741824 (1.0G)`);
+      // peer advanced; the quiet own uid is untouched
+      expect(f.baseline()[String(PEER)].oom_kill).toBe(4);
+      expect(f.baseline()[String(OWN)].last_alert_epoch).toBeUndefined();
+      expect(r.out).toContain(`flagged 1 agent OOM finding(s)`);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--dry-run: no post, no baseline write (first sight AND delta)", async () => {
+    const f = oomFixture();
+    try {
+      // first sight
+      f.events(OWN, { oom: 6, oom_kill: 3 });
+      const r1 = await f.run(["--dry-run"]);
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        `dry-run: would baseline user-${OWN}.slice (oom_kill=3 oom=6)`,
+      );
+      expect(fs.existsSync(f.baselineFile)).toBe(false);
+      // delta
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
+      const r2 = await f.run(["--dry-run"]);
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r2.out).toContain(
+        `dry-run: would post OOM-ALERT user-${OWN}.slice (oom_kill +3, 3 total)`,
+      );
+      expect(f.baseline()[String(OWN)].oom_kill).toBe(0); // untouched
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--quiet: detect + log, no post, no baseline advance (the delta survives to the next non-quiet sweep)", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
+      f.events(OWN, { oom: 4, oom_kill: 2 });
+      const r1 = await f.run(["--quiet"]);
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        `quiet: OOM user-${OWN}.slice oom_kill +2 not posted (no baseline advance)`,
+      );
+      expect(f.baseline()[String(OWN)].oom_kill).toBe(0);
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(1); // the delta survived the quiet run
+      expect(f.posts[0].content).toContain(
+        "oom_kill +2 (2 total since baseline 0)",
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  test("no webhook configured: detection only, exit 0, no baseline advance", async () => {
+    const f = oomFixture();
+    try {
+      f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
+      f.events(OWN, { oom: 2, oom_kill: 1 });
+      const r = await f.run([], { PI_DISPATCH_WEBHOOK: "" });
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `oom user-${OWN}.slice: oom_kill +1 - no webhook configured (no baseline advance)`,
+      );
+      expect(f.baseline()[String(OWN)].oom_kill).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("clean env: the OOM sweep fires with a REPLACED env (no harness PI_* needed)", async () => {
+    const f = oomFixture();
+    try {
+      // failing control for the var wiring: a DIFFERENT rec dir than the
+      // fixture default. If PI_DISPATCH_RECORD_DIR did not reach the
+      // sweep, the baseline would land at the default
+      // $HOME/.pi-dispatch/runs and this assertion goes red.
+      const recDir = path.join(f.tmp, "recdir-envi");
+      fs.mkdirSync(recDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(recDir, "oom-baseline.json"),
+        JSON.stringify({ [String(OWN)]: { oom_kill: 0, oom: 0 } }),
+      );
+      f.events(OWN, { oom: 2, oom_kill: 1 });
+      f.setMax(OWN, "25769803776");
+      f.setPeak(OWN, "17325654016");
+      // env -i: the sweep's env is EXACTLY this list - no PI_* from the
+      // bun test process, no ambient state. (Bun.spawn with the env var
+      // list replaces the child's env, same contract as `env -i`.)
+      // Awaited, not execSync: the webhook POST lands on THIS process's
+      // fixture server, which must keep running its event loop.
+      const child = Bun.spawn(
+        [
+          "env",
+          "-i",
+          `HOME=${f.home}`,
+          `PATH=/usr/local/bin:/usr/bin:/bin`,
+          `PI_BG_WT_DIR=${f.env.PI_BG_WT_DIR}`,
+          `PI_BG_TMPDIR=${f.env.PI_BG_TMPDIR}`,
+          `PI_BG_CG_ROOT=${f.env.PI_BG_CG_ROOT}`,
+          `PI_BG_OOM_ROOT=${f.oomRoot}`,
+          `PI_DISPATCH_RECORD_DIR=${recDir}`,
+          `PI_DISPATCH_WEBHOOK=${f.env.PI_DISPATCH_WEBHOOK}`,
+          "bash",
+          WD,
+        ],
+        { env: {}, stdout: "pipe", stderr: "pipe" },
+      );
+      const out = await new Response(child.stdout).text();
+      // bun 1.4: `exited` is the promise; `exit` is not a property
+      const exitCode = await child.exited;
+      expect(exitCode).toBe(0);
+      expect(out).toContain(
+        `OOM user-${OWN}.slice: oom_kill +1 (1 total, base 0), oom +2 (2 total)`,
+      );
+      // the post reached the fixture capture server
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toContain(
+        `[bg: agent-watch] OOM: user-${OWN}.slice oom_kill +1`,
+      );
+      // and the baseline advanced AT THE PASSED rec dir
+      const b = JSON.parse(
+        fs.readFileSync(path.join(recDir, "oom-baseline.json"), "utf8"),
+      );
+      expect(b[String(OWN)].oom_kill).toBe(1);
+      expect(b[String(OWN)].last_alert_epoch).toBeGreaterThan(0);
+      // the fixture-default rec dir was never written
+      expect(fs.existsSync(path.join(f.recDir, "oom-baseline.json"))).toBe(
+        false,
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  // INTEGRATION PROBE (the one allowed real-cgroup read in the suite):
+  // point the section at THIS box's real cgroup root, baseline frank's own
+  // slice, and prove the parse against reality. First-sight path only:
+  // the baseline lands in the fixture's fake rec dir, nothing real is
+  // written, and the counters are re-read after the sweep to prove no
+  // mutation. Skips where the runner's own user slice has no memory.events
+  // (no cgroup v2 user session).
+  const REAL_ROOT = "/sys/fs/cgroup/user.slice";
+  const realEvents = path.join(REAL_ROOT, `user-${OWN}.slice`, "memory.events");
+  const parseReal = (p: string): OomEntry => {
+    const txt = fs.readFileSync(p, "utf8");
+    const oom = /(^|\n)oom (\d+)/.exec(txt)?.[2];
+    const oom_kill = /(^|\n)oom_kill (\d+)/.exec(txt)?.[2];
+    if (!oom || !oom_kill)
+      throw new Error(`unparseable real memory.events: ${p}`);
+    return { oom: Number(oom), oom_kill: Number(oom_kill) };
+  };
+
+  test("probe (this box): parses the real own-slice counters, baselines them quietly, posts nothing", async () => {
+    if (!fs.existsSync(realEvents)) {
+      console.log(
+        "[skip] no own user-slice memory.events on this box (probe no-op)",
+      );
+      return;
+    }
+    const f = oomFixture();
+    try {
+      const ref = parseReal(realEvents); // pre-read (parse reference)
+      f.env.PI_BG_OOM_ROOT = REAL_ROOT; // the one real read in the suite
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0); // first sight = quiet baseline
+      expect(r.out).toContain(
+        `oom baseline: user-${OWN}.slice (oom_kill=${ref.oom_kill} oom=${ref.oom})`,
+      );
+      const b = f.baseline();
+      expect(b[String(OWN)].oom_kill).toBe(ref.oom_kill);
+      expect(b[String(OWN)].oom).toBe(ref.oom);
+      // read-only: the real counters are unchanged after the sweep
+      expect(parseReal(realEvents)).toEqual(ref);
+    } finally {
+      f.close();
+    }
+  });
 });
