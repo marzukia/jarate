@@ -6970,16 +6970,49 @@ describe("tasks (integration)", () => {
     );
   });
 
+  test("/tasks add: minutes suffix (30m) + quoted cron/ISO issue forms", async () => {
+    // "30m" -> minutes (issue example form)
+    await handleInbound(pi, inbound('/tasks add "fleet check" 30m', "m1"), ctx);
+    expect(replyContent()).toContain("[ok] task");
+    expect(loadTasks(tmp)[0]).toMatchObject({
+      prompt: "fleet check",
+      kind: "at",
+    });
+    // quoted 5-field cron (issue example form) -> system-tz recurring
+    await handleInbound(
+      pi,
+      inbound('/tasks add "daily 06:00 fleet check" "0 6 * * *"', "m2"),
+      ctx,
+    );
+    const cron = loadTasks(tmp)[1];
+    expect(cron).toMatchObject({
+      prompt: "daily 06:00 fleet check",
+      kind: "cron",
+      cron: "0 6 * * *",
+    });
+    expect(cron.tz).toBeUndefined();
+    expect(unwarped(replyContent())).toContain('cron "0 6 * * *" (system tz)');
+    // quoted ISO -> exact fire time
+    const iso = new Date(Date.now() + 3600000).toISOString();
+    await handleInbound(
+      pi,
+      inbound(`/tasks add "quoted iso" "${iso}"`, "m3"),
+      ctx,
+    );
+    expect(loadTasks(tmp)[2]).toMatchObject({
+      prompt: "quoted iso",
+      kind: "at",
+      atMs: Date.parse(iso),
+    });
+  });
+
   test("/tasks reschedule: swaps the spec, keeps id + prompt", async () => {
+    const atMs = Date.now() + 30 * 60000;
     const t = scheduleTask({
       channelId: "ch1",
       channelName: "Test",
       prompt: "check the build",
-      spec: {
-        kind: "at",
-        atMs: Date.now() + 30 * 60000,
-        nextFireAt: Date.now() + 30 * 60000,
-      },
+      spec: { kind: "at", atMs, nextFireAt: atMs },
       home: tmp,
     });
     await handleInbound(
@@ -6991,8 +7024,9 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(replyContent()).toContain("[ok] rescheduled");
+    // old spec -> new spec, then the new next fire
     expect(unwarped(replyContent())).toContain(
-      'cron "0 9 * * 1-5" (Australia/Melbourne)',
+      `at ${new Date(atMs).toISOString()} -> cron "0 9 * * 1-5" (Australia/Melbourne)`,
     );
     const after = loadTasks(tmp)[0];
     expect(after).toMatchObject({
@@ -7006,6 +7040,33 @@ describe("tasks (integration)", () => {
     });
     expect(after.atMs).toBeUndefined();
     expect(after.nextFireAt).toBeGreaterThan(Date.now());
+  });
+
+  test("/tasks reschedule: recurring -> one-shot (reverse direction)", async () => {
+    const t = scheduleTask({
+      channelId: "ch1",
+      prompt: "daily check",
+      spec: {
+        kind: "cron",
+        cron: "0 6 * * *",
+        nextFireAt: Date.now() + 3600000,
+      },
+      home: tmp,
+    });
+    await handleInbound(pi, inbound(`/tasks reschedule ${t.id} 45`, "m1"), ctx);
+    expect(replyContent()).toContain("[ok] rescheduled");
+    expect(unwarped(replyContent())).toContain(
+      'cron "0 6 * * *" (system tz) -> at ',
+    );
+    const after = loadTasks(tmp)[0];
+    expect(after).toMatchObject({
+      id: t.id,
+      prompt: "daily check",
+      kind: "at",
+      status: "pending",
+    });
+    expect(after.cron).toBeUndefined();
+    expect(after.atMs).toBeGreaterThanOrEqual(Date.now() + 44 * 60000);
   });
 
   test("/tasks reschedule: unknown id or other channel -> one [!] line, nothing changes", async () => {
@@ -7117,6 +7178,16 @@ describe("tasks (integration)", () => {
     );
     expect(unwarped(replyContent())).toBe(
       fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
+    );
+    await handleInbound(
+      pi,
+      inbound(`/tasks reschedule ${t.id} not-a-time`, "m14"),
+      ctx,
+    );
+    expect(unwarped(replyContent())).toBe(
+      fence(
+        '[!] invalid at: "not-a-time" (ISO time, e.g. 2026-09-10T15:00:00Z)',
+      ),
     );
     // seed untouched, nothing scheduled on any path above
     expect(loadTasks(tmp).map((x) => x.id)).toEqual([t.id]);
