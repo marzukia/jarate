@@ -8216,6 +8216,168 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(queuedAcks.has("m2b")).toBe(false);
   });
 
+  test("#84: shutdown while a run is in flight morphs the working frame to a terminal state (no frozen 'working' box)", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false; // the run is in flight
+    await handlers.turn_start(null, ctx); // posts the working frame (out1)
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(edits().some((t) => t.includes("working · 1 call"))).toBe(true);
+
+    await handlers.session_shutdown?.(); // process dies while the run lives
+
+    // terminal morph in place (agent_end never fires on a dying process)
+    expect(edits().some((t) => t.includes("┌ stopped · 1 call"))).toBe(true);
+    const deleted = (id: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${id}`),
+      );
+    expect(deleted("out1")).toBe(false); // calls > 0: morph, not delete
+  });
+
+  test("#84: shutdown on a 0-call verbose-2 run deletes the working frame (same rule as agent_end)", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // posts "working · 0 calls · 0s"
+    expect(channelPosts().some((t) => t.includes("┌ working · 0 calls"))).toBe(
+      true,
+    );
+
+    await handlers.session_shutdown?.();
+
+    // agent_end deletes 0-call frames (a leftover box is noise) — shutdown must
+    const deleted = (id: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${id}`),
+      );
+    expect(deleted("out1")).toBe(true);
+  });
+
+  test("#84: shutdown after a clean run end leaves the terminal 'done' frame untouched", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    const finMsg = {
+      role: "assistant",
+      content: [{ type: "text", text: "done answer" }],
+    };
+    await handlers.agent_end({ messages: [finMsg] }, ctx); // morphs to done
+    expect(edits().filter((t) => t.includes("┌ done · 1 call")).length).toBe(1);
+
+    await handlers.session_shutdown?.(); // runOpen is false: no second morph
+
+    expect(edits().some((t) => t.includes("stopped"))).toBe(false);
+    expect(edits().filter((t) => t.includes("┌ done · 1 call")).length).toBe(1);
+    const deleted = (id: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${id}`),
+      );
+    expect(deleted("out1")).toBe(false);
+  });
+
+  test("#84: shutdown consumes the in-flight interrupt's ack line (entry spliced out of the queue)", async () => {
+    jest.useFakeTimers();
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+    ctx.isIdle = () => false; // a run is in flight
+    const m2 = inbound("hello", "m2");
+    queueMidTurnInbound(
+      "ch1",
+      m2,
+      "ctx\n\nhello",
+      "discord/Test",
+      "hello",
+      false,
+    );
+    queuedAcks.set("m2", { ackId: "ack1", fromId: "uid", pos: 1 });
+
+    const p = runMidRunInterrupt(pi, ctx, "ch1", "m2");
+    jest.advanceTimersByTime(1000); // abort fired, entry spliced, settle running
+
+    await handlers.session_shutdown?.();
+
+    // the "[..] interrupting… Ns" line IS the queued ack — it must go,
+    // even though the drain cannot see the spliced entry
+    const deleted = (id: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${id}`),
+      );
+    expect(deleted("ack1")).toBe(true);
+
+    // let the interrupt settle after the shutdown (no throw, no re-arm)
+    ctx.isIdle = () => true;
+    jest.advanceTimersByTime(50);
+    await p;
+  });
+
+  test("#84: shutdown deletes the SPEC B live-text ephemeral (agent_end's delete never runs)", async () => {
+    verboseOverride.set("ch1", 1); // level 1: a reads-only run posts NO frame
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    // non-final step message (text + pending tool call) -> live text
+    await handlers.message_end(
+      {
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "toolCall", toolName: "read", arguments: {} },
+          ],
+        },
+      },
+      ctx,
+    );
+    // the first (non-essential) tool call posts the live-text message
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    const livePosted = channelPosts().some((t) => t === "let me check");
+    expect(livePosted).toBe(true);
+    // no working frame exists for this run
+    expect(channelPosts().some((t) => t.includes("┌ working"))).toBe(false);
+
+    await handlers.session_shutdown?.();
+
+    const deleted = (id: string) =>
+      fetchCalls.some(
+        (c) => c.method === "DELETE" && c.url.includes(`/messages/${id}`),
+      );
+    expect(deleted("out1")).toBe(true);
+  });
+
+  test("#84: shutdown settles an open compact window's ticking line (no marker to settle it)", async () => {
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await tick(); // placeholder post landed, tick armed (out1)
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
+
+    await handlers.session_shutdown?.(); // process dies mid-compact
+
+    const settled = fetchCalls.some(
+      (c) =>
+        c.method === "PATCH" &&
+        c.url.includes("/messages/out1") &&
+        String(c.body).includes("compact interrupted"),
+    );
+    expect(settled).toBe(true);
+  });
+
   test("second /reset while an op window is open is rejected; /compact sees the active op; /status shows the op label", async () => {
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
