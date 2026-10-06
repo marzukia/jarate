@@ -260,6 +260,7 @@ export function resetRuntimeStateForTest(): void {
   heldChannels.clear();
   verboseOverride.clear();
   handoffInFlight = false;
+  sessionStartTs = 0; // /status "up" baseline: no session_start in this test
 }
 function ensureRuntimeStateLoaded(): void {
   const dir = runtimeStateDir ?? "";
@@ -399,14 +400,28 @@ export function queueMidTurnInbound(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
   if (armInterrupt) {
-    // When an interrupt is already in flight (re-wake run in progress),
-    // use a longer delay so the re-wake run finishes before this message
-    // jumps the queue. Without this, rapid-fire messages cascade:
-    // each new message arms a 3s interrupt that kills the re-wake run
-    // mid-LLM-call, forcing a full 120K-token prefill restart.
-    const delay = interruptingChannels.has(channelId)
-      ? interruptStepTimeoutMs() * 4 // 12s: give the re-wake run room
-      : undefined; // default 3s
+    // Two 4x (12s) cases, both "let the in-flight work finish". The
+    // message is queued with a guaranteed re-wake either way, so the
+    // longer window only changes WHEN the interrupt cuts in:
+    // 1. An interrupt is already in flight (re-wake run in progress):
+    //    without this, rapid-fire messages cascade — each new message
+    //    arms a 3s interrupt that kills the re-wake run mid-LLM-call,
+    //    forcing a full 120K-token prefill restart.
+    // 2. #165: the sender is a known peer agent. A peer's mid-run message
+    //    is usually an echo of the exchange the in-flight step is in (the
+    //    step is often agent-say TO that peer) — the peer gets the run's
+    //    head start. 3s is far shorter than a typical LLM step + REST,
+    //    so the default killed the in-flight call mid-POST (2026-10-06:
+    //    pre-spawn kill of monky's agent-say by the very peer message it
+    //    answered). 12s lets the call complete; if it still drags past
+    //    12s the interrupt fires and the re-wake owns delivery.
+    // Human senders keep the 3s default (quick cut-in); [bg: machine
+    // wakes keep it too (isPeerInbound excludes them).
+    const delay =
+      interruptingChannels.has(channelId) ||
+      isPeerInbound(resolveChannel(channelId), msg)
+        ? interruptStepTimeoutMs() * 4 // 12s: give the in-flight run room
+        : undefined; // default 3s
     armInterruptTimer(channelId, msg.messageId, delay);
   }
   return q.length;
