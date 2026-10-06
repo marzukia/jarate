@@ -2663,6 +2663,80 @@ describe("#52: hb-from-birth (launcher window is liveness-covered)", () => {
     expect(pidAlive(child)).toBe(false);
   }, 40_000);
 
+  test("nested dispatch: the child FORKS its own hb child (no adoption of the parent's)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fx.env.PI_BG_HB_INTERVAL = "1"; // fast ticks for the mtime asserts
+    // parent WITHOUT the snapshot re-exec: the leak under test is
+    // PI_BG_HB_PID in the pi env (the same leak the fixture
+    // hermeticizes). The snapshot-shaped leak also carries
+    // PI_BG_RUN_ID/PI_BG_SNAP into the child - a separate identity
+    // issue, not this one (review #183 F2 repro shape).
+    fx.env.PI_BG_NOSNAP = "1";
+    fs.mkdirSync(art, { recursive: true });
+    // nested launcher on the pi PATH
+    fs.symlinkSync(PI_BG, path.join(fx.tmp, "bin", "jarate-bg"));
+    const stage = path.join(fx.tmp, "stage");
+    // pi stub: first invocation = parent (launches the child + asserts),
+    // second = child (plain run)
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        `if [ ! -f ${stage} ]; then`,
+        `  echo parent > ${stage}`,
+        `  echo "\${PI_BG_HB_PID:-}" > ${fx.tmp}/hbpid-parent`,
+        `  i=0`,
+        `  while [ "$(ls ${art} | grep -c -- '-hb$')" -lt 1 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done`,
+        `  for f in ${art}/*-hb; do [ -f "$f" ] && basename "$f" > ${fx.tmp}/hbfile-parent; done`,
+        `  jarate-bg worker "nested hb task" > ${fx.tmp}/child-out 2>&1 &`,
+        `  cp=$!`,
+        `  i=0`,
+        `  while [ "$(ls ${art} | grep -c -- '-hb$')" -lt 2 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done`,
+        `  chf=`,
+        `  for f in ${art}/*-hb; do [ "$(basename "$f")" != "$(cat ${fx.tmp}/hbfile-parent)" ] && chf="$f"; done`,
+        `  m1=$(stat -c %Y "$chf" 2>/dev/null)`,
+        `  sleep 2.5`,
+        `  m2=$(stat -c %Y "$chf" 2>/dev/null)`,
+        `  echo "$m1 $m2" > ${fx.tmp}/child-hb-mtimes`,
+        `  wait $cp`,
+        `  : > ${fx.tmp}/faults`,
+        `  [ -f "$chf" ] && echo child-hb-file-left >> ${fx.tmp}/faults`,
+        `  kill -0 "$(cat ${fx.tmp}/hbpid-parent)" 2>/dev/null || echo parent-hb-child-dead >> ${fx.tmp}/faults`,
+        `else`,
+        `  sleep 3`, // child run: outlive the parent's mtime sampling window
+        `fi`,
+        "echo pi-run-ok",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+    const r = await fx.run(["worker", "hb nested task"]);
+    expect(r.code).toBe(0);
+    // the leak is real: the parent's pi env carried PI_BG_HB_PID (an
+    // empty value would make the fork trivial and the test vacuous)
+    expect(
+      fs.readFileSync(path.join(fx.tmp, "hbpid-parent"), "utf8").trim(),
+    ).toMatch(/^\d+$/);
+    // the child forked its own child: its hb file was re-touched during
+    // the run (an adoption would leave it at the birth-touch mtime - the
+    // adopted child touches the PARENT's file)
+    const [m1, m2] = fs
+      .readFileSync(path.join(fx.tmp, "child-hb-mtimes"), "utf8")
+      .trim()
+      .split(" ");
+    expect(Number(m2)).toBeGreaterThan(Number(m1));
+    // the parent's hb child survived the child's exit (an adopted child
+    // would have been killed by the child's exit trap: false STALLED on
+    // the healthy parent), and the child's own hb file was cleaned up
+    expect(fs.readFileSync(path.join(fx.tmp, "faults"), "utf8").trim()).toBe(
+      "",
+    );
+  }, 60_000);
+
   test("launch-fail: the hb child dies with the wrapper (no phantom ticket)", async () => {
     const fx = fixture();
     fx.seedMainCreds();

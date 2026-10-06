@@ -548,7 +548,27 @@ PY
 # child into the ticket cgroup (jarate-bg-kill signals it with the tree).
 HB_INTERVAL="${PI_BG_HB_INTERVAL:-30}"
 hb_f="$BG_TMP/pi-bg-${run_id}-hb"
-if [ -n "${PI_BG_HB_PID:-}" ] && kill -0 "$PI_BG_HB_PID" 2>/dev/null; then
+# hb_ppid <pid>: the /proc/<pid>/stat ppid ("" when the pid is gone or
+# unreadable). Read builtin, no fork; the same 'pid (comm)' strip as
+# jarate-bg-kill's children_of (comm may contain spaces).
+hb_ppid() {
+  local s=""
+  IFS= read -r s 2>/dev/null < "/proc/$1/stat" || true
+  [ -n "$s" ] || return 1
+  s="${s#*) }"
+  set -- $s
+  [ -n "${2:-}" ] && printf '%s' "$2"
+}
+# Adopt only when PI_BG_HB_PID is OUR hb child: its /proc ppid is us ($$).
+# The snapshot re-exec keeps the wrapper pid, so the child forked by the
+# first incarnation is still ours there (the only adoption path). A nested
+# jarate-bg launched from pi inherits PI_BG_HB_PID from the parent
+# wrapper's env - and PI_BG_SNAP leaks the same way, so gating on
+# PI_BG_SNAP alone is not enough (review #183 F2). There the ppid is the
+# PARENT's wrapper pid, not ours: we fork our own child. A nested adoption
+# would let our exit trap kill the parent's hb child - false STALLED on
+# both tickets.
+if [ -n "${PI_BG_HB_PID:-}" ] && [ "$(hb_ppid "$PI_BG_HB_PID")" = "$$" ]; then
   hb_pid="$PI_BG_HB_PID" # adopted across the snapshot re-exec
 else
   (
