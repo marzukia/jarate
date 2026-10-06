@@ -10348,4 +10348,163 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     expect(midTurnQueues.get("ch1")?.[0].msg.messageId).toBe("2000");
   });
+
+  test("F1: op-window inbound after the drain + rewound cursor -> replay and survival drain deliver ONCE", async () => {
+    // ── Process 1: restart-class op. The inbound lands AFTER the op
+    // drained the queue but BEFORE process death (mirrored to the file,
+    // cursor advances past it); the op rewinds the cursor to W.
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false); // a run is in flight
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000"); // W: pre-op cursor (rewind point)
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    // receipt advances the cursor past the queued inbound
+    setChannelCursor("ch1", "2000");
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+    // the op rewinds the cursor to W before death (persisted)
+    setChannelCursor("ch1", "1000");
+    await p1.handlers.session_shutdown?.();
+    // fast path: memory drained; survival path: file + rewound cursor
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+    expect(loadPersistedCursors(rewakeDir())["111"]).toBe("1000");
+
+    // ── Process 2: respawn — the double-delivery window. The survival
+    // drain re-queues 2000 from the file; the first poll (after=W)
+    // replays the op window and delivers it directly. Its commit must
+    // prune the drained IN-MEMORY copy too — not just the file copy.
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true); // idle
+    script.polls = [[bgRaw("2000")], [], []]; // first poll = the replay
+    script.scan = [];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      ),
+    );
+    // the replay run ends -> the re-wake must NOT pop the drained copy
+    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+    const delivered = customSends(p2.sent).filter((s) =>
+      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+    );
+    expect(delivered).toHaveLength(1); // was 2 at 6753cec9 (replay + re-wake)
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+    const f2 = loadRewakeQueue(rewakeDir(), "ch1");
+    expect(f2.pending).toEqual([]);
+    expect(f2.delivered).toContain("2000");
+  });
+
+  test("F1 secondary: replay commits the id while the scan fetch is in flight -> exactly once (scan live-dedupes)", async () => {
+    // Same op-window shape, plus the (fake) scan window contains the id:
+    // a startup replay delivery that commits the id mid-scan-fetch must
+    // not be re-queued by the scan (dedupe re-checked live at push time,
+    // not only from the pre-fetch snapshot).
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    setChannelCursor("ch1", "2000");
+    setChannelCursor("ch1", "1000"); // op rewind, persisted
+    await p1.handlers.session_shutdown?.();
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    script.polls = [[bgRaw("2000")], [], []]; // the replay delivers + commits
+    script.scan = [bgRaw("2000")]; // the scan window also sees the id
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      ),
+    );
+    // the scan fetch (in flight during the replay commit) has landed
+    await new Promise((r) => setTimeout(r, 150));
+    // the scan must not have re-queued the committed id
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual([]);
+    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+    expect(
+      customSends(p2.sent).filter((s) =>
+        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      ),
+    ).toHaveLength(1); // exactly once
+  });
+
+  test("F2: edit of a queued inbound rewrites the FILE copy — restart drains the edited msg", async () => {
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false); // a run is in flight
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    setChannelCursor("ch1", "2000");
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    // the owner edits the queued message (MESSAGE_UPDATE route)
+    expect(
+      await updateQueuedInbound(
+        ctx1,
+        "ch1",
+        "2000",
+        "[bg:worker:OK] 2000 EDITED",
+        [],
+        "uid",
+      ),
+    ).toBe(true);
+    // memory re-rendered AND the file copy rewritten (F2)
+    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(
+      "[bg:worker:OK] 2000 EDITED",
+    );
+    expect(loadRewakeQueue(rewakeDir(), "ch1").pending[0].msg.body).toBe(
+      "[bg:worker:OK] 2000 EDITED",
+    );
+    await p1.handlers.session_shutdown?.();
+    // the file kept the EDITED msg across the restart boundary
+    expect(loadRewakeQueue(rewakeDir(), "ch1").pending[0].msg.body).toBe(
+      "[bg:worker:OK] 2000 EDITED",
+    );
+
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    script.polls = [[], [], []];
+    script.scan = [];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    // the survival drain re-queues the EDITED body, not the stale one
+    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(
+      "[bg:worker:OK] 2000 EDITED",
+    );
+  });
 });

@@ -18,6 +18,7 @@ import {
   rewakePending,
   rewakeQueuePath,
   rewakeRemovePending,
+  rewakeUpdatePendingMsg,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
@@ -93,6 +94,28 @@ describe("restart-queue state file (#180)", () => {
     expect(loadRewakeQueue(dir, "ch1").pending).toEqual([]);
   });
 
+  test("update pending msg rewrites the file entry (F2: edit survives a restart)", () => {
+    rewakeAddPending(dir, "ch1", entry("m1"));
+    const edited = { ...msg("m1"), body: "[bg:worker:OK] m1 EDITED" };
+    rewakeUpdatePendingMsg(dir, "ch1", "m1", edited);
+    const file = loadRewakeQueue(dir, "ch1");
+    expect(file.pending).toHaveLength(1);
+    expect(file.pending[0].msg.body).toBe("[bg:worker:OK] m1 EDITED");
+    expect(file.pending[0].queuedAt).toBe(1000); // FIFO position kept
+  });
+
+  test("update pending msg of an absent id → no rewrite (no-op)", () => {
+    rewakeAddPending(dir, "ch1", entry("m1"));
+    const p = rewakeQueuePath(dir, "ch1");
+    const before = fs.readFileSync(p, "utf8");
+    rewakeUpdatePendingMsg(dir, "ch1", "nope", msg("nope"));
+    expect(fs.readFileSync(p, "utf8")).toBe(before); // no-op: no write
+  });
+
+  test("delivered cap is tied to the lookback clamp (F3: margin at the edge)", () => {
+    expect(REWAKE_DELIVERED_CAP).toBe(REWAKE_LOOKBACK_MAX + 1);
+  });
+
   test("clear pending empties the line but keeps the delivered set", () => {
     rewakeAddPending(dir, "ch1", entry("m1"));
     rewakeCommitDelivered(dir, "ch1", "m2");
@@ -158,6 +181,8 @@ describe("restart-queue state file (#180)", () => {
     rewakeRemovePending(null, "ch1", "m1");
     rewakeClearPending(undefined, "ch1");
     rewakeCommitDelivered(null, "ch1", "m1");
+    rewakeUpdatePendingMsg(null, "ch1", "m1", msg("m1"));
+    rewakeUpdatePendingMsg(undefined, "ch1", "m1", msg("m1"));
     expect(rewakePending(undefined, "ch1")).toEqual([]);
   });
 
@@ -306,6 +331,26 @@ describe("restart-queue option 1: bounded startup history scan", () => {
     rewakeCommitDelivered(dir, "ch1", "1001");
     const { r } = await runScan([bgPost("1001", now)]);
     expect(r).toEqual({ scanned: 1, requeued: 0 });
+  });
+
+  test("F1 secondary: an id committed mid-fetch (startup replay delivery) is NOT re-queued", async () => {
+    const now = new Date().toISOString();
+    // The fetch commits the id before it resolves — a startup replay /
+    // wake-fail-kick delivery landing while the scan fetch is in flight.
+    // The scan's dedupe must see the commit and skip the id (exactly once).
+    const r = await scanUndeliveredBgInbounds({
+      stateDir: dir,
+      channels: [scanChannel()],
+      fetcher: async (_t, _url) => {
+        rewakeCommitDelivered(dir, "ch1", "1001");
+        return [bgPost("1001", now)];
+      },
+      requeue: (e) => {
+        rewakeAddPending(dir, "ch1", e);
+      },
+    });
+    expect(r).toEqual({ scanned: 1, requeued: 0 });
+    expect(rewakePending(dir, "ch1")).toEqual([]);
   });
 
   test("pending dedupes: a survived queued entry is NOT re-queued again", async () => {

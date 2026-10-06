@@ -87,11 +87,13 @@ import { memoryToc } from "./memory";
 import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
 import {
+  loadRewakeQueue,
   rewakeAddPending,
   rewakeClearPending,
   rewakeCommitDelivered,
   rewakePending,
   rewakeRemovePending,
+  rewakeUpdatePendingMsg,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
@@ -553,6 +555,23 @@ export function popChannelQueuedInbound(
   if (q.length === 0) midTurnQueues.delete(channelId);
   consumeQueuedAck(channelId, e.msg.messageId);
   return e;
+}
+
+/** Drop one queued entry by id WITHOUT delivering it (#186 F1): the
+ *  delivery already happened through another path (the cursor-replay
+ *  direct send) and its commit must not leave the drained copy behind
+ *  for the agent_end re-wake to pop — that second pop is exactly the
+ *  double delivery. Consume the ack like a pop would. No-op when the
+ *  id is not queued (the normal pop-then-send order reaches here with
+ *  the entry already out of the line). */
+function dropQueuedInbound(channelId: string, messageId: string): void {
+  const q = midTurnQueues.get(channelId);
+  if (!q) return;
+  const idx = q.findIndex((e) => e.msg.messageId === messageId);
+  if (idx === -1) return;
+  q.splice(idx, 1);
+  if (q.length === 0) midTurnQueues.delete(channelId);
+  consumeQueuedAck(channelId, messageId);
 }
 
 /** Remove one armed interrupt timer (the queue entry for it is gone).
@@ -1178,6 +1197,10 @@ export async function updateQueuedInbound(
   if (hasOwnerConfigured(ch) && !isOwnerUser(ch, authorId)) return false;
   entry.msg.body = content;
   entry.msg.attachments = attachments;
+  // #186 (F2): rewrite the FILE copy too — the file is the survival
+  // path; a restart before delivery must drain the edited
+  // body/attachments, not the pre-edit msg.
+  rewakeUpdatePendingMsg(runtimeStateDir, channelId, messageId, entry.msg);
 
   // Plain-path re-render (same pipeline as handleInbound's no-attachment
   // branch). Entries queued WITH attachments keep their stored file-folder
@@ -2452,8 +2475,17 @@ export default function (pi: ExtensionAPI) {
         channels: scanChannels,
         fetcher: (token, urlPath) => discordFetch(token, urlPath),
         requeue: (entry, chId) => {
+          const id = entry.msg.messageId;
           const q = midTurnQueues.get(chId) ?? [];
-          if (q.some((x) => x.msg.messageId === entry.msg.messageId)) return; // already covered (survival drain or live delivery)
+          if (q.some((x) => x.msg.messageId === id)) return; // already covered (survival drain or live delivery)
+          // #186 (F1 secondary): live re-check at push time, not the
+          // scan's pre-fetch snapshot — a startup delivery (replay /
+          // wake-fail kick) that committed this id after the snapshot
+          // must not be re-queued (the commit prunes the pending copy
+          // and records the delivered id — re-read both).
+          const f = loadRewakeQueue(rewakeStateDir, chId);
+          if (f.delivered.includes(id)) return; // committed after the snapshot
+          if (f.pending.some((p) => p.msg.messageId === id)) return; // queued after the snapshot
           q.push({ msg: entry.msg, queuedAt: entry.queuedAt });
           midTurnQueues.set(chId, q);
           rewakeAddPending(rewakeStateDir, chId, entry);
@@ -6477,7 +6509,14 @@ function sendToPi(
     // id in the delivered set (the startup history-scan dedupe). A
     // sendMessage throw returns false BEFORE this line: the file keeps
     // the entry, the next restart re-delivers (at-least-once).
-    if (messageId) rewakeCommitDelivered(runtimeStateDir, channelId, messageId);
+    if (messageId) {
+      rewakeCommitDelivered(runtimeStateDir, channelId, messageId);
+      // #186 (F1): the commit prunes the FILE copy; prune the drained
+      // in-memory copy too (same id still queued by the survival drain
+      // or a replay re-queue) — otherwise the agent_end re-wake pops
+      // it and delivers the same inbound twice.
+      dropQueuedInbound(channelId, messageId);
+    }
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
     return false;

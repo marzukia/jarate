@@ -56,14 +56,17 @@ import type { ChannelConfig, ChannelMessage } from "./types";
 export const REWAKE_LOOKBACK_DEFAULT = 50;
 /** Hard clamp for the lookback bound (the scan is one REST call). */
 export const REWAKE_LOOKBACK_MAX = 200;
-/** Delivered-id cap per channel. Must stay > the lookback bound: any
- *  [bg: post inside the scan window, if ever committed, is within the
- *  last DELIVERED_CAP commits and therefore still in the set. */
-export const REWAKE_DELIVERED_CAP = 200;
-/** Secondary age guard for the scan: a scan candidate older than this
- *  is re-queued anyway only when the file is corrupt (healthy files
- *  always dedupe in-window commits); the cap bounds the damage of a
- *  corrupt file to a few days of at-most re-runs. */
+/** Delivered-id cap per channel. Tied to the lookback clamp (MAX + 1)
+ *  so the invariant holds with margin at the edge: any [bg: post inside
+ *  the scan window, if ever committed, is within the last DELIVERED_CAP
+ *  commits and therefore still in the set. A test pins the tie — raising
+ *  REWAKE_LOOKBACK_MAX without the cap cannot slip through silently. */
+export const REWAKE_DELIVERED_CAP = REWAKE_LOOKBACK_MAX + 1;
+/** Age guard for the scan: applied uniformly to EVERY scan (file health
+ *  is not inspected) — a candidate older than this is dropped, never
+ *  re-queued. It bounds the re-queue to the last 72h of history: even a
+ *  corrupt file (lost delivered set) cannot resurrect a [bg: post older
+ *  than this. */
 export const REWAKE_SCAN_MAX_AGE_MS = 72 * 3_600_000;
 export const REWAKE_LOOKBACK_ENV = "PISCORD_REWAKE_LOOKBACK";
 
@@ -194,6 +197,24 @@ export function rewakeRemovePending(
   const next = file.pending.filter((p) => p.msg.messageId !== messageId);
   if (next.length === file.pending.length) return;
   file.pending = next;
+  saveRewakeQueue(stateDir, channelId, file);
+}
+
+/** Rewrite a pending entry's msg in the file (MESSAGE_UPDATE on a
+ *  queued message, #186 F2): the in-memory entry is re-rendered on
+ *  edit, and a restart before delivery must drain the EDITED
+ *  body/attachments, not the pre-edit msg. `queuedAt` (and FIFO order)
+ *  are kept. No write when the id is not pending. */
+export function rewakeUpdatePendingMsg(
+  stateDir: string | null | undefined,
+  channelId: string,
+  messageId: string,
+  msg: ChannelMessage,
+): void {
+  const file = loadRewakeQueue(stateDir, channelId);
+  const e = file.pending.find((p) => p.msg.messageId === messageId);
+  if (!e) return;
+  e.msg = msg;
   saveRewakeQueue(stateDir, channelId, file);
 }
 
