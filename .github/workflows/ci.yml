@@ -14,9 +14,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Runner scoping (2026-10-06): fork-PR code is arbitrary code and must never
+# run on the home lab. PR jobs stay on ubuntu-latest; push:main (already
+# past reviewer + gate + branch protection) runs on the nf self-hosted VMs.
+env:
+  RUNNER: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
+
 jobs:
   biome:
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +33,7 @@ jobs:
         run: bunx biome check .
 
   bridge:
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +46,7 @@ jobs:
         run: cd packages/bridge && bun x bun test
 
   recall:
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +60,7 @@ jobs:
         run: cd packages/recall && bun test
 
   bin:
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +70,7 @@ jobs:
         run: cd bin && bun test
 
   test:  # job name satisfies branch-protection required check "test"
-    runs-on: ubuntu-latest
+    runs-on: ${{ env.RUNNER }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
