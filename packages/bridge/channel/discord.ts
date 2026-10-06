@@ -1640,12 +1640,14 @@ export async function deleteDeferredAck(
   }
 }
 
-/** Commands piscord supports. NATIVE SLASH UI DISABLED (2026-09-09):
- *  INTERACTIONS_CREATE events are not reaching the gateway session
- *  (parked /status RCA). All commands work via plain text — type
- *  "/status" as a normal message, parsed in channel/index.ts.
- *  registerDiscordCommands pushes an EMPTY list to clear the slash menu. */
-const SLASH_COMMANDS = [
+/** Commands the bridge supports, as native Discord slash commands.
+ *  Registered GUILD-scoped on every boot (instant — no 1h global
+ *  propagation); the legacy global list stays cleared. Native '/' taps
+ *  arrive as INTERACTIONS_CREATE on the presence gateway (INTERACTIONS
+ *  intent, 5431caed) and route through buildInteractionHandler into the
+ *  same executor as the text path, which stays as the fallback —
+ *  agent-say / peer traffic produces messages, not interactions. */
+export const SLASH_COMMANDS = [
   { name: "stop", description: "Stop the current run" },
   {
     name: "btw",
@@ -1735,11 +1737,12 @@ const SLASH_COMMANDS = [
   },
 ];
 
-/** Clear guild + global slash commands so the native "/" menu is empty
- *  and every command is driven by plain text. Re-enable by pushing
- *  SLASH_COMMANDS instead of []. */
+/** Register SLASH_COMMANDS guild-scoped (instant, no 1h propagation) on
+ *  every boot; the legacy GLOBAL list stays CLEARED — guild registrations
+ *  shadow the global set, so the global PUT is always []. Idempotent:
+ *  every boot PUTs the same list; per-guild failures are logged and the
+ *  rest keep going. Exported for tests. */
 export async function registerDiscordCommands(token: string): Promise<void> {
-  const list: typeof SLASH_COMMANDS = [];
   try {
     const me = await discordFetch(token, "/applications/@me");
     const guilds = await discordFetch(token, "/users/@me/guilds");
@@ -1757,11 +1760,11 @@ export async function registerDiscordCommands(token: string): Promise<void> {
         await discordFetch(
           token,
           `/applications/${me.id}/guilds/${g.id}/commands`,
-          { method: "PUT", body: list },
+          { method: "PUT", body: SLASH_COMMANDS },
         );
         ok += 1;
         console.log(
-          `[interactions] registered ${list.length} slash commands in guild ${label}`,
+          `[interactions] registered ${SLASH_COMMANDS.length} slash commands in guild ${label}`,
         );
       } catch (e) {
         console.error(
@@ -1774,12 +1777,14 @@ export async function registerDiscordCommands(token: string): Promise<void> {
       console.error(
         `[interactions] guild command registration failed for all ${guildList.length} guilds`,
       );
-    // Clear legacy GLOBAL commands too (native slash UI is disabled).
+    // Legacy GLOBAL commands stay cleared: guild scope is the only source.
     await discordFetch(token, `/applications/${me.id}/commands`, {
       method: "PUT",
-      body: list,
+      body: [],
     });
-    console.log("[interactions] global command list synced (text-only mode)");
+    console.log(
+      `[interactions] global command list kept cleared (${SLASH_COMMANDS.length} guild-scoped)`,
+    );
   } catch (e) {
     console.error(
       "[interactions] register failed:",

@@ -828,18 +828,35 @@ test("registerDiscordCommands is per-guild, logs failures, keeps the rest (G1)",
       puts.push({ url: u, body: JSON.parse(init.body) });
       return jsonResp(200, null);
     }
+    if (method === "PUT" && u.endsWith("/applications/app1/commands")) {
+      puts.push({ url: u, body: JSON.parse(init.body) });
+      return jsonResp(200, null);
+    }
     return jsonResp(200, null);
   });
 
   await registerDiscordCommands("tok-reg"); // must not throw on the failing guild
 
-  // Text-only mode: one empty PUT per guild (clears the slash menu);
-  // the legacy global list is cleared too (no per-command names).
-  expect(puts.length).toBe(1);
+  // Native slash menu re-enabled (#169): the healthy guild's PUT carries
+  // the FULL command list (guild-scoped = instant); the failing guild is
+  // skipped, the rest keep going.
+  expect(puts.length).toBe(2);
   expect(puts[0].url).toBe(
     "https://discord.com/api/v10/applications/app1/guilds/g1/commands",
   );
-  expect(puts[0].body).toEqual([]);
+  expect(puts[0].body).toEqual(SLASH_COMMANDS);
+  // Legacy global list stays cleared: guild scope is the only source.
+  expect(puts[1].url).toBe(
+    "https://discord.com/api/v10/applications/app1/commands",
+  );
+  expect(puts[1].body).toEqual([]);
+
+  // Idempotent on every boot: a second run PUTs the identical list.
+  puts.length = 0;
+  await registerDiscordCommands("tok-reg");
+  expect(puts.length).toBe(2);
+  expect(puts[0].body).toEqual(SLASH_COMMANDS);
+  expect(puts[1].body).toEqual([]);
 });
 
 test("registerDiscordCommands skips cleanly with no guilds", async () => {
