@@ -4486,19 +4486,23 @@ function startCompact(
 // ─── /tasks spec-string adapter ────────────────────────────────────────────
 // Turns the raw schedule text of /tasks add|reschedule into parseTaskSpec
 // params (the SAME validator the task LLM tool uses — no second parser):
-//   1 token: all digits = minutes, otherwise an ISO time
+//   1 token: digits = minutes (optional m suffix, e.g. 30m), otherwise an ISO
 //   5 tokens: 5-field cron
 //   6 tokens: 5-field cron + IANA timezone
+// Surrounding double quotes on the spec are decoration (the issue examples
+// show /tasks add "..." "0 6 * * *"); no valid spec value (minutes, ISO,
+// cron field, IANA tz) contains a quote, so all of them are stripped.
 // Anything else is a form error (the command prints its usage line).
 function specStringParams(
   raw: string,
 ): { at?: string; minutes?: number; cron?: string; tz?: string } | undefined {
-  const s = raw.trim();
+  const s = raw.trim().replace(/"/g, "");
   if (!s) return undefined;
   const tokens = s.split(/\s+/);
   if (tokens.length === 1) {
     const t0 = tokens[0]!;
-    if (/^\d+$/.test(t0)) return { minutes: Number(t0) };
+    const mins = t0.match(/^(\d+)m?$/);
+    if (mins) return { minutes: Number(mins[1]!) };
     return { at: t0 };
   }
   if (tokens.length === 5) return { cron: tokens.join(" ") };
@@ -5229,7 +5233,8 @@ async function runChannelCommand(
           return { immediate: fence(`[!] ${r.error ?? "reschedule failed"}`) };
         return {
           immediate: fence(
-            `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(r.task)}, ` +
+            `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(t)} -> ` +
+              `${taskWhenLabel(r.task)}, ` +
               `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
           ),
         };
