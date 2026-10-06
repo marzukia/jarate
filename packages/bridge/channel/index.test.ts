@@ -8162,6 +8162,8 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   const waitOpShutdown = () => new Promise((r) => setTimeout(r, 1100));
 
   beforeEach(() => {
+    clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+    resetRuntimeStateForTest(); // sessionStartTs/held/verbose: no leaks
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "op-test-"));
     oldHome = process.env.HOME || "";
     home = path.join(tmp, "home");
