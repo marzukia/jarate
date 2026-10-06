@@ -2,15 +2,31 @@
 # jarate-bg — one-shot pi agent on a role profile (no Discord presence)
 # profiles: worker (131k ctx, medium thinking) | reviewer (131k ctx, xhigh thinking)
 #
-# LAUNCH FORM (issue #144): NOHUP IS REQUIRED. The launcher is the ticket's
-# supervisor by design (execs the pi child, waits for the WHOLE run, posts
-# the callback, then exits), so a foreground caller holds the launcher's
-# pipes for the run's full duration. A foreground launch (SIGHUP not
-# ignored) is an explicit error: ticket line + stderr error + exit 4,
-# sub-second, before any run record or heartbeat.
+# LAUNCH FORM (issue #144 + #145): NOHUP IS THE RECOMMENDED FORM. The
+# launcher is the ticket's supervisor by design (execs the pi child, waits
+# for the WHOLE run, posts the callback, then exits), so a foreground
+# caller holds the launcher's pipes for the run's full duration. Shapes:
+#   - nohup (SIGHUP SIG_IGN): the blessed form below - runs inline
+#     (unchanged topology; nobody is waiting on it anyway).
+#   - attached foreground (a shell blocks on us, SIGHUP default): the
+#     guard THROWS by default - ticket line + stderr error + exit 4,
+#     sub-second, before any run record or heartbeat.
+#     PI_BG_FOREGROUND_GUARD=warn downgrades to a loud warning; the run
+#     then continues DETACHED (daemonized after registration, below).
+#     PI_BG_ALLOW_FOREGROUND=1 (internal callers + tests) skips the
+#     guard; the run also continues DETACHED.
+#   - detached non-nohup (cron, systemd, job-control shells): the guard
+#     never fires (the caller does not block); the launcher DAEMONIZES
+#     after registration: ticket line + run record + heartbeat first, then
+#     the run phase re-execs in a detached child (own session, reparented
+#     to systemd) and the launcher exits 0 within seconds. The callback
+#     still fires on completion; output lands in
+#     $PI_BG_TMPDIR/pi-bg-<id>-launcher.log.
+# Blessed form (stays documented and recommended):
 #   cd <workdir> && printf '%s' "$task" | nohup jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] - \
 #     > log 2>&1 & sleep 4; head -1 log
 # Bypass: PI_BG_ALLOW_FOREGROUND=1 (internal callers + tests only).
+# Daemonize off: PI_BG_DAEMONIZE=0 (tests pin the legacy inline topology).
 #
 # usage: cd <workdir> && nohup jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task" > log 2>&1 &
 #        the task can also ride stdin (agent-say marker form, keeps it out of
@@ -181,6 +197,48 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   exit 0
 fi
 
+# --- attachment detection (issue #145) ------------------------------------
+# "Attached" = a parent will WAIT on this process: the 2026-10-04 harness
+# shape, where a non-interactive shell runs us as a foreground pipeline
+# member and blocks its tool call for the run's full duration.
+# Computed in the FIRST process only (before the setsid re-exec below, which
+# makes us a session + process-group leader and erases the shape), then
+# exported so re-exec'd, snapshot and daemon processes inherit one verdict.
+#
+#   attached = SIGHUP at default disposition (not nohup) AND our PGrp ==
+#   the parent's PGrp (we are a plain member of the parent's group)
+#
+#   - nohup: SIGHUP SIG_IGN set by nohup(1) -> never attached
+#   - cron / systemd: they create a new process group (and usually session)
+#     for the job -> we are a group leader -> never attached
+#   - job-control shells (interactive runs, `cmd &` jobs): each job gets
+#     its own process group -> we are a group leader -> never attached
+#   - non-interactive `bash -c 'cmd'` without job control: shared group
+#     -> attached (the incident shape)
+# /proc unreadable or the parent already gone -> not attached (fail open:
+# the guard must never break dispatch on an exotic box).
+# pgrp source: /proc/<pid>/stat field 5 ("pid (comm) state ppid pgrp
+# session ...") - /proc/<pid>/status has no plain pgrp line on modern
+# kernels (only namespaced NSpgid). Strip through the LAST ") " (comm may
+# itself contain parens; nothing after state ever does) and take fields.
+# Read /proc/$$/stat, NOT /proc/self/stat: the reader is the sed child of
+# this process-substitution, whose own stat would report THIS wrapper as
+# its parent (off by one level - the first bug caught in smoke).
+if [ "${PI_BG_SETSID:-0}" != "1" ]; then
+  _att=0
+  if [ -z "$(trap -p HUP 2>/dev/null)" ] && [ -r "/proc/$$/stat" ]; then
+    read -r _st _ppid _pgid _ < <(sed 's/^.*) //' "/proc/$$/stat" 2>/dev/null) || true
+    if [ -n "${_ppid:-}" ] && [ -n "${_pgid:-}" ] && [ "$_ppid" != "$$" ] \
+       && [ -r "/proc/$_ppid/stat" ]; then
+      read -r _st_p _ppid_p _pgid_p _ < <(sed 's/^.*) //' "/proc/$_ppid/stat" 2>/dev/null) || true
+      [ -n "${_pgid_p:-}" ] && [ "$_pgid_p" = "$_pgid" ] && _att=1
+    fi
+  fi
+  PI_BG_ATTACHED="$_att"
+  export PI_BG_ATTACHED
+  unset _st _ppid _pgid _ _st_p _ppid_p _pgid_p _att
+fi
+
 # --- session isolation (issue #56): own session + PGID via setsid -------
 # Re-exec ONCE under setsid: this process becomes a new session leader and
 # process-group leader; the pi child inherits both. A signal aimed at the
@@ -336,6 +394,19 @@ export PI_SESSION_ID="pi-${USER:-$(id -un)}-${profile}-${run_id}"
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
 
+# --- issue #145 (fix 1): daemon child detaches its stdout/stderr from the
+#     caller's pipes BEFORE it forks anything else - the ticket-creation
+#     heartbeat child (below) would otherwise hold the caller's pipe open
+#     for the whole run, and the caller's EOF would lag to run end: the
+#     exact block this fix removes. The fork line passes the same log, so
+#     this exec is a belt (a child re-launched by any other path still
+#     lands in the per-run launcher log). Everything from here on lands in
+#     the per-run launcher log; raw.out, out.md, webdrop and the webhook
+#     are unchanged.
+if [ "${PI_BG_DAEMON:-0}" = "1" ]; then
+  exec >>"$BG_TMP/pi-bg-${run_id}-launcher.log" 2>&1
+fi
+
 # --- foreground-launch guard (issue #144): nohup is the required form ---
 # The launcher is the ticket's SUPERVISOR by design: it execs the pi
 # child, waits for the WHOLE run, posts the completion callback, and
@@ -364,13 +435,34 @@ mkdir -p "$BG_TMP" 2>/dev/null
 # bypass). May be set by INTERNAL callers only - jarate-bg's own tests and
 # code that launches it attached on purpose. Operator dispatches use
 # the nohup form.
-if [ "${PI_BG_ALLOW_FOREGROUND:-}" != "1" ] && [ -z "$(trap -p HUP)" ]; then
-  echo "[pi-bg] ticket $run_id profile=$profile" 2>/dev/null || true
-  {
-    echo "jarate-bg: ERROR: foreground launch detected (issue #144). Use the nohup form:"
-    echo "  cd <workdir> && printf '%s' \"\$task\" | nohup jarate-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
-  } >&2
-  exit 4
+# --- foreground-launch guard (issue #144, refined by #145) -----------------
+# #144 threw on ANY SIGHUP-default launch. #145 narrows it to the shape
+# that actually blocks a caller (attached, above): cron / systemd /
+# job-control launches are SIGHUP-default but do NOT wait on us - they
+# must pass (and they daemonize below instead of running inline).
+_hup_ign=0
+[ -n "$(trap -p HUP 2>/dev/null)" ] && _hup_ign=1
+if [ "$_hup_ign" -eq 0 ] && [ "${PI_BG_ATTACHED:-0}" = "1" ] \
+   && [ "${PI_BG_ALLOW_FOREGROUND:-}" != "1" ] && [ "${PI_BG_DAEMON:-0}" != "1" ]; then
+  case "${PI_BG_FOREGROUND_GUARD:-throw}" in
+    warn)
+      # loud warning + continue: the run proceeds DETACHED (daemonized
+      # after registration below)
+      {
+        echo "jarate-bg: WARNING: foreground launch detected (issue #144) - continuing DETACHED (daemonized, issue #145). Use the nohup form:"
+        echo "  cd <workdir> && printf '%s' \"\$task\" | nohup jarate-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
+      } >&2
+      ;;
+    *)
+      echo "[pi-bg] ticket $run_id profile=$profile" 2>/dev/null || true
+      {
+        echo "jarate-bg: ERROR: foreground launch detected (issue #144). Use the nohup form:"
+        echo "  cd <workdir> && printf '%s' \"\$task\" | nohup jarate-bg $profile ... - >$BG_TMP/pi-bg-$run_id-launch.log 2>&1 &"
+        echo "  (internal callers: PI_BG_ALLOW_FOREGROUND=1 - runs detached, returns in seconds; issue #145)"
+      } >&2
+      exit 4
+      ;;
+  esac
 fi
 
 # --- concurrency cap (issue #41): refuse to start when this user already
@@ -480,7 +572,8 @@ if [ -n "$webhook" ]; then
   delivery="webhook"
 else
   delivery="none"
-  echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with jarate-wait" >&2
+  # the daemon child re-runs this block; the parent already warned the caller
+  [ "${PI_BG_DAEMON:-0}" != "1" ] && echo "[pi-bg] no webhook at ${HOME}/.config/pi-dispatch/webhook (and PI_DISPATCH_WEBHOOK unset) - no completion callback; poll with jarate-wait" >&2
 fi
 # --- per-command bash tool timeout (issue #142) ---------------------------
 # A wedged tool call (20261004-140606-286112: ssh -> docker exec -i held
@@ -889,7 +982,8 @@ if [ "$wt_mode" -eq 1 ]; then
     wt_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null)"
     [ -n "$wt_branch" ] || wt_branch="pi-bg/$run_id"
     wt_repo="$(basename "$top")"
-    echo "[pi-bg] worktree reused: $wt_path (branch $wt_branch, issue #110) - kept after run" 2>/dev/null || true
+    # the daemon child re-runs this block; the parent already printed the banner
+    [ "${PI_BG_DAEMON:-0}" != "1" ] && echo "[pi-bg] worktree reused: $wt_path (branch $wt_branch, issue #110) - kept after run" 2>/dev/null || true
   else
     ref="${wt_ref:-HEAD}"
     top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
@@ -901,12 +995,16 @@ if [ "$wt_mode" -eq 1 ]; then
     wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
     wt_branch="pi-bg/$id"
     wt_repo="$(basename "$top")"
-    if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
+    # issue #145 (fix 1): the daemon child re-runs this block; the parent
+    # already added the worktree (same run id -> same path + branch), so an
+    # existing gitdir is success, not launch-fail
+    if [ ! -e "$wt_path/.git" ] && ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
       echo "jarate-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
       bg_launch_fail "launch-fail: worktree add failed ref=$ref" \
         "launch-fail: worktree add failed ref=$ref (ref must be a branch/tag/commit, NOT a folder name)"
     fi
-    echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
+    # the daemon child re-runs this block; the parent already printed the banner
+    [ "${PI_BG_DAEMON:-0}" != "1" ] && echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
   fi
   # wt path + branch on the run record (audit; the #110 retry section
   # resolves a dead ticket's worktree from here). Audit-only: a missing
@@ -949,10 +1047,11 @@ if mkdir -p "$ESCAPE_CG" 2>/dev/null && echo $$ > "$ESCAPE_CG/cgroup.procs" 2>/d
   # stays in the caller cgroup: the trap reaps it with the wrapper, and a
   # SIGKILLed wrapper leaves it to self-terminate on its next tick.
   [ -n "${hb_pid:-}" ] && echo "$hb_pid" >> "$ESCAPE_CG/cgroup.procs" 2>/dev/null
-  echo "[pi-bg] cgroup escape active: $ESCAPE_CG" 2>/dev/null || true
+  # the daemon child re-runs this block; the parent already printed the banner
+  [ "${PI_BG_DAEMON:-0}" != "1" ] && echo "[pi-bg] cgroup escape active: $ESCAPE_CG" 2>/dev/null || true
 else
   rmdir "$ESCAPE_CG" 2>/dev/null
-  echo "[pi-bg] cgroup escape unavailable, running in caller cgroup" 2>/dev/null || true
+  [ "${PI_BG_DAEMON:-0}" != "1" ] && echo "[pi-bg] cgroup escape unavailable, running in caller cgroup" 2>/dev/null || true
 fi
 
 # (issue #101: webhook resolution + run record + early heartbeat moved up
@@ -1107,6 +1206,18 @@ bg_on_exit() {
     wait "$hb_pid" 2>/dev/null
     hb_pid=""
   fi
+  # issue #145 (fix 1): daemonized parent - the daemon child owns the run
+  # record, heartbeat file, cgroup dir, started marker, prompt file and
+  # raw.out (its own bg_on_exit finalizes them). Deliberately NOT here:
+  # record marking, hb/started/prompt removal, cgroup drain (the child is
+  # a member), and the per-run snapshot dir (the child re-execs from that
+  # path - deleting it here would race the child's setsid re-exec); the
+  # child drops it in its own bg_on_exit via PI_BG_SNAP_DIR. The parent's
+  # rc is 0 and says nothing about the ticket's outcome; the ticket's rc
+  # lives in pi-bg-<id>-rc + the callback, exactly like the nohup form.
+  if [ "${BG_DAEMONIZED:-0}" = "1" ]; then
+    return
+  fi
   # run record: terminal state (issue #51). Written BEFORE the cgroup drain
   # on purpose: jarate-bg-kill only finalizes "killed" after the drain confirms
   # empty, so "done" is guaranteed first and an operator kill ends up
@@ -1171,6 +1282,9 @@ bg_on_exit() {
   # deploy-swap guard: drop the per-run script snapshot (a hard link to the
   # startup inode; git already replaced the checkout path)
   [ -n "${SNAP_DIR:-}" ] && rm -rf "$SNAP_DIR" 2>/dev/null || true
+  # issue #145 (fix 1): daemon child drops the PARENT's snapshot dir (the
+  # child re-execs from that path; the parent's light exit must not race it)
+  [ -n "${PI_BG_SNAP_DIR:-}" ] && rm -rf "$PI_BG_SNAP_DIR" 2>/dev/null || true
   # session prune (2026-09-23; default flipped to KEEP 2026-09-25 after a
   # prune deleted live billing data): when opted in (PI_BG_PRUNE_SESSIONS=1)
   # drop this run's own session transcript so worker/reviewer .jsonl files
@@ -1231,6 +1345,37 @@ bg_prune_session() {
 trap bg_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# --- issue #145 (fix 1): daemonize after registration ---------------------
+# This process has finished ticket registration: ticket line printed, run
+# record state=running, heartbeat file + child, worktree added, cgroup
+# escaped, exit traps armed. Every HUP-default shape that reached here
+# would otherwise make the CALLER wait for the whole run (2026-10-04
+# incident: a foreground tool call blocked 189.2s). The nohup form runs
+# inline (unchanged topology); every HUP-default shape re-execs the run
+# phase in a detached child and exits 0 within seconds:
+#   - the child gets its own session (its top-of-script setsid re-exec,
+#     PI_BG_SETSID cleared for it) and is reparented to systemd when we
+#     exit - a caller timeout/abort can no longer block the run
+#   - the child re-runs registration (cap, record, worktree add, cgroup)
+#     - all idempotent by run_id - then runs the pi loop + callback itself
+#   - the child's stdout/stderr detach to pi-bg-<id>-launcher.log (above),
+#     so the caller's pipes get EOF at OUR exit, not at run end
+# Artifacts (run record, hb, cgroup, out.md, rc, webhook) are the same
+# files the inline form writes: jarate-bg-tail/kill/watchdog see the
+# ticket either way.
+if [ "${PI_BG_DAEMON:-0}" = "1" ]; then
+  : # we ARE the daemon child - run the pi loop inline (below)
+elif [ "${PI_BG_DAEMONIZE:-1}" != "0" ] && [ "$_hup_ign" -eq 0 ]; then
+  BG_DAEMONIZED=1
+  PI_BG_DAEMON=1 PI_BG_SNAP=1 PI_BG_RUN_ID="$run_id" PI_BG_SETSID= \
+    PI_BG_SNAP_DIR="${SNAP_DIR:-}" \
+    bash -c 'exec >>"$0" 2>&1; exec bash "$1" "${@:2}"' \
+      "$BG_TMP/pi-bg-${run_id}-launcher.log" "$0" \
+      "${PI_BG_ORIG_ARGS[@]+"${PI_BG_ORIG_ARGS[@]}"}" &
+  echo "[pi-bg] daemonized: ticket $run_id continues detached; output -> $BG_TMP/pi-bg-${run_id}-launcher.log" 2>/dev/null || true
+  exit 0
+fi
 
 # retry on empty completion (local model quirk: some phrasings return nothing)
 # pi runs in background + wait so a trapped TERM/INT fires immediately
