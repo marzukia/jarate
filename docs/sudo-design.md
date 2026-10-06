@@ -57,7 +57,7 @@ What exists today:
 Gaps that `jarate sudo` closes:
 
 1. **Two steps, id in the agent's head.** `vault-run` on a pending id
-   returns `state: pending (awaiting approval)` (`vault.ts:1196`). The
+   returns `state: pending (awaiting approval)` (`vault.ts:1197`). The
    agent must remember the id and re-run to poll; each re-run gets the
    same error back until the tap lands. Zero-inference wants one command
    that blocks on the tap.
@@ -165,7 +165,7 @@ agent:    jarate sudo --ttl=10m "stop qemu-nf-hr-r1" -- systemctl stop qemu-nf-h
   connection open through the done-wait (`vault.ts:1559-1598`); the same
   mechanism holds the reply while state is `pending`. A waiter registry
   `id -> {socket, reply, deadline}` is woken by the approve tap
-  (`vault.ts:1438` region), the deny tap, `settleTtl` (`vault.ts:664`),
+  (`vault.ts:1734` region), the deny tap, `settleTtl` (`vault.ts:664`),
   and revoke. The wrapper extends its reply timeout to `wait_ms + margin`
   (today 15 s, `bin/jarate-vault:52`).
 - No polling anywhere: the bridge pushes the settle over the socket.
@@ -372,11 +372,11 @@ Remaining:
 
 | file | role |
 |---|---|
-| `packages/bridge/channel/vault.ts` | state machine + socket server. PR 2: `ttlMs` on the record (`:94`, `:945`, `:1788`); per-request `--wait` deadline (`:2011` default, `:664` `settleTtl`); `vsudo` op + waiter registry (server loop `:1544-1559`; `vaultRunBegin` pending path `:1196`; approve tap `:1438`); reattach (pending scan `:1054`); `sudo-status` over `vstatus` agent filter (`:1401`); new audit events (`:214`). |
+| `packages/bridge/channel/vault.ts` | state machine + socket server. PR 2: `ttlMs` on the record (`:94`, `:945`, `:1788`); per-request `--wait` deadline (`:2011` default, `:664` `settleTtl`); `vsudo` op + waiter registry (server loop `:1544-1559`; `vaultRunBegin` pending path `:1196`; approve tap `:1782`); reattach (pending scan `:1054`); `sudo-status` over `vstatus` agent filter (`:1401`); new audit events (`:214`). |
 | `bin/jarate-vault` | bun wrapper (the only process that sees the value besides bridge + child). PR 2/3: `sudo` + `sudo-status` subcommands (request+run session; `cmdRun` `:397`; reply timeout `:52` extended by wait_ms); SSHPASS as the password-kind envvar for the sudo child; re-run command in error docs. |
-| `bin/jarate` | bash dispatch. PR 3: `sudo` / `sudo-status` forwarding (vault dispatch pattern `:1708`, `:1762`); hop target + password source for the child pipeline (`:107`, `:385`); the `run_remote_probe` shape (`:383`) becomes the sudo child. |
+| `bin/jarate` | bash dispatch. PR 3: `sudo` / `sudo-status` forwarding (run-raw dispatch pattern `:1708` (pat), `:1762` (vault)); hop target + password source for the child pipeline (`:107`, `:385`); the `run_remote_probe` shape (`:383`) becomes the sudo child. |
 | `install.sh` | PR 3: sudo-pass -> known-store migration (idempotent, `--dry-run` clean; link section `:180`). |
-| `docs/NEW-AGENT.md` | PR 3: sudo-pass convention note (`:29-31`) -> vault known store; `chpasswd` deprecation (`:27`). |
+| `docs/NEW-AGENT.md` | PR 3: sudo-pass convention note (`:31-33`) -> vault known store; `chpasswd` deprecation (`:27`). |
 | `packages/bridge/channel/vault.test.ts` | bridge tests: vsudo approve / deny / wait-expire / reattach / reuse / restart (fake Discord, fake clock, real sockets in mkdtemp - existing harness). |
 | `bin/jarate-vault.test.ts` | wrapper tests: fake vault server, child env/cmdline capture (existing harness); ps-sweep test for the value. |
 
