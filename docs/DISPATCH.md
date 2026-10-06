@@ -318,6 +318,37 @@ re-post note and the letter is deleted (exactly-once). Failure: the letter
 is kept for the next sweep. No lock: one 15-min timer per box; a double
 sweep double-posts at most.
 
+### Mid-run events (watchdog + `jarate-bg signal`, issue #143)
+
+The 2026-10-04/05 incident: an operator killed a wedged grandchild of a
+dispatched worker by hand, then had to POLL (sleep + tail of the session
+jsonl) to verify the run resumed - there was no event for the kill.
+
+- **Watchdog** (every sweep): for live runs (`state=running` + `is_live`)
+  the cgroup membership and the session jsonl mtime are diffed against the
+  last-seen baseline stored in the run record (`cgPids` + `sessMtime`,
+  refreshed every sweep; first sight = baseline only). A baseline pid gone
+  from the cgroup emits one `CHILD-LEFT`; the session jsonl advancing
+  emits one `SESS-WRITE`. Additive status: no state change, no kill -
+  never DEAD/HUNG/retry. Dedupe per ticket per class per UTC day in the
+  dead log (class prefix in the reason field); `already_dead` (the
+  DEAD/STALLED dedupe) ignores event lines, so an event today cannot
+  suppress a real death later today. Emission: stdout line + dead-log line
+  (always, even `--quiet`) + webhook post (non-quiet: embed-only, author
+  `pi-bg ticket · <t>` so the bridge exemption wakes the channel; green =
+  the run is ALIVE). `--dry-run`: would-emit lines, no state. A change
+  that happens AND reverts between two sweeps is missed (15-min timer).
+- **`jarate-bg signal <run-id> <TERM|KILL> [--dry-run]`**: perform the
+  intervention instead of by hand - per-pid signal on the run's cgroup
+  tree (same enumeration as jarate-bg-kill; NEVER the process group, that
+  is a whole-run kill) + the receipt on the same event path: stdout line +
+  dead-log line (class `signal`) + webhook post. Bounded confirm
+  (`PI_BG_SIGNAL_WAIT`, default 3s): the receipt says `all signaled
+  members gone` (rc 0) or `still alive: <pids>` (rc 3) - the orchestrator
+  reads it, no re-look. Short-id resolution like jarate-bg-kill. The
+  watchdog's CHILD-LEFT (separate class, both may fire the same day)
+  confirms the departure on the next sweep.
+
 ### AGENTS.md drift tripwire (watchdog, alert-only)
 
 `~/.pi/agent/AGENTS.md` is prompt-level law: changes require the operator's

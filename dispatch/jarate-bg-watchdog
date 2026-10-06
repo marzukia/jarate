@@ -82,6 +82,24 @@
 #       letter deleted (exactly-once). Failure: letter kept for the next
 #       sweep. No lock (one 15-min timer per box; a double sweep
 #       double-posts at most).
+#   4g. Mid-run events (issue #143): for live (state=running + is_live)
+#       runs, diff the cgroup membership and the session jsonl mtime
+#       against the last-seen baseline stored in the run record
+#       (cgPids + sessMtime, refreshed every sweep). A baseline pid gone
+#       from the cgroup (an external kill of a wedged child - the
+#       after-intervention case #142's HUNG does not see) emits one
+#       CHILD-LEFT; the session jsonl advancing (pi wrote again after
+#       quiet) emits one SESS-WRITE. ADDITIVE status: no state change,
+#       no kill - never DEAD/HUNG/retry. Dedupe per ticket per class per
+#       UTC day in the dead log (class prefix in the reason field);
+#       already_dead (the DEAD/STALLED dedupe) ignores event lines, so
+#       an event today cannot suppress a real death later today.
+#       Emission: stdout line + dead-log line (always, even --quiet) +
+#       webhook post (non-quiet: embed-only, author "pi-bg ticket · <t>"
+#       so the bridge exemption wakes the channel; green = the run is
+#       ALIVE). --dry-run: would-emit lines, no record/dead-log changes.
+#       Caveat: a change that happens AND reverts between two sweeps is
+#       missed (15-min timer) - the event is the next-sweep view.
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -209,10 +227,14 @@ is_live() {
   return 1
 }
 
-# dedupe: already logged as dead on <today>
+# dedupe: already logged as dead on <today>. Mid-run event lines (issue
+# #143: "child-left:" / "sess-write:" / "signal:" class prefix in the
+# reason field) are status for a LIVE run and must not suppress the
+# DEAD/STALLED flag for the same ticket later the same day.
 already_dead() {
   local t="$1"
-  grep -q "^${today} ${t} " "$DEADLOG" 2>/dev/null
+  grep "^${today} ${t} " "$DEADLOG" 2>/dev/null |
+    grep -qv -E ' (child-left|sess-write|signal): '
 }
 
 # rule-3 lookups: persistent dir first, legacy /tmp for pre-upgrade runs
@@ -1167,6 +1189,203 @@ PY
 fi
 [ "$hung_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $hung_found hung ticket(s)"
 
+# ─── mid-run events (issue #143): external child-death + session writes ────
+# #142's HUNG covers the NO-intervention case (alive tree, quiet session).
+# This section covers the AFTER-intervention case: a run whose cgroup
+# membership CHANGED since the last sweep (a child died or moved out -
+# e.g. an operator kill of a wedged grandchild) or whose session jsonl
+# mtime advanced (pi wrote again - the run resumed). ADDITIVE status
+# lines, not a run class: they never touch state and never kill, and a
+# child-death event on a still-running run must NOT trigger
+# DEAD/HUNG/retry (the lister is state=running + is_live only).
+# See header 4g for the full contract.
+
+# already_event <ticket> <class>: the class line for this ticket is
+# already in today's dead log (issue #143 dedupe, per ticket per class
+# per UTC day - house style, same file as DEAD/STALLED).
+already_event() {
+  grep -qE "^${today} $1 [^ ]+ [^ ]+ ${2}: " "$DEADLOG" 2>/dev/null
+}
+
+# wd_rec_evt <ticket>: the current event baseline from the run record,
+# \x1f-separated "<pids-comma>\x1f<mtime-or->". No line when the record
+# is missing/corrupt (first sight - the caller baselines, no event).
+wd_rec_evt() {
+  python3 - "${rec_dir}/pi-bg-${1}.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    rec = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+pids = rec.get("cgPids") or []
+mt = rec.get("sessMtime")
+print(",".join(str(p) for p in pids) + "\x1f" + (str(mt) if mt is not None else "-"))
+PY
+}
+
+# wd_rec_evt_set <ticket> <pids-comma|-> <mtime|->: refresh the baseline
+# to the just-observed state (every sweep, event emitted or not - the
+# next diff is against the new state; the dead log is the dedupe, this
+# is only the diff memory).
+wd_rec_evt_set() {
+  local t="$1" pids="$2" mt="$3"
+  PI_BG_EV_PIDS="${pids}" PI_BG_EV_MTIME="${mt}" \
+  python3 - "${rec_dir}/pi-bg-${t}.json" <<'PY' 2>/dev/null || true
+import json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+pids = os.environ.get("PI_BG_EV_PIDS") or "-"
+rec["cgPids"] = ([int(x) for x in pids.split(",") if x.strip()]
+                 if pids != "-" else [])
+mt = os.environ.get("PI_BG_EV_MTIME") or "-"
+rec["sessMtime"] = int(mt) if mt.isdigit() else None
+json.dump(rec, open(p, "w"), indent=2)
+PY
+}
+
+# wd_build_event <body-file> <ticket> <repo> <class> <what> <detail> <at>
+# Status embed for a mid-run event (issue #143): same frame shape +
+# 40-col mobile budget as wd_build/wd_build_hung. Green (3066993): the
+# run is ALIVE and this is information, not an alarm (DEAD is orange,
+# HUNG/STALLED red).
+wd_build_event() {
+  local bodyfile="$1" t="$2" repo="$3" cls="$4" what="$5" detail="$6" at="$7"
+  WD_E_T="$t" WD_E_REPO="$repo" WD_E_CLS="$cls" WD_E_WHAT="$what" \
+  WD_E_DETAIL="$detail" WD_E_AT="$at" python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("WD_E_" + k, "")
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
+VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def kv(key, val):
+    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
+t = E('T')
+lines = ["\u250c " + E('CLS') + " \u00b7 " + t,
+         "\u251c $ jarate-bg-watchdog sweep",
+         kv("repo", E('REPO')),
+         kv("what", E('WHAT')),
+         kv("detail", E('DETAIL')),
+         kv("at", E('AT')),
+         "\u2514"]
+embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
+         "color": 3066993,
+         "title": E('CLS').upper() + " \u00b7 " + t,
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg watchdog (event)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+}
+
+ev_found=0
+if [ -d "$rec_dir" ]; then
+  while IFS=$'\t' read -r rt rprof rcwd rstart; do
+    [ -n "$rt" ] || continue
+    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    # worktree run? (same lookup as the HUNG sweep: liveness + pi cwd +
+    # repo name); a dead run is skipped - the DIED paths own it
+    wt=""; repo="cwd"
+    for cand in "$WT_DIR"/*/"$rt"; do
+      if [ -d "$cand" ]; then wt="$cand"; repo="$(basename "$(dirname "$cand")")"; break; fi
+    done
+    is_live "$rt" "$wt" || continue
+    # current cgroup membership (the diff input; empty when the run has
+    # no escape cgroup - the cwd-fallback case, sess-write still works)
+    cur_pids="$(cg_members "$rt" | sort -un | tr '\n' ',' | sed 's/,$//')"
+    # current session jsonl mtime (same discovery as the HUNG sweep)
+    cur_mt=""
+    piscwd="$wt"; [ -n "$piscwd" ] || piscwd="$rcwd"
+    if [ -n "$piscwd" ] && [ -n "$rstart" ]; then
+      slug="--${piscwd#/}"; slug="${slug//\//-}--"
+      sd="$HOME/.pi/agent-${rprof}/sessions/$slug"
+      jf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$rstart" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+      [ -n "$jf" ] && cur_mt="$(stat -c %Y "$jf" 2>/dev/null)"
+    fi
+    # last-seen baseline (first sight = empty -> baseline only, no event)
+    ev_pids=""; ev_mt="-"
+    IFS=$'\x1f' read -r ev_pids ev_mt < <(wd_rec_evt "$rt") || true
+    case "$ev_mt" in '' | *[!0-9]*) ev_mt="-" ;; esac
+    ev_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # child-left: a baseline pid is gone from the cgroup since the last
+    # sweep (an external kill of a wedged child lands here - the
+    # after-intervention case #142's HUNG does not see). (out) = the pid
+    # is alive but moved to another cgroup (rare); unmarked = /proc gone.
+    left=""
+    if [ -n "$ev_pids" ]; then
+      for p in ${ev_pids//,/ }; do
+        case ",$cur_pids," in *",$p,"*) continue ;; esac
+        if [ -d "/proc/$p" ]; then
+          left="${left:+$left,}$p(out)"
+        else
+          left="${left:+$left,}$p"
+        fi
+      done
+    fi
+    if [ -n "$left" ] && ! already_event "$rt" "child-left"; then
+      if [ "$DRY" -eq 1 ]; then
+        echo "[pi-bg-watchdog] dry-run: would emit CHILD-LEFT $repo/$rt (pids $left left the cgroup)"
+      else
+        echo "[pi-bg-watchdog] CHILD-LEFT $repo/$rt (pids $left left the cgroup; at $ev_ts)"
+        printf '%s %s %s %s %s\n' "$today" "$rt" "$repo" "$ev_ts" "child-left: pids $left left cgroup" >> "$DEADLOG"
+        if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
+          bodyf="$BG_TMP/pi-bg-watchdog-event-body.json"
+          wd_build_event "$bodyf" "$rt" "$repo" "child-left" "child left the run cgroup" "pids $left" "$ev_ts"
+          if [ -s "$bodyf" ]; then
+            wd_post "$bodyf" || echo "[pi-bg-watchdog] CHILD-LEFT post failed for $rt (dead log still updated)" >&2
+          fi
+          rm -f "$bodyf"
+        fi
+        ev_found=$((ev_found + 1))
+      fi
+    fi
+    # sess-write: the session jsonl advanced since the last sweep (pi
+    # wrote again - the "it resumed" verification after a kill)
+    if [ "$ev_mt" != "-" ] && [ -n "$cur_mt" ] && [ "$cur_mt" -gt "$ev_mt" ] \
+      && ! already_event "$rt" "sess-write"; then
+      prev="$(date -u -d "@$ev_mt" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || prev="unknown"
+      if [ "$DRY" -eq 1 ]; then
+        echo "[pi-bg-watchdog] dry-run: would emit SESS-WRITE $repo/$rt (session jsonl wrote)"
+      else
+        echo "[pi-bg-watchdog] SESS-WRITE $repo/$rt (session jsonl wrote at $ev_ts; was $prev)"
+        printf '%s %s %s %s %s\n' "$today" "$rt" "$repo" "$ev_ts" "sess-write: session jsonl wrote (was $prev)" >> "$DEADLOG"
+        if [ "$QUIET" -eq 0 ] && [ -n "$webhook" ]; then
+          bodyf="$BG_TMP/pi-bg-watchdog-event-body.json"
+          wd_build_event "$bodyf" "$rt" "$repo" "sess-write" "session jsonl wrote" "was $prev" "$ev_ts"
+          if [ -s "$bodyf" ]; then
+            wd_post "$bodyf" || echo "[pi-bg-watchdog] SESS-WRITE post failed for $rt (dead log still updated)" >&2
+          fi
+          rm -f "$bodyf"
+        fi
+        ev_found=$((ev_found + 1))
+      fi
+    fi
+    # refresh the baseline to the just-observed state (every sweep: the
+    # next diff is against now; dry-run changes nothing)
+    [ "$DRY" -eq 0 ] && wd_rec_evt_set "$rt" "${cur_pids:--}" "${cur_mt:--}"
+  done < <(python3 - "$rec_dir" <<'PY' 2>/dev/null
+import glob, json, os, sys
+d = sys.argv[1]
+for f in sorted(glob.glob(os.path.join(d, "pi-bg-*.json"))):
+    try:
+        rec = json.load(open(f))
+    except Exception:
+        continue
+    if rec.get("state") != "running":
+        continue
+    run = str(rec.get("run") or "")
+    if not run:
+        continue
+    print(f"{run}\t{rec.get('profile') or 'worker'}\t{rec.get('cwd') or ''}\t{rec.get('started') or ''}")
+PY
+  )
+fi
+[ "$ev_found" -gt 0 ] && echo "[pi-bg-watchdog] emitted $ev_found mid-run event(s) (issue #143)"
+
 # ─── empty cgroup reaper (2026-09-14, issue: pi-bg cgroup-dir leak) ─────────
 # A ticket dir that holds no process is a leak: a live run always keeps at
 # least the wrapper shell in its escape cgroup. Untrappable deaths (bun
@@ -1493,5 +1712,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0

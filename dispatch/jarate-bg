@@ -29,6 +29,12 @@
 # Daemonize off: PI_BG_DAEMONIZE=0 (tests pin the legacy inline topology).
 #
 # usage: cd <workdir> && nohup jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "task" > log 2>&1 &
+#        jarate-bg signal <run-id> <TERM|KILL> [--dry-run]
+#          signal the run's cgroup tree (per-pid, never the process group -
+#          that is jarate-bg-kill) and emit the receipt: stdout line +
+#          dead-log line + webhook post (issue #143, same event path as the
+#          watchdog's mid-run events). rc 0 = all signaled members gone,
+#          3 = still alive after PI_BG_SIGNAL_WAIT, 2 = usage/unknown.
 #        the task can also ride stdin (agent-say marker form, keeps it out of
 #        argv for the whole run - issue #118):
 #        cd <workdir> && printf '%s' "$task" | nohup jarate-bg worker - > log 2>&1 &
@@ -237,6 +243,211 @@ if [ "${PI_BG_SETSID:-0}" != "1" ]; then
   PI_BG_ATTACHED="$_att"
   export PI_BG_ATTACHED
   unset _st _ppid _pgid _ _st_p _ppid_p _pgid_p _att
+fi
+
+# --- signal subcommand (issue #143): mid-run intervention + receipt -------
+# The incident (2026-10-04/05): an operator killed a wedged grandchild of a
+# dispatched worker by hand, then POLLED (sleep + tail of the session
+# jsonl) to verify the run resumed - nothing reported the kill. This
+# subcommand performs the signal on the run's cgroup tree (same
+# enumeration as jarate-bg-kill) AND emits the receipt on the same event
+# path as the watchdog's mid-run events: a stdout line + a dead-log line
+# (class "signal" - already_dead ignores it, so a later real death is not
+# suppressed) + a webhook post (embed-only, author "pi-bg ticket · <t>"
+# so the bridge exemption wakes the channel; green = the run is alive).
+# The watchdog's CHILD-LEFT event (a separate class; both may fire the
+# same day) confirms the departure on the next sweep.
+# Per-pid signals ONLY, never the process group: the whole run shares one
+# session (setsid, issue #56) - a group signal is a whole-run kill (that
+# is jarate-bg-kill). The receipt is best-effort over the webhook: the
+# dead-log line is the durable receipt, the run keeps running, and its
+# own callback still wakes the orchestrator.
+if [ "${1:-}" = "signal" ]; then
+  shift
+  sig_id="" sig_name="" sig_dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) sig_dry=1; shift ;;
+      -h|--help) echo "usage: jarate-bg signal <run-id> <TERM|KILL> [--dry-run]"; exit 0 ;;
+      -*) echo "jarate-bg signal: unknown arg: $1 (want <run-id> <TERM|KILL> [--dry-run])" >&2; exit 2 ;;
+      *)
+        if [ -z "$sig_id" ]; then sig_id="$1"
+        elif [ -z "$sig_name" ]; then sig_name="$1"
+        else echo "jarate-bg signal: unknown arg: $1 (want <run-id> <TERM|KILL> [--dry-run])" >&2; exit 2; fi
+        shift
+        ;;
+    esac
+  done
+  [ -n "$sig_id" ] && [ -n "$sig_name" ] || { echo "usage: jarate-bg signal <run-id> <TERM|KILL> [--dry-run]" >&2; exit 2; }
+  case "$sig_name" in
+    TERM | 15) sig_name="TERM" ;;
+    KILL | 9) sig_name="KILL" ;;
+    *) echo "jarate-bg signal: unknown signal '$sig_name' (want TERM or KILL)" >&2; exit 2 ;;
+  esac
+  sig_rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+  if ! [[ "$sig_id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+    # short id: same resolution as jarate-bg-kill (unique 7+ digit suffix
+    # in the record dir)
+    if [[ "$sig_id" =~ ^[0-9]{7,}$ ]]; then
+      sig_matches=()
+      for rf in "$sig_rec_dir"/pi-bg-*.json; do
+        [ -f "$rf" ] || continue
+        sig_base="${rf##*/}"; sig_base="${sig_base#pi-bg-}"; sig_base="${sig_base%.json}"
+        [[ "$sig_base" =~ ^[0-9]{8}-[0-9]{6}-([0-9]{7,})$ ]] || continue
+        [ "${BASH_REMATCH[1]}" = "$sig_id" ] && sig_matches+=("$sig_base")
+      done
+      case "${#sig_matches[@]}" in
+        1) echo "jarate-bg signal: short id $sig_id -> ${sig_matches[0]} (run record)" >&2; sig_id="${sig_matches[0]}" ;;
+        0) echo "jarate-bg signal: no run record in $sig_rec_dir matches short id '$sig_id' (want the full id, or a unique 7+ digit suffix)" >&2; exit 2 ;;
+        *) echo "jarate-bg signal: short id '$sig_id' is ambiguous, matches: ${sig_matches[*]} (use the full id)" >&2; exit 2 ;;
+      esac
+    else
+      echo "jarate-bg signal: '$sig_id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix)" >&2
+      exit 2
+    fi
+  fi
+  sig_cg="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg/$sig_id"
+  if [ ! -d "$sig_cg" ]; then
+    echo "jarate-bg signal: no cgroup for ticket '$sig_id' ($sig_cg missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
+    exit 2
+  fi
+  # tree enumeration (same shape as jarate-bg-kill): the cgroup members
+  # plus every descendant (a real cgroup v2 move carries the whole
+  # subtree; the /proc walk closes the escape-failed case)
+  sig_children_of() {
+    local want="$1" c s
+    for c in /proc/[0-9]*; do
+      IFS= read -r s 2>/dev/null < "$c/stat" || continue
+      s="${s#*) }"  # drop 'pid (comm)' - comm may contain spaces
+      [ "${s#* }" = "${s}" ] && continue
+      set -- $s
+      [ "$2" = "$want" ] && basename "$c"
+    done
+  }
+  sig_list_tree() {
+    local p d c queue=() next=()
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      echo "$p"
+      queue=("$p")
+      while [ "${#queue[@]}" -gt 0 ]; do
+        next=()
+        for d in "${queue[@]}"; do
+          for c in $(sig_children_of "$d"); do
+            echo "$c"
+            next+=("$c")
+          done
+        done
+        queue=("${next[@]+"${next[@]}"}")
+      done
+    done < <(cat "$sig_cg/cgroup.procs" 2>/dev/null | sort -un)
+  }
+  sig_pids="$(sig_list_tree | sort -un | tr '\n' ' ')"
+  sig_pids="${sig_pids% }"
+  if [ "$sig_dry" -eq 1 ]; then
+    echo "process tree for $sig_id (would be signaled $sig_name):"
+    for p in $sig_pids; do
+      ps -o pid=,ppid=,etime=,args= -p "$p" 2>/dev/null || echo "$p  (gone)"
+    done
+    echo "dry-run: no signal sent"
+    exit 0
+  fi
+  if [ -z "$sig_pids" ]; then
+    echo "jarate-bg signal: no live process in $sig_cg (empty cgroup - the run is not here)" >&2
+    exit 3
+  fi
+  for p in $sig_pids; do kill -"$sig_name" "$p" 2>/dev/null; done
+  # bounded confirm (house shape: the jarate-bg-kill drain poll, short):
+  # the receipt reports the RESULT - the orchestrator reads it, no
+  # re-look. /proc, not the cgroup file: a plain-file test root is not
+  # kernel-maintained.
+  sig_wait="${PI_BG_SIGNAL_WAIT:-3}"
+  case "$sig_wait" in '' | *[!0-9]*) sig_wait=3 ;; esac
+  [ "$sig_wait" -ge 1 ] || sig_wait=1
+  sig_t0="$(date +%s)"
+  sig_gone=0
+  sig_alive=""
+  while :; do
+    sig_alive=""
+    for p in $sig_pids; do
+      [ -d "/proc/$p" ] && sig_alive="${sig_alive:+$sig_alive }$p"
+    done
+    [ -z "$sig_alive" ] && { sig_gone=1; break; }
+    [ $(( $(date +%s) - sig_t0 )) -ge "$sig_wait" ] && break
+    sleep 0.5
+  done
+  sig_dur=$(( $(date +%s) - sig_t0 ))
+  if [ "$sig_gone" -eq 1 ]; then
+    sig_result="all signaled members gone after ${sig_dur}s"
+  else
+    sig_result="still alive after ${sig_dur}s: $sig_alive"
+  fi
+  # receipt: stdout + dead log (always) + webhook (best-effort)
+  sig_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  sig_repo="cwd"
+  sig_wt_dir="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
+  for cand in "$sig_wt_dir"/*/"$sig_id"; do
+    [ -d "$cand" ] && { sig_repo="$(basename "$(dirname "$cand")")"; break; }
+  done
+  echo "[pi-bg] signal $sig_name -> $sig_id: pids $sig_pids ($sig_result)"
+  printf '%s %s %s %s %s\n' \
+    "$(date -u +%Y-%m-%d)" "$sig_id" "$sig_repo" "$sig_ts" \
+    "signal: $sig_name sent to pids $sig_pids by $(id -un); $sig_result" \
+    >> "${HOME}/.pi-bg-deadlog" 2>/dev/null || true
+  sig_webhook="${PI_DISPATCH_WEBHOOK:-}"
+  if [ -z "$sig_webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
+    sig_webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
+  fi
+  if [ -n "$sig_webhook" ]; then
+    sig_tmp="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+    mkdir -p "$sig_tmp" 2>/dev/null
+    sig_bodyf="$sig_tmp/pi-bg-${sig_id}-signal-body.json"
+    SIG_E_T="$sig_id" SIG_E_REPO="$sig_repo" SIG_E_SIG="$sig_name" \
+    SIG_E_PIDS="$sig_pids" SIG_E_RESULT="$sig_result" SIG_E_AT="$sig_ts" \
+    python3 - > "$sig_bodyf" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("SIG_E_" + k, "")
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
+VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as the watchdog)
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def kv(key, val):
+    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
+t = E('T')
+lines = ["\u250c signal \u00b7 " + t,
+         "\u251c $ jarate-bg signal " + E('SIG'),
+         kv("repo", E('REPO')),
+         kv("what", "signal " + E('SIG') + " sent to the run cgroup tree"),
+         kv("detail", "pids " + E('PIDS')),
+         kv("result", E('RESULT')),
+         kv("at", E('AT')),
+         "\u2514"]
+embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
+         "color": 3066993,  # green: alive run, informational (issue #143)
+         "title": "SIGNAL \u00b7 " + t,
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg signal (issue #143)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"embeds": [embed]}, sys.stdout)
+PY
+    if [ -s "$sig_bodyf" ]; then
+      sig_code=000
+      for i in 1 2 3; do
+        sig_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$sig_webhook" \
+          -H 'Content-Type: application/json' --max-time 15 --data @"$sig_bodyf" 2>/dev/null)" || sig_code="000"
+        case "$sig_code" in 2*) break ;; esac
+        [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
+      done
+      case "$sig_code" in
+        2*) : ;;
+        *) echo "jarate-bg signal: webhook receipt FAILED (http=$sig_code) - dead log still updated" >&2 ;;
+      esac
+    fi
+    rm -f "$sig_bodyf"
+  fi
+  [ "$sig_gone" -eq 1 ] && exit 0
+  exit 3
 fi
 
 # --- session isolation (issue #56): own session + PGID via setsid -------
