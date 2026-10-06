@@ -64,12 +64,14 @@ import extension, {
   peerFwdSnapshotForTest,
   pendingAttachments,
   pendingInterrupts,
+  persistLivePlaceholders,
   popChannelQueuedInbound,
   prunePendingBatches,
   queuedAcks,
   queueMidTurnInbound,
   REPEAT_WARNING,
   RUN_FRAME_MAX_STEPS,
+  readLivePlaceholders,
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
@@ -87,6 +89,7 @@ import extension, {
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
   settleOpTick,
+  simulateProcessDeathForTest,
   stopAllCompactTicks,
   stopAllOpTicks,
   TODO_TOOL_DESCRIPTION,
@@ -10585,5 +10588,636 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     const f2 = loadRewakeQueue(rewakeDir(), "ch1");
     expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
     expect(f2.delivered).toContain("2000");
+  });
+});
+    });
+  });
+});
+
+// ── #84: stale placeholder settlement (all exit paths) ──────────────────
+//
+// A placeholder (working frame, SPEC B live text, [queued] ack, in-flight
+// interrupt, compact line) must reach a terminal state on EVERY exit path:
+// interrupt, run end (any channel), channel switch, agent_end throw,
+// shutdown, and process death (crash record settled at next startup).
+
+describe("#84: placeholder settlement (all exit paths)", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string; body?: any }[] = [];
+  let msgN = 0;
+  const realFetch = globalThis.fetch;
+
+  const CH1 = {
+    id: "ch1",
+    name: "Test",
+    type: "discord",
+    botToken: "tok1",
+    ownerUserId: "uid",
+    ack: true,
+  };
+  const CH2 = {
+    id: "ch2",
+    name: "Other",
+    type: "discord",
+    botToken: "tok2",
+    ownerUserId: "uid",
+    ack: true,
+  };
+
+  const inbound = (
+    body: string,
+    id: string,
+    channelId = "ch1",
+    channelName = "Test",
+  ): ChannelMessage => ({
+    channelId,
+    channelName,
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  const flush = async (n = 12) => {
+    for (let i = 0; i < n; i++) await Promise.resolve();
+  };
+
+  const content = (c: (typeof fetchCalls)[number]) => {
+    const b = typeof c.body === "string" ? JSON.parse(c.body) : (c.body ?? {});
+    return b.content ?? "";
+  };
+  const posts = (ch = "ch1") =>
+    fetchCalls
+      .filter(
+        (c) =>
+          c.method === "POST" && c.url.includes(`/channels/${ch}/messages`),
+      )
+      .map(content);
+  const editsTo = (id: string) =>
+    fetchCalls
+      .filter((c) => c.method === "PATCH" && c.url.includes(`/messages/${id}`))
+      .map(content);
+  const deleted = (id: string) =>
+    fetchCalls.some(
+      (c) =>
+        c.method === "DELETE" &&
+        c.url.includes(`/messages/${id}`) &&
+        !c.url.includes("/reactions/"),
+    );
+  const file = () => path.join(tmp, ".tmp", "live-placeholders.json");
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "p84-test-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels: [CH1] }),
+    );
+    handlers = {};
+    sent = [];
+    fetchCalls = [];
+    msgN = 0;
+    midTurnQueues.clear();
+    queuedAcks.clear();
+    verboseOverride.clear();
+    pendingAttachments.clear();
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      compact: () => {},
+      modelRegistry: { getAvailable: () => [] },
+      getContextUsage: () => undefined,
+      model: { id: "cur", name: "Cur" },
+      shutdown: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      let id = "out1";
+      if (
+        init?.method === "POST" &&
+        /\/channels\/ch[12]\/messages$/.test(String(url))
+      )
+        id = `out${++msgN}`;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(async () => {
+    clearDiscordStatesForTest();
+    resetPeerFwdForTest();
+    jest.useRealTimers();
+    stopAllOpTicks();
+    stopAllCompactTicks();
+    clearAllCompacting();
+    midTurnQueues.clear();
+    queuedAcks.clear();
+    clearAllInterrupts();
+    setInterruptCtx(null);
+    setRuntimeStateDir(null);
+    resetRuntimeStateForTest();
+    try {
+      await handlers.agent_end?.({ messages: [] }, ctx);
+    } catch {
+      /* cleanup only */
+    }
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // A second extension instance in the SAME process: module state survives
+  // the "death", the closure state is fresh — exactly what a restart is.
+  const secondInstance = () => {
+    const pi2: any = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers2[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent2.push({ m, o });
+      },
+    };
+    const handlers2: Record<string, (...a: any[]) => any> = {};
+    const sent2: { m: any; o?: any }[] = [];
+    extension(pi2);
+    return { pi2, handlers2, sent2 };
+  };
+
+  test("interrupt mid-turn: the working frame reaches its terminal state (no frozen ticking count)", async () => {
+    jest.useFakeTimers();
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false; // a run is in flight
+    await handlers.turn_start(null, ctx); // working frame (out1)
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(editsTo("out1").some((t) => t.includes("working · 1 call"))).toBe(
+      true,
+    );
+
+    // a second inbound lands mid-run -> queued + acked (out2)
+    await handleInbound(pi, inbound("hello", "m2"), ctx);
+    await flush();
+    expect(posts().some((t) => t.includes("[queued] 1 in line"))).toBe(true);
+
+    const p = runMidRunInterrupt(pi, ctx, "ch1", "m2");
+    jest.advanceTimersByTime(5000); // interrupt tick edit on the ack
+    expect(editsTo("out2").some((t) => t.includes("interrupting"))).toBe(true);
+
+    // the aborted run ends while the interrupt is in flight
+    const finMsg = {
+      role: "assistant",
+      content: [{ type: "text", text: "partial" }],
+    };
+    await handlers.agent_end({ messages: [finMsg] }, ctx);
+
+    ctx.isIdle = () => true;
+    jest.advanceTimersByTime(50);
+    await flush();
+    await p;
+
+    // 1. the working frame was settled in place — a FINAL frame, not a
+    //    frozen count that keeps ticking or never resolves
+    expect(editsTo("out1").some((t) => t.includes("┌ done · 1 call"))).toBe(
+      true,
+    );
+    // 2. the interrupt tick settled and the ack line was consumed
+    expect(editsTo("out2").some((t) => t.includes("[ok] interrupted"))).toBe(
+      true,
+    );
+    expect(deleted("out2")).toBe(true);
+    // 3. the spliced entry went through to pi as a fresh run (threaded)
+    const rew = sent.find(
+      (s) =>
+        s.m.customType === "channel-inbound" &&
+        s.m.details?.body?.includes("hello"),
+    );
+    expect(rew).toBeDefined();
+    expect(rew!.m.details.messageId).toBe("m2");
+    // 4. nothing ticks after the settle
+    const n1 = editsTo("out1").length;
+    const n2 = editsTo("out2").length;
+    jest.advanceTimersByTime(30_000);
+    await flush();
+    expect(editsTo("out1").length).toBe(n1);
+    expect(editsTo("out2").length).toBe(n2);
+  });
+
+  test("normal run end settles the frame and leaves no crash record", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // out1
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    // a live frame leaves a crash record behind (for the death case)
+    expect(fs.existsSync(file())).toBe(true);
+    expect(readLivePlaceholders()?.frame?.msgId).toBe("out1");
+
+    const finMsg = {
+      role: "assistant",
+      content: [{ type: "text", text: "the answer" }],
+    };
+    await handlers.agent_end({ messages: [finMsg] }, ctx);
+    await flush();
+
+    expect(editsTo("out1").some((t) => t.includes("┌ done · 1 call"))).toBe(
+      true,
+    );
+    expect(deleted("out1")).toBe(false); // calls > 0: morph, not delete
+    expect(fs.existsSync(file())).toBe(false); // settled: no crash record
+  });
+
+  test("run end after lastActiveChannel moved settles the frame + live text on the RUN'S channel", async () => {
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels: [CH1, CH2] }),
+    );
+    verboseOverride.set("ch1", 1); // level 1: frame on essentials only
+    verboseOverride.set("ch2", 1);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    // a redirect writes -> essential -> a level-1 frame posts (out1 on ch1)
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "echo probe > /tmp/p" } },
+      ctx,
+    );
+    expect(posts().some((t) => t.includes("┌ working"))).toBe(true);
+    await handlers.message_end(
+      {
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "checking things" },
+            { type: "toolCall", toolName: "read", arguments: {} },
+          ],
+        },
+      },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    ); // live text out2 on ch1
+    expect(posts().some((t) => t.includes("checking things"))).toBe(true);
+
+    // a second channel's inbound flips lastActiveChannel mid-run
+    await handleInbound(pi, inbound("other", "m2", "ch2", "Other"), ctx);
+    await flush();
+
+    const finMsg = {
+      role: "assistant",
+      content: [{ type: "text", text: "the answer" }],
+    };
+    await handlers.agent_end({ messages: [finMsg] }, ctx);
+    await flush();
+
+    // the frame was settled on ch1 (the run's channel), not ch2
+    expect(editsTo("out1").some((t) => t.includes("┌ done"))).toBe(true);
+    // the live text was deleted on ch1, not ch2
+    const ltDelete = fetchCalls.find(
+      (c) =>
+        c.method === "DELETE" && c.url.includes("/channels/ch1/messages/out2"),
+    );
+    expect(ltDelete).toBeDefined();
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("channel switch at tool_call settles the old channel's frame in place", async () => {
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({ channels: [CH1, CH2] }),
+    );
+    verboseOverride.set("ch1", 2);
+    verboseOverride.set("ch2", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // frame out1 on ch1
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+
+    // ch2's inbound flips lastActiveChannel mid-run
+    await handleInbound(pi, inbound("work2", "m2", "ch2", "Other"), ctx);
+    await flush(); // ack out2 on ch2
+
+    // the next tool call arrives for ch2: the display moves channels
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "pwd" } },
+      ctx,
+    );
+    // the OLD channel's frame is settled in place (stopped), not frozen
+    expect(editsTo("out1").some((t) => t.includes("┌ stopped · 1 call"))).toBe(
+      true,
+    );
+    // the new channel posts its own frame (out3)
+    expect(posts("ch2").some((t) => t.includes("┌ working"))).toBe(true);
+
+    const finMsg = {
+      role: "assistant",
+      content: [{ type: "text", text: "the answer" }],
+    };
+    await handlers.agent_end({ messages: [finMsg] }, ctx);
+    await flush();
+    expect(editsTo("out3").some((t) => t.includes("┌ done"))).toBe(true);
+  });
+
+  test("agent_end that throws before the close block still settles the frame (finally net)", async () => {
+    verboseOverride.set("ch1", 2);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // 0-call frame out1
+    expect(posts().some((t) => t.includes("┌ working · 0 calls"))).toBe(true);
+
+    // messages={} makes sumRunUsage/failurePostText throw mid-handler —
+    // the close block is skipped; the finally net must still settle.
+    await expect(
+      handlers.agent_end({ messages: {} } as any, ctx),
+    ).rejects.toThrow();
+    await flush();
+
+    expect(deleted("out1")).toBe(true); // 0 calls: erase, no ghost box
+  });
+
+  test("process death with a live frame: the next startup morphs it to stopped", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // out1
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    const rec = readLivePlaceholders();
+    expect(rec?.frame).toMatchObject({
+      channelId: "ch1",
+      msgId: "out1",
+      calls: 1,
+    });
+    expect(rec?.frame?.body).toMatch(/^┌ working/);
+
+    const { handlers2 } = secondInstance();
+    simulateProcessDeathForTest(); // crash: no shutdown, no agent_end
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    expect(editsTo("out1").some((t) => t.includes("┌ stopped · 1 call"))).toBe(
+      true,
+    );
+    expect(deleted("out1")).toBe(false); // calls > 0: morph, not delete
+    expect(fs.existsSync(file())).toBe(false); // record consumed
+  });
+
+  test("process death with a 0-call frame: the next startup deletes it", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx); // "working · 0 calls" out1
+    expect(readLivePlaceholders()?.frame?.calls).toBe(0);
+
+    const { handlers2 } = secondInstance();
+    simulateProcessDeathForTest();
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    expect(deleted("out1")).toBe(true);
+    expect(editsTo("out1")).toEqual([]);
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("process death with live text: the next startup deletes it", async () => {
+    verboseOverride.set("ch1", 1); // reads-only run: no frame, live text only
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    await handlers.message_end(
+      {
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "let me check" },
+            { type: "toolCall", toolName: "read", arguments: {} },
+          ],
+        },
+      },
+      ctx,
+    );
+    await handlers.tool_call(
+      { toolName: "read", input: { path: "a.txt" } },
+      ctx,
+    );
+    const rec = readLivePlaceholders();
+    expect(rec?.liveText).toMatchObject({ channelId: "ch1", msgId: "out1" });
+    expect(rec?.frame).toBeNull();
+
+    const { handlers2 } = secondInstance();
+    simulateProcessDeathForTest();
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    expect(deleted("out1")).toBe(true);
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("process death mid-interrupt: the spliced entry is redelivered and its ack deleted", async () => {
+    jest.useFakeTimers();
+    await handlers.session_start?.(null, ctx); // configRoot for channel REST
+    ctx.isIdle = () => false;
+    const m2 = inbound("hello", "m2");
+    queueMidTurnInbound("ch1", m2, "ctx\n\nhello", "discord/Test", "hello");
+    queuedAcks.set("m2", { ackId: "ack1", fromId: "uid", pos: 1 });
+
+    const p = runMidRunInterrupt(pi, ctx, "ch1", "m2");
+    jest.advanceTimersByTime(100); // tick pending, settle-wait polling
+    const rec = readLivePlaceholders();
+    expect(rec?.interrupts).toHaveLength(1);
+    expect(rec?.interrupts[0]).toMatchObject({
+      channelId: "ch1",
+      msgId: "m2",
+      ackId: "ack1",
+      display: "hello",
+    });
+
+    const { handlers2, sent2 } = secondInstance();
+    simulateProcessDeathForTest();
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    // the entry was spliced out of the queue before the crash — nobody
+    // else would deliver it, so the startup redelivers it as a fresh run
+    const redelivered = sent2.find(
+      (s) =>
+        s.m.customType === "channel-inbound" && s.m.details?.body === "hello",
+    );
+    expect(redelivered).toBeDefined();
+    expect(redelivered!.m.details.messageId).toBe("m2");
+    expect(deleted("ack1")).toBe(true); // ack line not orphaned
+    expect(fs.existsSync(file())).toBe(false);
+
+    // let the old instance's dangling interrupt settle (test hygiene)
+    ctx.isIdle = () => true;
+    jest.advanceTimersByTime(50);
+    await flush();
+    await p;
+  });
+
+  test("process death with an orphaned queued ack: the startup deletes the ack line", async () => {
+    await handlers.session_start?.(null, ctx);
+    ctx.isIdle = () => false;
+    const m2 = inbound("hello", "m2");
+    queueMidTurnInbound(
+      "ch1",
+      m2,
+      "ctx\n\nhello",
+      "discord/Test",
+      "hello",
+      false, // no interrupt armed
+    );
+    queuedAcks.set("m2", { ackId: "ack1", fromId: "uid", pos: 1 });
+    persistLivePlaceholders();
+    expect(readLivePlaceholders()?.queueAcks).toEqual([
+      { channelId: "ch1", inboundId: "m2", ackId: "ack1", pos: 1 },
+    ]);
+
+    const { handlers2, sent2 } = secondInstance();
+    simulateProcessDeathForTest(); // the queue ENTRY is gone with the process
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    expect(deleted("ack1")).toBe(true); // the [queued] line is not orphaned
+    // the entry itself is #180's scope (queued-inbound persistence) —
+    // only the placeholder line is settled here
+    expect(sent2.some((s) => s.m.customType === "channel-inbound")).toBe(false);
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("process death mid-compact: the startup settles the compact line", async () => {
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await flush();
+    expect(posts().some((t) => t.includes("[..] compacting"))).toBe(true);
+    expect(readLivePlaceholders()?.compacts).toEqual([
+      { channelId: "ch1", msgId: "out1" },
+    ]);
+
+    const { handlers2 } = secondInstance();
+    simulateProcessDeathForTest();
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+
+    expect(editsTo("out1").some((t) => t.includes("compact interrupted"))).toBe(
+      true,
+    );
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("in-process restart (reason != startup) does not settle; a real start does", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(fs.existsSync(file())).toBe(true);
+
+    const { handlers2 } = secondInstance();
+    simulateProcessDeathForTest();
+    const nBefore = fetchCalls.length;
+    await handlers2.session_start?.(null, ctx); // in-process /new-style re-fire
+    await flush();
+    // untouched: no settle REST since the re-fire
+    expect(
+      fetchCalls
+        .slice(nBefore)
+        .some(
+          (c) =>
+            (c.method === "PATCH" || c.method === "DELETE") &&
+            c.url.includes("/messages/out1"),
+        ),
+    ).toBe(false);
+    expect(readLivePlaceholders()?.frame?.msgId).toBe("out1"); // record kept
+
+    const nStart = fetchCalls.length;
+    await handlers2.session_start?.({ reason: "startup" }, ctx);
+    await flush();
+    expect(
+      fetchCalls
+        .slice(nStart)
+        .some(
+          (c) =>
+            c.method === "PATCH" &&
+            c.url.includes("/messages/out1") &&
+            String(c.body).includes("stopped"),
+        ),
+    ).toBe(true);
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  test("shutdown unlinks the crash record (a clean exit leaves nothing to settle)", async () => {
+    verboseOverride.set("ch1", 2);
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("work", "m1"), ctx);
+    ctx.isIdle = () => false;
+    await handlers.turn_start(null, ctx);
+    await handlers.tool_call(
+      { toolName: "bash", input: { command: "ls" } },
+      ctx,
+    );
+    expect(fs.existsSync(file())).toBe(true);
+
+    await handlers.session_shutdown?.();
+    await flush();
+
+    expect(editsTo("out1").some((t) => t.includes("┌ stopped · 1 call"))).toBe(
+      true,
+    );
+    expect(fs.existsSync(file())).toBe(false);
   });
 });
