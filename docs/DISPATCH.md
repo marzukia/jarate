@@ -358,10 +358,9 @@ the only durable OOM record, so every sweep reads `memory.events` and
 alerts on DELTA, not level.
 
 - **Roster**: the sweep's own uid + every `uid [webhook]` line of
-  `$HOME/.config/jarate/fleet-agents` (the same file `jarate peers` /
-  `jarate agents-check` consume; `#` comments and junk lines tolerated,
-  uids deduped). The webhook column is parsed but not yet used - per-agent
-  routing is M2.
+  `$HOME/.config/jarate/fleet-agents` (watchdog is the only in-tree
+  consumer; `#` comments and junk lines tolerated, uids deduped). The
+  webhook column is parsed but not yet used - per-agent routing is M2.
 - **Read**: `$PI_BG_OOM_ROOT/user-<uid>.slice/memory.events` (env seam,
   default `/sys/fs/cgroup/user.slice`; unit tests run against a fake root
   plus one first-sight probe against the runner's own real slice) +
