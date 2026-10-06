@@ -3436,12 +3436,17 @@ export const PEER_SENDER_HINT =
 export const PEER_SENDER_HINT_NO_FWD =
   "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
 
-/** #177: true when the inbound is a [bg:-prefixed machine wake (pi-bg
- *  callback, dead-letter alert, ETL alert). Machine wakes are never more
- *  urgent than the in-flight turn: they ride the re-wake queue and deliver
- *  at agent_end, and arm no mid-run interrupt (queue-only, #177). */
+/** #177: true when the inbound is a [bg: machine wake (pi-bg callback,
+ *  dead-letter alert, ETL alert). Machine wakes are never more urgent than
+ *  the in-flight turn: they ride the re-wake queue and deliver at agent_end,
+ *  and arm no mid-run interrupt (queue-only, #177).
+ *
+ *  Covers both callback shapes via the shared classifier isBgCallbackBody:
+ *  the "[bg:" content prefix, and the standard embed-only pi-bg completion
+ *  callback (content="", bridge body "<embed>\nAuthor: pi-bg ticket · <rid>").
+ *  The 2026-10-06 incident callback was the embed-only shape. */
 export function isBgInbound(msg: ChannelMessage): boolean {
-  return msg.body.trimStart().startsWith("[bg:");
+  return isBgCallbackBody(msg.body.trimStart());
 }
 
 /** c1: true when the inbound is authored by a known peer bot. Bg-webhook

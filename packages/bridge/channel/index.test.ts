@@ -2499,6 +2499,60 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
+    test("embed-only pi-bg callback (content='', Author: pi-bg) mid-run: queued, no arm, delivered at agent_end — EXACT lost-callback shape (2026-10-06, ticket 3580612)", async () => {
+      // The standard pi-bg completion callback is embed-only by
+      // construction (dispatch/jarate-bg bg_build: content='', embed
+      // author "pi-bg ticket · <rid>"); plain "[bg:" content is the
+      // python3-missing fallback only. The bridge-built body is the
+      // serialized embed — no "[bg:" prefix anywhere. The 2026-10-06
+      // incident lost EXACTLY this shape (msg 1556883632919150653, Beepy
+      // webhook author not in peerBotIds, mid-run): pre-fix isBgInbound
+      // missed it and the 3s interrupt armed + was lost at compact.
+      const body = [
+        "<embed>",
+        "Author: pi-bg ticket · 20261006-040516-3580612",
+        "Title: reviewer · PASS · 14m27s",
+        "```bash",
+        "┌ jarate-bg 20261006-040516-3580612",
+        "└",
+        "```",
+        "task: adversarially review marzukia/jarate PR #179",
+        "result: VERDICT: PASS (pack: /var/tmp/reviews/pr-179-result.md)",
+        "Footer: pi-bg",
+        "</embed>",
+      ].join("\n");
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      const baseTimers = pendingInterrupts.size;
+      // Beepy-style author: a webhook bot NOT in peerBotIds.
+      const msg = {
+        ...inbound(body, "1556883632919150653"),
+        from: "Beepy",
+        fromId: "1546769099252695103",
+      };
+      await handleInbound(pi, msg, ctx);
+      // Queued for the guaranteed re-wake (depth +1)...
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // ...but NO timer armed (arm count unchanged, nothing pending for
+      // ch1) — the embed-only shape is a machine wake like the [bg:
+      // prefix shape.
+      expect(pendingInterrupts.size).toBe(baseTimers);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      // The 3s point (and beyond) passes with no abort, no early
+      // delivery: the in-flight run survives intact.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 2);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.body).toBe(body);
+      expect(sent[baseSends].m.details.messageId).toBe("1556883632919150653");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
     test("[bg: inbound idle: immediate delivery, nothing queued or armed (regression pin)", async () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
