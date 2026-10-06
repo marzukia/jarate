@@ -2584,12 +2584,26 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
     expect(recs[0].delivery).toBe("none");
   });
 
-  test("killed run: wrapper traps done, pi-bg-kill finalizes state=killed", async () => {
+  test("killed run: wrapper traps done, pi-bg-kill finalizes state=cancelled (one terminal embed)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const art = path.join(fx.tmp, "art");
     fx.env.PI_BG_TMPDIR = art;
     fx.env.PI_BG_HB_INTERVAL = "1";
+    // webhook on: a manual kill must produce EXACTLY ONE terminal embed
+    // (the CANCELLED post) - pre-#51 a graceful TERM also fired the
+    // wrapper-trap DIED post for the same cancellation
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
     fs.mkdirSync(art, { recursive: true });
     fs.writeFileSync(
       path.join(fx.tmp, "bin", "pi"),
@@ -2629,15 +2643,23 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
       const rec2 = JSON.parse(
         fs.readFileSync(path.join(recDir, `pi-bg-${rec.run}.json`), "utf8"),
       );
-      expect(rec2.state).toBe("killed");
+      // #51 CANCELLED class: a manual kill ends the record cancelled
+      // (distinct from state=killed, the watchdog/launch-fail audit path)
+      expect(rec2.state).toBe("cancelled");
       expect(rec2.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
       // kill marker present (the watchdog skips this ticket)
       expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-killed`))).toBe(
         true,
       );
+      // exactly ONE terminal embed: the CANCELLED post, no DIED double
+      expect(posts).toHaveLength(1);
+      expect(posts[0].embeds[0].title).toBe(
+        `pi-bg ${rec.run} \u00b7 CANCELLED`,
+      );
       // hb child cleaned up by the wrapper trap (no orphan re-touching it)
       await Bun.sleep(1500);
       expect(fs.existsSync(path.join(art, `pi-bg-${rec.run}-hb`))).toBe(false);
+      server.stop(true);
     } finally {
       try {
         process.kill(-p.pid, "SIGKILL");

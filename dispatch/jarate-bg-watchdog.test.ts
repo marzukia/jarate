@@ -762,11 +762,11 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
       expect(r.out).toContain(`DEAD jarate/${t}`);
       expect(r.out).not.toContain(`DEAD cwd/${t}`);
       expect(f.posts).toHaveLength(1);
-      // the worktree sweep owns the flag; it does not mark records
-      // (existing behavior), so the record stays running until the
-      // age prune - the point here is exactly ONE flag, no double post
+      // the worktree sweep owns the flag; since #51 it also marks the
+      // record killed (sticky terminal: no cross-day re-flag), so the
+      // cwd sweep's running-only filter skips it - exactly ONE flag
       expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
-        "running",
+        "killed",
       );
     } finally {
       f.close();
@@ -775,7 +775,222 @@ describe("watchdog #86: cwd-ticket sweep (non-worktree dispatches)", () => {
 });
 
 /**
- * #116: cwd-sweep vs cgroup-reaper race. A SIGKILLed long cwd run leaves an
+ * #51 sticky terminal lifecycle (the zombie one-shot fix). The per-day
+ * deadlog dedupe only suppresses SAME-day re-flags; pre-#51 a SIGKILLed
+ * worktree run left its record state=running, so the NEXT day's sweep
+ * re-flagged the same death with a second terminal embed (the "zombie
+ * one-shot": the orchestrator's queue kept a ticket that was already
+ * dead). Now the worktree sweep marks the record killed at flag time
+ * (same audit path as the cwd sweep) - a ticket whose record reached a
+ * terminal state is never flagged again. HELD records (the #110 retry
+ * machinery) stay running on purpose so the retry section re-decides
+ * them daily; manual kills end state=cancelled (jarate-bg-kill, the
+ * CANCELLED class) and are never DEAD.
+ */
+describe("watchdog #51: sticky terminal lifecycle", () => {
+  const TID = (n: number) => `20991231-235958-${700 + n}`;
+  const recFile = (f: { home: string }, t: string) =>
+    path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`);
+  const deadlog = (f: { home: string }) => path.join(f.home, ".pi-bg-deadlog");
+  const wtDir = (f: { wtDir: string }, t: string) =>
+    path.join(f.wtDir, "jarate", t);
+  const age = (d: string, min: number) =>
+    fs.utimesSync(
+      d,
+      new Date(Date.now() - min * 60 * 1000),
+      new Date(Date.now() - min * 60 * 1000),
+    );
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  sticky terminal test\n`,
+    );
+  const plantRunning = (f: { home: string; tmp: string }, t: string) => {
+    const d = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      recFile(f, t),
+      JSON.stringify(
+        {
+          run: t,
+          profile: "worker",
+          project: null,
+          cwd: path.join(f.tmp, "workdir"),
+          started: "2026-09-25T10:00:00Z",
+          delivery: "webhook",
+          state: "running",
+        },
+        null,
+        2,
+      ),
+    );
+  };
+  const backdateDeadlog = (f: { home: string }, t: string) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    const p = deadlog(f);
+    const lines = fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .map((l) =>
+        l.startsWith(`${today} ${t} `) ? l.replace(today, yesterday) : l,
+      );
+    fs.writeFileSync(p, `${lines.join("\n").trimEnd()}\n`);
+  };
+
+  test("cross-day: a flagged worktree death is never re-flagged", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(1);
+      fs.mkdirSync(wtDir(f, t), { recursive: true });
+      age(wtDir(f, t), 30);
+      plantRunning(f, t);
+      // no hb file: pre-upgrade-style ticket, DEAD on the first sweep
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`DEAD jarate/${t}`);
+      expect(f.posts).toHaveLength(1);
+      // the sticky mark closed the record at flag time
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "killed",
+      );
+
+      // the per-day deadlog dedupe EXPIRES: simulate the next day
+      backdateDeadlog(f, t);
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`DEAD jarate/${t}`);
+      expect(f.posts).toHaveLength(1); // no second terminal embed
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "killed",
+      );
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("held record: re-flagged daily until the retry fires (stays running)", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(2);
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true });
+      age(wt, 30);
+      plantRunning(f, t);
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-prompt.md`), "retry me\n");
+      // cap 1 with one "live" ticket (fresh hb file, no record)
+      fs.writeFileSync(path.join(f.art, `pi-bg-${TID(9)}-hb`), "");
+      const over = {
+        PI_BG_LAUNCHER: JB,
+        PI_BG_MAX_CONCURRENT: "1",
+      };
+      const r1 = await f.run([], over);
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`retry ${t}: HELD (at cap 1/1)`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].embeds[0].description).toContain("retry held: at cap");
+      // held records stay state=running (the #110 retry section
+      // re-decides them daily; closing them would kill the retry)
+      const rec1 = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
+      expect(rec1.state).toBe("running");
+      expect(rec1.deadRetry.state).toBe("held");
+
+      // same day: the sweep dedupes, the retry section re-decides
+      const r2 = await f.run([], over);
+      expect(r2.out).toContain(`retry ${t}: HELD (at cap 1/1)`);
+      expect(f.posts).toHaveLength(1);
+
+      // next day: re-flag + re-decide - still held, still running
+      backdateDeadlog(f, t);
+      const r3 = await f.run([], over);
+      expect(r3.out).toContain(`DEAD jarate/${t}`);
+      expect(f.posts).toHaveLength(2);
+      expect(f.posts[1].embeds[0].description).toContain("retry held: at cap");
+      expect(JSON.parse(fs.readFileSync(recFile(f, t), "utf8")).state).toBe(
+        "running",
+      );
+
+      // a slot frees: the retry fires and closes the record
+      fs.rmSync(path.join(f.art, `pi-bg-${TID(9)}-hb`));
+      const r4 = await f.run([], over);
+      expect(r4.out).toContain(`retry ${t}: DISPATCHED`);
+      const rec4 = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
+      expect(rec4.state).toBe("killed");
+      expect(rec4.deadRetry.state).toBe("dispatched");
+      // clean up the retry record so the reaper/prune see a settled box
+      const recIds = fs
+        .readdirSync(path.join(f.home, ".pi-dispatch", "runs"))
+        .filter((n) => n !== `pi-bg-${t}.json`);
+      for (const n of recIds) {
+        const rj = JSON.parse(
+          fs.readFileSync(path.join(f.home, ".pi-dispatch", "runs", n), "utf8"),
+        );
+        rj.state = "killed";
+        fs.writeFileSync(
+          path.join(f.home, ".pi-dispatch", "runs", n),
+          JSON.stringify(rj),
+        );
+      }
+    } finally {
+      f.close();
+    }
+  }, 90_000);
+
+  const setCancelled = (f: { home: string }, t: string) => {
+    const p = recFile(f, t);
+    fs.writeFileSync(
+      p,
+      fs
+        .readFileSync(p, "utf8")
+        .replace(/"state": "running"/, '"state": "cancelled"'),
+    );
+  };
+
+  test("state=cancelled record + kill marker: never flagged (worktree + cwd)", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      // worktree run, manually killed: kill marker + cancelled record
+      const t1 = TID(3);
+      const wt = wtDir(f, t1);
+      fs.mkdirSync(wt, { recursive: true });
+      age(wt, 30);
+      plantRunning(f, t1);
+      setCancelled(f, t1);
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t1}-killed`), "killed\n");
+      // cwd run, manually killed: cancelled record, empty cgroup, stale hb
+      const t2 = TID(4);
+      plantRunning(f, t2);
+      setCancelled(f, t2);
+      fs.mkdirSync(path.join(f.tmp, "cg", "pi-bg", t2), { recursive: true });
+      const hb = path.join(f.art, `pi-bg-${t2}-hb`);
+      fs.writeFileSync(hb, "");
+      age(hb, 15);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain(`DEAD jarate/${t1}`);
+      expect(r.out).not.toContain(`DEAD cwd/${t2}`);
+      expect(r.out).not.toContain(`STALLED jarate/${t1}`);
+      expect(f.posts).toHaveLength(0);
+      expect(JSON.parse(fs.readFileSync(recFile(f, t1), "utf8")).state).toBe(
+        "cancelled",
+      );
+      expect(JSON.parse(fs.readFileSync(recFile(f, t2), "utf8")).state).toBe(
+        "cancelled",
+      );
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+});
+
+/**
+ * #116: cwd-sweep vs cgroup-reaper race. A
+ * SIGKILLed long cwd run leaves an
  * EMPTY cgroup dir while the heartbeat is still fresh (< STALL_MIN). A
  * sweep landing in that window skips the ticket (hb fresh) and its
  * reaper rmdirs the empty aged dir. Pre-fix, the NEXT sweep saw no cgroup
@@ -1639,7 +1854,9 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r.out).not.toContain(`retry ${t}:`);
       const rec4 = rec(f, t);
       expect(rec4.deadRetry).toBeUndefined();
-      expect(rec4.state).toBe("running"); // the dir sweep does not mutate
+      // #51: the sticky terminal mark closes the record (nothing to hold:
+      // no prompt -> no retry decision)
+      expect(rec4.state).toBe("killed");
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(1);
       expect(postOrThrow(f, t).description).not.toContain("retry");

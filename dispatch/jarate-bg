@@ -1033,8 +1033,14 @@ bg_on_exit() {
   # #57): the trap runs on every trapped exit (normal/INT/TERM/error);
   # a SIGKILLed wrapper leaves no rc file (watchdog then says DEAD).
   printf '%s\n' "$ec" > "$BG_TMP/pi-bg-${run_id}-rc" 2>/dev/null || true
+  # #51 sticky terminal: a manual kill writes the -killed marker BEFORE
+  # the TERM (jarate-bg-kill), so this trap sees it and stays quiet -
+  # the kill script's CANCELLED embed is the one and only terminal embed
+  # for a manual kill. Without this a graceful TERM produced DIED +
+  # KILLED for the same cancellation.
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
-     [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ]; then
+     [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ] && \
+     [ ! -f "$BG_TMP/pi-bg-${run_id}-killed" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
     reason="$(bg_death_reason)"
     bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \

@@ -275,7 +275,9 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
 - `pi-bg-<id>-wb-status` — success-path webhook HTTP code + time
   (recorded at post time; the response body stays in `pi-bg-<id>-wb-resp.txt`)
 - `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail
-- `pi-bg-<id>-killed` — jarate-bg-kill marker (the watchdog skips such tickets)
+- `pi-bg-<id>-killed` — jarate-bg-kill marker (the watchdog skips such tickets;
+  written before the TERM so the wrapper trap stays quiet on a manual kill,
+  issue #51)
 
 ### tail / kill (in-flight control)
 
@@ -288,8 +290,13 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
   (issue #56: jarate-bg runs under setsid; the wrapper leads the ticket session,
   so `-pgid` covers session processes that escaped the cgroup walk), waits
   `$PI_BG_KILL_WAIT` (10s), then SIGKILL via `cgroup.kill` (per-pid +
-  per-group fallback). Posts a `KILLED`
+  per-group fallback). Posts a `CANCELLED`
   embed (same webhook URL source as jarate-bg; dead letter on post failure).
+  Manual kill is the CANCELLED terminal class (issue #51): the run record
+  ends `state=cancelled`, the `-killed` marker is written BEFORE the
+  signals so the wrapper's exit trap suppresses its DIED post - exactly
+  one terminal embed per manual kill. `state=killed` stays the watchdog
+  audit path (DEAD/SILENT sweep, launch-fail).
   Precise by construction: only the run's cgroup subtree dies.
 
 ### AGENTS.md drift tripwire (watchdog, alert-only)

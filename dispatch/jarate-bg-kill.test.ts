@@ -1,9 +1,12 @@
 /**
- * dispatch/jarate-bg-kill — v3 embed style (mockup3).
+ * dispatch/jarate-bg-kill — v3 embed style (mockup3) + #51 CANCELLED class.
  *
  * Runs the real bash script against a fake cgroup (PI_BG_CG_ROOT override)
  * with a real sleeping victim, captures the webhook payload, and asserts
- * the framed description stays inside the 40-col mobile budget.
+ * the framed description stays inside the 40-col mobile budget. A manual
+ * kill is the CANCELLED terminal state (issue #51): the embed says
+ * CANCELLED and the run record ends state=cancelled (distinct from
+ * state=killed, the watchdog/launch-fail audit path).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -44,6 +47,25 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       },
     });
 
+    // run record: the kill must end it state=cancelled (#51 CANCELLED
+    // class, distinct from state=killed). Seeded state=done: the wrapper's
+    // exit trap writes "done" during the drain poll, the kill finalizes.
+    const recDir = path.join(tmp, "records");
+    fs.mkdirSync(recDir, { recursive: true });
+    const recFile = path.join(recDir, `pi-bg-${id}.json`);
+    fs.writeFileSync(
+      recFile,
+      JSON.stringify({
+        run: id,
+        profile: "worker",
+        project: null,
+        cwd: tmp,
+        started: "2026-09-13T12:00:00Z",
+        delivery: "webhook",
+        state: "done",
+      }),
+    );
+
     // victim: a real sleeping process "inside" the fake cgroup
     const victim = spawn(["sleep", "300"], {
       stdout: "ignore",
@@ -56,6 +78,7 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       HOME: home,
       PI_BG_CG_ROOT: cgRoot,
       PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_RECORD_DIR: recDir,
       PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
       PI_BG_WB_BACKOFF: "0",
       PI_BG_KILL_WAIT: "1",
@@ -82,13 +105,13 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
 
       if (!body) throw new Error(`webhook not captured (stderr: ${err})`);
       const em = body.embeds[0];
-      expect(em.title).toBe(`pi-bg ${id} · KILLED`);
+      expect(em.title).toBe(`pi-bg ${id} · CANCELLED`);
       for (const ch of ["⛔", "✓", "✗", "⚠", "→", "—"]) {
         expect(em.title + em.description).not.toContain(ch);
       }
       const lines = em.description.split("\n");
       expect(lines[0]).toBe("```bash");
-      expect(lines[1]).toBe(`┌ killed · ${id}`);
+      expect(lines[1]).toBe(`┌ cancelled · ${id}`);
       // the "$ jarate-bg-kill <rid>" line is 36 cols for this id: the rid head
       // clips (tail kept - the pid end is the discriminator)
       // at the 40-col budget the full rid fits the command line (34 cols)
@@ -99,7 +122,12 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
       expect(em.description).toContain("├ pids   : ");
       // wait seconds include list_tree's /proc scan time -> match shape only
       expect(em.description).toMatch(/├ wait {3}: \d+s \(TERM->KILL\)/);
-      expect(em.description).toContain("├ state  : killed on request");
+      expect(em.description).toContain("├ state  : cancelled on request");
+      // #51: the run record ends state=cancelled ("cancelled" is the
+      // final state for a manual kill, over the wrapper's "done")
+      expect(JSON.parse(fs.readFileSync(recFile, "utf8")).state).toBe(
+        "cancelled",
+      );
     } finally {
       victim.kill("SIGKILL");
       server.stop(true);

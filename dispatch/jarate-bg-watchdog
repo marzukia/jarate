@@ -224,15 +224,16 @@ has_started() {
 }
 
 # record_done <ticket>: the run record reached a terminal state (jarate-bg
-# marks state=done on every trapped exit, jarate-bg-kill marks killed). A
-# ticket whose wrapper ran its exit trap COMPLETED - if no out.md exists
-# the callback was lost or mislabeled (deploy-swap deaths, 2026-09-15),
-# not a lost process. The sweep must not re-flag it DEAD.
+# marks state=done on every trapped exit, jarate-bg-kill marks cancelled,
+# the watchdog's own sweep/launch-fail paths mark killed). A ticket whose
+# wrapper ran its exit trap COMPLETED - if no out.md exists the callback
+# was lost or mislabeled (deploy-swap deaths, 2026-09-15), not a lost
+# process. The sweep must not re-flag it DEAD.
 record_done() {
   local t="$1" rf
   rf="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}/pi-bg-$t.json"
   [ -f "$rf" ] || return 1
-  grep -q '"state": *"done"\|"state": *"killed"' "$rf" 2>/dev/null
+  grep -q '"state": *"done"\|"state": *"killed"\|"state": *"cancelled"' "$rf" 2>/dev/null
 }
 
 # hb_stale <ticket>: 0 when a heartbeat file exists and is older than
@@ -695,6 +696,30 @@ for d in "$WT_DIR"/*/*/; do
   if [ "$kind" = "DEAD" ] && retry_gate; then
     wd_dead_retry_decide "$t" "$repo" "$d" || true
     [ -n "$WDR_ACTION" ] && reason="$WDR_ACTION: $reason"
+  fi
+
+  # #51 sticky terminal: mark the run record killed (same audit path as
+  # the cwd sweep) so the per-day dead-log dedupe expiring cannot re-flag
+  # this death with a SECOND terminal embed. A worktree SIGKILL used to
+  # leave the record "running" and re-flag daily. HELD records stay
+  # state=running on purpose (the #110 retry section re-decides them
+  # daily, issue #110 review F1); records already at a terminal state
+  # (done/killed/cancelled) are never touched.
+  if [ "$DRY" -eq 0 ]; then
+    IFS=$'\x1f' read -r rst _ drS _ _ _ _ _ < <(wd_rec_fields "$t")
+    if [ "$rst" = "running" ] && [ "$drS" != "held" ]; then
+      PI_BG_REC_STATE="killed" python3 - "$rec_dir/pi-bg-${t}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+    fi
   fi
 
   echo "[pi-bg-watchdog] $kind $repo/$t (last activity $last, $reason)"
@@ -1339,9 +1364,11 @@ fi
 #     untouched for > PRUNE_DAYS are pruned: the ticket's artifact files
 #     (persistent dir + legacy /tmp) and the record itself are deleted.
 #     The record mtime is the age clock: jarate-bg marks state=done on every
-#     trapped exit and jarate-bg-kill marks state=killed (both refresh the
-#     mtime), so a stale mtime means an untrappable death or a record that
-#     was never closed. Live tickets keep theirs (prune_live above).
+#     trapped exit and jarate-bg-kill finalizes state=cancelled (both
+#     refresh the mtime), so a stale mtime means an untrappable death or a
+#     record that was never closed. Live tickets keep theirs (prune_live
+#     above). Sweep-flagged deaths end state=killed (sticky terminal,
+#     issue #51) - pruned here, never re-flagged.
 pruned_state=0
 if [ "$PRUNE_DAYS" -gt 0 ]; then
   rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
