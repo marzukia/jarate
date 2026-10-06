@@ -60,7 +60,10 @@ const states = new Map<string, DiscordState>();
 
 // ─── API helpers ───────────────────────────────────────────────────────────
 
-async function discordFetch(
+/** Bounded REST call against the Discord API (3 attempts, 429-aware).
+ *  Exported: the #180 startup history scan reuses it (and tests stub
+ *  the transport via globalThis.fetch). */
+export async function discordFetch(
   token: string,
   urlPath: string,
   opts?: { method?: string; body?: any },
@@ -587,7 +590,7 @@ export function isBgWebhook(raw: any): boolean {
 // ─── Shared inbound delivery (poll + gateway) ───────────────────────────
 
 /** Map a raw Discord attachments array to AttachmentRefs. */
-function mapAttachmentRefs(raw: any): AttachmentRef[] {
+export function mapAttachmentRefs(raw: any): AttachmentRef[] {
   return (raw || []).map((a: any) => ({
     id: a.id,
     filename: a.filename || "file",
@@ -597,6 +600,47 @@ function mapAttachmentRefs(raw: any): AttachmentRef[] {
     duration: typeof a.duration === "number" ? a.duration : undefined,
     waveform: typeof a.waveform === "string" ? a.waveform : undefined,
   }));
+}
+
+/** Map a raw REST/gateway message to the bridge's ChannelMessage
+ *  (identity + body + attachments + reply context). Shared by the live
+ *  delivery path (deliverInboundMessage) and the #180 startup history
+ *  scan — one mapping, so a re-queued post renders exactly like a
+ *  live one. */
+export function buildChannelMessageFromRaw(
+  config: ChannelConfig,
+  raw: any,
+): ChannelMessage {
+  // Embeds (rich text from other bots, app interactions) are not in
+  // raw.content — serialize them into the body so the LLM can read them.
+  const embedText = serializeEmbeds(raw.embeds || []);
+  const body = [raw.content || "", embedText].filter(Boolean).join("\n\n");
+
+  // Reply context: the message this one replies to (both the gateway and
+  // poll payloads carry referenced_message). Rendered as a
+  // <replied-message> block in the LLM context by the inbound handler.
+  const ref = raw.referenced_message;
+  const repliedMessage =
+    typeof ref?.content === "string" && ref.content
+      ? {
+          author: ref.author?.global_name || ref.author?.username || "",
+          text: ref.content.slice(0, 1000),
+        }
+      : undefined;
+
+  return {
+    channelId: config.id,
+    channelName: config.name,
+    channelType: "discord",
+    messageId: String(raw.id),
+    from: raw.author?.global_name || raw.author?.username || "unknown",
+    fromId: raw.author?.id,
+    body,
+    timestamp: raw.timestamp || new Date().toISOString(),
+    attachments: mapAttachmentRefs(raw.attachments),
+    repliedMessage,
+    isRoom: false,
+  };
 }
 
 /**
@@ -627,38 +671,7 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
   )
     return false;
 
-  const attachments: AttachmentRef[] = mapAttachmentRefs(raw.attachments);
-
-  // Embeds (rich text from other bots, app interactions) are not in
-  // raw.content — serialize them into the body so the LLM can read them.
-  const embedText = serializeEmbeds(raw.embeds || []);
-  const body = [raw.content || "", embedText].filter(Boolean).join("\n\n");
-
-  // Reply context: the message this one replies to (both the gateway and
-  // poll payloads carry referenced_message). Rendered as a
-  // <replied-message> block in the LLM context by the inbound handler.
-  const ref = raw.referenced_message;
-  const repliedMessage =
-    typeof ref?.content === "string" && ref.content
-      ? {
-          author: ref.author?.global_name || ref.author?.username || "",
-          text: ref.content.slice(0, 1000),
-        }
-      : undefined;
-
-  const channelMsg: ChannelMessage = {
-    channelId: config.id,
-    channelName: config.name,
-    channelType: "discord",
-    messageId: id,
-    from: raw.author?.global_name || raw.author?.username || "unknown",
-    fromId: raw.author?.id,
-    body,
-    timestamp: raw.timestamp || new Date().toISOString(),
-    attachments,
-    repliedMessage,
-    isRoom: false,
-  };
+  const channelMsg = buildChannelMessageFromRaw(config, raw);
 
   // onMessage runs its synchronous prefix (command detection marks its
   // own message) before returning, so we can check the flag here.
@@ -1170,7 +1183,7 @@ interface PresenceState {
 let intent4004Logged = false;
 
 /** True when both ids are snowflakes and a sorts before b. */
-function isOlderSnowflake(a: string, b: string | null): boolean {
+export function isOlderSnowflake(a: string, b: string | null): boolean {
   if (!b) return false;
   if (/^\d+$/.test(a) && /^\d+$/.test(b)) return BigInt(a) < BigInt(b);
   return false;
