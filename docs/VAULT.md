@@ -13,7 +13,8 @@ agent: jarate vault-run <id> -- <cmd> [args...]
   -> value injected into ONE child process env, rc passed through
 ```
 
-Design: `docs/vault-design.md`. Bridge side:
+Design: `docs/vault-design.md`. The sudo pipe surface (`jarate sudo`,
+issue #149) is designed in `docs/sudo-design.md`. Bridge side:
 `packages/bridge/channel/vault.ts`. CLI: `bin/jarate` (thin dispatch) +
 `bin/jarate-vault` (bun wrapper; the only process that ever sees the value
 besides the one child it spawns).
