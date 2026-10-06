@@ -1424,6 +1424,49 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       ),
     );
   };
+  // plant a CWD run record (no wt field) + stored prompt + stale hb +
+  // empty cgroup dir (the SIGKILL shape): the cwd sweep's DEAD fixture
+  const plantCwdRun = (f: F, t: string, prompt: string) => {
+    const d = recDirOf(f);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      recFileOf(f, t),
+      JSON.stringify(
+        {
+          run: t,
+          profile: "worker",
+          project: null,
+          cwd: f.tmp,
+          started: new Date(Date.now() - 3600_000)
+            .toISOString()
+            .replace(".000Z", "Z"),
+          delivery: "webhook",
+          state: "running",
+        },
+        null,
+        2,
+      ),
+    );
+    fs.writeFileSync(
+      path.join(f.art, `pi-bg-${t}-prompt.md`),
+      `# pi-bg worker task\n\n${prompt}\n`,
+    );
+    const hb = path.join(f.art, `pi-bg-${t}-hb`);
+    fs.writeFileSync(hb, "");
+    age(hb, 15); // > STALL_MIN (10)
+    const cg = path.join(f.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), "");
+  };
+  // two fresh filler hbs filling PI_BG_MAX_CONCURRENT=2; returns the
+  // first filler's path (rm it to free a slot)
+  const plantFillers = (f: F) => {
+    const fa = path.join(f.art, "pi-bg-20991211-000000-777-hb");
+    const fb = path.join(f.art, "pi-bg-20991212-000000-777-hb");
+    fs.writeFileSync(fa, "");
+    fs.writeFileSync(fb, "");
+    return fa;
+  };
 
   test("SIGKILL mid-run -> re-dispatched ONCE into the SAME worktree (retryOf), retry callback fires", async () => {
     const f = retryFixture();
@@ -1501,7 +1544,8 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       age(path.join(f.art, `pi-bg-${t2}-hb`), 15);
       const r2 = await f.run();
       expect(r2.code).toBe(0);
-      expect(r2.out).toContain(`DEAD cwd/${t2}`);
+      // wt-chain retry: the repo name, not "cwd" (review F4)
+      expect(r2.out).toContain(`DEAD repo/${t2}`);
       expect(r2.out).toContain("second death in chain (issue #110)");
       expect(r2.out).not.toContain("DISPATCHED");
       const rec2 = rec(f, t2);
@@ -1742,4 +1786,192 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       f.close();
     }
   }, 120_000);
+
+  test("cwd run: first death at full cap -> HELD, record stays running; slot frees -> fires on a later sweep (review F1)", async () => {
+    const f = retryFixture();
+    bless(f);
+    f.env.PI_BG_MAX_CONCURRENT = "2";
+    const t = RT(8);
+    plantCwdRun(f, t, "cwd held task");
+    const filler = plantFillers(f);
+    let t2 = "";
+    try {
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`DEAD cwd/${t}`);
+      expect(r1.out).toContain(`retry ${t}: HELD (at cap 2/2)`);
+      // the record must STAY running: killed+held is never re-checked by
+      // the retry section and the retry is dropped forever (review F1)
+      expect(rec(f, t).state).toBe("running");
+      expect((rec(f, t).deadRetry as { state: string }).state).toBe("held");
+      expect(recIds(f)).toEqual([t]); // nothing launched
+      expect(f.posts).toHaveLength(1);
+      expect(postOrThrow(f, t).description).toContain("retry held: at cap");
+      // sweep 2: dead-log dedupe at the site; cap recheck in the retry
+      // section still held; no re-post
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`retry ${t}: HELD (at cap 2/2)`);
+      expect(recIds(f)).toEqual([t]);
+      expect(f.posts).toHaveLength(1);
+      // a slot frees: the later sweep fires it (T3 shape, cwd variant)
+      fs.rmSync(filler);
+      const r3 = await f.run();
+      expect(r3.code).toBe(0);
+      expect(r3.out).toContain(`retry ${t}: DISPATCHED`);
+      // no worktree claim for a cwd run (review F4a)
+      expect(r3.out).toContain(`(retry_of=${t}, same cwd)`);
+      const rec3 = rec(f, t);
+      expect(rec3.state).toBe("killed");
+      expect((rec3.deadRetry as { state: string }).state).toBe("dispatched");
+      t2 = (rec3.deadRetry as { ticket: string }).ticket;
+      expect(t2).toMatch(/^\d{8}-\d{6}-\d+$/);
+      expect(rec(f, t2).retryOf).toBe(t);
+      expect(recIds(f).sort()).toEqual([t, t2].sort());
+      killTicket(f, t2);
+    } finally {
+      f.close();
+    }
+  }, 90_000);
+
+  test("quiet + PI_BG_WATCHDOG_RETRY=1: retry fully functional, zero posts (review F2)", async () => {
+    const f = retryFixture();
+    bless(f);
+    f.env.PI_BG_MAX_CONCURRENT = "2";
+    const t = RT(9);
+    plantCwdRun(f, t, "cwd quiet-retry task");
+    const filler = plantFillers(f);
+    // retry pi stays slow: no OK callback can race the zero-post asserts
+    fs.writeFileSync(path.join(f.tmp, "slow-ALL"), "");
+    const q = { PI_BG_WATCHDOG_RETRY: "1" };
+    let t2 = "";
+    try {
+      const r1 = await f.run(["--quiet"], q);
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`retry ${t}: HELD (at cap 2/2)`);
+      expect(rec(f, t).state).toBe("running");
+      expect((rec(f, t).deadRetry as { state: string }).state).toBe("held");
+      expect(f.posts).toHaveLength(0); // quiet contract: no posts
+      // quiet WITHOUT the override: the retry machinery is off entirely
+      const r1b = await f.run(["--quiet"]);
+      expect(r1b.code).toBe(0);
+      expect(r1b.out).not.toContain(`retry ${t}:`);
+      expect(r1b.out).toContain("retry_on=0");
+      expect(recIds(f)).toEqual([t]);
+      expect(f.posts).toHaveLength(0);
+      // a slot frees + override: fires, record advances, still zero posts
+      fs.rmSync(filler);
+      const r2 = await f.run(["--quiet"], q);
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r2.out).toContain("retry_on=1");
+      const rec2 = rec(f, t);
+      expect(rec2.state).toBe("killed");
+      expect((rec2.deadRetry as { state: string }).state).toBe("dispatched");
+      t2 = (rec2.deadRetry as { ticket: string }).ticket;
+      expect(rec(f, t2).retryOf).toBe(t);
+      expect(recIds(f).sort()).toEqual([t, t2].sort());
+      expect(f.posts).toHaveLength(0);
+      killTicket(f, t2);
+    } finally {
+      f.close();
+    }
+  }, 90_000);
+
+  test("live retry in the original dir: no spurious STALLED re-flag of the original after midnight (review F3)", async () => {
+    const f = retryFixture();
+    bless(f);
+    // 8-digit date parts: the sweep skips ticket ids that do not match
+    // ^[0-9]{8}-[0-9]{6}-[0-9]+$ (the RT() helper is 1-digit only)
+    const t1 = "20991220-040506-110";
+    const t2 = "20991221-040506-110";
+    const wt = path.join(f.wtDir, "repo", t1);
+    fs.mkdirSync(wt, { recursive: true });
+    const d = recDirOf(f);
+    fs.mkdirSync(d, { recursive: true });
+    // original: dead + closed, its chain dispatched to t2 (yesterday)
+    fs.writeFileSync(
+      recFileOf(f, t1),
+      JSON.stringify(
+        {
+          run: t1,
+          profile: "worker",
+          project: null,
+          cwd: f.tmp,
+          started: new Date(Date.now() - 7200_000)
+            .toISOString()
+            .replace(".000Z", "Z"),
+          delivery: "webhook",
+          state: "killed",
+          wt,
+          deadRetry: {
+            state: "dispatched",
+            ticket: t2,
+            at: "2026-10-05T23:50:00Z",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    // retry: live, running, in the SAME dir (the wt-reuse shape)
+    fs.writeFileSync(
+      recFileOf(f, t2),
+      JSON.stringify(
+        {
+          run: t2,
+          profile: "worker",
+          project: null,
+          cwd: wt,
+          started: new Date(Date.now() - 600_000)
+            .toISOString()
+            .replace(".000Z", "Z"),
+          delivery: "webhook",
+          state: "running",
+          wt,
+          retryOf: t1,
+        },
+        null,
+        2,
+      ),
+    );
+    // yesterday's dead-log line for t1: today's dedupe has expired
+    const yday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+    fs.writeFileSync(
+      path.join(f.home, ".pi-bg-deadlog"),
+      `${yday} ${t1} repo 2026-10-05T23:50:00Z started, no completion marker (callback lost - SIGKILL/OOM)\n`,
+    );
+    // the retry alive in the original dir (its cgroup member sits in wt)
+    const sleep = Bun.spawn(["sleep", "300"], {
+      cwd: wt,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const cg = path.join(f.tmp, "cg", "pi-bg", t2);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${sleep.pid}\n`);
+    const hb1 = path.join(f.art, `pi-bg-${t1}-hb`);
+    fs.writeFileSync(hb1, "");
+    age(hb1, 15); // original hb stale
+    fs.writeFileSync(path.join(f.art, `pi-bg-${t2}-hb`), ""); // retry fresh
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("STALLED");
+      expect(f.posts).toHaveLength(0);
+      expect(rec(f, t1).state).toBe("killed"); // untouched
+      // control: chain unconfirmed (retry record gone) -> STALLED stands
+      fs.rmSync(recFileOf(f, t2));
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`STALLED repo/${t1}`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].embeds[0].title).toBe(
+        "1 stalled \u00b7 watchdog sweep",
+      );
+    } finally {
+      sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 60_000);
 });
