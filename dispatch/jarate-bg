@@ -29,6 +29,18 @@
 #   branch pi-bg/<id>. The worktree is KEPT after the run so the orchestrator
 #   can diff/commit/merge it; path + branch are printed and in the callback.
 #
+# --wt-reuse <dir>: internal (issue #110, watchdog DEAD-retry re-dispatch):
+#   run in an EXISTING worktree dir (the dead ticket's checkout - partial
+#   work survives) instead of adding a new one; no new branch. The
+#   watchdog launches from inside the dir. Launch-fail (rc 3) when the dir
+#   is not a git worktree.
+#   The wt path + branch are stored in the run record (wt/wtBranch).
+#
+# PI_BG_RETRY_OF=<ticket>: internal (issue #110): tag the run record with
+#   the dead ticket this run retries (retryOf). Set by the watchdog's
+#   re-dispatch; the retry's own death is then a second death (human wake
+#   only, no third attempt).
+#
 # --project <tag>: project tag for invoice itemisation (2026-09-18).
 #   tag: [a-z0-9][a-z0-9-]{0,31}, one per run; invalid/missing value =
 #   usage error (rc 2, no side effects). Stored in the run record
@@ -206,6 +218,7 @@ export PI_CODING_AGENT_DIR="${HOME}/.pi/agent-${profile}"
 # a forked helper can no longer be miscounted - the zone just stays lean.
 wt_ref=""
 wt_mode=0
+wt_reuse_dir=""
 pj_tag=""
 args=()
 while [ $# -gt 0 ]; do
@@ -215,6 +228,17 @@ while [ $# -gt 0 ]; do
       shift
       # ref is the next arg only if something follows and it is not another flag
       if [ $# -ge 2 ] && [ "${1#-}" = "$1" ]; then wt_ref="$1"; shift; fi
+      ;;
+    --wt-reuse)
+      # issue #110 (internal: the watchdog's DEAD-retry re-dispatch): reuse
+      # an EXISTING worktree dir instead of `git worktree add`. Usage error
+      # here: rc 2, one stderr line, no side effects (same contract as
+      # --project above).
+      wt_mode=1
+      shift
+      [ $# -ge 1 ] || { echo "jarate-bg: --wt-reuse needs a value (existing worktree dir)" >&2; exit 2; }
+      wt_reuse_dir="$1"
+      shift
       ;;
     --project)
       # usage errors here: rc 2, one stderr line, no side effects (the run
@@ -483,7 +507,8 @@ rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 mkdir -p "$rec_dir" 2>/dev/null
 PI_BG_REC_RUN="$run_id" PI_BG_REC_PROFILE="$profile" PI_BG_REC_PROJECT="$pj_tag" \
 PI_BG_REC_CWD="$(pwd)" \
-PI_BG_REC_DELIVERY="$delivery" PI_BG_REC_CMD_TIMEOUT="$CMD_TIMEOUT" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' \
+PI_BG_REC_DELIVERY="$delivery" PI_BG_REC_CMD_TIMEOUT="$CMD_TIMEOUT" \
+PI_BG_RETRY_OF="${PI_BG_RETRY_OF:-}" python3 - "$rec_dir/pi-bg-${run_id}.json" <<'PY' \
   || echo "[pi-bg] WARNING: run-record write failed ($run_id) - watchdog blind spot (issue #101)" >&2
 import datetime, json, os, sys
 rec = {
@@ -496,6 +521,10 @@ rec = {
     "cmdTimeout": int(os.environ.get("PI_BG_REC_CMD_TIMEOUT", "900")),
     "state": "running",
 }
+if os.environ.get("PI_BG_RETRY_OF"):
+    # issue #110: this run retries a dead ticket (watchdog re-dispatch);
+    # its own death is then a second death = human wake only
+    rec["retryOf"] = os.environ["PI_BG_RETRY_OF"]
 with open(sys.argv[1], "w") as fh:
     json.dump(rec, fh, indent=2)
 PY
@@ -772,22 +801,54 @@ fi
 # instead of skipping the post; default to empty so a launch-fail exits clean 3.
 webhook="${webhook:-}"
 if [ "$wt_mode" -eq 1 ]; then
-  ref="${wt_ref:-HEAD}"
-  top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
-    echo "jarate-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
-    bg_launch_fail "launch-fail: not a git repo" \
-      "launch-fail: --worktree needs a git repo (cwd=$(pwd) is not one)"
-  }
-  id="$run_id"
-  wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
-  wt_branch="pi-bg/$id"
-  wt_repo="$(basename "$top")"
-  if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
-    echo "jarate-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
-    bg_launch_fail "launch-fail: worktree add failed ref=$ref" \
-      "launch-fail: worktree add failed ref=$ref (ref must be a branch/tag/commit, NOT a folder name)"
+  if [ -n "$wt_reuse_dir" ]; then
+    # issue #110: the watchdog's DEAD retry reuses the dead ticket's
+    # worktree dir (partial work survives; the retry is launched from
+    # inside it). No new dir, no new branch - the run lands in the same
+    # checkout the dead run left behind.
+    top="$(git -C "$wt_reuse_dir" rev-parse --show-toplevel 2>/dev/null)" || {
+      echo "jarate-bg: LAUNCH-FAIL: --wt-reuse dir is not a git worktree: $wt_reuse_dir" >&2
+      bg_launch_fail "launch-fail: wt-reuse not a git worktree" \
+        "launch-fail: --wt-reuse dir is not a git worktree: $wt_reuse_dir"
+    }
+    wt_path="$(cd "$top" && pwd)"
+    wt_branch="$(git -C "$wt_path" branch --show-current 2>/dev/null)"
+    [ -n "$wt_branch" ] || wt_branch="pi-bg/$run_id"
+    wt_repo="$(basename "$top")"
+    echo "[pi-bg] worktree reused: $wt_path (branch $wt_branch, issue #110) - kept after run" 2>/dev/null || true
+  else
+    ref="${wt_ref:-HEAD}"
+    top="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+      echo "jarate-bg: LAUNCH-FAIL: --worktree needs a git repo (cwd=$(pwd) is not one)" >&2
+      bg_launch_fail "launch-fail: not a git repo" \
+        "launch-fail: --worktree needs a git repo (cwd=$(pwd) is not one)"
+    }
+    id="$run_id"
+    wt_path="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}/$(basename "$(git rev-parse --show-toplevel)")/$id"
+    wt_branch="pi-bg/$id"
+    wt_repo="$(basename "$top")"
+    if ! git worktree add -b "$wt_branch" "$wt_path" "$ref" >/dev/null 2>&1; then
+      echo "jarate-bg: LAUNCH-FAIL: worktree add failed (ref=$ref path=$wt_path) - ref must be a branch/tag/commit, NOT a folder name" >&2
+      bg_launch_fail "launch-fail: worktree add failed ref=$ref" \
+        "launch-fail: worktree add failed ref=$ref (ref must be a branch/tag/commit, NOT a folder name)"
+    fi
+    echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
   fi
-  echo "[pi-bg] worktree: $wt_path (branch $wt_branch, from $ref) - kept after run" 2>/dev/null || true
+  # wt path + branch on the run record (audit; the #110 retry section
+  # resolves a dead ticket's worktree from here). Audit-only: a missing
+  # record is skipped, like every other record write below.
+  PI_BG_REC_FILE="$rec_dir/pi-bg-${run_id}.json" \
+  PI_BG_REC_WT="$wt_path" PI_BG_REC_WT_BRANCH="$wt_branch" python3 - <<'PY' 2>/dev/null || true
+import json, os, sys
+p = os.environ["PI_BG_REC_FILE"]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["wt"] = os.environ["PI_BG_REC_WT"]
+rec["wtBranch"] = os.environ["PI_BG_REC_WT_BRANCH"]
+json.dump(rec, open(p, "w"), indent=2)
+PY
 fi
 
 # task: captured at arg parsing (issue #118 — argv carries no task prose)
