@@ -99,7 +99,7 @@ import extension, {
   verboseOverride,
   workingMaxMs,
 } from "./index";
-import { loadRewakeQueue } from "./restart-queue";
+import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
 import {
@@ -10506,5 +10506,84 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(
       "[bg:worker:OK] 2000 EDITED",
     );
+  });
+
+  test("crash with a live [queued] line: ack id survives in the file, restored + deleted exactly once", async () => {
+    // ── Process 1: callback queued mid-run; the [queued] ack POST
+    // resolves (fake id "w1") and its id is mirrored into the file
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    setChannelCursor("ch1", "2000");
+    await waitFor(
+      () =>
+        queuedAcks.get("2000")?.ackId === "w1" &&
+        loadRewakeQueue(rewakeDir(), "ch1").pending[0]?.ackId === "w1",
+    );
+    // an OLD-SHAPE entry (pre-fix writer: no ackId key on disk) joins
+    // the file — compat: it must still load and drain
+    rewakeAddPending(rewakeDir(), "ch1", {
+      msg: inbound("[bg:worker:OK] 3000", "3000"),
+      queuedAt: Date.now(),
+    });
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(rewakeDir(), "rewake-ch1.json"), "utf8"),
+    ) as { pending: Array<Record<string, unknown>> };
+    expect(raw.pending[0].ackId).toBe("w1");
+    expect(raw.pending[1].ackId).toBeUndefined(); // old shape on disk
+
+    // ── CRASH: no session_shutdown. Memory (incl. the ack map) dies
+    // with the process, the ack line stays in Discord, the file
+    // survives — the only thing crossing the boundary
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    queuedAcks.clear(); // fresh process: the map is empty
+    midTurnQueues.clear(); // module state a real respawn never carries
+    script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
+    script.scan = [];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    // the survival drain re-queued BOTH entries (old shape loads)…
+    expect(midTurnQueues.get("ch1")?.length).toBe(2);
+    // …and restored ONLY the entry whose ack survived, at its line
+    // position — the old-shape entry has no (nonexistent) line
+    expect(queuedAcks.get("2000")?.ackId).toBe("w1");
+    expect(queuedAcks.get("2000")?.pos).toBe(1);
+    expect(queuedAcks.has("3000")).toBe(false);
+
+    // the wake run ends -> the re-wake pop delivers the survived
+    // callback and consumes the restored ack
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+      ),
+    );
+    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+    const delivered = customSends(p2.sent).filter((s) =>
+      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+    );
+    expect(delivered).toHaveLength(1);
+    // the kept [queued] line is deleted EXACTLY ONCE: the crash left
+    // it live (no shutdown fast path), the restored id is consumed —
+    // no orphan, no double delete
+    expect(
+      script.calls.filter(
+        (c) => c.method === "DELETE" && c.url.endsWith("/messages/w1"),
+      ),
+    ).toHaveLength(1);
+    expect(queuedAcks.get("2000")).toBeUndefined();
+    // the old-shape entry is still queued (no line to delete) and the
+    // delivered set now holds the committed id
+    const f2 = loadRewakeQueue(rewakeDir(), "ch1");
+    expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
+    expect(f2.delivered).toContain("2000");
   });
 });

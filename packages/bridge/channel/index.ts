@@ -93,6 +93,7 @@ import {
   rewakeCommitDelivered,
   rewakePending,
   rewakeRemovePending,
+  rewakeSetPendingAck,
   rewakeUpdatePendingMsg,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
@@ -533,6 +534,16 @@ export function drainRewakeSurvival(
       // in-process reuse and is idempotent either way.
       if (q.some((x) => x.msg.messageId === e.msg.messageId)) continue;
       q.push({ msg: e.msg, queuedAt: e.queuedAt });
+      // #194 interaction: the fresh process has an EMPTY queuedAcks
+      // map, but the `[queued] N in line` line survived the restart
+      // (the crash-settle keeps it alive when a rewake entry is
+      // restored) — restore its id at its line position so the
+      // re-wake drain's consumeQueuedAck deletes it exactly once.
+      if (e.ackId)
+        queuedAcks.set(e.msg.messageId, {
+          ackId: e.ackId,
+          pos: q.length,
+        });
       n += 1;
     }
     midTurnQueues.set(ch.id, q);
@@ -6259,12 +6270,24 @@ export async function handleInbound(
       replyToMessageId: msg.messageId,
     })
       .then((res) => {
-        if (res.success && res.messageId)
+        if (res.success && res.messageId) {
           queuedAcks.set(msg.messageId, {
             ackId: res.messageId,
             fromId: msg.fromId,
             pos,
           });
+          // #194 interaction: mirror the ack id into the survival
+          // file — a restart before delivery restores it into the
+          // fresh queuedAcks map (drainRewakeSurvival) so the re-wake
+          // drain deletes the line exactly once. No-op when the entry
+          // is already committed/dropped from the file.
+          rewakeSetPendingAck(
+            runtimeStateDir,
+            ch.id,
+            msg.messageId,
+            res.messageId,
+          );
+        }
       })
       .catch(() => {});
     return true;

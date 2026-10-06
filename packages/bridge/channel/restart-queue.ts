@@ -74,10 +74,19 @@ export const REWAKE_LOOKBACK_ENV = "PISCORD_REWAKE_LOOKBACK";
  *  pre-rendered interrupt copies) are deliberately NOT persisted —
  *  they are derived state; the re-wake path re-renders via
  *  handleInbound, and a resurrected entry without a pre-render simply
- *  does not arm the interrupt (the re-wake path owns it). */
+ *  does not arm the interrupt (the re-wake path owns it). `ackId`
+ *  (the `[queued] N in line` line's Discord message id, mirrored when
+ *  the ack POST resolves) IS persisted: a fresh process has an EMPTY
+ *  queuedAcks map, so the drain (drainRewakeSurvival) restores the
+ *  line from the file and the re-wake drain's consumeQueuedAck deletes
+ *  it exactly once — without the id the kept line is orphaned forever
+ *  (PR #194's crash-settle keeps it alive across the restart when a
+ *  rewake entry is restored). Absent on files written before the
+ *  field — it is additive, v:1 unchanged. */
 export interface RewakePendingEntry {
   msg: ChannelMessage;
   queuedAt: number;
+  ackId?: string;
 }
 
 interface RewakeQueueFile {
@@ -133,14 +142,18 @@ export function loadRewakeQueue(
         (e as Record<string, unknown>).msg !== null
       ) {
         const m = (e as RewakePendingEntry).msg;
-        if (typeof m.messageId === "string" && m.messageId.length > 0)
-          pending.push({
+        if (typeof m.messageId === "string" && m.messageId.length > 0) {
+          const entry: RewakePendingEntry = {
             msg: m as ChannelMessage,
             queuedAt:
               typeof (e as RewakePendingEntry).queuedAt === "number"
                 ? (e as RewakePendingEntry).queuedAt
                 : 0,
-          });
+          };
+          const a = (e as RewakePendingEntry).ackId;
+          if (typeof a === "string" && a.length > 0) entry.ackId = a;
+          pending.push(entry);
+        }
       }
     }
   }
@@ -215,6 +228,27 @@ export function rewakeUpdatePendingMsg(
   const e = file.pending.find((p) => p.msg.messageId === messageId);
   if (!e) return;
   e.msg = msg;
+  saveRewakeQueue(stateDir, channelId, file);
+}
+
+/** Set a pending entry's ack line id (the `[queued] N in line` post,
+ *  mirrored when the ack POST resolves): a fresh process has an empty
+ *  queuedAcks map, so the startup drain restores the line from the
+ *  file and the re-wake drain deletes it exactly once — without the
+ *  id, PR #194's crash-settle keeps the line alive across the restart
+ *  and nothing ever deletes it (orphan). No write when the id is not
+ *  pending (entry already committed/dropped — the line was consumed
+ *  in-process) or already set. */
+export function rewakeSetPendingAck(
+  stateDir: string | null | undefined,
+  channelId: string,
+  messageId: string,
+  ackId: string,
+): void {
+  const file = loadRewakeQueue(stateDir, channelId);
+  const e = file.pending.find((p) => p.msg.messageId === messageId);
+  if (!e || e.ackId === ackId) return;
+  e.ackId = ackId;
   saveRewakeQueue(stateDir, channelId, file);
 }
 
