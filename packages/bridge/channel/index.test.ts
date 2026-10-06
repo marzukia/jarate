@@ -1770,6 +1770,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     afterEach(() => {
       clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
+      resetRuntimeStateForTest(); // sessionStartTs/held/verbose: no leaks
       setInterruptCtx(null);
       clearAllInterrupts();
       pendingInterrupts.clear();
@@ -1930,6 +1931,156 @@ describe("extension handlers (A1/A2/A4)", () => {
       } finally {
         delete process.env.PISCORD_INTERRUPT_STEP_TIMEOUT_MS;
       }
+    });
+
+    // ── #165: peer-armed interrupts use the in-flight (4x) window ────
+    // 2026-10-06 abort RCA: a peer's agent-say reply landed mid-run and
+    // armed the 3s DEFAULT — the in-flight multiplier (4x, used while an
+    // interrupt is in flight) never applied to a plain in-flight run. The
+    // 3s window expired mid-REST-POST and killed the very agent-say call
+    // that was messaging that peer (pre-spawn "Operation aborted").
+    // Fix: a peer-authored mid-run inbound (isPeerInbound) arms at the
+    // 4x window like the other in-flight-armed paths; humans and [bg:
+    // machine wakes keep the 3s default. The queued message always has
+    // the guaranteed re-wake as fallback, so the longer window only
+    // changes WHEN the interrupt cuts in, never WHETHER it delivers.
+
+    test("peer mid-run inbound arms the 4x in-flight window, not the 3s default (#165)", async () => {
+      peerSettings(); // peerBotIds: [peer-1]
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      expect(idle).toBe(false);
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // Armed at 4x (12s), not the 3s default. at is read on the same
+      // virtual clock; the ±1ms tolerance covers real-Date clocks.
+      const armed = pendingInterrupts.get("ch1")?.[0];
+      expect(armed).toBeDefined();
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
+      ).toBeLessThanOrEqual(1);
+      // The 3s default point passes with NO abort: the in-flight step
+      // gets the run's head start.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The 4x window fires at 4x: interrupt lands, message is the next run.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("pm1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("human mid-run inbound keeps the 3s default with peer config active (#165)", async () => {
+      peerSettings(); // same fixture as the peer test: fromId is the ONLY
+      // differentiator (uid is not in peerBotIds)
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      expect(idle).toBe(false);
+      const baseAborts = abortCount;
+      await handleInbound(pi, inbound("human mid-run", "hm1"), ctx);
+      const armed = pendingInterrupts.get("ch1")?.[0];
+      expect(armed).toBeDefined();
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
+      ).toBeLessThanOrEqual(1);
+      // Human cut-in timing is unchanged: fires at 3x, not 12x.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() - 1);
+      expect(abortCount).toBe(baseAborts);
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+    });
+
+    test("[bg: peer-authored wake keeps the 3s default (machine wake, not peer speech) (#165)", async () => {
+      peerSettings();
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      expect(idle).toBe(false);
+      const baseAborts = abortCount;
+      const wake = { ...inboundPeer("[bg:etl] ticket", "bm1"), from: "bg" };
+      await handleInbound(pi, wake, ctx);
+      const armed = pendingInterrupts.get("ch1")?.[0];
+      expect(armed).toBeDefined();
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
+      ).toBeLessThanOrEqual(1);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+    });
+
+    test("peer inbound with no run in flight delivers directly, arms no interrupt (#165)", async () => {
+      peerSettings();
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      idle = true; // no run in flight: the 4x window must not apply
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inboundPeer("peer idle", "pi1"), ctx);
+      // Not queued, not armed — straight to pi as a fresh run.
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("pi1");
+      // Nothing pending to fire at 3s or 12s.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends + 1);
+    });
+
+    test("peer mid-settle keeps the 4x window; #124 order intact (#165 symmetric corner)", async () => {
+      // The settle window (an interrupt already in flight) armed at 4x
+      // BEFORE #165 via the in-flight disjunct — the peer disjunct must
+      // not double it, shorten it, or reorder the #124 delivery.
+      peerSettings();
+      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+      expect(idle).toBe(false);
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      ctx.abort = () => {
+        abortCount += 1;
+      }; // slow settle: interrupt stays in flight across the window
+      // 1. Human m1 mid-run: 3s arm, fires, settle polling begins.
+      await handleInbound(pi, inbound("first", "m1"), ctx);
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends); // still settling
+      // 2. Peer m2 arrives mid-settle (interrupt in flight): 4x arm.
+      await handleInbound(pi, inboundPeer("second", "pm2"), ctx);
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      const armed = pendingInterrupts
+        .get("ch1")
+        ?.find((p) => p.messageId === "pm2");
+      expect(armed).toBeDefined();
+      expect(
+        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
+      ).toBeLessThanOrEqual(1);
+      // 3. A plain 3s elapse must NOT fire m2 (no early re-arm, no abort).
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 1);
+      expect(sent.length).toBe(baseSends);
+      // 4. The run settles: m1 (the in-flight interrupt) gets the next run.
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("m1");
+      // 5. m1's re-wake run is now active; m2's 4x timer fires on schedule.
+      idle = false;
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3 - 25);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts + 2);
+      idle = true;
+      jest.advanceTimersByTime(25);
+      await Promise.resolve();
+      expect(sent.length).toBe(baseSends + 2);
+      expect(sent[baseSends + 1].m.details.messageId).toBe("pm2");
+      expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
     test("run that ends before the timeout: re-wake delivers, timer is a no-op", async () => {
