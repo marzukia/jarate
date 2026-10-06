@@ -444,21 +444,66 @@ export function wrapFenceLine(line: string, max: number): string[] {
   return out;
 }
 
+/** A fence line that IS a link (whole-line forms), rendered as the
+ * hoisted plain line, or null when the line is not a whole-line link.
+ * Exported for tests. */
+export function wholeLinkLine(
+  line: string,
+  forms: [RegExp, (m: RegExpMatchArray) => string][],
+): string | null {
+  for (const [re, render] of forms) {
+    const m = line.match(re);
+    if (m !== null) return render(m);
+  }
+  return null;
+}
+
 /**
- * Hoist bare URLs out of fenced code blocks.
+ * Hoist URLs and links out of fenced code blocks.
  *
  * A URL inside a ``` fence is NOT clickable in Discord - it renders as
  * monospace text. When the LLM ships a link in a code block (the "dev link"
- * habit), the reader gets a non-clickable string. Detect fence lines that are
- * a bare http(s) URL (the whole line, nothing else) and move them to plain
- * lines immediately after the fence so Discord auto-links them. If a fence
- * contained only URL lines, the fence is dropped entirely.
+ * habit), the reader gets a non-clickable string. Hoist the following fence
+ * lines to plain lines immediately after the fence so Discord links them:
  *
- * Fence-aware (same toggle as wrapFenceLines); non-URL code lines are left
- * inside the fence untouched. Exported for tests.
+ * - a bare http(s) URL that fills the line,
+ * - an autolink <url> or a backticked `url` that fills the line (fence
+ *   bodies carry ESCAPED backticks after escapeBackticksInCodeBlocks -
+ *   both forms match),
+ * - a markdown link [label](url) or image ![alt](url) that fills the line.
+ *   Links re-emit in the bridge's `label (<url>)` form (image refs stay
+ *   as-is): convertInlineForDiscord already ran, so a raw [label](url)
+ *   would be re-converted on a second pass and the pipeline would not be
+ *   idempotent,
+ * - (untagged fences only) a line mixing a bare URL with other content:
+ *   the URL hoists, the remainder stays fenced and is dropped if it is
+ *   empty or punctuation-only (issue #87).
+ *
+ * If a fence contained only hoisted lines, the fence is dropped entirely.
+ *
+ * Fence-aware (same toggle as wrapFenceLines). LANGUAGE-TAGGED fences
+ * (```python, ```bash, ...) never get the mixed-line treatment: a URL
+ * inside real code is an argument, not a link (same rule as
+ * wrapFenceLines). Other code lines are left inside the fence untouched.
+ * Exported for tests.
  */
 export function hoistFencedUrls(md: string): string {
   const urlLine = /^\s*(https?:\/\/\S+)\s*$/i;
+  const autoLinkLine = /^\s*<(https?:\/\/[^\s<>\\]+)>\s*$/i;
+  const spanUrlLine = /^\s*\\?`(https?:\/\/[^`\\\s]+)\\?`\s*$/i;
+  const mdLinkLine =
+    /^\s*(!?)\[([^\]]+)\]\(((?:https?|mailto):[^\s)]+)\)\s*[.!?]*\s*$/i;
+  // whole-line link forms, tried in order; the render function emits the
+  // hoisted plain line
+  const wholeLinkForms: [RegExp, (m: RegExpMatchArray) => string][] = [
+    [urlLine, (m) => m[1]!],
+    [autoLinkLine, (m) => m[1]!],
+    [spanUrlLine, (m) => m[1]!],
+    [
+      mdLinkLine,
+      (m) => (m[1] === "!" ? `[${m[2]}](${m[3]})` : `${m[2]} (<${m[3]}>)`),
+    ],
+  ];
   const lines = md.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -473,14 +518,30 @@ export function hoistFencedUrls(md: string): string {
     const fenceStart = i;
     let j = i + 1;
     while (j < lines.length && !lines[j]!.trimStart().startsWith("```")) j++;
-    const fenceEnd = j; // index of the closing fence line
+    const fenceEnd = j; // index of the closing fence line (== length if open)
+    const closed = fenceEnd < lines.length;
     const body = lines.slice(fenceStart + 1, fenceEnd);
+    const tagged = lines[fenceStart]!.trimStart().slice(3).trim() !== "";
     const hoisted: string[] = [];
     const kept: string[] = [];
     for (const bl of body) {
-      const m = bl.match(urlLine);
-      if (m) hoisted.push(m[1]!);
-      else kept.push(bl);
+      const whole = wholeLinkLine(bl, wholeLinkForms);
+      if (whole !== null) {
+        hoisted.push(whole);
+        continue;
+      }
+      if (!tagged) {
+        const urls = extractMachineUrls(bl);
+        if (urls.length > 0) {
+          let r = bl;
+          for (const u of urls) r = r.slice(0, u.start) + r.slice(u.end);
+          r = r.replace(/[ \t]+/g, " ").trim();
+          if (/\w/.test(r)) kept.push(r);
+          for (const u of urls) hoisted.push(u.url);
+          continue;
+        }
+      }
+      kept.push(bl);
     }
     if (hoisted.length === 0) {
       // no urls to hoist; emit fence unchanged
@@ -490,9 +551,11 @@ export function hoistFencedUrls(md: string): string {
     }
     if (kept.length > 0) {
       // fence still has code in it: keep it, then the hoisted urls after
-      out.push(lines[fenceStart]!, ...kept, lines[fenceEnd]!, ...hoisted);
+      out.push(lines[fenceStart]!, ...kept);
+      if (closed) out.push(lines[fenceEnd]!);
+      out.push(...hoisted);
     } else {
-      // fence was urls only: drop it, emit the urls as plain lines
+      // fence was links only: drop it, emit the links as plain lines
       out.push(...hoisted);
     }
     i = fenceEnd + 1;
@@ -575,11 +638,13 @@ function isMachineLine(raw: string): boolean {
  * Returns each bare URL plus the range to remove from the line. A
  * `<url>` autolink or `url` inline-code wrapper immediately around the
  * URL is absorbed into the range, so removing the range removes the
- * wrapper too. A URL inside a quoted or code-spanned region that opened
+ * wrapper too - including the escape backslash of a backtick wrapper in
+ * a fence body (escapeBackticksInCodeBlocks ships `url` as \`url\`).
+ * A URL inside a quoted or code-spanned region that opened
  * EARLIER on the line (a JSON string value, a mixed-content span) is not
  * linkable here - removing it would break the quoted content - and is
- * skipped. Trailing sentence punctuation (.,;:!?)]) is not part of the
- * URL. Exported for tests.
+ * skipped. Trailing sentence punctuation (.,;:!?)]) and a trailing
+ * backslash (an escape) are not part of the URL. Exported for tests.
  */
 export function extractMachineUrls(
   line: string,
@@ -589,23 +654,38 @@ export function extractMachineUrls(
   let m: RegExpExecArray | null = re.exec(line);
   while (m !== null) {
     const s = m.index;
-    let e = m.index + m[0].length;
-    while (e > s && /[.,;:!?)\]]/.test(line[e - 1]!)) e--;
-    const wrapped =
-      (line[s - 1] === "<" && line[e] === ">") ||
-      (line[s - 1] === "`" && line[e] === "`");
-    const ws = wrapped ? s - 1 : s;
-    const we = wrapped ? e + 1 : e;
-    const before = line.slice(0, ws);
+    const mEnd = m.index + m[0].length;
+    const before = line[s - 1]!;
+    const after = line[mEnd]!;
+    // wrapper detection runs on the RAW match end: in a fence body the
+    // closing backtick is escaped, so the raw match ends on the backslash
+    let ws = s;
+    let we = mEnd;
+    if (before === "<" && after === ">") {
+      ws--;
+      we++;
+    } else if (before === "`" && after === "`") {
+      ws--;
+      we++;
+      // fence bodies escape backticks: absorb the escape backslash too,
+      // or the removal leaves a dangling \ behind
+      if (ws > 0 && line[ws - 1] === "\\") ws--;
+      if (we < line.length && line[we] === "\\") we++;
+    }
+    // a trailing \ (escape) is not URL content, then sentence punctuation
+    let urlEnd = mEnd;
+    while (urlEnd > s && line[urlEnd - 1] === "\\") urlEnd--;
+    while (urlEnd > s && /[.,;:!?)\]]/.test(line[urlEnd - 1]!)) urlEnd--;
+    const beforeUrl = line.slice(0, ws);
     if (
-      (before.match(/"/g)?.length ?? 0) % 2 === 1 ||
-      (before.match(/'/g)?.length ?? 0) % 2 === 1 ||
-      (before.match(/`/g)?.length ?? 0) % 2 === 1
+      (beforeUrl.match(/"/g)?.length ?? 0) % 2 === 1 ||
+      (beforeUrl.match(/'/g)?.length ?? 0) % 2 === 1 ||
+      (beforeUrl.match(/`/g)?.length ?? 0) % 2 === 1
     ) {
       m = re.exec(line);
       continue;
     }
-    found.push({ url: line.slice(s, e), start: ws, end: we });
+    found.push({ url: line.slice(s, urlEnd), start: ws, end: we });
     m = re.exec(line);
   }
   return found;
