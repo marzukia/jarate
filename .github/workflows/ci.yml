@@ -14,9 +14,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Fork-PR code never runs on the home lab: PR jobs -> ubuntu-latest,
+# push:main -> nf.
+
 jobs:
   biome:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +30,7 @@ jobs:
         run: bunx biome check .
 
   bridge:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +43,7 @@ jobs:
         run: cd packages/bridge && bun x bun test
 
   recall:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +57,7 @@ jobs:
         run: cd packages/recall && bun test
 
   bin:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +67,7 @@ jobs:
         run: cd bin && bun test
 
   test:  # job name satisfies branch-protection required check "test"
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'nf' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
