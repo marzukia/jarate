@@ -439,7 +439,8 @@ wd_dead_retry_dispatch() {
       PI_BG_RUN_ID="$new_id" PI_BG_RETRY_OF="$t" \
       PATH="$(dirname "$pi_bin"):$PATH" \
       nohup "$launcher" "$prof" ${wargs[@]+"${wargs[@]}"} ${pjargs[@]+"${pjargs[@]}"} - \
-      > "$BG_TMP/pi-bg-${new_id}-launch.log" 2>&1 & )
+      > "$BG_TMP/pi-bg-${new_id}-launch.log" 2>&1 & ) \
+    < /dev/null > "$BG_TMP/pi-bg-${new_id}-launch.log" 2>&1
   for i in $(seq 1 "$retry_wait"); do
     [ -f "${rec_dir}/pi-bg-${new_id}.json" ] && break
     sleep 1
@@ -459,18 +460,22 @@ wd_dead_retry_dispatch() {
 }
 
 # wd_dead_retry_decide <ticket> <repo> <wt-dir|->: the classification-site
-# decision. Prints the action that gets PREPENDED to the DEAD reason
-# (the reason kv keeps the head - the embed shows it); prints nothing
-# when the plain embed is right. Called for DEAD class only (SILENT is
-# owned by #57's in-wrapper retry; HUNG/STALLED are not auto-retried).
+# decision. Sets the global WDR_ACTION (PREPENDED to the DEAD reason; the
+# reason kv keeps the head - the embed shows it), empty when the plain
+# embed is right. No $( ) capture: the launch below starts a pipeline
+# whose list subshell outlives the sweep and must not inherit the
+# caller's pipes. Called for DEAD class only (SILENT is owned by #57's
+# in-wrapper retry; HUNG/STALLED are not auto-retried).
+WDR_ACTION=""
 wd_dead_retry_decide() {
   local t="$1" wt="$3" rc
+  WDR_ACTION=""
   [ -f "${rec_dir}/pi-bg-${t}.json" ] || return 2  # pre-#51: embed only
   local st rt drS drT
   IFS=$'\x1f' read -r st rt drS drT _ _ _ _ < <(wd_rec_fields "$t")
   if [ -n "$rt" ]; then
     # this record already IS a retry: its death is the second death
-    echo "second death in chain (issue #110): retry died - human wake"
+    WDR_ACTION="second death in chain (issue #110): retry died - human wake"
     return 2
   fi
   case "$drS" in
@@ -489,8 +494,8 @@ wd_dead_retry_decide() {
   wd_dead_retry_dispatch "$t" "$wt"
   rc=$?
   case $rc in
-    0) echo "retry dispatched (issue #110)" ;;
-    1) echo "retry held: at cap - fires on a later sweep (issue #110)" ;;
+    0) WDR_ACTION="retry dispatched (issue #110)" ;;
+    1) WDR_ACTION="retry held: at cap - fires on a later sweep (issue #110)" ;;
     *) return 2 ;;
   esac
   return 0
@@ -653,8 +658,8 @@ for d in "$WT_DIR"/*/*/; do
   # reason (the reason kv keeps the head - the embed shows it). DRY/QUIET
   # skip the decision: the baseline run launches nothing.
   if [ "$kind" = "DEAD" ] && [ "$DRY" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
-    action="$(wd_dead_retry_decide "$t" "$repo" "$d")"
-    [ -n "$action" ] && reason="$action: $reason"
+    wd_dead_retry_decide "$t" "$repo" "$d" || true
+    [ -n "$WDR_ACTION" ] && reason="$WDR_ACTION: $reason"
   fi
 
   echo "[pi-bg-watchdog] $kind $repo/$t (last activity $last, $reason)"
@@ -723,8 +728,8 @@ if [ -d "$rec_dir" ]; then
     # SECOND death (the retry reuses the original's worktree dir, so the
     # dir sweep has already closed the original and skips it)
     if [ "$DRY" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
-      action="$(wd_dead_retry_decide "$rt" "cwd" "-")"
-      [ -n "$action" ] && reason="$action: $reason"
+      wd_dead_retry_decide "$rt" "cwd" "-" || true
+      [ -n "$WDR_ACTION" ] && reason="$WDR_ACTION: $reason"
     fi
     echo "[pi-bg-watchdog] DEAD cwd/$rt (last activity $last, $reason)"
     DT+=("$rt"); DREPO+=("cwd"); DP+=("${rcwd:--}")
