@@ -275,6 +275,9 @@ export function resetRuntimeStateForTest(): void {
   verboseOverride.clear();
   handoffInFlight = false;
   sessionStartTs = 0; // /status "up" baseline: no session_start in this test
+  interruptEntryInFlight.clear();
+  compactPlaceholders.clear();
+  setLivePlaceholderSnapshot(null);
 }
 function ensureRuntimeStateLoaded(): void {
   const dir = runtimeStateDir ?? "";
@@ -374,6 +377,7 @@ function consumeQueuedAck(
     }
   }
   renumberQueuedAcks(channelId);
+  persistLivePlaceholders(); // #84: the ack line left (or was renumbered)
 }
 
 /** Re-edit the channel's remaining queued acks so positions stay true
@@ -725,6 +729,234 @@ export function clearAllInterrupts(): void {
   interruptingChannels.clear();
   interruptCancelled.clear();
   interruptInFlight.clear();
+  interruptEntryInFlight.clear();
+  persistLivePlaceholders();
+}
+
+// ─── Live placeholder persistence (#84: crash settle) ───────────────────
+// A process death (OOM, SIGKILL, power loss) runs neither agent_end nor
+// session_shutdown — the working frame, SPEC B live text, in-flight
+// interrupt ack, open compact line, and queued-inbound acks freeze in the
+// channel. #173 settled the PLANNED death; this covers the unplanned one.
+// Every live placeholder is recorded here on post, cleared on settle (the
+// file exists iff a placeholder is live); the next real process start
+// (session_start reason "startup") reads the file and drives whatever
+// survived to a terminal state. Queued-inbound entry REDISPATCH is issue
+// #180's scope — here only the placeholder LINES are settled, plus the
+// spliced in-flight interrupt entry (the queue no longer holds it, so
+// nobody else redelivers it).
+interface LiveFrameRec {
+  channelId: string;
+  msgId: string;
+  /** Shown call count at snapshot time (0 -> startup deletes, not morphs). */
+  calls: number;
+  /** Last rendered UNFENCED working frame body (null when unrenderable). */
+  body: string | null;
+}
+interface LiveMsgRec {
+  channelId: string;
+  msgId: string;
+}
+interface LiveInterruptRec extends LiveMsgRec {
+  ackId: string | null;
+  text: string;
+  title: string;
+  display: string;
+}
+interface LiveQueueAckRec {
+  channelId: string;
+  /** The queued inbound message id the ack belongs to. */
+  inboundId: string;
+  ackId: string;
+  pos: number;
+}
+interface LivePlaceholderState {
+  v: 1;
+  frame: LiveFrameRec | null;
+  liveText: LiveMsgRec | null;
+  interrupts: LiveInterruptRec[];
+  compacts: LiveMsgRec[];
+  queueAcks: LiveQueueAckRec[];
+}
+
+/** Pre-rendered entry of an in-flight interrupt, kept alongside
+ *  interruptInFlight so a crash can redeliver it (#84). */
+const interruptEntryInFlight = new Map<
+  string,
+  { text: string; title: string; display: string }
+>();
+
+/** Pure-compact placeholder lines (armCompactTick only; restart-class op
+ *  windows are covered by the op marker, and #173's shutdown settles both). */
+const compactPlaceholders = new Map<string, string>(); // channelId -> msgId
+
+const LIVE_PLACEHOLDERS_FILE = "live-placeholders.json";
+
+/** Closure-scoped frame/live-text state, registered by the extension.
+ *  Null outside an extension instance (e.g. in unit scope). */
+let livePlaceholderSnapshot:
+  | (() => { frame: LiveFrameRec | null; liveText: LiveMsgRec | null })
+  | null = null;
+
+export function setLivePlaceholderSnapshot(
+  fn:
+    | (() => { frame: LiveFrameRec | null; liveText: LiveMsgRec | null })
+    | null,
+): void {
+  livePlaceholderSnapshot = fn;
+}
+
+function livePlaceholdersPath(): string | null {
+  return runtimeStateDir
+    ? path.join(runtimeStateDir, LIVE_PLACEHOLDERS_FILE)
+    : null;
+}
+
+/** Snapshot the queued-ack lines: acks whose entries are still in the
+ *  queue (an in-flight interrupt's ack rides its interrupt record instead). */
+function snapshotQueueAcks(): LiveQueueAckRec[] {
+  const out: LiveQueueAckRec[] = [];
+  for (const [messageId, ack] of queuedAcks) {
+    for (const [channelId, q] of midTurnQueues) {
+      if (!q.some((e) => e.msg.messageId === messageId)) continue;
+      out.push({
+        channelId,
+        inboundId: messageId,
+        ackId: ack.ackId,
+        pos: ack.pos,
+      });
+      break;
+    }
+  }
+  return out;
+}
+
+/** Rewrite <cwd>/.tmp/live-placeholders.json atomically (or unlink it when
+ *  no placeholder is live). Never throws — a persist failure must not break
+ *  the message path; the crash settle is best-effort on top. */
+export function persistLivePlaceholders(): void {
+  const p = livePlaceholdersPath();
+  if (!p) return;
+  try {
+    const snap = livePlaceholderSnapshot?.() ?? { frame: null, liveText: null };
+    const interrupts: LiveInterruptRec[] = [];
+    for (const [channelId, msgId] of interruptInFlight) {
+      const entry = interruptEntryInFlight.get(channelId);
+      if (!entry) continue;
+      interrupts.push({
+        channelId,
+        msgId,
+        ackId: queuedAcks.get(msgId)?.ackId ?? null,
+        ...entry,
+      });
+    }
+    const state: LivePlaceholderState = {
+      v: 1,
+      frame: snap.frame,
+      liveText: snap.liveText,
+      interrupts,
+      compacts: [...compactPlaceholders].map(([channelId, msgId]) => ({
+        channelId,
+        msgId,
+      })),
+      queueAcks: snapshotQueueAcks(),
+    };
+    const empty =
+      !state.frame &&
+      !state.liveText &&
+      state.interrupts.length === 0 &&
+      state.compacts.length === 0 &&
+      state.queueAcks.length === 0;
+    if (empty) {
+      unlinkLivePlaceholders();
+      return;
+    }
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tmp = `${p}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    console.error(
+      "[channel] live-placeholder persist failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
+}
+
+/** Read + validate the persisted record. `null` = no file or corrupt. */
+export function readLivePlaceholders(): LivePlaceholderState | null {
+  const p = livePlaceholdersPath();
+  if (!p) return null;
+  try {
+    const s = JSON.parse(fs.readFileSync(p, "utf8")) as any;
+    if (typeof s !== "object" || s?.v !== 1) return null;
+    const isMsgRec = (r: any): r is LiveMsgRec =>
+      !!r && typeof r.channelId === "string" && typeof r.msgId === "string";
+    return {
+      v: 1,
+      frame:
+        s.frame &&
+        typeof s.frame.channelId === "string" &&
+        typeof s.frame.msgId === "string"
+          ? {
+              channelId: s.frame.channelId,
+              msgId: s.frame.msgId,
+              calls: typeof s.frame.calls === "number" ? s.frame.calls : 0,
+              body: typeof s.frame.body === "string" ? s.frame.body : null,
+            }
+          : null,
+      liveText: isMsgRec(s.liveText) ? s.liveText : null,
+      interrupts: Array.isArray(s.interrupts)
+        ? (s.interrupts.filter(
+            (r: any) =>
+              !!r &&
+              typeof r.channelId === "string" &&
+              typeof r.msgId === "string" &&
+              typeof r.text === "string" &&
+              (r.ackId === null || typeof r.ackId === "string"),
+          ) as LiveInterruptRec[])
+        : [],
+      compacts: Array.isArray(s.compacts) ? s.compacts.filter(isMsgRec) : [],
+      queueAcks: Array.isArray(s.queueAcks)
+        ? s.queueAcks.filter(
+            (r: any) =>
+              !!r &&
+              typeof r.channelId === "string" &&
+              typeof r.inboundId === "string" &&
+              typeof r.ackId === "string",
+          )
+        : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Remove the record (best-effort; a missing file is the normal state). */
+export function unlinkLivePlaceholders(): void {
+  const p = livePlaceholdersPath();
+  if (!p) return;
+  try {
+    fs.unlinkSync(p);
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Simulate a process death for tests: drop the in-memory live state
+ * WITHOUT rewriting the persisted record — a crash runs no code, so the
+ * file must survive exactly as the live process last wrote it.
+ */
+export function simulateProcessDeathForTest(): void {
+  pendingInterrupts.clear();
+  interruptingChannels.clear();
+  interruptCancelled.clear();
+  interruptInFlight.clear();
+  interruptEntryInFlight.clear();
+  compactPlaceholders.clear();
+  midTurnQueues.clear();
+  queuedAcks.clear();
 }
 
 // ─── Compaction window (per channel) ─────────────────────────────────────
@@ -821,10 +1053,16 @@ function opBusyRefusal(channelId: string): string {
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
  *  fired without a completion event. */
 export function clearCompacting(channelId: string, warn = false): void {
+  // #84: the placeholder-line record follows the window's life
+  compactPlaceholders.delete(channelId);
   const e = compactingChannels.get(channelId);
-  if (!e) return;
+  if (!e) {
+    persistLivePlaceholders();
+    return;
+  }
   clearTimeout(e.timer);
   compactingChannels.delete(channelId);
+  persistLivePlaceholders();
   // F1: window closed = restart-class op cancelled — drop the pending
   // op-shutdown timer so its chain never runs.
   const opTimer = opShutdownTimers.get(channelId);
@@ -854,6 +1092,11 @@ function beginCompacting(
   const label = opts.label ?? "compacting";
   const rewindTo = opts.rewindTo ?? null;
   const timer = setTimeout(() => {
+    // #84: the completion event never arrived — settle the placeholder to a
+    // terminal line (a frozen counting tick is the stale placeholder this
+    // fix kills), then clear + drain as before. No-op for restart-class ops
+    // (their tick is not armed; the op marker covers them).
+    settleCompactTick(ch.id, "[!] compact stalled");
     clearCompacting(ch.id, true);
     drainQueuedAfterCompact(pi, ctx);
   }, COMPACT_FALLBACK_MS);
@@ -958,14 +1201,21 @@ export function armCompactTick(ch: ChannelConfig, msgId: string): void {
   armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>
     isCompacting(ch.id) ? opTickLine("compacting", secs) : null,
   );
+  compactPlaceholders.set(ch.id, msgId); // #84: crash settle for this line
+  persistLivePlaceholders();
 }
 
 export function settleCompactTick(channelId: string, text: string): boolean {
-  return settleOpTick(`compact:${channelId}`, text);
+  const ok = settleOpTick(`compact:${channelId}`, text);
+  compactPlaceholders.delete(channelId); // #84: settled = no longer live
+  persistLivePlaceholders();
+  return ok;
 }
 
 export function stopCompactTick(channelId: string): void {
   stopOpTick(`compact:${channelId}`);
+  compactPlaceholders.delete(channelId);
+  persistLivePlaceholders();
 }
 
 export function stopAllCompactTicks(): void {
@@ -1041,6 +1291,14 @@ export async function runMidRunInterrupt(
   }
   interruptingChannels.add(channelId);
   interruptInFlight.set(channelId, messageId);
+  // #84: record the spliced entry so a crash before sendToPi can redeliver
+  // it — the queue no longer holds it, so nobody else would.
+  interruptEntryInFlight.set(channelId, {
+    text: entry.text,
+    title: entry.title ?? "",
+    display: entry.display ?? entry.msg.body,
+  });
+  persistLivePlaceholders();
   console.log(
     `[channel] mid-run interrupt: aborting current step, then sending ${messageId}`,
   );
@@ -1177,6 +1435,8 @@ export async function runMidRunInterrupt(
     // The success and cap paths run synchronously from the settle-loop
     // exit, so they cannot leave a live flag behind.
     interruptCancelled.delete(channelId);
+    interruptEntryInFlight.delete(channelId); // #84: redelivery record is over
+    persistLivePlaceholders(); // #84: entry consumed (or restored to queue)
     // Fallback: if the tick was never armed (no ack) or settle raced, drop it.
     stopOpTick(`interrupt:${channelId}`);
   }
@@ -2398,6 +2658,28 @@ export default function (pi: ExtensionAPI) {
       console.error("[op] marker settle failed:", sanitizeUnknownValue(e));
     }
 
+    // Crash settle (#84): a process death that never ran agent_end /
+    // session_shutdown (OOM, SIGKILL, power loss) left live placeholders
+    // frozen in the channel — working frame, SPEC B live text, in-flight
+    // interrupt ack, compact line, queued acks. The previous process
+    // persisted them on every transition; drive whatever survived to a
+    // terminal state now. Real process starts only (reason "startup"): an
+    // in-process /new//reload re-fire must not settle placeholders the
+    // live process still owns. Queued-inbound entry REDISPATCH is issue
+    // #180's scope — here the placeholder LINES are settled, plus the
+    // spliced in-flight interrupt entry (the queue no longer holds it, so
+    // nobody else redelivers it).
+    if (event?.reason === "startup") {
+      try {
+        await settleCrashedPlaceholders(pi, ctx);
+      } catch (e) {
+        console.error(
+          "[channel] crash settle failed:",
+          sanitizeUnknownValue(e),
+        );
+      }
+    }
+
     // Post-restart wake (issue #111, P0): on a real process start
     // (reason "startup"), post ONE "back online" message — planned /
     // unplanned restart class + the in-flight pi-bg summary — to the
@@ -2654,48 +2936,14 @@ export default function (pi: ExtensionAPI) {
           `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
         );
     }
-    // #84 (remaining path; franky evidence 2026-10-05): a shutdown while a
-    // run is still active (handoff restart mid-run, crash, deploy) never
-    // fires agent_end — the ONLY place the working frame gets its terminal
-    // morph/delete — so the box stays frozen mid-count in the channel.
-    // Close it here with the SAME rules as agent_end (0 shown calls ->
-    // delete, else morph to a terminal state), before the disconnects
-    // below drop the channel state REST resolution needs.
-    if (
-      runOpen &&
-      statusMsgId &&
-      statusChannelId &&
-      statusMsgAt >= runStartedAt
-    ) {
-      const fch = channels.find(
-        (c) => c.id === statusChannelId && c.type === "discord",
-      );
-      if (fch) {
-        stopOpTick(`working:${statusChannelId}`); // no further tick edits
-        const lvl = verboseLevel(fch);
-        const shown = (
-          lvl === 1
-            ? toolCallsThisTurn.filter((c) => c.essential)
-            : toolCallsThisTurn
-        ).map((c) => c.action);
-        if (shown.length === 0) {
-          shutdownDeletes.push(
-            deleteDiscordMessage(fch, statusMsgId).catch(() => {}),
-          );
-        } else {
-          const secs = Math.round((Date.now() - runStartedAt) / 1000);
-          shutdownDeletes.push(
-            editDiscordMessage(
-              fch,
-              statusMsgId,
-              fence(runFrame("stopped", shown, shown.length, secs)),
-            ).catch(() => {}),
-          );
-        }
-        statusMsgId = null;
-        statusMsgAt = 0;
-      }
-    }
+    // #84 (settle owner): a shutdown while a run is still active (handoff
+    // restart mid-run, crash, deploy) never fires agent_end, so the working
+    // frame would freeze mid-count. Close it here through the same owner
+    // as agent_end (0 shown calls -> delete, else morph to the terminal
+    // state), before the disconnects below drop the channel state REST
+    // resolution needs.
+    if (runOpen)
+      settleWorkingFrame({ state: "stopped", deletes: shutdownDeletes });
     // SPEC B live text: agent_end's deleteLiveText never runs on a dying
     // process — the ephemeral line would stay frozen in the channel.
     if (liveTextMsgId && liveTextChannelId) {
@@ -2729,6 +2977,7 @@ export default function (pi: ExtensionAPI) {
       if (!t) continue;
       clearInterval(t.timer);
       opTicks.delete(`compact:${id}`);
+      compactPlaceholders.delete(id); // #84: record follows the settle
       shutdownDeletes.push(
         editDiscordMessage(
           t.ch,
@@ -2779,6 +3028,11 @@ export default function (pi: ExtensionAPI) {
     // Discord before the process dies. Worst case a few x ~300ms, well
     // inside the systemd stop timeout.
     await Promise.allSettled(shutdownDeletes);
+    // #84: crash-settle record — every placeholder above was driven to its
+    // terminal state in-process; drop the record so the respawn's startup
+    // settle is a no-op. After the await on purpose: a death mid-drain
+    // leaves the file behind and the startup settle retries the REST.
+    unlinkLivePlaceholders();
   });
 
   // ─── /undo store: non-git preimages ─────────────────────────────────
@@ -2834,7 +3088,9 @@ export default function (pi: ExtensionAPI) {
         return null;
       }
       // UNFENCED body: armOpTick fences exactly once (review F1).
-      return workingFrameBody(wch, Math.floor(secs / 5) * 5);
+      const body = workingFrameBody(wch, Math.floor(secs / 5) * 5);
+      persistLivePlaceholders(); // #84: keep the crash-settle body fresh
+      return body;
     });
   };
 
@@ -2866,6 +3122,7 @@ export default function (pi: ExtensionAPI) {
         if (r.success) {
           liveTextShown = next;
           liveTextAt = now;
+          persistLivePlaceholders(); // #84: live text refreshed
         } else
           console.error(
             `[channel] live-text edit failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -2885,6 +3142,7 @@ export default function (pi: ExtensionAPI) {
           liveTextChannelId = ch.id;
           liveTextAt = now;
           liveTextShown = next;
+          persistLivePlaceholders(); // #84: live text posted
         } else if (!r.success)
           console.error(
             `[channel] live-text post failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -2919,6 +3177,187 @@ export default function (pi: ExtensionAPI) {
         sanitizeUnknownValue(e),
       );
     }
+    persistLivePlaceholders(); // #84: the live text is gone
+  };
+
+  // ─── Working frame settle owner (#84: stale placeholders) ──────────
+  // The ONE place the working frame reaches a terminal state. Every
+  // exit path funnels here: agent_end (done/failed — including the
+  // finally net when a handler throw skips the close block), the
+  // run's channel switch at tool_call (stopped), session_shutdown
+  // (stopped; #173's inline settle is this call), and /verbose on->off
+  // (erase). Idempotent: it nulls the pointer, so a second settle is a
+  // no-op. Returns false when it left the pointer alone (not this
+  // run's frame, #38) so a caller can still reset it.
+  const settleWorkingFrame = (opts: {
+    state?: "done" | "failed" | "stopped";
+    erase?: boolean;
+    trailing?: string;
+    deletes?: Promise<unknown>[];
+    onlyChannelId?: string;
+    chFallback?: ChannelConfig | null;
+  }): boolean => {
+    const msgId = statusMsgId;
+    const fchId = statusChannelId;
+    if (!msgId || !fchId) return false;
+    if (opts.onlyChannelId && fchId !== opts.onlyChannelId) return false;
+    // Only close a frame created by THIS run (statusMsgAt >=
+    // runStartedAt): a verbose-off run must not touch the previous run's
+    // terminal line (#38).
+    if (statusMsgAt < runStartedAt) return false;
+    // Channel resolution: the caller's captured channel (inbound-fresh)
+    // when it matches, then the session config, then a live re-load —
+    // the closure `channels` is empty before session_start (tests and
+    // the earliest events), which is exactly when a /verbose off can hit.
+    let fch: ChannelConfig | undefined;
+    if (opts.chFallback && opts.chFallback.id === fchId) fch = opts.chFallback;
+    else {
+      fch = channels.find((c) => c.id === fchId && c.type === "discord");
+      if (!fch) {
+        const rc = resolveChannel(fchId);
+        if (rc && rc.type === "discord") fch = rc;
+      }
+    }
+    statusMsgId = null;
+    statusMsgAt = 0;
+    stopOpTick(`working:${fchId}`);
+    if (fch) {
+      const lvl = verboseLevel(fch);
+      const shown = (
+        lvl === 1
+          ? toolCallsThisTurn.filter((c) => c.essential)
+          : toolCallsThisTurn
+      ).map((c) => c.action);
+      const p =
+        opts.erase || shown.length === 0
+          ? deleteDiscordMessage(fch, msgId).catch(() => {})
+          : editDiscordMessage(
+              fch,
+              msgId,
+              fence(
+                runFrame(
+                  opts.state ?? "stopped",
+                  shown,
+                  shown.length,
+                  Math.round((Date.now() - runStartedAt) / 1000),
+                  opts.trailing,
+                ),
+              ),
+            ).catch(() => {});
+      if (opts.deletes) opts.deletes.push(p);
+    }
+    persistLivePlaceholders(); // #84: frame record cleared
+    return true;
+  };
+
+  // Crash settle (#84): persist the live working frame + SPEC B live text
+  // on every transition so the next process start can drive them to a
+  // terminal state. The body is re-rendered from the CURRENT call list at
+  // the 5s step, so a crash mid-tick resumes from the last whole step.
+  setLivePlaceholderSnapshot(() => {
+    const msgId = statusMsgId;
+    const fchId = statusChannelId;
+    let frame: LiveFrameRec | null = null;
+    if (msgId && fchId) {
+      const fch = channels.find((c) => c.id === fchId && c.type === "discord");
+      const secs =
+        Math.floor(Math.max(0, Date.now() - runStartedAt) / 1000 / 5) * 5;
+      const lvl = fch ? verboseLevel(fch) : 2;
+      const shown = (
+        lvl === 1
+          ? toolCallsThisTurn.filter((c) => c.essential)
+          : toolCallsThisTurn
+      ).map((c) => c.action);
+      frame = {
+        channelId: fchId,
+        msgId,
+        calls: shown.length,
+        body: fch ? workingFrameBody(fch, secs) : null,
+      };
+    }
+    const liveText =
+      liveTextMsgId && liveTextChannelId
+        ? { channelId: liveTextChannelId, msgId: liveTextMsgId }
+        : null;
+    return { frame, liveText };
+  });
+
+  /** #84: drive the crash-surviving placeholders (live-placeholders.json)
+   *  to a terminal state on a real process start. All REST in parallel,
+   *  awaited so the channel is settled before the wake post; the record is
+   *  unlinked once the calls land. */
+  const settleCrashedPlaceholders = async (
+    pi: ExtensionAPI,
+    _ctx: ExtensionContext,
+  ): Promise<void> => {
+    const state = readLivePlaceholders();
+    if (!state) return;
+    const rest: Promise<unknown>[] = [];
+    const chOf = (id: string): ChannelConfig | null =>
+      channels.find((c) => c.id === id && c.type === "discord") ?? null;
+    if (state.frame) {
+      const fch = chOf(state.frame.channelId);
+      if (fch) {
+        // Same rules as the in-process settles: 0 shown calls (or an
+        // unrenderable body) -> delete; else the header flips working ->
+        // stopped in place (the recorded body is the last whole 5s step).
+        rest.push(
+          (state.frame.calls === 0 || !state.frame.body
+            ? deleteDiscordMessage(fch, state.frame.msgId)
+            : editDiscordMessage(
+                fch,
+                state.frame.msgId,
+                fence(state.frame.body.replace(/^┌ working/, "┌ stopped")),
+              )
+          ).catch(() => {}),
+        );
+      }
+    }
+    if (state.liveText) {
+      const ch = chOf(state.liveText.channelId);
+      if (ch)
+        rest.push(
+          deleteDiscordMessage(ch, state.liveText.msgId).catch(() => {}),
+        );
+    }
+    for (const c of state.compacts) {
+      const ch = chOf(c.channelId);
+      if (!ch) continue;
+      rest.push(
+        editDiscordMessage(
+          ch,
+          c.msgId,
+          fence("[!] compact interrupted - restart"),
+        ).catch(() => {}),
+      );
+    }
+    for (const q of state.queueAcks) {
+      const kept = (midTurnQueues.get(q.channelId) ?? []).some(
+        (e) => e.msg.messageId === q.inboundId,
+      );
+      if (kept) continue; // #180 restored the entry: its drain owns the ack
+      const ch = chOf(q.channelId);
+      if (ch) rest.push(deleteDiscordMessage(ch, q.ackId).catch(() => {}));
+    }
+    for (const r of state.interrupts) {
+      const ch = chOf(r.channelId);
+      if (!ch) continue;
+      // The entry was spliced out of the queue before the crash —
+      // redeliver it as a fresh run (the in-process interrupt success
+      // path, minus the tick), then clear its ack line.
+      lastActiveChannel = ch; // the fresh run's frame lands on its channel
+      try {
+        sendToPi(pi, r.channelId, r.text, r.title, r.display, r.msgId);
+      } catch (e) {
+        console.error(
+          "[channel] crash-settle interrupt redelivery failed:",
+          sanitizeUnknownValue(e),
+        );
+      }
+      if (r.ackId) rest.push(deleteDiscordMessage(ch, r.ackId).catch(() => {}));
+    }
+    if (rest.length > 0) await Promise.allSettled(rest);
+    unlinkLivePlaceholders();
   };
 
   // Display gate (#38): called on a live /verbose on->off transition —
@@ -2927,12 +3366,9 @@ export default function (pi: ExtensionAPI) {
   // verbose comes back on. runChannelCommand is module-level, so the
   // closure hands this in instead of reaching for the state directly.
   const deleteLiveStatusBlock = async (ch: ChannelConfig) => {
-    if (statusMsgId && statusChannelId === ch.id) {
-      await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
-      statusMsgId = null;
-      statusMsgAt = 0;
-      stopOpTick(`working:${ch.id}`);
-    }
+    // #84: the frame's terminal-state owner (erase: delete, no morph).
+    // Channel-scoped: a /verbose off on ch1 must not kill ch2's live frame.
+    settleWorkingFrame({ erase: true, onlyChannelId: ch.id, chFallback: ch });
     // SPEC B: the ephemeral live-text message goes with the block.
     await deleteLiveText(ch);
   };
@@ -2942,8 +3378,12 @@ export default function (pi: ExtensionAPI) {
     if (!lastActiveChannel) return;
     const ch = lastActiveChannel;
     if (statusChannelId !== ch.id) {
-      // new channel: this channel gets its own block (old channel's stays)
-      statusMsgId = null;
+      // #84: the run's display is moving channels — settle the old
+      // channel's frame in place (a frozen mid-count box is the stale
+      // placeholder this fix kills) before this channel takes over.
+      settleWorkingFrame({ state: "stopped" });
+      statusMsgId = null; // covers a not-this-run frame the owner left (#38)
+      statusMsgAt = 0;
       statusChannelId = ch.id;
     }
     if (!runOpen) {
@@ -2986,6 +3426,7 @@ export default function (pi: ExtensionAPI) {
             statusMsgId = r.messageId;
             statusMsgAt = Date.now();
             armWorkingTick();
+            persistLivePlaceholders(); // #84: frame posted
           } else if (!r.success)
             console.error(
               `[channel] status send failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -2996,6 +3437,7 @@ export default function (pi: ExtensionAPI) {
             console.error(
               `[channel] status edit failed: ${sanitizeSensitiveText(r.error || "")}`,
             );
+          else persistLivePlaceholders(); // #84: frame refreshed
         }
       } catch {}
     }
@@ -3027,15 +3469,25 @@ export default function (pi: ExtensionAPI) {
       statusMsgAt = 0;
       // SPEC B: fresh run, fresh ephemeral text slot. A leftover message
       // from an abnormal run end is deleted here (agent_end normally
-      // already did); the pointers are cleared either way.
-      if (liveTextMsgId && liveTextChannelId === ch.id)
-        deleteDiscordMessage(ch, liveTextMsgId).catch(() => {});
+      // already did); the pointers are cleared either way. #84: delete it
+      // on ITS channel — lastActiveChannel may have moved mid-run.
+      {
+        const ltId = liveTextMsgId;
+        const ltChId = liveTextChannelId;
+        if (ltId && ltChId) {
+          const ltCh = channels.find(
+            (c) => c.id === ltChId && c.type === "discord",
+          );
+          if (ltCh) deleteDiscordMessage(ltCh, ltId).catch(() => {});
+        }
+      }
       liveTextMsgId = null;
       liveTextChannelId = null;
       liveTextAt = 0;
       liveTextShown = null;
       liveTextLatest = null;
       liveTextArmed = false;
+      persistLivePlaceholders(); // #84: pointers cleared for the new run
       // /undo store: capture the pre-run state (once per run). Best-effort:
       // a snapshot failure must never break the run.
       try {
@@ -3059,6 +3511,7 @@ export default function (pi: ExtensionAPI) {
           statusChannelId = ch.id;
           statusMsgAt = Date.now();
           armWorkingTick();
+          persistLivePlaceholders(); // #84: frame posted
         }
       }
     }
@@ -3315,236 +3768,253 @@ export default function (pi: ExtensionAPI) {
   // step. A run can contain several (steering messages interrupt the
   // turn), so forward every one of them.
   pi.on("agent_end", async (event, ctx) => {
-    // Clear turn state FIRST: since step-finals are forwarded at
-    // message_end, a normal turn reaches agent_end with finals.length === 0
-    // and the early return below. Clearing at the bottom leaked the typing
-    // timer (typing indicator ran forever) and left agentBusy stuck (presence
-    // stuck on "working") — 2026-09-08.
-    if (typingTimer) {
-      clearInterval(typingTimer);
-      typingTimer = null;
-    }
-    stopOpTickPrefix("working:");
-    agentBusy = false;
-    refreshActivity(ctx);
-    // /undo store: finalize THIS run's snapshot before the re-wake below
-    // hands the queue to pi (so the post-state reflects this run, not the
-    // next). Best-effort: a snapshot failure must never break run end.
+    // #84: the finally net below settles the working frame if ANY throw
+    // skips the close block (the tick stops at the top of this handler, so
+    // a skip would leave the box frozen mid-count).
+    let runStats: UsageStats = {
+      turns: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    };
     try {
-      if (undoRun) {
-        // F3: record whether this run actually answered, so /undo skips
-        // empty runs (/stop before the first step) instead of cutting the
-        // previous run's conversation while keeping this run's file state.
-        const assistantOutput = (event.messages ?? []).some((m: any) => {
-          if (m?.role !== "assistant") return false;
-          if (Array.isArray(m.content)) {
-            return m.content.some(
-              (b: any) =>
-                b?.type === "text" &&
-                typeof b.text === "string" &&
-                b.text.trim() !== "",
-            );
-          }
-          return typeof m.content === "string" && m.content.trim() !== "";
-        });
-        finishRun(undoRun, ctx.cwd, safeSessionFile(ctx), assistantOutput);
-        undoRun = null;
+      // Clear turn state FIRST: since step-finals are forwarded at
+      // message_end, a normal turn reaches agent_end with finals.length === 0
+      // and the early return below. Clearing at the bottom leaked the typing
+      // timer (typing indicator ran forever) and left agentBusy stuck (presence
+      // stuck on "working") — 2026-09-08.
+      if (typingTimer) {
+        clearInterval(typingTimer);
+        typingTimer = null;
       }
-    } catch (e) {
-      undoRun = null;
-      console.error("[undo] finish failed:", sanitizeUnknownValue(e));
-    }
-    // Deferred /compact (queued while this run was in progress). The
-    // IIFE inside pi's compact() awaits abort()+waitForIdle() before it
-    // compacts, so it runs only after this run settles (including the
-    // re-wake continuation below) and cannot abort that run.
-    flushPendingCompact(ctx);
+      stopOpTickPrefix("working:");
+      agentBusy = false;
+      refreshActivity(ctx);
+      // /undo store: finalize THIS run's snapshot before the re-wake below
+      // hands the queue to pi (so the post-state reflects this run, not the
+      // next). Best-effort: a snapshot failure must never break run end.
+      try {
+        if (undoRun) {
+          // F3: record whether this run actually answered, so /undo skips
+          // empty runs (/stop before the first step) instead of cutting the
+          // previous run's conversation while keeping this run's file state.
+          const assistantOutput = (event.messages ?? []).some((m: any) => {
+            if (m?.role !== "assistant") return false;
+            if (Array.isArray(m.content)) {
+              return m.content.some(
+                (b: any) =>
+                  b?.type === "text" &&
+                  typeof b.text === "string" &&
+                  b.text.trim() !== "",
+              );
+            }
+            return typeof m.content === "string" && m.content.trim() !== "";
+          });
+          finishRun(undoRun, ctx.cwd, safeSessionFile(ctx), assistantOutput);
+          undoRun = null;
+        }
+      } catch (e) {
+        undoRun = null;
+        console.error("[undo] finish failed:", sanitizeUnknownValue(e));
+      }
+      // Deferred /compact (queued while this run was in progress). The
+      // IIFE inside pi's compact() awaits abort()+waitForIdle() before it
+      // compacts, so it runs only after this run settles (including the
+      // re-wake continuation below) and cannot abort that run.
+      flushPendingCompact(ctx);
 
-    // Proactive token-% gate (first shot): context at/over the handoff
-    // threshold with nothing in flight → the same compact /compact runs.
-    // Deferred one macrotask like the size gate — if the re-wake run below
-    // starts before the timer fires, the gate skips (not idle). The
-    // RELIABLE shot is the agent_settled listener below (issue #85): pi
-    // clears the run-active flag (isIdle → true) only AFTER this awaited
-    // handler resolves, so on runs that await Discord I/O the timer fires
-    // while isIdle() is still false and this shot bails. A flush-started
-    // compact above already owns the op window, so the gate yields to it.
-    autoCompactByToken(pi, ctx);
+      // Proactive token-% gate (first shot): context at/over the handoff
+      // threshold with nothing in flight → the same compact /compact runs.
+      // Deferred one macrotask like the size gate — if the re-wake run below
+      // starts before the timer fires, the gate skips (not idle). The
+      // RELIABLE shot is the agent_settled listener below (issue #85): pi
+      // clears the run-active flag (isIdle → true) only AFTER this awaited
+      // handler resolves, so on runs that await Discord I/O the timer fires
+      // while isIdle() is still false and this shot bails. A flush-started
+      // compact above already owns the op window, so the gate yields to it.
+      autoCompactByToken(pi, ctx);
 
-    // Capture the run's channel BEFORE the re-wake await: a second channel's
-    // inbound can arrive during that await and overwrite lastActiveChannel,
-    // which would mis-target this run's activity block, failure post, and
-    // finals. The re-wake message's own run will get a fresh agent_end with
-    // its own captured channel.
-    const ch = lastActiveChannel;
+      // Capture the run's channel BEFORE the re-wake await: a second channel's
+      // inbound can arrive during that await and overwrite lastActiveChannel,
+      // which would mis-target this run's failure post and finals. The
+      // re-wake message's own run will get a fresh agent_end with its own
+      // captured channel. (The frame settle is channel-independent: the owner
+      // resolves the frame's OWN channel — #84.)
+      const ch = lastActiveChannel;
 
-    // SPEC B: clear the ephemeral live-text message on run end — error,
-    // stop, timeout, or a final delivered on this path instead of
-    // message_end. Before the re-wake below: the next run's turn_start
-    // would otherwise reset the pointers and orphan this run's message.
-    // Best effort — logged, never breaks the run.
-    if (ch) await deleteLiveText(ch);
-
-    // #40: keep the last completed run's usage for /usage last. Any run
-    // with billable tokens, done or failed (the synthetic failure message
-    // carries empty usage, so a hard-failed run keeps the previous value).
-    const runStats = sumRunUsage(event.messages ?? []);
-    if (hasUsage(runStats))
-      lastRunUsage.value = { stats: runStats, at: new Date() };
-
-    // Re-wake: inbounds that arrived while this run was in flight were queued
-    // (not steered into it) so they cannot be swallowed. Start a fresh run for
-    // the oldest queued one now. Awaiting it guarantees the message is handed
-    // to pi before this handler returns, so the new turn actually starts
-    // (triggerTurn; pi continues the run for a steer queued at agent_end).
-    // Repeats on each agent_end until the queue drains.
-    //
-    // YIELD TO IN-FLIGHT INTERRUPTS (any channel): an in-flight interrupt's
-    // settle loop is waiting on isIdle() so its message can start the next
-    // run. A re-wake run started here would hold isIdle() false for the run's
-    // whole duration (minutes), the interrupt would burn its 120 s settle
-    // cap, and its placeholder would linger until a later re-wake finally
-    // delivered it (2026-09-30 incident: re-wake run started 2 s after the
-    // abort and ate the entire settle window). The entries stay queued
-    // (FIFO position and acks intact — nothing popped); the interrupt run's
-    // own agent_end re-wakes them. /stop in the window clears only its OWN
-    // channel's queue (non-held) — cross-channel entries are rescued by the
-    // interrupt cancel branch's re-wake kick (runMidRunInterrupt); held
-    // channels are skipped by popOldestQueuedInbound. Nothing is lost or
-    // double-sent.
-    if (interruptingChannels.size > 0) {
-      console.log(
-        `[channel] re-wake deferred: interrupt in flight (${[...interruptingChannels].join(", ")})`,
-      );
-    } else {
-      const queued = popOldestQueuedInbound();
-      if (queued) {
-        console.log(
-          `[channel] re-wake: starting run for queued mid-turn inbound (${queued.channelId})`,
-        );
-        try {
-          await handleInbound(pi, queued.msg, ctx, true);
-        } catch (e) {
-          console.error("[channel] re-wake failed:", sanitizeUnknownValue(e));
+      // SPEC B: clear the ephemeral live-text message on run end — error,
+      // stop, timeout, or a final delivered on this path instead of
+      // message_end. Before the re-wake below: the next run's turn_start
+      // would otherwise reset the pointers and orphan this run's message.
+      // #84: delete it on ITS OWN channel — lastActiveChannel may have
+      // moved mid-run. Best effort — logged, never breaks the run.
+      {
+        const ltId = liveTextMsgId;
+        const ltChId = liveTextChannelId;
+        if (ltId && ltChId) {
+          const ltCh =
+            channels.find((c) => c.id === ltChId && c.type === "discord") ??
+            (ch && ch.id === ltChId ? ch : null);
+          if (ltCh) await deleteLiveText(ltCh);
         }
       }
-    }
 
-    if (!ch) return;
+      // #40: keep the last completed run's usage for /usage last. Any run
+      // with billable tokens, done or failed (the synthetic failure message
+      // carries empty usage, so a hard-failed run keeps the previous value).
+      runStats = sumRunUsage(event.messages ?? []);
+      if (hasUsage(runStats))
+        lastRunUsage.value = { stats: runStats, at: new Date() };
 
-    const finals = collectFinals(event.messages ?? []);
-
-    // close the activity block: 0 tool calls -> delete it (a leftover
-    // "done · 0 calls" box is noise); otherwise it stays up showing the run.
-    // Only close a block created by THIS run (statusMsgAt >= runStartedAt):
-    // a verbose-off run leaves statusMsgId pointing at the previous run's
-    // line, which history keeps as-is (#38).
-    if (
-      statusMsgId &&
-      statusChannelId === ch.id &&
-      statusMsgAt >= runStartedAt
-    ) {
-      // #10: level 1 shows essential calls only; a run whose calls are all
-      // non-essential closes like a 0-call run (delete the block).
-      const lvl = verboseLevel(ch);
-      const shownActions = (
-        lvl === 1
-          ? toolCallsThisTurn.filter((c) => c.essential)
-          : toolCallsThisTurn
-      ).map((c) => c.action);
-      if (shownActions.length === 0) {
-        await deleteDiscordMessage(ch, statusMsgId).catch(() => {});
+      // Re-wake: inbounds that arrived while this run was in flight were queued
+      // (not steered into it) so they cannot be swallowed. Start a fresh run for
+      // the oldest queued one now. Awaiting it guarantees the message is handed
+      // to pi before this handler returns, so the new turn actually starts
+      // (triggerTurn; pi continues the run for a steer queued at agent_end).
+      // Repeats on each agent_end until the queue drains.
+      //
+      // YIELD TO IN-FLIGHT INTERRUPTS (any channel): an in-flight interrupt's
+      // settle loop is waiting on isIdle() so its message can start the next
+      // run. A re-wake run started here would hold isIdle() false for the run's
+      // whole duration (minutes), the interrupt would burn its 120 s settle
+      // cap, and its placeholder would linger until a later re-wake finally
+      // delivered it (2026-09-30 incident: re-wake run started 2 s after the
+      // abort and ate the entire settle window). The entries stay queued
+      // (FIFO position and acks intact — nothing popped); the interrupt run's
+      // own agent_end re-wakes them. /stop in the window clears only its OWN
+      // channel's queue (non-held) — cross-channel entries are rescued by the
+      // interrupt cancel branch's re-wake kick (runMidRunInterrupt); held
+      // channels are skipped by popOldestQueuedInbound. Nothing is lost or
+      // double-sent.
+      if (interruptingChannels.size > 0) {
+        console.log(
+          `[channel] re-wake deferred: interrupt in flight (${[...interruptingChannels].join(", ")})`,
+        );
       } else {
-        const secs = Math.round((Date.now() - runStartedAt) / 1000);
-        const failed = !!failurePostText(event.messages ?? [], userStoppedRun);
-        // #40: run usage as the trailing frame line (append-only, before
-        // the closing bar; same 40-col budget as every other line).
-        const trailing = runUsageLine(runStats) ?? undefined;
-        // live-frame unification: the morph edits the SAME working message
-        // in place — only the header flips. fence() keeps the box glyphs
-        // monospace (mockup3: "frames live in code fences only").
-        await editDiscordMessage(
-          ch,
-          statusMsgId,
-          fence(
-            runFrame(
-              failed ? "failed" : "done",
-              shownActions,
-              shownActions.length,
-              secs,
-              trailing,
-            ),
-          ),
-        ).catch(() => {});
-      }
-    }
-    runOpen = false;
-
-    toolCallsThisTurn = [];
-
-    const send = (text: string, replyTo?: string) => {
-      const files = detectAttachmentFiles(text);
-      return sendFinalWithFiles(ch, text, files, replyTo);
-    };
-
-    if (finals.length === 0) {
-      // Surface silent run failures (A2): without this, a model/API error
-      // (empty-text failure message) ends the run with no channel output.
-      const failText = failurePostText(event.messages ?? [], userStoppedRun);
-      userStoppedRun = false;
-      if (failText) {
-        try {
-          const r = await send(failText);
-          if (!r.success)
-            console.error(
-              `[channel] error post failed: ${sanitizeSensitiveText(r.error || "")}`,
-            );
-        } catch {}
-      }
-      return;
-    }
-    userStoppedRun = false;
-
-    for (const f of finals) {
-      if (recordFinalRepeat(ch.id, f.text)) {
-        // Repetition loop (seen across the whole run, incl. the
-        // message_end path): one warning, abort, skip the repeated final.
-        userStoppedRun = true;
-        if (ch.type === "discord") {
+        const queued = popOldestQueuedInbound();
+        if (queued) {
+          console.log(
+            `[channel] re-wake: starting run for queued mid-turn inbound (${queued.channelId})`,
+          );
           try {
-            const r = await send(REPEAT_WARNING);
+            await handleInbound(pi, queued.msg, ctx, true);
+          } catch (e) {
+            console.error("[channel] re-wake failed:", sanitizeUnknownValue(e));
+          }
+        }
+      }
+
+      if (!ch) return;
+
+      const finals = collectFinals(event.messages ?? []);
+
+      // Close the activity block (single owner, #84): 0 tool calls ->
+      // delete (a leftover "done · 0 calls" box is noise); otherwise it
+      // stays up showing the run. The owner resolves the frame's OWN
+      // channel (lastActiveChannel may have moved mid-run) and only
+      // closes a block created by THIS run (statusMsgAt >= runStartedAt):
+      // a verbose-off run leaves statusMsgId pointing at the previous
+      // run's line, which history keeps as-is (#38).
+      settleWorkingFrame({
+        state: failurePostText(event.messages ?? [], userStoppedRun)
+          ? "failed"
+          : "done",
+        trailing: runUsageLine(runStats) ?? undefined,
+        chFallback: ch,
+      });
+      runOpen = false;
+
+      toolCallsThisTurn = [];
+
+      const send = (text: string, replyTo?: string) => {
+        const files = detectAttachmentFiles(text);
+        return sendFinalWithFiles(ch, text, files, replyTo);
+      };
+
+      if (finals.length === 0) {
+        // Surface silent run failures (A2): without this, a model/API error
+        // (empty-text failure message) ends the run with no channel output.
+        const failText = failurePostText(event.messages ?? [], userStoppedRun);
+        userStoppedRun = false;
+        if (failText) {
+          try {
+            const r = await send(failText);
             if (!r.success)
               console.error(
-                `[channel] repetition warning failed: ${sanitizeSensitiveText(r.error || "")}`,
+                `[channel] error post failed: ${sanitizeSensitiveText(r.error || "")}`,
               );
           } catch {}
+        }
+        return;
+      }
+      userStoppedRun = false;
+
+      for (const f of finals) {
+        if (recordFinalRepeat(ch.id, f.text)) {
+          // Repetition loop (seen across the whole run, incl. the
+          // message_end path): one warning, abort, skip the repeated final.
+          userStoppedRun = true;
+          if (ch.type === "discord") {
+            try {
+              const r = await send(REPEAT_WARNING);
+              if (!r.success)
+                console.error(
+                  `[channel] repetition warning failed: ${sanitizeSensitiveText(r.error || "")}`,
+                );
+            } catch {}
+            try {
+              ctx.abort();
+            } catch {}
+          }
+          continue;
+        }
+        const chunks = chunkText(f.text, 1900);
+        for (let i = 0; i < chunks.length; i++) {
           try {
-            ctx.abort();
+            const r = await send(chunks[i], i === 0 ? f.replyTo : undefined);
+            if (!r.success)
+              console.error(
+                `[channel] send failed: ${sanitizeSensitiveText(r.error || "")}`,
+              );
           } catch {}
         }
-        continue;
+        // Peer auto-forward (b): same rule as the message_end path — a
+        // final delivered here (not caught by the early send) that
+        // targets a peer agent's message is relayed to the peer channel.
+        if (f.replyTo) await forwardPeerReply(ch, f.text, f.replyTo);
+        // Clear the ack even when every chunk failed, so a failed reply
+        // does not leave a stale 👀 on the user's message.
+        if (ch.type === "discord" && f.replyTo) {
+          const token = getDiscordToken(ch.id) || ch.botToken;
+          const channelId = getDiscordChannelId(ch.id);
+          if (token && channelId)
+            unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
+        }
       }
-      const chunks = chunkText(f.text, 1900);
-      for (let i = 0; i < chunks.length; i++) {
-        try {
-          const r = await send(chunks[i], i === 0 ? f.replyTo : undefined);
-          if (!r.success)
-            console.error(
-              `[channel] send failed: ${sanitizeSensitiveText(r.error || "")}`,
-            );
-        } catch {}
-      }
-      // Peer auto-forward (b): same rule as the message_end path — a
-      // final delivered here (not caught by the early send) that
-      // targets a peer agent's message is relayed to the peer channel.
-      if (f.replyTo) await forwardPeerReply(ch, f.text, f.replyTo);
-      // Clear the ack even when every chunk failed, so a failed reply
-      // does not leave a stale 👀 on the user's message.
-      if (ch.type === "discord" && f.replyTo) {
-        const token = getDiscordToken(ch.id) || ch.botToken;
-        const channelId = getDiscordChannelId(ch.id);
-        if (token && channelId)
-          unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
+    } finally {
+      // #84: last line of defense — the frame reaches a terminal state on
+      // EVERY exit path. No-op on the normal path (the close above already
+      // settled it and nulled the pointer).
+      let state: "done" | "failed" = "done";
+      let trailing: string | undefined;
+      try {
+        state = failurePostText(event.messages ?? [], userStoppedRun)
+          ? "failed"
+          : "done";
+        trailing = runUsageLine(runStats) ?? undefined;
+      } catch {}
+      try {
+        settleWorkingFrame({
+          state,
+          trailing,
+          chFallback: lastActiveChannel,
+        });
+      } catch (e) {
+        console.error(
+          "[channel] agent_end frame settle failed:",
+          sanitizeUnknownValue(e),
+        );
       }
     }
   });
@@ -6287,6 +6757,7 @@ export async function handleInbound(
             msg.messageId,
             res.messageId,
           );
+          persistLivePlaceholders(); // #84: the ack line is live
         }
       })
       .catch(() => {});
