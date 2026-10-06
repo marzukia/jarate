@@ -323,9 +323,13 @@ PY
       [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
     done
     if [ "$ok" -eq 0 ]; then
-      printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
-        "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
+      # self-contained letter (issue #53): the watchdog re-posts it on a
+      # later sweep. The body is embedded NOW (rm -f below would dangle
+      # a `body     : <path>` reference).
+      { printf 'ticket   : %s\nevent    : kill\nhttp     : %s (3 attempts)\nwhen     : %s\n' \
+          "$id" "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf -- '--- body json ---\n'
+        cat "$bodyf" 2>/dev/null; } > "$BG_TMP/pi-bg-${id}-kill-webhook-failed"
       echo "jarate-bg-kill: webhook FAILED (http=$code) - dead letter: $BG_TMP/pi-bg-${id}-kill-webhook-failed" >&2
     fi
     rm -f "$bodyf"

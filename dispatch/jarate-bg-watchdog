@@ -70,6 +70,18 @@
 #       judgeable from inside (rc + quiet tail, process still alive).
 #       Under --quiet the retry is off unless PI_BG_WATCHDOG_RETRY=1
 #       (posts stay suppressed - the quiet contract is no posts).
+#   4f. dead-letter consumption (issue #53): a callback that failed all
+#       3 post attempts (webhook down, bridge restart gap) leaves a dead
+#       letter (jarate-bg pi-bg-<id>-webhook-failed, jarate-bg-kill
+#       pi-bg-<id>-kill-webhook-failed) and the orchestrator never wakes
+#       on a DIED it never sees. Each sweep re-posts every letter whose
+#       JSON body is recoverable (embedded after the `--- body json ---`
+#       marker; pre-#53 letters fall back to the `body     : <path>`
+#       file while it exists): a [bg:...] content post wakes the channel
+#       (queue-only, #177/#179). Success: wb-status re-post note +
+#       letter deleted (exactly-once). Failure: letter kept for the next
+#       sweep. No lock (one 15-min timer per box; a double sweep
+#       double-posts at most).
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -543,7 +555,12 @@ wd_post() {
   for i in 1 2 3; do
     code="$(curl -s -o "$BG_TMP/pi-bg-watchdog-wb-resp.txt" -w '%{http_code}' -X POST "$webhook" \
       -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
-    case "$code" in 2*) return 0 ;; esac
+    case "$code" in
+      2*) # the dead-letter consumer (issue #53) records this code in the
+          # ticket's wb-status; the resp file holds the body, not the code
+          printf '%s\n' "$code" > "$BG_TMP/pi-bg-watchdog-wb-code" 2>/dev/null
+          return 0 ;;
+    esac
     [ "$i" -lt 3 ] && sleep $((i * 3))
   done
   echo "[pi-bg-watchdog] webhook FAILED (http=$code) for body: $body" >&2
@@ -1285,6 +1302,65 @@ PY
   rm -f "$bodyf"
 fi
 
+# ─── dead-letter consumption (issue #53) ──────────────────────────────────────
+# A callback that failed all 3 post attempts (webhook down, bridge restart
+# gap) writes a dead letter (jarate-bg: pi-bg-<id>-webhook-failed,
+# jarate-bg-kill: pi-bg-<id>-kill-webhook-failed) and forgets it - the
+# orchestrator never wakes on a DIED it never sees. Since #53 the letter
+# embeds the JSON body after the `--- body json ---` marker (pre-#53
+# letters reference a body file the launcher's tmp cleanup deletes -
+# best-effort fallback if it still exists). Each sweep re-posts every
+# letter with a recoverable, JSON-valid body: a `[bg:...]` content post
+# wakes the channel (queue-only, issues #177/#179), the embed lands in the
+# /jobs history. On success: the ticket's wb-status gets a re-post note
+# and the letter is deleted (exactly-once). On failure: the letter stays
+# for the next sweep. No lock (house style: one 15-min timer per box; a
+# double sweep double-posts at most, the [bg: dedupe in the bridge keeps
+# that to one wake).
+dl_consumed=0
+if [ -n "$webhook" ]; then
+  for letter in "$BG_TMP"/pi-bg-*-webhook-failed \
+                "$LEGACY_TMP"/pi-bg-*-webhook-failed \
+                "$BG_TMP"/pi-bg-*-kill-webhook-failed \
+                "$LEGACY_TMP"/pi-bg-*-kill-webhook-failed; do
+    [ -f "$letter" ] || continue
+    base="${letter##*/pi-bg-}"
+    case "$base" in
+      *-kill-webhook-failed) dl_t="${base%-kill-webhook-failed}" ;;
+      *)                     dl_t="${base%-webhook-failed}" ;;
+    esac
+    dl_bodyjson="$(awk 'f{print} /^--- body json ---$/{f=1}' "$letter" 2>/dev/null)"
+    if [ -z "$dl_bodyjson" ]; then
+      # pre-#53 letter shape: `body     : <path>` (may be gone)
+      dl_ref="$(sed -n 's/^body     : //p' "$letter" | head -1)"
+      [ -n "$dl_ref" ] && [ -s "$dl_ref" ] && dl_bodyjson="$(cat "$dl_ref" 2>/dev/null)"
+    fi
+    if [ -z "$dl_bodyjson" ] || \
+       ! printf '%s' "$dl_bodyjson" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+      [ "$QUIET" -eq 0 ] && echo "[pi-bg-watchdog] dead letter $letter: no recoverable body - kept for forensics"
+      continue
+    fi
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would re-post dead letter $dl_t"
+      continue
+    fi
+    dl_bodyf="$BG_TMP/pi-bg-${dl_t}-dl-body.json"
+    printf '%s' "$dl_bodyjson" > "$dl_bodyf"
+    if wd_post "$dl_bodyf"; then
+      dl_code="$(cat "$BG_TMP/pi-bg-watchdog-wb-code" 2>/dev/null)"
+      [ -n "$dl_code" ] || dl_code=200
+      printf '%s %s (watchdog re-post, issue #53)\n' \
+        "$dl_code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${dl_t}-wb-status"
+      rm -f "$letter" "$dl_bodyf"
+      dl_consumed=$((dl_consumed + 1))
+      [ "$QUIET" -eq 0 ] && echo "[pi-bg-watchdog] dead letter $dl_t: re-posted (http=$dl_code)"
+    else
+      rm -f "$dl_bodyf"
+      [ "$QUIET" -eq 0 ] && echo "[pi-bg-watchdog] dead letter $dl_t: re-post failed - kept for next sweep" >&2
+    fi
+  done
+fi
+
 # ─── AGENTS.md drift tripwire (2026-09-14, alert-only) ────────────────────────
 # Manifest: ~/.pi/agent/.agents-md-hash (<sha256>  <ts>  <note>). The check
 # itself never blocks; this section only decides whether to post. One warning
@@ -1393,5 +1469,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0

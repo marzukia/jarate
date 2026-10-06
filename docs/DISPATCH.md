@@ -274,7 +274,13 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
   second silent death follows (the watchdog then reports SILENT, not DEAD)
 - `pi-bg-<id>-wb-status` — success-path webhook HTTP code + time
   (recorded at post time; the response body stays in `pi-bg-<id>-wb-resp.txt`)
-- `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail
+- `pi-bg-<id>-webhook-failed` — dead letter when all 3 post attempts fail.
+  Self-contained (issue #53): the JSON body is embedded after the
+  `--- body json ---` marker (the pre-#53 `body     : <path>` line
+  dangles - the exit trap's tmp cleanup deletes the body file). The
+  watchdog re-posts it on the next sweep (below). `pi-bg-<id>-kill-webhook-failed`
+  is the jarate-bg-kill analogue (failed CANCELLED post), same shape,
+  same consumer.
 - `pi-bg-<id>-killed` — jarate-bg-kill marker (the watchdog skips such tickets;
   written before the TERM so the wrapper trap stays quiet on a manual kill,
   issue #51)
@@ -298,6 +304,19 @@ history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
   one terminal embed per manual kill. `state=killed` stays the watchdog
   audit path (DEAD/SILENT sweep, launch-fail).
   Precise by construction: only the run's cgroup subtree dies.
+
+### Dead-letter consumption (watchdog, issue #53)
+
+A callback that failed all 3 post attempts (webhook down, bridge restart
+gap) leaves a dead letter and the orchestrator never wakes on a DIED it
+never sees. Each `jarate-bg-watchdog` sweep re-posts every letter whose
+JSON body is recoverable (self-contained letters: the embedded body after
+the `--- body json ---` marker; pre-#53 letters: the `body     : <path>`
+file while it still exists): a `[bg:...]` content post wakes the channel
+(queue-only, issues #177/#179). Success: the ticket's `wb-status` gets a
+re-post note and the letter is deleted (exactly-once). Failure: the letter
+is kept for the next sweep. No lock: one 15-min timer per box; a double
+sweep double-posts at most.
 
 ### AGENTS.md drift tripwire (watchdog, alert-only)
 

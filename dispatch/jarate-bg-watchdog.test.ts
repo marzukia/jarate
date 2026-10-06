@@ -2192,3 +2192,254 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     }
   }, 60_000);
 });
+
+/**
+ * #53: dead-letter consumption. A callback that failed all 3 post
+ * attempts (webhook down, bridge restart gap) leaves a dead letter and
+ * the orchestrator never wakes on a DIED it never sees. The watchdog now
+ * re-posts every letter whose JSON body is recoverable: self-contained
+ * letters carry the body after the `--- body json ---` marker; pre-#53
+ * letters reference a body file (fallback while it exists). Success:
+ * wb-status re-post note + letter deleted (exactly-once). Failure: kept.
+ */
+describe("#53: dead-letter consumption", () => {
+  const TID = (n: number) => `20991231-235958-${600 + n}`;
+  const recFile = (f: { home: string }, t: string) =>
+    path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`);
+  const wtDir = (f: { wtDir: string }, t: string) =>
+    path.join(f.wtDir, "jarate", t);
+  const age = (d: string, min: number) =>
+    fs.utimesSync(
+      d,
+      new Date(Date.now() - min * 60 * 1000),
+      new Date(Date.now() - min * 60 * 1000),
+    );
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  dead letter test\n`,
+    );
+  const plantRunning = (f: { home: string; tmp: string }, t: string) => {
+    const d = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      recFile(f, t),
+      JSON.stringify(
+        {
+          run: t,
+          profile: "worker",
+          project: null,
+          cwd: path.join(f.tmp, "workdir"),
+          started: "2026-09-25T10:00:00Z",
+          delivery: "webhook",
+          state: "running",
+        },
+        null,
+        2,
+      ),
+    );
+  };
+
+  // Self-contained letter (post-#53 shape): header + embedded JSON body.
+  const plantLetter = (
+    f: { art: string },
+    t: string,
+    kind: "cb" | "kill",
+    body: object,
+  ) => {
+    const name =
+      kind === "kill"
+        ? `pi-bg-${t}-kill-webhook-failed`
+        : `pi-bg-${t}-webhook-failed`;
+    const p = path.join(f.art, name);
+    const lines = [
+      `ticket   : ${t}`,
+      ...(kind === "kill" ? ["event    : kill"] : []),
+      "http     : 000 (3 attempts)",
+      "when     : 2026-10-06T00:00:00Z",
+      "response : ",
+      "--- body json ---",
+      JSON.stringify(body),
+      "",
+    ];
+    fs.writeFileSync(p, lines.join("\n"));
+    return p;
+  };
+
+  const DIED_BODY = {
+    content: "[bg:worker:DIED] cwd=/w task=dead letter task\n\nout",
+  };
+
+  test("self-contained cb letter: re-posted, wb-status note, deleted (exactly-once)", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(1);
+    const lp = plantLetter(f, t, "cb", DIED_BODY);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dead letter ${t}: re-posted`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toEqual(DIED_BODY);
+      expect(fs.existsSync(lp)).toBe(false);
+      const ws = fs.readFileSync(
+        path.join(f.art, `pi-bg-${t}-wb-status`),
+        "utf8",
+      );
+      expect(ws).toContain("(watchdog re-post, issue #53)");
+      // exactly-once: a second sweep finds nothing to consume
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("kill letter: re-posted and cleared like a callback letter", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(2);
+    const body = {
+      content: "",
+      embeds: [{ title: `pi-bg ${t} \u00b7 CANCELLED` }],
+    };
+    const lp = plantLetter(f, t, "kill", body);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dead letter ${t}: re-posted`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toEqual(body);
+      expect(fs.existsSync(lp)).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("pre-#53 letter: body-file fallback while the file exists", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(3);
+    const bodyPath = path.join(f.art, `pi-bg-${t}-body.json`);
+    fs.writeFileSync(bodyPath, JSON.stringify(DIED_BODY));
+    const lp = path.join(f.art, `pi-bg-${t}-webhook-failed`);
+    fs.writeFileSync(
+      lp,
+      [
+        `ticket   : ${t}`,
+        "http     : 000 (3 attempts)",
+        "when     : 2026-10-06T00:00:00Z",
+        `body     : ${bodyPath}`,
+        "",
+      ].join("\n"),
+    );
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dead letter ${t}: re-posted`);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0]).toEqual(DIED_BODY);
+      expect(fs.existsSync(lp)).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("no recoverable body: letter kept for forensics, no post", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(4);
+    const lp = path.join(f.art, `pi-bg-${t}-webhook-failed`);
+    fs.writeFileSync(
+      lp,
+      [
+        `ticket   : ${t}`,
+        "http     : 000 (3 attempts)",
+        "when     : 2026-10-06T00:00:00Z",
+        `body     : ${path.join(f.art, "gone.json")}`,
+        "",
+      ].join("\n"),
+    );
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("no recoverable body - kept for forensics");
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(lp)).toBe(true);
+      // still there after a second sweep (not a transient failure)
+      await f.run();
+      expect(fs.existsSync(lp)).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("dry-run: would re-post, letter kept, nothing posted", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(5);
+    const lp = plantLetter(f, t, "cb", DIED_BODY);
+    try {
+      const r = await f.run(["--dry-run"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dry-run: would re-post dead letter ${t}`);
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(lp)).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("webhook down: re-post fails, letter kept for the next sweep", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(6);
+    const lp = plantLetter(f, t, "cb", DIED_BODY);
+    try {
+      // port 9 (discard): conn refused -> all 3 attempts 000
+      const r = await f.run([], {
+        PI_DISPATCH_WEBHOOK: "http://127.0.0.1:9/dl",
+      });
+      expect(r.code).toBe(0);
+      expect(r.err).toContain(
+        `dead letter ${t}: re-post failed - kept for next sweep`,
+      );
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(lp)).toBe(true);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("DEAD sweep + consumption: dead-letter reason AND re-posted DIED", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(7);
+    const wt = wtDir(f, t);
+    fs.mkdirSync(wt, { recursive: true });
+    age(wt, 30);
+    plantRunning(f, t);
+    const lp = plantLetter(f, t, "cb", DIED_BODY);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`DEAD jarate/${t}`);
+      // TWO posts: the DEAD digest (posted by the sweep) + the re-posted
+      // DIED callback (posted by the consumer, in order)
+      expect(f.posts).toHaveLength(2);
+      const digest = f.posts[0].embeds[0];
+      expect(digest.title).toBe("DEAD \u00b7 watchdog sweep");
+      // the reason line tail-clips at the 29-col value budget
+      expect(digest.description).toContain("webhook dead letter exists");
+      expect(f.posts[1]).toEqual(DIED_BODY);
+      // the letter is gone after the sweep (consumed, exactly-once)
+      expect(fs.existsSync(lp)).toBe(false);
+      // #51 sticky mark: the flagged death closed the running record
+      const rec = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
+      expect(rec.state).toBe("killed");
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+});

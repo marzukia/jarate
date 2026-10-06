@@ -1143,6 +1143,45 @@ describe("#86: launch-fail webhook", () => {
 });
 
 /**
+ * #53: self-contained dead letters. When the webhook is down the launcher
+ * used to dead-letter a header pointing at the body file - which its own
+ * exit-trap tmp cleanup deletes, leaving the letter unrecoverable and the
+ * DIED lost forever (the orchestrator never wakes). The letter now embeds
+ * the JSON body after the `--- body json ---` marker; the watchdog
+ * re-posts it on the next sweep.
+ */
+describe("#53: self-contained dead letters (launcher side)", () => {
+  test("launch-fail post failure: the letter embeds the JSON body", async () => {
+    const fx = fixture();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fs.mkdirSync(art, { recursive: true });
+    // port 9 (discard): conn refused -> all 3 attempts 000
+    fx.env.PI_DISPATCH_WEBHOOK = "http://127.0.0.1:9/dl";
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    const r = await fx.run(["worker", "--worktree", "dl letter task"]);
+    expect(r.code).toBe(3);
+    const letters = fs
+      .readdirSync(art)
+      .filter((f) => f.endsWith("-webhook-failed"));
+    expect(letters).toHaveLength(1);
+    const letter = fs.readFileSync(path.join(art, letters[0] ?? ""), "utf8");
+    expect(letter).toContain("http     : 000 (3 attempts)");
+    const marker = "--- body json ---";
+    expect(letter).toContain(marker);
+    // everything after the marker is the embedded body: valid JSON, the
+    // DIED embed the bridge would have delivered
+    const bodyJson = letter.split(marker).slice(1).join(marker).trim();
+    const parsed = JSON.parse(bodyJson) as {
+      embeds: { author: { name: string } }[];
+    };
+    expect(parsed.embeds[0].author.name).toMatch(
+      /^pi-bg ticket \u00b7 \d{8}-\d{6}-\d+$/,
+    );
+  }, 30_000);
+});
+
+/**
  * #41: concurrency cap (PI_BG_MAX_CONCURRENT, default 3).
  *
  * pi-bg counts live tickets by fresh heartbeat files (issue #123: the

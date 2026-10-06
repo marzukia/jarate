@@ -680,7 +680,12 @@ run_start_epoch="${PI_BG_RUN_START_EPOCH:-$(date +%s)}"
 # bg_post <body-file>: 3 attempts, backoff, --max-time; 2xx = success.
 # success: HTTP code + time recorded in $BG_WB_STATUS (webhook-delivery audit,
 #   issue #14) and $BG_WB_RESP kept as the last response body.
-# final failure: dead-letter file + stderr note, return 1.
+# final failure: dead-letter file + stderr note, return 1. The letter is
+#   SELF-CONTAINED (issue #53): the JSON body is embedded after the
+#   `--- body json ---` marker so the watchdog can re-post it on a later
+#   sweep even after the body file is gone (the exit trap's tmp cleanup
+#   deletes it). The `body     : <path>` line stays for humans and as the
+#   pre-#53 letter shape.
 bg_post() {
   local body="$1" code i
   [ -n "$webhook" ] || return 1
@@ -698,7 +703,9 @@ bg_post() {
     printf 'http     : %s (3 attempts)\n' "$code"
     printf 'when     : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'response : %s\n' "$(head -c 300 "$BG_WB_RESP" 2>/dev/null)"
-    printf 'body     : %s\n' "$body"; } > "$BG_DEAD"
+    printf 'body     : %s\n' "$body"
+    printf -- '--- body json ---\n'
+    cat "$body" 2>/dev/null; } > "$BG_DEAD"
   echo "[pi-bg] webhook FAILED (http=$code) - dead letter: $BG_DEAD" >&2
   return 1
 }

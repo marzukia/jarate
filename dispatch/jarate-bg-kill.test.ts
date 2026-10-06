@@ -137,6 +137,79 @@ describe("jarate-bg-kill v3 embed: framed payload, 40-col budget", () => {
 });
 
 /**
+ * #53: self-contained kill dead letter. When the CANCELLED post fails all
+ * 3 attempts the kill writes a dead letter; it now embeds the JSON body
+ * after the `--- body json ---` marker (the body file is rm -f'd right
+ * after), so the watchdog can re-post the CANCELLED on a later sweep.
+ */
+describe("jarate-bg-kill #53: self-contained dead letter", () => {
+  test("post failure: the kill letter embeds the CANCELLED body", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkill53-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00009";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    const victim = spawn(["sleep", "300"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      // port 9 (discard): conn refused -> all 3 attempts 000
+      PI_DISPATCH_WEBHOOK: "http://127.0.0.1:9/dl",
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "1",
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    try {
+      expect(code).toBe(0);
+      expect(out).toContain(`killed ${id}`);
+      expect(err).toContain("webhook FAILED");
+      const letterPath = path.join(
+        tmp,
+        "art",
+        `pi-bg-${id}-kill-webhook-failed`,
+      );
+      expect(fs.existsSync(letterPath)).toBe(true);
+      const letter = fs.readFileSync(letterPath, "utf8");
+      expect(letter).toContain(`ticket   : ${id}`);
+      expect(letter).toContain("event    : kill");
+      expect(letter).toContain("http     : 000 (3 attempts)");
+      const marker = "--- body json ---";
+      expect(letter).toContain(marker);
+      // the embedded body is the CANCELLED embed, valid JSON
+      const bodyJson = letter.split(marker).slice(1).join(marker).trim();
+      const parsed = JSON.parse(bodyJson) as { embeds: { title: string }[] };
+      expect(parsed.embeds[0].title).toBe(`pi-bg ${id} \u00b7 CANCELLED`);
+    } finally {
+      victim.kill("SIGKILL");
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
  * #56: whole-session kill. jarate-bg runs under setsid: the wrapper is the
  * session + process-group leader and the pi child shares its PGID.
  * jarate-bg-kill must signal the session's process group, not just the per-pid
