@@ -57,6 +57,17 @@
 #       successful post, so a dead webhook retries next sweep). NEVER
 #       kills: HUNG informs + wakes; if the process later dies the
 #       existing DIED path fires unchanged.
+#   4e. DEAD retry (issue #110): a FIRST death (DEAD class, run record
+#       with the stored task prompt, no retryOf yet) is re-dispatched
+#       ONCE through the normal jarate-bg launcher (PI_BG_RUN_ID +
+#       PI_BG_RETRY_OF + --wt-reuse <same worktree>: partial work
+#       survives). Cap full -> held in the run record (deadRetry),
+#       fired by a later sweep on a free slot. The retry's own death =
+#       SECOND death = human wake only, no third attempt. HUNG/STALLED
+#       are never auto-retried. Placement: the watchdog, not the wrapper
+#       trap - DEAD means the traps never ran (that is the death class);
+#       #57's SILENT retry stays in the wrapper because SILENT is only
+#       judgeable from inside (rc + quiet tail, process still alive).
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -71,6 +82,12 @@
 #                      issue #142)
 #   PI_BG_PRUNE_DAYS   run-record prune age, days (default 7, 0 = off, #51)
 #   PI_BG_WT_PRUNE_DAYS killed-worktree prune age, days (default 7, 0 = off)
+#   PI_BG_LAUNCHER     jarate-bg launcher path for the DEAD-retry
+#                      re-dispatch (issue #110; default: $HOME/scripts/
+#                      jarate-bg, then PATH; test hook)
+#   PI_BG_RETRY_WAIT   seconds to wait for the retry's run record after
+#                      launch (issue #110; default 8; a record that never
+#                      appears drops the retry back to held)
 # args:
 #   --quiet   log-only mode: append to dead log, post no webhooks
 #             (use for the first run after install to baseline existing debris)
@@ -113,6 +130,7 @@ done
 # tests point the sweep at a per-run fake root instead of the real user slice.
 CG_DIR="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg"
 today="$(date -u +%Y-%m-%d)"
+rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 
 webhook="${PI_DISPATCH_WEBHOOK:-}"
 if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
@@ -239,6 +257,243 @@ has_retry1() {
 }
 rc_of() {
   tr -d '[:space:]' < "$BG_TMP/pi-bg-${1}-rc" 2>/dev/null
+}
+
+# ─── DEAD-class auto retry (issue #110) ───────────────────────────────────
+# State machine, all markers in the run records (a watchdog restart or a
+# double sweep is idempotent on them):
+#   first death (DEAD, record + stored prompt, no retryOf, no deadRetry)
+#     -> cap free: deadRetry={dispatched, ticket=T2}; T2 is launched
+#        through the normal jarate-bg launcher (PI_BG_RUN_ID +
+#        PI_BG_RETRY_OF=T1 + --wt-reuse <same worktree>); T2's record
+#        carries retryOf=T1; T1's record is closed (killed).
+#     -> cap full: deadRetry={held} (posted with the DEAD alert); a
+#        later sweep (the retry section) fires it on a free slot.
+#        A launch that never starts its record (cap race, launch-fail)
+#        drops back to held.
+#   second death (the retry dies: its record has retryOf)
+#     -> embed only + human wake (FAIL-loop rule: one round, then human).
+#   HUNG/STALLED: not auto-retried (issue #110 non-goal).
+# Precondition: the record stores the task prompt (post-#101). Pre-#101
+# records (no prompt file) get the embed only, no retry.
+retry_wait="${PI_BG_RETRY_WAIT:-8}"
+case "$retry_wait" in '' | *[!0-9]*) retry_wait=8 ;; esac
+[ "$retry_wait" -ge 1 ] || retry_wait=1
+retry_dispatched=0
+retry_held=0
+
+# wd_cap: "<live> <max>" - live-ticket count + resolved cap, SAME rules as
+# the jarate-bg launcher (hb-file count, 3-interval window,
+# PI_BG_MAX_CONCURRENT / cap file / fleet default 3; 0 = unlimited). The
+# launcher re-checks at launch, so a race resolves by the launcher
+# refusing (exit 5) and the retry dropping back to held.
+wd_cap() {
+  local max_c int cutoff live hb
+  max_c="${PI_BG_MAX_CONCURRENT:-}"
+  if [ -z "$max_c" ] && [ -f "${HOME}/.config/pi-dispatch/max-concurrent" ]; then
+    max_c="$(tr -d '[:space:]' < "${HOME}/.config/pi-dispatch/max-concurrent" 2>/dev/null)"
+  fi
+  [ -z "$max_c" ] && max_c=3
+  case "$max_c" in '' | *[!0-9]*) max_c=3 ;; esac
+  if [ "$max_c" -eq 0 ]; then
+    echo "0 0"
+    return 0
+  fi
+  int="${PI_BG_HB_INTERVAL:-30}"
+  case "$int" in '' | *[!0-9]*) int=30 ;; esac
+  [ "$int" -ge 1 ] || int=1
+  cutoff=$(( $(date +%s) - int * 3 ))
+  live=0
+  while IFS= read -r hb; do
+    live=$((live + 1))
+  done < <(find "$BG_TMP" -maxdepth 1 -type f -name 'pi-bg-*-hb' -newermt "@${cutoff}" 2>/dev/null)
+  echo "$live $max_c"
+}
+
+# wd_rec_fields <ticket>: \x1f-separated record fields, one line
+# (\x1f = non-whitespace: bash read collapses consecutive tab delimiters,
+# which would swallow the empty fields):
+#   state  retryOf  deadRetry.state  deadRetry.ticket  profile  project
+#   cwd    wt
+# (no line when the record is missing/corrupt; caller must tolerate it).
+wd_rec_fields() {
+  python3 - "${rec_dir}/pi-bg-${1}.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    rec = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+dr = rec.get("deadRetry") or {}
+fields = [rec.get("state"), rec.get("retryOf"), dr.get("state"),
+          dr.get("ticket"), rec.get("profile"), rec.get("project"),
+          rec.get("cwd"), rec.get("wt")]
+print("\x1f".join("" if f is None else str(f) for f in fields))
+PY
+}
+
+# wd_rec_set_deadretry <ticket> <held|dispatched> <ticket-id|->: the
+# deadRetry marker in the original record - the double-dispatch guard.
+# "at" is set once (first mark); held rechecks keep it.
+wd_rec_set_deadretry() {
+  local t="$1" st="$2" tk="$3"
+  [ "$tk" = "-" ] && tk=""
+  PI_BG_DR_STATE="$st" PI_BG_DR_TICKET="$tk" \
+  python3 - "${rec_dir}/pi-bg-${t}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+dr = rec.get("deadRetry") or {}
+dr["state"] = os.environ["PI_BG_DR_STATE"]
+if os.environ["PI_BG_DR_TICKET"]:
+    dr["ticket"] = os.environ["PI_BG_DR_TICKET"]
+dr.setdefault("at", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+rec["deadRetry"] = dr
+json.dump(rec, open(p, "w"), indent=2)
+PY
+}
+
+# wd_rec_close <ticket> <reason>: state=killed + finished (audit path,
+# same as the cwd sweep / jarate-bg-kill). Closes the original record
+# once its death is owned by the retry chain (or a non-retryable reason).
+wd_rec_close() {
+  local t="$1" reason="$2"
+  PI_BG_REASON="$reason" python3 - "${rec_dir}/pi-bg-${t}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = "killed"
+rec["reason"] = os.environ["PI_BG_REASON"]
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+}
+
+# wd_retry_launcher: resolve the jarate-bg launcher for the re-dispatch.
+# PI_BG_LAUNCHER (test hook) > $HOME/scripts/jarate-bg (the install.sh
+# canonical spot - the systemd watchdog env has no ~/scripts on PATH) >
+# PATH. rc 1 when none resolves.
+wd_retry_launcher() {
+  local l="${PI_BG_LAUNCHER:-}"
+  [ -n "$l" ] || l="${HOME}/scripts/jarate-bg"
+  [ -x "$l" ] && { printf '%s' "$l"; return 0; }
+  l="$(command -v jarate-bg 2>/dev/null)" || l=""
+  [ -n "$l" ] && { printf '%s' "$l"; return 0; }
+  return 1
+}
+
+# wd_dead_retry_dispatch <ticket> <wt-dir|->: launch the one auto
+# re-dispatch for a dead ticket's first death. Preconditions (record,
+# stored prompt, no retryOf, no live dispatch marker) are the CALLER's;
+# this function owns the cap decision + the launch + the markers.
+# rc: 0 dispatched, 1 held (cap full / launch never started),
+#     2 not retryable (launcher/prompt/dir missing -> embed only)
+wd_dead_retry_dispatch() {
+  local t="$1" wt="$2"
+  local pf="$BG_TMP/pi-bg-${t}-prompt.md"
+  local launcher prof pj cwd1 wt1 cap live maxc new_id i
+  [ -f "${rec_dir}/pi-bg-${t}.json" ] || return 2
+  [ -s "$pf" ] || return 2
+  launcher="$(wd_retry_launcher)" || return 2
+  IFS=$'\x1f' read -r _ _ _ _ prof pj cwd1 wt1 < <(wd_rec_fields "$t")
+  case "$prof" in worker | reviewer) ;; *) prof="worker" ;; esac
+  # the retry must land in the SAME dir: the sweep's worktree dir first,
+  # else the record's wt (new records), else none (cwd run -> its cwd)
+  [ -n "$wt" ] && [ "$wt" != "-" ] || wt="$wt1"
+  local launchcwd="${cwd1:-$HOME}"
+  [ -n "$wt" ] && [ "$wt" != "-" ] && launchcwd="$wt"
+  if [ ! -d "$launchcwd" ]; then
+    wd_rec_close "$t" "retry not possible: launch dir missing ($launchcwd)"
+    echo "[pi-bg-watchdog] retry $t: launch dir missing ($launchcwd) - no retry"
+    return 2
+  fi
+  cap="$(wd_cap)"
+  live="${cap%% *}"; maxc="${cap##* }"
+  if [ "$maxc" -gt 0 ] && [ "$live" -ge "$maxc" ]; then
+    wd_rec_set_deadretry "$t" held "-"
+    retry_held=$((retry_held + 1))
+    echo "[pi-bg-watchdog] retry $t: HELD (at cap $live/$maxc) - fires on a later sweep"
+    return 1
+  fi
+  new_id="$(date -u +%Y%m%d-%H%M%S)-$RANDOM"
+  # marker BEFORE the launch: the deadRetry state is the double-dispatch
+  # guard across watchdog restarts / double sweeps
+  wd_rec_set_deadretry "$t" dispatched "$new_id"
+  local wargs=() pjargs=()
+  [ -n "$wt" ] && [ "$wt" != "-" ] && wargs=(--wt-reuse "$wt")
+  [ -n "$pj" ] && pjargs=(--project "$pj")
+  # pi lives outside the systemd user-service PATH; the retry must reach
+  # it the same way a login-shell dispatch does
+  local pi_bin
+  pi_bin="$(command -v pi 2>/dev/null)" || pi_bin=""
+  [ -n "$pi_bin" ] || pi_bin="${HOME}/.pi/agent/bin/pi"
+  # same launch path as a normal dispatch: nohup + launcher + cgroup +
+  # hb + run record. PI_BG_RUN_ID pins the pre-generated ticket, PI_BG_
+  # RETRY_OF tags the new record, the task is the SAME stored prompt.
+  ( cd "$launchcwd" && tail -n +3 "$pf" | \
+      PI_BG_RUN_ID="$new_id" PI_BG_RETRY_OF="$t" \
+      PATH="$(dirname "$pi_bin"):$PATH" \
+      nohup "$launcher" "$prof" ${wargs[@]+"${wargs[@]}"} ${pjargs[@]+"${pjargs[@]}"} - \
+      > "$BG_TMP/pi-bg-${new_id}-launch.log" 2>&1 & )
+  for i in $(seq 1 "$retry_wait"); do
+    [ -f "${rec_dir}/pi-bg-${new_id}.json" ] && break
+    sleep 1
+  done
+  if [ ! -f "${rec_dir}/pi-bg-${new_id}.json" ]; then
+    # launch failed before its record (cap race, launch-fail, no
+    # profile): back to held - a later sweep retries; the DEAD embed
+    # was already posted with the retry reason
+    wd_rec_set_deadretry "$t" held "-"
+    echo "[pi-bg-watchdog] retry $t: launch $new_id did not start - back to held (log: $BG_TMP/pi-bg-${new_id}-launch.log)"
+    return 1
+  fi
+  wd_rec_close "$t" "dead retry dispatched: $new_id (issue #110)"
+  retry_dispatched=$((retry_dispatched + 1))
+  echo "[pi-bg-watchdog] retry $t: DISPATCHED $new_id (retry_of=$t, same worktree)"
+  return 0
+}
+
+# wd_dead_retry_decide <ticket> <repo> <wt-dir|->: the classification-site
+# decision. Prints the action that gets PREPENDED to the DEAD reason
+# (the reason kv keeps the head - the embed shows it); prints nothing
+# when the plain embed is right. Called for DEAD class only (SILENT is
+# owned by #57's in-wrapper retry; HUNG/STALLED are not auto-retried).
+wd_dead_retry_decide() {
+  local t="$1" wt="$3" rc
+  [ -f "${rec_dir}/pi-bg-${t}.json" ] || return 2  # pre-#51: embed only
+  local st rt drS drT
+  IFS=$'\x1f' read -r st rt drS drT _ _ _ _ < <(wd_rec_fields "$t")
+  if [ -n "$rt" ]; then
+    # this record already IS a retry: its death is the second death
+    echo "second death in chain (issue #110): retry died - human wake"
+    return 2
+  fi
+  case "$drS" in
+    dispatched)
+      # crash window / double sweep: reconcile, never re-launch here.
+      # (The retry section closes the record; if the retry's record is
+      # gone entirely, drop back to held so the cap check runs again.)
+      if [ -z "$drT" ] || [ ! -f "${rec_dir}/pi-bg-${drT}.json" ]; then
+        wd_rec_set_deadretry "$t" held "-"
+        drS="held"
+      else
+        return 2
+      fi
+      ;;
+  esac
+  wd_dead_retry_dispatch "$t" "$wt"
+  rc=$?
+  case $rc in
+    0) echo "retry dispatched (issue #110)" ;;
+    1) echo "retry held: at cap - fires on a later sweep (issue #110)" ;;
+    *) return 2 ;;
+  esac
+  return 0
 }
 
 # wd_post <body-file>: same retry shape as jarate-bg bg_post (3 attempts)
@@ -394,6 +649,14 @@ for d in "$WT_DIR"/*/*/; do
     reason="no callback on record (SIGKILL/OOM suspected)"
   fi
 
+  # DEAD-class auto retry (issue #110): the action is PREPENDED to the
+  # reason (the reason kv keeps the head - the embed shows it). DRY/QUIET
+  # skip the decision: the baseline run launches nothing.
+  if [ "$kind" = "DEAD" ] && [ "$DRY" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    action="$(wd_dead_retry_decide "$t" "$repo" "$d")"
+    [ -n "$action" ] && reason="$action: $reason"
+  fi
+
   echo "[pi-bg-watchdog] $kind $repo/$t (last activity $last, $reason)"
   DT+=("$t"); DREPO+=("$repo"); DP+=("$d"); DLAST+=("$last"); DREAS+=("$reason"); DTYPE+=("$kind")
   printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" >> "$DEADLOG"
@@ -422,7 +685,6 @@ done
 # append the dead log (same today-dedupe), reap the empty cgroup via the
 # guarded cgroup.kill, and mark the record state=killed (same audit path
 # as jarate-bg-kill, so the record stops lying "running").
-rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
 cwd_found=0
 if [ -d "$rec_dir" ]; then
   while IFS=$'\t' read -r rt rcwd; do
@@ -456,6 +718,13 @@ if [ -d "$rec_dir" ]; then
       reason="cwd run: cgroup reaped (dir gone), heartbeat stale > ${STALL_MIN} min (issue #116)"
     else
       reason="cwd run: cgroup empty, heartbeat stale > ${STALL_MIN} min (issue #86)"
+    fi
+    # DEAD-class auto retry (issue #110): the cwd sweep owns a retry's
+    # SECOND death (the retry reuses the original's worktree dir, so the
+    # dir sweep has already closed the original and skips it)
+    if [ "$DRY" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+      action="$(wd_dead_retry_decide "$rt" "cwd" "-")"
+      [ -n "$action" ] && reason="$action: $reason"
     fi
     echo "[pi-bg-watchdog] DEAD cwd/$rt (last activity $last, $reason)"
     DT+=("$rt"); DREPO+=("cwd"); DP+=("${rcwd:--}")
@@ -499,6 +768,62 @@ PY
   )
 fi
 [ "$cwd_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $cwd_found dead cwd ticket(s)"
+
+# ─── DEAD retry (issue #110): held + crashed-window records ────────────────
+# deadRetry markers in run records (issue #51 audit trail), handled here
+# instead of only at the DEAD classification site because the
+# classification is dead-log deduped for the day - a retry held at a full
+# cap would otherwise wait until tomorrow. Two cases per record:
+#   held: first death at a full cap - fire it now if a slot freed.
+#   dispatched + still running: watchdog died between the mark and the
+#     record close - reconcile (close if the retry's record exists, else
+#     drop back to held so the cap check runs again). Never re-launchs:
+#     a dispatched marker with a live retry record means the chain is
+#     already owned.
+if [ "$DRY" -eq 0 ] && [ "$QUIET" -eq 0 ] && [ -d "$rec_dir" ]; then
+  retry_list="$(python3 - "$rec_dir" <<'PY' 2>/dev/null
+import glob, json, os, sys
+d = sys.argv[1]
+for f in sorted(glob.glob(os.path.join(d, "pi-bg-*.json"))):
+    try:
+        rec = json.load(open(f))
+    except Exception:
+        continue
+    dr = rec.get("deadRetry") or {}
+    if dr.get("state") not in ("held", "dispatched"):
+        continue
+    if rec.get("state") != "running":
+        continue
+    run = str(rec.get("run") or "")
+    if run:
+        print(run + "\t" + str(dr.get("state")))
+PY
+)"
+  while IFS=$'\t' read -r hrt hstate; do
+    [ -n "$hrt" ] || continue
+    [[ "$hrt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    if [ "$hstate" = "dispatched" ]; then
+      IFS=$'\x1f' read -r _ _ _ hdt _ _ _ _ < <(wd_rec_fields "$hrt")
+      if [ -n "$hdt" ] && [ -f "${rec_dir}/pi-bg-${hdt}.json" ]; then
+        wd_rec_close "$hrt" "dead retry chain: $hdt (issue #110)"
+        echo "[pi-bg-watchdog] retry $hrt: chain confirmed ($hdt) - record closed"
+      else
+        wd_rec_set_deadretry "$hrt" held "-"
+        echo "[pi-bg-watchdog] retry $hrt: dispatch marker without a record - back to held"
+      fi
+      continue
+    fi
+    # held: cap recheck + launch (dispatch re-marks held when still full)
+    hwt=""
+    IFS=$'\x1f' read -r _ _ _ _ _ _ _ hwt < <(wd_rec_fields "$hrt")
+    if [ -z "$hwt" ]; then
+      for cand in "$WT_DIR"/*/"$hrt"; do
+        [ -d "$cand" ] && { hwt="$cand"; break; }
+      done
+    fi
+    wd_dead_retry_dispatch "$hrt" "${hwt:--}" || true
+  done <<< "$retry_list"
+fi
 
 # ─── HUNG sweep (issue #142): alive tree, quiet session ────────────────────────
 # HUNG = ALL of:
@@ -982,5 +1307,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held (quiet=$QUIET dry=$DRY stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS)"
 exit 0
