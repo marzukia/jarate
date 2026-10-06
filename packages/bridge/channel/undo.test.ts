@@ -970,7 +970,9 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     const undo = performUndo(sess, 2);
     expect(undo.restarted).toBe(true);
     expect(undo.reRun).toBe(true);
-    expect(undo.text).toBe("[ok] undone: 3 files + conversation (re-running)");
+    expect(undo.text).toBe(
+      "[ok] undone: 2 turns + 3 files + conversation (re-running q2)",
+    );
     // session: back to pre-2nd-turn state (through T2)
     expect(ids(sess)).toEqual(["s1", "T1", "A1", "T2"]);
     // re-run target is the 2nd trigger
@@ -1021,7 +1023,9 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     // finishRun stores run.preFiles only): b -> b0 restored; a keeps run 1
     // (pre-cut, kept turn); c stays c3 — run 3's change is NOT in run 2's
     // snapshot (the documented N>1 files-mode limit).
-    expect(undo.text).toBe("[ok] undone: 1 file + conversation (re-running)");
+    expect(undo.text).toBe(
+      "[ok] undone: 2 turns + 1 file + conversation (re-running q2)",
+    );
     expect(fs.readFileSync(a, "utf8")).toBe("a1");
     expect(fs.readFileSync(b, "utf8")).toBe("b0");
     expect(fs.readFileSync(c, "utf8")).toBe("c3");
@@ -1114,5 +1118,59 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     const r4 = startRun(cwd)!;
     finishRun(r4, cwd, sess, true);
     expect(performRedo().text).toBe("[!] redo stale: newer run completed");
+  });
+
+  test("N=1 ack stays byte-identical; N>1 names turn count + re-run pointer", () => {
+    // N=1 (default and explicit): the legacy ack, character for character
+    const f1 = makeSession(dir("ack1"), chain);
+    const u1 = performUndo(f1);
+    expect(u1.text).toBe("[ok] undone: conversation (re-running)");
+    const f1b = makeSession(dir("ack1b"), chain);
+    expect(performUndo(f1b, 1).text).toBe(u1.text);
+    consumeRerun(f1);
+    consumeRerun(f1b);
+
+    // N=2: how many turns were rolled back + where the session now
+    // points (the kept trigger, re-run on restart)
+    const f2 = makeSession(dir("ack2"), chain);
+    const u2 = performUndo(f2, 2);
+    expect(u2.text).toBe("[ok] undone: 2 turns + conversation (re-running q2)");
+    consumeRerun(f2);
+  });
+
+  test("N>1 pointer: whitespace flattened, truncated to 70 chars", () => {
+    const longBody = "x".repeat(90);
+    const longChain = [
+      header,
+      T1,
+      A1,
+      { ...T2, content: longBody, details: { body: longBody } },
+      A2,
+      T3,
+      A3,
+    ];
+    const f1 = makeSession(dir("ptrlong"), longChain);
+    const u1 = performUndo(f1, 2);
+    expect(u1.text).toBe(
+      `[ok] undone: 2 turns + conversation (re-running ${"x".repeat(70)})`,
+    );
+    consumeRerun(f1);
+
+    // multi-line trigger flattens to one line in the pointer
+    const nlBody = "line one\nline two";
+    const nlChain = [
+      header,
+      T1,
+      A1,
+      { ...T2, content: nlBody, details: { body: nlBody } },
+      A2,
+      T3,
+      A3,
+    ];
+    const f3 = makeSession(dir("ptrnl"), nlChain);
+    const u3 = performUndo(f3, 2);
+    expect(u3.text).toBe(
+      "[ok] undone: 2 turns + conversation (re-running line one line two)",
+    );
   });
 });

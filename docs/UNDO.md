@@ -50,6 +50,8 @@ So conversation revert = **truncate the JSONL + respawn + re-run**:
   Guards: 10-minute TTL (an unrelated restart must not re-fire a stale
   prompt) and session-file match (the record only fires on the session it
   was written for). The ack says `(re-running)` when a re-run was parked.
+  For `/undo N` with N>1 it says `(re-running <trigger>)` instead — the
+  kept trigger text, flattened to one line, truncated to 70 chars.
 - `ctx.shutdown()` 300ms later — identical mechanism to `/reset`
   (systemd `Restart=always` re-runs `pi -c`). `restarted=true` in the
   result lets the test prove a restart is required. `/undo N` reuses the
@@ -147,7 +149,11 @@ seq, which for `/undo 1` is the same value.
   (`isOwner` check + shared `ownerOnly` message); non-owners see
   "Owner only: /<cmd>".
 - Acks (no emoji, `[ok]`/`[!]` style):
-  - `[ok] undone: 2 files + conversation (re-running)`
+  - `[ok] undone: 2 files + conversation (re-running)` (N=1, byte-identical
+    to the legacy single-turn ack)
+  - `[ok] undone: 2 turns + 3 files + conversation (re-running q2)`
+    (N>1: names how many turns were rolled back + where the session now
+    points — the kept trigger, re-run on restart, 70-char cap)
   - `[ok] undone: 1 file` (files-only run)
   - `[ok] undone: conversation (re-running)` (no matching store entry)
   - `[ok] undone: kept 1 >20MB file (not restored)` (cap-skipped preimage only)
@@ -155,7 +161,8 @@ seq, which for `/undo 1` is the same value.
   - `[!] usage: /undo [N] (N is 1 or more)` (N = 0 / non-numeric; no action)
   - `[!] nothing to undo: only M turns back` (N > chain length; no action)
   - `[ok] redone: ...` / `[!] nothing to redo` / `[!] redo stale: newer run completed`
-  - `(re-running)` is present only when a re-run trigger was parked (F1)
+  - `(re-running)` is present only when a re-run trigger was parked (F1);
+    for N>1 the trigger text (70-char cap) is included in the paren
 
 ## Busy-agent handling
 
