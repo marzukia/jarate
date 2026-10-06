@@ -892,6 +892,117 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
 });
 
 /**
+ * #110 launcher side: --wt-reuse (the watchdog's DEAD-retry re-dispatch
+ * lands in the dead ticket's existing worktree dir, no new dir/branch),
+ * the retryOf record tag (PI_BG_RETRY_OF env), and the wt/wtBranch record
+ * fields (audit + the retry section's worktree resolution).
+ */
+describe("#110 launcher: --wt-reuse + retryOf record tag", () => {
+  const gitRepo = (fx: { tmp: string; env: Record<string, string> }) => {
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+  };
+
+  test("--wt-reuse: run lands in the EXISTING dir, no new worktree added", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    gitRepo(fx);
+    const reuse = path.join(fx.tmp, "wt-orig");
+    execSync(`git worktree add -b pi-bg/orig ${reuse}`, {
+      cwd: fx.tmp,
+      env: { ...fx.env },
+      stdio: "pipe",
+    });
+    const r = await fx.run(["worker", "--wt-reuse", reuse, "retry task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("worktree reused");
+    expect(r.out).toContain(`(branch pi-bg/orig`);
+    // no second worktree dir appeared: still main + orig only
+    const wtlist = execSync("git worktree list", {
+      cwd: fx.tmp,
+      env: { ...fx.env },
+      stdio: "pipe",
+    })
+      .toString()
+      .trim()
+      .split("\n").length;
+    expect(wtlist).toBe(2);
+    // record: wt + wtBranch point at the reused checkout
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    const wtReal = fs.realpathSync(reuse);
+    expect(recs[0].wt).toBe(wtReal);
+    expect(recs[0].wtBranch).toBe("pi-bg/orig");
+    expect(recs[0].state).toBe("done");
+  });
+
+  test("--wt-reuse of a non-worktree dir: launch-fail rc 3, record killed", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const notwt = path.join(fx.tmp, "notwt");
+    fs.mkdirSync(notwt);
+    const r = await fx.run(["worker", "--wt-reuse", notwt, "t"]);
+    expect(r.code).toBe(3);
+    expect(r.err).toContain(
+      "LAUNCH-FAIL: --wt-reuse dir is not a git worktree",
+    );
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].state).toBe("killed");
+    expect(recs[0].reason).toContain(
+      "launch-fail: wt-reuse not a git worktree",
+    );
+  });
+
+  test("--wt-reuse with no value: usage error rc 2, no record", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const r = await fx.run(["worker", "--wt-reuse"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("--wt-reuse needs a value");
+    // usage error exits before any side effect: not even the records dir
+    const recs = fs.existsSync(fx.env.PI_DISPATCH_RECORD_DIR)
+      ? fx.records()
+      : [];
+    expect(recs).toHaveLength(0);
+  });
+
+  test("PI_BG_RETRY_OF tags the run record (retryOf); its death is a second death", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    fx.env.PI_BG_RETRY_OF = "20261006-040758-111111";
+    try {
+      const r = await fx.run(["worker", "retry task"]);
+      expect(r.code).toBe(0);
+      const recs = fx.records();
+      expect(recs).toHaveLength(1);
+      expect(recs[0].retryOf).toBe("20261006-040758-111111");
+      expect(recs[0].state).toBe("done");
+    } finally {
+      delete fx.env.PI_BG_RETRY_OF;
+    }
+  });
+
+  test("normal --worktree run: record also carries wt + wtBranch", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    gitRepo(fx);
+    const r = await fx.run(["worker", "--worktree", "wt task"]);
+    expect(r.code).toBe(0);
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].wt).toContain(`.pi-bg-wt/${path.basename(fx.tmp)}/`);
+    expect(recs[0].wtBranch).toBe(`pi-bg/${recs[0].run}`);
+  });
+});
+
+/**
  * #86 + A1 (polish sweep): launch-fail webhook. A --worktree launch-fail
  * (not a git repo / worktree add failed) exits 3 BEFORE the run record +
  * bg_on_exit register, so bg_launch_fail posts the standard bg_build DIED
