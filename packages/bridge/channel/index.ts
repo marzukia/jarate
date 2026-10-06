@@ -42,13 +42,16 @@ import {
   deferInteraction,
   deleteDiscordMessage,
   disconnectDiscord,
+  discordFetch,
   editDiscordMessage,
   editInteractionMessage,
   getChannelCursor,
   getDiscordChannelId,
+  getDiscordStates,
   getDiscordToken,
   loadChannelStateFile,
   loadDiscordAttachment,
+  loadPersistedCursors,
   MAX_ATTACHMENT_BYTES,
   patchChannelState,
   registerDiscordCommands,
@@ -83,6 +86,14 @@ import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
 import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
+import {
+  rewakeAddPending,
+  rewakeClearPending,
+  rewakeCommitDelivered,
+  rewakePending,
+  rewakeRemovePending,
+  scanUndeliveredBgInbounds,
+} from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
@@ -395,7 +406,22 @@ export function queueMidTurnInbound(
     q = [];
     midTurnQueues.set(channelId, q);
   }
-  q.push({ msg, queuedAt: Date.now(), text, title, display });
+  const entry: QueuedInbound = {
+    msg,
+    queuedAt: Date.now(),
+    text,
+    title,
+    display,
+  };
+  q.push(entry);
+  // #180 (survival path): mirror the entry into the per-channel state
+  // file. session_shutdown clears MEMORY only; the file is what a
+  // respawn drains. Synchronous tmp+rename right after the push — the
+  // in-memory → file window is the same tick, no await in between.
+  rewakeAddPending(runtimeStateDir, channelId, {
+    msg,
+    queuedAt: entry.queuedAt,
+  });
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
@@ -464,16 +490,55 @@ export function popOldestQueuedInbound(): {
 /** Drop all queued inbounds for a channel (/stop, shutdown drain).
  *  `deletes` collects the ack-delete promises so the caller can await
  *  them (session_shutdown must — the process dies right after). Returns
- *  the count dropped. */
+ *  the count dropped. `keepFile` (session_shutdown only): the in-memory
+ *  drain is the fast path (ack cleanup); the #180 state file is the
+ *  SURVIVAL path and must outlive the process. */
 export function clearQueuedInbound(
   channelId: string,
   deletes?: Promise<unknown>[],
+  opts?: { keepFile?: boolean },
 ): number {
   const q = midTurnQueues.get(channelId);
   if (!q) return 0;
-  for (const e of q) consumeQueuedAck(channelId, e.msg.messageId, deletes);
+  for (const e of q) {
+    consumeQueuedAck(channelId, e.msg.messageId, deletes);
+    if (!opts?.keepFile)
+      rewakeRemovePending(runtimeStateDir, channelId, e.msg.messageId);
+  }
   const n = q.length;
   midTurnQueues.delete(channelId);
+  return n;
+}
+
+/** #180 (survival drain): re-queue persisted pending entries into the
+ *  in-memory re-wake queue at a real process start. The file is left in
+ *  place — entries are pruned from it exactly when committed to pi
+ *  (sendToPi) or dropped, so a second death before delivery re-drains
+ *  the same file and the message is still delivered exactly once.
+ *  Returns the count re-queued. Exported for tests. */
+export function drainRewakeSurvival(
+  stateDir: string,
+  channels: ChannelConfig[],
+): number {
+  let n = 0;
+  for (const ch of channels) {
+    if (ch.type !== "discord") continue;
+    const pending = rewakePending(stateDir, ch.id);
+    if (pending.length === 0) continue;
+    const q = midTurnQueues.get(ch.id) ?? [];
+    for (const e of pending) {
+      // Fresh process: midTurnQueues is empty; the guard is for
+      // in-process reuse and is idempotent either way.
+      if (q.some((x) => x.msg.messageId === e.msg.messageId)) continue;
+      q.push({ msg: e.msg, queuedAt: e.queuedAt });
+      n += 1;
+    }
+    midTurnQueues.set(ch.id, q);
+  }
+  if (n > 0)
+    console.log(
+      `[channel] rewake survival: re-queued ${n} queued inbound(s) from state files`,
+    );
   return n;
 }
 
@@ -999,6 +1064,9 @@ export async function runMidRunInterrupt(
       // the ack message still exists (same race as the success path).
       settleOpTick(`interrupt:${channelId}`, `[ok] interrupted`);
       consumeQueuedAck(channelId, messageId);
+      // #180: the entry is dropped (never sent to pi) — prune the
+      // survived copy so a restart does not re-deliver the cancel.
+      rewakeRemovePending(runtimeStateDir, channelId, messageId);
       // Re-wake vehicle: this run's agent_end deferred to us, so if we are
       // dropped, no run exists to re-wake the deferred entries. Kick the
       // oldest one when idle (no-op while a run is active — its
@@ -1156,6 +1224,9 @@ export async function deleteQueuedInbound(
     q.splice(idx, 1);
     if (q.length === 0) midTurnQueues.delete(channelId);
     disarmInterrupt(channelId, messageId);
+    // #180: the operator deleted the message — the survived copy must
+    // not resurrect it on the next restart.
+    rewakeRemovePending(runtimeStateDir, channelId, messageId);
     console.log(
       `[channel] queued inbound ${messageId} dropped (message deleted)`,
     );
@@ -2168,6 +2239,26 @@ export default function (pi: ExtensionAPI) {
     const enabled = channels.filter((c) => c.enabled);
     if (enabled.length === 0) return;
 
+    // #180: re-wake survival (same startup machinery as the wake below;
+    // reason "startup" = a real process start, the same guard
+    // runRestartWake uses). Real start: drain the per-channel state
+    // files back into the in-memory re-wake queue — session_shutdown
+    // cleared memory only, and the Discord cursor already advanced past
+    // those inbounds at receipt, so without this the queue dies with
+    // the process (2026-10-06 incident: pi-bg callback queued
+    // 04:19:44, restart 04:19:52, callback never consumed). In-process
+    // /new and /reload (reason != "startup"): the same entries were
+    // just wiped from memory by session_shutdown's midTurnQueues.clear()
+    // — clear the files too, so a restart never resurrects a
+    // /new-dropped queue.
+    const rewakeStateDir = path.join(ctx.cwd, ".tmp");
+    if (event?.reason === "startup") {
+      drainRewakeSurvival(rewakeStateDir, enabled);
+    } else {
+      for (const ch of enabled)
+        if (ch.type === "discord") rewakeClearPending(rewakeStateDir, ch.id);
+    }
+
     const defaultCh = getDefaultChannel(channels);
     if (defaultCh) lastActiveChannel = defaultCh;
 
@@ -2286,7 +2377,7 @@ export default function (pi: ExtensionAPI) {
       // real pi always passes the event (reason "startup" on process start)
       void runRestartWake({
         reason: event?.reason,
-        stateDir: path.join(ctx.cwd, ".tmp"),
+        stateDir: rewakeStateDir,
         target:
           wakeCh && (wakeCh.botToken || wakeCh.webhookUrl)
             ? {
@@ -2297,13 +2388,91 @@ export default function (pi: ExtensionAPI) {
             : null,
       })
         .then((r) => {
-          if (r.posted)
+          if (r.posted) {
             console.log(
               `[wake] posted restart wake (${r.restartClass}) to ${wakeCh?.id}`,
             );
+            return;
+          }
+          if (r.reason === "dedup") return; // a racing start owns the post
+          // #180: the wake post never lands — the wake inbound is what
+          // starts the run whose agent_end re-wakes the survived queue.
+          // Kick the oldest entry directly (the bridge is idle at
+          // startup; if a run is live, its agent_end owns the queue and
+          // the pop is left to it — no double delivery).
+          const queued = ctx.isIdle() ? popOldestQueuedInbound() : null;
+          if (queued) {
+            console.log(
+              `[channel] wake post failed: delivering queued inbound directly (${queued.channelId})`,
+            );
+            handleInbound(pi, queued.msg, ctx, true).catch((e) =>
+              console.error(
+                "[channel] wake-fail direct delivery failed:",
+                sanitizeUnknownValue(e),
+              ),
+            );
+          }
         })
         .catch((e) =>
           console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
+        );
+    }
+
+    // #180 (option 1): bounded startup history scan — ONE fetch per
+    // channel (messages?before=<cursor>&limit=$PISCORD_REWAKE_LOOKBACK,
+    // default 50) re-queueing any [bg:/pi-bg webhook post the old
+    // process RECEIVED (cursor already past it) but never committed to
+    // pi. Backstop for the primary file layer: the cursor-vs-queue-file
+    // micro-window and any other pre-queue loss. Dedupes against the
+    // persisted delivered set (committed ids) + the pending list; non-bg
+    // human messages (incl. a human quoting a callback) have no
+    // webhook_id and are never re-queued. Fire-and-forget like the
+    // wake: a dead network at boot is a silent no-op, never a startup
+    // failure.
+    if (event?.reason === "startup") {
+      const scanChannels = enabled
+        .filter((c) => c.type === "discord")
+        .map((c) => {
+          const discordId = getDiscordChannelId(c.id) ?? c.channel;
+          return {
+            config: c,
+            discordId,
+            // Live state (connectDiscord seeded it from the persisted
+            // cursor) or the file directly if connect has not run yet.
+            cursor:
+              getDiscordStates().get(c.id)?.lastMessageId ??
+              loadPersistedCursors(rewakeStateDir)[discordId] ??
+              null,
+            token: getDiscordToken(c.id) || c.botToken || "",
+          };
+        })
+        .filter((s) => s.token.length > 0);
+      void scanUndeliveredBgInbounds({
+        stateDir: rewakeStateDir,
+        channels: scanChannels,
+        fetcher: (token, urlPath) => discordFetch(token, urlPath),
+        requeue: (entry, chId) => {
+          const q = midTurnQueues.get(chId) ?? [];
+          if (q.some((x) => x.msg.messageId === entry.msg.messageId)) return; // already covered (survival drain or live delivery)
+          q.push({ msg: entry.msg, queuedAt: entry.queuedAt });
+          midTurnQueues.set(chId, q);
+          rewakeAddPending(rewakeStateDir, chId, entry);
+          console.log(
+            `[channel] rewake bg scan: re-queued undelivered machine wake ${entry.msg.messageId} (${chId})`,
+          );
+        },
+      })
+        .then((r) => {
+          if (r.requeued > 0)
+            console.log(
+              `[channel] rewake bg scan: ${r.requeued} undelivered post(s) re-queued (${r.scanned} window msgs)`,
+            );
+        })
+        .catch((e) =>
+          console.error(
+            "[channel] rewake bg scan failed:",
+            sanitizeUnknownValue(e),
+          ),
         );
     }
 
@@ -2431,7 +2600,12 @@ export default function (pi: ExtensionAPI) {
     const shutdownDeletes: Promise<unknown>[] = [];
     for (const ch of channels) {
       if (isHeld(ch)) continue;
-      const dropped = clearQueuedInbound(ch.id, shutdownDeletes);
+      // #180: keepFile — this drain is the fast path (ack cleanup
+      // before the disconnects drop REST state); the per-channel state
+      // file is the survival path a respawn drains instead of clearing.
+      const dropped = clearQueuedInbound(ch.id, shutdownDeletes, {
+        keepFile: true,
+      });
       if (dropped > 0)
         console.log(
           `[channel] shutdown drained ${dropped} queued mid-turn inbound(s) from ${ch.id}`,
@@ -6298,6 +6472,12 @@ function sendToPi(
       },
       { triggerTurn: true, deliverAs: "steer" },
     );
+    // #180: pi accepted the message — the delivery is committed. Prune
+    // the survived copy (if this was a queued re-wake) and record the
+    // id in the delivered set (the startup history-scan dedupe). A
+    // sendMessage throw returns false BEFORE this line: the file keeps
+    // the entry, the next restart re-delivers (at-least-once).
+    if (messageId) rewakeCommitDelivered(runtimeStateDir, channelId, messageId);
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
     return false;

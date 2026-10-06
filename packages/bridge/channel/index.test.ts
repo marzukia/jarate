@@ -80,6 +80,7 @@ import extension, {
   runShellPassthrough,
   runUsageLine,
   setHandoffRestartArmed,
+  setHeld,
   setInterruptCtx,
   setLiveKickoffStateHookForTest,
   setProcessExitHookForTest,
@@ -98,6 +99,7 @@ import extension, {
   verboseOverride,
   workingMaxMs,
 } from "./index";
+import { loadRewakeQueue } from "./restart-queue";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
 import {
@@ -9963,5 +9965,387 @@ describe("wave 2c bridge commands", () => {
       expect(hasOwnerConfigured({ ownerUserIds: ["a"] })).toBe(true);
       expect(hasOwnerConfigured({ ownerUserId: "uid" })).toBe(true);
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// #180: queued inbounds survive a process restart.
+//
+// The re-wake queue is in-memory and session_shutdown drains it on EVERY
+// death, while the Discord cursor already advanced past the queued inbound
+// at receipt — so a respawn never re-fetches it (2026-10-06 incident:
+// pi-bg callback msg 1556883632919150653 queued 04:19:44, process
+// restarted 04:19:52, callback never consumed).
+//
+//   option 2 (primary): the queued entry is mirrored into a per-channel
+//     state file at queue time, pruned on commit/drop; session_shutdown
+//     keeps draining memory (fast path) but keeps the file (survival
+//     path); a real process start (reason "startup") drains the file back
+//     into the queue and the normal agent_end re-wake delivers it.
+//   option 1 (backstop): the same startup does one bounded history scan
+//     (before=<cursor>) re-queueing undelivered [bg:/pi-bg webhook posts.
+//
+// These tests model REAL process boundaries: fresh pi + fresh handlers,
+// clearDiscordStatesForTest between "processes", persisted state files
+// (cursor + rewake) are the only thing that crosses the boundary.
+// ─────────────────────────────────────────────────────────────────────────
+describe("restart-queue survival (#180): incident-shape e2e", () => {
+  let tmp = "";
+  let oldHome = "";
+  const realFetch = globalThis.fetch;
+  let script: {
+    polls: any[][];
+    scan: any[];
+    calls: { url: string; method: string }[];
+  };
+
+  const rewakeDir = () => path.join(tmp, ".tmp");
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "Beepy",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  /** Raw REST [bg: webhook post (the pi-bg callback shape). */
+  const bgRaw = (id: string) => ({
+    id,
+    webhook_id: "7000",
+    content: `[bg:worker:OK] ${id}`,
+    timestamp: new Date().toISOString(),
+    author: { id: "7000", bot: true, username: "beepy" },
+  });
+  /** Raw REST restart-wake post (the bridge's own wake). */
+  const wakeRaw = (id: string) => ({
+    id,
+    webhook_id: "7000",
+    content: "[bg: restart-wake] clean",
+    timestamp: new Date().toISOString(),
+    author: { id: "7000", bot: true, username: "beepy" },
+  });
+
+  /** One fake pi "process": fresh handler table + fresh send capture. */
+  const mkProcess = () => {
+    const handlers: Record<string, (...a: any[]) => any> = {};
+    const sent: { m: any; o?: any }[] = [];
+    const pi: any = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    return { pi, handlers, sent };
+  };
+
+  const mkCtx = (idle: boolean): any => ({
+    cwd: tmp,
+    ui: { setStatus: () => {} },
+    isIdle: () => idle,
+    hasPendingMessages: () => false,
+    abort: () => {},
+    compact: () => {},
+    modelRegistry: { getAvailable: () => [] },
+    getContextUsage: () => undefined,
+    model: { id: "cur", name: "Cur" },
+    shutdown: () => {},
+  });
+
+  /** Flush microtasks + drive polls until pred() or timeout. */
+  const waitFor = async (pred: () => boolean, ms = 2000) => {
+    const t0 = Date.now();
+    while (!pred()) {
+      if (Date.now() - t0 > ms) throw new Error("waitFor: timeout");
+      await new Promise((r) => setTimeout(r, 10));
+      await pollDiscord("ch1");
+    }
+  };
+
+  const customSends = (sent: { m: any }[]) =>
+    sent.filter((s) => s.m?.customType === CHANNEL_MSG_TYPE);
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "issue180-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            enabled: true,
+            channel: "111",
+            botToken: "tok1",
+            ownerUserId: "uid",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    script = { polls: [[], [], []], scan: [], calls: [] };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      script.calls.push({ url: u, method });
+      const json = (v: any) => ({
+        ok: true,
+        status: 200,
+        json: async () => v,
+        text: async () => JSON.stringify(v),
+      });
+      const notFound = () => ({
+        ok: false,
+        status: 204,
+        json: async () => ({}),
+        text: async () => "",
+      });
+      if (u.endsWith("/users/@me")) return json({ id: "9000" });
+      if (method === "POST" && u.includes("/messages"))
+        return json({ id: "w1" }); // wake + ack posts: fixed id
+      if (u.includes("reactions")) return notFound();
+      if (method === "DELETE") return notFound();
+      if (u.includes("before=")) return json(script.scan); // #180 scan
+      if (u.includes("after=")) return json(script.polls.shift() ?? []); // polls (FIFO)
+      return json([]); // seed ?limit=1, guilds, dms, ...
+    }) as any;
+    setSystemdRestartHookForTest(() => {});
+    setRuntimeStateDir(null);
+  });
+
+  afterEach(() => {
+    clearDiscordStatesForTest();
+    stopAllOpTicks();
+    clearAllCompacting();
+    clearAllInterrupts();
+    resetRuntimeStateForTest();
+    setInterruptCtx(null);
+    setSystemdRestartHookForTest(null);
+    for (const id of [...midTurnQueues.keys()])
+      clearQueuedInbound(id, undefined, { keepFile: true });
+    midTurnQueues.clear();
+    queuedAcks.clear();
+    pendingInterrupts.clear();
+    heldChannels.clear();
+    setRuntimeStateDir(null);
+    process.env.HOME = oldHome;
+    globalThis.fetch = realFetch;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("incident: callback queued mid-run, clean restart -> delivered exactly once", async () => {
+    // ── Process 1: the callback lands while a run is live → queued ──
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false); // a run is in flight
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    // delivery advances the cursor PAST the queued inbound (the incident)
+    setChannelCursor("ch1", "2000");
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    // option 2: the entry is mirrored into the state file at queue time
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+
+    // the process dies (clean stop)
+    await p1.handlers.session_shutdown?.();
+    // fast path: memory drained…
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+    // survival path: the file is intact
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+    // (live state is dropped by the disconnects — assert the persisted file)
+    expect(loadPersistedCursors(rewakeDir())["111"]).toBe("2000");
+
+    // ── Process 2: respawn (reason "startup") ──
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true); // idle
+    script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
+    script.scan = [];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    // survival drain re-queued the callback before anything else ran
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    // the wake post comes in via the poll → direct send (idle)
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+      ),
+    );
+    // the wake run ends → re-wake delivers the survived callback
+    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+    const delivered = customSends(p2.sent).filter((s) =>
+      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+    );
+    expect(delivered).toHaveLength(1); // exactly once
+    // commit: pending pruned, id recorded for the scan dedupe
+    const f2 = loadRewakeQueue(rewakeDir(), "ch1");
+    expect(f2.pending).toEqual([]);
+    expect(f2.delivered).toContain("2000");
+
+    // ── Process 3: restart AGAIN (crash after delivery) ──
+    clearDiscordStatesForTest();
+    const p3 = mkProcess();
+    const ctx3 = mkCtx(true);
+    // the original callback post is STILL in history below the cursor —
+    // the scan must NOT re-queue it (delivered set dedupe)
+    script.polls = [[], [], []];
+    script.scan = [bgRaw("2000")];
+    await p3.handlers.session_start?.({ reason: "startup" }, ctx3);
+    await new Promise((r) => setTimeout(r, 150));
+    await pollDiscord("ch1");
+    expect(customSends(p3.sent)).toHaveLength(0); // no wake (lock), no re-run
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual([]);
+  });
+
+  test("empty restart: no queued inbounds -> no rewake state file, no scan fetch", async () => {
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    await p1.handlers.session_shutdown?.();
+    const rewakeFile = path.join(rewakeDir(), "rewake-ch1.json");
+    expect(fs.existsSync(rewakeFile)).toBe(false); // nothing was ever queued
+
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    await new Promise((r) => setTimeout(r, 150));
+    await pollDiscord("ch1");
+    expect(fs.existsSync(rewakeFile)).toBe(false); // drain+scan wrote nothing
+    // no cursor was ever persisted → the scan issues no REST call at all
+    expect(script.calls.some((c) => c.url.includes("before="))).toBe(false);
+    expect(customSends(p2.sent)).toHaveLength(0);
+  });
+
+  test("option 1 backstop: cursor advanced, queue file lost → history scan re-queues", async () => {
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    setChannelCursor("ch1", "2000");
+    // a later (human) receipt advances the cursor past the callback —
+    // the scan window (before=<cursor>) now contains it; human posts
+    // are never scan candidates, so only the machine wake is re-queued
+    setChannelCursor("ch1", "2001");
+    fs.rmSync(path.join(rewakeDir(), "rewake-ch1.json"), { force: true });
+    await p1.handlers.session_shutdown?.();
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    // the post is in history below the cursor — the scan finds it
+    script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
+    script.scan = [bgRaw("2000")];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+      ),
+    );
+    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+    expect(
+      customSends(p2.sent).filter((s) =>
+        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      ),
+    ).toHaveLength(1); // delivered via the scan-re-queued entry
+    const f2 = loadRewakeQueue(rewakeDir(), "ch1");
+    expect(f2.pending).toEqual([]);
+    expect(f2.delivered).toContain("2000");
+  });
+
+  test("in-process /new//reload (reason != startup) clears the file, not just memory", async () => {
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    await p1.handlers.session_shutdown?.(); // memory drained, file kept
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+
+    // in-process session restart (the /new and /reload path)
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    await p2.handlers.session_start?.({ reason: "reload" }, ctx2);
+    await new Promise((r) => setTimeout(r, 50));
+    // the /new-dropped queue must not resurrect on the next real restart
+    expect(loadRewakeQueue(rewakeDir(), "ch1").pending).toEqual([]);
+    expect(midTurnQueues.get("ch1")).toBeUndefined();
+  });
+
+  test("held channel: the buffer survives the restart (drained back into the held queue)", async () => {
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    setHeld("ch1", true);
+    await handleInbound(
+      p1.pi,
+      inbound("[bg:worker:OK] 2000", "2000"),
+      ctx1,
+      false,
+    );
+    setChannelCursor("ch1", "2000");
+    await p1.handlers.session_shutdown?.();
+    expect(midTurnQueues.get("ch1")).toBeUndefined(); // memory wiped
+    // held channels skip the shutdown drain loop — file was never pruned
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["2000"]);
+
+    clearDiscordStatesForTest();
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    script.polls = [[], [], []];
+    script.scan = [];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    // the hold flag is persisted (channel-state.json) → re-held at start,
+    // and the survived entry is back in the (held) channel's queue
+    expect(isHeld({ id: "ch1", name: "Test", type: "discord" } as any)).toBe(
+      true,
+    );
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
+    expect(midTurnQueues.get("ch1")?.[0].msg.messageId).toBe("2000");
   });
 });
