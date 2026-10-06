@@ -159,6 +159,13 @@ export function __patVaultResetForTest(): void {
   vaultEntries.clear();
 }
 
+/** Test hook: drop the registry entry for a path WITHOUT stopping the
+ *  server, so a later startPatVault on the same path performs a real bind
+ *  against a live listener (issue #128 fix 2). */
+export function __patDetachForTest(socketPath: string): void {
+  vaultEntries.delete(socketPath);
+}
+
 // ─── Small helpers ────────────────────────────────────────────────────────
 
 function iso(ms: number): string {
@@ -424,6 +431,25 @@ function startupSweep(st: PatVaultState): void {
   audit(st, "sweep", undefined, { n });
 }
 
+/** Connect probe: true only if a live peer accepts on the socket path.
+ *  Any failure (ECONNREFUSED, ENOENT, EACCES, ENOTSOCK, timeout) means
+ *  no live peer — the entry is a crash leftover (issue #128). */
+function probeSocket(p: string, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.connect(p);
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      resolve(ok);
+    };
+    s.once("connect", () => done(true));
+    s.once("error", () => done(false));
+    s.setTimeout(timeoutMs, () => done(false));
+  });
+}
+
 function bindSocket(st: PatVaultState): Promise<void> {
   return (async () => {
     try {
@@ -434,10 +460,19 @@ function bindSocket(st: PatVaultState): Promise<void> {
       return;
     }
     for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        if (fs.existsSync(st.socketPath)) fs.unlinkSync(st.socketPath);
-      } catch {
-        // stale unlink failure: the listen below decides
+      let livePeer = false;
+      if (fs.existsSync(st.socketPath)) {
+        // Probe before unlink: the entry may belong to a live server.
+        // A blind unlink makes that server unreachable by path
+        // (issue #128). Only crash leftovers get unlinked.
+        livePeer = await probeSocket(st.socketPath);
+        if (!livePeer) {
+          try {
+            fs.unlinkSync(st.socketPath);
+          } catch {
+            // stale unlink failure: the listen below decides
+          }
+        }
       }
       try {
         const srv = await new Promise<net.Server>((resolve, reject) => {
@@ -456,6 +491,15 @@ function bindSocket(st: PatVaultState): Promise<void> {
         st.server = srv;
         return;
       } catch (e: any) {
+        if (livePeer) {
+          // The listen failed (EADDRINUSE) because the path is owned by
+          // a live server we did not unlink. Do not stomp it: surface
+          // clearly, run request-only (posts + taps + edits still work).
+          audit(st, "vault-error", undefined, {
+            err: `socket ${st.socketPath} owned by a live server (probe connected); not unlinking — is another pi/daemon running?`,
+          });
+          return;
+        }
         if (e?.code !== "EADDRINUSE" || attempt === 2) {
           // Request-only (socket down): posts + taps + edits still work.
           audit(st, "vault-error", undefined, {
@@ -463,7 +507,8 @@ function bindSocket(st: PatVaultState): Promise<void> {
           });
           return;
         }
-        // EADDRINUSE: second unlink + bind (crash leftover reappearing)
+        // EADDRINUSE: second probe + unlink + bind (crash leftover
+        // reappearing)
       }
     }
   })();
