@@ -359,8 +359,9 @@ alerts on DELTA, not level.
 
 - **Roster**: the sweep's own uid + every `uid [webhook]` line of
   `$HOME/.config/jarate/fleet-agents` (watchdog is the only in-tree
-  consumer; `#` comments and junk lines tolerated, uids deduped). The
-  webhook column is parsed but not yet used - per-agent routing is M2.
+  consumer; `#` comments and junk lines tolerated, uids deduped, first
+  entry per uid wins). The webhook column is M2's per-agent wake - see
+  the liveness section below.
 - **Read**: `$PI_BG_OOM_ROOT/user-<uid>.slice/memory.events` (env seam,
   default `/sys/fs/cgroup/user.slice`; unit tests run against a fake root
   plus one first-sight probe against the runner's own real slice) +
@@ -384,6 +385,61 @@ alerts on DELTA, not level.
   and changes no MemoryMax; absent slices are skipped (M2's liveness
   markers classify dead session vs quiet agent). `--quiet` = detect + log,
   no post, no baseline advance; `--dry-run` = print only.
+
+### Agent liveness (watchdog, issue #191 M2)
+
+The OOM signature above catches kill storms, not a quiet agent death: a
+pi.service down with no in-flight tickets and no OOM (bridge wedged,
+crash, session gone) produces zero watchdog events - the 2026-10-04 monky
+incident sat dark 33 minutes until found by accident. M2 adds the
+agent-level floor: a marker proves the process serving the agent (the
+bridge poll loop) is alive.
+
+- **Marker**: the bridge touches `/var/tmp/jarate-live/<uid>` (0644 file
+  in a sticky world-writable 1777 dir - created by `install.sh` and the
+  bridge itself) every poll cycle (30s) + at session start
+  (`packages/bridge/channel/index.ts`, `touchLiveMarker`). `/var/tmp`, not
+  `/tmp`: the pre-boot marker must survive a reboot so a fresh boot is
+  classed BOOT-GAP, not death. Fallback if the bridge change is not yet
+  deployed: a user timer touching the same path every 5 min (coarser; not
+  shipped - the bridge touch is authoritative).
+- **Roster**: the sweep's own uid + the `fleet-agents` file (same source
+  as M1). Non-orchestrator boxes are zero-config: no fleet file = own uid
+  only. The webhook column is the per-agent wake: the operator webhook
+  pages on every finding, and the agent's own incoming hook gets a copy
+  (best-effort, single attempt) so the agent sees its near-misses on
+  return.
+- **Classes** (state: `$PI_DISPATCH_RECORD_DIR/live-state.json`, same
+  write discipline as `oom-baseline.json`):
+  - **FRESH** - marker within `$PI_BG_LIVE_STALE_MIN` (default 15) -> ok.
+    A fresh marker after silent/dead logs "recovered" (no post).
+  - **BOOT-GAP** - marker predates kernel btime AND the boot is younger
+    than the limit -> no alert (wait for the first post-boot marker).
+    An OLD boot with a still-pre-boot marker escalates like stale: the
+    "agent never came up after reboot" case (age = uptime).
+  - **SILENT** - marker stale, or gone after having been seen -> WARN
+    post on the ok -> silent transition (orange near-miss, one per
+    episode).
+  - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT post (red page,
+    silent -> dead). The `user@<uid>.service` cgroup (M1's
+    `PI_BG_OOM_ROOT` seam) empty/gone adds the "session gone" class to the
+    frame: the whole user session is down, not just the agent.
+  - **NEVER-SEEN** - no marker ever observed -> WARN only, never dead
+    (fleet deploy window: a peer's bridge may predate the marker code;
+    absence of the mechanism is not evidence of death).
+- **Dedupe / wake**: max 1 ALERT per uid per `$PI_BG_LIVE_DEDUPE_MIN`
+  (default 60; 0 = off); the window spans episodes and the stamp advances
+  ONLY after a successful operator post (dead-letter pattern: dead
+  webhook -> the same class re-posts next sweep). Content prefix
+  `[bg: agent-watch]` (webhook wake rule: the bridge drops bot/webhook
+  posts unless the content starts with `[bg:`).
+- **Test seams**: `PI_BG_LIVE_ROOT` (fake marker dir),
+  `PI_BG_LIVE_BTIME_FILE` (fake btime file). `--quiet` = detect + log, no
+  post, no state advance; `--dry-run` = print only. The section no-ops
+  when the marker dir is absent (mechanism not installed on this box).
+- **Finding, not page**: no auto-restart of pi.service, no MemoryMax
+  changes (M3 territory: restart the dead pi.service + alert the operator
+  in the same post).
 
 ### AGENTS.md drift tripwire (watchdog, alert-only)
 

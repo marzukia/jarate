@@ -20,10 +20,13 @@ const JB = path.join(import.meta.dir, "jarate-bg");
 const JARATE = path.join(import.meta.dir, "..", "bin", "jarate");
 
 type Post = {
+  content?: string;
   embeds: Array<{
     title: string;
     description: string;
+    color?: number;
     author?: { name: string };
+    footer?: { text: string };
   }>;
 };
 
@@ -3444,6 +3447,721 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(b[String(OWN)].oom).toBe(ref.oom);
       // read-only: the real counters are unchanged after the sweep
       expect(parseReal(realEvents)).toEqual(ref);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// #191 M2: agent liveness (marker sweep). Each agent's bridge touches
+// $PI_BG_LIVE_ROOT/<uid> (0644 file in a sticky 1777 dir; real default
+// /var/tmp/jarate-live) every poll cycle + at session start. The sweep
+// checks the roster (own uid + ~/.config/jarate/fleet-agents, the same
+// file as M1 - but M2 uses the webhook column: the per-agent wake) for
+// FRESH (marker within PI_BG_LIVE_STALE_MIN, default 15 -> ok) / BOOT-GAP
+// (marker predates kernel btime AND boot younger than the limit -> no
+// alert; an OLD boot with a still-pre-boot marker escalates like stale -
+// "agent never came up after reboot") / SILENT (marker stale, or gone
+// after having been seen -> WARN post on the ok->silent transition, one
+// per episode) / AGENT-DEAD (two consecutive stale sweeps -> ALERT post;
+// the user@<uid>.service cgroup (M1 PI_BG_OOM_ROOT seam) empty/gone adds
+// the "session gone" class) / NEVER-SEEN (no marker ever observed -> WARN
+// only, never dead: the fleet deploy window). State:
+// $rec_dir/live-state.json (same write discipline as oom-baseline.json:
+// state + the dedupe stamp advance ONLY after a successful operator post;
+// dead webhook -> same class re-posts next sweep). Max 1 ALERT per uid
+// per PI_BG_LIVE_DEDUPE_MIN (60, 0 = off); the window spans episodes.
+// Wake: operator webhook + the roster's per-agent webhook; content prefix
+// [bg: agent-watch]. Test seams: PI_BG_LIVE_ROOT (fake marker dir),
+// PI_BG_LIVE_BTIME_FILE (fake btime file).
+// ────────────────────────────────────────────────────────────────────────────
+describe("#191 M2: agent liveness (marker sweep)", () => {
+  const OWN = os.userInfo().uid;
+  const PEER = OWN === 1003 ? 1004 : 1003; // fleet-roster uid (fake marker)
+  const NOW = () => Math.floor(Date.now() / 1000);
+
+  type LiveEntry = {
+    state: "ok" | "silent" | "dead";
+    marker_seen?: boolean;
+    mtime?: number;
+    last_alert_epoch?: number;
+    at?: string;
+  };
+
+  /** Base fixture + marker/session/btime helpers on the fake live root. */
+  const liveFixture = () => {
+    const f = fixture();
+    const liveRoot = path.join(f.tmp, "live");
+    const oomRoot = f.env.PI_BG_OOM_ROOT as string;
+    const recDir = f.env.PI_DISPATCH_RECORD_DIR as string;
+    fs.mkdirSync(liveRoot, { recursive: true, mode: 0o1777 });
+    const btimeFile = path.join(f.tmp, "btime");
+    // boot 1h ago by default: BOOT-GAP requires an explicit recent boot
+    fs.writeFileSync(
+      btimeFile,
+      `btime ${NOW() - 3600}\ncpu  1 0 1 0 0 0 0 0 0 0\n`,
+    );
+    f.env.PI_BG_LIVE_ROOT = liveRoot;
+    f.env.PI_BG_LIVE_BTIME_FILE = btimeFile;
+    // no drift post under the liveness tests (same as M1): bless the
+    // fixture AGENTS.md
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-10-07T00:00:00Z  #191 M2 live test\n`,
+    );
+    // the roster's per-agent own hook: a second capture server
+    const peerPosts: Post[] = [];
+    const peerServer = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") peerPosts.push((await req.json()) as Post);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const markerPath = (uid: number) => path.join(liveRoot, String(uid));
+    const marker = (uid: number, ageMin: number) => {
+      const p = markerPath(uid);
+      fs.writeFileSync(p, `${Date.now()}\n`);
+      const t = NOW() - ageMin * 60;
+      fs.utimesSync(p, t, t);
+      return p;
+    };
+    const stateFile = path.join(recDir, "live-state.json");
+    const seedState = (entries: Record<string, LiveEntry>) => {
+      fs.mkdirSync(recDir, { recursive: true });
+      fs.writeFileSync(stateFile, JSON.stringify(entries, null, 2));
+    };
+    const state = (): Record<string, LiveEntry> =>
+      JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    // the session class: the user@<uid>.service cgroup under the M1 OOM
+    // root seam (cg_has_members reads the plain cgroup.procs file)
+    const session = (uid: number, pids: number[] = [4242]) => {
+      const d = path.join(oomRoot, `user-${uid}.slice`, `user@${uid}.service`);
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(
+        path.join(d, "cgroup.procs"),
+        pids.map(String).join("\n") + (pids.length > 0 ? "\n" : ""),
+      );
+    };
+    return {
+      ...f,
+      liveRoot,
+      oomRoot,
+      recDir,
+      btimeFile,
+      setBtime: (epoch: number) =>
+        fs.writeFileSync(
+          btimeFile,
+          `btime ${epoch}\ncpu  1 0 1 0 0 0 0 0 0 0\n`,
+        ),
+      peerPosts,
+      peerUrl: `http://127.0.0.1:${peerServer.port}/peer`,
+      markerPath,
+      marker,
+      stateFile,
+      seedState,
+      state,
+      session,
+      fleet: (lines: string[]) => {
+        const d = path.join(f.home, ".config", "jarate");
+        fs.mkdirSync(d, { recursive: true });
+        fs.writeFileSync(path.join(d, "fleet-agents"), `${lines.join("\n")}\n`);
+      },
+      close: () => {
+        peerServer.stop(true);
+        f.close();
+      },
+    };
+  };
+
+  test("FRESH: marker within the limit -> state ok, no post, no state churn on re-sweep", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 1);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("ok");
+      expect(s[String(OWN)].marker_seen).toBe(true);
+      expect(s[String(OWN)].mtime).toBeGreaterThan(NOW() - 125);
+      const m1 = s[String(OWN)].mtime as number;
+      const r2 = await f.run();
+      expect(f.posts).toHaveLength(0);
+      expect(f.state()[String(OWN)].mtime).toBe(m1); // no churn
+      void r2;
+    } finally {
+      f.close();
+    }
+  });
+
+  test("first sight with no marker: recorded, no alert", async () => {
+    const f = liveFixture();
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `live: user-${OWN} no marker (first sight, no alert)`,
+      );
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("ok");
+      expect(s[String(OWN)].marker_seen).toBe(false);
+      expect(s[String(OWN)].mtime).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("stale sweep 1: SILENT WARN post (orange near-miss), state silent, summary counts", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      const body = f.posts[0];
+      // the content prefix is the webhook wake marker (isBgWebhook)
+      expect(body.content).toBe(
+        `[bg: agent-watch] SILENT: user-${OWN} 20m stale (limit 15m)`,
+      );
+      const em = body.embeds[0];
+      expect(em.title).toBe(`SILENT \u00b7 user-${OWN}`);
+      expect(em.author?.name).toBe("pi-bg watchdog");
+      expect(em.color).toBe(15105570); // orange: near-miss, not the page
+      expect(em.footer?.text).toBe("pi-bg watchdog (live, issue #191)");
+      const lines = codeLines(em);
+      for (const want of [
+        `\u250c silent \u00b7 user-${OWN}`,
+        `\u251c $ jarate-bg-watchdog live`,
+        `\u251c uid    : ${OWN}`,
+        `\u251c age    : 20m stale (limit 15m)`,
+        `\u251c note   : marker stale`,
+        `\u251c session: gone`,
+      ]) {
+        expect(lines).toContain(want);
+      }
+      // the frame obeys the 40-col mobile budget (docs/STYLE.md 2.3)
+      for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("silent");
+      expect(s[String(OWN)].marker_seen).toBe(true);
+      expect(s[String(OWN)].mtime).toBeGreaterThan(NOW() - 1205);
+      // the sweep summary line carries the live counters (shims contract)
+      expect(r.out).toContain("1 agent SILENT(s)");
+      expect(r.out).toContain("live_stale_min=15 live_dedupe_min=60");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("stale sweep 2: AGENT-DEAD ALERT (red) + dedupe stamp; sweep 3: still dead (no post, no stamp churn)", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      f.seedState({
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+        },
+      });
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] AGENT-DEAD: user-${OWN} 20m stale (limit 15m), session gone`,
+      );
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe(`AGENT-DEAD \u00b7 user-${OWN} (session gone)`);
+      expect(em.color).toBe(15158332); // red: the page
+      expect(codeLines(em)).toContain(
+        `\u251c note   : 2 consecutive stale sweeps`,
+      );
+      expect(r1.out).toContain(
+        `AGENT-DEAD user-${OWN}: 20m stale (limit 15m) (session gone)`,
+      );
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("dead");
+      expect(s[String(OWN)].last_alert_epoch).toBeGreaterThanOrEqual(NOW() - 5);
+      const stamp = s[String(OWN)].last_alert_epoch as number;
+      // sweep 3: still stale, state dead -> no post, stamp untouched
+      const r2 = await f.run();
+      expect(f.posts).toHaveLength(1);
+      expect(r2.out).toContain(
+        `live: user-${OWN} still dead (20m stale (limit 15m))`,
+      );
+      expect(f.state()[String(OWN)].last_alert_epoch).toBe(stamp);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("recovery: FRESH marker after dead -> state ok, no post, dedupe stamp kept", async () => {
+    const f = liveFixture();
+    try {
+      const stamp = NOW() - 4200;
+      f.seedState({
+        [String(OWN)]: {
+          state: "dead",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+          last_alert_epoch: stamp,
+        },
+      });
+      f.marker(OWN, 0); // the agent is back
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `live: user-${OWN} recovered (marker 0m old, was dead)`,
+      );
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("ok");
+      expect(s[String(OWN)].marker_seen).toBe(true);
+      expect(s[String(OWN)].last_alert_epoch).toBe(stamp); // kept: the window spans episodes
+    } finally {
+      f.close();
+    }
+  });
+
+  test("BOOT-GAP: marker predates a recent boot -> no alert (first sight and silent state)", async () => {
+    const f = liveFixture();
+    try {
+      f.setBtime(NOW() - 600); // boot 10m ago (< the 15m limit)
+      f.marker(OWN, 60); // marker 60m old: pre-boot
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `live: user-${OWN} marker predates boot (boot 10m old, no alert)`,
+      );
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("ok");
+      expect(s[String(OWN)].marker_seen).toBe(true);
+    } finally {
+      f.close();
+    }
+    // a SILENT-state uid under a recent boot stays silent (no alert, no reset)
+    const g = liveFixture();
+    try {
+      g.setBtime(NOW() - 300); // boot 5m ago
+      g.fleet([String(PEER)]); // roster: uid-only line (no webhook column)
+      g.marker(PEER, 120);
+      g.seedState({
+        [String(PEER)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 7200,
+        },
+      });
+      const r = await g.run();
+      expect(r.code).toBe(0);
+      expect(g.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `live: user-${PEER} marker predates boot (boot 5m old, no alert)`,
+      );
+      expect(g.state()[String(PEER)].state).toBe("silent");
+    } finally {
+      g.close();
+    }
+  });
+
+  test("BOOT-GAP aged: old boot + pre-boot marker -> escalates (SILENT then AGENT-DEAD, age = uptime)", async () => {
+    const f = liveFixture();
+    try {
+      f.setBtime(NOW() - 3600); // boot 1h ago (> the 15m limit)
+      f.marker(OWN, 120); // marker 2h old: pre-boot
+      f.seedState({
+        [String(OWN)]: { state: "ok", marker_seen: true, mtime: NOW() - 7200 },
+      });
+      await f.run();
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] SILENT: user-${OWN} predates boot (up 60m)`,
+      );
+      expect(codeLines(f.posts[0].embeds[0])).toContain(
+        `\u251c note   : agent never up after reboot`,
+      );
+      expect(f.state()[String(OWN)].state).toBe("silent");
+      await f.run();
+      expect(f.posts).toHaveLength(2);
+      expect(f.posts[1].content).toBe(
+        `[bg: agent-watch] AGENT-DEAD: user-${OWN} predates boot (up 60m), session gone`,
+      );
+      expect(f.state()[String(OWN)].state).toBe("dead");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("NEVER-SEEN: no marker ever -> WARN only, never dead (3 sweeps)", async () => {
+    const f = liveFixture();
+    try {
+      const r1 = await f.run(); // first sight
+      expect(f.posts).toHaveLength(0);
+      expect(f.state()[String(OWN)].marker_seen).toBe(false);
+      const r2 = await f.run(); // the WARN fires once
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] SILENT: user-${OWN} no marker (never seen)`,
+      );
+      expect(
+        codeLines(f.posts[0].embeds[0]).some((l) =>
+          l.includes("\u251c note   : marker never observed"),
+        ),
+      ).toBe(true);
+      expect(f.state()[String(OWN)].state).toBe("silent");
+      expect(f.state()[String(OWN)].marker_seen).toBe(false);
+      const r3 = await f.run(); // no escalation, no repeat
+      expect(f.posts).toHaveLength(1);
+      expect(f.state()[String(OWN)].state).toBe("silent");
+      void r1;
+      void r2;
+      void r3;
+    } finally {
+      f.close();
+    }
+  });
+
+  test("marker gone after sight: stale from the last-seen mtime", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 10);
+      await f.run(); // ok
+      expect(f.state()[String(OWN)].state).toBe("ok");
+      fs.rmSync(f.markerPath(OWN));
+      f.seedState({
+        [String(OWN)]: { state: "ok", marker_seen: true, mtime: NOW() - 1200 },
+      });
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] SILENT: user-${OWN} gone (last seen 20m ago)`,
+      );
+      expect(codeLines(f.posts[0].embeds[0])).toContain(
+        `\u251c note   : marker deleted after sight`,
+      );
+      expect(f.state()[String(OWN)].state).toBe("silent");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("AGENT-DEAD dedupe: suppressed inside the 60m window (stamp kept), fires after it elapses", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      f.seedState({
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+          last_alert_epoch: NOW() - 600,
+        },
+      });
+      const r1 = await f.run();
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        `live: user-${OWN} AGENT-DEAD suppressed (last alert 10m ago < 60m)`,
+      );
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("dead");
+      // the OLD stamp is kept: the window is not restarted by a suppressed sweep
+      expect(s[String(OWN)].last_alert_epoch).toBeGreaterThanOrEqual(
+        NOW() - 605,
+      );
+      expect(s[String(OWN)].last_alert_epoch).toBeLessThanOrEqual(NOW() - 595);
+      // the window elapsed: the same dead episode pages again
+      f.seedState({
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+          last_alert_epoch: NOW() - 4200,
+        },
+      });
+      await f.run();
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toContain("AGENT-DEAD");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("dead webhook: state kept, the same class re-posts after the webhook recovers (SILENT then AGENT-DEAD)", async () => {
+    const f = liveFixture();
+    try {
+      const deadHook = "http://127.0.0.1:1/none";
+      f.marker(OWN, 20);
+      const r1 = await f.run([], { PI_DISPATCH_WEBHOOK: deadHook });
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.err).toContain(
+        `live: user-${OWN} silent post failed - state kept, retries next sweep`,
+      );
+      expect(fs.existsSync(f.stateFile)).toBe(false); // no advance
+      const r2 = await f.run(); // the webhook is back
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toContain("SILENT");
+      expect(f.state()[String(OWN)].state).toBe("silent");
+      // the ALERT with a dead webhook: state stays silent (the retry case)
+      const r3 = await f.run([], { PI_DISPATCH_WEBHOOK: deadHook });
+      expect(f.posts).toHaveLength(1);
+      expect(r3.err).toContain(
+        `live: user-${OWN} dead post failed - state kept, retries next sweep`,
+      );
+      expect(f.state()[String(OWN)].state).toBe("silent");
+      await f.run();
+      expect(f.posts).toHaveLength(2);
+      expect(f.posts[1].content).toContain("AGENT-DEAD");
+      expect(f.state()[String(OWN)].state).toBe("dead");
+      void r2;
+      void r3;
+    } finally {
+      f.close();
+    }
+  }, 60_000);
+
+  test("session class: members present -> 'session present' (no title suffix); empty cgroup -> 'session gone' + title suffix", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      f.session(OWN, [4242]); // the user session is alive: agent-only death
+      f.seedState({
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+        },
+      });
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] AGENT-DEAD: user-${OWN} 20m stale (limit 15m)`,
+      );
+      expect(f.posts[0].embeds[0].title).toBe(`AGENT-DEAD \u00b7 user-${OWN}`);
+      expect(codeLines(f.posts[0].embeds[0])).toContain(
+        `\u251c session: present`,
+      );
+      expect(r1.out).toContain(
+        `AGENT-DEAD user-${OWN}: 20m stale (limit 15m) (session present)`,
+      );
+    } finally {
+      f.close();
+    }
+    const g = liveFixture();
+    try {
+      g.marker(OWN, 20);
+      g.session(OWN, []); // the cgroup exists but is empty: session gone
+      g.seedState({
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+        },
+      });
+      await g.run();
+      expect(g.posts).toHaveLength(1);
+      expect(g.posts[0].content).toBe(
+        `[bg: agent-watch] AGENT-DEAD: user-${OWN} 20m stale (limit 15m), session gone`,
+      );
+      expect(g.posts[0].embeds[0].title).toBe(
+        `AGENT-DEAD \u00b7 user-${OWN} (session gone)`,
+      );
+      expect(codeLines(g.posts[0].embeds[0])).toContain(`\u251c session: gone`);
+    } finally {
+      g.close();
+    }
+  });
+
+  test("fleet roster: the peer's marker is swept; the peer gets its own webhook copy; own stays quiet", async () => {
+    const f = liveFixture();
+    try {
+      f.fleet([`# fleet`, `${PEER} ${f.peerUrl}`, `garbage line`]);
+      f.marker(OWN, 1); // own: fresh
+      f.marker(PEER, 20); // peer: stale
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      expect(f.posts).toHaveLength(1); // only the peer's SILENT
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] SILENT: user-${PEER} 20m stale (limit 15m)`,
+      );
+      expect(f.peerPosts).toHaveLength(1); // the peer's own hook got a copy
+      expect(f.peerPosts[0].content).toBe(f.posts[0].content);
+      await f.run();
+      expect(f.posts).toHaveLength(2);
+      expect(f.posts[1].content).toContain(`AGENT-DEAD: user-${PEER}`);
+      expect(f.peerPosts).toHaveLength(2);
+      expect(f.peerPosts[1].content).toContain(`AGENT-DEAD: user-${PEER}`);
+      // own uid: ok, no post of any kind
+      expect(f.state()[String(OWN)].state).toBe("ok");
+      expect(f.state()[String(PEER)].state).toBe("dead");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("roster parse: duplicate uids first-wins, bad lines skipped, a uid whose hook IS the operator hook is not double-posted", async () => {
+    const f = liveFixture();
+    try {
+      f.fleet([
+        `${PEER} ${f.env.PI_DISPATCH_WEBHOOK}`, // first: the operator hook
+        `${PEER} ${f.peerUrl}`, // dup: ignored (first-wins)
+        `garbage line`, // no uid
+        ``,
+        `# comment`,
+      ]);
+      f.marker(OWN, 1); // fresh: no post
+      f.marker(PEER, 20);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1); // the operator SILENT (no dup post)
+      expect(f.peerPosts).toHaveLength(0); // first-wins hook == operator
+      expect(f.state()[String(PEER)].state).toBe("silent");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--dry-run: no post, no state write (first sight, SILENT, AGENT-DEAD)", async () => {
+    const f = liveFixture();
+    try {
+      const r0 = await f.run(["--dry-run"]);
+      expect(r0.out).toContain(
+        `dry-run: would record live first-sight user-${OWN} (no marker, no alert)`,
+      );
+      expect(fs.existsSync(f.stateFile)).toBe(false);
+      f.marker(OWN, 20);
+      const r1 = await f.run(["--dry-run"]);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        `dry-run: would post silent user-${OWN} (20m stale (limit 15m))`,
+      );
+      expect(fs.existsSync(f.stateFile)).toBe(false);
+      // AGENT-DEAD dry: the seeded state is untouched
+      const seeded: Record<string, LiveEntry> = {
+        [String(OWN)]: {
+          state: "silent",
+          marker_seen: true,
+          mtime: NOW() - 1200,
+        },
+      };
+      f.seedState(seeded);
+      const r2 = await f.run(["--dry-run"]);
+      expect(f.posts).toHaveLength(0);
+      expect(r2.out).toContain(
+        `dry-run: would post dead user-${OWN} (20m stale (limit 15m))`,
+      );
+      expect(f.state()).toEqual(seeded);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("--quiet: detect + log, no post, no state advance (the next live run posts)", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      const r1 = await f.run(["--quiet"]);
+      expect(f.posts).toHaveLength(0);
+      expect(r1.out).toContain(
+        `quiet: silent user-${OWN} (20m stale (limit 15m)) not posted (no state advance)`,
+      );
+      expect(fs.existsSync(f.stateFile)).toBe(false);
+      await f.run();
+      expect(f.posts).toHaveLength(1); // not advanced -> ok -> silent
+      expect(f.posts[0].content).toContain("SILENT");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("no operator webhook: detect + log only, no state advance", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20);
+      const r = await f.run([], { PI_DISPATCH_WEBHOOK: "" });
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(0);
+      expect(r.out).toContain(
+        `live: user-${OWN} silent - no webhook configured (no state advance)`,
+      );
+      expect(fs.existsSync(f.stateFile)).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("clean env (env -i): PI_BG_LIVE_ROOT + PI_BG_LIVE_BTIME_FILE + PI_DISPATCH_RECORD_DIR wiring", async () => {
+    const f = liveFixture();
+    try {
+      // failing control for the var wiring: a DIFFERENT rec dir than the
+      // fixture default. If PI_DISPATCH_RECORD_DIR did not reach the
+      // sweep, the state would land at the default
+      // $HOME/.pi-dispatch/runs and this assertion goes red.
+      const recDir2 = path.join(f.tmp, "recdir-live");
+      fs.mkdirSync(recDir2, { recursive: true });
+      f.session(OWN, [4242]);
+      f.marker(OWN, 20);
+      fs.writeFileSync(
+        path.join(recDir2, "live-state.json"),
+        JSON.stringify(
+          {
+            [String(OWN)]: {
+              state: "silent",
+              marker_seen: true,
+              mtime: NOW() - 1200,
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      const child = Bun.spawn(
+        [
+          "env",
+          "-i",
+          `HOME=${f.home}`,
+          `PATH=/usr/local/bin:/usr/bin:/bin`,
+          `PI_BG_WT_DIR=${f.env.PI_BG_WT_DIR}`,
+          `PI_BG_TMPDIR=${f.env.PI_BG_TMPDIR}`,
+          `PI_BG_CG_ROOT=${f.env.PI_BG_CG_ROOT}`,
+          `PI_BG_OOM_ROOT=${f.oomRoot}`,
+          `PI_BG_LIVE_ROOT=${f.liveRoot}`,
+          `PI_BG_LIVE_BTIME_FILE=${f.btimeFile}`,
+          `PI_DISPATCH_RECORD_DIR=${recDir2}`,
+          `PI_DISPATCH_WEBHOOK=${f.env.PI_DISPATCH_WEBHOOK}`,
+          "bash",
+          WD,
+        ],
+        { env: {}, stdout: "pipe", stderr: "pipe" },
+      );
+      const out = await new Response(child.stdout).text();
+      const exitCode = await child.exited;
+      expect(exitCode).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] AGENT-DEAD: user-${OWN} 20m stale (limit 15m)`,
+      );
+      expect(codeLines(f.posts[0].embeds[0])).toContain(
+        `\u251c session: present`,
+      );
+      // the state advanced AT THE PASSED rec dir
+      const s2 = JSON.parse(
+        fs.readFileSync(path.join(recDir2, "live-state.json"), "utf8"),
+      ) as Record<string, LiveEntry>;
+      expect(s2[String(OWN)].state).toBe("dead");
+      expect(s2[String(OWN)].last_alert_epoch).toBeGreaterThanOrEqual(
+        NOW() - 5,
+      );
+      // the fixture-default rec dir was never written
+      expect(fs.existsSync(f.stateFile)).toBe(false);
+      void out;
     } finally {
       f.close();
     }
