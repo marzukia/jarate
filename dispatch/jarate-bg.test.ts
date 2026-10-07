@@ -571,6 +571,10 @@ function wdFixtureX(n: number) {
   env.PI_BG_TMPDIR = art;
   // keep the sweep (incl. the empty-cgroup reaper) off the real cgroup fs
   env.PI_BG_CG_ROOT = path.join(tmp, "cg");
+  // keep the M2 liveness section off the real /var/tmp/jarate-live
+  // (issue #199 review: a stale real marker adds an extra SILENT post
+  // to the exact-count assertions; absent dir -> the section no-ops)
+  env.PI_BG_LIVE_ROOT = path.join(tmp, "live");
   delete env.PI_DISPATCH_WEBHOOK;
   delete env.PI_BG_SETSID;
   // same hermeticity as fixture() above: a ticket run leaks SNAP + RUN_ID

@@ -107,6 +107,11 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
           // the first-sight line lands on stdout and the one-line
           // contract below breaks (failing control for this env)
           PI_BG_OOM_ROOT: join(tmp, "oom"),
+          // the liveness section (issue #191 M2) reads $PI_BG_LIVE_ROOT
+          // for the agent markers: keep it on the fake (marker-less)
+          // root or the first-sight line lands on stdout and the one-line
+          // contract below breaks (failing control for this env)
+          PI_BG_LIVE_ROOT: join(tmp, "live"),
           PATH: process.env.PATH ?? "",
         },
       });

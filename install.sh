@@ -269,6 +269,23 @@ else
   fi
 fi
 
+# --- 3c. live marker dir (issue #191 M2) ------------------------------------
+# /var/tmp/jarate-live: the per-agent liveness markers (<uid>, 0644) the
+# bridge touches every poll cycle; the watchdog's fleet liveness sweep
+# (another user) reads everyone's, so the dir is sticky world-writable
+# like /tmp. /var/tmp, not /tmp: the marker must survive a reboot so the
+# sweep can classify BOOT-GAP (marker older than kernel btime) instead of
+# alerting on a fresh boot. Created only when absent: a dir another agent
+# created first is already shared (1777) and un-chmoddable by us.
+LIVE_MARKER_DIR=/var/tmp/jarate-live
+if [ -d "$LIVE_MARKER_DIR" ]; then
+  echo "  live marker: $LIVE_MARKER_DIR (exists, unchanged)"
+else
+  echo "  live marker: $LIVE_MARKER_DIR (create, 1777 sticky)"
+  run mkdir -p "$LIVE_MARKER_DIR"
+  run chmod 1777 "$LIVE_MARKER_DIR"
+fi
+
 # --- 4. finish ---------------------------------------------------------------
 echo
 echo "== done (settings.json untouched, no pi processes touched)"

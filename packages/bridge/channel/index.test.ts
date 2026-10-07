@@ -49,6 +49,7 @@ import extension, {
   isOwnerUser,
   isPeerInbound,
   isVerbose,
+  LIVE_MARKER_DIR,
   LIVE_TEXT_PLACEHOLDER,
   LIVE_TEXT_THROTTLE_MS,
   lastRunUsage,
@@ -96,6 +97,7 @@ import extension, {
   TOOL_LINE_MAX,
   TOOL_TEXT_MAX,
   toolActionText,
+  touchLiveMarker,
   truncateLiveText,
   updateQueuedInbound,
   verboseLevel,
@@ -11223,5 +11225,62 @@ describe("#84: placeholder settlement (all exit paths)", () => {
       true,
     );
     expect(fs.existsSync(file())).toBe(false);
+  });
+});
+
+// ─── Live marker (issue #191 M2: agent liveness) ─────────────────────────
+// The bridge touches <LIVE_MARKER_DIR>/<uid> (0644) in a sticky 1777 dir
+// once per poll cycle + at session start. The watchdog's fleet liveness
+// sweep (another user) pages on marker staleness: a pi.service death with
+// no in-flight tickets produced zero ticket-class events (2026-10-04
+// monky OOM incident, 33 min dark). /var/tmp (not /tmp): the pre-boot
+// marker survives a reboot so the sweep classifies BOOT-GAP instead of
+// alerting on a fresh boot. The touch is best-effort: a failure must
+// never break the poll loop.
+describe("live marker (#191 M2)", () => {
+  const uid = process.getuid?.() ?? 0;
+
+  test("LIVE_MARKER_DIR defaults to /var/tmp/jarate-live (the watchdog's default root)", () => {
+    expect(LIVE_MARKER_DIR).toBe("/var/tmp/jarate-live");
+  });
+
+  test("touchLiveMarker creates the sticky 1777 dir + 0644 <uid> file and returns the path", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-live-"));
+    try {
+      const before = Date.now();
+      const f = touchLiveMarker(dir);
+      expect(f).toBe(path.join(dir, String(uid)));
+      expect(fs.statSync(dir).mode & 0o7777).toBe(0o1777);
+      expect(fs.statSync(f as string).mode & 0o777).toBe(0o644);
+      expect(
+        Number(fs.readFileSync(f as string, "utf8")),
+      ).toBeGreaterThanOrEqual(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("touchLiveMarker is idempotent: re-touch refreshes the same file, no churn", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-live-"));
+    try {
+      const f1 = touchLiveMarker(dir);
+      const f2 = touchLiveMarker(dir);
+      expect(f2).toBe(f1);
+      expect(fs.readdirSync(dir)).toEqual([String(uid)]);
+      expect(fs.statSync(dir).mode & 0o7777).toBe(0o1777);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("touchLiveMarker is best-effort: a non-creatable path returns null (never throws)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-live-"));
+    try {
+      const blocker = path.join(dir, "blocker");
+      fs.writeFileSync(blocker, "x"); // a file where the dir must go
+      expect(touchLiveMarker(path.join(blocker, "sub"))).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

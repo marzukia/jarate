@@ -121,6 +121,33 @@
 #       written only after a successful post). FINDING only (M1): no
 #       auto-restart, no MemoryMax changes, no liveness paging (M2 adds
 #       the live markers + fleet liveness sweep).
+#   4i. agent liveness (issue #191, M2): the OOM signature above catches
+#       kill storms but not a quiet agent death - a pi.service down with
+#       no in-flight tickets and no OOM (bridge wedged, crash, session
+#       gone) produces zero watchdog events. Each agent's bridge touches
+#       a world-readable live marker $PI_BG_LIVE_ROOT/<uid> (default
+#       /var/tmp/jarate-live, 0644 file in a sticky world-writable dir)
+#       every poll cycle (30s) + at session start; the sweep checks the
+#       roster (own uid + fleet-agents file, same source as M1) for:
+#       FRESH (marker within PI_BG_LIVE_STALE_MIN, default 15) / BOOT-GAP
+#       (marker predates kernel btime AND boot younger than the limit -
+#       /var/tmp keeps the pre-boot marker so a reboot is not a false
+#       death; an OLD boot with a still-pre-boot marker escalates, the
+#       "agent never came up after reboot" case) / SILENT (marker stale,
+#       or gone after having been seen -> WARN post, ok -> silent) /
+#       AGENT-DEAD (two consecutive stale sweeps -> ALERT post, silent
+#       -> dead; the user@<uid>.service cgroup empty/gone adds the
+#       "session gone" class to the frame) / NEVER-SEEN (no marker ever
+#       observed -> WARN only, never dead: a peer's bridge may predate
+#       the marker code). State: $rec_dir/live-state.json (same location
+#       + write discipline as oom-baseline.json: state and the dedupe
+#       stamp advance ONLY after a successful operator post). Wake:
+#       operator webhook + the roster's per-agent webhook (the
+#       fleet-agents column M1 parsed but did not use) so the agent sees
+#       its own near-misses on return. Content prefix [bg: agent-watch]
+#       (webhook wake rule). Max 1 ALERT per uid per PI_BG_LIVE_DEDUPE_MIN
+#       min (default 60; the window spans episodes). FINDING only: no
+#       auto-restart of pi.service.
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
 #      `jarate agents-check`; on drift post ONE warning per drifted hash
 #      (state: ~/.pi/agent/.agents-md-drift-warned). Never reverts,
@@ -150,6 +177,17 @@
 #                      memory.events, same pattern as PI_BG_CG_ROOT)
 #   PI_BG_OOM_DEDUPE_MIN  max one OOM ALERT per uid per N min (default
 #                      60, 0 = off; issue #191 M1)
+#   PI_BG_LIVE_ROOT    live-marker dir (issue #191 M2; default
+#                      /var/tmp/jarate-live; the bridge touches
+#                      <uid> 0644 files here, the test hook points it
+#                      at a fake dir)
+#   PI_BG_LIVE_STALE_MIN  marker age that is SILENT (default 15 min;
+#                      two consecutive stale sweeps -> AGENT-DEAD;
+#                      issue #191 M2)
+#   PI_BG_LIVE_DEDUPE_MIN max one live ALERT per uid per N min (default
+#                      60, 0 = off; issue #191 M2)
+#   PI_BG_LIVE_BTIME_FILE kernel btime source (issue #191 M2; default
+#                      /proc/stat "btime <epoch>" line; test seam)
 # args:
 #   --quiet   log-only mode: append to dead log, post no webhooks
 #             (use for the first run after install to baseline existing
@@ -1871,6 +1909,396 @@ fi
 [ "$oom_found" -gt 0 ] && echo "[pi-bg-watchdog] flagged $oom_found agent OOM finding(s)"
 [ "$oom_suppressed" -gt 0 ] && echo "[pi-bg-watchdog] deduped $oom_suppressed OOM alert(s) (${OOM_DEDUPE_MIN}m window)"
 
+# ─── agent liveness (issue #191, M2) ─────────────────────────────────────────
+# The marker proves the process serving the agent (the bridge poll loop)
+# is alive: each agent's bridge touches $LIVE_ROOT/<uid> (0644 file in a
+# sticky world-writable dir) every poll cycle + at session start
+# (packages/bridge/channel/index.ts). pi.service down, bridge wedged, or
+# the whole user session gone -> the marker goes stale. READ-ONLY on the
+# cgroup side (the session class reuses M1's OOM_ROOT seam); the only
+# writes are the state file and the posts. This section is the agent-level
+# floor under the ticket sweep: a death with no in-flight tickets and no
+# OOM (bridge wedged, crash, session gone) produced zero watchdog events
+# before (the 2026-10-04 monky incident: 33 min dark, found by accident).
+#
+# Per-roster-uid classes (sweep order):
+#   FRESH      marker mtime within LIVE_STALE_MIN (default 15) -> ok; a
+#              fresh marker after silent/dead logs "recovered" (no post)
+#   BOOT-GAP   marker predates kernel btime AND the boot is younger than
+#              LIVE_STALE_MIN -> no alert (wait for the first post-boot
+#              marker; /var/tmp keeps the pre-boot marker - /tmp would
+#              wipe it and a reboot looked like death)
+#   SILENT     stale (marker age > LIVE_STALE_MIN, marker gone after
+#              having been seen, or an OLD boot with a still-pre-boot
+#              marker - "agent never came up after reboot") -> WARN post
+#              on the ok -> silent transition (one per episode)
+#   AGENT-DEAD still stale on the NEXT sweep (two consecutive stale
+#              sweeps) -> ALERT post, silent -> dead; the user@<uid>
+#              .service cgroup empty/gone adds the "session gone" class
+#              to the frame (whole session down, not just the agent)
+#   NEVER-SEEN no marker ever observed -> WARN only, never dead (fleet
+#              deploy window: a peer's bridge may predate the marker
+#              code; absence of the mechanism is not evidence of death)
+#
+# State: $rec_dir/live-state.json (same location + write discipline as
+# oom-baseline.json): {"<uid>": {"state": "ok"|"silent"|"dead",
+# "marker_seen": bool, "mtime": last-seen-epoch?, "last_alert_epoch": s?,
+# "at": iso}}. State + the dedupe stamp advance ONLY after a successful
+# operator post (dead-letter pattern): a dead webhook keeps the state, the
+# same class re-posts next sweep. Max 1 ALERT per uid per LIVE_DEDUPE_MIN
+# min (default 60, 0 = off); the window SPANS episodes (a flap to death
+# again within an hour is suppressed, logged). The WARN class is not
+# deduped: it fires once per episode (the transition), not per sweep.
+# Wake: operator webhook ($webhook, the authoritative page) + the roster's
+# per-agent webhook (the fleet-agents column M1 parsed but did not use) so
+# the agent sees its own near-misses on return; the own-webhook post is
+# best-effort (the agent is probably down) - logged, never retried. Content
+# prefix [bg: agent-watch] (webhook wake rule: the bridge drops bot/webhook
+# posts unless the content starts with [bg: ).
+# --quiet = detect + log, no post, no state advance; --dry-run = print
+# only. The section no-ops when $LIVE_ROOT is absent (the marker
+# mechanism is not installed on this box).
+LIVE_ROOT="${PI_BG_LIVE_ROOT:-/var/tmp/jarate-live}"
+LIVE_STALE_MIN="${PI_BG_LIVE_STALE_MIN:-15}"
+case "$LIVE_STALE_MIN" in '' | *[!0-9]*) LIVE_STALE_MIN=15 ;; esac
+LIVE_DEDUPE_MIN="${PI_BG_LIVE_DEDUPE_MIN:-60}"
+case "$LIVE_DEDUPE_MIN" in '' | *[!0-9]*) LIVE_DEDUPE_MIN=60 ;; esac
+LIVE_BTIME_FILE="${PI_BG_LIVE_BTIME_FILE:-/proc/stat}"
+LIVE_STATE="$rec_dir/live-state.json"
+live_silent=0
+live_dead=0
+live_suppressed=0
+live_gaps=0
+
+# wd_live_roster: "<uid>\t<webhook>" per line (own uid first with an empty
+# webhook; then the fleet-agents roster - same file + tolerance as M1's
+# wd_oom_roster, but M2 keeps the webhook column: the per-agent wake).
+# Duplicate uids keep the FIRST entry (own uid wins the slot, then file
+# order).
+wd_live_roster() {
+  local own
+  own="$(id -u)"
+  {
+    printf '%s\t%s\n' "$own" ""
+    if [ -f "${HOME}/.config/jarate/fleet-agents" ]; then
+      awk '!/^[[:space:]]*#/ && $1 ~ /^[0-9]+$/ {print $1 "\t" (NF >= 2 ? $2 : "")}' \
+        "${HOME}/.config/jarate/fleet-agents" 2>/dev/null
+    fi
+  } | awk -F'\t' '!seen[$1]++'
+}
+
+# wd_live_btime: kernel boot time (epoch) from the btime line (test seam
+# PI_BG_LIVE_BTIME_FILE, default /proc/stat). 0 when unreadable (then no
+# BOOT-GAP can trigger; the normal staleness path still works).
+wd_live_btime() {
+  local v
+  v="$(awk '$1 == "btime" {print $2; exit}' "$LIVE_BTIME_FILE" 2>/dev/null)"
+  case "$v" in '' | *[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+
+# wd_live_mtime <uid>: marker mtime (epoch) or empty (no marker).
+wd_live_mtime() {
+  stat -c %Y "$LIVE_ROOT/$1" 2>/dev/null || true
+}
+
+# wd_live_session <uid>: "present"|"gone" - the user@<uid>.service cgroup
+# under the M1 OOM_ROOT seam. Distinguishes agent-dead (session cgroup
+# still holds processes: a wedged pi, other session work) from
+# whole-session-dead (cgroup empty/gone: the user session itself is down).
+wd_live_session() {
+  local d="$OOM_ROOT/user-$1.slice/user@$1.service"
+  if [ -d "$d" ] && cg_has_members "$d"; then
+    echo present
+  else
+    echo gone
+  fi
+}
+
+# wd_live_get <uid>: "<state> <marker_seen 0|1> <mtime|-> <last_alert|->";
+# prints nothing when the entry is absent (or the file missing/corrupt).
+wd_live_get() {
+  python3 - "$LIVE_STATE" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+p, uid = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+e = d.get(uid)
+if not isinstance(e, dict) or e.get("state") not in ("ok", "silent", "dead"):
+    sys.exit(0)
+ms = 1 if e.get("marker_seen") else 0
+mt = e.get("mtime")
+la = e.get("last_alert_epoch")
+print(e["state"], ms, mt if isinstance(mt, int) else "-",
+      la if isinstance(la, int) else "-")
+PY
+}
+
+# wd_live_set <uid> <state> <marker_seen 0|1> <mtime|-> <last_alert|->:
+# update one uid entry, keep the others (missing file = first write).
+# last_alert "-" keeps the existing stamp (the 60-min window spans
+# episodes); an epoch sets it. Audit-only: a python failure never breaks
+# the sweep.
+wd_live_set() {
+  local uid="$1" st="$2" ms="$3" mt="$4" la="$5"
+  [ "$mt" = "-" ] && mt=""
+  [ "$la" = "-" ] && la=""
+  mkdir -p "$(dirname "$LIVE_STATE")" 2>/dev/null
+  PI_LS_UID="$uid" PI_LS_ST="$st" PI_LS_MS="$ms" PI_LS_MT="$mt" PI_LS_LA="$la" \
+  python3 - "$LIVE_STATE" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+uid = os.environ["PI_LS_UID"]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+e = d.get(uid) or {}
+e["state"] = os.environ["PI_LS_ST"]
+e["marker_seen"] = os.environ["PI_LS_MS"] == "1"
+if os.environ["PI_LS_MT"]:
+    e["mtime"] = int(os.environ["PI_LS_MT"])
+else:
+    e.pop("mtime", None)
+if os.environ["PI_LS_LA"]:
+    e["last_alert_epoch"] = int(os.environ["PI_LS_LA"])
+e["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+d[uid] = e
+json.dump(d, open(p, "w"), indent=2)
+PY
+}
+
+# wd_build_live <body-file> <uid> <kind> <age> <note> <session>
+# kind: SILENT (orange, near-miss, one per episode) or AGENT-DEAD (red,
+# two consecutive stale sweeps). The body carries BOTH the [bg: agent-watch]
+# content (the webhook wake marker, isBgWebhook) and the 40-col frame
+# (age + note + the session class). A session-gone AGENT-DEAD carries the
+# class in the title (the whole user session is down, not just the agent).
+wd_build_live() {
+  local bodyfile="$1" uid="$2" kind="$3" age="$4" note="$5" sess="$6"
+  WD_L_UID="$uid" WD_L_KIND="$kind" WD_L_AGE="$age" WD_L_NOTE="$note" \
+  WD_L_SESS="$sess" \
+  python3 - > "$bodyfile" 2>/dev/null <<'PY'
+import json, os, sys, datetime
+E = lambda k: os.environ.get("WD_L_" + k, "")
+FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
+# 7-col labels ("session" is the longest) -> 28-col value budget
+def clip_end(s, max):
+    s = str(s)
+    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
+def kv(key, val):
+    return "\u251c " + key.ljust(7) + ": " + clip_end(val, FRAME_W - 12)
+uid = E("UID")
+kind = E("KIND") or "SILENT"
+color = 15158332 if kind == "AGENT-DEAD" else 15105570  # red / orange
+sess = E("SESS") or "unknown"
+title = kind + " \u00b7 user-" + uid
+if kind == "AGENT-DEAD" and sess == "gone":
+    title += " (session gone)"
+lines = ["\u250c " + kind.lower() + " \u00b7 user-" + uid,
+         "\u251c $ jarate-bg-watchdog live",
+         kv("uid", uid),
+         kv("age", E("AGE")),
+         kv("note", E("NOTE")),
+         kv("session", sess),
+         "\u2514"]
+content = "[bg: agent-watch] " + kind + ": user-" + uid + " " + E("AGE")
+if kind == "AGENT-DEAD" and sess == "gone":
+    content += ", session gone"
+embed = {"author": {"name": "pi-bg watchdog"},
+         "color": color,
+         "title": title,
+         "description": "```bash\n" + "\n".join(lines) + "\n```",
+         "footer": {"text": "pi-bg watchdog (live, issue #191)"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+json.dump({"content": content, "embeds": [embed]}, sys.stdout)
+PY
+}
+
+# wd_live_post <body-file> <own-webhook-or-empty>: operator webhook first
+# (the authoritative page - its success is what advances state), then the
+# roster's per-agent webhook (the agent's own incoming hook: it sees its
+# near-misses on return; best-effort single attempt - the agent is
+# probably down, a failure is logged and never retried here).
+wd_live_post() {
+  local body="$1" own="${2:-}" code
+  wd_post "$body" || return 1
+  if [ -n "$own" ] && [ "$own" != "$webhook" ]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$own" \
+      -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
+    case "$code" in
+      2*) ;;
+      *) echo "[pi-bg-watchdog] live: own-webhook post failed (http=$code, best-effort, not retried)" >&2 ;;
+    esac
+  fi
+  return 0
+}
+
+if [ -d "$LIVE_ROOT" ]; then
+  live_now="$(date +%s)"
+  live_btime="$(wd_live_btime)"
+  while IFS=$'\t' read -r l_uid l_wh; do
+    [ -n "$l_uid" ] || continue
+    case "$l_uid" in *[!0-9]*) continue ;; esac
+    l_mtime="$(wd_live_mtime "$l_uid")"
+    l_line="$(wd_live_get "$l_uid")"
+    if [ -z "$l_line" ]; then
+      l_st=""; l_ms=0; l_mt=""; l_la=""
+    else
+      l_st="${l_line%% *}"
+      rest="${l_line#* }"
+      l_ms="${rest%% *}"
+      rest="${rest#* }"
+      l_mt="${rest%% *}"
+      l_la="${rest##* }"
+    fi
+    [ "$l_mt" = "-" ] && l_mt=""
+    [ "$l_la" = "-" ] && l_la=""
+
+    l_action=""   # "" | silent | dead
+    l_age_str=""  # frame age line (compact, <= 29 col)
+    l_note=""     # frame note line
+
+    if [ -z "$l_mtime" ]; then
+      # ── no marker ──
+      if [ -z "$l_st" ]; then
+        # first sight: record, no alert
+        if [ "$DRY" -eq 1 ]; then
+          echo "[pi-bg-watchdog] dry-run: would record live first-sight user-$l_uid (no marker, no alert)"
+        else
+          wd_live_set "$l_uid" ok 0 - -
+          echo "[pi-bg-watchdog] live: user-$l_uid no marker (first sight, no alert)"
+        fi
+        continue
+      fi
+      if [ "$l_ms" = "0" ]; then
+        # never seen: WARN only (one per episode), never dead
+        if [ "$l_st" = "ok" ]; then
+          l_action="silent"
+          l_age_str="no marker (never seen)"
+          l_note="marker never observed (deploy window)"
+        else
+          continue  # silent: the WARN was sent on the transition
+        fi
+      else
+        # seen, now gone: age from the last-seen mtime
+        if [ -n "$l_mt" ]; then
+          l_age_min=$(( (live_now - l_mt) / 60 ))
+          l_age_str="gone (last seen ${l_age_min}m ago)"
+          l_note="marker deleted after sight"
+        else
+          l_age_min=$(( LIVE_STALE_MIN + 1 ))
+          l_age_str="gone (age unknown)"
+          l_note="no recorded last-seen time"
+        fi
+      fi
+    else
+      # ── marker present ──
+      if [ "$live_btime" -gt 0 ] && [ "$l_mtime" -lt "$live_btime" ]; then
+        boot_age_min=$(( (live_now - live_btime) / 60 ))
+        if [ "$boot_age_min" -le "$LIVE_STALE_MIN" ]; then
+          # recent boot: wait for the first post-boot marker
+          live_gaps=$(( live_gaps + 1 ))
+          echo "[pi-bg-watchdog] live: user-$l_uid marker predates boot (boot ${boot_age_min}m old, no alert)"
+          if [ "$l_ms" = "0" ] && [ "$DRY" -eq 0 ]; then
+            wd_live_set "$l_uid" "${l_st:-ok}" 1 "$l_mtime" -
+          fi
+          continue
+        fi
+        # old boot, still pre-boot marker: the agent never came up
+        # after reboot - escalate like a stale marker (age = uptime)
+        l_age_str="predates boot (up ${boot_age_min}m)"
+        l_note="agent never up after reboot"
+      else
+        l_age_min=$(( (live_now - l_mtime) / 60 ))
+        if [ "$l_age_min" -le "$LIVE_STALE_MIN" ]; then
+          # FRESH
+          if [ "$l_st" = "silent" ] || [ "$l_st" = "dead" ]; then
+            echo "[pi-bg-watchdog] live: user-$l_uid recovered (marker ${l_age_min}m old, was $l_st)"
+          fi
+          if [ "$DRY" -eq 0 ] && { [ -z "$l_st" ] || [ "$l_st" != "ok" ] || [ "$l_ms" = "0" ]; }; then
+            wd_live_set "$l_uid" ok 1 "$l_mtime" -
+          fi
+          continue
+        fi
+        l_age_str="${l_age_min}m stale (limit ${LIVE_STALE_MIN}m)"
+        l_note="marker stale"
+      fi
+    fi
+
+    # ── stale path: escalate ──
+    if [ "$l_st" = "dead" ]; then
+      echo "[pi-bg-watchdog] live: user-$l_uid still dead ($l_age_str)"
+      continue
+    fi
+    if [ "$l_st" = "silent" ]; then
+      l_action="dead"
+      l_note="2 consecutive stale sweeps"
+    else
+      l_action="silent"
+    fi
+
+    # 60-min ALERT dedupe (spec false-positive budget): the window spans
+    # episodes; the stamp is written only after a successful post
+    if [ "$l_action" = "dead" ] && [ -n "$l_la" ] && [ "$LIVE_DEDUPE_MIN" -gt 0 ]; then
+      la_age_min=$(( (live_now - l_la) / 60 ))
+      if [ "$la_age_min" -lt "$LIVE_DEDUPE_MIN" ]; then
+        echo "[pi-bg-watchdog] live: user-$l_uid AGENT-DEAD suppressed (last alert ${la_age_min}m ago < ${LIVE_DEDUPE_MIN}m)"
+        live_suppressed=$(( live_suppressed + 1 ))
+        if [ "$DRY" -eq 0 ]; then
+          wd_live_set "$l_uid" dead "${l_ms:-0}" "${l_mtime:-$l_mt}" -
+        fi
+        continue
+      fi
+    fi
+
+    if [ "$DRY" -eq 1 ]; then
+      echo "[pi-bg-watchdog] dry-run: would post ${l_action} user-$l_uid ($l_age_str)"
+      continue
+    fi
+    if [ "$QUIET" -eq 1 ]; then
+      echo "[pi-bg-watchdog] quiet: ${l_action} user-$l_uid ($l_age_str) not posted (no state advance)"
+      continue
+    fi
+    if [ -z "$webhook" ]; then
+      echo "[pi-bg-watchdog] live: user-$l_uid ${l_action} - no webhook configured (no state advance)"
+      continue
+    fi
+    l_sess="$(wd_live_session "$l_uid")"
+    # a marker seen now (even stale) counts as the mechanism having
+    # worked: marker_seen advances with the state
+    l_ms_adv="${l_ms}"
+    [ -n "$l_mtime" ] && l_ms_adv=1
+    bodyf="$BG_TMP/pi-bg-watchdog-live-body.json"
+    if [ "$l_action" = "dead" ]; then
+      wd_build_live "$bodyf" "$l_uid" "AGENT-DEAD" "$l_age_str" "$l_note" "$l_sess"
+    else
+      wd_build_live "$bodyf" "$l_uid" "SILENT" "$l_age_str" "$l_note" "$l_sess"
+    fi
+    if [ -s "$bodyf" ]; then
+      if wd_live_post "$bodyf" "$l_wh"; then
+        if [ "$l_action" = "dead" ]; then
+          wd_live_set "$l_uid" dead "$l_ms_adv" "${l_mtime:-$l_mt}" "$live_now"
+          echo "[pi-bg-watchdog] AGENT-DEAD user-$l_uid: $l_age_str (session $l_sess)"
+          live_dead=$(( live_dead + 1 ))
+        else
+          wd_live_set "$l_uid" silent "$l_ms_adv" "${l_mtime:-$l_mt}" -
+          echo "[pi-bg-watchdog] SILENT user-$l_uid: $l_age_str (session $l_sess)"
+          live_silent=$(( live_silent + 1 ))
+        fi
+      else
+        echo "[pi-bg-watchdog] live: user-$l_uid ${l_action} post failed - state kept, retries next sweep" >&2
+      fi
+    else
+      echo "[pi-bg-watchdog] live: user-$l_uid ${l_action} embed build failed - state kept" >&2
+    fi
+    rm -f "$bodyf"
+  done < <(wd_live_roster)
+fi
+[ "$live_silent" -gt 0 ] && echo "[pi-bg-watchdog] flagged $live_silent agent SILENT finding(s)"
+[ "$live_dead" -gt 0 ] && echo "[pi-bg-watchdog] flagged $live_dead AGENT-DEAD finding(s)"
+
 # ─── AGENTS.md drift tripwire (2026-09-14, alert-only) ────────────────────────
 # Manifest: ~/.pi/agent/.agents-md-hash (<sha256>  <ts>  <note>). The check
 # itself never blocks; this section only decides whether to post. One warning
@@ -1994,5 +2422,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed, $oom_found agent OOM finding(s), $oom_suppressed OOM alert(s) deduped (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS oom_dedupe_min=$OOM_DEDUPE_MIN)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed, $oom_found agent OOM finding(s), $oom_suppressed OOM alert(s) deduped, $live_silent agent SILENT(s), $live_dead AGENT-DEAD(s), $live_suppressed live alert(s) deduped, $live_gaps boot-gap(s) (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS oom_dedupe_min=$OOM_DEDUPE_MIN live_stale_min=$LIVE_STALE_MIN live_dedupe_min=$LIVE_DEDUPE_MIN)"
 exit 0
