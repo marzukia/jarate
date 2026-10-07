@@ -2857,9 +2857,13 @@ export default function (pi: ExtensionAPI) {
       const tDue = deliverDueTasks(pi, channels);
       if (tDue > 0)
         console.log(`[task] delivered ${tDue} due task(s) on startup`);
+      // Live marker (issue #191 M2): touch once at startup, then every
+      // poll tick — a wedge anywhere in this process goes stale.
+      touchLiveMarker();
       if (schedPoller) clearInterval(schedPoller);
       schedPoller = setInterval(() => {
         try {
+          touchLiveMarker();
           const n = deliverDueWakes(pi, channels);
           if (n > 0) console.log(`[sleep] delivered ${n} due wake(s)`);
           const tn = deliverDueTasks(pi, channels);
@@ -4415,6 +4419,49 @@ const sleep = (ms: number) =>
 function safeSessionFile(ctx: ExtensionContext): string | null {
   try {
     return ctx.sessionManager?.getSessionFile?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Live marker (issue #191 M2: agent liveness) ─────────────────────────
+// Touch /var/tmp/jarate-live/<uid> (0644) once per poll cycle. The
+// watchdog's fleet liveness sweep (dispatch/jarate-bg-watchdog) pages on
+// marker staleness: a pi.service death with NO in-flight tickets produced
+// zero ticket-class events (2026-10-04 monky OOM incident, 33 min dark,
+// found by accident). /var/tmp, not /tmp: the pre-boot marker must survive
+// a reboot so the sweep classifies BOOT-GAP (marker older than kernel
+// btime) instead of alerting on a fresh boot. The dir is sticky
+// world-writable (like /tmp) so each agent user writes its own <uid> file
+// and the orchestrator's sweep (another user) can read everyone's.
+// Best-effort: a marker failure must never break the bridge poll loop.
+export const LIVE_MARKER_DIR =
+  process.env.JARATE_LIVE_DIR ?? "/var/tmp/jarate-live";
+
+export function touchLiveMarker(dir: string = LIVE_MARKER_DIR): string | null {
+  try {
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (uid === null) return null;
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o1777 });
+    } catch {
+      // exists or not creatable — the file write below decides
+    }
+    try {
+      // mkdir's mode is umask-filtered; the sticky bit is required so
+      // the orchestrator's sweep (a different user) can read the markers
+      fs.chmodSync(dir, 0o1777);
+    } catch {
+      // not the dir owner: fine if it is already world-writable
+    }
+    const f = path.join(dir, String(uid));
+    fs.writeFileSync(f, `${Date.now()}\n`);
+    try {
+      fs.chmodSync(f, 0o644); // world-readable for the sweep
+    } catch {
+      // not the file owner (uid squat); mtime still advances if writable
+    }
+    return f;
   } catch {
     return null;
   }
