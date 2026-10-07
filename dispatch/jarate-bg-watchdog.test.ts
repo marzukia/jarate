@@ -68,6 +68,11 @@ function fixture() {
   // keep the OOM signature section (issue #191 M1) off the real cgroup fs:
   // the fake root has no slices by default -> the section is a no-op
   env.PI_BG_OOM_ROOT = path.join(tmp, "oom");
+  // keep the M2 liveness section off the real /var/tmp/jarate-live:
+  // absent dir -> the section no-ops (liveFixture overrides with its
+  // own 1777 live dir); without this pin, pre-deploy a stale real
+  // marker adds an extra SILENT post to every exact-count assertion
+  env.PI_BG_LIVE_ROOT = path.join(tmp, "live");
   // pin the baseline/run-record location to the fake HOME (clean-env
   // lesson: the OOM tests must not inherit an ambient
   // $PI_DISPATCH_RECORD_DIR from the harness box)
@@ -3373,6 +3378,7 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
           `PI_BG_TMPDIR=${f.env.PI_BG_TMPDIR}`,
           `PI_BG_CG_ROOT=${f.env.PI_BG_CG_ROOT}`,
           `PI_BG_OOM_ROOT=${f.oomRoot}`,
+          `PI_BG_LIVE_ROOT=${f.env.PI_BG_LIVE_ROOT}`,
           `PI_DISPATCH_RECORD_DIR=${recDir}`,
           `PI_DISPATCH_WEBHOOK=${f.env.PI_DISPATCH_WEBHOOK}`,
           "bash",
@@ -3652,6 +3658,32 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       // the sweep summary line carries the live counters (shims contract)
       expect(r.out).toContain("1 agent SILENT(s)");
       expect(r.out).toContain("live_stale_min=15 live_dedupe_min=60");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("corrupt live-state.json: no crash, SILENT (WARN) recovery, state rewritten valid after a successful post", async () => {
+    const f = liveFixture();
+    try {
+      f.marker(OWN, 20); // stale -> the escalation path
+      // garbage the json parser rejects (same untested pattern as M1's
+      // oom-baseline.json recovery)
+      fs.mkdirSync(f.recDir, { recursive: true });
+      fs.writeFileSync(f.stateFile, "{ not json ");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // a corrupt state reads as first-sight (empty entry) -> sweep 1
+      // escalates exactly one level: the WARN class, never AGENT-DEAD
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].content).toBe(
+        `[bg: agent-watch] SILENT: user-${OWN} 20m stale (limit 15m)`,
+      );
+      // dead-letter discipline: the state is rewritten as valid JSON
+      // only after the successful operator post
+      const s = f.state();
+      expect(s[String(OWN)].state).toBe("silent");
+      expect(s[String(OWN)].marker_seen).toBe(true);
     } finally {
       f.close();
     }
