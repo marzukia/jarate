@@ -20,6 +20,8 @@ import {
   handleMessageCreate,
   handleMessageDelete,
   handleMessageUpdate,
+  interactionUserId,
+  interactionUserName,
   isBgWebhook,
   loadChannelStateFile,
   loadPersistedCursors,
@@ -1065,6 +1067,21 @@ test("parseGatewayPayload: bare 16+ digit ints -> exact strings; everything else
   expect(p.arr[0]).toBe("1234567890123456789");
   // plain JSON.parse rounds the same text — that is the bug this prevents
   expect(JSON.parse(raw).d.id).not.toBe("1557766848009994272");
+});
+
+test("interactionUserId/interactionUserName: member.user fallback (live guild capture 2026-10-08)", () => {
+  // live shape: guild INTERACTION_CREATE has NO top-level user
+  expect(interactionUserId({ member: { user: { id: "u2" } } })).toBe("u2");
+  expect(interactionUserId({ user: { id: "u1" } })).toBe("u1");
+  expect(
+    interactionUserId({ user: { id: "u1" }, member: { user: { id: "u2" } } }),
+  ).toBe("u1"); // top-level wins when both present
+  expect(interactionUserId({})).toBe("");
+  expect(interactionUserId(undefined)).toBe("");
+  expect(interactionUserName({ member: { user: { username: "x" } } })).toBe(
+    "x",
+  );
+  expect(interactionUserName({})).toBeUndefined();
 });
 
 test("parseGatewayPayload fast path: no 16+ digit run -> plain JSON.parse (RCA 2026-10-08)", () => {

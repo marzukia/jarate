@@ -496,6 +496,23 @@ describe("one-callback discipline", () => {
     }
   });
 
+  test("guild payload (live capture 2026-10-08): user under member.user, NO top-level user — owner tap approves", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const req = await makePending(f);
+      const d = mkD(`i-guild-${req.id}`, `pat:approve:${req.id}`, {
+        message: { id: req.messageId },
+        member: { user: { id: OWNER, username: "Owner" } },
+      });
+      delete d.user; // live shape: guild INTERACTION_CREATE omits top-level user
+      await f.h.handlePatComponent(d);
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+    } finally {
+      f.cleanup();
+    }
+  });
+
   test("non-owner tap: visible in-channel refusal, state untouched, audit", async () => {
     const f = mkVault();
     try {

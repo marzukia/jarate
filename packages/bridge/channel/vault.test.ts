@@ -1154,6 +1154,48 @@ describe("tap rejection feedback (RCA 2026-10-08)", () => {
     }
   }, 15000);
 
+  test("guild payload (live capture 2026-10-08): user under member.user, NO top-level user — owner tap approves", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      const d = mkD(`i-guild-${id}`, `vault:approve:${id}`, {
+        message: { id: cred!.messageId },
+        member: { user: { id: OWNER, username: "Owner" } },
+      });
+      delete d.user; // live shape: guild INTERACTION_CREATE omits top-level user
+      await f.h.handleVaultComponent(d);
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      const app = f.auditEvents().find((e) => e.event === "approve");
+      expect(app).toBeTruthy();
+      expect(app!.user).toBe(OWNER);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("guild payload: non-owner via member.user audits the REAL uid (not empty string)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      const d = mkD(`i-guild-nn-${id}`, `vault:approve:${id}`, {
+        message: { id: cred!.messageId },
+        member: { user: { id: OTHER, username: "Other" } },
+      });
+      delete d.user;
+      await f.h.handleVaultComponent(d);
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const ev = f.auditEvents().find((e) => e.event === "non-owner-tap");
+      expect(ev).toBeTruthy();
+      expect(ev!.user).toBe(OTHER);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
   test("wrong message: rejected + audited mismatch + visible reply", async () => {
     const f = mkVault();
     try {

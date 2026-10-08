@@ -1196,6 +1196,20 @@ export function isOlderSnowflake(a: string, b: string | null): boolean {
   return false;
 }
 
+/** Interaction actor id. Current Discord gateway sends the user nested
+ *  under `member.user` for guild interactions — top-level `user` is
+ *  ABSENT (live capture 2026-10-08: every tap audited non-owner with
+ *  user="" because handlers read d.user.id). Top-level `user` is kept
+ *  as fallback for DM / older payload shapes. */
+export function interactionUserId(d: any): string {
+  return String(d?.user?.id ?? d?.member?.user?.id ?? "");
+}
+
+export function interactionUserName(d: any): string | undefined {
+  const n = d?.user?.username ?? d?.member?.user?.username;
+  return n != null ? String(n) : undefined;
+}
+
 /** Parse a raw gateway payload, preserving snowflake precision.
  *  Discord serializes snowflake ids as JSON strings today, but any bare
  *  integer >= 16 digits would be rounded by JSON.parse beyond 2^53 —
