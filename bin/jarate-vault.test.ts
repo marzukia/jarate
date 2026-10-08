@@ -793,3 +793,220 @@ describe("bin/jarate dispatch", () => {
     expect((JSON.parse(r3.out) as Doc).count).toBe(1);
   });
 });
+
+// ─── #205: optional level + minute granularity ────────────────────────────
+
+describe("parseRequestArgv #205 (optional level, --minutes)", () => {
+  test("level omitted → undefined on the parsed request", () => {
+    const p = parseRequestArgv([
+      "github-pat",
+      "marzukia/jarate:write",
+      "open PR for #41",
+    ]);
+    expect(p.kind).toBe("github-pat");
+    expect(p.name).toBe("marzukia/jarate:write");
+    expect(p.level).toBeUndefined();
+    expect(p.reason).toBe("open PR for #41");
+  });
+
+  test("explicit level still consumed (reason starts after it)", () => {
+    const p = parseRequestArgv([
+      "api-key",
+      "k",
+      "time-boxed",
+      "--minutes",
+      "30",
+      "--envvar",
+      "K",
+      "half hour grant",
+    ]);
+    expect(p.level).toBe("time-boxed");
+    expect(p.hours).toBe(0.5);
+    expect(p.reason).toBe("half hour grant");
+  });
+
+  test("--hours: minute granularity (0.5 = 30m, 1.5 = 90m)", () => {
+    expect(
+      parseRequestArgv([
+        "api-key",
+        "k",
+        "--envvar",
+        "K",
+        "--hours",
+        "0.5",
+        "a reason here",
+      ]).hours,
+    ).toBe(0.5);
+    expect(
+      parseRequestArgv([
+        "api-key",
+        "k",
+        "--envvar",
+        "K",
+        "--hours",
+        "1.5",
+        "a reason here",
+      ]).hours,
+    ).toBe(1.5);
+  });
+
+  test("--hours off-grid / out of range → rc 2", async () => {
+    const v = await new FakeVault().start();
+    try {
+      const r1 = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "--envvar",
+          "K",
+          "--hours",
+          "73",
+          "a reason here",
+        ],
+        v.env(),
+      );
+      expect(r1.code).toBe(2);
+      const r2 = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "--envvar",
+          "K",
+          "--hours",
+          "0",
+          "a reason here",
+        ],
+        v.env(),
+      );
+      expect(r2.code).toBe(2);
+      expect(v.lines).toEqual([]);
+    } finally {
+      await v.stop();
+    }
+  });
+
+  test("--minutes 30 → hours 0.5 in-process", () => {
+    expect(
+      parseRequestArgv([
+        "api-key",
+        "k",
+        "--envvar",
+        "K",
+        "--minutes",
+        "30",
+        "a reason here",
+      ]).hours,
+    ).toBe(0.5);
+  });
+
+  test("--minutes 0 / 4321 / both flags → rc 2", async () => {
+    const v = await new FakeVault().start();
+    try {
+      const r1 = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "--envvar",
+          "K",
+          "--minutes",
+          "0",
+          "a reason here",
+        ],
+        v.env(),
+      );
+      expect(r1.code).toBe(2);
+      const r2 = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "--envvar",
+          "K",
+          "--minutes",
+          "4321",
+          "a reason here",
+        ],
+        v.env(),
+      );
+      expect(r2.code).toBe(2);
+      const r3 = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "--envvar",
+          "K",
+          "--hours",
+          "1",
+          "--minutes",
+          "30",
+          "a reason here",
+        ],
+        v.env(),
+      );
+      expect(r3.code).toBe(2);
+      expect(v.lines).toEqual([]);
+    } finally {
+      await v.stop();
+    }
+  });
+
+  test("wire line omits level when not given (bridge applies the default)", async () => {
+    const v = await new FakeVault().start();
+    try {
+      const r = await runTool(
+        ["request", "github-pat", "marzukia/jarate:write", "open PR for #41"],
+        v.env(),
+      );
+      expect(r.code).toBe(0);
+      expect(v.lines[0]).toEqual({
+        v: 1,
+        op: "vrequest",
+        agent: "monky",
+        kind: "github-pat",
+        name: "marzukia/jarate:write",
+        envvar: "GH_TOKEN",
+        reason: "open PR for #41",
+      });
+    } finally {
+      await v.stop();
+    }
+  });
+
+  test("wire line carries --minutes as fractional hours", async () => {
+    const v = await new FakeVault().start();
+    try {
+      const r = await runTool(
+        [
+          "request",
+          "api-key",
+          "k",
+          "time-boxed",
+          "--minutes",
+          "90",
+          "--envvar",
+          "K",
+          "ninety minute grant",
+        ],
+        v.env(),
+      );
+      expect(r.code).toBe(0);
+      expect(v.lines[0]).toEqual({
+        v: 1,
+        op: "vrequest",
+        agent: "monky",
+        kind: "api-key",
+        name: "k",
+        level: "time-boxed",
+        hours: 1.5,
+        envvar: "K",
+        reason: "ninety minute grant",
+      });
+    } finally {
+      await v.stop();
+    }
+  });
+});

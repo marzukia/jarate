@@ -30,8 +30,9 @@
 #   pat-request <scope> <reason>  ask the channel owner for a GitHub PAT (JSON doc; rc 0/1/2)
 #   pat-run <id> -- <cmd> [args]  run one command under the approved token (child rc; 124 on cap)
 #   pat-status [id]               read-only PAT request state (never prints the token)
-#   vault-request <kind> <name> <level> [flags] <reason...>
+#   vault-request <kind> <name> [level] [flags] <reason...>
 #                               ask the channel owner for a credential (JSON doc; rc 0/1/2)
+#                               level omitted → 30-min time-box default (--hours whole minutes 1m..72h, or --minutes 1..4320)
 #   vault-run <id> -- <cmd> [args]  run one command under the approved credential (child rc; 124 on cap)
 #   vault-status [id]             read-only vault request state (never prints the credential)
 #   vault-revoke <id>             revoke an approved request

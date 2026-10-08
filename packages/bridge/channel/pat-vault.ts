@@ -86,7 +86,7 @@ export interface PatRequest {
   created: number; // epoch ms
   approvedAt?: number;
   handedOffAt?: number;
-  ttlDeadline: number; // created + ttlMs
+  ttlDeadline: number; // created + ttlMs; 0 = no TTL (#203, pending blocks)
   claimDeadline?: number; // approvedAt + claimMs
   deniedBy?: string;
   runRc?: number;
@@ -549,6 +549,11 @@ function settleClaim(st: PatVaultState, id: string): void {
 }
 
 function armTtl(st: PatVaultState, req: PatRequest): void {
+  // #203: ttlMs 0 = no TTL. Pending is BLOCKING until tap or revoke;
+  // the timer exists only when an explicit JARATE_PAT_TTL_MS is set.
+  // Deadline 0 (persisted no-TTL sentinel) is never armed against, even
+  // if an env TTL appears in a later restart.
+  if (st.ttlMs === 0 || req.ttlDeadline <= 0) return;
   track(
     st,
     req.id,
@@ -638,6 +643,15 @@ function patEmbed(
     { name: "scope", value: String(req.scope), inline: true },
   ];
   if (status === "pending") {
+    // #205: the grant is visible BEFORE the tap. PAT grants are one-shot
+    // by construction (claim window after approval).
+    fields.push({
+      name: "grant",
+      value: `single use (claim within ${Math.round(
+        st.claimMs / 1000,
+      )}s of approval)`,
+      inline: false,
+    });
     fields.push({
       name: "reason",
       value: String(req.reason || "-"),
@@ -665,8 +679,14 @@ function patEmbed(
     expired: `PAT expired - ${req.agent}`,
   };
   let footer = req.id;
-  if (status === "pending")
-    footer = `expires ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)}) · ${req.id}`;
+  if (status === "pending") {
+    // #203: no TTL (default) → pending until tap; the expiry timestamp
+    // line stays only when an explicit TTL is configured.
+    footer =
+      st.ttlMs > 0 && req.ttlDeadline > 0
+        ? `expires ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)}) · ${req.id}`
+        : `pending until tap · ${req.id}`;
+  }
   return {
     title: titles[status] ?? titles.pending,
     color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
@@ -807,7 +827,11 @@ export async function patRequest(
     audit(st, "pending-reject", { agent, scope, id: pending.id });
     return {
       ok: false,
-      error: `pending: ${pending.id} expires ${iso(pending.ttlDeadline)}`,
+      error: `pending: ${pending.id} ${
+        pending.ttlDeadline > 0
+          ? `expires ${iso(pending.ttlDeadline)}`
+          : "is still pending (no expiry — tap to clear)"
+      }`,
     };
   }
   const now = st.now();
@@ -837,7 +861,9 @@ export async function patRequest(
     messageId: "",
     state: "pending",
     created: now,
-    ttlDeadline: now + st.ttlMs,
+    // #203: 0 = no TTL (the default). A real deadline only when an
+    // explicit JARATE_PAT_TTL_MS is configured.
+    ttlDeadline: st.ttlMs > 0 ? now + st.ttlMs : 0,
   };
   st.requests.set(id, req);
 
@@ -859,7 +885,13 @@ export async function patRequest(
   armTtl(st, req);
   audit(st, "request", { agent, scope, id });
   persist(st);
-  return { ok: true, id, state: "pending", ttl: iso(req.ttlDeadline) };
+  // #203: null ttl = no expiry (pending is blocking until tap).
+  return {
+    ok: true,
+    id,
+    state: "pending",
+    ttl: req.ttlDeadline > 0 ? iso(req.ttlDeadline) : null,
+  };
 }
 
 /** `run` op (begin). The socket server keeps the connection open for the
@@ -1387,13 +1419,15 @@ function load(st: PatVaultState): void {
     const r: PatRequest = { ...raw, id };
     st.requests.set(id, r);
     if (r.state === "pending") {
-      if (r.ttlDeadline <= now) {
+      // #203: ttlDeadline 0 = no TTL → never expired. A past deadline
+      // only settles when a TTL is configured (explicit env override).
+      if (st.ttlMs > 0 && r.ttlDeadline > 0 && r.ttlDeadline <= now) {
         r.state = "expired";
         r.expiredKind = "ttl";
         audit(st, "recovered-expired", base(r));
         void editRequestMessage(st, r, ttlExpiredText(st), [], "expired");
       } else {
-        armTtl(st, r);
+        armTtl(st, r); // no-op when ttlMs === 0
       }
     } else if (r.state === "approved") {
       if (r.claimDeadline && r.claimDeadline <= now) {
@@ -1463,7 +1497,9 @@ export function startPatVault(opts: StartPatVaultOpts): PatVaultHandle {
       register: opts.secrets?.register ?? registerRuntimeSecrets,
       drop: opts.secrets?.drop ?? dropRuntimeSecrets,
     },
-    ttlMs: envNum("JARATE_PAT_TTL_MS", 300_000),
+    // #203: 0 = no TTL (pending is BLOCKING until tap).
+    // Explicit JARATE_PAT_TTL_MS override still works exactly as before.
+    ttlMs: envNum("JARATE_PAT_TTL_MS", 0),
     claimMs: envNum("JARATE_PAT_CLAIM_MS", 60_000),
     maxPending: envNum("JARATE_PAT_MAX_PENDING", 1),
     budgetPerHour: envNum("JARATE_PAT_BUDGET_PER_HOUR", 5),

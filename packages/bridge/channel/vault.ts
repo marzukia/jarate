@@ -100,7 +100,7 @@ export interface VaultCredential {
   messageId: string; // the button message, for match checks
   state: VaultCredentialState;
   created: number; // epoch ms
-  ttlDeadline: number; // created + ttlMs
+  ttlDeadline: number; // created + ttlMs; 0 = no TTL (#203, pending blocks)
   claimDeadline?: number; // one-shot: approvedAt + claimMs
   approvedAt?: number;
   expiresAt?: number; // time-boxed: approvedAt + hours
@@ -711,6 +711,11 @@ function settleWindow(st: VaultState, id: string): void {
 }
 
 function armTtl(st: VaultState, c: VaultCredential): void {
+  // #203: ttlMs 0 = no TTL. Pending is BLOCKING until tap or revoke;
+  // the timer exists only when an explicit JARATE_VAULT_TTL_MS is set.
+  // Deadline 0 (persisted no-TTL sentinel) is never armed against, even
+  // if an env TTL appears in a later restart.
+  if (st.ttlMs === 0 || c.ttlDeadline <= 0) return;
   track(
     st,
     c.id,
@@ -751,6 +756,8 @@ function ttlText(st: VaultState, _c: VaultCredential): string {
 }
 
 function pendingButtons(id: string): Array<Record<string, unknown>> {
+  // #203: Revoke is the kill switch on a no-TTL pending card (operator
+  // option b: keep Approve/Deny, add Revoke).
   return [
     {
       type: 1,
@@ -762,6 +769,7 @@ function pendingButtons(id: string): Array<Record<string, unknown>> {
           custom_id: `vault:approve:${id}`,
         },
         { type: 2, style: 4, label: "Deny", custom_id: `vault:deny:${id}` },
+        { type: 2, style: 4, label: "Revoke", custom_id: `vault:revoke:${id}` },
       ],
     },
   ];
@@ -804,6 +812,21 @@ function levelText(st: VaultState, c: VaultCredential): string {
   return "permanent (until revoked)";
 }
 
+/** #205: what an approval grants, shown on the PENDING card so the
+ *  operator sees the grant window BEFORE tapping. */
+function grantText(st: VaultState, c: VaultCredential): string {
+  if (c.level === "one-shot")
+    return `one-shot — grant: single use (claim within ${Math.round(
+      st.claimMs / 1000,
+    )}s of approval)`;
+  if (c.level === "time-boxed") {
+    const mins = Math.round(c.hours * 60);
+    const dur = mins < 60 ? `${mins}m` : `${mins / 60}h`;
+    return `time-boxed — grant: ${dur} from approval (reusable)`;
+  }
+  return "permanent — grant: permanent (until revoked)";
+}
+
 /** Embed for the request/status message. `status` selects title + color. */
 function credEmbed(
   st: VaultState,
@@ -813,7 +836,13 @@ function credEmbed(
   const fields: Array<Record<string, unknown>> = [
     { name: "kind", value: String(c.kind), inline: true },
     { name: "name", value: String(c.name), inline: true },
-    { name: "level", value: levelText(st, c), inline: false },
+    {
+      name: "level",
+      // #205: the pending card shows the grant window, not the
+      // post-approval form (no approvedAt/expiresAt yet).
+      value: status === "pending" ? grantText(st, c) : levelText(st, c),
+      inline: false,
+    },
   ];
   if (c.label)
     fields.push({ name: "label", value: String(c.label), inline: false });
@@ -834,8 +863,14 @@ function credEmbed(
     used: `VAULT used`,
   };
   let footer = c.id;
-  if (status === "pending")
-    footer = `expires ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)}) · ${c.id}`;
+  if (status === "pending") {
+    // #203: no TTL (default) → pending until tap or revoke; the expiry
+    // timestamp line stays only when an explicit TTL is configured.
+    footer =
+      st.ttlMs > 0 && c.ttlDeadline > 0
+        ? `expires ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)}) · ${c.id}`
+        : `pending until tap or revoke · ${c.id}`;
+  }
   return {
     title: titles[status] ?? titles.pending,
     color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
@@ -912,7 +947,10 @@ export function validateRequestLine(line: VaultRequestLine):
   | { ok: false; error: string } {
   const kind = line.kind;
   const name = line.name;
-  const level = line.level;
+  // #205: level is optional. Omitted → time-boxed with a 30-minute grant
+  // (default applied here so ANY client gets it, not just the CLI).
+  let level = line.level;
+  if (level === undefined || level === "") level = "time-boxed";
   if (!kind || !KINDS.includes(kind as VaultKind)) {
     return {
       ok: false,
@@ -941,10 +979,35 @@ export function validateRequestLine(line: VaultRequestLine):
   }
   let hours = 0;
   if (level === "time-boxed") {
-    hours = line.hours ?? 0;
-    if (!Number.isInteger(hours) || hours < 1 || hours > 72) {
-      return { ok: false, error: "usage: time-boxed needs --hours 1..72" };
+    // #205: minute granularity. hours is stored as a fraction (0.5 = 30m);
+    // any whole-minute value 1m..72h is accepted, rounded onto the grid.
+    if (line.hours !== undefined) {
+      if (typeof line.hours !== "number" || !Number.isFinite(line.hours)) {
+        return {
+          ok: false,
+          error:
+            "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+        };
+      }
+      hours = line.hours;
+    } else if (line.level === undefined) {
+      hours = 0.5; // default grant: 30 minutes (#205)
+    } else {
+      return {
+        ok: false,
+        error:
+          "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+      };
     }
+    const mins = Math.round(hours * 60);
+    if (mins < 1 || mins > 4320) {
+      return {
+        ok: false,
+        error:
+          "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+      };
+    }
+    hours = mins / 60;
   } else if (line.hours !== undefined) {
     return { ok: false, error: "usage: --hours only applies to time-boxed" };
   }
@@ -1066,7 +1129,11 @@ export async function vaultRequest(
     });
     return {
       ok: false,
-      error: `pending: ${pending.id} expires ${iso(pending.ttlDeadline)}`,
+      error: `pending: ${pending.id} ${
+        pending.ttlDeadline > 0
+          ? `expires ${iso(pending.ttlDeadline)}`
+          : "is still pending (no expiry — tap or revoke to clear)"
+      }`,
     };
   }
   const now = st.now();
@@ -1111,7 +1178,9 @@ export async function vaultRequest(
     messageId: "",
     state: "pending",
     created: now,
-    ttlDeadline: now + st.ttlMs,
+    // #203: 0 = no TTL (the default). A real deadline only when an
+    // explicit JARATE_VAULT_TTL_MS is configured.
+    ttlDeadline: st.ttlMs > 0 ? now + st.ttlMs : 0,
     useCount: 0,
     runsInFlight: 0,
   };
@@ -1122,7 +1191,7 @@ export async function vaultRequest(
     st.secrets.register([storedValue]);
   }
 
-  const res = await sendDiscordMessage(st.ch, "tap Approve or Deny", {
+  const res = await sendDiscordMessage(st.ch, "tap Approve, Deny, or Revoke", {
     components: pendingButtons(id),
     embeds: [credEmbed(st, cred, "pending")],
   });
@@ -1148,7 +1217,13 @@ export async function vaultRequest(
     ...(v.fromEnv ? { from_env: v.fromEnv } : {}),
   });
   persist(st);
-  return { ok: true, id, state: "pending", ttl: iso(cred.ttlDeadline) };
+  // #203: null ttl = no expiry (pending is blocking until tap or revoke).
+  return {
+    ok: true,
+    id,
+    state: "pending",
+    ttl: cred.ttlDeadline > 0 ? iso(cred.ttlDeadline) : null,
+  };
 }
 
 /** `vrun` op (begin). The socket server keeps the connection open for the
@@ -1732,7 +1807,9 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
 
       // State gate per verb.
       if (verb === "revoke") {
-        if (cred.state !== "active") {
+        // #203: revoke is the kill switch on no-TTL pending cards too
+        // (pending | active; anything else is already settled).
+        if (cred.state !== "active" && cred.state !== "pending") {
           audit(st, "tap-rejected", credFields(cred), {
             reason: "already-handled",
             user: uid,
@@ -1746,6 +1823,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
           );
           return;
         }
+        const fromState = cred.state; // "pending" | "active" (#203)
         cred.state = "revoked";
         cred.revokedBy = actorDiscord(uid);
         clearTimersFor(st, cred.id);
@@ -1754,13 +1832,15 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         audit(st, "revoke", credFields(cred), {
           user: uid,
           actor: actorDiscord(uid),
-          from_state: "active",
+          from_state: fromState,
         });
         persist(st);
         await editCredentialMessage(
           st,
           cred,
           revokedText(cred, String(d.user?.username ?? uid)),
+          [],
+          "revoked",
         );
         await deleteDeferredAck(st.botToken, d);
         return;
@@ -1885,7 +1965,10 @@ function load(st: VaultState): void {
     const c: VaultCredential = { ...raw, id };
     st.credentials.set(id, c);
     if (c.state === "pending") {
-      if (c.ttlDeadline <= now) {
+      // #203: ttlDeadline 0 = no TTL → never expired. A past deadline only
+      // settles when a TTL is actually configured (explicit env override);
+      // a no-TTL pending survives any restart indefinitely.
+      if (st.ttlMs > 0 && c.ttlDeadline > 0 && c.ttlDeadline <= now) {
         c.state = "expired";
         c.expiredKind = "ttl";
         settleStoredValueFromDisk(st, c);
@@ -1899,7 +1982,7 @@ function load(st: VaultState): void {
           `[expired] VAULT request ${c.id} unanswered (${ttlText(st, c)})`,
         ).catch(() => {});
       } else {
-        armTtl(st, c);
+        armTtl(st, c); // no-op when ttlMs === 0
       }
     } else if (c.state === "active") {
       if (
@@ -2045,7 +2128,9 @@ export function startVault(opts: StartVaultOpts): VaultHandle {
       register: opts.secrets?.register ?? registerRuntimeSecrets,
       drop: opts.secrets?.drop ?? dropRuntimeSecrets,
     },
-    ttlMs: envNum("JARATE_VAULT_TTL_MS", 300_000),
+    // #203: 0 = no TTL (pending is BLOCKING until tap or revoke).
+    // Explicit JARATE_VAULT_TTL_MS override still works exactly as before.
+    ttlMs: envNum("JARATE_VAULT_TTL_MS", 0),
     claimMs: envNum("JARATE_VAULT_CLAIM_MS", 60_000),
     hourMs: envNum("JARATE_VAULT_HOUR_MS", HOUR_MS),
     maxPending: envNum("JARATE_VAULT_MAX_PENDING", 1),
