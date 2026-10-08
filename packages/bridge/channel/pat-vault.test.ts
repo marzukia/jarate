@@ -2446,3 +2446,37 @@ describe("#203 pending without TTL is blocking", () => {
     }
   }, 20000);
 });
+
+// ─── startup sweep (#208) ─────────────────────────────────────────────────
+
+describe("startup sweep (#208): audit only when something was pruned", () => {
+  test("clean boot: no sweep audit line", () => {
+    const f = mkVault();
+    try {
+      const events = f.auditLines().map((l) => JSON.parse(l));
+      expect(events.filter((e: any) => e.event === "sweep")).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("boot with crash-leftover files: exactly one sweep line (n = count), files pruned", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pat-sweep-"));
+    const xdg = path.join(tmp, "xdg");
+    const fileDir = path.join(xdg, "jarate-pat");
+    fs.mkdirSync(fileDir, { recursive: true });
+    fs.writeFileSync(path.join(fileDir, "stale-a"), "x");
+    fs.writeFileSync(path.join(fileDir, "stale-b"), "y");
+    const f = mkVault({ xdgDir: xdg });
+    try {
+      // pat-vault audit lines are key=value, not JSON
+      const sweeps = f.auditLines().filter((l) => l.includes("event=sweep"));
+      expect(sweeps).toHaveLength(1);
+      expect(sweeps[0]).toMatch(/ n=2(\s|$)/);
+      // the leftovers are gone
+      expect(fs.readdirSync(fileDir)).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+});
