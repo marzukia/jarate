@@ -11,8 +11,10 @@
  *   2. One-shot single-use by construction: state flip to `consumed`
  *      happens BEFORE the value line is flushed.
  *   3. Owner-approval gate: only owner taps approve/deny/revoke;
- *      non-owner taps are ephemeral-replied + audit-logged, state
- *      untouched. Agent self-revoke via the `vrevoke` op (actor must be
+ *      non-owner taps get a VISIBLE reply + an audit line, state
+ *      untouched. The gate runs BEFORE the message-mismatch check
+ *      (#204): a stranger's stale tap audits as non-owner-tap, not
+ *      mismatch. Agent self-revoke via the `vrevoke` op (actor must be
  *      the requesting agent).
  *   4. Every value lifetime is timer-owned by the bridge (TTL 5m, claim
  *      60s, window N hours, censor grace 10s, startup sweep) with lazy
@@ -1633,6 +1635,28 @@ function markSeen(st: VaultState, id: string): boolean {
   return true;
 }
 
+/** Deliver tap feedback via replyInteraction (visible in channel);
+ *  when the transport fails, audit tap-feedback-failed (#204: a tap
+ *  outcome whose feedback never reached the channel must be observable
+ *  in audit.log, not only in the journal). pre/extra mirror the branch's
+ *  own audit line so the failure reads as its decision. Never throws. */
+async function tapReply(
+  st: VaultState,
+  d: any,
+  text: string,
+  pre: Record<string, unknown>,
+  extra: Record<string, unknown>,
+): Promise<boolean> {
+  const ok = await replyInteraction(st.botToken, d, text);
+  if (!ok)
+    audit(st, "tap-feedback-failed", pre, {
+      ...extra,
+      interaction: String(d.id),
+      text,
+    });
+  return ok;
+}
+
 function makeHandler(st: VaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1668,20 +1692,40 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
 
       const cred = st.credentials.get(parsedId);
       if (!cred) {
-        audit(
+        const nf = {
+          reason: "not-found",
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", { id: parsedId }, nf);
+        await tapReply(
           st,
-          "tap-rejected",
-          { id: parsedId },
-          {
-            reason: "not-found",
-            user: uid,
-            verb,
-          },
-        );
-        await replyInteraction(
-          st.botToken,
           d,
           "[!] tap rejected: request not found or already handled",
+          { id: parsedId },
+          nf,
+        );
+        return;
+      }
+
+      // Owner gate BEFORE the mismatch check (#204): a non-owner tap on
+      // a stale/forwarded button copy must audit as non-owner-tap, not
+      // be swallowed by mismatch. The mismatch check itself is kept — it
+      // still guards owner taps on the wrong message/channel.
+      if (!isOwnerUser(st.ch, uid)) {
+        audit(st, "non-owner-tap", credFields(cred), {
+          user: uid,
+          actor: actorDiscord(uid),
+          verb,
+          interaction: String(d.id),
+        });
+        await tapReply(
+          st,
+          d,
+          "[!] tap rejected: only the owner can approve vault requests",
+          credFields(cred),
+          { user: uid, verb, interaction: String(d.id) },
         );
         return;
       }
@@ -1699,7 +1743,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         String(srcMsgId) !== String(cred.messageId) ||
         String(d.channel_id) !== String(cred.channelId)
       ) {
-        audit(st, "tap-rejected", credFields(cred), {
+        const mm = {
           reason: "mismatch",
           user: uid,
           verb,
@@ -1707,25 +1751,15 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
           expected_channel: cred.channelId,
           got_message: srcMsgId == null ? null : String(srcMsgId),
           got_channel: d.channel_id == null ? null : String(d.channel_id),
-        });
-        await replyInteraction(
-          st.botToken,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", credFields(cred), mm);
+        await tapReply(
+          st,
           d,
           "[!] tap rejected: button not on the request message",
-        );
-        return;
-      }
-
-      if (!isOwnerUser(st.ch, uid)) {
-        audit(st, "non-owner-tap", credFields(cred), {
-          user: uid,
-          actor: actorDiscord(uid),
-          verb,
-        });
-        await replyInteraction(
-          st.botToken,
-          d,
-          "[!] tap rejected: only the owner can approve vault requests",
+          credFields(cred),
+          mm,
         );
         return;
       }
@@ -1733,16 +1767,20 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
       // State gate per verb.
       if (verb === "revoke") {
         if (cred.state !== "active") {
-          audit(st, "tap-rejected", credFields(cred), {
+          const sh = {
             reason: "already-handled",
             user: uid,
             verb,
             state: cred.state,
-          });
-          await replyInteraction(
-            st.botToken,
+            interaction: String(d.id),
+          };
+          audit(st, "tap-rejected", credFields(cred), sh);
+          await tapReply(
+            st,
             d,
             "[!] tap rejected: already handled",
+            credFields(cred),
+            sh,
           );
           return;
         }
@@ -1767,16 +1805,20 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
       }
 
       if (cred.state !== "pending") {
-        audit(st, "tap-rejected", credFields(cred), {
+        const sh = {
           reason: "already-handled",
           user: uid,
           verb,
           state: cred.state,
-        });
-        await replyInteraction(
-          st.botToken,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", credFields(cred), sh);
+        await tapReply(
+          st,
           d,
           "[!] tap rejected: already handled",
+          credFields(cred),
+          sh,
         );
         return;
       }
@@ -1794,10 +1836,12 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
               actor: actorDiscord(uid),
               err: "stored value file missing",
             });
-            await replyInteraction(
-              st.botToken,
+            await tapReply(
+              st,
               d,
               "[!] value lost (bridge restarted) — re-request",
+              credFields(cred),
+              { user: uid, verb, interaction: String(d.id) },
             );
             return;
           }
@@ -1815,7 +1859,11 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
               actor: actorDiscord(uid),
               err: "value file missing",
             });
-            await replyInteraction(st.botToken, d, "[!] value file missing");
+            await tapReply(st, d, "[!] value file missing", credFields(cred), {
+              user: uid,
+              verb,
+              interaction: String(d.id),
+            });
             return;
           }
         }
@@ -1865,8 +1913,24 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
     } catch (e) {
       // Never reject (M1 parity): log + audit + best-effort feedback.
       console.error("[interactions] vault handler failed:", e);
-      audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await replyInteraction(st.botToken, d, "[!] vault error");
+      const err = String(e);
+      audit(
+        st,
+        "vault-error",
+        { id: parsedId },
+        {
+          err,
+          user: String(d.user?.id ?? ""),
+          interaction: String(d.id),
+        },
+      );
+      await tapReply(
+        st,
+        d,
+        "[!] vault error",
+        { id: parsedId },
+        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+      );
     }
   };
 }

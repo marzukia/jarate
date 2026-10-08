@@ -1488,3 +1488,213 @@ describe("request edge cases", () => {
     }
   }, 15000);
 });
+
+// ─── Tap-outcome observability (#204: every outcome visible + audited) ──────
+//
+// Appended block. Existing fixtures/tests untouched (two other workers own
+// these shared files concurrently).
+describe("tap observability (#204: every outcome visible + audited)", () => {
+  test("non-owner tap, real payload shape (no message field): audited non-owner-tap, not mismatch", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      // Real shape: no top-level d.message_id; message absent entirely
+      // (a stale/forwarded copy). Under the old order the mismatch check
+      // preempted the owner gate and swallowed this as `mismatch`.
+      await f.h.handleVaultComponent(
+        mkD("obs-no1", `vault:approve:${id}`, {
+          message: undefined,
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      // Wrong-message variant: same expectation.
+      await f.h.handleVaultComponent(
+        mkD("obs-no2", `vault:approve:${id}`, {
+          message: { id: "other-message" },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const evs = f.auditEvents();
+      expect(
+        evs.filter((e) => e.event === "non-owner-tap" && e.user === OTHER)
+          .length,
+      ).toBe(2);
+      expect(
+        evs.some((e) => e.event === "tap-rejected" && e.reason === "mismatch"),
+      ).toBe(false);
+      for (const i of ["obs-no1", "obs-no2"]) {
+        const r = f.fd.replies(i);
+        expect(r.length).toBe(1);
+        expect(r[0].body.content).toMatch(/only the owner/);
+        expect(r[0].body.flags).toBeUndefined(); // visible, not ephemeral
+      }
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("feedback transport failure is audited tap-feedback-failed (#204)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      // Kill every interaction-webhook call (PATCH @original + fallback
+      // POST root). The defer callback + card posts are not webhooks.
+      const whCalls: Array<{ url: string; method: string }> = [];
+      const base = globalThis.fetch;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        const url = String(input);
+        if (url.includes("/webhooks/")) {
+          whCalls.push({ url, method: init?.method ?? "GET" });
+          return resp(503, { message: "stubbed outage" });
+        }
+        return base(input, init);
+      }) as any;
+      try {
+        await f.h.handleVaultComponent(
+          mkD("obs-ff", `vault:approve:${id}`, {
+            message: { id: "other-message" },
+          }),
+        );
+      } finally {
+        globalThis.fetch = base;
+      }
+
+      // Decision audited, delivery failure audited with the same context.
+      const evs = f.auditEvents();
+      const rej = evs.find(
+        (e) => e.event === "tap-rejected" && e.reason === "mismatch",
+      );
+      expect(rej).toBeTruthy();
+      const ff = evs.find((e) => e.event === "tap-feedback-failed");
+      expect(ff).toBeTruthy();
+      expect(ff!.reason).toBe("mismatch");
+      expect(ff!.user).toBe(OWNER);
+      expect(ff!.verb).toBe("approve");
+      expect(ff!.interaction).toBe("obs-ff");
+      expect(String(ff!.text)).toContain("tap rejected");
+      // Both routes were attempted, neither delivered.
+      expect(
+        whCalls.some(
+          (c) => c.method === "PATCH" && c.url.endsWith("/messages/@original"),
+        ),
+      ).toBe(true);
+      expect(
+        whCalls.some(
+          (c) => c.method === "POST" && c.url.endsWith("intok-obs-ff"),
+        ),
+      ).toBe(true);
+      // State untouched.
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("every rejection branch replies visible in-channel (no flags 64) (#204)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id)!;
+      // not-found
+      await f.h.handleVaultComponent(
+        mkD(
+          "obs-nf",
+          "vault:approve:vault_00000000-0000-0000-0000-000000000000",
+        ),
+      );
+      // mismatch
+      await f.h.handleVaultComponent(
+        mkD("obs-mm", `vault:approve:${id}`, {
+          message: { id: "other-message" },
+        }),
+      );
+      // non-owner (on the correct message — gate vs mismatch ordering)
+      await f.h.handleVaultComponent(
+        mkD("obs-no", `vault:approve:${id}`, {
+          message: { id: cred.messageId },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      // stale: deny first, then approve again
+      await tap(f, id, "deny");
+      await f.h.handleVaultComponent(
+        mkD("obs-st", `vault:approve:${id}`, {
+          message: { id: cred.messageId },
+        }),
+      );
+
+      for (const i of ["obs-nf", "obs-mm", "obs-no", "obs-st"]) {
+        const r = f.fd.replies(i);
+        expect(r.length, `reply for ${i}`).toBe(1);
+        expect(r[0].body.flags, `flags for ${i}`).toBeUndefined();
+        expect(r[0].body.content, `content for ${i}`).toMatch(/tap rejected/);
+      }
+      const evs = f.auditEvents();
+      expect(
+        evs.some((e) => e.event === "tap-rejected" && e.reason === "not-found"),
+      ).toBe(true);
+      expect(
+        evs.some((e) => e.event === "tap-rejected" && e.reason === "mismatch"),
+      ).toBe(true);
+      expect(evs.some((e) => e.event === "non-owner-tap")).toBe(true);
+      expect(
+        evs.some(
+          (e) => e.event === "tap-rejected" && e.reason === "already-handled",
+        ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("silent-branch audits carry the interaction id + fields (#204)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id)!;
+      await f.h.handleVaultComponent(
+        mkD(
+          "obs-id1",
+          "vault:approve:vault_00000000-0000-0000-0000-000000000000",
+        ),
+      );
+      await f.h.handleVaultComponent(
+        mkD("obs-id2", `vault:approve:${id}`, {
+          message: { id: "other-message" },
+        }),
+      );
+      await tap(f, id, "deny");
+      await f.h.handleVaultComponent(
+        mkD("obs-id3", `vault:approve:${id}`, {
+          message: { id: cred.messageId },
+        }),
+      );
+
+      const evs = f.auditEvents();
+      const nf = evs.find(
+        (e) => e.event === "tap-rejected" && e.reason === "not-found",
+      );
+      expect(nf!.interaction).toBe("obs-id1");
+      const mm = evs.find(
+        (e) => e.event === "tap-rejected" && e.reason === "mismatch",
+      );
+      expect(mm!.interaction).toBe("obs-id2");
+      expect(mm!.user).toBe(OWNER);
+      expect(mm!.got_message).toBe("other-message");
+      expect(mm!.expected_message).toBe(cred.messageId);
+      expect(mm!.got_channel).toBe("999");
+      const sh = evs.find(
+        (e) => e.event === "tap-rejected" && e.reason === "already-handled",
+      );
+      expect(sh!.interaction).toBe("obs-id3");
+      expect(sh!.state).toBe("denied");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});

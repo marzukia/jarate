@@ -6,8 +6,11 @@
  *   1. Only the bridge reads a PAT file — at approve (both transports:
  *      dead-file gate; file mode also publishes) and at handoff (socket
  *      mode, rotation-aware).
- *   2. Only an owner's tap mutates a request; every other tap gets an
- *      ephemeral reply and an audit line, state untouched.
+ *   2. Only an owner's tap mutates a request; every other tap gets a
+ *      VISIBLE reply (PATCH @original) and an audit line, state
+ *      untouched. The owner gate runs BEFORE the message-mismatch check
+ *      (#204): a stranger's stale tap audits as non-owner-tap, not
+ *      mismatch.
  *   3. One tap = one token = one command. `handed-off` is terminal.
  *   4. The token is in at most 3 places at once: bridge memory, the bun
  *      wrapper, one child's env. Never in argv, never in a file (socket
@@ -1187,6 +1190,28 @@ function markSeen(st: PatVaultState, id: string): boolean {
   return true;
 }
 
+/** Deliver tap feedback via replyInteraction (visible in channel);
+ *  when the transport fails, audit tap-feedback-failed (#204: a tap
+ *  outcome whose feedback never reached the channel must be observable
+ *  in audit.log, not only in the journal). pre/extra mirror the branch's
+ *  own audit line so the failure reads as its decision. Never throws. */
+async function tapReply(
+  st: PatVaultState,
+  d: any,
+  text: string,
+  pre: Record<string, unknown>,
+  extra: Record<string, unknown>,
+): Promise<boolean> {
+  const ok = await replyInteraction(st.botToken, d, text);
+  if (!ok)
+    audit(st, "tap-feedback-failed", pre, {
+      ...extra,
+      interaction: String(d.id),
+      text,
+    });
+  return ok;
+}
+
 function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1225,25 +1250,44 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       // 4. Lookup. Miss → stale id / settled elsewhere.
       const req = st.requests.get(parsedId);
       if (!req) {
-        audit(
+        const nf = {
+          reason: "not-found",
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", { id: parsedId }, nf);
+        await tapReply(
           st,
-          "tap-rejected",
-          { id: parsedId },
-          {
-            reason: "not-found",
-            user: uid,
-            verb,
-          },
-        );
-        await replyInteraction(
-          st.botToken,
           d,
           "[!] tap rejected: request not found or already handled",
+          { id: parsedId },
+          nf,
         );
         return;
       }
 
-      // 5. Message + channel match (stale-copy / forwarded button).
+      // 5. Owner gate BEFORE the mismatch check (#204): a non-owner tap
+      //    on a stale/forwarded button copy must audit as non-owner-tap,
+      //    not be swallowed by mismatch. ownerUserIds preferred /
+      //    ownerUserId legacy.
+      if (!isOwnerUser(st.ch, uid)) {
+        audit(st, "non-owner-tap", base(req), {
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        });
+        await tapReply(
+          st,
+          d,
+          "[!] tap rejected: only the owner can approve PAT requests",
+          base(req),
+          { user: uid, verb, interaction: String(d.id) },
+        );
+        return;
+      }
+
+      // 6. Message + channel match (stale-copy / forwarded button).
       //    The live payload has NO d.message_id — per the Discord spec
       //    the component's message is the `message` field on the
       //    INTERACTION object itself (older payloads nested it in data).
@@ -1256,7 +1300,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         String(srcMsgId) !== String(req.messageId) ||
         String(d.channel_id) !== String(req.channelId)
       ) {
-        audit(st, "tap-rejected", base(req), {
+        const mm = {
           reason: "mismatch",
           user: uid,
           verb,
@@ -1264,38 +1308,35 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
           expected_channel: req.channelId,
           got_message: srcMsgId == null ? null : String(srcMsgId),
           got_channel: d.channel_id == null ? null : String(d.channel_id),
-        });
-        await replyInteraction(
-          st.botToken,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", base(req), mm);
+        await tapReply(
+          st,
           d,
           "[!] tap rejected: button not on the request message",
-        );
-        return;
-      }
-
-      // 6. Owner gate (ownerUserIds preferred / ownerUserId legacy).
-      if (!isOwnerUser(st.ch, uid)) {
-        audit(st, "non-owner-tap", base(req), { user: uid });
-        await replyInteraction(
-          st.botToken,
-          d,
-          "[!] tap rejected: only the owner can approve PAT requests",
+          base(req),
+          mm,
         );
         return;
       }
 
       // 7. State gate.
       if (req.state !== "pending") {
-        audit(st, "tap-rejected", base(req), {
+        const sh = {
           reason: "already-handled",
           user: uid,
           verb,
           state: req.state,
-        });
-        await replyInteraction(
-          st.botToken,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", base(req), sh);
+        await tapReply(
+          st,
           d,
           "[!] tap rejected: already handled",
+          base(req),
+          sh,
         );
         return;
       }
@@ -1313,11 +1354,12 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         const chk = checkScopeToken(st, req.scope);
         if (!chk.ok) {
           audit(st, "vault-error", base(req), { user: uid, err: chk.error });
-          await replyInteraction(
-            st.botToken,
-            d,
-            tapTokenFileText(st, req, chk),
-          );
+          await tapReply(st, d, tapTokenFileText(st, req, chk), base(req), {
+            user: uid,
+            verb,
+            err: chk.error,
+            interaction: String(d.id),
+          });
           return;
         }
         if (st.transport === "file") {
@@ -1367,8 +1409,24 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
     } catch (e) {
       // M1: never reject. Log + audit + best-effort deliverable feedback.
       console.error("[interactions] vault handler failed:", e);
-      audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await replyInteraction(st.botToken, d, "[!] vault error");
+      const err = String(e);
+      audit(
+        st,
+        "vault-error",
+        { id: parsedId },
+        {
+          err,
+          user: String(d.user?.id ?? ""),
+          interaction: String(d.id),
+        },
+      );
+      await tapReply(
+        st,
+        d,
+        "[!] vault error",
+        { id: parsedId },
+        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+      );
     }
   };
 }

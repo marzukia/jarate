@@ -11,6 +11,7 @@ import {
   connectDiscordPresence,
   deferInteraction,
   disconnectDiscord,
+  discordFetch,
   editInteractionMessage,
   ensurePresenceState,
   getChannelCursor,
@@ -973,7 +974,9 @@ test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @or
   expect(calls[0].url).toBe(
     "https://discord.com/api/v10/interactions/i1/tok123/callback",
   );
-  expect(calls[0].body).toEqual({ type: 5 });
+  // flags 64: ephemeral loading state — the "Thinking" ack is tapper-only
+  // (was channel-visible; #207). One-line update to the pinned body.
+  expect(calls[0].body).toEqual({ type: 5, flags: 64 });
 
   await editInteractionMessage("tok-d", interaction, "result");
   expect(calls[1].url).toBe(
@@ -1253,4 +1256,91 @@ test("getChannelCursor / setChannelCursor round-trip and persist", async () => {
   expect(getChannelCursor("cs")).toBe("42");
   clearDiscordStatesForTest();
   expect(getChannelCursor("cs")).toBeNull();
+});
+
+// ─── Tap-outcome observability (#204 / #207 / #210) ────────────────────────
+
+test("deferInteraction body carries flags 64 — ephemeral loading state, tapper-only (#207)", async () => {
+  const calls: { url: string; method: string; body: any }[] = [];
+  setFetch(async (u, init) => {
+    calls.push({
+      url: u,
+      method: init?.method ?? "GET",
+      body: JSON.parse(init.body),
+    });
+    return jsonResp(204, null);
+  });
+  await deferInteraction("tok-d", interaction);
+  expect(calls.length).toBe(1);
+  expect(calls[0].method).toBe("POST");
+  expect(calls[0].url).toBe(
+    "https://discord.com/api/v10/interactions/i1/tok123/callback",
+  );
+  // flags 64 on a type-5 defer = ephemeral loading state. Callback
+  // consumption is unchanged: still exactly one callback POST.
+  expect(calls[0].body).toEqual({ type: 5, flags: 64 });
+});
+
+test("sendInteractionFollowup / replyInteraction report delivery; false on transport failure (#204)", async () => {
+  setFetch(async () => jsonResp(200, { id: "m" }));
+  expect(await sendInteractionFollowup("tok-d", interaction, "ok")).toBe(true);
+  expect(await replyInteraction("tok-d", interaction, "ok")).toBe(true);
+
+  setFetch(async () => jsonResp(503, { message: "stubbed outage" }));
+  expect(await sendInteractionFollowup("tok-d", interaction, "x")).toBe(false);
+  expect(await replyInteraction("tok-d", interaction, "x")).toBe(false);
+});
+
+test("discordFetch: 4xx body truncated to 200 by default, full with fullError (#210)", async () => {
+  const body = {
+    message: "Invalid Form Body",
+    code: 50035,
+    errors: {
+      webhook_service: {
+        _errors: [
+          {
+            code: "ENUM_TYPE_COERCE",
+            message: `Value "${"m".repeat(350)}" is not a valid enum value.`,
+          },
+        ],
+      },
+    },
+  };
+  const full = JSON.stringify(body);
+  expect(full.length).toBeGreaterThan(200);
+  setFetch(async () => jsonResp(400, body));
+
+  const errDefault = await discordFetch("tok-d", "/x", {
+    method: "POST",
+    body: {},
+  }).catch((e: unknown) => e);
+  expect(String(errDefault)).toContain(
+    `Discord API 400: ${full.slice(0, 200)}`,
+  );
+  expect(String(errDefault)).not.toContain(full); // truncated
+
+  const errFull = await discordFetch("tok-d", "/x", {
+    method: "POST",
+    body: {},
+    fullError: true,
+  }).catch((e: unknown) => e);
+  expect(String(errFull)).toContain(full); // whole body kept
+});
+
+test("deferInteraction logs the FULL 4xx body on failure (interaction call site, #210)", async () => {
+  const body = { message: "x".repeat(400), code: 50035 };
+  const full = JSON.stringify(body);
+  expect(full.length).toBeGreaterThan(200);
+  setFetch(async () => jsonResp(400, body));
+  const orig = console.error;
+  const errs: string[] = [];
+  console.error = (...a: unknown[]) => {
+    errs.push(a.map((x) => String(x)).join(" "));
+  };
+  try {
+    await deferInteraction("tok-d", interaction); // swallows the throw
+  } finally {
+    console.error = orig;
+  }
+  expect(errs.some((s) => s.includes(full))).toBe(true);
 });
