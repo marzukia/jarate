@@ -45,7 +45,9 @@ Token shape on every handoff: `gh[pousr]_[A-Za-z0-9]{36}` or
 1. `pat-request <scope> <reason>` → bridge validates scope (must be a known
    store file), reason 3–200 chars, 1 pending/agent, budget 5 approvals/hour
    per agent (rolling), then posts a Discord message with `[Approve][Deny]`
-   buttons. Record state `pending`, TTL 5 min.
+   buttons. Record state `pending`, no TTL by default (#203: pending is
+   BLOCKING until tap or revoke; `JARATE_PAT_TTL_MS` opts an explicit
+   window in).
 2. Owner tap (only owner — `isOwnerUser`; other taps get an ephemeral reply
    + `non-owner-tap` audit, state untouched) → `approved`, claim window 60 s.
 3. `pat-run <id> -- <cmd>` → bridge **reads the token file at handoff**
@@ -75,8 +77,8 @@ token = one command.
 3. One tap = one token = one command; id single-use.
 4. Token in at most 3 places at once: bridge memory, wrapper, one child env.
    Never argv, never a file (socket mode), never LLM context.
-5. Every secret lifetime is timer-owned by the bridge (TTL 5 m, claim 60 s,
-   censor grace 10 s, boot sweep).
+5. Every secret lifetime is timer-owned by the bridge (pending TTL
+   opt-in via env, claim 60 s, censor grace 10 s, boot sweep).
 6. Budget enforced where the token is (bridge), not in the CLI.
 7. Restart-safe: state persists; file dir swept at boot; timers re-armed.
 8. Egress censor: token registered as a runtime secret for its lifetime;
@@ -99,19 +101,21 @@ token = one command.
 
 | level | lifetime after approve | reuse | terminal events |
 |---|---|---|---|
-| `one-shot` (default) | 60 s claim window — identical to today's PAT semantics | exactly 1 command | run → `consumed`; claim miss → `expired`; revoke → `revoked` |
-| `time-boxed` | `--hours N` (1–72), from approval time | unlimited inside the window | window end → `expired` (timer + lazy check); revoke → `revoked` |
+| `one-shot` | 60 s claim window — identical to today's PAT semantics | exactly 1 command | run → `consumed`; claim miss → `expired`; revoke → `revoked` |
+| `time-boxed` (default) | `--hours N` (whole minutes, 1m–72h) or `--minutes N`; **omitted level → 30 m** (#205), from approval time | unlimited inside the window | window end → `expired` (timer + lazy check); revoke → `revoked` |
 | `permanent` | until explicitly revoked | unlimited | revoke (owner tap or requesting agent CLI) → `revoked` |
 
-Common to all: `pending` TTL 5 min, owner Approve/Deny gate, 1 pending per
-agent, budget 5 approvals/hour per agent, JSON-lines audit.
+Common to all: no `pending` TTL by default (BLOCKING until tap or revoke;
+`JARATE_VAULT_TTL_MS` opts an explicit window in — #203), owner
+Approve/Deny/Revoke gate, 1 pending per agent, budget 5 approvals/hour
+per agent, JSON-lines audit.
 
 ### 2.3 State machine
 
 ```
                  ┌────────┐  owner deny    ┌────────┐
        request ─▶pending ─────────────────▶ denied  │
-                 │        │ TTL 5m         └────────┘
+                 │        │ TTL (opt-in)   └────────┘
                  │        ▼
                  │     ┌─────────┐
                  │     │ expired │
@@ -258,7 +262,8 @@ Events: `request`, `approve`, `deny`, `revoke`, `use` (rc), `handoff`
 7. 0600/0700 + atomic writes + no secret in filenames.
 8. `github-pat` one-shot reproduces today's exact wire + env contract
    (GH_TOKEN, git header, GIT_TERMINAL_PROMPT, 900 s cap, rc 124,
-   done accounting, claim 60 s, TTL 5 m, budget 5/hour, 1 pending).
+   done accounting, claim 60 s, pending TTL opt-in, budget 5/hour,
+   1 pending).
 
 ### 2.9 What changes vs the PAT flow
 

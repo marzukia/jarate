@@ -170,8 +170,8 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "pat-request <scope> <reason>: ask the channel owner for a GitHub PAT (scope: default or owner/repo:read|write). " +
       "pat-run <request-id> -- <cmd> [args]: run one command under the approved token (single use; token is injected as GH_TOKEN, never echo it; 900s cap). " +
       "pat-status [request-id]: read-only state of PAT requests (no token). " +
-      "vault-request <kind> <name> <level> [--label L] [--hours N] [--envvar VAR] [--from-env VAR] <reason>: " +
-      "ask the owner for a credential (kind: github-pat|api-key|password; level: one-shot|time-boxed|permanent). " +
+      "vault-request <kind> <name> [level] [--label L] [--hours N | --minutes N] [--envvar VAR] [--from-env VAR] <reason>: " +
+      "ask the owner for a credential (kind: github-pat|api-key|password; level: one-shot|time-boxed|permanent, omitted → 30-min time-box default; --hours whole minutes 1m..72h, --minutes 1..4320). " +
       "vault-run <request-id> -- <cmd> [args]: run a command under the approved credential (token injected as env, never echo it; 900s cap). " +
       "vault-status [request-id]: read-only vault state (no value). " +
       "vault-revoke <request-id>: self-revoke your pending/active credential. " +

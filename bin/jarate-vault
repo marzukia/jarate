@@ -4,8 +4,10 @@
  * credential value (besides the bridge itself and the spawned child's env).
  *
  * Subcommands:
- *   request <kind> <name> <level> [--label L] [--hours N] [--envvar V]
- *           [--from-env E] <reason...>
+ *   request <kind> <name> [level] [--label L] [--hours N | --minutes N]
+ *           [--envvar V] [--from-env E] <reason...>
+ *           level omitted → 30-min time-box default (bridge-side, #205);
+ *           --hours whole minutes 1m..72h (0.5 = 30m); --minutes 1..4320
  *   request-raw <prejoined>        tool path (N4): shellWords re-split
  *   run <id> -- <cmd> [args...]    run a command under the approved value
  *   run-raw <id> <raw>             tool path: <raw> is one pre-joined string
@@ -299,7 +301,7 @@ function spawnChild(
 interface ParsedRequest {
   kind: Kind;
   name: string;
-  level: Level;
+  level?: Level; // #205: optional — omitted → bridge default (30-min time-box)
   label?: string;
   hours?: number;
   envvar?: string;
@@ -308,14 +310,22 @@ interface ParsedRequest {
 }
 
 const USAGE_REQUEST =
-  "request: usage: jarate vault-request <kind> <name> <level> [--label L] [--hours N] [--envvar V] [--from-env E] <reason...>";
+  "request: usage: jarate vault-request <kind> <name> [level] [--label L] [--hours N | --minutes N] [--envvar V] [--from-env E] <reason...>"
+  + "\n  level: one-shot | time-boxed | permanent (omitted → 30-min time-box default)"
+  + "\n  --hours: whole minutes, 1m..72h (0.5 = 30m)   --minutes: 1..4320";
 
 export function parseRequestArgv(argv: string[]): ParsedRequest {
   const pos: string[] = [];
   const opts: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--label" || a === "--hours" || a === "--envvar" || a === "--from-env") {
+    if (
+      a === "--label" ||
+      a === "--hours" ||
+      a === "--minutes" ||
+      a === "--envvar" ||
+      a === "--from-env"
+    ) {
       const v = argv[++i];
       if (v === undefined || v.startsWith("-") && v !== "-")
         failUsage(`${USAGE_REQUEST} (missing value for ${a})`);
@@ -326,17 +336,39 @@ export function parseRequestArgv(argv: string[]): ParsedRequest {
       pos.push(a);
     }
   }
-  const [kind, name, level, ...reasonParts] = pos;
-  if (!kind || !name || !level) failUsage(USAGE_REQUEST);
+  const [kind, name, ...tail] = pos;
+  if (!kind || !name) failUsage(USAGE_REQUEST);
   if (!KINDS.includes(kind as Kind))
     failUsage(`${USAGE_REQUEST} (kind: ${KINDS.join("|")})`);
-  if (!LEVELS.includes(level as Level))
-    failUsage(`${USAGE_REQUEST} (level: ${LEVELS.join("|")})`);
+  // #205: level is optional. LEVELS is a closed set, so a known level word
+  // in the third position is consumed as the level; anything else starts
+  // the reason. Omitted → the bridge applies the 30-min time-box default.
+  let level: Level | undefined;
+  let reasonParts = tail;
+  if (tail.length > 0 && LEVELS.includes(tail[0] as Level)) {
+    level = tail[0] as Level;
+    reasonParts = tail.slice(1);
+  }
   let hours: number | undefined;
   if (opts["--hours"] !== undefined) {
-    hours = Number(opts["--hours"]);
-    if (!Number.isInteger(hours) || hours < 1 || hours > 72)
-      failUsage(`${USAGE_REQUEST} (--hours 1..72)`);
+    // #205: minute granularity — whole-minute values, 1m..72h (0.5 = 30m).
+    const h = Number(opts["--hours"]);
+    const mins = h * 60;
+    if (
+      !Number.isFinite(mins) ||
+      Math.abs(Math.round(mins) - mins) > 1e-6 ||
+      mins < 1 ||
+      mins > 4320
+    )
+      failUsage(`${USAGE_REQUEST} (--hours: whole minutes, 1m..72h)`);
+    hours = Math.round(mins) / 60;
+  }
+  if (opts["--minutes"] !== undefined) {
+    const m = Number(opts["--minutes"]);
+    if (!Number.isInteger(m) || m < 1 || m > 4320)
+      failUsage(`${USAGE_REQUEST} (--minutes 1..4320)`);
+    if (hours !== undefined) failUsage(`${USAGE_REQUEST} (--hours and --minutes)`);
+    hours = m / 60;
   }
   const reason = reasonParts.join(" ");
   if (reason.length < 3) failUsage(`${USAGE_REQUEST} (reason 3-200 chars)`);
@@ -351,11 +383,13 @@ export function parseRequestArgv(argv: string[]): ParsedRequest {
   return {
     kind: kind as Kind,
     name,
-    level: level as Level,
+    ...(level !== undefined ? { level } : {}),
     ...(opts["--label"] !== undefined ? { label: opts["--label"] } : {}),
     ...(hours !== undefined ? { hours } : {}),
     ...(envvar !== undefined ? { envvar } : {}),
-    ...(opts["--from-env"] !== undefined ? { fromEnv: opts["--from-env"] } : {}),
+    ...(opts["--from-env"] !== undefined
+      ? { fromEnv: opts["--from-env"] }
+      : {}),
     reason,
   };
 }
@@ -366,7 +400,9 @@ function requestLine(p: ParsedRequest): Record<string, unknown> {
     agent: agentName(),
     kind: p.kind,
     name: p.name,
-    level: p.level,
+    // #205: level omitted on the wire → the bridge applies the 30-min
+    // time-box default (so ANY client gets the default, not just this CLI).
+    ...(p.level !== undefined ? { level: p.level } : {}),
     reason: p.reason,
   };
   if (p.label !== undefined) line.label = p.label;

@@ -1698,3 +1698,336 @@ describe("tap observability (#204: every outcome visible + audited)", () => {
     }
   }, 15000);
 });
+
+// ─── #203: no default TTL (pending = BLOCKING) ─────────────────────────────
+//
+// The fixture env always sets JARATE_VAULT_TTL_MS=1200 (shortened clock);
+// no-TTL config (the new default) is modeled by st.ttlMs = 0 after start.
+
+describe("#203 pending without TTL is blocking", () => {
+  test("default (ttlMs 0): survives past the old 5m deadline, no expire, buttons intact, revoke kill switch", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 0; // default config
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-0",
+        level: "one-shot",
+        envvar: "BK",
+        reason: "no default ttl",
+      } as any);
+      expect(res.ok).toBe(true);
+      expect(res.ttl).toBeNull(); // reply: no expiry
+      const id = res.id as string;
+      expect(f.st.credentials.get(id)!.ttlDeadline).toBe(0); // sentinel
+      // Card: no-TTL footer + Revoke kill switch + content line.
+      const posted = f.fd.channelPosts()[0].body;
+      expect(posted.content).toBe("tap Approve, Deny, or Revoke");
+      expect(posted.embeds[0].footer.text).toBe(
+        `pending until tap or revoke · ${id}`,
+      );
+      const labels = posted.components[0].components.map((b: any) => b.label);
+      expect(labels).toEqual(["Approve", "Deny", "Revoke"]);
+      // Clock jumps past the old 5-minute deadline; real time also passes
+      // the fixture's 1200ms TTL in case a timer was wrongly armed.
+      const base = f.st.now();
+      f.st.now = () => base + 6 * 60_000;
+      await tick(1500);
+      expect(f.st.credentials.get(id)!.state).toBe("pending");
+      expect(f.auditEvents().map((e) => e.event)).not.toContain("expire");
+      expect(f.fd.messageEdits().length).toBe(0); // card untouched
+      // Pending-reject names the no-expiry state.
+      const r2 = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-1",
+        level: "one-shot",
+        envvar: "BK",
+        reason: "second request",
+      } as any);
+      expect(r2.ok).toBe(false);
+      expect(String(r2.error)).toMatch(/no expiry/);
+      // Kill switch: owner revoke tap on the pending card.
+      await tap(f, id, "revoke");
+      expect(f.st.credentials.get(id)!.state).toBe("revoked");
+      const rev = f.auditEvents().find((e) => e.event === "revoke");
+      expect(rev).toBeDefined();
+      expect(rev!.from_state).toBe("pending");
+      const edits = f.fd.messageEdits();
+      expect(edits.length).toBe(1);
+      expect(edits[0].body.components).toEqual([]); // buttons removed
+      expect(edits[0].body.embeds[0].title).toBe("VAULT revoked");
+      // The slot frees: a new request is accepted after the kill switch.
+      const r3 = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-1",
+        level: "one-shot",
+        envvar: "BK",
+        reason: "third request",
+      } as any);
+      expect(r3.ok).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("explicit JARATE_VAULT_TTL_MS still expires at the deadline", async () => {
+    const f = mkVault(); // fixture env: JARATE_VAULT_TTL_MS=1200
+    try {
+      await f.h.ready;
+      expect(f.st.ttlMs).toBe(1200);
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-3",
+        level: "one-shot",
+        envvar: "BK",
+        reason: "explicit ttl",
+      } as any);
+      expect(res.ok).toBe(true);
+      expect(typeof res.ttl).toBe("string"); // deadline in the reply
+      const id = res.id as string;
+      const posted = f.fd.channelPosts()[0].body;
+      expect(posted.embeds[0].footer.text).toMatch(
+        new RegExp(`^expires \\d{2}:\\d{2}:\\d{2}Z \\(1200ms\\) · ${id}$`),
+      );
+      await tick(1500);
+      expect(f.st.credentials.get(id)!.state).toBe("expired");
+      expect(
+        f.auditEvents().some((e) => e.event === "expire" && e.reason === "ttl"),
+      ).toBe(true);
+      const edits = f.fd.messageEdits();
+      expect(edits.length).toBe(1);
+      expect(edits[0].body.components).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("restart: no-TTL pending survives (no recovered-expired); still approvable", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 0; // default config
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-3",
+        level: "one-shot",
+        envvar: "BK",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "restart no ttl",
+      } as any);
+      expect(res.ok).toBe(true);
+      const id = res.id as string;
+      const vp = path.join(f.secretsDir, `${id}.secret`);
+      expect(fs.existsSync(vp)).toBe(true);
+      // Long uptime, then restart on the same dirs.
+      const base = f.st.now();
+      f.st.now = () => base + 30 * 60_000;
+      stopVault(f.h);
+      __vaultResetForTest();
+      clearRegistryCache();
+      clearRuntimeSecrets();
+      const f2 = mkVault({ xdgDir: path.join(f.tmp, "xdg") });
+      try {
+        await f2.h.ready;
+        // f2's env TTL is 1200 (fixture) — the persisted no-TTL sentinel
+        // must win: no recovered-expired, no timer re-armed against 0.
+        const cred = f2.st.credentials.get(id)!;
+        expect(cred.state).toBe("pending");
+        expect(cred.ttlDeadline).toBe(0);
+        expect(fs.readFileSync(vp, "utf-8")).toBe(BYO_VALUE);
+        expect(
+          f2.auditEvents().some((e) => e.event === "recovered-expired"),
+        ).toBe(false);
+        await tick(1500); // past f2's 1200ms env TTL: still pending
+        expect(f2.st.credentials.get(id)!.state).toBe("pending");
+        await approve(f2, id);
+        const run = await vrun(f2, id);
+        expect(run.ok).toBe(true);
+        expect(run.token).toBe(BYO_VALUE);
+      } finally {
+        f2.cleanup();
+      }
+    } finally {
+      fs.rmSync(f.tmp, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("revoke on pending: audited from_state pending, stored value deleted at settle", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 0;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-0",
+        level: "time-boxed",
+        hours: 2,
+        envvar: "BK",
+        from_env: "MY_SECRET",
+        value: BYO_VALUE,
+        reason: "revoke pending test",
+      } as any);
+      const id = res.id as string;
+      const vp = path.join(f.secretsDir, `${id}.secret`);
+      expect(fs.existsSync(vp)).toBe(true);
+      await tap(f, id, "revoke");
+      expect(f.st.credentials.get(id)!.state).toBe("revoked");
+      expect(fs.existsSync(vp)).toBe(false); // deleted at settle
+      const rev = f.auditEvents().find((e) => e.event === "revoke");
+      expect(rev).toBeDefined();
+      expect(rev!.from_state).toBe("pending");
+      // active-revoke audit still records from_state active (no regression)
+      const id2 = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-1",
+        level: "time-boxed",
+        hours: 2,
+        envvar: "BK",
+        reason: "active revoke",
+      });
+      await approve(f, id2);
+      expect(f.st.credentials.get(id2)!.state).toBe("active");
+      await tap(f, id2, "revoke");
+      const rev2 = f.auditEvents().filter((e) => e.event === "revoke");
+      expect(rev2[rev2.length - 1].from_state).toBe("active");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+// ─── #205: default grant = 30-minute time-box ───────────────────────────────
+
+describe("#205 default grant is a 30-minute time-box", () => {
+  test("request without level → time-boxed 30m; card shows the grant; window lapses", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const res = await vaultRequest(f.st, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-0",
+        envvar: "BK",
+        reason: "default grant",
+      } as any);
+      expect(res.ok).toBe(true);
+      const id = res.id as string;
+      const cred = f.st.credentials.get(id)!;
+      expect(cred.level).toBe("time-boxed");
+      expect(cred.hours).toBe(0.5);
+      // Pending card shows the grant window before the tap.
+      const posted = f.fd.channelPosts()[0].body;
+      const lf = posted.embeds[0].fields.find((x: any) => x.name === "level");
+      expect(String(lf.value)).toBe(
+        "time-boxed — grant: 30m from approval (reusable)",
+      );
+      // Approve arms the window (fixture HOUR_MS=600ms → 300ms window).
+      await approve(f, id);
+      const c2 = f.st.credentials.get(id)!;
+      expect(c2.state).toBe("active");
+      expect(c2.expiresAt).toBeGreaterThan(0);
+      await tick(450);
+      expect(f.st.credentials.get(id)!.state).toBe("expired");
+      expect(f.st.credentials.get(id)!.expiredKind).toBe("window");
+      expect(
+        f
+          .auditEvents()
+          .some((e) => e.event === "expire" && e.reason === "window"),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("explicit permanent → card says permanent; no window armed", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "bk-1",
+        level: "permanent",
+        envvar: "BK",
+        reason: "explicit permanent",
+      });
+      const posted = f.fd.channelPosts()[0].body;
+      const lf = posted.embeds[0].fields.find((x: any) => x.name === "level");
+      expect(String(lf.value)).toBe(
+        "permanent — grant: permanent (until revoked)",
+      );
+      await approve(f, id);
+      const cred = f.st.credentials.get(id)!;
+      expect(cred.state).toBe("active");
+      expect(cred.expiresAt).toBeUndefined(); // no window
+      const base = f.st.now();
+      f.st.now = () => base + 6 * 60_000; // far past any 30m window
+      expect(f.st.credentials.get(id)!.state).toBe("active");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("validateRequestLine: level optional, whole-minute granularity", () => {
+    const base = { kind: "api-key", name: "k", envvar: "K", reason: "abc" };
+    const dflt = validateRequestLine({ ...base } as any);
+    expect(dflt.ok).toBe(true);
+    if (dflt.ok) {
+      expect(dflt.level).toBe("time-boxed");
+      expect(dflt.hours).toBe(0.5);
+    }
+    const h30 = validateRequestLine({
+      ...base,
+      level: "time-boxed",
+      hours: 0.5,
+    } as any);
+    expect(h30.ok).toBe(true);
+    if (h30.ok) expect(h30.hours).toBe(0.5);
+    const h90 = validateRequestLine({
+      ...base,
+      level: "time-boxed",
+      hours: 1.5,
+    } as any);
+    expect(h90.ok).toBe(true);
+    if (h90.ok) expect(h90.hours).toBe(1.5);
+    // whole minutes: 1/240 h = 0.25m → rounds to 0 → rejected
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 1 / 240,
+      } as any).ok,
+    ).toBe(false);
+    // 72h still the cap; above it rejected
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 72,
+      } as any).ok,
+    ).toBe(true);
+    expect(
+      validateRequestLine({
+        ...base,
+        level: "time-boxed",
+        hours: 72.02,
+      } as any).ok,
+    ).toBe(false);
+    // omitted level + explicit hours: the hours win
+    const oh = validateRequestLine({ ...base, hours: 2 } as any);
+    expect(oh.ok).toBe(true);
+    if (oh.ok) {
+      expect(oh.level).toBe("time-boxed");
+      expect(oh.hours).toBe(2);
+    }
+  });
+});

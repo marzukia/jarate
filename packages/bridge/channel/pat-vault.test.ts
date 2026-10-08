@@ -2361,3 +2361,88 @@ describe("tap observability (#204: every outcome visible + audited)", () => {
     }
   }, 15000);
 });
+
+// ─── #203: no default TTL (pending = BLOCKING) ─────────────────────────────
+//
+// The file's beforeEach always sets JARATE_PAT_TTL_MS=1200 (shortened
+// clock); no-TTL config (the new default) is modeled by st.ttlMs = 0
+// after start. Explicit-TTL expiry is already covered by the
+// "unanswered (1200ms)" tests above.
+
+describe("#203 pending without TTL is blocking", () => {
+  test("default (ttlMs 0): survives past the deadline, no expire, card untouched", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 0; // default config
+      const req = await makePending(f);
+      expect(req.ttlDeadline).toBe(0); // sentinel
+      // Card: no-TTL footer + grant visible before the tap (#205).
+      const posted = f.fd.channelPosts()[0].body;
+      expect(posted.embeds[0].footer.text).toBe(
+        `pending until tap · ${req.id}`,
+      );
+      const gf = posted.embeds[0].fields.find((x: any) => x.name === "grant");
+      expect(String(gf.value)).toBe("single use (claim within 1s of approval)");
+      // Clock jumps past the old 5-minute deadline; real time also passes
+      // the fixture's 1200ms TTL in case a timer was wrongly armed.
+      const base = f.st.now();
+      f.st.now = () => base + 6 * 60_000;
+      await tick(1500);
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(f.auditLines().some((l) => l.includes("expire"))).toBe(false);
+      expect(f.fd.messageEdits().length).toBe(0); // card untouched
+      // Pending-reject names the no-expiry state.
+      const r2 = await patRequest(f.st, {
+        agent: "monky",
+        scope: "marzukia/jarate:write",
+        reason: "second request",
+      });
+      expect(r2.ok).toBe(false);
+      expect(String(r2.error)).toMatch(/no expiry/);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("restart: no-TTL pending survives (no recovered-expired); still approvable", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      f.st.ttlMs = 0; // default config
+      const req = await makePending(f);
+      // Long uptime, then restart on the same dirs.
+      const base = f.st.now();
+      f.st.now = () => base + 30 * 60_000;
+      stopPatVault(f.h);
+      __patVaultResetForTest();
+      clearRegistryCache();
+      clearRuntimeSecrets();
+      const f2 = mkVault({ xdgDir: path.join(f.tmp, "xdg") });
+      try {
+        await f2.h.ready;
+        const loaded = f2.st.requests.get(req.id)!;
+        // f2's env TTL is 1200 (fixture) — the persisted no-TTL sentinel
+        // must win: no recovered-expired, no timer re-armed against 0.
+        expect(loaded.state).toBe("pending");
+        expect(loaded.ttlDeadline).toBe(0);
+        expect(
+          f2.auditLines().some((l) => l.includes("recovered-expired")),
+        ).toBe(false);
+        await tick(1500); // past f2's 1200ms env TTL: still pending
+        expect(f2.st.requests.get(req.id)!.state).toBe("pending");
+        // Still approvable after restart.
+        await f2.h.handlePatComponent(
+          mkD(`i-rs-${req.id}`, `pat:approve:${req.id}`, {
+            message: { id: loaded.messageId },
+          }),
+        );
+        expect(f2.st.requests.get(req.id)!.state).toBe("approved");
+      } finally {
+        f2.cleanup();
+      }
+    } finally {
+      fs.rmSync(f.tmp, { recursive: true, force: true });
+    }
+  }, 20000);
+});
