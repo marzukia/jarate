@@ -87,11 +87,6 @@ export interface HandoffSettings {
   /** Fraction (0..1) of the TOTAL context window where the handoff kicks
    *  in for threshold compactions. Env: HANDOFF_THRESHOLD. */
   threshold: number;
-  /** Session-file size that forces the restart-class op. Env:
-   *  HANDOFF_RESTART_FILE_CAP. Default 2MB (issue #85): a full 262k-window
-   *  compact writes 1–5MB of session file, so the old 64MB default made
-   *  the restart-class op effectively unreachable. */
-  restartFileCap: number;
   /** sizeGuard hard cap for the doc, in tokens. */
   sizeGuardTokens: number;
   /** Store dir. "~" expands to $HOME. */
@@ -101,9 +96,6 @@ export interface HandoffSettings {
 export const HANDOFF_DEFAULTS: HandoffSettings = {
   enabled: true,
   threshold: 0.8,
-  // issue #85: lowered from 64MB — a 262k context is a 1–5MB file, so the
-  // old cap was unreachable and /compact never rotated the session.
-  restartFileCap: 2_000_000,
   sizeGuardTokens: 12_000,
   storeDir: "~/.jarate/handovers",
 };
@@ -170,8 +162,8 @@ export interface ExtractCtxState {
 
 /** Resolve handoff settings: defaults, then ~/.pi/agent/settings.json,
  *  then <cwd>/.pi/settings.json (project wins), then env overrides
- *  (HANDOFF_THRESHOLD / HANDOFF_RESTART_FILE_CAP keep per-box tuning out
- *  of settings). Invalid values fall back to defaults with a warning. */
+ *  (HANDOFF_THRESHOLD / HANDOFF_ENABLED keep per-box tuning out of
+ *  settings). Invalid values fall back to defaults with a warning. */
 export function resolveHandoffSettings(
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -200,10 +192,6 @@ export function resolveHandoffSettings(
           `[handover] invalid handoff.threshold (${String(o.threshold)}) - using ${s.threshold}`,
         );
     }
-    if (o.restartFileCap !== undefined) {
-      const c = Number(o.restartFileCap);
-      if (Number.isFinite(c) && c > 0) s.restartFileCap = Math.floor(c);
-    }
     if (o.sizeGuardTokens !== undefined) {
       const g = Number(o.sizeGuardTokens);
       if (Number.isFinite(g) && g > 0) s.sizeGuardTokens = Math.floor(g);
@@ -213,8 +201,6 @@ export function resolveHandoffSettings(
   }
   const envT = Number(env.HANDOFF_THRESHOLD ?? "");
   if (Number.isFinite(envT) && envT > 0 && envT <= 1) s.threshold = envT;
-  const envC = Number(env.HANDOFF_RESTART_FILE_CAP ?? "");
-  if (Number.isFinite(envC) && envC > 0) s.restartFileCap = Math.floor(envC);
   // Env override of the flag itself (1/0, true/false) — same precedence as
   // the other env knobs: env beats settings.json beats default.
   const envE = env.HANDOFF_ENABLED?.trim().toLowerCase();

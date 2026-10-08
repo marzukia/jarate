@@ -7684,8 +7684,11 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(liveFile)).toBe(false); // moved aside
   });
 
-  test("over the cap: restart op — placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+  test("restart op: placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
+    // (was "over the cap" — the cap check is gone since c863c341: every
+    // handoff-qualifying compact restarts; this test exercises the restart
+    // chain, not a size gate.)
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864)); // 1.5 MB
     const stale = path.join(sessDir, "old.jsonl");
     fs.writeFileSync(stale, "old session");
@@ -7717,7 +7720,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
   });
 
   test("/stop during the handoff op: cancelled, marker cleared, cursor restored, file untouched", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
@@ -7733,8 +7736,8 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(restarter).toEqual([]);
   });
 
-  test("handoff disabled: over-cap file, no restart op", async () => {
-    writeSettings({ enabled: false, restartFileCap: 1000, storeDir });
+  test("handoff disabled: large file, no restart op", async () => {
+    writeSettings({ enabled: false, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(2048));
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
@@ -7806,7 +7809,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
   });
 
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
 
     // auto-compact in flight: no bridge window (startCompact not involved),
