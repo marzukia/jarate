@@ -2135,3 +2135,229 @@ describe("patRunBegin / patStatus unit", () => {
     }
   });
 });
+
+// ─── Tap-outcome observability (#204: every outcome visible + audited) ──────
+//
+// Appended block. Existing fixtures/tests untouched (two other workers own
+// these shared files concurrently).
+describe("tap observability (#204: every outcome visible + audited)", () => {
+  test("non-owner tap, real payload shape (no message field): audited non-owner-tap, not mismatch", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      // Real shape: no top-level d.message_id; message absent entirely
+      // (a stale/forwarded copy). Under the old order the mismatch check
+      // preempted the owner gate and swallowed this as `mismatch`.
+      await f.h.handlePatComponent(
+        mkD("obs-p1", `pat:approve:${req.id}`, {
+          message: undefined,
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      // Wrong-message variant: same expectation.
+      await f.h.handlePatComponent(
+        mkD("obs-p2", `pat:approve:${req.id}`, {
+          message: { id: "other-message" },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      const lines = f.auditLines();
+      expect(
+        lines.filter((l) => l.includes("event=non-owner-tap")).length,
+      ).toBe(2);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") && l.includes("reason=mismatch"),
+        ),
+      ).toBe(false);
+      for (const i of ["obs-p1", "obs-p2"]) {
+        const r = f.fd.replies(i);
+        expect(r.length).toBe(1);
+        expect(r[0].body.content).toMatch(/only the owner/);
+        expect(r[0].body.flags).toBeUndefined(); // visible, not ephemeral
+      }
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("feedback transport failure is audited tap-feedback-failed (#204)", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      // Kill every interaction-webhook call (PATCH @original + fallback
+      // POST root). The defer callback + card posts are not webhooks.
+      const whCalls: Array<{ url: string; method: string }> = [];
+      const base = globalThis.fetch;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        const url = String(input);
+        if (url.includes("/webhooks/")) {
+          whCalls.push({ url, method: init?.method ?? "GET" });
+          return resp(503, { message: "stubbed outage" });
+        }
+        return base(input, init);
+      }) as any;
+      try {
+        await f.h.handlePatComponent(
+          mkD("obs-pf", `pat:approve:${req.id}`, {
+            message: { id: "other-message" },
+          }),
+        );
+      } finally {
+        globalThis.fetch = base;
+      }
+
+      const lines = f.auditLines();
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") && l.includes("reason=mismatch"),
+        ),
+      ).toBe(true);
+      const ff = lines.find((l) => l.includes("event=tap-feedback-failed"));
+      expect(ff).toBeTruthy();
+      expect(ff!).toContain("reason=mismatch");
+      expect(ff!).toContain(`user=${OWNER}`);
+      expect(ff!).toContain("verb=approve");
+      expect(ff!).toContain("interaction=obs-pf");
+      // Both routes were attempted, neither delivered.
+      expect(
+        whCalls.some(
+          (c) => c.method === "PATCH" && c.url.endsWith("/messages/@original"),
+        ),
+      ).toBe(true);
+      expect(
+        whCalls.some(
+          (c) => c.method === "POST" && c.url.endsWith("intok-obs-pf"),
+        ),
+      ).toBe(true);
+      // State untouched.
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("every rejection branch replies visible in-channel (no flags 64) (#204)", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      // not-found
+      await f.h.handlePatComponent(
+        mkD("obs-p3", "pat:approve:pat_00000000-0000-0000-0000-000000000000"),
+      );
+      // mismatch
+      await f.h.handlePatComponent(
+        mkD("obs-p4", `pat:approve:${req.id}`, {
+          message: { id: "other-message" },
+        }),
+      );
+      // non-owner (on the correct message — gate vs mismatch ordering)
+      await f.h.handlePatComponent(
+        mkD("obs-p5", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      // stale: deny first, then approve again
+      await f.h.handlePatComponent(
+        mkD("obs-p6", `pat:deny:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      await f.h.handlePatComponent(
+        mkD("obs-p7", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+
+      for (const i of ["obs-p3", "obs-p4", "obs-p5", "obs-p7"]) {
+        const r = f.fd.replies(i);
+        expect(r.length, `reply for ${i}`).toBe(1);
+        expect(r[0].body.flags, `flags for ${i}`).toBeUndefined();
+        expect(r[0].body.content, `content for ${i}`).toMatch(/tap rejected/);
+      }
+      const lines = f.auditLines();
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") && l.includes("reason=not-found"),
+        ),
+      ).toBe(true);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") && l.includes("reason=mismatch"),
+        ),
+      ).toBe(true);
+      expect(lines.some((l) => l.includes("event=non-owner-tap"))).toBe(true);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") &&
+            l.includes("reason=already-handled"),
+        ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("silent-branch audits carry the interaction id + fields (#204)", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("obs-p8", "pat:approve:pat_00000000-0000-0000-0000-000000000000"),
+      );
+      await f.h.handlePatComponent(
+        mkD("obs-p9", `pat:approve:${req.id}`, {
+          message: { id: "other-message" },
+        }),
+      );
+      await f.h.handlePatComponent(
+        mkD("obs-pa", `pat:deny:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      await f.h.handlePatComponent(
+        mkD("obs-pb", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+
+      const lines = f.auditLines();
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") &&
+            l.includes("reason=not-found") &&
+            l.includes("interaction=obs-p8"),
+        ),
+      ).toBe(true);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") &&
+            l.includes("reason=mismatch") &&
+            l.includes("interaction=obs-p9") &&
+            l.includes(`user=${OWNER}`) &&
+            l.includes("got_message=other-message"),
+        ),
+      ).toBe(true);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("event=tap-rejected") &&
+            l.includes("reason=already-handled") &&
+            l.includes("interaction=obs-pb") &&
+            l.includes("state=denied"),
+        ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});

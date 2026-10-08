@@ -62,11 +62,17 @@ const states = new Map<string, DiscordState>();
 
 /** Bounded REST call against the Discord API (3 attempts, 429-aware).
  *  Exported: the #180 startup history scan reuses it (and tests stub
- *  the transport via globalThis.fetch). */
+ *  the transport via globalThis.fetch).
+ *
+ *  Errors carry up to 200 chars of the response body by default. Pass
+ *  fullError for interaction/webhook calls: Discord 4xx JSON error
+ *  bodies are small and name the exact failing field, and the 200-char
+ *  cut hid the 50035 ENUM_TYPE_COERCE body that pinned the followup
+ *  URL bug (D9 / #210). fullError caps at 1000 chars as a size bound. */
 export async function discordFetch(
   token: string,
   urlPath: string,
-  opts?: { method?: string; body?: any },
+  opts?: { method?: string; body?: any; fullError?: boolean },
 ): Promise<any> {
   const headers: Record<string, string> = {
     Authorization: `Bot ${token}`,
@@ -96,7 +102,8 @@ export async function discordFetch(
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      throw new Error(`Discord API ${resp.status}: ${text.slice(0, 200)}`);
+      const cap = opts?.fullError ? 1000 : 200; // #210
+      throw new Error(`Discord API ${resp.status}: ${text.slice(0, cap)}`);
     }
 
     if (resp.status === 204) return null;
@@ -1610,6 +1617,7 @@ export async function respondToInteraction(
         type: 4,
         data: text ? { content: egressText(text) } : {}, // secret censor
       },
+      fullError: true, // #210
     });
   } catch (e) {
     console.error(
@@ -1622,7 +1630,11 @@ export async function respondToInteraction(
 /** Defer a slash command (callback type 5). This is the ack that keeps
  *  Discord from showing "did not respond in time" (3s window) — call it
  *  BEFORE any command work. The deferred message shows "Thinking" until
- *  edited via editInteractionMessage. */
+ *  edited via editInteractionMessage. Flags 64 = ephemeral loading state
+ *  (#207): the "Thinking" bubble is tapper-only, not channel-visible —
+ *  tap OUTCOMES live in the (visible) reply + card edit, not in the ack.
+ *  Callback consumption is unchanged: exactly one callback response per
+ *  interaction (the defer spends it). */
 export async function deferInteraction(
   botToken: string,
   d: any,
@@ -1630,7 +1642,8 @@ export async function deferInteraction(
   try {
     await discordFetch(botToken, `/interactions/${d.id}/${d.token}/callback`, {
       method: "POST",
-      body: { type: 5 },
+      body: { type: 5, flags: 64 }, // #207: ephemeral loading state
+      fullError: true, // #210
     });
   } catch (e) {
     console.error(
@@ -1653,6 +1666,7 @@ export async function editInteractionMessage(
       {
         method: "PATCH",
         body: { content: egressText(text) }, // secret censor
+        fullError: true, // #210
       },
     );
   } catch (e) {
@@ -1672,13 +1686,15 @@ export async function editInteractionMessage(
  *  "Execute Webhook" route; interaction tokens reject it with 400 50035
  *  (errors.webhook_service: ENUM_TYPE_COERCE on "messages") — RCA
  *  2026-10-08, vault tap feedback invisible. Errors are swallowed (a
- *  failed followup must not kill the tap flow). */
+ *  failed followup must not kill the tap flow). Returns true when the
+ *  followup was delivered, false when the transport failed — callers
+ *  audit the failure (tap-feedback-failed, #204). */
 export async function sendInteractionFollowup(
   botToken: string,
   d: any,
   text: string,
   opts?: { ephemeral?: boolean },
-): Promise<void> {
+): Promise<boolean> {
   try {
     await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
       method: "POST",
@@ -1686,12 +1702,15 @@ export async function sendInteractionFollowup(
         content: egressText(text), // secret censor
         ...(opts?.ephemeral ? { flags: 64 } : {}),
       },
+      fullError: true, // #210
     });
+    return true;
   } catch (e) {
     console.error(
       "[interactions] followup failed:",
       sanitizeSensitiveText(String(e)),
     );
+    return false;
   }
 }
 
@@ -1703,13 +1722,15 @@ export async function sendInteractionFollowup(
  *  failure (RCA 2026-10-08: every rejection reply was an ephemeral
  *  followup on the wrong URL and the operator saw nothing). Fallback:
  *  a new followup message if @original is already gone. Errors are
- *  swallowed (must not kill the tap flow). */
+ *  swallowed (must not kill the tap flow). Returns true when the reply
+ *  was delivered (either route), false when both failed — callers audit
+ *  the failure (tap-feedback-failed, #204). */
 export async function replyInteraction(
   botToken: string,
   d: any,
   text: string,
   opts?: { ephemeral?: boolean },
-): Promise<void> {
+): Promise<boolean> {
   const body = {
     content: egressText(text), // secret censor
     ...(opts?.ephemeral ? { flags: 64 } : {}),
@@ -1718,8 +1739,9 @@ export async function replyInteraction(
     await discordFetch(
       botToken,
       `/webhooks/${d.application_id}/${d.token}/messages/@original`,
-      { method: "PATCH", body },
+      { method: "PATCH", body, fullError: true }, // #210
     );
+    return true;
   } catch (e1) {
     console.error(
       "[interactions] reply failed:",
@@ -1729,12 +1751,15 @@ export async function replyInteraction(
       await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
         method: "POST",
         body,
+        fullError: true, // #210
       });
+      return true;
     } catch (e2) {
       console.error(
         "[interactions] followup failed:",
         sanitizeSensitiveText(String(e2)),
       );
+      return false;
     }
   }
 }
@@ -1749,7 +1774,7 @@ export async function deleteDeferredAck(
     await discordFetch(
       botToken,
       `/webhooks/${d.application_id}/${d.token}/messages/@original`,
-      { method: "DELETE" },
+      { method: "DELETE", fullError: true }, // #210
     );
   } catch {
     // 404 (already gone) and network blips are both non-fatal here.
