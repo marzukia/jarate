@@ -36,6 +36,7 @@ import {
   validateRequestLine,
   validateValueShape,
   vaultRequest,
+  vaultSlash,
 } from "./vault";
 
 // ─── fake Discord REST ─────────────────────────────────────────────────────
@@ -1487,4 +1488,291 @@ describe("request edge cases", () => {
       f.cleanup();
     }
   }, 15000);
+});
+
+// ─── startup sweep (#208) ─────────────────────────────────────────────────
+
+describe("startup sweep (#208): audit only when something was pruned", () => {
+  test("clean boot: no sweep audit line", () => {
+    const f = mkVault();
+    try {
+      expect(f.auditEvents().filter((e) => e.event === "sweep")).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("boot with crash-leftover files: exactly one sweep line (n = count), files pruned", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vault-sweep-"));
+    const xdg = path.join(tmp, "xdg");
+    const fileDir = path.join(xdg, "jarate-vault");
+    fs.mkdirSync(fileDir, { recursive: true });
+    fs.writeFileSync(path.join(fileDir, "stale-a"), "x");
+    fs.writeFileSync(path.join(fileDir, "stale-b"), "y");
+    const f = mkVault({ xdgDir: xdg });
+    try {
+      const sweeps = f.auditEvents().filter((e) => e.event === "sweep");
+      expect(sweeps).toHaveLength(1);
+      expect(sweeps[0].n).toBe(2);
+      expect(sweeps[0].actor).toBe("system");
+      // the leftovers are gone
+      expect(fs.readdirSync(fileDir)).toEqual([]);
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+// ─── /vault slash commands (#206, D5) ─────────────────────────────────────
+
+describe("vaultSlash (#206): owner-gated text path", () => {
+  test("status: empty vault lists nothing", async () => {
+    const f = mkVault();
+    try {
+      const s = await vaultSlash(f.st, "status", undefined, OWNER, "Owner");
+      expect(s.ok).toBe(true);
+      expect(s.text).toBe("vault: no pending or active credentials");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("status: lists pending + active with id/kind/name/state/created/grant/link", async () => {
+    const f = mkVault();
+    try {
+      const id1 = await makePending(f, {
+        agent: "monky",
+        kind: "github-pat",
+        name: "marzukia/jarate:write",
+        level: "one-shot",
+        reason: "test status listing",
+      });
+      const a = await vaultSlash(f.st, "approve", id1, OWNER, "Owner");
+      expect(a.ok).toBe(true);
+      const id2 = await makePending(f, {
+        agent: "monky",
+        kind: "api-key",
+        name: "window-key",
+        level: "time-boxed",
+        hours: 2,
+        envvar: "TEST_KEY",
+        reason: "test status listing",
+      });
+      const s = await vaultSlash(
+        f.st,
+        "status",
+        undefined,
+        OWNER,
+        "Owner",
+        "guild-1",
+      );
+      expect(s.ok).toBe(true);
+      expect(s.text).toContain("[vault: 1 pending, 1 active]");
+      // id (truncated display), kind/name, state
+      expect(s.text).toContain(id1.slice(0, 10));
+      expect(s.text).toContain(id2.slice(0, 10));
+      expect(s.text).toContain("github-pat/marzukia/jarate:write");
+      expect(s.text).toContain("api-key/window-key");
+      expect(s.text).toMatch(/ {2}active$/m);
+      expect(s.text).toMatch(/ {2}pending$/m);
+      // created timestamp
+      expect(s.text).toMatch(
+        /created \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z/,
+      );
+      // grant window: active one-shot -> claim by; pending time-boxed -> 2h
+      expect(s.text).toMatch(/claim by \d{4}-/);
+      expect(s.text).toContain("  grant 2h");
+      // message link (guild id from the interaction)
+      expect(s.text).toContain("https://discord.com/channels/guild-1/999/");
+      expect(s.text).toContain(`/${f.st.credentials.get(id1)!.messageId}`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("approve: card edit is byte-identical to a button tap (shared transition)", async () => {
+    // Fixture A: owner approves via /vault.
+    const fa = mkVault();
+    const ida = await makePending(fa);
+    const ra = await vaultSlash(fa.st, "approve", ida, OWNER, "Owner");
+    expect(ra.ok).toBe(true);
+    expect(ra.text).toBe(`[ok] approved ${ida}`);
+    expect(fa.st.credentials.get(ida)!.state).toBe("active");
+    const evA = fa.auditEvents().find((e) => e.event === "approve");
+    expect(evA).toBeDefined();
+    expect(evA!.actor).toBe(`slash:${OWNER}`);
+    expect(evA!.user).toBe(OWNER);
+
+    // Fixture B: owner approves the same request via the button tap.
+    const fb = mkVault();
+    const idb = await makePending(fb);
+    await approve(fb, idb);
+    const evB = fb.auditEvents().find((e) => e.event === "approve");
+    expect(evB!.actor).toBe(`discord:${OWNER}`);
+
+    // The card edit payloads match once the per-fixture ids/times are
+    // normalized — same embed, same buttons, same content.
+    const norm = (body: any, id: string) =>
+      JSON.stringify(body)
+        .replaceAll(id, "ID")
+        .replaceAll(/\d{2}:\d{2}/g, "HHMM");
+    const editA = fa.fd.messageEdits().at(-1)!;
+    const editB = fb.fd.messageEdits().at(-1)!;
+    expect(norm(editA.body, ida)).toBe(norm(editB.body, idb));
+
+    fa.cleanup();
+    fb.cleanup();
+  });
+
+  test("deny: denied state + audit + card edit", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      const r = await vaultSlash(f.st, "deny", id, OWNER, "Owner");
+      expect(r.ok).toBe(true);
+      expect(r.text).toBe(`[ok] denied ${id}`);
+      const cred = f.st.credentials.get(id)!;
+      expect(cred.state).toBe("denied");
+      expect(cred.deniedBy).toBe(OWNER);
+      const ev = f.auditEvents().find((e) => e.event === "deny");
+      expect(ev?.actor).toBe(`slash:${OWNER}`);
+      const edits = f.fd.messageEdits();
+      expect(edits).toHaveLength(1);
+      expect(edits[0].body.content).toBe("denied by Owner");
+      expect(JSON.stringify(edits[0].body)).toContain("VAULT denied");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("non-owner: visible error + audited, state unchanged", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      const r = await vaultSlash(f.st, "approve", id, OTHER, "Other");
+      expect(r.ok).toBe(false);
+      expect(r.text).toContain("[!] only the owner can use /vault");
+      expect(f.st.credentials.get(id)!.state).toBe("pending");
+      const ev = f
+        .auditEvents()
+        .find((e) => e.event === "slash-rejected" && e.reason === "not-owner");
+      expect(ev).toBeDefined();
+      expect(ev?.actor).toBe(`slash:${OTHER}`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("unknown id: visible error + audited (not-found)", async () => {
+    const f = mkVault();
+    try {
+      await makePending(f);
+      const r = await vaultSlash(
+        f.st,
+        "approve",
+        "vault_deadbeef",
+        OWNER,
+        "Owner",
+      );
+      expect(r.ok).toBe(false);
+      expect(r.text).toMatch(/no such credential/);
+      const ev = f
+        .auditEvents()
+        .find((e) => e.event === "slash-rejected" && e.reason === "not-found");
+      expect(ev).toBeDefined();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("ambiguous prefix: error, no state change", async () => {
+    const f = mkVault();
+    try {
+      // Two credentials (one denied, one pending) so the shortest
+      // prefix "vault_" matches both — ids are unique per credential.
+      const id1 = await makePending(f);
+      await vaultSlash(f.st, "deny", id1, OWNER, "Owner");
+      const id2 = await makePending(f);
+      const r = await vaultSlash(f.st, "approve", "vault_", OWNER, "Owner");
+      expect(r.ok).toBe(false);
+      expect(r.text).toMatch(/ambiguous/);
+      expect(f.st.credentials.get(id2)!.state).toBe("pending");
+      const ev = f
+        .auditEvents()
+        .find(
+          (e) => e.event === "slash-rejected" && e.reason === "ambiguous-id",
+        );
+      expect(ev).toBeDefined();
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("unique prefix resolves; exact id still works", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      // uuid tail is unique among (the only) credential
+      const r = await vaultSlash(f.st, "deny", id.slice(0, 14), OWNER, "Owner");
+      expect(r.ok).toBe(true);
+      expect(f.st.credentials.get(id)!.state).toBe("denied");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("already handled: slash approve on a denied cred is rejected + audited", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      await vaultSlash(f.st, "deny", id, OWNER, "Owner");
+      const r = await vaultSlash(f.st, "approve", id, OWNER, "Owner");
+      expect(r.ok).toBe(false);
+      expect(r.text).toMatch(/already handled/);
+      expect(f.st.credentials.get(id)!.state).toBe("denied");
+      const ev = f
+        .auditEvents()
+        .find(
+          (e) => e.event === "slash-rejected" && e.reason === "already-handled",
+        );
+      expect(ev).toBeDefined();
+      expect(ev?.state).toBe("denied");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("ping: re-announces in the channel, referencing the card", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id)!;
+      const r = await vaultSlash(f.st, "ping", id, OWNER, "Owner");
+      expect(r.ok).toBe(true);
+      expect(r.text).toMatch(/\[ok\] pinged/);
+      const posts = f.fd.channelPosts();
+      const ping = posts.find((p) =>
+        String(p.body?.content ?? "").includes(id),
+      );
+      expect(ping).toBeDefined();
+      expect(ping!.body.message_reference.message_id).toBe(cred.messageId);
+      expect(ping!.body.content).toContain(`/vault approve ${id}`);
+      const ev = f.auditEvents().find((e) => e.event === "slash-ping");
+      expect(ev).toBeDefined();
+      expect(ev?.actor).toBe(`slash:${OWNER}`);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("usage: unknown action gets a usage line", async () => {
+    const f = mkVault();
+    try {
+      const s = await vaultSlash(f.st, "bogus", undefined, OWNER, "Owner");
+      expect(s.ok).toBe(false);
+      expect(s.text).toMatch(/usage: \/vault/);
+    } finally {
+      f.cleanup();
+    }
+  });
 });

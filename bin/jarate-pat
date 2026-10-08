@@ -3,6 +3,9 @@
  * jarate-pat — PAT vault client. The ONLY process that ever sees the token
  * (besides the bridge itself and the spawned child's env).
  *
+ * DEPRECATED (#209): use jarate-vault — the github-pat kind covers PATs.
+ * Kept working as-is; nothing removed.
+ *
  * Subcommands:
  *   request <scope> <reason...>      ask the owner for a PAT (JSON doc out)
  *   run <id> -- <cmd> [args...]      run one command under the approved token
@@ -389,7 +392,9 @@ async function main(): Promise<void> {
       await cmdStatus(rest);
       return;
     default:
-      failUsage("usage: jarate-pat <request|run|run-raw|status> ...");
+      failUsage(
+        "usage: jarate-pat <request|run|run-raw|status> ...\ndeprecated: use jarate-vault (the github-pat kind covers PATs)",
+      );
   }
 }
 

@@ -16,6 +16,7 @@ import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
+  __setVaultHandleForTest,
   bashToolEssential,
   buildInteractionHandler,
   buildRepliedMessageBlock,
@@ -120,6 +121,12 @@ import {
   resolveSystemdUnit,
 } from "./types";
 import { performUndo } from "./undo";
+import {
+  __vaultResetForTest,
+  startVault,
+  stopVault,
+  vaultRequest,
+} from "./vault";
 
 /** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
  *  40-col budget (word boundaries, 2-space continuation indent). These
@@ -11282,5 +11289,310 @@ describe("live marker (#191 M2)", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ─── /vault interaction subcommands (#206, D5) ─────────────────────────────
+// The `vault` entry in SLASH_COMMANDS routes to vaultSlash with the SAME
+// state transitions as button taps. These tests wire a REAL vault
+// (socket transport, mkdtemp XDG) into a bridge channel via
+// __setVaultHandleForTest and drive buildInteractionHandler the way
+// Discord would. No network: fetch is stubbed.
+
+describe("buildInteractionHandler: /vault subcommands (#206)", () => {
+  const realFetch = globalThis.fetch;
+  const VAULT_ENV_KEYS = [
+    "JARATE_VAULT_TTL_MS",
+    "JARATE_VAULT_CLAIM_MS",
+    "JARATE_VAULT_CENSOR_GRACE_MS",
+    "JARATE_VAULT_HOUR_MS",
+    "JARATE_VAULT_MAX_PENDING",
+  ];
+
+  let calls: Array<{ url: string; method: string; body: any }>;
+  let tmp: string;
+  let vaultHandle: any;
+  let pi: any;
+  const ctx: any = {
+    cwd: "/tmp",
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    abort: () => {},
+    compact: () => {},
+    modelRegistry: { getAvailable: () => [] },
+    getContextUsage: () => undefined,
+    model: { id: "cur", name: "Cur" },
+  };
+
+  const ch = {
+    id: "ich",
+    name: "IntTest",
+    type: "discord",
+    botToken: "tok-i",
+    channel: "888",
+    ownerUserId: "owner1",
+  } as any;
+
+  const d = (
+    name: string,
+    extra: Record<string, unknown> = {},
+    userId = "owner1",
+  ) => ({
+    id: "i1",
+    token: "tok123",
+    application_id: "app1",
+    channel_id: "888",
+    guild_id: "guild1",
+    user: {
+      id: userId,
+      username: userId === "owner1" ? "OwnerOne" : "Somebody",
+    },
+    data: { name, options: [] as any[], ...extra },
+  });
+
+  function jsonResp(status: number, data: unknown) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => data,
+      text: async () => JSON.stringify(data ?? ""),
+    };
+  }
+
+  /** Fetch stub recording every call; channel message POSTs get real ids. */
+  function stubFetch() {
+    calls = [];
+    let msgSeq = 0;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const method = init?.method ?? "GET";
+      const body =
+        method !== "GET" && init?.body
+          ? JSON.parse(init.body as string)
+          : undefined;
+      calls.push({ url: String(url), method, body });
+      if (method === "POST" && String(url).includes("/channels/888/messages")) {
+        return jsonResp(200, { id: `m${++msgSeq}` });
+      }
+      return jsonResp(204, null);
+    }) as any;
+    return calls;
+  }
+
+  /** Deferred-ack edits (defer-first design): immediate results land as
+   *  PATCH /webhooks/.../messages/@original, not as a followup POST. */
+  function deferredTexts(): string[] {
+    return calls
+      .filter(
+        (c) =>
+          c.method === "PATCH" &&
+          c.url.includes("/webhooks/app1/tok123/messages/@original"),
+      )
+      .map((c) => String(c.body?.content ?? ""));
+  }
+
+  async function installVault(): Promise<void> {
+    stubFetch();
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-vault-"));
+    const xdg = path.join(tmp, "xdg");
+    for (const k of VAULT_ENV_KEYS) {
+      process.env[k] =
+        k === "JARATE_VAULT_MAX_PENDING"
+          ? "5"
+          : k === "JARATE_VAULT_HOUR_MS"
+            ? "600"
+            : "200";
+    }
+    process.env.JARATE_VAULT_TTL_MS = "1200";
+    process.env.JARATE_VAULT_CLAIM_MS = "800";
+    // known value the github-pat requests resolve against (vault known/ dir
+    // layout: <kind>/<owner>/<name>), token shape per validateValueShape
+    const knownDir = path.join(tmp, "vault", "known");
+    fs.mkdirSync(path.join(knownDir, "github-pat", "marzukia"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(knownDir, "github-pat", "marzukia", "jarate:write"),
+      `github_pat_${"f".repeat(30)}`,
+      { mode: 0o600 },
+    );
+    pi = { setModel: () => {}, sendMessage: async () => ({}) };
+    vaultHandle = startVault({
+      ch,
+      botToken: ch.botToken,
+      stateDir: path.join(tmp, "state"),
+      xdgDir: xdg,
+      vaultDir: path.join(tmp, "vault"),
+      knownDir: path.join(tmp, "vault", "known"),
+      secretsDir: path.join(tmp, "vault", "secrets"),
+      stateFile: path.join(tmp, "vault", "state.json"),
+      auditFile: path.join(tmp, "vault", "audit.log"),
+      legacyPatsDir: path.join(tmp, "legacy-pats"),
+      legacyDefaultPatFile: path.join(tmp, "marzukia-pat"),
+      transport: "socket",
+    });
+    __setVaultHandleForTest(ch.id, vaultHandle);
+    await vaultHandle.ready;
+  }
+
+  function auditEvents(): any[] {
+    const p = path.join(tmp, "vault", "audit.log");
+    if (!fs.existsSync(p)) return [];
+    return fs
+      .readFileSync(p, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+  }
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    if (vaultHandle) {
+      stopVault(vaultHandle);
+      vaultHandle = undefined;
+      __vaultResetForTest();
+    }
+    __setVaultHandleForTest(ch.id, null);
+    if (tmp) {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      tmp = undefined as any;
+    }
+    for (const k of VAULT_ENV_KEYS) delete process.env[k];
+    clearDiscordStatesForTest();
+  });
+
+  test("no vault on the channel: visible error, no crash", async () => {
+    stubFetch();
+    pi = { setModel: () => {}, sendMessage: async () => ({}) };
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(d("vault", { options: [{ type: 1, name: "status" }] }) as any);
+    expect(deferredTexts().at(-1)).toContain("vault not running");
+  });
+
+  test("status (owner): lists the pending request in the reply", async () => {
+    await installVault();
+    const req = await vaultRequest(vaultHandle.vault, {
+      agent: "monky",
+      kind: "github-pat",
+      name: "marzukia/jarate:write",
+      level: "one-shot",
+      reason: "integration test",
+    });
+    expect(req.ok).toBe(true);
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(d("vault", { options: [{ type: 1, name: "status" }] }) as any);
+    const text = deferredTexts().at(-1)!;
+    expect(text).toContain("[vault: 1 pending, 0 active]");
+    expect(text).toContain("github-pat/marzukia/jarate:write");
+    expect(text).toContain("one-shot");
+    // message link uses the interaction's guild id
+    expect(text).toContain("https://discord.com/channels/guild1/888/");
+  });
+
+  test("approve (owner): same transition as a tap — active, card edited, audit actor slash:", async () => {
+    await installVault();
+    const req = await vaultRequest(vaultHandle.vault, {
+      agent: "monky",
+      kind: "github-pat",
+      name: "marzukia/jarate:write",
+      level: "one-shot",
+      reason: "integration test",
+    });
+    expect(req.ok).toBe(true);
+    const id = req.id as string;
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(
+      d("vault", {
+        options: [
+          {
+            type: 1,
+            name: "approve",
+            options: [{ type: 3, name: "id", value: id }],
+          },
+        ],
+      }) as any,
+    );
+    const cred = (vaultHandle.vault.credentials as any).get(id);
+    expect(cred.state).toBe("active");
+    // audit: the SAME event as a tap, actor names the slash path
+    const ev = auditEvents().find((e) => e.event === "approve");
+    expect(ev).toBeDefined();
+    expect(ev.actor).toBe("slash:owner1");
+    // card edited (the request message, not a new post)
+    const edits = calls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/channels/888/messages/"),
+    );
+    expect(edits.length).toBe(1);
+    expect(edits[0].body.embeds[0].title).toContain("approved");
+    expect(String(edits[0].body.content)).toContain(`jarate vault-run ${id}`);
+  });
+
+  test("deny (owner): denied state + audit actor slash:", async () => {
+    await installVault();
+    const req = await vaultRequest(vaultHandle.vault, {
+      agent: "monky",
+      kind: "github-pat",
+      name: "marzukia/jarate:write",
+      level: "one-shot",
+      reason: "integration test",
+    });
+    expect(req.ok).toBe(true);
+    const id = req.id as string;
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(
+      d("vault", {
+        options: [
+          {
+            type: 1,
+            name: "deny",
+            options: [{ type: 3, name: "id", value: id }],
+          },
+        ],
+      }) as any,
+    );
+    const cred = (vaultHandle.vault.credentials as any).get(id);
+    expect(cred.state).toBe("denied");
+    const ev = auditEvents().find((e) => e.event === "deny");
+    expect(ev).toBeDefined();
+    expect(ev.actor).toBe("slash:owner1");
+  });
+
+  test("non-owner: visible error + audited, state unchanged", async () => {
+    await installVault();
+    const req = await vaultRequest(vaultHandle.vault, {
+      agent: "monky",
+      kind: "github-pat",
+      name: "marzukia/jarate:write",
+      level: "one-shot",
+      reason: "integration test",
+    });
+    expect(req.ok).toBe(true);
+    const id = req.id as string;
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
+    await h(
+      d(
+        "vault",
+        {
+          options: [
+            {
+              type: 1,
+              name: "approve",
+              options: [{ type: 3, name: "id", value: id }],
+            },
+          ],
+        },
+        "someone-else",
+      ) as any,
+    );
+    expect(deferredTexts().at(-1)).toContain(
+      "[!] only the owner can use /vault",
+    );
+    expect((vaultHandle.vault.credentials as any).get(id).state).toBe(
+      "pending",
+    );
+    const ev = auditEvents().find(
+      (e) => e.event === "slash-rejected" && e.reason === "not-owner",
+    );
+    expect(ev).toBeDefined();
+    expect(ev.actor).toBe("slash:someone-else");
   });
 });

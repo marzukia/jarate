@@ -1851,6 +1851,59 @@ export const SLASH_COMMANDS = [
       },
     ],
   },
+  {
+    // #206 (D5): non-button vault ops. Subcommand form (type 1); the
+    // handler in index.ts folds it back to a "status" / "approve <id>"
+    // / "deny <id>" / "ping <id>" arg for runChannelCommand.
+    name: "vault",
+    description: "Credential vault: status + owner approve/deny",
+    options: [
+      {
+        type: 1,
+        name: "status",
+        description: "List pending + active credentials",
+      },
+      {
+        type: 1,
+        name: "approve",
+        description: "Approve a pending request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
+      },
+      {
+        type: 1,
+        name: "deny",
+        description: "Deny a pending request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
+      },
+      {
+        type: 1,
+        name: "ping",
+        description: "Re-announce a pending/active request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
+      },
+    ],
+  },
 ];
 
 /** Register SLASH_COMMANDS guild-scoped (instant, no 1h propagation) on

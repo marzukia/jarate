@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import {
   connectDiscord,
   connectDiscordPresence,
   deferInteraction,
+  deleteDeferredAck,
   disconnectDiscord,
   editInteractionMessage,
   ensurePresenceState,
@@ -1253,4 +1254,101 @@ test("getChannelCursor / setChannelCursor round-trip and persist", async () => {
   expect(getChannelCursor("cs")).toBe("42");
   clearDiscordStatesForTest();
   expect(getChannelCursor("cs")).toBeNull();
+});
+
+// ─── URL contract (issue #211, D4) ─────────────────────────────────────────
+// Pinned routes the bridge must use for interaction traffic. Sources:
+// developers/discord-api-docs:
+//  - "Create Interaction Response" (receiving-and-responding)
+//      POST   /interactions/{interaction.id}/{token}/callback
+//  - "Create Followup Message" (webhooks) — the interaction webhook
+//      POST   /webhooks/{application.id}/{token}
+//    (the webhook ROOT — NOT .../messages, which is the Incoming Webhooks
+//    route and 404s for interaction tokens; RCA 2026-10-08)
+//  - "Edit Webhook Message" (webhooks)
+//      PATCH  /webhooks/{application.id}/{token}/messages/{message.id}
+//  - "Delete Webhook Message" (webhooks)
+//      DELETE /webhooks/{application.id}/{token}/messages/{message.id}
+// {message.id} is "@original" for the deferred ack created by
+// deferInteraction. If a future edit changes any URL below, update the
+// constant to match the current Discord docs — that is the point of
+// pinning it.
+const EXPECTED_ROUTES = {
+  createInteractionResponse: "/interactions/{id}/{token}/callback",
+  createFollowup: "/webhooks/{application_id}/{token}",
+  editWebhookMessage:
+    "/webhooks/{application_id}/{token}/messages/{message_id}",
+  deleteWebhookMessage:
+    "/webhooks/{application_id}/{token}/messages/{message_id}",
+} as const;
+
+function renderRoute(
+  route: string,
+  d: { id: string; token: string; application_id: string },
+): string {
+  return route
+    .replaceAll("{id}", d.id)
+    .replaceAll("{token}", d.token)
+    .replaceAll("{application_id}", d.application_id)
+    .replaceAll("{message_id}", "@original");
+}
+
+describe("URL contract (#211): interaction endpoints vs pinned Discord routes", () => {
+  const realFetch = globalThis.fetch;
+  const BASE = "https://discord.com/api/v10";
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test("callback + followup + edit + delete all match the pinned routes (no network)", async () => {
+    const d = {
+      id: "int-1",
+      token: "tok-1",
+      application_id: "app-1",
+    } as any;
+    const calls: Array<{ method: string; url: string }> = [];
+    setFetch(async (url, init) => {
+      calls.push({ method: init?.method ?? "GET", url });
+      return jsonResp(204, null);
+    });
+
+    // The full interaction lifecycle, in order:
+    await respondToInteraction("bot-tok", d, "ack"); // 1. ACK (type-6 reply)
+    await deferInteraction("bot-tok", d); // 2. ACK (type-5 defer)
+    await sendInteractionFollowup("bot-tok", d, "hello"); // 3. Create Followup
+    await editInteractionMessage("bot-tok", d, "world"); // 4. Edit Webhook Message
+    await deleteDeferredAck("bot-tok", d); // 5. Delete Webhook Message
+    await replyInteraction("bot-tok", d, "final"); // 6. Edit Webhook Message
+
+    expect(calls.map((c) => `${c.method} ${c.url.replace(BASE, "")}`)).toEqual([
+      `POST ${renderRoute(EXPECTED_ROUTES.createInteractionResponse, d)}`,
+      `POST ${renderRoute(EXPECTED_ROUTES.createInteractionResponse, d)}`,
+      `POST ${renderRoute(EXPECTED_ROUTES.createFollowup, d)}`,
+      `PATCH ${renderRoute(EXPECTED_ROUTES.editWebhookMessage, d)}`,
+      `DELETE ${renderRoute(EXPECTED_ROUTES.deleteWebhookMessage, d)}`,
+      `PATCH ${renderRoute(EXPECTED_ROUTES.editWebhookMessage, d)}`,
+    ]);
+  });
+
+  test("Create Followup is the webhook ROOT — never the incoming-webhook .../messages route", async () => {
+    const d = {
+      id: "int-2",
+      token: "tok-2",
+      application_id: "app-2",
+    } as any;
+    const urls: string[] = [];
+    setFetch(async (url) => {
+      urls.push(url);
+      return jsonResp(200, { id: "m1" });
+    });
+
+    await sendInteractionFollowup("bot-tok", d, "hello");
+
+    expect(urls).toEqual([`${BASE}/webhooks/app-2/tok-2`]);
+    // The RCA incident: POST .../webhooks/{app}/{token}/messages is the
+    // Incoming Webhooks route — 404 "Unknown Webhook Message" for
+    // interaction tokens.
+    expect(urls[0].endsWith("/messages")).toBe(false);
+  });
 });

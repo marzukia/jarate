@@ -428,7 +428,9 @@ function startupSweep(st: PatVaultState): void {
   } catch (e) {
     audit(st, "vault-error", undefined, { err: `filedir: ${String(e)}` });
   }
-  audit(st, "sweep", undefined, { n });
+  // #208: a clean boot is not an event — audit only when something
+  // was actually pruned.
+  if (n > 0) audit(st, "sweep", undefined, { n });
 }
 
 /** Connect probe: true only if a live peer accepts on the socket path.
