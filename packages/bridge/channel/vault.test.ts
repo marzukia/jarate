@@ -24,6 +24,7 @@ import {
   clearRuntimeSecrets,
   getRuntimeSecrets,
 } from "./censor";
+import { parseGatewayPayload } from "./discord";
 import {
   __vaultResetForTest,
   knownNames,
@@ -89,6 +90,17 @@ class FakeDiscord {
       ) {
         return resp(200, { id: "followup" });
       }
+      // Interaction webhook (RCA 2026-10-08): POST /webhooks/{app}/{token}
+      // is Create Followup (webhook ROOT — wait is implicit); the
+      // /messages/@original subroute edits/deletes the deferred ack.
+      const wh = url.match(/\/webhooks\/[^/]+\/[^/]+(\/.*)?$/);
+      if (wh) {
+        const rest = wh[1] ?? "";
+        if (method === "POST" && rest === "")
+          return resp(200, { id: "followup" });
+        if (rest.startsWith("/messages/")) return resp(204, null);
+        return resp(404, { message: "Unknown Webhook Message" });
+      }
       if (method === "PATCH" && url.includes("/messages/"))
         return resp(204, null);
       if (method === "DELETE") return resp(204, null);
@@ -99,10 +111,20 @@ class FakeDiscord {
   followups(): Array<{ url: string; body: any }> {
     return this.calls
       .filter(
+        (c) => c.method === "POST" && /\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
+      )
+      .map((c) => ({ url: c.url, body: c.body }));
+  }
+
+  /** Visible tap replies: PATCH @original on the interaction webhook. */
+  replies(id?: string): Array<{ url: string; body: any }> {
+    return this.calls
+      .filter(
         (c) =>
-          c.method === "POST" &&
+          c.method === "PATCH" &&
           c.url.includes("/webhooks/") &&
-          c.url.includes("messages?wait=true"),
+          c.url.endsWith("/messages/@original") &&
+          (id ? c.url.includes(`intok-${id}`) : true),
       )
       .map((c) => ({ url: c.url, body: c.body }));
   }
@@ -123,8 +145,13 @@ class FakeDiscord {
   }
 
   messageEdits(): any[] {
+    // Channel message edits only (the tap reply PATCHes the interaction
+    // webhook's @original — a different /messages/ route, excluded here).
     return this.calls.filter(
-      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+      (c) =>
+        c.method === "PATCH" &&
+        c.url.includes("/channels/") &&
+        c.url.includes("/messages/"),
     );
   }
 }
@@ -303,7 +330,10 @@ function mkD(
     token: `intok-${id}`,
     application_id: "app1",
     channel_id: "999",
-    message_id: "",
+    // Real payload shape (RCA 2026-10-08): the component's message is the
+    // `message` field on the interaction itself; d.message_id does not
+    // exist in Discord's spec and used to be what the handler compared.
+    message: { id: "" },
     data: { custom_id: customId },
     user: { id: OWNER, username: "Owner" },
     ...over,
@@ -332,12 +362,12 @@ async function approve(f: VaultFix, id: string): Promise<void> {
   const cred = f.st.credentials.get(id);
   await f.h.handleVaultComponent(
     mkD(`i-${id}`, `vault:approve:${id}`, {
-      message_id: cred?.messageId ?? "",
+      message: { id: cred?.messageId ?? "" },
     }),
   );
 }
 
-/** Owner-deny / owner-revoke taps (message_id matched). */
+/** Owner-deny / owner-revoke taps (message.id matched). */
 async function tap(
   f: VaultFix,
   id: string,
@@ -347,7 +377,7 @@ async function tap(
   const cred = f.st.credentials.get(id);
   await f.h.handleVaultComponent(
     mkD(`i-${verb}-${id}`, `vault:${verb}:${id}`, {
-      message_id: cred?.messageId ?? "",
+      message: { id: cred?.messageId ?? "" },
     }),
   );
 }
@@ -649,7 +679,7 @@ describe("one-shot (single-use)", () => {
       await f.h.handleVaultComponent(
         mkD(`i-n1`, `vault:approve:${id}`, {
           user: { id: OTHER, username: "Other" },
-          message_id: f.st.credentials.get(id)?.messageId ?? "",
+          message: { id: f.st.credentials.get(id)?.messageId ?? "" },
         }),
       );
       expect(f.st.credentials.get(id)?.state).toBe("pending");
@@ -1089,6 +1119,197 @@ describe("audit completeness", () => {
       expect(res.ok).toBe(false);
       expect(String(res.error)).toMatch(/budget/i);
       expect(String(res.error)).toMatch(/next slot/i);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+describe("tap rejection feedback (RCA 2026-10-08)", () => {
+  // Live repro: every tap hit the audit-silent message-mismatch path
+  // (handler compared d.message_id — absent from Discord's payload — so
+  // "undefined" !== cred.messageId always), and the ephemeral followup
+  // reply 400'd on the wrong webhook URL. Both fixed: real field +
+  // audit on every tap outcome + visible in-channel reply.
+
+  test("string match (real payload shape): approve + audit", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      await f.h.handleVaultComponent(
+        mkD(`i-str-${id}`, `vault:approve:${id}`, {
+          message: { id: cred!.messageId },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      const app = f.auditEvents().find((e) => e.event === "approve");
+      expect(app).toBeTruthy();
+      expect(app!.user).toBe(OWNER);
+      expect(app!.id).toBe(id);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("wrong message: rejected + audited mismatch + visible reply", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      await f.h.handleVaultComponent(
+        mkD("i-wm", `vault:approve:${id}`, {
+          message: { id: "other-message" },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const ev = f.auditEvents().find((e) => e.event === "tap-rejected");
+      expect(ev).toBeTruthy();
+      expect(ev!.reason).toBe("mismatch");
+      expect(ev!.expected_message).toBe(cred!.messageId);
+      expect(ev!.got_message).toBe("other-message");
+      // Visible, non-ephemeral, in-channel: PATCH @original, no flags.
+      const r = f.fd.replies("i-wm");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toMatch(/tap rejected/);
+      expect(r[0].body.flags).toBeUndefined();
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("stale custom id: audited not-found + visible reply", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      await f.h.handleVaultComponent(
+        mkD("i-nf", "vault:approve:vault_00000000-0000-0000-0000-000000000000"),
+      );
+      const ev = f.auditEvents().find((e) => e.event === "tap-rejected");
+      expect(ev).toBeTruthy();
+      expect(ev!.reason).toBe("not-found");
+      const r = f.fd.replies("i-nf");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toMatch(/not found/);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("already handled: audited + visible reply (deny then approve)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      await tap(f, id, "deny");
+      expect(f.st.credentials.get(id)?.state).toBe("denied");
+      await f.h.handleVaultComponent(
+        mkD(`i-ag-${id}`, `vault:approve:${id}`, {
+          message: { id: f.st.credentials.get(id)?.messageId ?? "" },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("denied");
+      const ev = f
+        .auditEvents()
+        .find(
+          (e) => e.event === "tap-rejected" && e.reason === "already-handled",
+        );
+      expect(ev).toBeTruthy();
+      const r = f.fd.replies(`i-ag-${id}`);
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toMatch(/already handled/);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("gateway redelivery: audited duplicate, no second reply", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const d = mkD(`i-dup-${id}`, `vault:approve:${id}`, {
+        message: { id: "other-message" },
+      });
+      await f.h.handleVaultComponent(d);
+      await f.h.handleVaultComponent(d);
+      // exactly one visible reply for two deliveries
+      expect(f.fd.replies(`i-dup-${id}`).length).toBe(1);
+      const ev = f
+        .auditEvents()
+        .find((e) => e.event === "tap-rejected" && e.reason === "duplicate");
+      expect(ev).toBeTruthy();
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("bare 19-digit message id > 2^53 survives gateway parse (pipeline)", async () => {
+    // Discord serializes snowflakes as strings today; this is the
+    // string-safety net: a bare integer in the raw payload must NOT be
+    // rounded before the tap match. 1557766848009994272 > 2^53.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      f.st.credentials.get(id)!.messageId = "1557766848009994272";
+      const raw = JSON.stringify({
+        op: 0,
+        t: "INTERACTION_CREATE",
+        s: 7,
+        d: {
+          type: 3,
+          id: "i-big",
+          token: "intok-i-big",
+          application_id: "app1",
+          channel_id: "999",
+          message: { id: null }, // replaced below with a BARE integer
+          data: { custom_id: `vault:approve:${id}` },
+          user: { id: OWNER, username: "Owner" },
+        },
+      }).replace(
+        '"message":{"id":null}',
+        '"message":{"id":1557766848009994272}',
+      );
+      const d = parseGatewayPayload(raw).d;
+      expect(d.message.id).toBe("1557766848009994272"); // string, exact
+      await f.h.handleVaultComponent(d);
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      expect(
+        f.auditEvents().some((e) => e.event === "approve" && e.user === OWNER),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("pre-rounded number id: rejected + audited (documents the limit)", async () => {
+    // If a >2^53 id was already parsed to a double ELSEWHERE (not via
+    // parseGatewayPayload), the precision is gone: 1557766848009994272
+    // -> 1557766848009994200. The tap is rejected loudly, with audit
+    // and a visible reply — never silently.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      f.st.credentials.get(id)!.messageId = "1557766848009994272";
+      await f.h.handleVaultComponent(
+        mkD("i-big2", `vault:approve:${id}`, {
+          // biome-ignore lint/correctness/noPrecisionLoss: deliberate — the rounded double (…200) IS the test case
+          message: { id: 1557766848009994272 },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const ev = f
+        .auditEvents()
+        .find((e) => e.event === "tap-rejected" && e.reason === "mismatch");
+      expect(ev).toBeTruthy();
+      expect(ev!.got_message).toBe("1557766848009994200"); // rounded
+      const r = f.fd.replies("i-big2");
+      expect(r.length).toBe(1);
     } finally {
       f.cleanup();
     }

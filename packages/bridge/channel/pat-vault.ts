@@ -19,8 +19,8 @@
  *      bridge-owned (anything in it at boot is stale).
  *   8. Deliverable feedback: the defer consumes the one-shot interaction
  *      callback, so every post-defer reply goes through
- *      sendInteractionFollowup (interaction webhook) and every path
- *      clears the "Thinking" ack with deleteDeferredAck.
+ *      replyInteraction (PATCH @original — visible in channel) and the
+ *      success path clears the "Thinking" ack with deleteDeferredAck.
  *   9. handlePatComponent NEVER REJECTS (top-level try/catch; M1) — an
  *      escaped rejection would be an unhandled promise rejection and kill
  *      the whole bridge under Node 22's unhandled-rejections=throw.
@@ -39,8 +39,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  replyInteraction,
   sendDiscordMessage,
-  sendInteractionFollowup,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
 import type { ChannelConfig } from "./types";
@@ -1204,56 +1204,99 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       await deferInteraction(st.botToken, d);
 
       // 3. Dedupe (gateway redelivery; tokens are single-use anyway).
-      if (!markSeen(st, String(d.id))) return;
+      //    No second reply (the first tap already showed feedback), but
+      //    audit it: a tap with no audit line is how the 2026-10-08
+      //    mismatch bug stayed invisible.
+      const uid = String(d.user?.id ?? "");
+      if (!markSeen(st, String(d.id))) {
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "duplicate",
+            user: uid,
+            verb,
+          },
+        );
+        return;
+      }
 
       // 4. Lookup. Miss → stale id / settled elsewhere.
       const req = st.requests.get(parsedId);
       if (!req) {
-        await sendInteractionFollowup(
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "not-found",
+            user: uid,
+            verb,
+          },
+        );
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: request not found or already handled",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
       // 5. Message + channel match (stale-copy / forwarded button).
+      //    The live payload has NO d.message_id — per the Discord spec
+      //    the component's message is the `message` field on the
+      //    INTERACTION object itself (older payloads nested it in data).
+      //    Reading d.message_id compared "undefined" against the req id,
+      //    so every tap was rejected (RCA 2026-10-08). d.message_id is
+      //    kept only as a defensive last resort.
+      const srcMsgId = d?.message?.id ?? d?.data?.message?.id ?? d?.message_id;
       if (
-        String(d.message_id) !== req.messageId ||
-        String(d.channel_id) !== req.channelId
+        srcMsgId == null ||
+        String(srcMsgId) !== String(req.messageId) ||
+        String(d.channel_id) !== String(req.channelId)
       ) {
-        await sendInteractionFollowup(
+        audit(st, "tap-rejected", base(req), {
+          reason: "mismatch",
+          user: uid,
+          verb,
+          expected_message: req.messageId,
+          expected_channel: req.channelId,
+          got_message: srcMsgId == null ? null : String(srcMsgId),
+          got_channel: d.channel_id == null ? null : String(d.channel_id),
+        });
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: button not on the request message",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
       // 6. Owner gate (ownerUserIds preferred / ownerUserId legacy).
-      const uid = String(d.user?.id ?? "");
       if (!isOwnerUser(st.ch, uid)) {
         audit(st, "non-owner-tap", base(req), { user: uid });
-        await sendInteractionFollowup(
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] only the owner can approve PAT requests",
-          { ephemeral: true },
+          "[!] tap rejected: only the owner can approve PAT requests",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
       // 7. State gate.
       if (req.state !== "pending") {
-        await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-          ephemeral: true,
+        audit(st, "tap-rejected", base(req), {
+          reason: "already-handled",
+          user: uid,
+          verb,
+          state: req.state,
         });
-        await deleteDeferredAck(st.botToken, d);
+        await replyInteraction(
+          st.botToken,
+          d,
+          "[!] tap rejected: already handled",
+        );
         return;
       }
 
@@ -1270,12 +1313,11 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         const chk = checkScopeToken(st, req.scope);
         if (!chk.ok) {
           audit(st, "vault-error", base(req), { user: uid, err: chk.error });
-          await sendInteractionFollowup(
+          await replyInteraction(
             st.botToken,
             d,
             tapTokenFileText(st, req, chk),
           );
-          await deleteDeferredAck(st.botToken, d);
           return;
         }
         if (st.transport === "file") {
@@ -1326,10 +1368,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       // M1: never reject. Log + audit + best-effort deliverable feedback.
       console.error("[interactions] vault handler failed:", e);
       audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await sendInteractionFollowup(st.botToken, d, "[!] vault error", {
-        ephemeral: true,
-      });
-      await deleteDeferredAck(st.botToken, d);
+      await replyInteraction(st.botToken, d, "[!] vault error");
     }
   };
 }

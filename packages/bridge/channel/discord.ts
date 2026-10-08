@@ -1189,6 +1189,59 @@ export function isOlderSnowflake(a: string, b: string | null): boolean {
   return false;
 }
 
+/** Parse a raw gateway payload, preserving snowflake precision.
+ *  Discord serializes snowflake ids as JSON strings today, but any bare
+ *  integer >= 16 digits would be rounded by JSON.parse beyond 2^53 —
+ *  and the vault/pat tap match compares message ids as strings, so one
+ *  lost digit rejects the tap. Bare (unquoted) long integers are quoted
+ *  before parsing; string contents are untouched (the scanner tracks
+ *  string state). Fast path: no 16+ digit run -> plain JSON.parse. */
+export function parseGatewayPayload(raw: string): any {
+  if (!/\d{16,}/.test(raw)) return JSON.parse(raw);
+  return JSON.parse(quoteLongIntegers(raw));
+}
+
+/** Quote bare (outside string literals) integer runs of 16+ digits.
+ *  Exposed for tests. Floats (dot / exponent after the run) are left
+ *  alone; a leading minus is folded into the quoted string. */
+export function quoteLongIntegers(raw: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c >= "0" && c <= "9") {
+      let j = i;
+      while (j < raw.length && raw[j] >= "0" && raw[j] <= "9") j++;
+      const run = raw.slice(i, j);
+      const after = raw[j];
+      if (run.length >= 16 && after !== "." && after !== "e" && after !== "E") {
+        // A leading minus belongs to the number: fold it into the
+        // quoted string, else `-"123…"` is not valid JSON and the
+        // whole event is dropped by onmessage's catch.
+        if (out.endsWith("-")) out = `${out.slice(0, -1)}"-${run}"`;
+        else out += `"${run}"`;
+      } else out += run;
+      i = j - 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 /** All channel states registered for a bot token. */
 function statesForToken(token: string): DiscordState[] {
   const out: DiscordState[] = [];
@@ -1246,7 +1299,8 @@ function connectPresence(st: PresenceState): void {
   ws.onmessage = (ev: any) => {
     let msg: any;
     try {
-      msg = JSON.parse(String(ev.data));
+      // String-safe for 16+ digit snowflakes (see parseGatewayPayload).
+      msg = parseGatewayPayload(String(ev.data));
     } catch {
       return;
     }
@@ -1609,11 +1663,16 @@ export async function editInteractionMessage(
   }
 }
 
-/** Post-defer reply on an interaction. The callback is already spent
- *  (defer consumed it — Discord allows exactly ONE callback response per
- *  interaction), so this goes to the interaction webhook — the same
- *  endpoint family editInteractionMessage uses for @original. Errors are
- *  swallowed (a failed followup must not kill the tap flow). */
+/** Create a followup message on an interaction. The callback is already
+ *  spent (defer consumed it — Discord allows exactly ONE callback
+ *  response per interaction), so this goes to the interaction webhook.
+ *  NOTE: the endpoint is the webhook ROOT — POST /webhooks/{app.id}/
+ *  {token} (wait is always true for interaction webhooks). The
+ *  /webhooks/{app}/{token}/messages form is the INCOMING-webhook
+ *  "Execute Webhook" route; interaction tokens reject it with 400 50035
+ *  (errors.webhook_service: ENUM_TYPE_COERCE on "messages") — RCA
+ *  2026-10-08, vault tap feedback invisible. Errors are swallowed (a
+ *  failed followup must not kill the tap flow). */
 export async function sendInteractionFollowup(
   botToken: string,
   d: any,
@@ -1621,22 +1680,62 @@ export async function sendInteractionFollowup(
   opts?: { ephemeral?: boolean },
 ): Promise<void> {
   try {
-    await discordFetch(
-      botToken,
-      `/webhooks/${d.application_id}/${d.token}/messages?wait=true`,
-      {
-        method: "POST",
-        body: {
-          content: egressText(text), // secret censor
-          ...(opts?.ephemeral ? { flags: 64 } : {}),
-        },
+    await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
+      method: "POST",
+      body: {
+        content: egressText(text), // secret censor
+        ...(opts?.ephemeral ? { flags: 64 } : {}),
       },
-    );
+    });
   } catch (e) {
     console.error(
       "[interactions] followup failed:",
       sanitizeSensitiveText(String(e)),
     );
+  }
+}
+
+/** Post-defer tap RESULT: edit the deferred original in place (PATCH
+ *  @original) — the documented replacement for the deprecated
+ *  "followup POST right after a defer edits the original" behavior.
+ *  The deferred message is non-ephemeral, so the result is visible to
+ *  the whole channel — deliberate: a silent vault/pat tap is a control
+ *  failure (RCA 2026-10-08: every rejection reply was an ephemeral
+ *  followup on the wrong URL and the operator saw nothing). Fallback:
+ *  a new followup message if @original is already gone. Errors are
+ *  swallowed (must not kill the tap flow). */
+export async function replyInteraction(
+  botToken: string,
+  d: any,
+  text: string,
+  opts?: { ephemeral?: boolean },
+): Promise<void> {
+  const body = {
+    content: egressText(text), // secret censor
+    ...(opts?.ephemeral ? { flags: 64 } : {}),
+  };
+  try {
+    await discordFetch(
+      botToken,
+      `/webhooks/${d.application_id}/${d.token}/messages/@original`,
+      { method: "PATCH", body },
+    );
+  } catch (e1) {
+    console.error(
+      "[interactions] reply failed:",
+      sanitizeSensitiveText(String(e1)),
+    );
+    try {
+      await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
+        method: "POST",
+        body,
+      });
+    } catch (e2) {
+      console.error(
+        "[interactions] followup failed:",
+        sanitizeSensitiveText(String(e2)),
+      );
+    }
   }
 }
 

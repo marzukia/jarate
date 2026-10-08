@@ -90,6 +90,17 @@ class FakeDiscord {
       ) {
         return resp(200, { id: "followup" });
       }
+      // Interaction webhook (RCA 2026-10-08): POST /webhooks/{app}/{token}
+      // is Create Followup (webhook ROOT — wait is implicit); the
+      // /messages/@original subroute edits/deletes the deferred ack.
+      const wh = url.match(/\/webhooks\/[^/]+\/[^/]+(\/.*)?$/);
+      if (wh) {
+        const rest = wh[1] ?? "";
+        if (method === "POST" && rest === "")
+          return resp(200, { id: "followup" });
+        if (rest.startsWith("/messages/")) return resp(204, null);
+        return resp(404, { message: "Unknown Webhook Message" });
+      }
       if (method === "PATCH" && url.includes("/messages/"))
         return resp(204, null);
       if (method === "DELETE") return resp(204, null);
@@ -101,10 +112,20 @@ class FakeDiscord {
   followups(): Array<{ url: string; body: any }> {
     return this.calls
       .filter(
+        (c) => c.method === "POST" && /\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
+      )
+      .map((c) => ({ url: c.url, body: c.body }));
+  }
+
+  /** Visible tap replies: PATCH @original on the interaction webhook. */
+  replies(id?: string): Array<{ url: string; body: any }> {
+    return this.calls
+      .filter(
         (c) =>
-          c.method === "POST" &&
+          c.method === "PATCH" &&
           c.url.includes("/webhooks/") &&
-          c.url.includes("messages?wait=true"),
+          c.url.endsWith("/messages/@original") &&
+          (id ? c.url.includes(`intok-${id}`) : true),
       )
       .map((c) => ({ url: c.url, body: c.body }));
   }
@@ -131,8 +152,13 @@ class FakeDiscord {
   }
 
   messageEdits(): any[] {
+    // Channel message edits only (the tap reply PATCHes the interaction
+    // webhook's @original — a different /messages/ route, excluded here).
     return this.calls.filter(
-      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+      (c) =>
+        c.method === "PATCH" &&
+        c.url.includes("/channels/") &&
+        c.url.includes("/messages/"),
     );
   }
 }
@@ -251,7 +277,7 @@ function mkD(
     token: `intok-${id}`,
     application_id: "app1",
     channel_id: "999",
-    message_id: "",
+    message: { id: "" },
     data: { custom_id: customId },
     user: { id: OWNER, username: "Owner" },
     ...over,
@@ -398,7 +424,9 @@ describe("one-callback discipline", () => {
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-app", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-app", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       // Exactly one callback POST for this interaction (the defer).
       const cb = f.fd.callbacksFor("i-app");
@@ -437,48 +465,54 @@ describe("one-callback discipline", () => {
     }
   });
 
-  test("not-found: ephemeral followup on webhook URL, ack cleared, no state", async () => {
+  test("not-found: visible reply on @original, no state (RCA 2026-10-08)", async () => {
     const f = mkVault();
     try {
       await f.h.handlePatComponent(
         mkD("i-nf", "pat:approve:pat_00000000-0000-0000-0000-000000000000", {
-          message_id: "x",
+          message: { id: "x" },
         }),
       );
       expect(f.fd.callbacksFor("i-nf")).toBe(1);
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].url).toBe(
-        "https://discord.com/api/v10/webhooks/app1/intok-i-nf/messages?wait=true",
+      const r = f.fd.replies("i-nf");
+      expect(r.length).toBe(1);
+      expect(r[0].url).toBe(
+        "https://discord.com/api/v10/webhooks/app1/intok-i-nf/messages/@original",
       );
-      expect(fu[0].body.content).toBe(
-        "[!] request not found or already handled",
+      expect(r[0].body.content).toBe(
+        "[!] tap rejected: request not found or already handled",
       );
-      expect(fu[0].body.flags).toBe(64);
-      expect(f.fd.ackDeletes()).toBe(1);
+      // Visible in-channel: no ephemeral flag, no fallback POST, no ack
+      // delete (the deferred ack IS the message that got edited).
+      expect(r[0].body.flags).toBeUndefined();
+      expect(f.fd.followups().length).toBe(0);
+      expect(f.fd.ackDeletes()).toBe(0);
       expect(f.fd.messageEdits().length).toBe(0);
+      expect(f.auditLines().some((l) => l.includes("event=tap-rejected"))).toBe(
+        true,
+      );
     } finally {
       f.cleanup();
     }
   });
 
-  test("non-owner tap: ephemeral refusal, state untouched, audit", async () => {
+  test("non-owner tap: visible in-channel refusal, state untouched, audit", async () => {
     const f = mkVault();
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
         mkD("i-no", `pat:approve:${req.id}`, {
-          message_id: req.messageId,
+          message: { id: req.messageId },
           user: { id: OTHER, username: "Other" },
         }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.content).toBe(
-        "[!] only the owner can approve PAT requests",
+      const r = f.fd.replies("i-no");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toBe(
+        "[!] tap rejected: only the owner can approve PAT requests",
       );
-      expect(fu[0].body.flags).toBe(64);
-      expect(f.fd.ackDeletes()).toBe(1);
+      expect(r[0].body.flags).toBeUndefined();
+      expect(f.fd.ackDeletes()).toBe(0);
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
       expect(
         f.auditLines().some((l) => l.includes("event=non-owner-tap")),
@@ -488,19 +522,29 @@ describe("one-callback discipline", () => {
     }
   });
 
-  test("stale copy: message_id mismatch -> no transition", async () => {
+  test("stale copy: message.id mismatch -> no transition (RCA 2026-10-08)", async () => {
     const f = mkVault();
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-sc", `pat:approve:${req.id}`, { message_id: "other-message" }),
+        mkD("i-sc", `pat:approve:${req.id}`, {
+          message: { id: "other-message" },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.content).toBe(
-        "[!] request not found or already handled",
+      const r = f.fd.replies("i-sc");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toBe(
+        "[!] tap rejected: button not on the request message",
       );
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(
+        f
+          .auditLines()
+          .some(
+            (l) =>
+              l.includes("event=tap-rejected") && l.includes("reason=mismatch"),
+          ),
+      ).toBe(true);
     } finally {
       f.cleanup();
     }
@@ -512,13 +556,15 @@ describe("one-callback discipline", () => {
       const req = await makePending(f);
       await f.h.handlePatComponent(
         mkD("i-cm", `pat:approve:${req.id}`, {
-          message_id: req.messageId,
+          message: { id: req.messageId },
           channel_id: "888",
         }),
       );
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
-      expect(f.fd.followups()[0].body.content).toBe(
-        "[!] request not found or already handled",
+      const r = f.fd.replies("i-cm");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toBe(
+        "[!] tap rejected: button not on the request message",
       );
     } finally {
       f.cleanup();
@@ -530,7 +576,7 @@ describe("one-callback discipline", () => {
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-dn", `pat:deny:${req.id}`, { message_id: req.messageId }),
+        mkD("i-dn", `pat:deny:${req.id}`, { message: { id: req.messageId } }),
       );
       const edits = f.fd.messageEdits();
       expect(edits.length).toBe(1);
@@ -554,15 +600,17 @@ describe("one-callback discipline", () => {
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-d1", `pat:deny:${req.id}`, { message_id: req.messageId }),
+        mkD("i-d1", `pat:deny:${req.id}`, { message: { id: req.messageId } }),
       );
       const editsAfterDeny = f.fd.messageEdits().length;
       await f.h.handlePatComponent(
-        mkD("i-d2", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-d2", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.content).toBe("[!] already handled");
+      const r = f.fd.replies("i-d2");
+      expect(r.length).toBe(1);
+      expect(r[0].body.content).toBe("[!] tap rejected: already handled");
       expect(f.fd.messageEdits().length).toBe(editsAfterDeny);
       expect(f.st.requests.get(req.id)!.state).toBe("denied");
     } finally {
@@ -575,7 +623,7 @@ describe("one-callback discipline", () => {
     try {
       const req = await makePending(f);
       const d = mkD("i-dd", `pat:deny:${req.id}`, {
-        message_id: req.messageId,
+        message: { id: req.messageId },
       });
       await f.h.handlePatComponent(d);
       const denies1 = f
@@ -599,13 +647,17 @@ describe("one-callback discipline", () => {
       const req = await makePending(f);
       const callsBefore = f.fd.calls.length;
       await f.h.handlePatComponent(
-        mkD("i-nm", `other:button:${req.id}`, { message_id: req.messageId }),
+        mkD("i-nm", `other:button:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       expect(f.fd.calls.length).toBe(callsBefore);
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
       // Also: a matching id but non-vault prefix.
       await f.h.handlePatComponent(
-        mkD("i-nm2", `pat:approve:wrong_format`, { message_id: req.messageId }),
+        mkD("i-nm2", `pat:approve:wrong_format`, {
+          message: { id: req.messageId },
+        }),
       );
       expect(f.fd.calls.length).toBe(callsBefore);
     } finally {
@@ -657,7 +709,7 @@ describe("state machine", () => {
 
       // Approve.
       await f.h.handlePatComponent(
-        mkD("i-h", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-h", `pat:approve:${req.id}`, { message: { id: req.messageId } }),
       );
       expect(f.st.requests.get(req.id)!.state).toBe("approved");
 
@@ -749,7 +801,9 @@ describe("state machine", () => {
       await f.h.ready;
       const req = await makePending(f, "default");
       await f.h.handlePatComponent(
-        mkD("i-cl", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-cl", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const c = new VaultClient(f.xdg);
       await c.connect();
@@ -798,7 +852,9 @@ describe("state machine", () => {
     try {
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-cc", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-cc", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const pub = path.join(fileDirOf(f), `pat-${req.id}`);
       expect(fs.existsSync(pub)).toBe(true);
@@ -883,7 +939,9 @@ describe("state machine", () => {
       );
       // A pending request can still be approved (the deliberate tap wins).
       await f.h.handlePatComponent(
-        mkD("i-bt", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-bt", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       expect(f.st.requests.get(req.id)!.state).toBe("approved");
     } finally {
@@ -1002,14 +1060,14 @@ describe("state machine", () => {
       const req = f.st.requests.get(r.id as string)!;
       await f.h.handlePatComponent(
         mkD("i-wn", `pat:approve:${req.id}`, {
-          message_id: req.messageId,
+          message: { id: req.messageId },
           channel_id: "777",
         }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.content).toBe(
-        "[!] only the owner can approve PAT requests",
+      const repl = f.fd.replies("i-wn");
+      expect(repl.length).toBe(1);
+      expect(repl[0].body.content).toBe(
+        "[!] tap rejected: only the owner can approve PAT requests",
       );
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
     } finally {
@@ -1039,15 +1097,17 @@ describe("robustness", () => {
         const req = await makePending(f);
         // Must RESOLVE, not reject.
         await f.h.handlePatComponent(
-          mkD("i-m1", `pat:approve:${req.id}`, { message_id: req.messageId }),
+          mkD("i-m1", `pat:approve:${req.id}`, {
+            message: { id: req.messageId },
+          }),
         );
         // Named case: the throw happened AFTER the read (token file present),
         // so the generic catch path ran: [!] vault error, state stays pending.
-        const fu = f.fd.followups();
-        expect(fu.length).toBe(1);
-        expect(fu[0].body.content).toBe("[!] vault error");
-        expect(fu[0].body.flags).toBe(64);
-        expect(f.fd.ackDeletes()).toBe(1);
+        const r = f.fd.replies("i-m1");
+        expect(r.length).toBe(1);
+        expect(r[0].body.content).toBe("[!] vault error");
+        expect(r[0].body.flags).toBeUndefined();
+        expect(f.fd.ackDeletes()).toBe(0);
         expect(f.st.requests.get(req.id)!.state).toBe("pending");
         expect(
           f.auditLines().some((l) => l.includes("event=vault-error")),
@@ -1074,13 +1134,15 @@ describe("robustness", () => {
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.unlinkSync(p);
       await f.h.handlePatComponent(
-        mkD("i-mf", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-mf", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      // Non-ephemeral: the channel sees it (no flags field).
-      expect(fu[0].body.flags).toBeUndefined();
-      const c = fu[0].body.content;
+      const r = f.fd.replies("i-mf");
+      expect(r.length).toBe(1);
+      // Visible in-channel: no flags field (was: non-ephemeral followup).
+      expect(r[0].body.flags).toBeUndefined();
+      const c = r[0].body.content;
       expect(c.split("\n")[0]).toBe(
         "[!] approve blocked: token file missing for marzukia/jarate:write",
       );
@@ -1104,14 +1166,16 @@ describe("robustness", () => {
               l.includes(`err=token file missing: ${p}`),
           ),
       ).toBe(true);
-      expect(f.fd.ackDeletes()).toBe(1);
+      expect(f.fd.ackDeletes()).toBe(0);
       expect(f.fd.messageEdits().length).toBe(0);
       // Restore the file, re-tap within the TTL -> normal approve.
       fs.writeFileSync(p, `${FINE_TOKEN}\n`, {
         mode: 0o600,
       });
       await f.h.handlePatComponent(
-        mkD("i-mf2", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-mf2", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       expect(f.st.requests.get(req.id)!.state).toBe("approved");
       expect(fs.existsSync(path.join(fileDirOf(f), `pat-${req.id}`))).toBe(
@@ -1129,12 +1193,14 @@ describe("robustness", () => {
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.unlinkSync(p);
       await f.h.handlePatComponent(
-        mkD("i-ms", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-ms", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.flags).toBeUndefined();
-      const c = fu[0].body.content;
+      const r = f.fd.replies("i-ms");
+      expect(r.length).toBe(1);
+      expect(r[0].body.flags).toBeUndefined();
+      const c = r[0].body.content;
       expect(c.split("\n")[0]).toBe(
         "[!] approve blocked: token file missing for marzukia/jarate:write",
       );
@@ -1148,7 +1214,7 @@ describe("robustness", () => {
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
       expect(f.st.requests.get(req.id)!.approvedAt).toBeUndefined();
       expect(f.fd.messageEdits().length).toBe(0);
-      expect(f.fd.ackDeletes()).toBe(1);
+      expect(f.fd.ackDeletes()).toBe(0);
       expect(
         f
           .auditLines()
@@ -1170,12 +1236,14 @@ describe("robustness", () => {
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.writeFileSync(p, ""); // zero bytes
       await f.h.handlePatComponent(
-        mkD("i-me", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-me", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.flags).toBeUndefined();
-      const c = fu[0].body.content;
+      const r = f.fd.replies("i-me");
+      expect(r.length).toBe(1);
+      expect(r[0].body.flags).toBeUndefined();
+      const c = r[0].body.content;
       expect(c.split("\n")[0]).toBe(
         "[!] approve blocked: token file empty for marzukia/jarate:write",
       );
@@ -1183,15 +1251,17 @@ describe("robustness", () => {
       expect(c).toContain("write the token (one line, 0600), then re-tap");
       expect(c).toContain("jarate pat-request marzukia/jarate:write <reason>");
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
-      expect(f.fd.ackDeletes()).toBe(1);
+      expect(f.fd.ackDeletes()).toBe(0);
       // Whitespace-only is empty too.
       fs.writeFileSync(p, "  \n");
       await f.h.handlePatComponent(
-        mkD("i-me2", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-me2", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu2 = f.fd.followups();
-      expect(fu2.length).toBe(2);
-      expect(fu2[1].body.content.split("\n")[0]).toBe(
+      const r2 = f.fd.replies("i-me2");
+      expect(r2.length).toBe(1);
+      expect(r2[0].body.content.split("\n")[0]).toBe(
         "[!] approve blocked: token file empty for marzukia/jarate:write",
       );
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
@@ -1207,12 +1277,14 @@ describe("robustness", () => {
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.writeFileSync(p, "not-a-token\n");
       await f.h.handlePatComponent(
-        mkD("i-mb", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-mb", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
-      const fu = f.fd.followups();
-      expect(fu.length).toBe(1);
-      expect(fu[0].body.flags).toBeUndefined();
-      const c = fu[0].body.content;
+      const r = f.fd.replies("i-mb");
+      expect(r.length).toBe(1);
+      expect(r[0].body.flags).toBeUndefined();
+      const c = r[0].body.content;
       expect(c.split("\n")[0]).toBe(
         "[!] approve blocked: token shape invalid for marzukia/jarate:write",
       );
@@ -1222,7 +1294,7 @@ describe("robustness", () => {
       expect(f.st.requests.get(req.id)!.state).toBe("pending");
       // Nothing censored, nothing published.
       expect(getRuntimeSecrets()).not.toContain("not-a-token");
-      expect(f.fd.ackDeletes()).toBe(1);
+      expect(f.fd.ackDeletes()).toBe(0);
     } finally {
       f.cleanup();
     }
@@ -1474,7 +1546,9 @@ describe("socket protocol", () => {
       // atomic write: handoff reply first, then the usage error).
       const req = await makePending(f);
       await f.h.handlePatComponent(
-        mkD("i-ed", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-ed", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const c3 = new VaultClient(f.xdg);
       await c3.connect();
@@ -1523,7 +1597,9 @@ describe("socket protocol", () => {
 
       // Approve, hand off, then KILL the wrapper (close before done).
       await f.h.handlePatComponent(
-        mkD("i-ab", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-ab", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const c2 = new VaultClient(f.xdg);
       await c2.connect();
@@ -1582,7 +1658,9 @@ describe("file mode", () => {
       await f.h.ready;
       const req = await makePending(f, "marzukia/jarate:write");
       await f.h.handlePatComponent(
-        mkD("i-fm", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-fm", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const fileDir = fileDirOf(f);
       expect(fs.statSync(fileDir).mode & 0o777).toBe(0o700);
@@ -1973,7 +2051,9 @@ describe("patRunBegin / patStatus unit", () => {
     try {
       const req = await makePending(f, "marzukia/jarate:write");
       await f.h.handlePatComponent(
-        mkD("i-hf", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-hf", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.unlinkSync(p);
@@ -2010,7 +2090,9 @@ describe("patRunBegin / patStatus unit", () => {
     try {
       const req = await makePending(f, "marzukia/jarate:write");
       await f.h.handlePatComponent(
-        mkD("i-hs", `pat:approve:${req.id}`, { message_id: req.messageId }),
+        mkD("i-hs", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
       );
       const p = path.join(f.patsDir, "marzukia", "jarate:write");
       fs.writeFileSync(p, "not-a-token\n"); // corrupted after approve

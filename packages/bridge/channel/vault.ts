@@ -39,8 +39,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  replyInteraction,
   sendDiscordMessage,
-  sendInteractionFollowup,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
 import type { ChannelConfig } from "./types";
@@ -1647,58 +1647,103 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
 
       await deferInteraction(st.botToken, d);
 
-      if (!markSeen(st, String(d.id))) return;
+      const uid = String(d.user?.id ?? "");
+
+      // Dedupe (gateway redelivery) — no second reply (the first tap
+      // already showed feedback), but audit it: a tap with no audit line
+      // is how the 2026-10-08 mismatch bug stayed invisible.
+      if (!markSeen(st, String(d.id))) {
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "duplicate",
+            user: uid,
+            verb,
+          },
+        );
+        return;
+      }
 
       const cred = st.credentials.get(parsedId);
       if (!cred) {
-        await sendInteractionFollowup(
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "not-found",
+            user: uid,
+            verb,
+          },
+        );
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: request not found or already handled",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
+      // Message + channel match (stale copy / forwarded button).
+      // The live payload has NO d.message_id — per the Discord spec the
+      // component's message is the `message` field on the INTERACTION
+      // object itself (older payloads nested it in data). Reading
+      // d.message_id compared "undefined" against the cred id, so every
+      // tap was rejected (RCA 2026-10-08). d.message_id is kept only as
+      // a defensive last resort for synthetic payloads.
+      const srcMsgId = d?.message?.id ?? d?.data?.message?.id ?? d?.message_id;
       if (
-        String(d.message_id) !== cred.messageId ||
-        String(d.channel_id) !== cred.channelId
+        srcMsgId == null ||
+        String(srcMsgId) !== String(cred.messageId) ||
+        String(d.channel_id) !== String(cred.channelId)
       ) {
-        await sendInteractionFollowup(
+        audit(st, "tap-rejected", credFields(cred), {
+          reason: "mismatch",
+          user: uid,
+          verb,
+          expected_message: cred.messageId,
+          expected_channel: cred.channelId,
+          got_message: srcMsgId == null ? null : String(srcMsgId),
+          got_channel: d.channel_id == null ? null : String(d.channel_id),
+        });
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: button not on the request message",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
-      const uid = String(d.user?.id ?? "");
       if (!isOwnerUser(st.ch, uid)) {
         audit(st, "non-owner-tap", credFields(cred), {
           user: uid,
           actor: actorDiscord(uid),
           verb,
         });
-        await sendInteractionFollowup(
+        await replyInteraction(
           st.botToken,
           d,
-          "[!] only the owner can approve vault requests",
-          { ephemeral: true },
+          "[!] tap rejected: only the owner can approve vault requests",
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
       // State gate per verb.
       if (verb === "revoke") {
         if (cred.state !== "active") {
-          await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-            ephemeral: true,
+          audit(st, "tap-rejected", credFields(cred), {
+            reason: "already-handled",
+            user: uid,
+            verb,
+            state: cred.state,
           });
-          await deleteDeferredAck(st.botToken, d);
+          await replyInteraction(
+            st.botToken,
+            d,
+            "[!] tap rejected: already handled",
+          );
           return;
         }
         cred.state = "revoked";
@@ -1722,10 +1767,17 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
       }
 
       if (cred.state !== "pending") {
-        await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-          ephemeral: true,
+        audit(st, "tap-rejected", credFields(cred), {
+          reason: "already-handled",
+          user: uid,
+          verb,
+          state: cred.state,
         });
-        await deleteDeferredAck(st.botToken, d);
+        await replyInteraction(
+          st.botToken,
+          d,
+          "[!] tap rejected: already handled",
+        );
         return;
       }
 
@@ -1742,15 +1794,11 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
               actor: actorDiscord(uid),
               err: "stored value file missing",
             });
-            await sendInteractionFollowup(
+            await replyInteraction(
               st.botToken,
               d,
               "[!] value lost (bridge restarted) — re-request",
-              {
-                ephemeral: true,
-              },
             );
-            await deleteDeferredAck(st.botToken, d);
             return;
           }
         } else {
@@ -1767,15 +1815,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
               actor: actorDiscord(uid),
               err: "value file missing",
             });
-            await sendInteractionFollowup(
-              st.botToken,
-              d,
-              "[!] value file missing",
-              {
-                ephemeral: true,
-              },
-            );
-            await deleteDeferredAck(st.botToken, d);
+            await replyInteraction(st.botToken, d, "[!] value file missing");
             return;
           }
         }
@@ -1826,10 +1866,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
       // Never reject (M1 parity): log + audit + best-effort feedback.
       console.error("[interactions] vault handler failed:", e);
       audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await sendInteractionFollowup(st.botToken, d, "[!] vault error", {
-        ephemeral: true,
-      });
-      await deleteDeferredAck(st.botToken, d);
+      await replyInteraction(st.botToken, d, "[!] vault error");
     }
   };
 }

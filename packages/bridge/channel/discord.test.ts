@@ -24,16 +24,20 @@ import {
   mimeForFile,
   POLL_BACKFILL_MS,
   POLL_INTERVAL_MS,
+  parseGatewayPayload,
   patchChannelState,
   persistChannelCursor,
   pollDiscord,
+  quoteLongIntegers,
   registerDiscordCommands,
+  replyInteraction,
   resolveChannelId,
   respondToInteraction,
   SLASH_COMMANDS,
   seedChannelStateForTest,
   sendDiscordMessage,
   sendFilesToDiscord,
+  sendInteractionFollowup,
   setChannelCursor,
   setDiscordInteractionHandler,
   stopDiscordPresence,
@@ -980,6 +984,91 @@ test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @or
 
   await respondToInteraction("tok-d", interaction, "plain");
   expect(calls[2].body).toEqual({ type: 4, data: { content: "plain" } });
+});
+
+// ─── Interaction followup + gateway snowflake precision (RCA 2026-10-08) ──
+
+test("sendInteractionFollowup POSTs the webhook ROOT (Create Followup), not /messages (RCA 2026-10-08)", async () => {
+  const calls: { url: string; method: string; body: any }[] = [];
+  setFetch(async (u, init) => {
+    calls.push({
+      url: u,
+      method: init?.method ?? "GET",
+      body: JSON.parse(init.body),
+    });
+    return jsonResp(200, { id: "m" });
+  });
+  await sendInteractionFollowup("tok-d", interaction, "done", {
+    ephemeral: true,
+  });
+  expect(calls.length).toBe(1);
+  // The /webhooks/{app}/{token}/messages form is the INCOMING-webhook
+  // "Execute Webhook" route; interaction tokens reject it with 400 50035.
+  expect(calls[0].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123");
+  expect(calls[0].method).toBe("POST");
+  expect(calls[0].body).toEqual({ content: "done", flags: 64 });
+});
+
+test("replyInteraction PATCHes @original, visible by default (RCA 2026-10-08)", async () => {
+  const calls: { url: string; method: string; body: any }[] = [];
+  setFetch(async (u, init) => {
+    calls.push({
+      url: u,
+      method: init?.method ?? "GET",
+      body: JSON.parse(init.body),
+    });
+    return jsonResp(204, null);
+  });
+  await replyInteraction("tok-d", interaction, "[!] tap rejected: mismatch");
+  expect(calls.length).toBe(1);
+  expect(calls[0].url).toBe(
+    "https://discord.com/api/v10/webhooks/app1/tok123/messages/@original",
+  );
+  expect(calls[0].method).toBe("PATCH");
+  expect(calls[0].body).toEqual({ content: "[!] tap rejected: mismatch" });
+  // Visible to the whole channel: no ephemeral flag.
+  expect(calls[0].body.flags).toBeUndefined();
+
+  await replyInteraction("tok-d", interaction, "secret", { ephemeral: true });
+  expect(calls[1].body.flags).toBe(64);
+});
+
+test("replyInteraction falls back to webhook-ROOT followup when @original is gone (RCA 2026-10-08)", async () => {
+  const calls: { url: string; method: string }[] = [];
+  setFetch(async (u, init) => {
+    calls.push({ url: u, method: init?.method ?? "GET" });
+    if (u.endsWith("/messages/@original"))
+      return jsonResp(404, { message: "Unknown Message" });
+    return jsonResp(200, { id: "m" });
+  });
+  await replyInteraction("tok-d", interaction, "still visible");
+  expect(calls.length).toBe(2);
+  expect(calls[0].method).toBe("PATCH");
+  expect(calls[1].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123");
+  expect(calls[1].method).toBe("POST");
+});
+
+test("parseGatewayPayload: bare 16+ digit ints -> exact strings; everything else untouched (RCA 2026-10-08)", () => {
+  const raw =
+    '{"op":0,"s":1,"d":{"id":1557766848009994272,"channel_id":1557766848009994272},"n":42,"f":1.5e18,"neg":-1557766848009994272,"str":"1557766848009994272 and 1557766848009994273","arr":[1234567890123456789]}';
+  const p = parseGatewayPayload(raw);
+  expect(p.d.id).toBe("1557766848009994272");
+  expect(p.d.channel_id).toBe("1557766848009994272");
+  expect(p.n).toBe(42); // short ints untouched
+  expect(p.f).toBe(1.5e18); // floats untouched
+  expect(p.neg).toBe("-1557766848009994272"); // sign folded into the string
+  expect(p.str).toBe("1557766848009994272 and 1557766848009994273"); // string contents untouched
+  expect(p.arr[0]).toBe("1234567890123456789");
+  // plain JSON.parse rounds the same text — that is the bug this prevents
+  expect(JSON.parse(raw).d.id).not.toBe("1557766848009994272");
+});
+
+test("parseGatewayPayload fast path: no 16+ digit run -> plain JSON.parse (RCA 2026-10-08)", () => {
+  const raw = '{"op":0,"s":1,"d":{"id":"1557766848009994272","n":42}}';
+  const p = parseGatewayPayload(raw);
+  expect(p.d.id).toBe("1557766848009994272"); // already a string
+  expect(p.d.n).toBe(42);
+  expect(quoteLongIntegers('{"a":123}')).toBe('{"a":123}');
 });
 
 test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only)", () => {
