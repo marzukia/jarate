@@ -11,8 +11,10 @@
  *   2. One-shot single-use by construction: state flip to `consumed`
  *      happens BEFORE the value line is flushed.
  *   3. Owner-approval gate: only owner taps approve/deny/revoke;
- *      non-owner taps are ephemeral-replied + audit-logged, state
- *      untouched. Agent self-revoke via the `vrevoke` op (actor must be
+ *      non-owner taps get a VISIBLE reply + an audit line, state
+ *      untouched. The gate runs BEFORE the message-mismatch check
+ *      (#204): a stranger's stale tap audits as non-owner-tap, not
+ *      mismatch. Agent self-revoke via the `vrevoke` op (actor must be
  *      the requesting agent).
  *   4. Every value lifetime is timer-owned by the bridge (TTL 5m, claim
  *      60s, window N hours, censor grace 10s, startup sweep) with lazy
@@ -39,8 +41,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  replyInteraction,
   sendDiscordMessage,
-  sendInteractionFollowup,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
 import type { ChannelConfig } from "./types";
@@ -100,7 +102,7 @@ export interface VaultCredential {
   messageId: string; // the button message, for match checks
   state: VaultCredentialState;
   created: number; // epoch ms
-  ttlDeadline: number; // created + ttlMs
+  ttlDeadline: number; // created + ttlMs; 0 = no TTL (#203, pending blocks)
   claimDeadline?: number; // one-shot: approvedAt + claimMs
   approvedAt?: number;
   expiresAt?: number; // time-boxed: approvedAt + hours
@@ -498,7 +500,9 @@ function startupSweep(st: VaultState): void {
       { err: `filedir: ${String(e)}` },
     );
   }
-  audit(st, "sweep", { actor: "system" }, { n });
+  // #208: a clean boot is not an event — audit only when something
+  // was actually pruned.
+  if (n > 0) audit(st, "sweep", { actor: "system" }, { n });
 }
 
 /** Connect probe: true only if a live peer accepts on the socket path.
@@ -711,6 +715,11 @@ function settleWindow(st: VaultState, id: string): void {
 }
 
 function armTtl(st: VaultState, c: VaultCredential): void {
+  // #203: ttlMs 0 = no TTL. Pending is BLOCKING until tap or revoke;
+  // the timer exists only when an explicit JARATE_VAULT_TTL_MS is set.
+  // Deadline 0 (persisted no-TTL sentinel) is never armed against, even
+  // if an env TTL appears in a later restart.
+  if (st.ttlMs === 0 || c.ttlDeadline <= 0) return;
   track(
     st,
     c.id,
@@ -751,6 +760,8 @@ function ttlText(st: VaultState, _c: VaultCredential): string {
 }
 
 function pendingButtons(id: string): Array<Record<string, unknown>> {
+  // #203: Revoke is the kill switch on a no-TTL pending card (operator
+  // option b: keep Approve/Deny, add Revoke).
   return [
     {
       type: 1,
@@ -762,6 +773,7 @@ function pendingButtons(id: string): Array<Record<string, unknown>> {
           custom_id: `vault:approve:${id}`,
         },
         { type: 2, style: 4, label: "Deny", custom_id: `vault:deny:${id}` },
+        { type: 2, style: 4, label: "Revoke", custom_id: `vault:revoke:${id}` },
       ],
     },
   ];
@@ -804,6 +816,21 @@ function levelText(st: VaultState, c: VaultCredential): string {
   return "permanent (until revoked)";
 }
 
+/** #205: what an approval grants, shown on the PENDING card so the
+ *  operator sees the grant window BEFORE tapping. */
+function grantText(st: VaultState, c: VaultCredential): string {
+  if (c.level === "one-shot")
+    return `one-shot — grant: single use (claim within ${Math.round(
+      st.claimMs / 1000,
+    )}s of approval)`;
+  if (c.level === "time-boxed") {
+    const mins = Math.round(c.hours * 60);
+    const dur = mins < 60 ? `${mins}m` : `${mins / 60}h`;
+    return `time-boxed — grant: ${dur} from approval (reusable)`;
+  }
+  return "permanent — grant: permanent (until revoked)";
+}
+
 /** Embed for the request/status message. `status` selects title + color. */
 function credEmbed(
   st: VaultState,
@@ -813,7 +840,13 @@ function credEmbed(
   const fields: Array<Record<string, unknown>> = [
     { name: "kind", value: String(c.kind), inline: true },
     { name: "name", value: String(c.name), inline: true },
-    { name: "level", value: levelText(st, c), inline: false },
+    {
+      name: "level",
+      // #205: the pending card shows the grant window, not the
+      // post-approval form (no approvedAt/expiresAt yet).
+      value: status === "pending" ? grantText(st, c) : levelText(st, c),
+      inline: false,
+    },
   ];
   if (c.label)
     fields.push({ name: "label", value: String(c.label), inline: false });
@@ -834,8 +867,14 @@ function credEmbed(
     used: `VAULT used`,
   };
   let footer = c.id;
-  if (status === "pending")
-    footer = `expires ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)}) · ${c.id}`;
+  if (status === "pending") {
+    // #203: no TTL (default) → pending until tap or revoke; the expiry
+    // timestamp line stays only when an explicit TTL is configured.
+    footer =
+      st.ttlMs > 0 && c.ttlDeadline > 0
+        ? `expires ${timeOfDay(c.ttlDeadline)}Z (${ttlText(st, c)}) · ${c.id}`
+        : `pending until tap or revoke · ${c.id}`;
+  }
   return {
     title: titles[status] ?? titles.pending,
     color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
@@ -912,7 +951,10 @@ export function validateRequestLine(line: VaultRequestLine):
   | { ok: false; error: string } {
   const kind = line.kind;
   const name = line.name;
-  const level = line.level;
+  // #205: level is optional. Omitted → time-boxed with a 30-minute grant
+  // (default applied here so ANY client gets it, not just the CLI).
+  let level = line.level;
+  if (level === undefined || level === "") level = "time-boxed";
   if (!kind || !KINDS.includes(kind as VaultKind)) {
     return {
       ok: false,
@@ -941,10 +983,35 @@ export function validateRequestLine(line: VaultRequestLine):
   }
   let hours = 0;
   if (level === "time-boxed") {
-    hours = line.hours ?? 0;
-    if (!Number.isInteger(hours) || hours < 1 || hours > 72) {
-      return { ok: false, error: "usage: time-boxed needs --hours 1..72" };
+    // #205: minute granularity. hours is stored as a fraction (0.5 = 30m);
+    // any whole-minute value 1m..72h is accepted, rounded onto the grid.
+    if (line.hours !== undefined) {
+      if (typeof line.hours !== "number" || !Number.isFinite(line.hours)) {
+        return {
+          ok: false,
+          error:
+            "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+        };
+      }
+      hours = line.hours;
+    } else if (line.level === undefined) {
+      hours = 0.5; // default grant: 30 minutes (#205)
+    } else {
+      return {
+        ok: false,
+        error:
+          "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+      };
     }
+    const mins = Math.round(hours * 60);
+    if (mins < 1 || mins > 4320) {
+      return {
+        ok: false,
+        error:
+          "usage: time-boxed needs --hours 1m..72h (whole minutes) or --minutes 1..4320",
+      };
+    }
+    hours = mins / 60;
   } else if (line.hours !== undefined) {
     return { ok: false, error: "usage: --hours only applies to time-boxed" };
   }
@@ -1066,7 +1133,11 @@ export async function vaultRequest(
     });
     return {
       ok: false,
-      error: `pending: ${pending.id} expires ${iso(pending.ttlDeadline)}`,
+      error: `pending: ${pending.id} ${
+        pending.ttlDeadline > 0
+          ? `expires ${iso(pending.ttlDeadline)}`
+          : "is still pending (no expiry — tap or revoke to clear)"
+      }`,
     };
   }
   const now = st.now();
@@ -1111,7 +1182,9 @@ export async function vaultRequest(
     messageId: "",
     state: "pending",
     created: now,
-    ttlDeadline: now + st.ttlMs,
+    // #203: 0 = no TTL (the default). A real deadline only when an
+    // explicit JARATE_VAULT_TTL_MS is configured.
+    ttlDeadline: st.ttlMs > 0 ? now + st.ttlMs : 0,
     useCount: 0,
     runsInFlight: 0,
   };
@@ -1122,7 +1195,7 @@ export async function vaultRequest(
     st.secrets.register([storedValue]);
   }
 
-  const res = await sendDiscordMessage(st.ch, "tap Approve or Deny", {
+  const res = await sendDiscordMessage(st.ch, "tap Approve, Deny, or Revoke", {
     components: pendingButtons(id),
     embeds: [credEmbed(st, cred, "pending")],
   });
@@ -1148,7 +1221,13 @@ export async function vaultRequest(
     ...(v.fromEnv ? { from_env: v.fromEnv } : {}),
   });
   persist(st);
-  return { ok: true, id, state: "pending", ttl: iso(cred.ttlDeadline) };
+  // #203: null ttl = no expiry (pending is blocking until tap or revoke).
+  return {
+    ok: true,
+    id,
+    state: "pending",
+    ttl: cred.ttlDeadline > 0 ? iso(cred.ttlDeadline) : null,
+  };
 }
 
 /** `vrun` op (begin). The socket server keeps the connection open for the
@@ -1633,6 +1712,348 @@ function markSeen(st: VaultState, id: string): boolean {
   return true;
 }
 
+/** Deliver tap feedback via replyInteraction (visible in channel);
+ *  when the transport fails, audit tap-feedback-failed (#204: a tap
+ *  outcome whose feedback never reached the channel must be observable
+ *  in audit.log, not only in the journal). pre/extra mirror the branch's
+ *  own audit line so the failure reads as its decision. Never throws. */
+async function tapReply(
+  st: VaultState,
+  d: any,
+  text: string,
+  pre: Record<string, unknown>,
+  extra: Record<string, unknown>,
+): Promise<boolean> {
+  const ok = await replyInteraction(st.botToken, d, text);
+  if (!ok)
+    audit(st, "tap-feedback-failed", pre, {
+      ...extra,
+      interaction: String(d.id),
+      text,
+    });
+  return ok;
+}
+
+/** Outcome of a decision (approve/deny/revoke) applied via the shared
+ *  state transition. `reason` distinguishes the rejection classes for
+ *  the caller's feedback + audit. */
+export type VaultDecisionOutcome =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: "already-handled" | "value-lost" | "value-missing";
+    };
+
+/** Shared state transition for approve/deny/revoke (#206, D5).
+ *  Called from BOTH the button-tap handler (makeHandler) and the /vault
+ *  slash path (vaultSlash) — one machine, no duplicated transition
+ *  logic. Owns: the value check, the state change, the timers, the
+ *  audit event, persist, and the card edit (so both paths edit the
+ *  card identically). The caller owns: lookup, the owner/same-message
+ *  gates, and the user-facing feedback. */
+async function applyDecision(
+  st: VaultState,
+  cred: VaultCredential,
+  verb: "approve" | "deny" | "revoke",
+  uid: string,
+  actor: string,
+  who: string,
+): Promise<VaultDecisionOutcome> {
+  if (verb === "revoke") {
+    // #203: revoke is the kill switch on no-TTL pending cards too
+    // (pending | active; anything else is already settled).
+    if (cred.state !== "active" && cred.state !== "pending")
+      return { ok: false, reason: "already-handled" };
+    const fromState = cred.state; // "pending" | "active" (#203)
+    cred.state = "revoked";
+    cred.revokedBy = actor;
+    clearTimersFor(st, cred.id);
+    settleStoredValueFromDisk(st, cred);
+    if (st.transport === "file") unlinkPublished(st, cred.id);
+    audit(st, "revoke", credFields(cred), {
+      user: uid,
+      actor,
+      from_state: fromState,
+    });
+    persist(st);
+    await editCredentialMessage(
+      st,
+      cred,
+      revokedText(cred, who),
+      [],
+      "revoked",
+    );
+    return { ok: true };
+  }
+  if (cred.state !== "pending") return { ok: false, reason: "already-handled" };
+  if (verb === "approve") {
+    if (cred.valueSource === "stored") {
+      try {
+        readValueFile(st, cred.id);
+      } catch {
+        // File lost (bridge restart) — cannot publish the value.
+        audit(st, "vault-error", credFields(cred), {
+          actor,
+          err: "stored value file missing",
+        });
+        return { ok: false, reason: "value-lost" };
+      }
+    } else {
+      try {
+        const t = readKnownValue(st, cred.kind, cred.name);
+        if (!validateValueShape(cred.kind, t))
+          throw new Error(`value shape invalid for ${cred.kind}/${cred.name}`);
+      } catch {
+        audit(st, "vault-error", credFields(cred), {
+          actor,
+          err: "value file missing",
+        });
+        return { ok: false, reason: "value-missing" };
+      }
+    }
+    cred.state = "active";
+    cred.approvedAt = st.now();
+    if (cred.level === "one-shot") {
+      cred.claimDeadline = st.now() + st.claimMs;
+      armClaim(st, cred);
+    } else if (cred.level === "time-boxed") {
+      cred.expiresAt = st.now() + cred.hours * st.hourMs;
+      armWindow(st, cred);
+    }
+    const approvals = st.approvals[cred.agent] ?? [];
+    approvals.push(st.now());
+    st.approvals[cred.agent] = approvals;
+    audit(st, "approve", credFields(cred), { user: uid, actor });
+    persist(st);
+    await editCredentialMessage(
+      st,
+      cred,
+      approvedText(cred),
+      revokeButtons(cred.id),
+      "approved",
+    );
+    return { ok: true };
+  }
+  // deny
+  cred.state = "denied";
+  cred.deniedBy = uid;
+  clearTimersFor(st, cred.id);
+  settleStoredValueFromDisk(st, cred);
+  audit(st, "deny", credFields(cred), { user: uid, actor });
+  persist(st);
+  await editCredentialMessage(st, cred, deniedText(cred, who), [], "denied");
+  return { ok: true };
+}
+
+/** Resolve a credential by full id or unique prefix (#206: operators
+ *  copy ids from card footers; a prefix keeps mobile entry short).
+ *  `ambiguous` = more than one credential matches the prefix. */
+function resolveCredential(
+  st: VaultState,
+  idArg: string,
+): { cred: VaultCredential | null; ambiguous: boolean } {
+  const arg = idArg.trim();
+  if (!arg) return { cred: null, ambiguous: false };
+  const exact = st.credentials.get(arg);
+  if (exact) return { cred: exact, ambiguous: false };
+  const matches = [...st.credentials.values()].filter((c) =>
+    c.id.startsWith(arg),
+  );
+  return {
+    cred: matches.length === 1 ? matches[0] : null,
+    ambiguous: matches.length > 1,
+  };
+}
+
+/** Short duration for status lines (claim windows etc.). */
+function fmtDur(ms: number): string {
+  if (ms >= 3_600_000) return `${Math.round(ms / 3_600_000)}h`;
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`;
+  return `${Math.max(1, Math.round(ms / 1000))}s`;
+}
+
+/** ISO without the .000ms tail (shorter status lines). */
+function isoShort(ts: number): string {
+  return iso(ts).replace(".000Z", "Z");
+}
+
+/** #206 (D5): per-credential lines for /vault status. Field lines stay
+ *  ≤40 cols (mobile fence budget); the message link is a single
+ *  unbreakable token and sits on its own line. */
+function vaultStatusLines(
+  c: VaultCredential,
+  guildId: string | undefined,
+  claimMs: number,
+): string[] {
+  const lines: string[] = [
+    `${c.id.slice(0, 10)}…${c.id.slice(-8)}  ${c.state}`,
+    `  ${c.kind}/${c.name}`,
+    `  created ${isoShort(c.created)}`,
+  ];
+  if (c.level === "one-shot") {
+    lines.push(
+      c.state === "active" && c.claimDeadline
+        ? `  claim by ${isoShort(c.claimDeadline)}`
+        : `  grant one-shot, claim ${fmtDur(claimMs)}`,
+    );
+  } else {
+    lines.push(
+      c.state === "active" && c.expiresAt
+        ? `  expires ${isoShort(c.expiresAt)}`
+        : `  grant ${c.hours}h`,
+    );
+  }
+  if (guildId && c.messageId)
+    lines.push(
+      `https://discord.com/channels/${guildId}/${c.channelId ?? "?"}/${c.messageId}`,
+    );
+  else lines.push(`  card msg ${c.messageId ?? "?"}`);
+  return lines;
+}
+
+/** /vault <status|approve|deny|ping> [id] — the owner-gated text path
+ *  for the credential vault (#206, D5). State transitions are the
+ *  shared applyDecision() — identical to the button taps, and the card
+ *  edit happens inside it, so a slash approve edits the card exactly
+ *  like a tap. The audit actor is "slash:<uid>" (vs the tap's
+ *  "discord:<uid>"). Non-owner usage is visible + audited
+ *  (slash-rejected, reason not-owner). */
+export async function vaultSlash(
+  st: VaultState,
+  action: string,
+  idArg: string | undefined,
+  uid: string,
+  who: string,
+  guildId?: string,
+): Promise<{ ok: boolean; text: string }> {
+  const act = (action ?? "").trim().toLowerCase();
+  const actor = `slash:${uid}`;
+  if (!isOwnerUser(st.ch, uid)) {
+    audit(
+      st,
+      "slash-rejected",
+      { action: act },
+      {
+        user: uid,
+        actor,
+        reason: "not-owner",
+      },
+    );
+    return { ok: false, text: "[!] only the owner can use /vault" };
+  }
+  if (act === "status") {
+    const creds = [...st.credentials.values()]
+      .filter((c) => c.state === "pending" || c.state === "active")
+      .sort((a, b) =>
+        a.state === b.state
+          ? a.created - b.created
+          : a.state === "pending"
+            ? -1
+            : 1,
+      );
+    if (creds.length === 0)
+      return { ok: true, text: "vault: no pending or active credentials" };
+    const p = creds.filter((c) => c.state === "pending").length;
+    audit(st, "slash-status", { action: act }, { user: uid, actor });
+    return {
+      ok: true,
+      text: [
+        `[vault: ${p} pending, ${creds.length - p} active]`,
+        "",
+        ...creds.flatMap((c) => vaultStatusLines(c, guildId, st.claimMs)),
+      ].join("\n"),
+    };
+  }
+  if (act !== "approve" && act !== "deny" && act !== "ping") {
+    return {
+      ok: false,
+      text: "[!] usage: /vault status | approve <id> | deny <id> | ping <id>",
+    };
+  }
+  const { cred, ambiguous } = resolveCredential(st, idArg ?? "");
+  if (ambiguous) {
+    audit(
+      st,
+      "slash-rejected",
+      { action: act },
+      {
+        user: uid,
+        actor,
+        reason: "ambiguous-id",
+        id: (idArg ?? "").trim(),
+      },
+    );
+    return {
+      ok: false,
+      text: `[!] ${(idArg ?? "").trim()}: ambiguous id (multiple matches)`,
+    };
+  }
+  if (!cred) {
+    audit(
+      st,
+      "slash-rejected",
+      { action: act },
+      {
+        user: uid,
+        actor,
+        reason: "not-found",
+        id: (idArg ?? "").trim(),
+      },
+    );
+    return {
+      ok: false,
+      text: `[!] ${(idArg ?? "").trim()}: no such credential`,
+    };
+  }
+  if (act === "ping") {
+    if (cred.state !== "pending" && cred.state !== "active") {
+      return {
+        ok: false,
+        text: `[!] ${cred.id}: not pingable (state ${cred.state})`,
+      };
+    }
+    const hint = cred.state === "pending" ? "approve" : "revoke";
+    const res = await sendDiscordMessage(
+      st.ch,
+      `vault ${cred.state}: ${cred.kind}/${cred.name} (${cred.id}) — tap or /vault ${hint} ${cred.id}`,
+      { replyToMessageId: cred.messageId },
+    );
+    audit(st, "slash-ping", credFields(cred), { user: uid, actor });
+    if (!res.success)
+      return { ok: false, text: `[!] ping failed: ${res.error ?? "unknown"}` };
+    return { ok: true, text: `[ok] pinged ${cred.id} (${cred.state})` };
+  }
+  const dec = await applyDecision(st, cred, act, uid, actor, who);
+  if (!dec.ok) {
+    if (dec.reason === "already-handled") {
+      audit(st, "slash-rejected", credFields(cred), {
+        user: uid,
+        actor,
+        reason: "already-handled",
+        state: cred.state,
+      });
+      return {
+        ok: false,
+        text: `[!] ${cred.id}: already handled (state ${cred.state})`,
+      };
+    }
+    // value-lost / value-missing: vault-error already audited inside
+    // applyDecision.
+    return {
+      ok: false,
+      text:
+        dec.reason === "value-lost"
+          ? `[!] ${cred.id}: value lost (bridge restarted) — re-request`
+          : `[!] ${cred.id}: value file missing`,
+    };
+  }
+  return {
+    ok: true,
+    text:
+      act === "approve" ? `[ok] approved ${cred.id}` : `[ok] denied ${cred.id}`,
+  };
+}
+
 function makeHandler(st: VaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1647,189 +2068,166 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
 
       await deferInteraction(st.botToken, d);
 
-      if (!markSeen(st, String(d.id))) return;
+      const uid = String(d.user?.id ?? "");
+
+      // Dedupe (gateway redelivery) — no second reply (the first tap
+      // already showed feedback), but audit it: a tap with no audit line
+      // is how the 2026-10-08 mismatch bug stayed invisible.
+      if (!markSeen(st, String(d.id))) {
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "duplicate",
+            user: uid,
+            verb,
+          },
+        );
+        return;
+      }
 
       const cred = st.credentials.get(parsedId);
       if (!cred) {
-        await sendInteractionFollowup(
-          st.botToken,
+        const nf = {
+          reason: "not-found",
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", { id: parsedId }, nf);
+        await tapReply(
+          st,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: request not found or already handled",
+          { id: parsedId },
+          nf,
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
-      if (
-        String(d.message_id) !== cred.messageId ||
-        String(d.channel_id) !== cred.channelId
-      ) {
-        await sendInteractionFollowup(
-          st.botToken,
-          d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
-        );
-        await deleteDeferredAck(st.botToken, d);
-        return;
-      }
-
-      const uid = String(d.user?.id ?? "");
+      // Owner gate BEFORE the mismatch check (#204): a non-owner tap on
+      // a stale/forwarded button copy must audit as non-owner-tap, not
+      // be swallowed by mismatch. The mismatch check itself is kept — it
+      // still guards owner taps on the wrong message/channel.
       if (!isOwnerUser(st.ch, uid)) {
         audit(st, "non-owner-tap", credFields(cred), {
           user: uid,
           actor: actorDiscord(uid),
           verb,
+          interaction: String(d.id),
         });
-        await sendInteractionFollowup(
-          st.botToken,
+        await tapReply(
+          st,
           d,
-          "[!] only the owner can approve vault requests",
-          { ephemeral: true },
+          "[!] tap rejected: only the owner can approve vault requests",
+          credFields(cred),
+          { user: uid, verb, interaction: String(d.id) },
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
-      // State gate per verb.
-      if (verb === "revoke") {
-        if (cred.state !== "active") {
-          await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-            ephemeral: true,
-          });
-          await deleteDeferredAck(st.botToken, d);
-          return;
-        }
-        cred.state = "revoked";
-        cred.revokedBy = actorDiscord(uid);
-        clearTimersFor(st, cred.id);
-        settleStoredValueFromDisk(st, cred);
-        if (st.transport === "file") unlinkPublished(st, cred.id);
-        audit(st, "revoke", credFields(cred), {
+      // Message + channel match (stale copy / forwarded button).
+      // The live payload has NO d.message_id — per the Discord spec the
+      // component's message is the `message` field on the INTERACTION
+      // object itself (older payloads nested it in data). Reading
+      // d.message_id compared "undefined" against the cred id, so every
+      // tap was rejected (RCA 2026-10-08). d.message_id is kept only as
+      // a defensive last resort for synthetic payloads.
+      const srcMsgId = d?.message?.id ?? d?.data?.message?.id ?? d?.message_id;
+      if (
+        srcMsgId == null ||
+        String(srcMsgId) !== String(cred.messageId) ||
+        String(d.channel_id) !== String(cred.channelId)
+      ) {
+        const mm = {
+          reason: "mismatch",
           user: uid,
-          actor: actorDiscord(uid),
-          from_state: "active",
-        });
-        persist(st);
-        await editCredentialMessage(
+          verb,
+          expected_message: cred.messageId,
+          expected_channel: cred.channelId,
+          got_message: srcMsgId == null ? null : String(srcMsgId),
+          got_channel: d.channel_id == null ? null : String(d.channel_id),
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", credFields(cred), mm);
+        await tapReply(
           st,
-          cred,
-          revokedText(cred, String(d.user?.username ?? uid)),
+          d,
+          "[!] tap rejected: button not on the request message",
+          credFields(cred),
+          mm,
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
-      if (cred.state !== "pending") {
-        await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-          ephemeral: true,
-        });
-        await deleteDeferredAck(st.botToken, d);
-        return;
-      }
-
-      // Transition (the only place tap-verbs mutate state).
-      const now = st.now();
-      if (verb === "approve") {
-        if (cred.valueSource === "stored") {
-          // Value file already written at request; verify it survived
-          // (restart between request and approve).
-          try {
-            readValueFile(st, cred.id);
-          } catch {
-            audit(st, "vault-error", credFields(cred), {
-              actor: actorDiscord(uid),
-              err: "stored value file missing",
-            });
-            await sendInteractionFollowup(
-              st.botToken,
-              d,
-              "[!] value lost (bridge restarted) — re-request",
-              {
-                ephemeral: true,
-              },
-            );
-            await deleteDeferredAck(st.botToken, d);
-            return;
-          }
+      // Shared state transition (#206): the same machine as the /vault
+      // slash path (applyDecision). The tap only adds the gates above
+      // (same-message, owner) and the visible feedback below.
+      const dec = await applyDecision(
+        st,
+        cred,
+        verb,
+        uid,
+        actorDiscord(uid),
+        String(d.user?.username ?? uid),
+      );
+      if (!dec.ok) {
+        if (dec.reason === "already-handled") {
+          const sh = {
+            reason: "already-handled",
+            user: uid,
+            verb,
+            state: cred.state,
+            interaction: String(d.id),
+          };
+          audit(st, "tap-rejected", credFields(cred), sh);
+          await tapReply(
+            st,
+            d,
+            "[!] tap rejected: already handled",
+            credFields(cred),
+            sh,
+          );
+        } else if (dec.reason === "value-lost") {
+          await tapReply(
+            st,
+            d,
+            "[!] value lost (bridge restarted) — re-request",
+            credFields(cred),
+            { user: uid, verb, interaction: String(d.id) },
+          );
         } else {
-          // Known mode: named pre-check at approve (specific message),
-          // then read fresh at handoff anyway.
-          try {
-            const t = readKnownValue(st, cred.kind, cred.name);
-            if (!validateValueShape(cred.kind, t))
-              throw new Error(
-                `value shape invalid for ${cred.kind}/${cred.name}`,
-              );
-          } catch {
-            audit(st, "vault-error", credFields(cred), {
-              actor: actorDiscord(uid),
-              err: "value file missing",
-            });
-            await sendInteractionFollowup(
-              st.botToken,
-              d,
-              "[!] value file missing",
-              {
-                ephemeral: true,
-              },
-            );
-            await deleteDeferredAck(st.botToken, d);
-            return;
-          }
+          await tapReply(st, d, "[!] value file missing", credFields(cred), {
+            user: uid,
+            verb,
+            interaction: String(d.id),
+          });
         }
-        cred.state = "active";
-        cred.approvedAt = now;
-        if (cred.level === "one-shot") {
-          cred.claimDeadline = now + st.claimMs;
-          armClaim(st, cred);
-        } else if (cred.level === "time-boxed") {
-          cred.expiresAt = now + cred.hours * st.hourMs;
-          armWindow(st, cred);
-        }
-        const approvals = st.approvals[cred.agent] ?? [];
-        approvals.push(now);
-        st.approvals[cred.agent] = approvals;
-        audit(st, "approve", credFields(cred), {
-          user: uid,
-          actor: actorDiscord(uid),
-        });
-        persist(st);
-        await editCredentialMessage(
-          st,
-          cred,
-          approvedText(cred),
-          revokeButtons(cred.id),
-          "approved",
-        );
-      } else {
-        cred.state = "denied";
-        cred.deniedBy = uid;
-        clearTimersFor(st, cred.id);
-        settleStoredValueFromDisk(st, cred);
-        audit(st, "deny", credFields(cred), {
-          user: uid,
-          actor: actorDiscord(uid),
-        });
-        persist(st);
-        await editCredentialMessage(
-          st,
-          cred,
-          deniedText(cred, String(d.user?.username ?? uid)),
-          [],
-          "denied",
-        );
+        return;
       }
       await deleteDeferredAck(st.botToken, d);
     } catch (e) {
       // Never reject (M1 parity): log + audit + best-effort feedback.
       console.error("[interactions] vault handler failed:", e);
-      audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await sendInteractionFollowup(st.botToken, d, "[!] vault error", {
-        ephemeral: true,
-      });
-      await deleteDeferredAck(st.botToken, d);
+      const err = String(e);
+      audit(
+        st,
+        "vault-error",
+        { id: parsedId },
+        {
+          err,
+          user: String(d.user?.id ?? ""),
+          interaction: String(d.id),
+        },
+      );
+      await tapReply(
+        st,
+        d,
+        "[!] vault error",
+        { id: parsedId },
+        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+      );
     }
   };
 }
@@ -1848,7 +2246,10 @@ function load(st: VaultState): void {
     const c: VaultCredential = { ...raw, id };
     st.credentials.set(id, c);
     if (c.state === "pending") {
-      if (c.ttlDeadline <= now) {
+      // #203: ttlDeadline 0 = no TTL → never expired. A past deadline only
+      // settles when a TTL is actually configured (explicit env override);
+      // a no-TTL pending survives any restart indefinitely.
+      if (st.ttlMs > 0 && c.ttlDeadline > 0 && c.ttlDeadline <= now) {
         c.state = "expired";
         c.expiredKind = "ttl";
         settleStoredValueFromDisk(st, c);
@@ -1862,7 +2263,7 @@ function load(st: VaultState): void {
           `[expired] VAULT request ${c.id} unanswered (${ttlText(st, c)})`,
         ).catch(() => {});
       } else {
-        armTtl(st, c);
+        armTtl(st, c); // no-op when ttlMs === 0
       }
     } else if (c.state === "active") {
       if (
@@ -2008,7 +2409,9 @@ export function startVault(opts: StartVaultOpts): VaultHandle {
       register: opts.secrets?.register ?? registerRuntimeSecrets,
       drop: opts.secrets?.drop ?? dropRuntimeSecrets,
     },
-    ttlMs: envNum("JARATE_VAULT_TTL_MS", 300_000),
+    // #203: 0 = no TTL (pending is BLOCKING until tap or revoke).
+    // Explicit JARATE_VAULT_TTL_MS override still works exactly as before.
+    ttlMs: envNum("JARATE_VAULT_TTL_MS", 0),
     claimMs: envNum("JARATE_VAULT_CLAIM_MS", 60_000),
     hourMs: envNum("JARATE_VAULT_HOUR_MS", HOUR_MS),
     maxPending: envNum("JARATE_VAULT_MAX_PENDING", 1),

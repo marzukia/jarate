@@ -62,11 +62,17 @@ const states = new Map<string, DiscordState>();
 
 /** Bounded REST call against the Discord API (3 attempts, 429-aware).
  *  Exported: the #180 startup history scan reuses it (and tests stub
- *  the transport via globalThis.fetch). */
+ *  the transport via globalThis.fetch).
+ *
+ *  Errors carry up to 200 chars of the response body by default. Pass
+ *  fullError for interaction/webhook calls: Discord 4xx JSON error
+ *  bodies are small and name the exact failing field, and the 200-char
+ *  cut hid the 50035 ENUM_TYPE_COERCE body that pinned the followup
+ *  URL bug (D9 / #210). fullError caps at 1000 chars as a size bound. */
 export async function discordFetch(
   token: string,
   urlPath: string,
-  opts?: { method?: string; body?: any },
+  opts?: { method?: string; body?: any; fullError?: boolean },
 ): Promise<any> {
   const headers: Record<string, string> = {
     Authorization: `Bot ${token}`,
@@ -96,7 +102,8 @@ export async function discordFetch(
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      throw new Error(`Discord API ${resp.status}: ${text.slice(0, 200)}`);
+      const cap = opts?.fullError ? 1000 : 200; // #210
+      throw new Error(`Discord API ${resp.status}: ${text.slice(0, cap)}`);
     }
 
     if (resp.status === 204) return null;
@@ -1189,6 +1196,59 @@ export function isOlderSnowflake(a: string, b: string | null): boolean {
   return false;
 }
 
+/** Parse a raw gateway payload, preserving snowflake precision.
+ *  Discord serializes snowflake ids as JSON strings today, but any bare
+ *  integer >= 16 digits would be rounded by JSON.parse beyond 2^53 —
+ *  and the vault/pat tap match compares message ids as strings, so one
+ *  lost digit rejects the tap. Bare (unquoted) long integers are quoted
+ *  before parsing; string contents are untouched (the scanner tracks
+ *  string state). Fast path: no 16+ digit run -> plain JSON.parse. */
+export function parseGatewayPayload(raw: string): any {
+  if (!/\d{16,}/.test(raw)) return JSON.parse(raw);
+  return JSON.parse(quoteLongIntegers(raw));
+}
+
+/** Quote bare (outside string literals) integer runs of 16+ digits.
+ *  Exposed for tests. Floats (dot / exponent after the run) are left
+ *  alone; a leading minus is folded into the quoted string. */
+export function quoteLongIntegers(raw: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c >= "0" && c <= "9") {
+      let j = i;
+      while (j < raw.length && raw[j] >= "0" && raw[j] <= "9") j++;
+      const run = raw.slice(i, j);
+      const after = raw[j];
+      if (run.length >= 16 && after !== "." && after !== "e" && after !== "E") {
+        // A leading minus belongs to the number: fold it into the
+        // quoted string, else `-"123…"` is not valid JSON and the
+        // whole event is dropped by onmessage's catch.
+        if (out.endsWith("-")) out = `${out.slice(0, -1)}"-${run}"`;
+        else out += `"${run}"`;
+      } else out += run;
+      i = j - 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 /** All channel states registered for a bot token. */
 function statesForToken(token: string): DiscordState[] {
   const out: DiscordState[] = [];
@@ -1246,7 +1306,8 @@ function connectPresence(st: PresenceState): void {
   ws.onmessage = (ev: any) => {
     let msg: any;
     try {
-      msg = JSON.parse(String(ev.data));
+      // String-safe for 16+ digit snowflakes (see parseGatewayPayload).
+      msg = parseGatewayPayload(String(ev.data));
     } catch {
       return;
     }
@@ -1556,6 +1617,7 @@ export async function respondToInteraction(
         type: 4,
         data: text ? { content: egressText(text) } : {}, // secret censor
       },
+      fullError: true, // #210
     });
   } catch (e) {
     console.error(
@@ -1568,7 +1630,11 @@ export async function respondToInteraction(
 /** Defer a slash command (callback type 5). This is the ack that keeps
  *  Discord from showing "did not respond in time" (3s window) — call it
  *  BEFORE any command work. The deferred message shows "Thinking" until
- *  edited via editInteractionMessage. */
+ *  edited via editInteractionMessage. Flags 64 = ephemeral loading state
+ *  (#207): the "Thinking" bubble is tapper-only, not channel-visible —
+ *  tap OUTCOMES live in the (visible) reply + card edit, not in the ack.
+ *  Callback consumption is unchanged: exactly one callback response per
+ *  interaction (the defer spends it). */
 export async function deferInteraction(
   botToken: string,
   d: any,
@@ -1576,7 +1642,8 @@ export async function deferInteraction(
   try {
     await discordFetch(botToken, `/interactions/${d.id}/${d.token}/callback`, {
       method: "POST",
-      body: { type: 5 },
+      body: { type: 5, flags: 64 }, // #207: ephemeral loading state
+      fullError: true, // #210
     });
   } catch (e) {
     console.error(
@@ -1599,6 +1666,7 @@ export async function editInteractionMessage(
       {
         method: "PATCH",
         body: { content: egressText(text) }, // secret censor
+        fullError: true, // #210
       },
     );
   } catch (e) {
@@ -1609,34 +1677,90 @@ export async function editInteractionMessage(
   }
 }
 
-/** Post-defer reply on an interaction. The callback is already spent
- *  (defer consumed it — Discord allows exactly ONE callback response per
- *  interaction), so this goes to the interaction webhook — the same
- *  endpoint family editInteractionMessage uses for @original. Errors are
- *  swallowed (a failed followup must not kill the tap flow). */
+/** Create a followup message on an interaction. The callback is already
+ *  spent (defer consumed it — Discord allows exactly ONE callback
+ *  response per interaction), so this goes to the interaction webhook.
+ *  NOTE: the endpoint is the webhook ROOT — POST /webhooks/{app.id}/
+ *  {token} (wait is always true for interaction webhooks). The
+ *  /webhooks/{app}/{token}/messages form is the INCOMING-webhook
+ *  "Execute Webhook" route; interaction tokens reject it with 400 50035
+ *  (errors.webhook_service: ENUM_TYPE_COERCE on "messages") — RCA
+ *  2026-10-08, vault tap feedback invisible. Errors are swallowed (a
+ *  failed followup must not kill the tap flow). Returns true when the
+ *  followup was delivered, false when the transport failed — callers
+ *  audit the failure (tap-feedback-failed, #204). */
 export async function sendInteractionFollowup(
   botToken: string,
   d: any,
   text: string,
   opts?: { ephemeral?: boolean },
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await discordFetch(
-      botToken,
-      `/webhooks/${d.application_id}/${d.token}/messages?wait=true`,
-      {
-        method: "POST",
-        body: {
-          content: egressText(text), // secret censor
-          ...(opts?.ephemeral ? { flags: 64 } : {}),
-        },
+    await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
+      method: "POST",
+      body: {
+        content: egressText(text), // secret censor
+        ...(opts?.ephemeral ? { flags: 64 } : {}),
       },
-    );
+      fullError: true, // #210
+    });
+    return true;
   } catch (e) {
     console.error(
       "[interactions] followup failed:",
       sanitizeSensitiveText(String(e)),
     );
+    return false;
+  }
+}
+
+/** Post-defer tap RESULT: edit the deferred original in place (PATCH
+ *  @original) — the documented replacement for the deprecated
+ *  "followup POST right after a defer edits the original" behavior.
+ *  The deferred message is non-ephemeral, so the result is visible to
+ *  the whole channel — deliberate: a silent vault/pat tap is a control
+ *  failure (RCA 2026-10-08: every rejection reply was an ephemeral
+ *  followup on the wrong URL and the operator saw nothing). Fallback:
+ *  a new followup message if @original is already gone. Errors are
+ *  swallowed (must not kill the tap flow). Returns true when the reply
+ *  was delivered (either route), false when both failed — callers audit
+ *  the failure (tap-feedback-failed, #204). */
+export async function replyInteraction(
+  botToken: string,
+  d: any,
+  text: string,
+  opts?: { ephemeral?: boolean },
+): Promise<boolean> {
+  const body = {
+    content: egressText(text), // secret censor
+    ...(opts?.ephemeral ? { flags: 64 } : {}),
+  };
+  try {
+    await discordFetch(
+      botToken,
+      `/webhooks/${d.application_id}/${d.token}/messages/@original`,
+      { method: "PATCH", body, fullError: true }, // #210
+    );
+    return true;
+  } catch (e1) {
+    console.error(
+      "[interactions] reply failed:",
+      sanitizeSensitiveText(String(e1)),
+    );
+    try {
+      await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
+        method: "POST",
+        body,
+        fullError: true, // #210
+      });
+      return true;
+    } catch (e2) {
+      console.error(
+        "[interactions] followup failed:",
+        sanitizeSensitiveText(String(e2)),
+      );
+      return false;
+    }
   }
 }
 
@@ -1650,7 +1774,7 @@ export async function deleteDeferredAck(
     await discordFetch(
       botToken,
       `/webhooks/${d.application_id}/${d.token}/messages/@original`,
-      { method: "DELETE" },
+      { method: "DELETE", fullError: true }, // #210
     );
   } catch {
     // 404 (already gone) and network blips are both non-fatal here.
@@ -1749,6 +1873,59 @@ export const SLASH_COMMANDS = [
         name: "scope",
         description: "'list' or 'cancel <id>'",
         required: false,
+      },
+    ],
+  },
+  {
+    // #206 (D5): non-button vault ops. Subcommand form (type 1); the
+    // handler in index.ts folds it back to a "status" / "approve <id>"
+    // / "deny <id>" / "ping <id>" arg for runChannelCommand.
+    name: "vault",
+    description: "Credential vault: status + owner approve/deny",
+    options: [
+      {
+        type: 1,
+        name: "status",
+        description: "List pending + active credentials",
+      },
+      {
+        type: 1,
+        name: "approve",
+        description: "Approve a pending request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
+      },
+      {
+        type: 1,
+        name: "deny",
+        description: "Deny a pending request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
+      },
+      {
+        type: 1,
+        name: "ping",
+        description: "Re-announce a pending/active request (owner)",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "request id (full or unique prefix)",
+            required: true,
+          },
+        ],
       },
     ],
   },

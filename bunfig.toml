@@ -1,0 +1,7 @@
+# Root bunfig: lets `bun test <path>` from the repo root load the same
+# XDG isolation preload that packages/bridge/bunfig.toml uses for
+# `cd packages/bridge && bun test` (the bridge bunfig is only loaded
+# when cwd is packages/bridge). Relative preload paths need the leading
+# ./ to resolve from the repo root (bun 1.4.2).
+[test]
+preload = ["./packages/bridge/test/xdg-isolation.ts"]

@@ -77,12 +77,16 @@ as the rest of `jarate`). **No `pat-*` command ever prints the token.**
 
 ```
 $ jarate pat-request marzukia/jarate:write "open PR for dispatch refactor"
-{"ok":true,"id":"pat_5b0e...","state":"pending","ttl":"2026-09-26T12:05:00Z"}
+{ "ok":true,"id":"pat_5b0e...","state":"pending","ttl":null }
 ```
+
+- `ttl`: expiry timestamp, or `null` when no TTL is configured (the
+  default, #203 — pending blocks until the owner taps).
 
 - `reason`: remaining args joined with spaces, 3-200 chars.
 - rc 0 ok | rc 1 vault error (doc says why) | rc 2 usage.
-- Constraints enforced by the bridge: 1 pending per agent (TTL 5 min),
+- Constraints enforced by the bridge: 1 pending per agent (pending
+  blocks until tap; TTL opt-in via `JARATE_PAT_TTL_MS`),
   5 approvals/hour per agent (rolling).
 
 ### `jarate pat-run <request-id> -- <cmd> [args...]`
@@ -160,7 +164,7 @@ each <= 4096 chars.
 | `~/.tmp/pat-vault.json` | persisted state (requests + approvals + budget stamps). Bridge cwd is `$HOME`. |
 
 Bridge-side tuning env (set on `pi.service`, not per-call):
-`JARATE_PAT_TTL_MS` (default 300000), `JARATE_PAT_CLAIM_MS` (60000),
+`JARATE_PAT_TTL_MS` (default 0 = no TTL, pending blocks until tap), `JARATE_PAT_CLAIM_MS` (60000),
 `JARATE_PAT_MAX_PENDING` (1), `JARATE_PAT_BUDGET_PER_HOUR` (5),
 `JARATE_PAT_CENSOR_GRACE_MS` (10000), `JARATE_PAT_TRANSPORT`
 (`socket` default | `file`).
@@ -188,7 +192,7 @@ Inspect: `tail -20 ~/.jarate/pat-audit.log | jq .`.
 | symptom | cause / behavior | fix |
 |---|---|---|
 | `vault unavailable: no socket at ... (pi.service down?)` rc 1 | bridge not running | start pi.service; retry (request is idempotent — nothing was posted) |
-| `pending: pat_x expires ...` rc 1 | another request is pending for this agent | wait for TTL (5 min) or let the owner deny it |
+| `pending: pat_x ...` rc 1 | another request is pending for this agent | let the owner tap (deny) to clear it — or wait out the TTL if one is set |
 | `budget: 5 approvals in last hour; next slot ...` rc 1 | rolling budget cap | wait for the hour to roll |
 | `scope: unknown '...' (known: ...)` rc 1 | no token file for that scope | create the file (above), retry |
 | `state: already used` rc 1 | the id was run | re-request a fresh id |
@@ -197,7 +201,7 @@ Inspect: `tail -20 ~/.jarate/pat-audit.log | jq .`.
 | exit 124, no JSON, partial output | command hit the 900s cap | make the command faster / split it; re-request |
 | `file missing: <path>` rc 1 (file mode) | bridge restarted between publish and read (boot sweep) | retry inside the claim window (re-approve republishes); else re-request |
 | double tap / stale copy of the button message | dedupe by `d.id` + state check | ephemeral `already handled` / `not found or already handled`; nothing consumed |
-| non-owner taps | deliverable ephemeral `[!] only the owner...` | owner taps later within TTL |
+| non-owner taps | deliverable ephemeral `[!] only the owner...` | owner taps later (pending does not expire by default) |
 | vault request-only (run lines get `vault unavailable`) | socket dir not writable / EADDRINUSE twice | fix dir perms, restart bridge |
 
 Every tap gets visible feedback: a message edit on success/deny/expire,
@@ -237,9 +241,9 @@ dispatch line carries a `.catch` backstop).
 4. The token is in at most 3 places at once: bridge memory, the bun
    wrapper, one child's env. Never in argv, never in a file (socket
    mode), never in the LLM context (agents only see ids + status JSON).
-5. Every secret lifetime is timer-owned by the bridge (TTL 5 min, claim
-   60s, censor grace 10s, startup sweep). Early cleanup by the agent is
-   optional, never the guarantee.
+5. Every secret lifetime is timer-owned by the bridge (pending TTL
+   opt-in, claim 60s, censor grace 10s, startup sweep). Early cleanup by
+   the agent is optional, never the guarantee.
 6. Budget is enforced where the token is (bridge), not where the agent
    can bypass it (CLI).
 7. Restart-safe: state, approvals, and the sweep survive bridge

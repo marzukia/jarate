@@ -170,7 +170,7 @@ import {
   type UsageStats,
   usageFrame,
 } from "./usage";
-import { startVault, stopVault, type VaultHandle } from "./vault";
+import { startVault, stopVault, type VaultHandle, vaultSlash } from "./vault";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
 
@@ -182,6 +182,15 @@ let agentBusy = false;
 const patVaultHandles = new Map<string, PatVaultHandle>();
 // Generic vault handles per channel (same L4 refcount pattern).
 const vaultHandles = new Map<string, VaultHandle>();
+/** Test hook: register/clear the vault handle for a channel (the
+ *  production wiring happens in connectDiscord). #206. */
+export function __setVaultHandleForTest(
+  chId: string,
+  h: VaultHandle | null,
+): void {
+  if (h) vaultHandles.set(chId, h);
+  else vaultHandles.delete(chId);
+}
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -2098,7 +2107,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree|vault)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -4383,6 +4392,18 @@ export function buildInteractionHandler(
           ),
         )
       : undefined;
+    // /vault (#206): subcommand form — the first option is the
+    // subcommand (type 1); its "id" option (type 3) is the credential
+    // id. Fold back to "status" / "approve <id>" for runChannelCommand.
+    let vaultArg: string | undefined;
+    if (d.data?.name === "vault" && Array.isArray(d.data.options)) {
+      const sub = d.data.options.find((o: any) => o?.type === 1);
+      const subOpts = Array.isArray(sub?.options) ? sub.options : [];
+      const idOpt = subOpts.find((o: any) => o?.name === "id");
+      vaultArg = sub
+        ? `${sub.name}${idOpt?.value != null ? ` ${String(idOpt.value)}` : ""}`
+        : "";
+    }
     let text: string | undefined;
     try {
       const r = await runChannelCommand(
@@ -4390,9 +4411,14 @@ export function buildInteractionHandler(
         ctx,
         ch,
         d.data?.name,
-        opt?.value ?? undefined,
+        vaultArg ?? opt?.value ?? undefined,
         d.user?.id,
         true,
+        {
+          guildId: d.guild_id != null ? String(d.guild_id) : undefined,
+          username:
+            d.user?.username != null ? String(d.user.username) : undefined,
+        },
       );
       text = r.btw
         ? undefined
@@ -5281,6 +5307,7 @@ async function runChannelCommand(
   arg: string | undefined,
   fromId: string | undefined,
   native: boolean,
+  opts?: { guildId?: string; username?: string },
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
   const isOwner = isOwnerUser(ch, fromId);
   // A recognised command is NEVER handed to the agent as plain text when the
@@ -6074,6 +6101,24 @@ async function runChannelCommand(
         ),
       };
     }
+    case "vault": {
+      // #206 (D5): owner-gated text path for the credential vault.
+      // status | approve <id> | deny <id> | ping <id>. Non-owner ->
+      // visible error + audit (inside vaultSlash); the transitions
+      // share applyDecision() with the button taps.
+      const h = vaultHandles.get(ch.id);
+      if (!h) return { immediate: fence("[!] vault not running") };
+      const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
+      const r = await vaultSlash(
+        h.vault,
+        parts[0] ?? "status",
+        parts[1],
+        fromId ?? "",
+        opts?.username ?? fromId ?? "",
+        opts?.guildId,
+      );
+      return { immediate: fence(r.text) };
+    }
     default:
       return {};
   }
@@ -6639,6 +6684,7 @@ export async function handleInbound(
         cmd.arg,
         msg.fromId,
         false,
+        undefined,
       );
       if (r.btw) {
         noAck();

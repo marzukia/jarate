@@ -6,8 +6,11 @@
  *   1. Only the bridge reads a PAT file — at approve (both transports:
  *      dead-file gate; file mode also publishes) and at handoff (socket
  *      mode, rotation-aware).
- *   2. Only an owner's tap mutates a request; every other tap gets an
- *      ephemeral reply and an audit line, state untouched.
+ *   2. Only an owner's tap mutates a request; every other tap gets a
+ *      VISIBLE reply (PATCH @original) and an audit line, state
+ *      untouched. The owner gate runs BEFORE the message-mismatch check
+ *      (#204): a stranger's stale tap audits as non-owner-tap, not
+ *      mismatch.
  *   3. One tap = one token = one command. `handed-off` is terminal.
  *   4. The token is in at most 3 places at once: bridge memory, the bun
  *      wrapper, one child's env. Never in argv, never in a file (socket
@@ -19,8 +22,8 @@
  *      bridge-owned (anything in it at boot is stale).
  *   8. Deliverable feedback: the defer consumes the one-shot interaction
  *      callback, so every post-defer reply goes through
- *      sendInteractionFollowup (interaction webhook) and every path
- *      clears the "Thinking" ack with deleteDeferredAck.
+ *      replyInteraction (PATCH @original — visible in channel) and the
+ *      success path clears the "Thinking" ack with deleteDeferredAck.
  *   9. handlePatComponent NEVER REJECTS (top-level try/catch; M1) — an
  *      escaped rejection would be an unhandled promise rejection and kill
  *      the whole bridge under Node 22's unhandled-rejections=throw.
@@ -39,8 +42,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  replyInteraction,
   sendDiscordMessage,
-  sendInteractionFollowup,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
 import type { ChannelConfig } from "./types";
@@ -86,7 +89,7 @@ export interface PatRequest {
   created: number; // epoch ms
   approvedAt?: number;
   handedOffAt?: number;
-  ttlDeadline: number; // created + ttlMs
+  ttlDeadline: number; // created + ttlMs; 0 = no TTL (#203, pending blocks)
   claimDeadline?: number; // approvedAt + claimMs
   deniedBy?: string;
   runRc?: number;
@@ -428,7 +431,9 @@ function startupSweep(st: PatVaultState): void {
   } catch (e) {
     audit(st, "vault-error", undefined, { err: `filedir: ${String(e)}` });
   }
-  audit(st, "sweep", undefined, { n });
+  // #208: a clean boot is not an event — audit only when something
+  // was actually pruned.
+  if (n > 0) audit(st, "sweep", undefined, { n });
 }
 
 /** Connect probe: true only if a live peer accepts on the socket path.
@@ -549,6 +554,11 @@ function settleClaim(st: PatVaultState, id: string): void {
 }
 
 function armTtl(st: PatVaultState, req: PatRequest): void {
+  // #203: ttlMs 0 = no TTL. Pending is BLOCKING until tap or revoke;
+  // the timer exists only when an explicit JARATE_PAT_TTL_MS is set.
+  // Deadline 0 (persisted no-TTL sentinel) is never armed against, even
+  // if an env TTL appears in a later restart.
+  if (st.ttlMs === 0 || req.ttlDeadline <= 0) return;
   track(
     st,
     req.id,
@@ -638,6 +648,15 @@ function patEmbed(
     { name: "scope", value: String(req.scope), inline: true },
   ];
   if (status === "pending") {
+    // #205: the grant is visible BEFORE the tap. PAT grants are one-shot
+    // by construction (claim window after approval).
+    fields.push({
+      name: "grant",
+      value: `single use (claim within ${Math.round(
+        st.claimMs / 1000,
+      )}s of approval)`,
+      inline: false,
+    });
     fields.push({
       name: "reason",
       value: String(req.reason || "-"),
@@ -665,8 +684,14 @@ function patEmbed(
     expired: `PAT expired - ${req.agent}`,
   };
   let footer = req.id;
-  if (status === "pending")
-    footer = `expires ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)}) · ${req.id}`;
+  if (status === "pending") {
+    // #203: no TTL (default) → pending until tap; the expiry timestamp
+    // line stays only when an explicit TTL is configured.
+    footer =
+      st.ttlMs > 0 && req.ttlDeadline > 0
+        ? `expires ${timeOfDay(req.ttlDeadline)}Z (${ttlMinutes(st)}) · ${req.id}`
+        : `pending until tap · ${req.id}`;
+  }
   return {
     title: titles[status] ?? titles.pending,
     color: EMBED_COLOR[status] ?? EMBED_COLOR.pending,
@@ -807,7 +832,11 @@ export async function patRequest(
     audit(st, "pending-reject", { agent, scope, id: pending.id });
     return {
       ok: false,
-      error: `pending: ${pending.id} expires ${iso(pending.ttlDeadline)}`,
+      error: `pending: ${pending.id} ${
+        pending.ttlDeadline > 0
+          ? `expires ${iso(pending.ttlDeadline)}`
+          : "is still pending (no expiry — tap to clear)"
+      }`,
     };
   }
   const now = st.now();
@@ -837,7 +866,9 @@ export async function patRequest(
     messageId: "",
     state: "pending",
     created: now,
-    ttlDeadline: now + st.ttlMs,
+    // #203: 0 = no TTL (the default). A real deadline only when an
+    // explicit JARATE_PAT_TTL_MS is configured.
+    ttlDeadline: st.ttlMs > 0 ? now + st.ttlMs : 0,
   };
   st.requests.set(id, req);
 
@@ -859,7 +890,13 @@ export async function patRequest(
   armTtl(st, req);
   audit(st, "request", { agent, scope, id });
   persist(st);
-  return { ok: true, id, state: "pending", ttl: iso(req.ttlDeadline) };
+  // #203: null ttl = no expiry (pending is blocking until tap).
+  return {
+    ok: true,
+    id,
+    state: "pending",
+    ttl: req.ttlDeadline > 0 ? iso(req.ttlDeadline) : null,
+  };
 }
 
 /** `run` op (begin). The socket server keeps the connection open for the
@@ -1187,6 +1224,28 @@ function markSeen(st: PatVaultState, id: string): boolean {
   return true;
 }
 
+/** Deliver tap feedback via replyInteraction (visible in channel);
+ *  when the transport fails, audit tap-feedback-failed (#204: a tap
+ *  outcome whose feedback never reached the channel must be observable
+ *  in audit.log, not only in the journal). pre/extra mirror the branch's
+ *  own audit line so the failure reads as its decision. Never throws. */
+async function tapReply(
+  st: PatVaultState,
+  d: any,
+  text: string,
+  pre: Record<string, unknown>,
+  extra: Record<string, unknown>,
+): Promise<boolean> {
+  const ok = await replyInteraction(st.botToken, d, text);
+  if (!ok)
+    audit(st, "tap-feedback-failed", pre, {
+      ...extra,
+      interaction: String(d.id),
+      text,
+    });
+  return ok;
+}
+
 function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1204,56 +1263,115 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       await deferInteraction(st.botToken, d);
 
       // 3. Dedupe (gateway redelivery; tokens are single-use anyway).
-      if (!markSeen(st, String(d.id))) return;
+      //    No second reply (the first tap already showed feedback), but
+      //    audit it: a tap with no audit line is how the 2026-10-08
+      //    mismatch bug stayed invisible.
+      const uid = String(d.user?.id ?? "");
+      if (!markSeen(st, String(d.id))) {
+        audit(
+          st,
+          "tap-rejected",
+          { id: parsedId },
+          {
+            reason: "duplicate",
+            user: uid,
+            verb,
+          },
+        );
+        return;
+      }
 
       // 4. Lookup. Miss → stale id / settled elsewhere.
       const req = st.requests.get(parsedId);
       if (!req) {
-        await sendInteractionFollowup(
-          st.botToken,
+        const nf = {
+          reason: "not-found",
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", { id: parsedId }, nf);
+        await tapReply(
+          st,
           d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
+          "[!] tap rejected: request not found or already handled",
+          { id: parsedId },
+          nf,
         );
-        await deleteDeferredAck(st.botToken, d);
         return;
       }
 
-      // 5. Message + channel match (stale-copy / forwarded button).
-      if (
-        String(d.message_id) !== req.messageId ||
-        String(d.channel_id) !== req.channelId
-      ) {
-        await sendInteractionFollowup(
-          st.botToken,
-          d,
-          "[!] request not found or already handled",
-          { ephemeral: true },
-        );
-        await deleteDeferredAck(st.botToken, d);
-        return;
-      }
-
-      // 6. Owner gate (ownerUserIds preferred / ownerUserId legacy).
-      const uid = String(d.user?.id ?? "");
+      // 5. Owner gate BEFORE the mismatch check (#204): a non-owner tap
+      //    on a stale/forwarded button copy must audit as non-owner-tap,
+      //    not be swallowed by mismatch. ownerUserIds preferred /
+      //    ownerUserId legacy.
       if (!isOwnerUser(st.ch, uid)) {
-        audit(st, "non-owner-tap", base(req), { user: uid });
-        await sendInteractionFollowup(
-          st.botToken,
+        audit(st, "non-owner-tap", base(req), {
+          user: uid,
+          verb,
+          interaction: String(d.id),
+        });
+        await tapReply(
+          st,
           d,
-          "[!] only the owner can approve PAT requests",
-          { ephemeral: true },
+          "[!] tap rejected: only the owner can approve PAT requests",
+          base(req),
+          { user: uid, verb, interaction: String(d.id) },
         );
-        await deleteDeferredAck(st.botToken, d);
+        return;
+      }
+
+      // 6. Message + channel match (stale-copy / forwarded button).
+      //    The live payload has NO d.message_id — per the Discord spec
+      //    the component's message is the `message` field on the
+      //    INTERACTION object itself (older payloads nested it in data).
+      //    Reading d.message_id compared "undefined" against the req id,
+      //    so every tap was rejected (RCA 2026-10-08). d.message_id is
+      //    kept only as a defensive last resort.
+      const srcMsgId = d?.message?.id ?? d?.data?.message?.id ?? d?.message_id;
+      if (
+        srcMsgId == null ||
+        String(srcMsgId) !== String(req.messageId) ||
+        String(d.channel_id) !== String(req.channelId)
+      ) {
+        const mm = {
+          reason: "mismatch",
+          user: uid,
+          verb,
+          expected_message: req.messageId,
+          expected_channel: req.channelId,
+          got_message: srcMsgId == null ? null : String(srcMsgId),
+          got_channel: d.channel_id == null ? null : String(d.channel_id),
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", base(req), mm);
+        await tapReply(
+          st,
+          d,
+          "[!] tap rejected: button not on the request message",
+          base(req),
+          mm,
+        );
         return;
       }
 
       // 7. State gate.
       if (req.state !== "pending") {
-        await sendInteractionFollowup(st.botToken, d, "[!] already handled", {
-          ephemeral: true,
-        });
-        await deleteDeferredAck(st.botToken, d);
+        const sh = {
+          reason: "already-handled",
+          user: uid,
+          verb,
+          state: req.state,
+          interaction: String(d.id),
+        };
+        audit(st, "tap-rejected", base(req), sh);
+        await tapReply(
+          st,
+          d,
+          "[!] tap rejected: already handled",
+          base(req),
+          sh,
+        );
         return;
       }
 
@@ -1270,12 +1388,12 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         const chk = checkScopeToken(st, req.scope);
         if (!chk.ok) {
           audit(st, "vault-error", base(req), { user: uid, err: chk.error });
-          await sendInteractionFollowup(
-            st.botToken,
-            d,
-            tapTokenFileText(st, req, chk),
-          );
-          await deleteDeferredAck(st.botToken, d);
+          await tapReply(st, d, tapTokenFileText(st, req, chk), base(req), {
+            user: uid,
+            verb,
+            err: chk.error,
+            interaction: String(d.id),
+          });
           return;
         }
         if (st.transport === "file") {
@@ -1325,11 +1443,24 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
     } catch (e) {
       // M1: never reject. Log + audit + best-effort deliverable feedback.
       console.error("[interactions] vault handler failed:", e);
-      audit(st, "vault-error", { id: parsedId }, { err: String(e) });
-      await sendInteractionFollowup(st.botToken, d, "[!] vault error", {
-        ephemeral: true,
-      });
-      await deleteDeferredAck(st.botToken, d);
+      const err = String(e);
+      audit(
+        st,
+        "vault-error",
+        { id: parsedId },
+        {
+          err,
+          user: String(d.user?.id ?? ""),
+          interaction: String(d.id),
+        },
+      );
+      await tapReply(
+        st,
+        d,
+        "[!] vault error",
+        { id: parsedId },
+        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+      );
     }
   };
 }
@@ -1348,13 +1479,15 @@ function load(st: PatVaultState): void {
     const r: PatRequest = { ...raw, id };
     st.requests.set(id, r);
     if (r.state === "pending") {
-      if (r.ttlDeadline <= now) {
+      // #203: ttlDeadline 0 = no TTL → never expired. A past deadline
+      // only settles when a TTL is configured (explicit env override).
+      if (st.ttlMs > 0 && r.ttlDeadline > 0 && r.ttlDeadline <= now) {
         r.state = "expired";
         r.expiredKind = "ttl";
         audit(st, "recovered-expired", base(r));
         void editRequestMessage(st, r, ttlExpiredText(st), [], "expired");
       } else {
-        armTtl(st, r);
+        armTtl(st, r); // no-op when ttlMs === 0
       }
     } else if (r.state === "approved") {
       if (r.claimDeadline && r.claimDeadline <= now) {
@@ -1424,7 +1557,9 @@ export function startPatVault(opts: StartPatVaultOpts): PatVaultHandle {
       register: opts.secrets?.register ?? registerRuntimeSecrets,
       drop: opts.secrets?.drop ?? dropRuntimeSecrets,
     },
-    ttlMs: envNum("JARATE_PAT_TTL_MS", 300_000),
+    // #203: 0 = no TTL (pending is BLOCKING until tap).
+    // Explicit JARATE_PAT_TTL_MS override still works exactly as before.
+    ttlMs: envNum("JARATE_PAT_TTL_MS", 0),
     claimMs: envNum("JARATE_PAT_CLAIM_MS", 60_000),
     maxPending: envNum("JARATE_PAT_MAX_PENDING", 1),
     budgetPerHour: envNum("JARATE_PAT_BUDGET_PER_HOUR", 5),
