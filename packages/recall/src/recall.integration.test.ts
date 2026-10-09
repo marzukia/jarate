@@ -9,6 +9,15 @@
 // RECALL_PG_ADMIN_HOST (default 127.0.0.1). No committed default password:
 // unset RECALL_PG_ADMIN_PASS skips the suite.
 //
+// Working route on marzuki-hydrogen (2026-10-08 audit, 4/4 in ~3.5s):
+//   RECALL_PG_ADMIN_USER=andryo \
+//   RECALL_PG_ADMIN_PASS="$(cat ~/.config/sudo-pass)" bun test
+// The default RECALL_PG_ADMIN_USER=root is DEAD on that host: ssh root@
+// 127.0.0.1 is key-denied, and the monky role has rolcreatedb=f, so the
+// ssh+sudo-as-postgres admin route is the only one that works there.
+// CI runs no Postgres/Ollama services, so the suite skips in CI; a CI PG
+// service is a separate ticket.
+//
 // Skips cleanly (describe.skip) when Postgres admin or the Ollama embed
 // host is unreachable, so CI-less boxes stay green.
 
