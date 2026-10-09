@@ -88,6 +88,13 @@ export async function ingest(opts: IngestOptions): Promise<IngestStats> {
     }
     let pruned: number | null = null;
     if (!opts.noPrune) {
+      // Trade-off (audit F9): hash = sha256(source+content) and prune is
+      // scoped to THIS run's sources, so a renamed/moved file is a new
+      // source with a new hash — its old chunks survive this run (and any
+      // later run that does not list the old path) and stay searchable
+      // under the stale path. Deliberate: an unscoped prune would risk
+      // deleting chunks on a partial ingest. Pinned by the integration
+      // test "rename leaves the old source row".
       pruned = await pruneOrphans(
         sql,
         chunks.map((c) => c.hash),

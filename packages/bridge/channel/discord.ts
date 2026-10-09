@@ -1196,6 +1196,20 @@ export function isOlderSnowflake(a: string, b: string | null): boolean {
   return false;
 }
 
+/** Interaction actor id. Current Discord gateway sends the user nested
+ *  under `member.user` for guild interactions — top-level `user` is
+ *  ABSENT (live capture 2026-10-08: every tap audited non-owner with
+ *  user="" because handlers read d.user.id). Top-level `user` is kept
+ *  as fallback for DM / older payload shapes. */
+export function interactionUserId(d: any): string {
+  return String(d?.user?.id ?? d?.member?.user?.id ?? "");
+}
+
+export function interactionUserName(d: any): string | undefined {
+  const n = d?.user?.username ?? d?.member?.user?.username;
+  return n != null ? String(n) : undefined;
+}
+
 /** Parse a raw gateway payload, preserving snowflake precision.
  *  Discord serializes snowflake ids as JSON strings today, but any bare
  *  integer >= 16 digits would be rounded by JSON.parse beyond 2^53 —
@@ -1674,43 +1688,6 @@ export async function editInteractionMessage(
       "[interactions] edit failed:",
       sanitizeSensitiveText(String(e)),
     );
-  }
-}
-
-/** Create a followup message on an interaction. The callback is already
- *  spent (defer consumed it — Discord allows exactly ONE callback
- *  response per interaction), so this goes to the interaction webhook.
- *  NOTE: the endpoint is the webhook ROOT — POST /webhooks/{app.id}/
- *  {token} (wait is always true for interaction webhooks). The
- *  /webhooks/{app}/{token}/messages form is the INCOMING-webhook
- *  "Execute Webhook" route; interaction tokens reject it with 400 50035
- *  (errors.webhook_service: ENUM_TYPE_COERCE on "messages") — RCA
- *  2026-10-08, vault tap feedback invisible. Errors are swallowed (a
- *  failed followup must not kill the tap flow). Returns true when the
- *  followup was delivered, false when the transport failed — callers
- *  audit the failure (tap-feedback-failed, #204). */
-export async function sendInteractionFollowup(
-  botToken: string,
-  d: any,
-  text: string,
-  opts?: { ephemeral?: boolean },
-): Promise<boolean> {
-  try {
-    await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
-      method: "POST",
-      body: {
-        content: egressText(text), // secret censor
-        ...(opts?.ephemeral ? { flags: 64 } : {}),
-      },
-      fullError: true, // #210
-    });
-    return true;
-  } catch (e) {
-    console.error(
-      "[interactions] followup failed:",
-      sanitizeSensitiveText(String(e)),
-    );
-    return false;
   }
 }
 

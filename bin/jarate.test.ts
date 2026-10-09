@@ -97,7 +97,10 @@ function fixture(): Fixture {
   // stub getent: canned passwd + group for the hop-target derivation
   // (issue #147) — hermetic on every machine. Base = ONE candidate
   // ("operator", uid 1000, bash, in wheel); "svc" (uid 1001, nologin)
-  // must never be a candidate. The 0/2-candidate tests rewrite the two
+  // must never be a candidate; "peer-home" (uid 1002, bash, NOT in wheel)
+  // is the journal-errors peer's passwd entry (audit F8: per-name
+  // lookups answer it, so the remote probe's uid slot is non-empty) but
+  // is never a hop candidate. The 0/2-candidate tests rewrite the two
   // files before running.
   const getentPasswd = path.join(tmp, "getent.passwd");
   const getentWheel = path.join(tmp, "getent.wheel");
@@ -107,6 +110,7 @@ function fixture(): Fixture {
       "root:x:0:0:root:/root:/usr/sbin/nologin",
       "operator:x:1000:1000:Operator:/home/operator:/bin/bash",
       "svc:x:1001:1001:svc account:/home/svc:/usr/sbin/nologin",
+      "peer-home:x:1002:1002:Peer:/home/peer-home:/bin/bash",
       "",
     ].join("\n"),
   );
@@ -120,7 +124,15 @@ if [ \${1:-} = "group" ] && [ \${2:-} = "wheel" ]; then
 elif [ \${1:-} = "group" ]; then
   exit 2
 elif [ \${1:-} = "passwd" ]; then
-  if [ -z \${2:-} ]; then cat "${getentPasswd}"; else exit 2; fi
+  if [ -z \${2:-} ]; then
+    cat "${getentPasswd}"
+  else
+    # per-name lookup (audit F8): answer from the fixture file, rc 2 when
+    # the name is absent (real getent contract)
+    l="$(awk -F: -v u="$2" '$1==u {print; exit}' "${getentPasswd}")"
+    [ -n "$l" ] || exit 2
+    printf '%s\n' "$l"
+  fi
 else
   exit 2
 fi
@@ -216,6 +228,21 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   );
 
   const env = { ...process.env } as Record<string, string>;
+  // Ambient-env hygiene (audit F1): scrub every var the entrypoint reads
+  // (JARATE_*, AGENT_SAY_*, RAG_PROJECT) before the explicit fixture
+  // values below are set, same explicit-scrub pattern as the dispatch
+  // #110 fixture. A caller's shell must not flip a test: RAG_PROJECT
+  // leaks into the rag tests (src:ambient), JARATE_SSH_HOST into the
+  // #147 derivation.
+  for (const k of Object.keys(env)) {
+    if (
+      k === "RAG_PROJECT" ||
+      k.startsWith("JARATE_") ||
+      k.startsWith("AGENT_SAY_")
+    ) {
+      delete env[k];
+    }
+  }
   env.HOME = home;
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.XDG_RUNTIME_DIR = path.join(tmp, "xdg");
@@ -2255,6 +2282,9 @@ exit 1
     // the password crossed ssh stdin exactly once, and sudo received it
     expect(rec.sshStdin).toBe(PASS);
     expect(rec.sudoPw).toBe(PASS);
+    // audit F8: the getent stub answers per-name lookups, so the remote
+    // probe's uid slot is the fixture's peer-home uid (1002), not empty
+    expect(remote).toContain("XDG_RUNTIME_DIR=/run/user/1002");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 

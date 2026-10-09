@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  collectInflightJobs,
   formatJobsView,
   type InflightJob,
   type JobHistoryEntry,
@@ -63,6 +64,26 @@ describe("parseJobsFromPs (/jobs)", () => {
     ]);
   });
 
+  test("parses dispatch/-location wrapper lines (repo-relative invocations)", () => {
+    // A wrapper run from the repo checkout appears as dispatch/jarate-bg
+    // (or dispatch/pi-bg pre-rename), not scripts/*. The parser must
+    // accept both locations — the ps-grep filter does (D3).
+    const ps = [
+      "5001 00:05 /usr/bin/bash /repo/dispatch/jarate-bg worker dispatch-loc task",
+      "5002 00:06 /usr/bin/bash /repo/dispatch/pi-bg reviewer dispatch-loc review",
+      "",
+    ].join("\n");
+    expect(parseJobsFromPs(ps)).toEqual([
+      { id: null, age: "00:05", profile: "worker", task: "dispatch-loc task" },
+      {
+        id: null,
+        age: "00:06",
+        profile: "reviewer",
+        task: "dispatch-loc review",
+      },
+    ]);
+  });
+
   test("parses wrapper lines: pid, age, profile, task; dead pid => id null", () => {
     const ps = [
       "4194001 00:42 /usr/bin/bash /home/monky/scripts/pi-bg worker Resume the jarate migration stuff",
@@ -108,6 +129,97 @@ describe("parseJobsFromPs (/jobs)", () => {
 
   test("empty input is empty", () => {
     expect(parseJobsFromPs("")).toEqual([]);
+  });
+});
+
+// ─── collectInflightJobs full pipeline (ps + grep + parse, D3) ───────────
+// The #151 rename was covered at the parser level, but the grep filter in
+// collectInflightJobs still only matched scripts/pi-bg — a fail-open run
+// (pre-snapshot argv `bash .../scripts/jarate-bg worker ...`) was filtered
+// out before it ever reached the parser. This test exercises the real
+// ps|grep|parse pipeline against spawned wrapper processes.
+
+describe("collectInflightJobs (full ps+grep pipeline)", () => {
+  // The test process (and its children) usually runs inside a pi-bg
+  // ticket cgroup; a fake wrapper left there would resolve to the SAME
+  // ticket id as a live wrapper and be deduped away (youngest etime
+  // loses). Move each fake into a fresh background.slice cgroup so its
+  // id resolves null and it is counted on its own line.
+  const movePidToOwnCgroup = (pid: number | undefined): boolean => {
+    if (pid === undefined) return false;
+    const uid = process.getuid?.();
+    if (uid === undefined) return false;
+    const dir = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/background.slice/jarate-jobs-test-${pid}`;
+    try {
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "cgroup.procs"), String(pid));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test("fail-open wrapper cmdlines are counted: scripts/jarate-bg + dispatch/jarate-bg", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-jobs-ps-"));
+    for (const sub of ["scripts", "dispatch"]) {
+      fs.mkdirSync(path.join(tmp, sub), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmp, sub, "jarate-bg"),
+        "#!/usr/bin/env bash\nsleep 30\n",
+        { mode: 0o755 },
+      );
+    }
+    const procs = [
+      spawn(
+        "bash",
+        [
+          path.join(tmp, "scripts", "jarate-bg"),
+          "worker",
+          "pipeline-scripts-task",
+        ],
+        { stdio: "ignore" },
+      ),
+      spawn(
+        "bash",
+        [
+          path.join(tmp, "dispatch", "jarate-bg"),
+          "reviewer",
+          "pipeline-dispatch-task",
+        ],
+        { stdio: "ignore" },
+      ),
+    ];
+    const cgroups = procs.map((p) => movePidToOwnCgroup(p.pid));
+    try {
+      const t0 = Date.now();
+      let jobs: InflightJob[] = [];
+      while (Date.now() - t0 < 5000) {
+        jobs = collectInflightJobs();
+        const have = (t: string) => jobs.some((j) => j.task === t);
+        if (have("pipeline-scripts-task") && have("pipeline-dispatch-task"))
+          break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(jobs.some((j) => j.task === "pipeline-scripts-task")).toBe(true);
+      expect(jobs.some((j) => j.task === "pipeline-dispatch-task")).toBe(true);
+    } finally {
+      procs.forEach((p) => {
+        p.kill();
+      });
+      // wait for the pids to exit so the cgroup dirs empty out
+      await new Promise((r) => setTimeout(r, 100));
+      cgroups.forEach((ok, i) => {
+        if (!ok) return;
+        const uid = process.getuid?.();
+        const dir = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/background.slice/jarate-jobs-test-${procs[i].pid}`;
+        try {
+          fs.rmdirSync(dir);
+        } catch {
+          /* process still draining; the dir is inert */
+        }
+      });
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 

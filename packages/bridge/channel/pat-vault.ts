@@ -42,6 +42,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  interactionUserId,
+  interactionUserName,
   replyInteraction,
   sendDiscordMessage,
 } from "./discord";
@@ -1266,7 +1268,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
       //    No second reply (the first tap already showed feedback), but
       //    audit it: a tap with no audit line is how the 2026-10-08
       //    mismatch bug stayed invisible.
-      const uid = String(d.user?.id ?? "");
+      const uid = interactionUserId(d);
       if (!markSeen(st, String(d.id))) {
         audit(
           st,
@@ -1434,7 +1436,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         await editRequestMessage(
           st,
           req,
-          deniedText(String(d.user?.username ?? uid)),
+          deniedText(interactionUserName(d) ?? uid),
           [],
           "denied",
         );
@@ -1450,7 +1452,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         { id: parsedId },
         {
           err,
-          user: String(d.user?.id ?? ""),
+          user: interactionUserId(d),
           interaction: String(d.id),
         },
       );
@@ -1459,7 +1461,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         d,
         "[!] vault error",
         { id: parsedId },
-        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+        { err, user: interactionUserId(d), interaction: String(d.id) },
       );
     }
   };

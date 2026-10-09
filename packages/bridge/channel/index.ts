@@ -49,6 +49,8 @@ import {
   getDiscordChannelId,
   getDiscordStates,
   getDiscordToken,
+  interactionUserId,
+  interactionUserName,
   loadChannelStateFile,
   loadDiscordAttachment,
   loadPersistedCursors,
@@ -4432,12 +4434,11 @@ export function buildInteractionHandler(
         ch,
         d.data?.name,
         vaultArg ?? opt?.value ?? undefined,
-        d.user?.id,
+        interactionUserId(d),
         true,
         {
           guildId: d.guild_id != null ? String(d.guild_id) : undefined,
-          username:
-            d.user?.username != null ? String(d.user.username) : undefined,
+          username: interactionUserName(d),
         },
       );
       text = r.btw

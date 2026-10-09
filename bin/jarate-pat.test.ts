@@ -433,6 +433,23 @@ describe("jarate-pat run-raw: tool path (fake vault)", () => {
       await v.stop();
     }
   });
+
+  test("unknown subcommand -> rc 2 usage with the jarate-vault deprecation line", async () => {
+    // audit wave-fidelity F3: the #209 deprecation string is only emitted
+    // on this path; pin it so it cannot rot
+    const v = await new FakeVault().start();
+    try {
+      const r = await runTool(["bogus"], v.env());
+      expect(r.code).toBe(2);
+      const doc = JSON.parse(r.out) as Doc;
+      expect(doc.ok).toBe(false);
+      expect(String(doc.error)).toBe(
+        "usage: jarate-pat <request|run|run-raw|status> ...\ndeprecated: use jarate-vault (the github-pat kind covers PATs)",
+      );
+    } finally {
+      await v.stop();
+    }
+  });
 });
 
 describe("jarate-pat run: file mode (fake vault)", () => {

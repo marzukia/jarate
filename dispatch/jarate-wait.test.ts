@@ -185,11 +185,18 @@ describe("jarate-wait rc contract", () => {
     const r = await f.run(["--since", "100", "--timeout", "5", "--check", "1"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("CALLBACK m-emb");
-    // serialization order: title, description, fields (name: value)
+    // audit dispatch-core P14: pin the serialization ORDER, not just
+    // membership. The bridge order is title, description, then fields
+    // as "name: value"; the detail block after the CALLBACK line is
+    // exactly those lines joined with \n plus the trailing printf \n.
+    // A reorder (e.g. fields before description) passes the old
+    // toContain triple and fails this.
     const detail = r.out.split("CALLBACK m-emb\n")[1];
-    expect(detail).toContain("done \u00b7 20991231-235959-1");
-    expect(detail).toContain("ok: 12 pass, 0 fail");
-    expect(detail).toContain("result: all green");
+    expect(detail).toBe(
+      "done \u00b7 20991231-235959-1\n" +
+        "```\nok: 12 pass, 0 fail\n```\n" +
+        "result: all green\n",
+    );
   });
 
   test("B1: content + embeds -> content wins (no double print)", async () => {

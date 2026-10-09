@@ -7,6 +7,7 @@ import { fmtTokensLC } from "./ctxwatch";
 import {
   clearDiscordStatesForTest,
   getChannelCursor,
+  interactionUserId,
   loadPersistedCursors,
   pollDiscord,
   seedChannelStateForTest,
@@ -134,6 +135,59 @@ import { clearWorktreeState } from "./worktree";
  *  assertions predate the wrap; collapse wrap-newlines back to a single
  *  space on the RECEIVED side before matching. */
 const unwarped = (s: string) => s.replace(/\n +/g, " ");
+
+/** F2 (test-fidelity audit): the interaction network contract — the ONLY
+ *  (method, URL) pairs the bridge may send for one interaction:
+ *   - callback (defer / plain reply): POST  /interactions/{id}/{token}/callback
+ *   - edit the deferred message:       PATCH /webhooks/{app}/{token}/messages/@original
+ *   - create followup:                POST  /webhooks/{app}/{token}  (webhook ROOT)
+ *  The followup is the webhook ROOT: the incoming-webhook form
+ *  /webhooks/{app}/{token}/messages is rejected 400 50035 (RCA 2026-10-08).
+ *  Returns a violation string for any other call, null when allowed.
+ *  The vault-block stub additionally allows the plain channel message
+ *  routes (card post / card edit) via allowChannelMessages. */
+const interactionUrlViolation = (
+  url: string,
+  method: string,
+  allowChannelMessages = false,
+): string | null => {
+  const u = String(url);
+  const m = method ?? "GET";
+  if (
+    m === "POST" &&
+    /^https:\/\/discord\.com\/api\/v10\/interactions\/[^/]+\/[^/]+\/callback$/.test(
+      u,
+    )
+  )
+    return null;
+  if (
+    m === "PATCH" &&
+    /^https:\/\/discord\.com\/api\/v10\/webhooks\/[^/]+\/[^/]+\/messages\/@original$/.test(
+      u,
+    )
+  )
+    return null;
+  if (
+    m === "POST" &&
+    /^https:\/\/discord\.com\/api\/v10\/webhooks\/[^/]+\/[^/]+$/.test(u)
+  )
+    return null;
+  if (allowChannelMessages) {
+    if (
+      m === "POST" &&
+      /^https:\/\/discord\.com\/api\/v10\/channels\/[^/]+\/messages$/.test(u)
+    )
+      return null;
+    if (
+      m === "PATCH" &&
+      /^https:\/\/discord\.com\/api\/v10\/channels\/[^/]+\/messages\/[^/]+$/.test(
+        u,
+      )
+    )
+      return null;
+  }
+  return `${m} ${u}`;
+};
 
 describe("chunkText", () => {
   test("short fenced block is unchanged", () => {
@@ -5055,19 +5109,25 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   let pi: any;
   let ctx: any;
   let calls: { url: string; method: string; body?: any }[];
+  let urlViolations: string[];
 
   const d = (name: string, extra: Record<string, any> = {}) => ({
     id: "i1",
     token: "tok123",
     application_id: "app1",
     channel_id: "888",
-    user: { id: "owner1" },
+    // Live guild shape (capture 2026-10-08): the actor lives at
+    // member.user; guild INTERACTION_CREATE payloads carry NO top-level
+    // user. The top-level-only DM/older shape is kept by exactly one test
+    // in this file (see the #206 block, "status (owner)").
+    member: { user: { id: "owner1", username: "OwnerOne" } },
     data: { name, options: extra.options },
     ...extra,
   });
 
   beforeEach(() => {
     calls = [];
+    urlViolations = [];
     pi = { setModel: async () => true, sendMessage: () => {} };
     ctx = {
       cwd: "/tmp",
@@ -5080,6 +5140,11 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       model: { id: "cur", name: "Cur" },
     };
     globalThis.fetch = (async (url: any, init?: any) => {
+      // F2: pin the interaction URL contract — record every call that is
+      // not one of the allowed (method, route) pairs; asserted clean at
+      // test end (afterEach).
+      const v = interactionUrlViolation(String(url), init?.method ?? "GET");
+      if (v) urlViolations.push(v);
       calls.push({
         url: String(url),
         method: init?.method ?? "GET",
@@ -5095,6 +5160,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   });
 
   afterEach(() => {
+    // F2: no interaction call may land outside the allowed routes.
+    expect(urlViolations).toEqual([]);
     clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     globalThis.fetch = realFetch;
   });
@@ -5159,7 +5226,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       token: "tok123",
       application_id: "app1",
       channel_id: "888",
-      user: { id: "owner1" },
+      // live guild shape: actor at member.user, no top-level user
+      member: { user: { id: "owner1", username: "OwnerOne" } },
       type: 3,
       data: {
         custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
@@ -5172,6 +5240,38 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     expect(calls.length).toBe(0);
   });
 
+  test("type-3 guild-shape payload resolves the actor through the shared path (F4)", async () => {
+    // The live type-3 (button tap) payload has no top-level user and no
+    // message — the actor is at member.user. The index router forwards the
+    // payload intact to the component handlers, and those resolve the actor
+    // via the SAME shared helper (interactionUserId) the tap path uses —
+    // see vault.test.ts "guild payload (live capture 2026-10-08)" tests
+    // for the real-handler side.
+    let resolved: string | undefined;
+    let resolvedName: string | undefined;
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-i", null, {
+      handleVaultComponent: async (dd: any) => {
+        resolved = interactionUserId(dd);
+        resolvedName = dd?.member?.user?.username;
+      },
+    });
+    await h({
+      id: "i3",
+      token: "tok123",
+      application_id: "app1",
+      channel_id: "888",
+      guild_id: "guild1",
+      type: 3,
+      member: { user: { id: "owner1", username: "OwnerOne" } },
+      data: {
+        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
+      },
+    });
+    expect(resolved).toBe("owner1"); // member.user resolved, not ""
+    expect(resolvedName).toBe("OwnerOne"); // payload forwarded intact
+    expect(calls.length).toBe(0); // the router itself made no network call
+  });
+
   test("command path with a missing name fails readable, not TypeError", async () => {
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
     await h({
@@ -5179,7 +5279,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       token: "t",
       application_id: "app1",
       channel_id: "888",
-      user: { id: "owner1" },
+      member: { user: { id: "owner1", username: "OwnerOne" } },
       type: 2,
       data: {},
     }); // must not throw
@@ -5266,7 +5366,12 @@ describe("buildInteractionHandler (defer-first ack)", () => {
 
   test("owner-only command from a non-owner is refused on the interaction path (#169)", async () => {
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(d("status", { user: { id: "not-owner" } }));
+    // live guild shape: the non-owner actor is at member.user
+    await h(
+      d("status", {
+        member: { user: { id: "not-owner", username: "NotOwner" } },
+      }),
+    );
     // defer first, then the refusal edits the deferred message
     expect(JSON.parse(calls[0].body).type).toBe(5);
     const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
@@ -5279,7 +5384,10 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   test("no owner configured: the interaction refusal names the misconfiguration (#169)", async () => {
     const chNoOwner = { ...ch, ownerUserId: undefined };
     const h = buildInteractionHandler(pi, ctx, chNoOwner, "tok-i");
-    await h(d("status", { user: { id: "u1" } }));
+    // live guild shape: actor at member.user (uid "u1", not the owner)
+    await h(
+      d("status", { member: { user: { id: "u1", username: "Someone" } } }),
+    );
     const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
     expect(JSON.parse(edit!.body).content).toContain("no owner configured");
   });
@@ -7917,8 +8025,11 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(liveFile)).toBe(false); // moved aside
   });
 
-  test("over the cap: restart op — placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+  test("restart op: placeholder, seeded:false marker, file move + stale archive, shutdown", async () => {
+    // (was "over the cap" — the cap check is gone since c863c341: every
+    // handoff-qualifying compact restarts; this test exercises the restart
+    // chain, not a size gate.)
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864)); // 1.5 MB
     const stale = path.join(sessDir, "old.jsonl");
     fs.writeFileSync(stale, "old session");
@@ -7950,7 +8061,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
   });
 
   test("/stop during the handoff op: cancelled, marker cleared, cursor restored, file untouched", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
@@ -7966,8 +8077,8 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(restarter).toEqual([]);
   });
 
-  test("handoff disabled: over-cap file, no restart op", async () => {
-    writeSettings({ enabled: false, restartFileCap: 1000, storeDir });
+  test("handoff disabled: large file, no restart op", async () => {
+    writeSettings({ enabled: false, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(2048));
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     handlers.session_compact?.({ type: "session_compact" }, ctx);
@@ -8039,7 +8150,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
   });
 
   test("settle-flushed /compact re-opens the window: B skips, restarts after that compact's settle", async () => {
-    writeSettings({ enabled: true, restartFileCap: 1000, storeDir });
+    writeSettings({ enabled: true, storeDir });
     fs.writeFileSync(liveFile, "x".repeat(1_572_864));
 
     // auto-compact in flight: no bridge window (startCompact not involved),
@@ -9919,6 +10030,62 @@ describe("wave 2c bridge commands", () => {
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined }); // bare /jobs: view, no arg
   });
 
+  test("text /vault routes to the vault handler (#206: matchCommand + case vault)", async () => {
+    // The plain-text path (matchCommand regex -> runChannelCommand case
+    // "vault") is distinct from the slash-command path: a misfired regex or
+    // a dropped switch case silently answers "unknown command" or hands
+    // "/vault status" to the agent as a prompt.
+    // The startup path auto-registers a vault handle per connected channel
+    // (async), so pin the no-handle state explicitly for a deterministic
+    // refusal.
+    __setVaultHandleForTest("ch1", null);
+    expect(matchCommand("/vault status")).toEqual({
+      name: "vault",
+      arg: "status",
+    });
+    expect(matchCommand("/vault")).toEqual({ name: "vault", arg: undefined });
+    // no vault handle: visible refusal, not a prompt
+    await handleInbound(pi, inbound("/vault status", "mv0"), ctx);
+    expect(posts().some((t) => t.includes("vault not running"))).toBe(true);
+    // real vault on the channel: the text command reaches vaultSlash
+    const vtmp = path.join(tmp, "vault");
+    const vh = startVault({
+      ch: {
+        id: "ch1",
+        name: "Test",
+        type: "discord",
+        botToken: "tok1",
+        ownerUserId: OWNER,
+      } as any,
+      botToken: "tok1",
+      stateDir: path.join(vtmp, "state"),
+      xdgDir: path.join(vtmp, "xdg"),
+      vaultDir: vtmp,
+      knownDir: path.join(vtmp, "known"),
+      secretsDir: path.join(vtmp, "secrets"),
+      stateFile: path.join(vtmp, "state.json"),
+      auditFile: path.join(vtmp, "audit.log"),
+      legacyPatsDir: path.join(vtmp, "legacy"),
+      legacyDefaultPatFile: path.join(vtmp, "marzukia-pat"),
+      transport: "socket",
+    });
+    __setVaultHandleForTest("ch1", vh);
+    try {
+      await vh.ready;
+      fetchCalls.length = 0;
+      await handleInbound(pi, inbound("/vault status", "mv1"), ctx);
+      expect(
+        posts().some((t) =>
+          t.includes("vault: no pending or active credentials"),
+        ),
+      ).toBe(true);
+    } finally {
+      stopVault(vh);
+      __setVaultHandleForTest("ch1", null);
+      __vaultResetForTest();
+    }
+  });
+
   test("runUsageLine: pricing matches pi-token-cost.py (#40)", () => {
     expect(
       runUsageLine({
@@ -11543,6 +11710,7 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
   ];
 
   let calls: Array<{ url: string; method: string; body: any }>;
+  let urlViolations: string[] = [];
   let tmp: string;
   let vaultHandle: any;
   let pi: any;
@@ -11576,9 +11744,15 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
     application_id: "app1",
     channel_id: "888",
     guild_id: "guild1",
-    user: {
-      id: userId,
-      username: userId === "owner1" ? "OwnerOne" : "Somebody",
+    // Live guild shape (capture 2026-10-08): the actor lives at
+    // member.user; guild INTERACTION_CREATE payloads carry NO top-level
+    // user. The one top-level-only (DM/older-shape) test in this file is
+    // "status (owner)" below — the helper must still accept it.
+    member: {
+      user: {
+        id: userId,
+        username: userId === "owner1" ? "OwnerOne" : "Somebody",
+      },
     },
     data: { name, options: [] as any[], ...extra },
   });
@@ -11592,9 +11766,13 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
     };
   }
 
-  /** Fetch stub recording every call; channel message POSTs get real ids. */
+  /** Fetch stub recording every call; channel message POSTs get real ids.
+   *  F2: every call is checked against the interaction URL contract
+   *  (plus the vault's plain channel-message routes); violations are
+   *  asserted clean in afterEach. */
   function stubFetch() {
     calls = [];
+    urlViolations = [];
     let msgSeq = 0;
     globalThis.fetch = (async (url: any, init?: any) => {
       const method = init?.method ?? "GET";
@@ -11602,6 +11780,8 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
         method !== "GET" && init?.body
           ? JSON.parse(init.body as string)
           : undefined;
+      const v = interactionUrlViolation(String(url), method, true);
+      if (v) urlViolations.push(v);
       calls.push({ url: String(url), method, body });
       if (method === "POST" && String(url).includes("/channels/888/messages")) {
         return jsonResp(200, { id: `m${++msgSeq}` });
@@ -11678,6 +11858,8 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
   }
 
   afterEach(() => {
+    // F2: no interaction call may land outside the allowed routes.
+    expect(urlViolations).toEqual([]);
     globalThis.fetch = realFetch;
     if (vaultHandle) {
       stopVault(vaultHandle);
@@ -11712,7 +11894,15 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
     });
     expect(req.ok).toBe(true);
     const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(d("vault", { options: [{ type: 1, name: "status" }] }) as any);
+    // DM/older payload shape: top-level user ONLY (no member) — the single
+    // test in this file that keeps this shape; interactionUserId must still
+    // resolve the owner from it (F1). If the top-level fallback were gone,
+    // uid would be "" and this owner-only command would refuse.
+    await h({
+      ...d("vault", { options: [{ type: 1, name: "status" }] }),
+      user: { id: "owner1", username: "OwnerOne" },
+      member: undefined,
+    } as any);
     const text = deferredTexts().at(-1)!;
     expect(text).toContain("[vault: 1 pending, 0 active]");
     expect(text).toContain("github-pat/marzukia/jarate:write");

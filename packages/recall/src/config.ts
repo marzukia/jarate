@@ -48,7 +48,11 @@ export function parseDsn(dsn: string): DsnOptions {
   if (/^postgres(ql)?:\/\//.test(dsn)) {
     const u = new URL(dsn);
     const out: DsnOptions = {
-      host: u.hostname,
+      // socket URL (postgres:///rag) has an empty hostname: leave host
+      // UNSET (not "") so the driver's PG* fallback / socket default
+      // decides, same as a key=value DSN without host=. An empty-string
+      // host would be treated as a (weird) TCP host by the driver.
+      host: u.hostname || undefined,
       database: u.pathname.replace(/^\//, ""),
     };
     if (u.port) out.port = Number(u.port);

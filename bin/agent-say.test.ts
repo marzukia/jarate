@@ -73,10 +73,29 @@ function fixture(): Fixture {
   // that INCREMENTS per call (99, 100, ...): a dedupe test re-running agent-say
   // can tell a fresh POST (new id) from the receipt's id being re-echoed.
   // APPENDS to the capture so POSTs are countable across re-runs.
+  // Failure injection (audit F5): CURL_FAIL_CALLS (space-separated call
+  // numbers) makes those calls exit 3 like a real network failure;
+  // CURL_RESP_FILE (if set) cats that file as the response body (for
+  // Discord error JSONs without an .id).
   const curl = path.join(bin, "curl");
   fs.writeFileSync(
     curl,
-    `#!/bin/sh\n{ for a in "$@"; do printf '%s\\n' "$a"; done; } >> "$CURL_CAPTURE"\ncat > "$CURL_STDIN_CAPTURE"\nn=$(cat "$CURL_CALLS" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CURL_CALLS"\necho "{\\"id\\":\\"$((98+n))\\"}"\n`,
+    [
+      "#!/bin/sh",
+      '{ for a in "$@"; do printf \'%s\\n\' "$a"; done; } >> "$CURL_CAPTURE"',
+      'cat > "$CURL_STDIN_CAPTURE"',
+      'n=$(cat "$CURL_CALLS" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CURL_CALLS"',
+      'if [ -n "$CURL_FAIL_CALLS" ] && printf \'%s\\n\' $CURL_FAIL_CALLS | grep -qx "$n"; then',
+      '  echo "curl: (7) Failed to connect" >&2',
+      "  exit 3",
+      "fi",
+      'if [ -n "$CURL_RESP_FILE" ] && [ -f "$CURL_RESP_FILE" ]; then',
+      '  cat "$CURL_RESP_FILE"',
+      "  exit 0",
+      "fi",
+      'echo "{\\"id\\":\\"$((98+n))\\"}"',
+      "",
+    ].join("\n"),
   );
   fs.chmodSync(curl, 0o755);
 
@@ -86,6 +105,20 @@ function fixture(): Fixture {
   fs.chmodSync(bunStub, 0o755);
 
   const env = { ...process.env } as Record<string, string>;
+  // Ambient-env hygiene (audit F1): scrub the vars the script reads
+  // (AGENT_SAY_*, JARATE_*, RAG_PROJECT) before the explicit fixture
+  // values below, same explicit-scrub pattern as the dispatch #110
+  // fixture. An ambient AGENT_SAY_FORCE=1 would bypass the allowlist
+  // tests; PI_BOT_TOKEN is deleted below like the others.
+  for (const k of Object.keys(env)) {
+    if (
+      k === "RAG_PROJECT" ||
+      k.startsWith("JARATE_") ||
+      k.startsWith("AGENT_SAY_")
+    ) {
+      delete env[k];
+    }
+  }
   env.HOME = home;
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.CURL_CAPTURE = capture;
@@ -475,5 +508,62 @@ describe("agent-say outbox dedupe (2026-10-06 abort incident)", () => {
     expect(r2.code).toBe(0);
     expect(r2.out.trim()).toBe("sent 100");
     expect(postCount(f.capture)).toBe(2);
+  });
+});
+
+describe("agent-say failure paths + receipt ordering (audit F5)", () => {
+  const PEERS: Record<string, string> = {
+    monky: "1111111111111111111",
+  };
+
+  test("curl rc!=0 -> exit 1 'curl failed', no receipt written", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    const r = await f.run(["1111111111111111111", "hello monky"], undefined, {
+      CURL_FAIL_CALLS: "1",
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("curl failed");
+    // the attempt still hit the endpoint, but a failed POST must not
+    // leave a receipt behind
+    expect(postCount(f.capture)).toBe(1);
+    expect(fs.existsSync(outboxPath(f.rt))).toBe(false);
+  });
+
+  test("discord error JSON without .id -> exit 1 'discord error', no receipt", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    const respFile = path.join(f.tmp, "resp.json");
+    fs.writeFileSync(respFile, '{"code":10014,"message":"Unknown Channel"}');
+    const r = await f.run(["1111111111111111111", "hello monky"], undefined, {
+      CURL_RESP_FILE: respFile,
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("discord error");
+    expect(r.err).toContain("Unknown Channel");
+    expect(fs.existsSync(outboxPath(f.rt))).toBe(false);
+  });
+
+  test("failed POST writes no receipt; retry posts fresh (2026-10-06 semantics)", async () => {
+    const f = fixture();
+    f.setPeers(PEERS);
+    // first attempt: POST call 1 fails. A receipt written before the POST
+    // (the 2026-10-06 incident) would suppress this retry — it must not.
+    const r1 = await f.run(["1111111111111111111", "hello monky"], undefined, {
+      CURL_FAIL_CALLS: "1",
+    });
+    expect(r1.code).toBe(1);
+    expect(r1.err).toContain("curl failed");
+    expect(fs.existsSync(outboxPath(f.rt))).toBe(false);
+    // retry: POST call 2 succeeds -> a FRESH post (id 100), not a dedupe
+    // echo of a receipt
+    const r2 = await f.run(["1111111111111111111", "hello monky"]);
+    expect(r2.code).toBe(0);
+    expect(r2.out.trim()).toBe("sent 100");
+    expect(postCount(f.capture)).toBe(2);
+    const box = readOutbox(f.rt);
+    expect(box.length).toBe(1);
+    expect(box[0].id).toBe("100");
+    expect(box[0].text_sha256).toBe(sha256("hello monky"));
   });
 });

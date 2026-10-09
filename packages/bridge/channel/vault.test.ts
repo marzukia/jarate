@@ -84,16 +84,13 @@ class FakeDiscord {
       if (method === "POST" && /\/channels\/[^/]+\/messages$/.test(url)) {
         return resp(200, { id: `msg-${++this.msgSeq}` });
       }
-      if (
-        method === "POST" &&
-        url.includes("/webhooks/") &&
-        url.includes("messages?wait=true")
-      ) {
-        return resp(200, { id: "followup" });
-      }
       // Interaction webhook (RCA 2026-10-08): POST /webhooks/{app}/{token}
       // is Create Followup (webhook ROOT — wait is implicit); the
-      // /messages/@original subroute edits/deletes the deferred ack.
+      // /messages/@original subroute edits/deletes the deferred ack. The
+      // incoming-webhook form /webhooks/{app}/{token}/messages?wait=true is
+      // NOT a valid interaction route (live Discord: 400 50035) — the wh
+      // branch below 404s it, matching reality (audit F2: the old 200 here
+      // masked any regression back to that URL).
       const wh = url.match(/\/webhooks\/[^/]+\/[^/]+(\/.*)?$/);
       if (wh) {
         const rest = wh[1] ?? "";
@@ -1154,6 +1151,48 @@ describe("tap rejection feedback (RCA 2026-10-08)", () => {
     }
   }, 15000);
 
+  test("guild payload (live capture 2026-10-08): user under member.user, NO top-level user — owner tap approves", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      const d = mkD(`i-guild-${id}`, `vault:approve:${id}`, {
+        message: { id: cred!.messageId },
+        member: { user: { id: OWNER, username: "Owner" } },
+      });
+      delete d.user; // live shape: guild INTERACTION_CREATE omits top-level user
+      await f.h.handleVaultComponent(d);
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      const app = f.auditEvents().find((e) => e.event === "approve");
+      expect(app).toBeTruthy();
+      expect(app!.user).toBe(OWNER);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("guild payload: non-owner via member.user audits the REAL uid (not empty string)", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      const d = mkD(`i-guild-nn-${id}`, `vault:approve:${id}`, {
+        message: { id: cred!.messageId },
+        member: { user: { id: OTHER, username: "Other" } },
+      });
+      delete d.user;
+      await f.h.handleVaultComponent(d);
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      const ev = f.auditEvents().find((e) => e.event === "non-owner-tap");
+      expect(ev).toBeTruthy();
+      expect(ev!.user).toBe(OTHER);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
   test("wrong message: rejected + audited mismatch + visible reply", async () => {
     const f = mkVault();
     try {
@@ -1238,10 +1277,123 @@ describe("tap rejection feedback (RCA 2026-10-08)", () => {
       await f.h.handleVaultComponent(d);
       // exactly one visible reply for two deliveries
       expect(f.fd.replies(`i-dup-${id}`).length).toBe(1);
+      // Callback consumption: both deliveries defer (2 POSTs), but the
+      // callback is single-use — the stub 400s the second (exactly one
+      // consumed).
+      expect(f.fd.callbacksFor(`i-dup-${id}`)).toBe(2);
       const ev = f
         .auditEvents()
         .find((e) => e.event === "tap-rejected" && e.reason === "duplicate");
       expect(ev).toBeTruthy();
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("type-4 interaction with a vault custom_id: ignored (type-3 gate)", async () => {
+    // Live guild traffic carries the component as type 3 (MESSAGE_COMPONENT);
+    // type 4 is APPLICATION_COMMAND. A matching custom_id on a non-3 frame
+    // must be ignored entirely — no defer, no reply, no state change.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      const callsBefore = f.fd.calls.length;
+      await f.h.handleVaultComponent(
+        mkD("i-t4", `vault:approve:${id}`, {
+          type: 4,
+          message: { id: cred!.messageId },
+        }),
+      );
+      expect(f.fd.calls.length).toBe(callsBefore);
+      expect(f.st.credentials.get(id)?.state).toBe("pending");
+      expect(f.auditEvents().some((e) => e.event === "approve")).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("message id via d.data.message (older nested shape): tap accepted", async () => {
+    // The live payload puts the component's message on d.message (RCA
+    // 2026-10-08); older payloads nested it in d.data.message. Each
+    // fallback step of the lookup chain gets its own fixture.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      await f.h.handleVaultComponent(
+        mkD("i-dm2", `vault:approve:${id}`, {
+          message: undefined,
+          data: {
+            custom_id: `vault:approve:${id}`,
+            message: { id: cred!.messageId },
+          },
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("message id via d.message_id (defensive last resort): tap accepted", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const cred = f.st.credentials.get(id);
+      await f.h.handleVaultComponent(
+        mkD("i-mid", `vault:approve:${id}`, {
+          message: undefined,
+          data: { custom_id: `vault:approve:${id}` },
+          message_id: cred!.messageId,
+        }),
+      );
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("tap reply falls back to webhook-ROOT POST when @original is gone (50035 route pinned)", async () => {
+    // replyInteraction edits the deferred ack (PATCH @original); when the
+    // ack is gone it creates a followup on the webhook ROOT. If that
+    // followup URL ever regresses to the incoming-webhook
+    // /messages?wait=true form, live Discord answers 400 50035 and the
+    // tap feedback is silently lost (RCA 2026-10-08). The stub 404s that
+    // form (audit F2), so this test fails on the regression.
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const id = await makePending(f);
+      const base = globalThis.fetch;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        const url = String(input);
+        if (init?.method === "PATCH" && url.endsWith("/messages/@original"))
+          return resp(404, { message: "Unknown Webhook Message" });
+        return base(input, init);
+      }) as any;
+      try {
+        await f.h.handleVaultComponent(
+          mkD("i-fb", `vault:approve:${id}`, {
+            message: { id: "other-message" },
+          }),
+        );
+      } finally {
+        globalThis.fetch = base;
+      }
+      const fu = f.fd.followups();
+      expect(fu.length).toBe(1);
+      expect(fu[0].url).toBe(
+        "https://discord.com/api/v10/webhooks/app1/intok-i-fb",
+      );
+      expect(fu[0].body.content).toMatch(/tap rejected/);
+      expect(
+        f.auditEvents().some((e) => e.event === "tap-feedback-failed"),
+      ).toBe(false);
       expect(f.st.credentials.get(id)?.state).toBe("pending");
     } finally {
       f.cleanup();

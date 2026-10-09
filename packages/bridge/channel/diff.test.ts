@@ -265,6 +265,27 @@ describe("renderDiffHtml", () => {
     expect(jsonSlice).toContain("&lt;/script&gt;");
   });
 
+  test("escapes </script> in filenames/headers/titles (top-level \\u003c layer)", () => {
+    // The test above only exercises the highlightLine layer (diff TEXT is
+    // escHtml'd before it reaches JSON). Filenames, hunk headers, and the
+    // title bypass highlightLine entirely — they are protected ONLY by the
+    // JSON.stringify(...).replace(/</g, "\\u003c") guard in renderDiffHtml.
+    // Mutation D1 repro: remove that replace -> this test fails.
+    const tricky =
+      "diff --git a/x.html b/a</script>.html\n--- a/x.html\n+++ b/a</script>.html\n@@ -1 +1 @@ </script>\n+line\n";
+    const html = renderDiffHtml(tricky, "t</script>", "7d");
+    const jsonSlice = html.slice(
+      html.indexOf("const D = ") + "const D = ".length,
+      html.indexOf(";\nconst esc"),
+    );
+    expect(jsonSlice).not.toContain("</script>");
+    // filename, hunk header, and title survive, escaped (only < is
+    // neutralized; a raw > cannot close a script tag)
+    expect(jsonSlice).toContain("a\\u003c/script>.html");
+    expect(jsonSlice).toContain("@@ -1 +1 @@ \\u003c/script>");
+    expect(jsonSlice).toContain('"t":"t\\u003c/script>"');
+  });
+
   test("title, stats, ttl land in the page", () => {
     const html = renderDiffHtml(SAMPLE, "main..HEAD", "7d");
     expect(html).toContain("diff · main..HEAD");

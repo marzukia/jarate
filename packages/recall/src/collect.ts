@@ -18,7 +18,6 @@ export const SKIP_DIRS = new Set([
   ".cache",
   ".pi",
   ".npm",
-  "stale-20260908",
   ".next",
   "out",
   "target",

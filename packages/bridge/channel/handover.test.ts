@@ -400,16 +400,19 @@ describe("extractDeterministic", () => {
   // (channel-ctx block as the FIRST line) plus the clean body in
   // `details.body`. Machine inbounds (Beepy webhook, [bg: heartbeats) come
   // through the same customType; bridge-injected wakes carry no channel-ctx.
+  // Faithful to the CustomMessageEntry shape: timestamp is a string
+  // (sendToPi passes new Date().toISOString()) and details carries the
+  // channelTitle() string (e.g. "discord/Test").
   const inb = (i: number, from: string | null, body: string) => ({
     id: `e${i}`,
     type: "custom_message",
     customType: "channel-inbound",
-    timestamp: i,
+    timestamp: String(i),
     content:
       from != null
         ? `<channel-ctx type="discord" name="test" from="${from}" msgId="m${i}">ctx</channel-ctx>\n\n${body}`
         : body,
-    details: { body },
+    details: { title: "discord/Test", body },
   });
   test("last user asks: HUMAN inbounds only, last 2 (RCA F3)", () => {
     const entries = [
@@ -1495,13 +1498,12 @@ describe("resolveHandoffSettings", () => {
   const write = (p: string, obj: unknown) =>
     fs.writeFileSync(p, JSON.stringify(obj));
 
-  test("defaults: enabled TRUE (PR2), threshold 0.8, cap 2000000 (issue #85)", () => {
+  test("defaults: enabled TRUE (PR2), threshold 0.8", () => {
     const s = resolveHandoffSettings(path.join(tmp, "proj"), {});
     expect(s.enabled).toBe(true);
     expect(s.threshold).toBe(0.8);
-    // 2MB (was 64MB, issue #85): a full 262k-window compact writes a
-    // 1–5MB session file, so the old default made the restart unreachable.
-    expect(s.restartFileCap).toBe(2_000_000);
+    // (restartFileCap removed — c863c341 made every compact restart,
+    // "no size gate"; the dead config is gone, test-fidelity audit F3.)
     expect(s.sizeGuardTokens).toBe(12_000);
     expect(s.storeDir).toBe("~/.jarate/handovers");
   });
@@ -1533,12 +1535,6 @@ describe("resolveHandoffSettings", () => {
       HANDOFF_THRESHOLD: "0.55",
     } as NodeJS.ProcessEnv);
     expect(s.threshold).toBe(0.55);
-  });
-  test("env HANDOFF_RESTART_FILE_CAP overrides", () => {
-    const s = resolveHandoffSettings(path.join(tmp, "proj"), {
-      HANDOFF_RESTART_FILE_CAP: "32000000",
-    } as NodeJS.ProcessEnv);
-    expect(s.restartFileCap).toBe(32_000_000);
   });
   test("env HANDOFF_ENABLED overrides settings both ways", () => {
     write(path.join(tmp, "home", ".pi", "agent", "settings.json"), {
@@ -2452,7 +2448,7 @@ describe("auto-compact token-% gate", () => {
       logs.push(a.join(" "));
     };
     try {
-      await handlers.agent_end({ messages: [] }, ctx);
+      await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
       await flushMacrotasks();
     } finally {
       console.log = realLog;
@@ -2476,7 +2472,7 @@ describe("auto-compact token-% gate", () => {
       contextWindow: 262_144,
       percent: 79.9,
     });
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2484,7 +2480,7 @@ describe("auto-compact token-% gate", () => {
 
   test("over threshold but handoff in flight → not triggered (no double)", async () => {
     setHandoffInFlight(true);
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2501,7 +2497,7 @@ describe("auto-compact token-% gate", () => {
     expect(isHandoffFreshWindow(path.join(home, ".jarate", "handovers"))).toBe(
       true,
     );
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2516,7 +2512,7 @@ describe("auto-compact token-% gate", () => {
         storeDir: path.join(home, ".jarate", "handovers"),
       },
     });
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2524,7 +2520,7 @@ describe("auto-compact token-% gate", () => {
 
   test("no loop: settle → compact → doc → settle does NOT re-fire", async () => {
     // 1) settled turn over threshold: the gate fires the compact.
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(1);
     expect(isCompacting("ch1")).toBe(true);
@@ -2545,7 +2541,7 @@ describe("auto-compact token-% gate", () => {
     expect(isCompacting("ch1")).toBe(false);
     // 4) next settled turn: still over threshold, but the fresh window
     //    (doc just written) blocks a re-fire — no tight loop.
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(1);
     expect(isCompacting("ch1")).toBe(false);

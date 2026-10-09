@@ -40,6 +40,8 @@ interface Fixture {
   setInflight: (s: string | null) => void;
   run: () => Promise<{ code: number; out: string; err: string }>;
   posts: () => Post[];
+  /** stub call log: which of systemctl/journalctl the script invoked */
+  calls: () => string[];
 }
 
 function fixture(): Fixture {
@@ -49,6 +51,7 @@ function fixture(): Fixture {
   const bin = path.join(tmp, "bin");
   const capture = path.join(tmp, "curl-capture.txt");
   const journal = path.join(tmp, "journal.txt");
+  const callsPath = path.join(tmp, "stub-calls.txt");
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
   fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
@@ -82,15 +85,15 @@ printf '%s\\n%s\\n--\\n' "$url" "$data" >> "$CURL_CAPTURE"
 printf 'ok\\n'
 `,
   );
-  // stub systemctl: is-active rc from the env knob
+  // stub systemctl: is-active rc from the env knob; logs every call
   fs.writeFileSync(
     path.join(bin, "systemctl"),
-    '#!/bin/sh\nif [ -n "$STUB_SYSTEMD_RC" ]; then exit "$STUB_SYSTEMD_RC"; fi\nexit 0\n',
+    '#!/bin/sh\necho systemctl >> "$STUB_CALLS"\nif [ -n "$STUB_SYSTEMD_RC" ]; then exit "$STUB_SYSTEMD_RC"; fi\nexit 0\n',
   );
-  // stub journalctl: emits the prepared journal lines
+  // stub journalctl: emits the prepared journal lines; logs every call
   fs.writeFileSync(
     path.join(bin, "journalctl"),
-    `#!/bin/sh\ncat "$STUB_JOURNAL" 2>/dev/null || true\n`,
+    `#!/bin/sh\necho journalctl >> "$STUB_CALLS"\ncat "$STUB_JOURNAL" 2>/dev/null || true\n`,
   );
   for (const f of ["curl", "systemctl", "journalctl"]) {
     fs.chmodSync(path.join(bin, f), 0o755);
@@ -101,6 +104,7 @@ printf 'ok\\n'
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.CURL_CAPTURE = capture;
   env.STUB_JOURNAL = journal;
+  env.STUB_CALLS = callsPath;
   env.STUB_SYSTEMD_RC = "0";
   return {
     tmp,
@@ -148,6 +152,10 @@ printf 'ok\\n'
           };
         });
     },
+    calls: () =>
+      fs.existsSync(callsPath)
+        ? fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean)
+        : [],
   };
 }
 
@@ -230,6 +238,129 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(webhookPost(f).content).toContain(
         "└ [!] not healthy 90s after restart",
       );
+    } finally {
+      f.setInflight(null);
+    }
+  });
+});
+
+/**
+ * audit dispatch-core F1 (pi-postcheck slice P2): the journal filter must
+ * drop systemd "0 failed" summary lines. The live incident: a healthy
+ * restart's journal contained a line matching systemd[ + failed with a
+ * "0 failed" unit summary, and the postcheck posted a [!] "systemd
+ * error" quoting that line - a false alarm on every clean restart.
+ */
+describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => {
+  const SUMMARY =
+    "Sep 15 10:00:01 host systemd[1]: pi.service: 4 loaded units listed (4 target, 3 listening, 0 failed).";
+  const REAL =
+    "Sep 15 10:00:02 host systemd[1]: pi.service: Main process exited, code=killed, status=1/SEGV (Failed with result 'signal').";
+
+  test("only '0 failed' lines in journal -> healthy, no error block", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    // SUMMARY matches `systemd[` + `failed` (case-insensitive) but carries
+    // the "0 failed" marker: grep -aiv "0 failed" must drop it
+    f.setJournal([SUMMARY]);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // healthy: no systemd-error block in the channel line
+      expect(channelPost(f).content).toBe(
+        "`[ok] pi post-check: service healthy 90s after restart`",
+      );
+      expect(webhookPost(f).content).toContain(
+        "└ [ok] healthy 90s after restart",
+      );
+      expect(webhookPost(f).content).not.toContain("systemd error");
+    } finally {
+      f.setInflight(null);
+    }
+  });
+
+  test("'0 failed' line + real error: the real error is quoted, not the summary", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    // the summary line comes FIRST: without the filter, head -1 quotes IT
+    f.setJournal([SUMMARY, REAL]);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      const ch = channelPost(f).content;
+      expect(ch).toContain("`[!] pi restarted, systemd error:`");
+      expect(ch).toContain(REAL);
+      expect(ch).not.toContain(SUMMARY); // the 0-failed summary is filtered
+      expect(webhookPost(f).content).toContain(
+        "└ [!] not healthy 90s after restart",
+      );
+    } finally {
+      f.setInflight(null);
+    }
+  });
+});
+
+/**
+ * audit dispatch-core F2 (pi-postcheck slice P5): the missing-settings and
+ * no-bot-token branches. Both must: exit 0, post NO channel message (no
+ * CH_ID/TOKEN to post with), emit the degraded webhook frame, and short-
+ * circuit BEFORE any systemctl/journalctl call (proven by the stub call
+ * log). The literal channel MSG text is unobservable in these branches
+ * (it only ships with a channel post), so the branch is pinned via the
+ * observable side effects instead.
+ */
+describe("pi-postcheck: missing settings / no bot token branches", () => {
+  const DEGRADED =
+    "[bg: pi-restart]\n```\n┌ pi restart heartbeat\n└ [!] not healthy 90s after restart\n```";
+
+  test("settings.json missing: exit 0, no channel post, degraded frame, no systemd probes", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    fs.rmSync(path.join(f.home, ".pi", "agent", "settings.json"));
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // exactly ONE post: the webhook heartbeat (no channel post)
+      expect(f.posts()).toHaveLength(1);
+      expect(webhookPost(f).content).toBe(DEGRADED);
+      // branch short-circuits before probing the service
+      expect(f.calls()).toEqual([]);
+    } finally {
+      f.setInflight(null);
+    }
+  });
+
+  test("no bot token: exit 0, no channel post, degraded frame, no systemd probes", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    fs.writeFileSync(
+      path.join(f.home, ".pi", "agent", "settings.json"),
+      JSON.stringify({
+        channels: [
+          { channel: CHANNEL, botToken: "", enabled: true, default: true },
+        ],
+      }),
+    );
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // exactly ONE post: the webhook heartbeat (no channel post)
+      expect(f.posts()).toHaveLength(1);
+      expect(webhookPost(f).content).toBe(DEGRADED);
+      // the token check fires before is-active / journalctl
+      expect(f.calls()).toEqual([]);
     } finally {
       f.setInflight(null);
     }

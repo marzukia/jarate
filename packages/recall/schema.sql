@@ -58,6 +58,15 @@ LANGUAGE sql STABLE AS $$
   LIMIT k;
 $$;
 
-GRANT EXECUTE ON FUNCTION search(text, vector, text, int) TO frank;
-GRANT SELECT, INSERT, UPDATE, DELETE ON chunks TO frank;
-GRANT USAGE, SELECT ON SEQUENCE chunks_id_seq TO frank;
+-- Grants to the fleet peer role `frank` are CONDITIONAL on the role
+-- existing: with ON_ERROR_STOP=1 (the integration suite's psql), a hard
+-- GRANT would fail the whole schema apply on any host without that role.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'frank') THEN
+    GRANT EXECUTE ON FUNCTION search(text, vector, text, int) TO frank;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON chunks TO frank;
+    GRANT USAGE, SELECT ON SEQUENCE chunks_id_seq TO frank;
+  END IF;
+END
+$$;

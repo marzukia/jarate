@@ -41,6 +41,8 @@ import {
   deleteDeferredAck,
   editDiscordMessage,
   getDiscordChannelId,
+  interactionUserId,
+  interactionUserName,
   replyInteraction,
   sendDiscordMessage,
 } from "./discord";
@@ -2068,7 +2070,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
 
       await deferInteraction(st.botToken, d);
 
-      const uid = String(d.user?.id ?? "");
+      const uid = interactionUserId(d);
 
       // Dedupe (gateway redelivery) — no second reply (the first tap
       // already showed feedback), but audit it: a tap with no audit line
@@ -2170,7 +2172,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         verb,
         uid,
         actorDiscord(uid),
-        String(d.user?.username ?? uid),
+        interactionUserName(d) ?? uid,
       );
       if (!dec.ok) {
         if (dec.reason === "already-handled") {
@@ -2217,7 +2219,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         { id: parsedId },
         {
           err,
-          user: String(d.user?.id ?? ""),
+          user: interactionUserId(d),
           interaction: String(d.id),
         },
       );
@@ -2226,7 +2228,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         d,
         "[!] vault error",
         { id: parsedId },
-        { err, user: String(d.user?.id ?? ""), interaction: String(d.id) },
+        { err, user: interactionUserId(d), interaction: String(d.id) },
       );
     }
   };
