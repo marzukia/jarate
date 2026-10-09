@@ -38,8 +38,12 @@ test("isSupportedImageMime covers png/jpeg/gif/webp", () => {
 });
 
 test("optimizeImageBuffer: small image passes through (null)", async () => {
+  // sharp is an optionalDependency: when missing, skip with a visible
+  // warning instead of a silent no-op (audit M8).
   if (!sharp) {
-    console.log("sharp not installed — skipping optimizeImageBuffer tests");
+    console.warn(
+      "[skip] sharp not installed — 'optimizeImageBuffer: small image passes through (null)' skipped",
+    );
     return;
   }
   const small = await rawSharp(100, 100).png().toBuffer();
@@ -47,7 +51,12 @@ test("optimizeImageBuffer: small image passes through (null)", async () => {
 });
 
 test("optimizeImageBuffer: oversized image resized under 2000px", async () => {
-  if (!sharp) return;
+  if (!sharp) {
+    console.warn(
+      "[skip] sharp not installed — 'optimizeImageBuffer: oversized image resized under 2000px' skipped",
+    );
+    return;
+  }
   const big = await rawSharp(3000, 3000).png().toBuffer();
   const result = await optimizeImageBuffer(big, "image/png");
   expect(result).not.toBeNull();
@@ -58,7 +67,12 @@ test("optimizeImageBuffer: oversized image resized under 2000px", async () => {
 });
 
 test("optimizeImageBuffer: oversized jpeg resized and under 4MB", async () => {
-  if (!sharp) return;
+  if (!sharp) {
+    console.warn(
+      "[skip] sharp not installed — 'optimizeImageBuffer: oversized jpeg resized and under 4MB' skipped",
+    );
+    return;
+  }
   const jpeg = await rawSharp(2500, 2500, "#808080")
     .jpeg({ quality: 100, mozjpeg: true })
     .toBuffer();

@@ -8,6 +8,10 @@
 //
 // The bunfig.toml preload (test/xdg-isolation.ts) redirects
 // XDG_RUNTIME_DIR to a per-run tmpdir before any bridge module loads.
+// bunfig.toml only resolves from cwd, so running this file from another
+// dir (e.g. channel/) skips the preload — the redirect is reproduced
+// in-file below (guarded on JARETE_TEST_LIVE_XDG, same as the preload)
+// so the suite is cwd-independent.
 // These tests prove the redirect is active and that a socket-creating
 // start via the env fallback (the path index.ts uses at bridge startup)
 // leaves the live entries byte-identical (inode + mtime).
@@ -22,9 +26,25 @@ import {
 } from "./pat-vault";
 import { __vaultResetForTest, startVault, stopVault } from "./vault";
 
-// Live directory: the preload records it; if the preload is missing the
-// fallback is the bridge's own (vault.ts: xdg default), so the test still
-// knows where the live entries would be.
+// cwd-independent fallback for the bunfig preload (see header): if the
+// preload did not run (JARETE_TEST_LIVE_XDG unset), do the same redirect
+// now — before any test body calls startVault/startPatVault, which read
+// XDG_RUNTIME_DIR. Same tmpdir prefix as the preload so its stale sweep
+// reclaims the dir (process.on("exit") never fires under bun test).
+if (!process.env.JARETE_TEST_LIVE_XDG) {
+  const live =
+    process.env.XDG_RUNTIME_DIR ??
+    path.join("/run/user", String(process.getuid?.() ?? 0));
+  const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-test-xdg-"));
+  process.env.JARETE_TEST_LIVE_XDG = live;
+  process.env.XDG_RUNTIME_DIR = isolated;
+  console.error(
+    `[test] XDG isolated in-file (bunfig preload not active from cwd ${process.cwd()})`,
+  );
+}
+
+// Live directory: the preload (or the in-file fallback above) records it;
+// the remaining chain is the bridge's own (vault.ts: xdg default).
 const LIVE_XDG =
   process.env.JARETE_TEST_LIVE_XDG ??
   process.env.XDG_RUNTIME_DIR ??
@@ -59,10 +79,10 @@ function expectUnchanged(label: string, before: EntryState): void {
 }
 
 describe("issue #128: test sockets stay out of the live XDG_RUNTIME_DIR", () => {
-  test("preload isolates the test XDG from the live one", () => {
+  test("the test XDG is isolated from the live one", () => {
     expect(
       process.env.JARETE_TEST_LIVE_XDG,
-      "JARETE_TEST_LIVE_XDG unset: the bunfig.toml preload did not run",
+      "JARETE_TEST_LIVE_XDG unset: the XDG redirect (bunfig preload or in-file fallback) did not run",
     ).toBeDefined();
     expect(
       process.env.XDG_RUNTIME_DIR,

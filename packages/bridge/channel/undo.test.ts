@@ -236,23 +236,29 @@ describe("session truncation", () => {
     timestamp: "t",
     cwd: "/x",
   };
+  // Session-line fixtures mirror real pi payloads: every entry carries a
+  // top-level `timestamp`, and custom_message entries carry `display`.
   const triggerA = {
     type: "custom_message",
     id: "tA",
     parentId: null,
     customType: "channel-inbound",
     content: "do A",
+    display: true,
+    timestamp: "2026-09-10T08:00:00.000Z",
   };
   const assistantA = {
     type: "message",
     id: "aA",
     parentId: "tA",
+    timestamp: "2026-09-10T08:00:01.000Z",
     message: { role: "assistant", content: [{ type: "text", text: "did A" }] },
   };
   const toolResultA = {
     type: "message",
     id: "rA",
     parentId: "aA",
+    timestamp: "2026-09-10T08:00:02.000Z",
     message: {
       role: "toolResult",
       toolName: "bash",
@@ -266,11 +272,14 @@ describe("session truncation", () => {
     parentId: "rA",
     customType: "channel-inbound",
     content: "do B",
+    display: true,
+    timestamp: "2026-09-10T08:00:03.000Z",
   };
   const assistantB = {
     type: "message",
     id: "aB",
     parentId: "tB",
+    timestamp: "2026-09-10T08:00:04.000Z",
     message: { role: "assistant", content: [{ type: "text", text: "did B" }] },
   };
 
@@ -317,6 +326,8 @@ describe("session truncation", () => {
       parentId: "aB",
       customType: "channel-inbound",
       content: "do C",
+      display: true,
+      timestamp: "2026-09-10T08:00:05.000Z",
     };
     const file = makeSession(tmp, [
       header,
@@ -353,12 +364,14 @@ describe("session truncation", () => {
       type: "message",
       id: "u1",
       parentId: null,
+      timestamp: "2026-09-10T08:00:00.000Z",
       message: { role: "user", content: "hello" },
     };
     const asst = {
       type: "message",
       id: "u2",
       parentId: "u1",
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
     };
     const file = makeSession(tmp, [header, userMsg, asst]);
@@ -386,11 +399,42 @@ describe("session truncation", () => {
     expect(fs.readFileSync(path.join(dir, backups[0]), "utf8")).toBe(before);
   });
 
+  test("pre-truncation backups are pruned to the last 5 (cap exercised)", () => {
+    const sub = path.join(tmp, "prune");
+    fs.mkdirSync(sub, { recursive: true });
+    const file = makeSession(sub, [
+      header,
+      triggerA,
+      assistantA,
+      toolResultA,
+      triggerB,
+      assistantB,
+    ]);
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    // six old backups with sort-keys below a fresh Date.now() stamp
+    for (let i = 1; i <= 6; i++)
+      fs.writeFileSync(
+        path.join(dir, `${base}.undo-${1_000_000_000_000 + i}`),
+        "old",
+      );
+    truncateSession(file);
+    const backups = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith(`${base}.undo-`))
+      .sort();
+    expect(backups).toHaveLength(5); // cap = 5
+    // the two oldest were pruned; the fresh backup survived
+    expect(backups[0]).toBe(`${base}.undo-${1_000_000_000_003}`);
+    expect(backups.at(-1)).toMatch(new RegExp(`${base}\\.undo-\\d{13}$`));
+  });
+
   test("no trigger root-ward of the last assistant -> abort, file unchanged (F8)", () => {
     const asst = {
       type: "message",
       id: "a",
       parentId: null,
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "x" }] },
     };
     const file = makeSession(tmp, [header, asst]);
@@ -421,11 +465,14 @@ describe("re-run trigger (F1)", () => {
       customType: "channel-inbound",
       content: "<channel-ctx>ch: monky</channel-ctx>\n\nfix the bug",
       details: { title: "monky", body: "fix the bug" },
+      display: true,
+      timestamp: "2026-09-10T08:00:00.000Z",
     };
     const a1 = {
       type: "message",
       id: "a1",
       parentId: "t1",
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "done" }] },
     };
     const file = makeSession(cwd, [header, t1, a1]);
@@ -541,11 +588,14 @@ describe("run targeting (F3/F4/F5)", () => {
       parentId: null,
       customType: "channel-inbound",
       content: "q1",
+      display: true,
+      timestamp: "2026-09-10T08:00:00.000Z",
     };
     const a1 = {
       type: "message",
       id: "a1",
       parentId: "t1",
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "r1" }] },
     };
     const sess = makeSession(cwd, [header, t1, a1]);
@@ -645,6 +695,8 @@ describe("performUndo + performRedo end to end", () => {
       parentId: null,
       customType: "channel-inbound",
       content: "hi",
+      display: true,
+      timestamp: "2026-09-10T08:00:00.000Z",
     };
     const file = makeSession(cwd, [header, trigger]);
     const r = performUndo(file);
@@ -669,11 +721,14 @@ describe("performUndo + performRedo end to end", () => {
       parentId: null,
       customType: "channel-inbound",
       content: "q1",
+      display: true,
+      timestamp: "2026-09-10T08:00:00.000Z",
     };
     const a1 = {
       type: "message",
       id: "a1",
       parentId: "t1",
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "r1" }] },
     };
     const t2 = {
@@ -682,11 +737,14 @@ describe("performUndo + performRedo end to end", () => {
       parentId: "a1",
       customType: "channel-inbound",
       content: "q2",
+      display: true,
+      timestamp: "2026-09-10T08:00:02.000Z",
     };
     const a2 = {
       type: "message",
       id: "a2",
       parentId: "t2",
+      timestamp: "2026-09-10T08:00:03.000Z",
       message: { role: "assistant", content: [{ type: "text", text: "r2" }] },
     };
     const file = makeSession(cwd, [header, t1, a1, t2, a2]);
@@ -781,11 +839,14 @@ describe("cap and exclusion hardening (F7/F10)", () => {
       parentId: null,
       customType: "channel-inbound",
       content: "do A",
+      display: true,
+      timestamp: "2026-09-10T08:00:00.000Z",
     };
     const aA = {
       type: "message",
       id: "aA",
       parentId: "tA",
+      timestamp: "2026-09-10T08:00:01.000Z",
       message: {
         role: "assistant",
         content: [{ type: "text", text: "did A" }],
@@ -797,6 +858,8 @@ describe("cap and exclusion hardening (F7/F10)", () => {
       parentId: "aA",
       customType: "channel-inbound",
       content: "do B",
+      display: true,
+      timestamp: "2026-09-10T08:00:02.000Z",
     };
     const sess = path.join(cwd, "sess.jsonl"); // untracked, inside the repo
     fs.writeFileSync(
@@ -818,6 +881,30 @@ describe("cap and exclusion hardening (F7/F10)", () => {
       .map((l) => JSON.parse(l).id);
     expect(kept).toEqual(["s1", "tA"]);
   });
+
+  test("untracked files under .pi/agent/sessions/ are excluded from restore + cleanup (sessions-dir branch)", () => {
+    // The F10 test above covers the sessionFile-identity branch of
+    // isUndoExcludedPath; this one covers the directory branch: live session
+    // files pi writes into the worktree between snapshot and undo must not
+    // be resurrected by the untracked copy-back, and newer untracked
+    // session files must not be deleted by the cleanup pass.
+    const cwd = makeRepo(path.join(tmp, "f10s"));
+    commit(cwd, "base");
+    const sessDir = path.join(cwd, ".pi", "agent", "sessions");
+    fs.mkdirSync(sessDir, { recursive: true });
+    const sess = path.join(sessDir, "s.jsonl");
+    fs.writeFileSync(sess, "x\n");
+
+    const run = startRun(cwd)!; // pre-snapshot: untracked = [sess]
+    finishRun(run, cwd, null); // sessionFile null: only the dir branch applies
+    fs.rmSync(sess); // gone from the worktree: copy-back must NOT resurrect it
+    const extra = path.join(sessDir, "extra.jsonl");
+    fs.writeFileSync(extra, "y\n"); // newer untracked: cleanup must NOT delete it
+
+    performUndo(null);
+    expect(fs.existsSync(sess)).toBe(false);
+    expect(fs.existsSync(extra)).toBe(true);
+  });
 });
 
 // ─── #46 /undo N: multi-turn rollback ─────────────────────────────────
@@ -838,11 +925,14 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     customType: "channel-inbound",
     content: "q1",
     details: { body: "q1" },
+    display: true,
+    timestamp: "2026-09-10T08:00:00.000Z",
   };
   const A1 = {
     type: "message",
     id: "A1",
     parentId: "T1",
+    timestamp: "2026-09-10T08:00:01.000Z",
     message: { role: "assistant", content: [{ type: "text", text: "r1" }] },
   };
   const T2 = {
@@ -852,11 +942,14 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     customType: "channel-inbound",
     content: "q2",
     details: { body: "q2" },
+    display: true,
+    timestamp: "2026-09-10T08:00:02.000Z",
   };
   const A2 = {
     type: "message",
     id: "A2",
     parentId: "T2",
+    timestamp: "2026-09-10T08:00:03.000Z",
     message: { role: "assistant", content: [{ type: "text", text: "r2" }] },
   };
   const T3 = {
@@ -866,11 +959,14 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     customType: "channel-inbound",
     content: "q3",
     details: { body: "q3" },
+    display: true,
+    timestamp: "2026-09-10T08:00:04.000Z",
   };
   const A3 = {
     type: "message",
     id: "A3",
     parentId: "T3",
+    timestamp: "2026-09-10T08:00:05.000Z",
     message: { role: "assistant", content: [{ type: "text", text: "r3" }] },
   };
   const chain = [header, T1, A1, T2, A2, T3, A3];

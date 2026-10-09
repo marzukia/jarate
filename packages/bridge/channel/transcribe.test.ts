@@ -107,6 +107,25 @@ describe("transcribeVoice (#42)", () => {
     fs.chmodSync(p, 0o755);
   }
 
+  // Strict whisper stub: pins the EXACT arg sequence the real call site
+  // uses (-m <model> -l auto -nt -np -t <threads> -f <audio>, 10 args).
+  // model/threads come from the spawn env (JB_TRANSCRIBE_MODEL / optional
+  // JB_TRANSCRIBE_THREADS, default 4); the audio path is baked in. Any
+  // deviation (dropped -nt/-np, -l en, wrong order, wrong file) exits 3
+  // -> transcribeVoice returns null -> the transcript assertion fails.
+  function strictWhisperStub(audioFile: string, out: string): void {
+    const body = `#!/bin/sh
+t=\${JB_TRANSCRIBE_THREADS:-4}
+# NB: \${10} is braced — unbraced $10 parses as $1 + "0" under /bin/sh.
+if [ "$#" -ne 10 ] || [ "$1" != "-m" ] || [ "$2" != "$JB_TRANSCRIBE_MODEL" ] || [ "$3" != "-l" ] || [ "$4" != "auto" ] || [ "$5" != "-nt" ] || [ "$6" != "-np" ] || [ "$7" != "-t" ] || [ "$8" != "$t" ] || [ "$9" != "-f" ] || [ "\${10}" != "${audioFile}" ]; then
+  echo "whisper-cli: unexpected args: $*" >&2
+  exit 3
+fi
+echo "${out}"
+`;
+    stub("whisper-cli", body);
+  }
+
   function fixture(name: string): string {
     const p = path.join(tmp, name);
     fs.writeFileSync(p, Buffer.from("RIFF-fake-audio", "ascii"));
@@ -134,9 +153,10 @@ describe("transcribeVoice (#42)", () => {
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  test("wav + stub whisper-cli -> fixed transcript", async () => {
-    stub("whisper-cli", '#!/bin/sh\necho "hello from the whisper stub"\n');
-    const r = await transcribeVoice(fixture("note.wav"), {
+  test("wav + stub whisper-cli -> fixed transcript (exact flag set pinned)", async () => {
+    const wav = fixture("note.wav");
+    strictWhisperStub(wav, "hello from the whisper stub");
+    const r = await transcribeVoice(wav, {
       mime: "audio/wav",
       env: envWith(),
     });
@@ -196,10 +216,10 @@ echo "ffmpeg $out" >> ${"__SENTINEL__"}
 exit 0
 `;
 
-  test("m4a -> ffmpeg convert -> transcript; temp wav cleaned up", async () => {
+  test("m4a -> ffmpeg convert -> transcript; temp wav cleaned up (exact flag set pinned)", async () => {
     stub("ffmpeg", FFMPEG_STUB.replace("__SENTINEL__", sentinel));
-    stub("whisper-cli", `#!/bin/sh\necho "converted words"\n`);
     const f = fixture("recording.m4a");
+    strictWhisperStub(`${f}.16k.wav`, "converted words");
     const r = await transcribeVoice(f, {
       mime: "audio/mp4",
       env: envWith(),
@@ -223,10 +243,11 @@ exit 0
     expect(fs.existsSync(sentinel)).toBe(false);
   });
 
-  test("opus route (extension only, no audio mime) also converts", async () => {
+  test("opus route (extension only, no audio mime) also converts (exact flag set pinned)", async () => {
     stub("ffmpeg", FFMPEG_STUB.replace("__SENTINEL__", sentinel));
-    stub("whisper-cli", "#!/bin/sh\necho ok\n");
-    const r = await transcribeVoice(fixture("voice.opus"), {
+    const f = fixture("voice.opus");
+    strictWhisperStub(`${f}.16k.wav`, "ok");
+    const r = await transcribeVoice(f, {
       env: envWith(),
     });
     expect(r).toBe("ok");

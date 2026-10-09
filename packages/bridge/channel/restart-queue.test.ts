@@ -18,6 +18,7 @@ import {
   rewakePending,
   rewakeQueuePath,
   rewakeRemovePending,
+  rewakeSetPendingAck,
   rewakeUpdatePendingMsg,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
@@ -102,6 +103,23 @@ describe("restart-queue state file (#180)", () => {
     expect(file.pending).toHaveLength(1);
     expect(file.pending[0].msg.body).toBe("[bg:worker:OK] m1 EDITED");
     expect(file.pending[0].queuedAt).toBe(1000); // FIFO position kept
+  });
+
+  test("set pending ack mirrors the ack id into the file (live restart path, index.ts queueInLine)", () => {
+    rewakeAddPending(dir, "ch1", entry("m1"));
+    rewakeSetPendingAck(dir, "ch1", "m1", "ack-1");
+    const file = loadRewakeQueue(dir, "ch1");
+    expect(file.pending).toHaveLength(1);
+    expect(file.pending[0].ackId).toBe("ack-1");
+    expect(file.pending[0].queuedAt).toBe(1000); // FIFO position kept
+    const p = rewakeQueuePath(dir, "ch1");
+    const once = fs.readFileSync(p, "utf8");
+    rewakeSetPendingAck(dir, "ch1", "m1", "ack-1"); // same id: no write
+    expect(fs.readFileSync(p, "utf8")).toBe(once);
+    rewakeSetPendingAck(dir, "ch1", "nope", "ack-x"); // absent id: no write
+    expect(fs.readFileSync(p, "utf8")).toBe(once);
+    // a restart with a fresh process sees the ack id on drain
+    expect(rewakePending(dir, "ch1")[0].ackId).toBe("ack-1");
   });
 
   test("update pending msg of an absent id → no rewrite (no-op)", () => {

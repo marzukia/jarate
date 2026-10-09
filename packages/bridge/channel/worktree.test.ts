@@ -127,6 +127,41 @@ describe("newWorktree (#12)", () => {
     );
   });
 
+  test("explicit ref: worktree forks from that ref, not HEAD", () => {
+    // Pin the branch at the initial commit, then advance main one more
+    // commit: a worktree that ignored `ref` (mutation W4: from="HEAD")
+    // would start at the newer commit and fail the rev-parse assertions.
+    git(repo, "branch", "base-ref");
+    commitIn(repo, "second.txt", "second\n");
+    const headBefore = git(repo, "rev-parse", "HEAD");
+    const refCommit = git(repo, "rev-parse", "base-ref");
+    expect(headBefore).not.toBe(refCommit);
+
+    const line = newWorktree(repo, "base-ref", env);
+    expect(line).toMatch(/^\[ok\] worktree /);
+    expect(line).toContain("from base-ref");
+    const st = loadWorktreeState(repo);
+    expect(st).not.toBeNull();
+    expect(git(st!.path, "rev-parse", st!.branch)).toBe(refCommit);
+    expect(git(st!.path, "rev-parse", "HEAD")).toBe(refCommit);
+    // the worktree holds the ref's tree, not main's newer one
+    expect(fs.existsSync(path.join(st!.path, "base.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(st!.path, "second.txt"))).toBe(false);
+  });
+
+  test("blank ref falls back to HEAD", () => {
+    git(repo, "branch", "base-ref");
+    commitIn(repo, "second.txt", "second\n");
+    const line = newWorktree(repo, "   ", env);
+    expect(line).toMatch(/^\[ok\] worktree /);
+    expect(line).toContain("from HEAD");
+    const st = loadWorktreeState(repo)!;
+    expect(git(st.path, "rev-parse", st.branch)).toBe(
+      git(repo, "rev-parse", "HEAD"),
+    );
+    expect(fs.existsSync(path.join(st.path, "second.txt"))).toBe(true);
+  });
+
   test("a second /new-worktree while one is active is refused", () => {
     newWorktree(repo, undefined, env);
     const line = newWorktree(repo, undefined, env);
