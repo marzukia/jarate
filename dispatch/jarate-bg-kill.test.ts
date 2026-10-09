@@ -541,3 +541,212 @@ describe("jarate-bg-kill interrupt: provisional marker dropped (review F5)", () 
     }
   }, 40_000);
 });
+
+/**
+ * audit dispatch-core P12: SIGKILL escalation. A TERM-immune victim holds
+ * the drain open for the full PI_BG_KILL_WAIT window; the kill must then
+ * escalate to per-pid SIGKILL (with the cgroup.kill guard firing, since
+ * the cgroup is still non-empty). Pre-fix coverage: every kill test used
+ * a plain `sleep` victim that dies on TERM, so the escalation branch
+ * (gone=0 path) never ran.
+ */
+describe("jarate-bg-kill P12: SIGKILL escalation on TERM-immune victim", () => {
+  test("TERM-immune victim: survives the grace window, dies of SIGKILL (137)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkillp12-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00017";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    let body: { embeds: any[] } | null = null;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") body = (await req.json()) as any;
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    // run record: the escalation path still finalizes state=cancelled
+    const recDir = path.join(tmp, "records");
+    fs.mkdirSync(recDir, { recursive: true });
+    const recFile = path.join(recDir, `pi-bg-${id}.json`);
+    fs.writeFileSync(
+      recFile,
+      JSON.stringify({
+        run: id,
+        profile: "worker",
+        project: null,
+        cwd: tmp,
+        started: "2026-09-13T12:00:00Z",
+        delivery: "webhook",
+        state: "done",
+      }),
+    );
+
+    // TERM-immune victim that RECORDS the TERM (handler runs, loop keeps
+    // going): proves the TERM was delivered and survived - the death that
+    // follows must therefore be the KILL escalation.
+    const termRcvd = path.join(tmp, "term-rcvd");
+    const victim = spawn(
+      [
+        "bash",
+        "-c",
+        `trap 'touch ${termRcvd}' TERM; while :; do sleep 0.2; done`,
+      ],
+      { stdout: "ignore", stderr: "ignore", stdin: "ignore" },
+    );
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_RECORD_DIR: recDir,
+      PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "1",
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    const vcode = await victim.exited;
+
+    try {
+      expect(code).toBe(0);
+      expect(out).toContain(`killed ${id}`);
+      // the TERM was delivered (handler ran) and ignored
+      expect(fs.existsSync(termRcvd)).toBe(true);
+      // the victim died of SIGKILL, not TERM: 137 = 128+9. A TERM death
+      // would be 143 and would mean the escalation never fired.
+      expect(vcode).toBe(137);
+      // cgroup.kill guard: the cgroup was still non-empty at escalation,
+      // so the blind kill switch was skipped in favor of per-pid SIGKILL
+      expect(err).toContain("skipping cgroup.kill");
+      expect(err).toContain("not empty (live PIDs)");
+      // the kill-marker final line: real duration >= the 1s grace window,
+      // victim pid in the pids list
+      const marker = fs.readFileSync(
+        path.join(tmp, "art", `pi-bg-${id}-killed`),
+        "utf8",
+      );
+      const finalLine = marker.trim().split("\n").at(-1) as string;
+      const dur = Number(finalLine.match(/after (\d+)s/)?.[1]);
+      expect(dur).toBeGreaterThanOrEqual(1);
+      expect(finalLine).toContain(`pids: ${victim.pid} `);
+      // embed wait line reflects the escalation window
+      expect(body?.embeds[0].description).toMatch(
+        /\u251c wait {3}: \d+s \(TERM->KILL\)/,
+      );
+      // record finalized cancelled after the escalation path
+      expect(JSON.parse(fs.readFileSync(recFile, "utf8")).state).toBe(
+        "cancelled",
+      );
+    } finally {
+      try {
+        victim.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      server.stop(true);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
+ * audit dispatch-core P13 (kill side): webhook URL precedence when BOTH
+ * the env var and the file are set. jarate-bg-kill resolves PI_DISPATCH_
+ * WEBHOOK first, the file only fills an EMPTY env (same rule as
+ * jarate-bg). The file is parked on a dead port: if the file ever won,
+ * the CANCELLED post would die there and dead-letter.
+ */
+describe("jarate-bg-kill P13: kill webhook env-vs-file precedence", () => {
+  test("both set: env PI_DISPATCH_WEBHOOK wins over the file", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibgkillp13-"));
+    tmpDirs.push(tmp);
+    const home = path.join(tmp, "home");
+    fs.mkdirSync(home, { recursive: true });
+    const cgRoot = path.join(tmp, "cg");
+    const id = "20260913-120000-00018";
+    const cg = path.join(cgRoot, "pi-bg", id);
+    fs.mkdirSync(cg, { recursive: true });
+
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const cfg = path.join(home, ".config", "pi-dispatch");
+    fs.mkdirSync(cfg, { recursive: true });
+    // dead port: if the file URL ever won, the terminal post dies here
+    fs.writeFileSync(path.join(cfg, "webhook"), "http://127.0.0.1:9/dead\n");
+
+    const victim = spawn(["sleep", "300"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${victim.pid}\n`);
+
+    const env = {
+      ...process.env,
+      HOME: home,
+      PI_BG_CG_ROOT: cgRoot,
+      PI_BG_TMPDIR: path.join(tmp, "art"),
+      PI_DISPATCH_WEBHOOK: `http://127.0.0.1:${server.port}/hook`,
+      PI_BG_WB_BACKOFF: "0",
+      PI_BG_KILL_WAIT: "1",
+    } as Record<string, string>;
+    delete env.PI_SERVICE;
+
+    const p = spawn(["bash", KILL, id], {
+      env,
+      cwd: tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+
+    try {
+      expect(code).toBe(0);
+      expect(out).toContain(`killed ${id}`);
+      // env won: the CANCELLED post landed on the live server
+      expect(posts).toHaveLength(1);
+      expect(posts[0].embeds[0].title).toBe(`pi-bg ${id} \u00b7 CANCELLED`);
+      // the dead file URL was never hit: no dead letter, no failure text
+      const art = path.join(tmp, "art");
+      const deadLetters = fs
+        .readdirSync(art)
+        .filter((f) => f.includes("webhook-failed"));
+      expect(deadLetters).toHaveLength(0);
+      expect(err).not.toContain("webhook FAILED");
+    } finally {
+      victim.kill("SIGKILL");
+      server.stop(true);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
