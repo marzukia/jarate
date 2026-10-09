@@ -42,9 +42,11 @@ import {
   sendInteractionFollowup,
   setChannelCursor,
   setDiscordInteractionHandler,
+  startSlashReput,
   stopDiscordPresence,
   suppressAutoReact,
 } from "./discord";
+import { parseVerboseLevel } from "./index";
 
 // ─── fetch mock plumbing ───────────────────────────────────────────────────
 
@@ -880,6 +882,95 @@ test("registerDiscordCommands skips cleanly with no guilds", async () => {
   });
   await registerDiscordCommands("tok-dm");
   expect(seen.some((u) => u.includes("/commands"))).toBe(false);
+});
+
+// ─── Registry ↔ dispatch lockstep (2026-10-09: 8 dispatch cases shipped
+// unregistered; /verbose choices pinned to on/off instead of the parser's
+// 12 modes). These tests pin the SET so a silent drop fails CI. ───────────
+
+test("SLASH_COMMANDS registers every dispatch command, no silent drops", () => {
+  // Exact ordered list = the runChannelCommand switch in index.ts.
+  expect(SLASH_COMMANDS.map((c) => c.name)).toEqual([
+    "stop",
+    "btw",
+    "help",
+    "status",
+    "usage",
+    "context",
+    "reset",
+    "restart",
+    "undo",
+    "redo",
+    "verbose",
+    "hold",
+    "compact",
+    "handover",
+    "model",
+    "jobs",
+    "new-worktree",
+    "merge-worktree",
+    "diff",
+    "todos",
+    "sleep",
+    "tasks",
+    "vault",
+  ]);
+  // Names are unique (a duplicate would hide a drop in the list above).
+  const names = SLASH_COMMANDS.map((c) => c.name);
+  expect(new Set(names).size).toBe(names.length);
+});
+
+test("/verbose registered choices deep-equal the modes parseVerboseLevel accepts", () => {
+  const verbose = SLASH_COMMANDS.find((c) => c.name === "verbose");
+  expect(verbose).toBeDefined();
+  const opt = verbose!.options![0] as {
+    required?: boolean;
+    choices?: { name: string; value: string }[];
+  };
+  // Bare /verbose shows the current level — the option must stay optional.
+  expect(opt.required).toBe(false);
+  const registered: string[] = (opt.choices ?? []).map((c) => c.value);
+  // The parser's accepted set, straight from its switch (default → null).
+  const cases = [...parseVerboseLevel.toString().matchAll(/case "([^"]+)":/g)]
+    .map((m) => m[1]!)
+    .sort();
+  expect(cases.length).toBeGreaterThan(0); // extraction sanity
+  expect([...registered].sort()).toEqual(cases);
+  // Every registered choice actually parses to a level.
+  for (const v of registered) expect(parseVerboseLevel(v)).not.toBeNull();
+});
+
+test("startSlashReput: re-PUTs the guild list on interval; 0 disables (2026-10-08 drift)", async () => {
+  const puts: string[] = [];
+  setFetch(async (u, init) => {
+    if (u.endsWith("/applications/@me")) return jsonResp(200, { id: "app1" });
+    if (u.endsWith("/users/@me/guilds"))
+      return jsonResp(200, [{ id: "g1", name: "One" }]);
+    if (init?.method === "PUT" && u.includes("/commands")) puts.push(u);
+    return jsonResp(200, null);
+  });
+  // "0" disables: no timer, no re-PUT.
+  const off = startSlashReput("tok-r", { JARATE_SLASH_REPUT_MS: "0" });
+  expect(off).toBeNull();
+  expect(puts.length).toBe(0);
+  // 1ms interval: a cleared list self-heals within the window.
+  const t = startSlashReput("tok-r", { JARATE_SLASH_REPUT_MS: "1" });
+  expect(t).not.toBeNull();
+  const deadline = Date.now() + 1000;
+  while (puts.length === 0 && Date.now() < deadline)
+    await new Promise((r) => setTimeout(r, 5));
+  if (t) clearInterval(t);
+  expect(puts.length).toBeGreaterThan(0);
+  expect(puts[0]).toBe(
+    "https://discord.com/api/v10/applications/app1/guilds/g1/commands",
+  );
+});
+
+test("startSlashReput: default env = 6h unref'd timer", () => {
+  const t = startSlashReput("tok-r", {});
+  expect(t).not.toBeNull();
+  expect(t!.hasRef?.()).toBe(false); // never holds the process open
+  if (t) clearInterval(t);
 });
 
 // issue #169 — the socket/handler seam, hermetically: a fake gateway
