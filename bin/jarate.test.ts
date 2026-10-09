@@ -216,6 +216,21 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   );
 
   const env = { ...process.env } as Record<string, string>;
+  // Ambient-env hygiene (audit F1): scrub every var the entrypoint reads
+  // (JARATE_*, AGENT_SAY_*, RAG_PROJECT) before the explicit fixture
+  // values below are set, same explicit-scrub pattern as the dispatch
+  // #110 fixture. A caller's shell must not flip a test: RAG_PROJECT
+  // leaks into the rag tests (src:ambient), JARATE_SSH_HOST into the
+  // #147 derivation.
+  for (const k of Object.keys(env)) {
+    if (
+      k === "RAG_PROJECT" ||
+      k.startsWith("JARATE_") ||
+      k.startsWith("AGENT_SAY_")
+    ) {
+      delete env[k];
+    }
+  }
   env.HOME = home;
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.XDG_RUNTIME_DIR = path.join(tmp, "xdg");

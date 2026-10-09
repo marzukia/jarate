@@ -86,6 +86,20 @@ function fixture(): Fixture {
   fs.chmodSync(bunStub, 0o755);
 
   const env = { ...process.env } as Record<string, string>;
+  // Ambient-env hygiene (audit F1): scrub the vars the script reads
+  // (AGENT_SAY_*, JARATE_*, RAG_PROJECT) before the explicit fixture
+  // values below, same explicit-scrub pattern as the dispatch #110
+  // fixture. An ambient AGENT_SAY_FORCE=1 would bypass the allowlist
+  // tests; PI_BOT_TOKEN is deleted below like the others.
+  for (const k of Object.keys(env)) {
+    if (
+      k === "RAG_PROJECT" ||
+      k.startsWith("JARATE_") ||
+      k.startsWith("AGENT_SAY_")
+    ) {
+      delete env[k];
+    }
+  }
   env.HOME = home;
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.CURL_CAPTURE = capture;
