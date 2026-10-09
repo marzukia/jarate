@@ -9,12 +9,27 @@
 // RECALL_PG_ADMIN_HOST (default 127.0.0.1). No committed default password:
 // unset RECALL_PG_ADMIN_PASS skips the suite.
 //
+// Working route on marzuki-hydrogen (2026-10-08 audit, 4/4 in ~3.5s):
+//   RECALL_PG_ADMIN_USER=andryo \
+//   RECALL_PG_ADMIN_PASS="$(cat ~/.config/sudo-pass)" bun test
+// The default RECALL_PG_ADMIN_USER=root is DEAD on that host: ssh root@
+// 127.0.0.1 is key-denied, and the monky role has rolcreatedb=f, so the
+// ssh+sudo-as-postgres admin route is the only one that works there.
+// CI runs no Postgres/Ollama services, so the suite skips in CI; a CI PG
+// service is a separate ticket.
+//
 // Skips cleanly (describe.skip) when Postgres admin or the Ollama embed
 // host is unreachable, so CI-less boxes stay green.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -86,9 +101,15 @@ function dropScratchDb(): void {
 }
 
 async function rowCount(database: string): Promise<number> {
+  return countWhere(database, "true");
+}
+
+async function countWhere(database: string, where: string): Promise<number> {
   const sql = connect({ database, username: PGUSER, host: PGSOCKET });
   try {
-    const rows = await sql.unsafe("select count(*) as n from chunks");
+    const rows = await sql.unsafe(
+      `select count(*) as n from chunks where ${where}`,
+    );
     return Number(rows[0]?.n ?? 0);
   } finally {
     await sql.end({ timeout: 5 });
@@ -202,6 +223,27 @@ describeIt("recall integration (scratch db recall_test)", () => {
       const stats = await ingest({ config, roots: [home], home });
       expect(stats.pruned).toBe(0);
       expect(await rowCount(DB)).toBe(4);
+    },
+    { timeout: TEST_TIMEOUT_MS },
+  );
+
+  // audit F9: hash = sha256(source+content) and prune is scoped to THIS
+  // run's sources, so renaming a file is a NEW source + NEW hash: the old
+  // source's chunks survive (stale, still searchable). Pins the current
+  // behavior; a prune redesign would be deliberate and change this.
+  test(
+    "rename leaves the old source row (prune scoped to run sources)",
+    async () => {
+      const alpha = path.join(home, "projects", "alpha");
+      renameSync(path.join(alpha, "alpha.md"), path.join(alpha, "renamed.md"));
+      const stats = await ingest({ config, roots: [home], home });
+      expect(stats.pruned).toBe(0); // the stale row is out of prune scope
+      // 4 surviving rows + 1 new row for the renamed file
+      expect(await rowCount(DB)).toBe(5);
+      // the stale row is still there and searchable
+      expect(
+        await countWhere(DB, "source LIKE '%projects/alpha/alpha.md'"),
+      ).toBe(1);
     },
     { timeout: TEST_TIMEOUT_MS },
   );

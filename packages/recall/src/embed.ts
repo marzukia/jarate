@@ -63,8 +63,3 @@ export async function embed(opts: EmbedOpts, text: string): Promise<number[]> {
   if (!v) throw new Error("embed: no embedding returned");
   return v;
 }
-
-/** Postgres vector literal: [0.1,0.2,...] */
-export function vectorLiteral(v: number[]): string {
-  return `[${v.join(",")}]`;
-}

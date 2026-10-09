@@ -16,21 +16,27 @@ describe("defaultDsn ($USER default)", () => {
   };
 
   test("uses $USER for the default DSN user", () => {
-    process.env.USER = "frank";
-    delete process.env.LOGNAME;
-    expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=frank");
-    restoreUser();
+    try {
+      process.env.USER = "frank";
+      delete process.env.LOGNAME;
+      expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=frank");
+    } finally {
+      restoreUser();
+    }
   });
 
   test("falls back to LOGNAME, then the OS user", () => {
-    delete process.env.USER;
-    process.env.LOGNAME = "monky";
-    expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=monky");
-    delete process.env.LOGNAME;
-    expect(defaultDsn()).toBe(
-      `host=127.0.0.1 dbname=rag user=${userInfo().username}`,
-    );
-    restoreUser();
+    try {
+      delete process.env.USER;
+      process.env.LOGNAME = "monky";
+      expect(defaultDsn()).toBe("host=127.0.0.1 dbname=rag user=monky");
+      delete process.env.LOGNAME;
+      expect(defaultDsn()).toBe(
+        `host=127.0.0.1 dbname=rag user=${userInfo().username}`,
+      );
+    } finally {
+      restoreUser();
+    }
   });
 
   test("envConfig: default DSN user = $USER; RAG_DSN still wins, unset fields fall back", () => {
@@ -49,6 +55,7 @@ describe("defaultDsn ($USER default)", () => {
       expect(envConfig().dsn).toEqual({ database: "rag", username: "other" });
       expect(envConfig().dsn.host).toBeUndefined();
     } finally {
+      restoreUser();
       if (savedDsn === undefined) delete process.env.RAG_DSN;
       else process.env.RAG_DSN = savedDsn;
     }
@@ -91,6 +98,15 @@ describe("parseDsn", () => {
 
   test("missing dbname throws", () => {
     expect(() => parseDsn("host=127.0.0.1 user=monky")).toThrow(/dbname/);
+  });
+
+  test("socket URL (postgres:///rag): empty hostname -> host unset (audit F7)", () => {
+    // libpq treats a missing host as the unix-socket default; the same
+    // holds here: host stays UNSET (never ""), so connect() does not
+    // feed pgpassLookup a fake TCP host
+    const d = parseDsn("postgres:///rag");
+    expect(d).toEqual({ database: "rag" });
+    expect(d.host).toBeUndefined();
   });
 });
 

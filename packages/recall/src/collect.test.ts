@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { collect } from "./collect";
+import { collect, SKIP_DIRS } from "./collect";
 
 function setup(): { home: string; cleanup: () => void } {
   const home = mkdtempSync(path.join(tmpdir(), "recall-collect-"));
@@ -63,5 +63,30 @@ describe("collect", () => {
     } finally {
       cleanup();
     }
+  });
+
+  // audit F4: stale-20260908 (dated personal-infra residue) was removed
+  // from SKIP_DIRS; pin the list so a new entry (or a removal) is a
+  // deliberate, reviewed change instead of silent rot
+  test("SKIP_DIRS is exactly the pinned list", () => {
+    expect([...SKIP_DIRS].sort()).toEqual(
+      [
+        ".cache",
+        ".git",
+        ".mypy_cache",
+        ".next",
+        ".npm",
+        ".parcel-cache",
+        ".pi",
+        ".turbo",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "out",
+        "target",
+      ].sort(),
+    );
   });
 });
