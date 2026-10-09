@@ -146,6 +146,10 @@ describe("egress choke point", () => {
     // Floor: the 5 content senders + sendFilesToDiscord (filenames only).
     // A mutation that adds a NEW sender (exported or not, content: or
     // payload_json filenames) with raw text must FAIL the loop above.
+    // Floor check: defense-in-depth only. The real teeth are the explicit
+    // 7-sender list (test 2) and the bypass loop (this test). Mutation C2
+    // (floor -> >= 0) passes: the floor alone cannot prove coverage — it
+    // only keeps the list from silently shrinking below what we know about.
     expect(textSenders.length).toBeGreaterThanOrEqual(6);
   });
 });

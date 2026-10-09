@@ -33,13 +33,29 @@ const user = (id: string): string =>
     message: { role: "user", content: [] },
   });
 
-const delta = (id: string): string =>
+// DEFENSIVE fixture (audit F4): `message_update` is NOT a real pi
+// session-file entry type — zero `"type":"message_update"` occurrences
+// in any session jsonl on this host (verified 2026-10-08). In pi dist it
+// exists only as an extension event (core/extensions/types.d.ts
+// MessageUpdateEvent: { type, message, assistantMessageEvent }), so the
+// fixture below matches that shape. The guard in usage.ts (the
+// '"type":"message"' pre-filter + the addEntry type check) is harmless
+// defense in depth — the reference impl (pi-token-cost.py) excludes it
+// independently. Kept so a pi change that ever persists streaming deltas
+// cannot silently double-count usage.
+const delta = (): string =>
   JSON.stringify({
     type: "message_update",
-    id,
     message: {
       role: "assistant",
+      content: [],
       usage: { input: 100, output: 100, cacheRead: 100, cacheWrite: 100 },
+    },
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "p",
+      partial: { role: "assistant", content: [] },
     },
   });
 
@@ -191,7 +207,7 @@ describe("summarizeSessionFile", () => {
     const f = writeSession(tmp, "s1.jsonl", [
       user("u1"),
       asst("a1", A(100, 10, 5, 1)),
-      delta("a1"), // streaming delta with usage: must not double-count
+      delta(), // streaming delta with usage: must not double-count
       asst("a2", undefined), // no usage: skip
       asst("a3", A(0, 0, 0, 0)), // zero usage: skip
       asst("a4", A(200, 20, 7, 2)),
