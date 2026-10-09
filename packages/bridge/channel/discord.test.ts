@@ -40,8 +40,8 @@ import {
   SLASH_COMMANDS,
   seedChannelStateForTest,
   sendDiscordMessage,
+  sendDiscordTyping,
   sendFilesToDiscord,
-  sendInteractionFollowup,
   setChannelCursor,
   setDiscordInteractionHandler,
   stopDiscordPresence,
@@ -919,6 +919,9 @@ test("gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the h
             op: 0,
             s: 3,
             t: "INTERACTION_CREATE",
+            // Live guild shape (capture 2026-10-08): the actor lives at
+            // member.user; a guild INTERACTION_CREATE has NO top-level
+            // user, and a type-1 (PING) frame carries no data.
             d: {
               type: 1,
               id: "ix9",
@@ -926,8 +929,7 @@ test("gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the h
               application_id: "app9",
               channel_id: "888",
               guild_id: "g9",
-              user: { id: "u9" },
-              data: { id: "cmd9", name: "help" },
+              member: { user: { id: "u9" } },
             },
           }),
         );
@@ -951,7 +953,7 @@ test("gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the h
     expect(identified.length).toBe(1);
     expect(identified[0].intents & 0x2, "INTERACTIONS intent bit").toBe(0x2);
     expect(received.length).toBe(1);
-    expect(received[0].data.name).toBe("help");
+    expect(received[0].member.user.id).toBe("u9");
     expect(received[0].type).toBe(1);
     expect(received[0].channel_id).toBe("888");
   } finally {
@@ -994,27 +996,6 @@ test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @or
 
 // ─── Interaction followup + gateway snowflake precision (RCA 2026-10-08) ──
 
-test("sendInteractionFollowup POSTs the webhook ROOT (Create Followup), not /messages (RCA 2026-10-08)", async () => {
-  const calls: { url: string; method: string; body: any }[] = [];
-  setFetch(async (u, init) => {
-    calls.push({
-      url: u,
-      method: init?.method ?? "GET",
-      body: JSON.parse(init.body),
-    });
-    return jsonResp(200, { id: "m" });
-  });
-  await sendInteractionFollowup("tok-d", interaction, "done", {
-    ephemeral: true,
-  });
-  expect(calls.length).toBe(1);
-  // The /webhooks/{app}/{token}/messages form is the INCOMING-webhook
-  // "Execute Webhook" route; interaction tokens reject it with 400 50035.
-  expect(calls[0].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123");
-  expect(calls[0].method).toBe("POST");
-  expect(calls[0].body).toEqual({ content: "done", flags: 64 });
-});
-
 test("replyInteraction PATCHes @original, visible by default (RCA 2026-10-08)", async () => {
   const calls: { url: string; method: string; body: any }[] = [];
   setFetch(async (u, init) => {
@@ -1040,9 +1021,13 @@ test("replyInteraction PATCHes @original, visible by default (RCA 2026-10-08)", 
 });
 
 test("replyInteraction falls back to webhook-ROOT followup when @original is gone (RCA 2026-10-08)", async () => {
-  const calls: { url: string; method: string }[] = [];
+  const calls: { url: string; method: string; body: any }[] = [];
   setFetch(async (u, init) => {
-    calls.push({ url: u, method: init?.method ?? "GET" });
+    calls.push({
+      url: u,
+      method: init?.method ?? "GET",
+      body: init?.body ? JSON.parse(init.body) : undefined,
+    });
     if (u.endsWith("/messages/@original"))
       return jsonResp(404, { message: "Unknown Message" });
     return jsonResp(200, { id: "m" });
@@ -1050,8 +1035,13 @@ test("replyInteraction falls back to webhook-ROOT followup when @original is gon
   await replyInteraction("tok-d", interaction, "still visible");
   expect(calls.length).toBe(2);
   expect(calls[0].method).toBe("PATCH");
+  // Create Followup is the webhook ROOT — the incoming-webhook
+  // /webhooks/{app}/{token}/messages form is rejected with 400 50035.
   expect(calls[1].url).toBe("https://discord.com/api/v10/webhooks/app1/tok123");
   expect(calls[1].method).toBe("POST");
+  expect(calls[1].body.content).toBe("still visible");
+  // Visible to the whole channel: no ephemeral flag.
+  expect(calls[1].body.flags).toBeUndefined();
 });
 
 test("parseGatewayPayload: bare 16+ digit ints -> exact strings; everything else untouched (RCA 2026-10-08)", () => {
@@ -1299,14 +1289,69 @@ test("deferInteraction body carries flags 64 — ephemeral loading state, tapper
   expect(calls[0].body).toEqual({ type: 5, flags: 64 });
 });
 
-test("sendInteractionFollowup / replyInteraction report delivery; false on transport failure (#204)", async () => {
+test("replyInteraction reports delivery; false on transport failure (#204)", async () => {
   setFetch(async () => jsonResp(200, { id: "m" }));
-  expect(await sendInteractionFollowup("tok-d", interaction, "ok")).toBe(true);
   expect(await replyInteraction("tok-d", interaction, "ok")).toBe(true);
 
   setFetch(async () => jsonResp(503, { message: "stubbed outage" }));
-  expect(await sendInteractionFollowup("tok-d", interaction, "x")).toBe(false);
   expect(await replyInteraction("tok-d", interaction, "x")).toBe(false);
+});
+
+test("discordFetch: 429 retries, honors retry_after, succeeds on 3rd attempt (D6)", async () => {
+  let n = 0;
+  const t0 = Date.now();
+  setFetch(async () => {
+    n++;
+    if (n < 3)
+      return jsonResp(429, { retry_after: 0.01, message: "slow down" });
+    return jsonResp(200, { ok: 1 });
+  });
+  const r = await discordFetch("tok-d", "/x");
+  expect(r).toEqual({ ok: 1 });
+  expect(n).toBe(3);
+  // retry_after honored: 2 waits x (10ms + 100ms slack) = >= 200ms
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(200);
+});
+
+test("discordFetch: 429 on all 3 attempts -> terminal error (D6)", async () => {
+  let n = 0;
+  setFetch(async () => {
+    n++;
+    return jsonResp(429, { retry_after: 0, message: "slow down" });
+  });
+  const err = await discordFetch("tok-d", "/x").catch((e: any) => e);
+  expect(n).toBe(3);
+  // The 3rd 429 falls through to the !resp.ok throw (the post-loop
+  // throw is unreachable for 429 — !ok fires first).
+  expect(String(err?.message)).toMatch(/^Discord API 429/);
+});
+
+test("sendDiscordTyping POSTs /channels/{id}/typing (D6)", async () => {
+  clearDiscordStatesForTest();
+  const calls: { url: string; method: string }[] = [];
+  setFetch(async (u, init) => {
+    calls.push({ url: String(u), method: init?.method ?? "GET" });
+    return jsonResp(204, null);
+  });
+  await sendDiscordTyping({
+    id: "ch-typing",
+    type: "discord",
+    channel: "777",
+    botToken: "tok-typing",
+  } as any);
+  expect(calls).toEqual([
+    {
+      url: "https://discord.com/api/v10/channels/777/typing",
+      method: "POST",
+    },
+  ]);
+  // no botToken: silently skipped, no extra call
+  await sendDiscordTyping({
+    id: "ch-typing",
+    type: "discord",
+    channel: "777",
+  } as any);
+  expect(calls.length).toBe(1);
 });
 
 test("discordFetch: 4xx body truncated to 200 by default, full with fullError (#210)", async () => {
@@ -1421,41 +1466,18 @@ describe("URL contract (#211): interaction endpoints vs pinned Discord routes", 
     });
 
     // The full interaction lifecycle, in order:
-    await respondToInteraction("bot-tok", d, "ack"); // 1. ACK (type-6 reply)
+    await respondToInteraction("bot-tok", d, "ack"); // 1. ACK (type-4 reply)
     await deferInteraction("bot-tok", d); // 2. ACK (type-5 defer)
-    await sendInteractionFollowup("bot-tok", d, "hello"); // 3. Create Followup
-    await editInteractionMessage("bot-tok", d, "world"); // 4. Edit Webhook Message
-    await deleteDeferredAck("bot-tok", d); // 5. Delete Webhook Message
-    await replyInteraction("bot-tok", d, "final"); // 6. Edit Webhook Message
+    await editInteractionMessage("bot-tok", d, "world"); // 3. Edit Webhook Message
+    await deleteDeferredAck("bot-tok", d); // 4. Delete Webhook Message
+    await replyInteraction("bot-tok", d, "final"); // 5. Edit Webhook Message
 
     expect(calls.map((c) => `${c.method} ${c.url.replace(BASE, "")}`)).toEqual([
       `POST ${renderRoute(EXPECTED_ROUTES.createInteractionResponse, d)}`,
       `POST ${renderRoute(EXPECTED_ROUTES.createInteractionResponse, d)}`,
-      `POST ${renderRoute(EXPECTED_ROUTES.createFollowup, d)}`,
       `PATCH ${renderRoute(EXPECTED_ROUTES.editWebhookMessage, d)}`,
       `DELETE ${renderRoute(EXPECTED_ROUTES.deleteWebhookMessage, d)}`,
       `PATCH ${renderRoute(EXPECTED_ROUTES.editWebhookMessage, d)}`,
     ]);
-  });
-
-  test("Create Followup is the webhook ROOT — never the incoming-webhook .../messages route", async () => {
-    const d = {
-      id: "int-2",
-      token: "tok-2",
-      application_id: "app-2",
-    } as any;
-    const urls: string[] = [];
-    setFetch(async (url) => {
-      urls.push(url);
-      return jsonResp(200, { id: "m1" });
-    });
-
-    await sendInteractionFollowup("bot-tok", d, "hello");
-
-    expect(urls).toEqual([`${BASE}/webhooks/app-2/tok-2`]);
-    // The RCA incident: POST .../webhooks/{app}/{token}/messages is the
-    // Incoming Webhooks route — 404 "Unknown Webhook Message" for
-    // interaction tokens.
-    expect(urls[0].endsWith("/messages")).toBe(false);
   });
 });

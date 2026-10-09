@@ -9797,6 +9797,62 @@ describe("wave 2c bridge commands", () => {
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined }); // bare /jobs: view, no arg
   });
 
+  test("text /vault routes to the vault handler (#206: matchCommand + case vault)", async () => {
+    // The plain-text path (matchCommand regex -> runChannelCommand case
+    // "vault") is distinct from the slash-command path: a misfired regex or
+    // a dropped switch case silently answers "unknown command" or hands
+    // "/vault status" to the agent as a prompt.
+    // The startup path auto-registers a vault handle per connected channel
+    // (async), so pin the no-handle state explicitly for a deterministic
+    // refusal.
+    __setVaultHandleForTest("ch1", null);
+    expect(matchCommand("/vault status")).toEqual({
+      name: "vault",
+      arg: "status",
+    });
+    expect(matchCommand("/vault")).toEqual({ name: "vault", arg: undefined });
+    // no vault handle: visible refusal, not a prompt
+    await handleInbound(pi, inbound("/vault status", "mv0"), ctx);
+    expect(posts().some((t) => t.includes("vault not running"))).toBe(true);
+    // real vault on the channel: the text command reaches vaultSlash
+    const vtmp = path.join(tmp, "vault");
+    const vh = startVault({
+      ch: {
+        id: "ch1",
+        name: "Test",
+        type: "discord",
+        botToken: "tok1",
+        ownerUserId: OWNER,
+      } as any,
+      botToken: "tok1",
+      stateDir: path.join(vtmp, "state"),
+      xdgDir: path.join(vtmp, "xdg"),
+      vaultDir: vtmp,
+      knownDir: path.join(vtmp, "known"),
+      secretsDir: path.join(vtmp, "secrets"),
+      stateFile: path.join(vtmp, "state.json"),
+      auditFile: path.join(vtmp, "audit.log"),
+      legacyPatsDir: path.join(vtmp, "legacy"),
+      legacyDefaultPatFile: path.join(vtmp, "marzukia-pat"),
+      transport: "socket",
+    });
+    __setVaultHandleForTest("ch1", vh);
+    try {
+      await vh.ready;
+      fetchCalls.length = 0;
+      await handleInbound(pi, inbound("/vault status", "mv1"), ctx);
+      expect(
+        posts().some((t) =>
+          t.includes("vault: no pending or active credentials"),
+        ),
+      ).toBe(true);
+    } finally {
+      stopVault(vh);
+      __setVaultHandleForTest("ch1", null);
+      __vaultResetForTest();
+    }
+  });
+
   test("runUsageLine: pricing matches pi-token-cost.py (#40)", () => {
     expect(
       runUsageLine({

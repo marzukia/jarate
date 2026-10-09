@@ -111,7 +111,7 @@ export function parseJobsFromPs(
     const m = line
       .trim()
       .match(
-        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:scripts\/(?:pi-bg|jarate-bg)|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
+        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:(?:scripts|dispatch)\/(?:pi-bg|jarate-bg)|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
       );
     if (!m) continue;
     const id = ticketIdFromPid(Number(m[1]), procRoot);
@@ -158,9 +158,11 @@ export function collectInflightJobs(procRoot: string = "/proc"): InflightJob[] {
   try {
     const uid = process.getuid?.();
     // [s]/(s) tricks keep grep itself out of its own match; the second
-    // arm catches the per-run snapshot path (deploy-swap guard).
+    // arm catches the per-run snapshot path (deploy-swap guard). Both the
+    // scripts/ and dispatch/ wrapper locations are matched — a fail-open
+    // run (pre-snapshot) lives its whole life as scripts/jarate-bg.
     raw = execSync(
-      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep -E '(s)cripts/pi-bg|snap-[0-9]{8}-[0-9]{6}-[0-9]+/pi-bg'`,
+      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep -E '(s)cripts/(pi-bg|jarate-bg)|dispatch/(pi-bg|jarate-bg)|snap-[0-9]{8}-[0-9]{6}-[0-9]+/pi-bg'`,
       { encoding: "utf8", timeout: 5000 },
     );
   } catch {
