@@ -450,72 +450,82 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
  * stderr names the real user cgroup root, the ticket dir is created there
  * mid-run, and drained + reaped on exit (no leak).
  */
-describe("cgroup escape default path (no PI_BG_CG_ROOT): real user cgroup root", () => {
-  const uid = process.getuid();
-  const realTicketRoot = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/pi-bg`;
+const realUserSvc = `/sys/fs/cgroup/user.slice/user-${process.getuid()}.slice/user@${process.getuid()}.service`;
+// Requires a live systemd user session owning the real cgroup root. The
+// default escape parent (user@uid.service) is unobservable without one —
+// e.g. CI runners, where every pi-bg spawn overrides PI_BG_CG_ROOT — so
+// skip rather than fail. (Same env-gate class as root-only concurrency
+// test #41.) The fake-root suites already pin the escape mechanism itself.
+const describeDefaultCg = fs.existsSync(realUserSvc) ? describe : describe.skip;
 
-  test("default escape: stderr names the real root, ticket dir created mid-run + reaped on exit", async () => {
-    const fx = fixture();
-    fx.seedMainCreds();
-    delete fx.env.PI_BG_CG_ROOT;
-    expect(fs.existsSync(realTicketRoot)).toBe(true); // user manager owns it
-    // sleep long enough to observe the ticket cgroup dir mid-run
-    fs.writeFileSync(
-      path.join(fx.tmp, "bin", "pi"),
-      "#!/bin/sh\nsleep 5\necho pi-run-ok\n",
-    );
-    let runId = "";
-    const p = spawn(["bash", PI_BG, "worker", "default cg path task"], {
-      env: fx.env,
-      cwd: fx.tmp,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    try {
-      const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
-      const t0 = Date.now();
-      while (!runId && Date.now() - t0 < 15000) {
-        try {
-          const c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
-          if (c.length === 1)
-            runId = JSON.parse(
-              fs.readFileSync(path.join(recDir, c[0]), "utf8"),
-            ).run;
-        } catch {
-          /* the record dir is created by pi-bg after spawn */
+describeDefaultCg(
+  "cgroup escape default path (no PI_BG_CG_ROOT): real user cgroup root",
+  () => {
+    const realTicketRoot = `${realUserSvc}/pi-bg`;
+
+    test("default escape: stderr names the real root, ticket dir created mid-run + reaped on exit", async () => {
+      const fx = fixture();
+      fx.seedMainCreds();
+      delete fx.env.PI_BG_CG_ROOT;
+      expect(fs.existsSync(realUserSvc)).toBe(true); // user manager owns it
+      // sleep long enough to observe the ticket cgroup dir mid-run
+      fs.writeFileSync(
+        path.join(fx.tmp, "bin", "pi"),
+        "#!/bin/sh\nsleep 5\necho pi-run-ok\n",
+      );
+      let runId = "";
+      const p = spawn(["bash", PI_BG, "worker", "default cg path task"], {
+        env: fx.env,
+        cwd: fx.tmp,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      try {
+        const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
+        const t0 = Date.now();
+        while (!runId && Date.now() - t0 < 15000) {
+          try {
+            const c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+            if (c.length === 1)
+              runId = JSON.parse(
+                fs.readFileSync(path.join(recDir, c[0]), "utf8"),
+              ).run;
+          } catch {
+            /* the record dir is created by pi-bg after spawn */
+          }
+          if (!runId) await Bun.sleep(100);
         }
-        if (!runId) await Bun.sleep(100);
+        expect(runId).toMatch(/^\d{8}-\d{6}-\d+$/);
+        const ticketCg = `${realTicketRoot}/${runId}`;
+        // the ticket cgroup must exist on the REAL root mid-run
+        const t1 = Date.now();
+        while (!fs.existsSync(ticketCg) && Date.now() - t1 < 10000) {
+          await Bun.sleep(100);
+        }
+        expect(fs.existsSync(ticketCg)).toBe(true);
+        const [out] = await Promise.all([
+          new Response(p.stdout).text(),
+          new Response(p.stderr).text(),
+        ]);
+        const code = await p.exited;
+        expect(code).toBe(0);
+        // the default parent is the real user service cgroup (the banner
+        // prints on stdout; the webhook warnings are the stderr class)
+        expect(out).toContain(`[pi-bg] cgroup escape active: ${ticketCg}`);
+        // drained + reaped on exit: no leak on the real root
+        expect(fs.existsSync(ticketCg)).toBe(false);
+      } finally {
+        // an interrupted run (bun timeout/SIGKILL) would leave the dir
+        if (runId) {
+          fs.rmSync(`${realTicketRoot}/${runId}`, {
+            recursive: true,
+            force: true,
+          });
+        }
       }
-      expect(runId).toMatch(/^\d{8}-\d{6}-\d+$/);
-      const ticketCg = `${realTicketRoot}/${runId}`;
-      // the ticket cgroup must exist on the REAL root mid-run
-      const t1 = Date.now();
-      while (!fs.existsSync(ticketCg) && Date.now() - t1 < 10000) {
-        await Bun.sleep(100);
-      }
-      expect(fs.existsSync(ticketCg)).toBe(true);
-      const [out] = await Promise.all([
-        new Response(p.stdout).text(),
-        new Response(p.stderr).text(),
-      ]);
-      const code = await p.exited;
-      expect(code).toBe(0);
-      // the default parent is the real user service cgroup (the banner
-      // prints on stdout; the webhook warnings are the stderr class)
-      expect(out).toContain(`[pi-bg] cgroup escape active: ${ticketCg}`);
-      // drained + reaped on exit: no leak on the real root
-      expect(fs.existsSync(ticketCg)).toBe(false);
-    } finally {
-      // an interrupted run (bun timeout/SIGKILL) would leave the dir
-      if (runId) {
-        fs.rmSync(`${realTicketRoot}/${runId}`, {
-          recursive: true,
-          force: true,
-        });
-      }
-    }
-  }, 40_000);
-});
+    }, 40_000);
+  },
+);
 
 describe("#30: no webhook => loud warning at dispatch + run record delivery=none", () => {
   test("missing webhook: stderr warning + record marked delivery=none", async () => {
