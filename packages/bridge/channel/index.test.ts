@@ -5303,6 +5303,197 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   });
 });
 
+// ─── Slash registry ↔ dispatch routing (2026-10-09) ─────────────────────────
+// 2026-10-09 operator report: /usage, /context, /diff, /hold, /tasks,
+// /new-worktree, /merge-worktree (+ /handover) had dispatch cases but no
+// registered command, so the '/' menu never offered them. One routing test
+// per newly registered command: the slash interaction must reach its
+// runChannelCommand case WITH the option value (allowlist passthrough).
+// Pattern: #206 vault-slash tests (real interaction payload, stubbed fetch,
+// deferred-ack edits as the assertion surface).
+
+describe("buildInteractionHandler: registered slash commands route to their dispatch case", () => {
+  const realFetch = globalThis.fetch;
+  const ch: any = {
+    id: "ich-r",
+    name: "IntRoute",
+    type: "discord",
+    botToken: "tok-r",
+    channel: "777",
+    ownerUserId: "owner1",
+  };
+  let pi: any;
+  let ctx: any;
+  let calls: { url: string; method: string; body?: any }[];
+
+  const d = (name: string, extra: Record<string, any> = {}) => ({
+    id: "ir1",
+    token: "tokr123",
+    application_id: "appr",
+    channel_id: "777",
+    user: { id: "owner1" },
+    data: { name, options: extra.options ?? [] },
+    ...extra,
+  });
+
+  function deferredTexts(): string[] {
+    return calls
+      .filter(
+        (c) =>
+          c.method === "PATCH" &&
+          c.url.includes("/webhooks/appr/tokr123/messages/@original"),
+      )
+      .map((c) => String(JSON.parse(c.body as string).content ?? ""));
+  }
+
+  beforeEach(() => {
+    calls = [];
+    pi = { setModel: async () => true, sendMessage: () => {} };
+    ctx = {
+      cwd: "/tmp",
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+      compact: () => {},
+      modelRegistry: { getAvailable: () => [] },
+      getContextUsage: () => undefined,
+      model: { id: "cur", name: "Cur" },
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      calls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        body: init?.body,
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(() => {
+    clearDiscordStatesForTest();
+    globalThis.fetch = realFetch;
+  });
+
+  test("/usage last: scope choice reaches renderUsage via the usage case", async () => {
+    const saved = (lastRunUsage as { value: any }).value;
+    (lastRunUsage as { value: any }).value = {
+      stats: {
+        turns: 3,
+        input: 100,
+        output: 50,
+        cacheRead: 80,
+        cacheWrite: 5,
+      },
+      at: new Date("2026-10-09T00:00:00Z"),
+    };
+    try {
+      const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+      await h(
+        d("usage", {
+          options: [{ type: 3, name: "scope", value: "last" }],
+        }) as any,
+      );
+      expect(deferredTexts().at(-1)).toContain("usage · last run");
+    } finally {
+      (lastRunUsage as { value: any }).value = saved;
+    }
+  });
+
+  test("/context: count option passes the allowlist into renderContext", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(
+      d("context", {
+        options: [{ type: 3, name: "count", value: "12x" }],
+      }) as any,
+    );
+    expect(deferredTexts().at(-1)).toContain("[!] usage: /context [1-40]");
+  });
+
+  test("/diff: source option passes the allowlist into publishDiff", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(
+      d("diff", {
+        options: [{ type: 3, name: "source", value: "two words" }],
+      }) as any,
+    );
+    // styleGuard wraps at 40 cols: assert a wrap-safe substring of the
+    // usage line (only resolveDiffSource's null path emits it).
+    expect(deferredTexts().at(-1)).toContain("usage: /diff [git-range");
+  });
+
+  test("/hold: mode option passes the allowlist into the hold case", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(
+      d("hold", {
+        options: [{ type: 3, name: "mode", value: "bogus" }],
+      }) as any,
+    );
+    expect(deferredTexts().at(-1)).toContain("[!] usage: /hold on|off");
+  });
+
+  test("/tasks: action option passes the allowlist into the tasks case", async () => {
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(
+      d("tasks", {
+        options: [{ type: 3, name: "action", value: "cancel" }],
+      }) as any,
+    );
+    expect(deferredTexts().at(-1)).toContain("[!] usage: /tasks cancel <id>");
+  });
+
+  test("/new-worktree: ref option passes the allowlist into newWorktree", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-wt-"));
+    ctx.cwd = tmp;
+    try {
+      const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+      await h(
+        d("new-worktree", {
+          options: [{ type: 3, name: "ref", value: "main" }],
+        }) as any,
+      );
+      expect(deferredTexts().at(-1)).toContain("[!] not a git repo");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("/merge-worktree: routes to the worktree case (no active state)", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-mw-"));
+    ctx.cwd = tmp;
+    try {
+      const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+      await h(
+        d("merge-worktree", {
+          options: [{ type: 3, name: "mode", value: "squash" }],
+        }) as any,
+      );
+      expect(deferredTexts().at(-1)).toContain("[!] no active worktree");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("/handover: instructions option reaches startCompact via the handover case", async () => {
+    let compacted: any = null;
+    ctx.compact = (o?: any) => {
+      compacted = o;
+    };
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(
+      d("handover", {
+        options: [{ type: 3, name: "instructions", value: "focus on X" }],
+      }) as any,
+    );
+    expect(compacted?.customInstructions).toBe("focus on X");
+    expect(deferredTexts().at(-1)).toContain("compacting...");
+  });
+});
+
 describe("compact: defer mid-run + always report", () => {
   let tmp = "";
   let pi: any;

@@ -1788,6 +1788,11 @@ export async function deleteDeferredAck(
  *  intent, 5431caed) and route through buildInteractionHandler into the
  *  same executor as the text path, which stays as the fallback —
  *  agent-say / peer traffic produces messages, not interactions. */
+// NOTE: keep this list in lockstep with the runChannelCommand switch in
+// index.ts — every dispatch case needs a registered entry (and vice
+// versa). Option names are single-string args; buildInteractionHandler
+// passes through the first option whose name is in its allowlist, so new
+// option names must be added there too. discord.test.ts pins the set.
 export const SLASH_COMMANDS = [
   { name: "stop", description: "Stop the current run" },
   {
@@ -1804,25 +1809,101 @@ export const SLASH_COMMANDS = [
   },
   { name: "help", description: "List the commands" },
   { name: "status", description: "Session stats (owner)" },
-  { name: "reset", description: "Restart the session (owner)" },
+  {
+    name: "usage",
+    description: "Token usage: current session, all, or last run",
+    options: [
+      {
+        type: 3,
+        name: "scope",
+        description: "all, session, or last run (omit: session)",
+        required: false,
+        choices: [
+          { name: "all", value: "all" },
+          { name: "session", value: "session" },
+          { name: "last", value: "last" },
+        ],
+      },
+    ],
+  },
+  {
+    name: "context",
+    description: "What's eating the window: top-N + category totals (est)",
+    options: [
+      {
+        type: 3,
+        name: "count",
+        description: "N (1-40, default 10)",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "reset",
+    description: "Start a NEW session, clearing context (owner)",
+  },
   { name: "restart", description: "Restart pi, resuming this session (owner)" },
   {
     name: "undo",
-    description: "Revert last assistant turn: files + conversation (owner)",
+    description:
+      "Revert last N assistant turns (default 1): files + conversation (owner)",
+    options: [
+      {
+        type: 3,
+        name: "count",
+        description: "N (1 or more, default 1)",
+        required: false,
+      },
+    ],
   },
   { name: "redo", description: "Reapply an /undo (one level deep, owner)" },
   {
     name: "verbose",
-    description: "Forward tool calls (owner)",
+    description: "Tool detail: 0 text, 1 essential, 2 all (owner)",
     options: [
       {
         type: 3,
         name: "mode",
-        description: "on or off",
+        description: "bare shows the current level",
+        required: false,
+        // Pinned to every mode parseVerboseLevel (index.ts) accepts —
+        // discord.test.ts deep-equals this set against the parser.
+        choices: [
+          { name: "0", value: "0" },
+          { name: "off", value: "off" },
+          { name: "text", value: "text" },
+          { name: "text-only", value: "text-only" },
+          { name: "1", value: "1" },
+          { name: "essential", value: "essential" },
+          {
+            name: "text-and-essential-tools",
+            value: "text-and-essential-tools",
+          },
+          { name: "2", value: "2" },
+          { name: "on", value: "on" },
+          { name: "all", value: "all" },
+          { name: "tools", value: "tools" },
+          { name: "tools-and-text", value: "tools-and-text" },
+        ],
+      },
+    ],
+  },
+  {
+    name: "hold",
+    description: "Buffer messages until released (owner)",
+    options: [
+      {
+        type: 3,
+        name: "mode",
+        description: "on or off (bare toggles)",
         required: false,
         choices: [
           { name: "on", value: "on" },
           { name: "off", value: "off" },
+          { name: "yes", value: "yes" },
+          { name: "no", value: "no" },
+          { name: "1", value: "1" },
+          { name: "0", value: "0" },
         ],
       },
     ],
@@ -1830,6 +1911,18 @@ export const SLASH_COMMANDS = [
   {
     name: "compact",
     description: "Compact session context (owner)",
+    options: [
+      {
+        type: 3,
+        name: "instructions",
+        description: "optional focus instructions",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "handover",
+    description: "Compact via the handover doc (owner; needs handoff.enabled)",
     options: [
       {
         type: 3,
@@ -1851,7 +1944,55 @@ export const SLASH_COMMANDS = [
       },
     ],
   },
-  { name: "jobs", description: "List in-flight pi-bg dispatches" },
+  {
+    name: "jobs",
+    description: "List in-flight pi-bg dispatches (kill/tail are owner)",
+    options: [
+      {
+        type: 3,
+        name: "action",
+        description: "kill <id>, tail <id> [--n N], or json (omit: list)",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "new-worktree",
+    description: "Worktree for this session's repo (owner)",
+    options: [
+      {
+        type: 3,
+        name: "ref",
+        description: "git ref (default HEAD)",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "merge-worktree",
+    description: "Merge worktree back, keep or squash (owner)",
+    options: [
+      {
+        type: 3,
+        name: "mode",
+        description: "squash for squash merge (default keep)",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "diff",
+    description:
+      "Publish a diff to a shareable viewer URL (default: working tree)",
+    options: [
+      {
+        type: 3,
+        name: "source",
+        description: "git-range, file, or diff-paste (omit: working tree)",
+        required: false,
+      },
+    ],
+  },
   {
     name: "todos",
     description: "Show the channel todo board ('all' for every channel)",
@@ -1872,6 +2013,19 @@ export const SLASH_COMMANDS = [
         type: 3,
         name: "scope",
         description: "'list' or 'cancel <id>'",
+        required: false,
+      },
+    ],
+  },
+  {
+    name: "tasks",
+    description: "Schedule, change or cancel prompt tasks (owner)",
+    options: [
+      {
+        type: 3,
+        name: "action",
+        description:
+          'list, add "<prompt>" <minutes|ISO|cron [tz]>, reschedule <id> <spec>, cancel <id> (omit: list)',
         required: false,
       },
     ],
@@ -1985,6 +2139,40 @@ export async function registerDiscordCommands(token: string): Promise<void> {
       sanitizeSensitiveText(String(e)),
     );
   }
+}
+
+/** Default re-registration period: 6h. The guild list can be cleared out
+ *  from under a running bridge (2026-10-08: both guilds at 0 ~2-3h after
+ *  boot, audit log 403 - no trail), so a running bridge re-PUTs the guild
+ *  list periodically: idempotent, self-healing between boots. */
+export const SLASH_REPUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
+
+/** Start the periodic slash-command re-registration for one bot token.
+ *  Interval from JARATE_SLASH_REPUT_MS (default 6h); "0"/"off"/"false"
+ *  disable. unref'd: never holds the process open. Returns the timer (for
+ *  tests + shutdown) or null when disabled. Exported for tests. */
+export function startSlashReput(
+  token: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ReturnType<typeof setInterval> | null {
+  const raw = (env.JARATE_SLASH_REPUT_MS ?? String(SLASH_REPUT_DEFAULT_MS))
+    .trim()
+    .toLowerCase();
+  const ms =
+    raw === "0" || raw === "off" || raw === "false"
+      ? 0
+      : Number.parseInt(raw, 10);
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const t = setInterval(() => {
+    registerDiscordCommands(token).catch((e) =>
+      console.error(
+        "[interactions] slash re-register failed:",
+        sanitizeSensitiveText(String(e)),
+      ),
+    );
+  }, ms);
+  t.unref?.();
+  return t;
 }
 
 /** POST the typing indicator (~10s display). */

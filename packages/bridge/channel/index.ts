@@ -63,6 +63,7 @@ import {
   setChannelCursor,
   setDiscordInteractionHandler,
   setDiscordPresenceActivity,
+  startSlashReput,
   stopDiscordPresence,
   suppressAutoReact,
   unreactMessage,
@@ -2623,6 +2624,10 @@ export default function (pi: ExtensionAPI) {
           if (bt) {
             connectDiscordPresence(bt);
             registerDiscordCommands(bt).catch(() => {});
+            // Periodic re-registration guard (2026-10-08 drift: both guilds
+            // cleared ~2-3h after boot, no audit trail). unref'd, idempotent;
+            // JARATE_SLASH_REPUT_MS=0 disables.
+            startSlashReput(bt);
             // PAT vault: started alongside the interaction handler;
             // state persists in <cwd>/.tmp (same dir as channel-state).
             // L4: once per process per socket path; refcounted stop on
@@ -4385,11 +4390,26 @@ export function buildInteractionHandler(
       return;
     }
     await deferInteraction(botToken, d);
+    // Single-string options only: every registered command carries at most
+    // one type-3 option; its name must be in this allowlist or the value
+    // never reaches runChannelCommand. Keep in lockstep with SLASH_COMMANDS
+    // (discord.ts) — the option names in use: question (btw), mode
+    // (verbose/hold/merge-worktree), instructions (compact/handover), name
+    // (model), scope (usage/todos/sleep), count (context/undo), action
+    // (jobs/tasks), ref (new-worktree), source (diff).
     const opt = Array.isArray(d.data?.options)
       ? d.data.options.find((o: any) =>
-          ["question", "mode", "instructions", "name", "scope"].includes(
-            o?.name,
-          ),
+          [
+            "question",
+            "mode",
+            "instructions",
+            "name",
+            "scope",
+            "count",
+            "action",
+            "ref",
+            "source",
+          ].includes(o?.name),
         )
       : undefined;
     // /vault (#206): subcommand form — the first option is the
