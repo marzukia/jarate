@@ -83,16 +83,13 @@ class FakeDiscord {
           return resp(this.postStatus, { message: "stubbed" });
         return resp(200, { id: `msg-${++this.msgSeq}` });
       }
-      if (
-        method === "POST" &&
-        url.includes("/webhooks/") &&
-        url.includes("messages?wait=true")
-      ) {
-        return resp(200, { id: "followup" });
-      }
       // Interaction webhook (RCA 2026-10-08): POST /webhooks/{app}/{token}
       // is Create Followup (webhook ROOT — wait is implicit); the
-      // /messages/@original subroute edits/deletes the deferred ack.
+      // /messages/@original subroute edits/deletes the deferred ack. The
+      // incoming-webhook form /webhooks/{app}/{token}/messages?wait=true is
+      // NOT a valid interaction route (live Discord: 400 50035) — the wh
+      // branch below 404s it, matching reality (audit F2: the old 200 here
+      // masked any regression back to that URL).
       const wh = url.match(/\/webhooks\/[^/]+\/[^/]+(\/.*)?$/);
       if (wh) {
         const rest = wh[1] ?? "";
@@ -653,6 +650,142 @@ describe("one-callback discipline", () => {
       expect(denies2).toBe(denies1);
       // The second defer POST 400s (callback spent) — swallowed, no crash.
       expect(f.fd.callbacksFor("i-dd")).toBe(2);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("dedupe pre-transition: non-owner rejection redelivered -> no dup audit/reply (F3)", async () => {
+    // The state gate cannot catch redelivery of a tap that never
+    // transitioned (non-owner, mismatch): the state is still "pending".
+    // Only markSeen does — the second delivery must produce no second
+    // substantive audit and no second visible reply.
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      const d = mkD("i-ddn", `pat:approve:${req.id}`, {
+        message: { id: req.messageId },
+        user: { id: OTHER, username: "Other" },
+      });
+      await f.h.handlePatComponent(d);
+      const nonOwner = () =>
+        f.auditLines().filter((l) => l.includes("event=non-owner-tap")).length;
+      expect(nonOwner()).toBe(1);
+      expect(f.fd.replies("i-ddn").length).toBe(1);
+      await f.h.handlePatComponent(d); // redelivery, same d.id
+      expect(nonOwner()).toBe(1);
+      expect(f.fd.replies("i-ddn").length).toBe(1);
+      const dup = f
+        .auditLines()
+        .filter(
+          (l) => l.includes("event=tap-rejected") && l.includes("duplicate"),
+        ).length;
+      expect(dup).toBe(1);
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      // Both deliveries defer (2 POSTs); the callback is single-use —
+      // the second 400s (swallowed, no crash).
+      expect(f.fd.callbacksFor("i-ddn")).toBe(2);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("type-4 interaction with a pat custom_id: ignored (type-3 gate)", async () => {
+    // Live guild traffic carries the component as type 3 (MESSAGE_COMPONENT);
+    // type 4 is APPLICATION_COMMAND. A matching custom_id on a non-3 frame
+    // must be ignored entirely — no defer, no reply, no state change.
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      const callsBefore = f.fd.calls.length;
+      await f.h.handlePatComponent(
+        mkD("i-t4", `pat:approve:${req.id}`, {
+          type: 4,
+          message: { id: req.messageId },
+        }),
+      );
+      expect(f.fd.calls.length).toBe(callsBefore);
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(f.auditLines().some((l) => l.includes("event=approve"))).toBe(
+        false,
+      );
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("message id via d.data.message (older nested shape): tap accepted", async () => {
+    // The live payload puts the component's message on d.message (RCA
+    // 2026-10-08); older payloads nested it in d.data.message. Each
+    // fallback step of the lookup chain gets its own fixture.
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-dm2", `pat:approve:${req.id}`, {
+          message: undefined,
+          data: {
+            custom_id: `pat:approve:${req.id}`,
+            message: { id: req.messageId },
+          },
+        }),
+      );
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("message id via d.message_id (defensive last resort): tap accepted", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-mid", `pat:approve:${req.id}`, {
+          message: undefined,
+          data: { custom_id: `pat:approve:${req.id}` },
+          message_id: req.messageId,
+        }),
+      );
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("tap reply falls back to webhook-ROOT POST when @original is gone (50035 route pinned)", async () => {
+    // replyInteraction edits the deferred ack (PATCH @original); when the
+    // ack is gone it creates a followup on the webhook ROOT. If that
+    // followup URL ever regresses to the incoming-webhook
+    // /messages?wait=true form, live Discord answers 400 50035 and the
+    // tap feedback is silently lost (RCA 2026-10-08). The stub 404s that
+    // form (audit F2), so this test fails on the regression.
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      const base = globalThis.fetch;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        const url = String(input);
+        if (init?.method === "PATCH" && url.endsWith("/messages/@original"))
+          return resp(404, { message: "Unknown Webhook Message" });
+        return base(input, init);
+      }) as any;
+      try {
+        await f.h.handlePatComponent(
+          mkD("i-fb", `pat:approve:${req.id}`, {
+            message: { id: "other-message" },
+          }),
+        );
+      } finally {
+        globalThis.fetch = base;
+      }
+      const fu = f.fd.followups();
+      expect(fu.length).toBe(1);
+      expect(fu[0].url).toBe(
+        "https://discord.com/api/v10/webhooks/app1/intok-i-fb",
+      );
+      expect(fu[0].body.content).toMatch(/tap rejected/);
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
     } finally {
       f.cleanup();
     }

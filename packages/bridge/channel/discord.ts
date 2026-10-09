@@ -1691,43 +1691,6 @@ export async function editInteractionMessage(
   }
 }
 
-/** Create a followup message on an interaction. The callback is already
- *  spent (defer consumed it — Discord allows exactly ONE callback
- *  response per interaction), so this goes to the interaction webhook.
- *  NOTE: the endpoint is the webhook ROOT — POST /webhooks/{app.id}/
- *  {token} (wait is always true for interaction webhooks). The
- *  /webhooks/{app}/{token}/messages form is the INCOMING-webhook
- *  "Execute Webhook" route; interaction tokens reject it with 400 50035
- *  (errors.webhook_service: ENUM_TYPE_COERCE on "messages") — RCA
- *  2026-10-08, vault tap feedback invisible. Errors are swallowed (a
- *  failed followup must not kill the tap flow). Returns true when the
- *  followup was delivered, false when the transport failed — callers
- *  audit the failure (tap-feedback-failed, #204). */
-export async function sendInteractionFollowup(
-  botToken: string,
-  d: any,
-  text: string,
-  opts?: { ephemeral?: boolean },
-): Promise<boolean> {
-  try {
-    await discordFetch(botToken, `/webhooks/${d.application_id}/${d.token}`, {
-      method: "POST",
-      body: {
-        content: egressText(text), // secret censor
-        ...(opts?.ephemeral ? { flags: 64 } : {}),
-      },
-      fullError: true, // #210
-    });
-    return true;
-  } catch (e) {
-    console.error(
-      "[interactions] followup failed:",
-      sanitizeSensitiveText(String(e)),
-    );
-    return false;
-  }
-}
-
 /** Post-defer tap RESULT: edit the deferred original in place (PATCH
  *  @original) — the documented replacement for the deprecated
  *  "followup POST right after a defer edits the original" behavior.

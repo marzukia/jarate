@@ -400,16 +400,19 @@ describe("extractDeterministic", () => {
   // (channel-ctx block as the FIRST line) plus the clean body in
   // `details.body`. Machine inbounds (Beepy webhook, [bg: heartbeats) come
   // through the same customType; bridge-injected wakes carry no channel-ctx.
+  // Faithful to the CustomMessageEntry shape: timestamp is a string
+  // (sendToPi passes new Date().toISOString()) and details carries the
+  // channelTitle() string (e.g. "discord/Test").
   const inb = (i: number, from: string | null, body: string) => ({
     id: `e${i}`,
     type: "custom_message",
     customType: "channel-inbound",
-    timestamp: i,
+    timestamp: String(i),
     content:
       from != null
         ? `<channel-ctx type="discord" name="test" from="${from}" msgId="m${i}">ctx</channel-ctx>\n\n${body}`
         : body,
-    details: { body },
+    details: { title: "discord/Test", body },
   });
   test("last user asks: HUMAN inbounds only, last 2 (RCA F3)", () => {
     const entries = [
@@ -2445,7 +2448,7 @@ describe("auto-compact token-% gate", () => {
       logs.push(a.join(" "));
     };
     try {
-      await handlers.agent_end({ messages: [] }, ctx);
+      await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
       await flushMacrotasks();
     } finally {
       console.log = realLog;
@@ -2469,7 +2472,7 @@ describe("auto-compact token-% gate", () => {
       contextWindow: 262_144,
       percent: 79.9,
     });
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2477,7 +2480,7 @@ describe("auto-compact token-% gate", () => {
 
   test("over threshold but handoff in flight → not triggered (no double)", async () => {
     setHandoffInFlight(true);
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2494,7 +2497,7 @@ describe("auto-compact token-% gate", () => {
     expect(isHandoffFreshWindow(path.join(home, ".jarate", "handovers"))).toBe(
       true,
     );
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2509,7 +2512,7 @@ describe("auto-compact token-% gate", () => {
         storeDir: path.join(home, ".jarate", "handovers"),
       },
     });
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(0);
     expect(isCompacting("ch1")).toBe(false);
@@ -2517,7 +2520,7 @@ describe("auto-compact token-% gate", () => {
 
   test("no loop: settle → compact → doc → settle does NOT re-fire", async () => {
     // 1) settled turn over threshold: the gate fires the compact.
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(1);
     expect(isCompacting("ch1")).toBe(true);
@@ -2538,7 +2541,7 @@ describe("auto-compact token-% gate", () => {
     expect(isCompacting("ch1")).toBe(false);
     // 4) next settled turn: still over threshold, but the fresh window
     //    (doc just written) blocks a re-fire — no tight loop.
-    await handlers.agent_end({ messages: [] }, ctx);
+    await handlers.agent_end({ type: "agent_end", messages: [] }, ctx);
     await flushMacrotasks();
     expect(compacts).toBe(1);
     expect(isCompacting("ch1")).toBe(false);
