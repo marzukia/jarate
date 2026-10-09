@@ -441,6 +441,82 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
   });
 });
 
+/**
+ * audit dispatch-core P11: the cgroup-escape DEFAULT path (no PI_BG_CG_ROOT
+ * override) is unpinned - every fixture spawn overrides it, so the default
+ * parent computation (line: CG_PARENT="/sys/fs/cgroup/user.slice/user-$(id
+ * -u).slice/user@$(id -u).service") only runs in production. This test runs
+ * one real spawn WITHOUT the override and pins the default: the escape
+ * stderr names the real user cgroup root, the ticket dir is created there
+ * mid-run, and drained + reaped on exit (no leak).
+ */
+describe("cgroup escape default path (no PI_BG_CG_ROOT): real user cgroup root", () => {
+  const uid = process.getuid();
+  const realTicketRoot = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/pi-bg`;
+
+  test("default escape: stderr names the real root, ticket dir created mid-run + reaped on exit", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    delete fx.env.PI_BG_CG_ROOT;
+    expect(fs.existsSync(realTicketRoot)).toBe(true); // user manager owns it
+    // sleep long enough to observe the ticket cgroup dir mid-run
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      "#!/bin/sh\nsleep 5\necho pi-run-ok\n",
+    );
+    let runId = "";
+    const p = spawn(["bash", PI_BG, "worker", "default cg path task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
+      const t0 = Date.now();
+      while (!runId && Date.now() - t0 < 15000) {
+        try {
+          const c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+          if (c.length === 1)
+            runId = JSON.parse(
+              fs.readFileSync(path.join(recDir, c[0]), "utf8"),
+            ).run;
+        } catch {
+          /* the record dir is created by pi-bg after spawn */
+        }
+        if (!runId) await Bun.sleep(100);
+      }
+      expect(runId).toMatch(/^\d{8}-\d{6}-\d+$/);
+      const ticketCg = `${realTicketRoot}/${runId}`;
+      // the ticket cgroup must exist on the REAL root mid-run
+      const t1 = Date.now();
+      while (!fs.existsSync(ticketCg) && Date.now() - t1 < 10000) {
+        await Bun.sleep(100);
+      }
+      expect(fs.existsSync(ticketCg)).toBe(true);
+      const [out] = await Promise.all([
+        new Response(p.stdout).text(),
+        new Response(p.stderr).text(),
+      ]);
+      const code = await p.exited;
+      expect(code).toBe(0);
+      // the default parent is the real user service cgroup (the banner
+      // prints on stdout; the webhook warnings are the stderr class)
+      expect(out).toContain(`[pi-bg] cgroup escape active: ${ticketCg}`);
+      // drained + reaped on exit: no leak on the real root
+      expect(fs.existsSync(ticketCg)).toBe(false);
+    } finally {
+      // an interrupted run (bun timeout/SIGKILL) would leave the dir
+      if (runId) {
+        fs.rmSync(`${realTicketRoot}/${runId}`, {
+          recursive: true,
+          force: true,
+        });
+      }
+    }
+  }, 40_000);
+});
+
 describe("#30: no webhook => loud warning at dispatch + run record delivery=none", () => {
   test("missing webhook: stderr warning + record marked delivery=none", async () => {
     const fx = fixture();
@@ -468,6 +544,49 @@ describe("#30: no webhook => loud warning at dispatch + run record delivery=none
     const recs = fx.records();
     expect(recs.length).toBe(1);
     expect(recs[0].delivery).toBe("webhook");
+  }, 30_000);
+
+  // audit dispatch-core P13: webhook URL precedence when BOTH the env var
+  // and the file are set. jarate-bg line 778: PI_DISPATCH_WEBHOOK first,
+  // the file only fills an EMPTY env. The test parks the FILE on a dead
+  // port: if the file ever won, the terminal callback would die there.
+  test("both set: env PI_DISPATCH_WEBHOOK wins over the file", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    try {
+      const cfg = path.join(fx.home, ".config", "pi-dispatch");
+      fs.mkdirSync(cfg, { recursive: true });
+      // dead port: if the file URL ever won, the terminal post dies here
+      fs.writeFileSync(path.join(cfg, "webhook"), "http://127.0.0.1:9/dead\n");
+      fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+      const r = await fx.run(["worker", "precedence task"]);
+      expect(r.code).toBe(0);
+      expect(r.err).not.toContain("no completion callback");
+      expect(fx.records()[0].delivery).toBe("webhook");
+      // env won: the terminal callback landed on the live server
+      expect(posts).toHaveLength(1);
+      const e = posts[0].embeds[0];
+      expect(e.title).toMatch(/^worker \u00b7 OK \u00b7 /);
+      const task = (e.fields ?? []).find((f: any) => f.name === "task");
+      expect(task?.value).toContain("precedence task");
+      // the dead file URL was never hit: no dead letter in the artifact dir
+      const art = path.join(fx.home, ".pi-bg-art");
+      const deadLetters = fs.existsSync(art)
+        ? fs.readdirSync(art).filter((f) => f.includes("webhook-failed"))
+        : [];
+      expect(deadLetters).toHaveLength(0);
+    } finally {
+      server.stop(true);
+    }
   }, 30_000);
 });
 
@@ -2936,10 +3055,21 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
     fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
     fx.env.PI_BG_WB_BACKOFF = "0";
     fs.mkdirSync(art, { recursive: true });
+    // audit dispatch-core P10: the fake pi writes a START marker as its
+    // first act. The wrapper registers its EXIT/TERM traps BEFORE the pi
+    // spawn loop, so the marker proving pi started also proves the traps
+    // are armed - killing on the marker (not on the run record, which is
+    // created earlier, before the traps) is what makes the DIED-suppression
+    // assertion below non-vacuous. Pre-fix, a fast kill could land between
+    // record creation and trap registration: the wrapper died untrapped,
+    // no DIED post ever, and the test passed without exercising the
+    // kill-marker branch.
     fs.writeFileSync(
       path.join(fx.tmp, "bin", "pi"),
-      "#!/bin/sh\nsleep 30\necho pi-run-ok\n",
+      `#!/bin/sh\ntouch "$PI_BG_TEST_START" 2>/dev/null || true\nsleep 30\necho pi-run-ok\n`,
     );
+    const startMarker = path.join(art, "test-start");
+    fx.env.PI_BG_TEST_START = startMarker;
     const p = spawn(["bash", PI_BG, "worker", "kill record task"], {
       env: fx.env,
       cwd: fx.tmp,
@@ -2962,6 +3092,14 @@ describe("#51: one-shot run-state lifecycle (record state + prune)", () => {
         await Bun.sleep(100);
       }
       expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
+      // wait for the start marker (traps armed), then a short settle so
+      // the kill lands while the wrapper sits in its wait loop
+      const m0 = Date.now();
+      while (!fs.existsSync(startMarker) && Date.now() - m0 < 15000) {
+        await Bun.sleep(100);
+      }
+      expect(fs.existsSync(startMarker)).toBe(true);
+      await Bun.sleep(300);
       const kenv = { ...fx.env, PI_BG_KILL_WAIT: "1" } as Record<
         string,
         string
