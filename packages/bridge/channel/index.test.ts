@@ -127,6 +127,7 @@ import {
   stopVault,
   vaultRequest,
 } from "./vault";
+import { clearWorktreeState } from "./worktree";
 
 /** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
  *  40-col budget (word boundaries, 2-space continuation indent). These
@@ -5447,17 +5448,58 @@ describe("buildInteractionHandler: registered slash commands route to their disp
   });
 
   test("/new-worktree: ref option passes the allowlist into newWorktree", async () => {
+    // Real scratch repo (worktree.test.ts pattern): in a plain tmp dir
+    // newWorktree bails with "not a git repo" BEFORE the ref is read, so
+    // the allowlist entry was never discriminated by this test.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-wt-"));
-    ctx.cwd = tmp;
+    const repo = path.join(tmp, "live");
+    fs.mkdirSync(repo, { recursive: true });
+    const git = (...args: string[]) =>
+      execFileSync("git", args, {
+        cwd: repo,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@t",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@t",
+        },
+      });
+    git("init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "base.txt"), "base\n");
+    git("add", "base.txt");
+    git("commit", "-m", "base commit");
+    const oldWtDir = process.env.PI_BG_WT_DIR;
+    process.env.PI_BG_WT_DIR = path.join(tmp, "wt");
+    ctx.cwd = repo;
     try {
       const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+      // Existing ref: honored end-to-end. Dropping "ref" from the
+      // allowlist makes it "from HEAD" -> this line fails.
       await h(
         d("new-worktree", {
           options: [{ type: 3, name: "ref", value: "main" }],
         }) as any,
       );
-      expect(deferredTexts().at(-1)).toContain("[!] not a git repo");
+      const ok = unwarped(deferredTexts().at(-1) ?? "");
+      expect(ok).toContain("[ok] worktree ");
+      expect(ok).toContain("from main");
+      // Ref-specific failure: a ref that does not exist in the repo makes
+      // `git worktree add` fail - only reachable when the ref string
+      // actually reached newWorktree through the allowlist.
+      clearWorktreeState(repo);
+      await h(
+        d("new-worktree", {
+          options: [{ type: 3, name: "ref", value: "nosuchref" }],
+        }) as any,
+      );
+      const bad = unwarped(deferredTexts().at(-1) ?? "");
+      expect(bad).toContain("[!] worktree add failed");
+      expect(bad.replace(/ /g, "")).toContain("nosuchref");
     } finally {
+      if (oldWtDir === undefined) delete process.env.PI_BG_WT_DIR;
+      else process.env.PI_BG_WT_DIR = oldWtDir;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
