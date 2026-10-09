@@ -80,6 +80,29 @@ function fixture() {
   env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
   delete env.PI_SERVICE;
   delete env.JARATE_AGENTS_MD;
+  // audit dispatch-watchdog F6: the bun test process inherits the operator
+  // shell; ambient watchdog-override vars (e.g. PI_BG_HUNG_MIN=999) used to
+  // silently retune the timing-sensitive sweeps. A test that needs an
+  // override sets it explicitly (per-run or per-fixture); the base fixture
+  // never inherits one.
+  for (const k of [
+    "PI_BG_STALL_MIN",
+    "PI_BG_HUNG_MIN",
+    "PI_BG_MAX_CONCURRENT",
+    "PI_BG_RETRY_WAIT",
+    "PI_BG_PRUNE_DAYS",
+    "PI_BG_WT_PRUNE_DAYS",
+    "PI_BG_OOM_DEDUPE_MIN",
+    "PI_BG_LIVE_STALE_MIN",
+    "PI_BG_LIVE_DEDUPE_MIN",
+    "PI_BG_REAPER_MIN_AGE",
+    "PI_BG_HB_INTERVAL",
+    "PI_BG_WATCHDOG_RETRY",
+    "PI_BG_LIVE_BTIME_FILE",
+    "JARATE_BIN",
+  ]) {
+    delete env[k];
+  }
 
   const run = async (
     args: string[] = [],
@@ -401,6 +424,41 @@ describe("watchdog empty-cgroup reaper (leak belt+braces)", () => {
       f.close();
     }
   });
+
+  // audit dispatch-watchdog F8: the dry-run path must pre-check liveness
+  // (cg_has_members) like the live path's rmdir does. A dry-run reports
+  // "would reap" for a cgroup it could not actually reap (rmdir fails on a
+  // non-empty dir) - the operator pre-plans a kill that cannot happen.
+  test("--dry-run: live cgroup (real member) not reported would-reap", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      // aged EMPTY control: must be reported
+      const empty = plant(f, 12);
+      fs.utimesSync(empty, old, old);
+      // aged cgroup holding a REAL live process: must be skipped
+      const live = plant(f, 11);
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await Bun.sleep(100);
+      fs.writeFileSync(path.join(live, "cgroup.procs"), `${sleep.pid}\n`);
+      fs.utimesSync(live, old, old);
+      const r = await f.run(["--dry-run"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`dry-run: would reap empty cgroup ${empty}`);
+      expect(r.out).not.toContain(`dry-run: would reap empty cgroup ${live}`);
+      // dry-run touches nothing
+      expect(fs.existsSync(empty)).toBe(true);
+      expect(fs.existsSync(live)).toBe(true);
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
 
   test("#101: young empty dir (age < REAPER_MIN_AGE) is skipped, not reaped", async () => {
     const f = fixture();
@@ -1089,6 +1147,142 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
       f.close();
     }
   }, 30_000);
+
+  // audit dispatch-watchdog F1: the run-state prune must skip LIVE tickets
+  // (prune_live guard). A worktree ticket with a live cgroup member and an
+  // 8-day-old record (> PI_BG_PRUNE_DAYS default 7) survives the prune:
+  // record, artifacts and worktree dir all intact, no posts.
+  test("run-state prune: 8-day record on a LIVE ticket survives (prune_live guard)", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      bless(f);
+      const t = TID(6);
+      plantRunning(f, t);
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true }); // fresh mtime: no wt auto-prune
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await Bun.sleep(100);
+      const cg = path.join(f.tmp, "cg", "pi-bg", t);
+      fs.mkdirSync(cg, { recursive: true });
+      fs.writeFileSync(path.join(cg, "cgroup.procs"), `${sleep.pid}\n`);
+      const hb = path.join(f.art, `pi-bg-${t}-hb`);
+      fs.writeFileSync(hb, ""); // fresh hb: not STALLED, not DEAD
+      const start = path.join(f.art, `pi-bg-${t}-started`);
+      fs.writeFileSync(start, "x");
+      // state=done: the mid-run events sweep only baselines
+      // state=running records (wd_rec_evt_set rewrites the record on
+      // every sweep, refreshing its mtime); a done record keeps its
+      // 8-day mtime until the prune section, where prune_live is the
+      // only thing between it and rm -f. (state=running + live cgroup
+      // is the same guard, but the per-sweep baseline refresh would
+      // mask the guard: the age check would skip the record first.)
+      const rf = recFile(f, t);
+      const rec = JSON.parse(fs.readFileSync(rf, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      rec.state = "done";
+      fs.writeFileSync(rf, JSON.stringify(rec, null, 2));
+      // age the record past the default 7-day prune floor
+      const old = new Date(Date.now() - 8 * 86_400_000);
+      fs.utimesSync(rf, old, old);
+
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // no prune happened: no prune line, sweep summary says 0 pruned
+      expect(r.out).not.toContain(`pruned run state ${t}`);
+      expect(r.out).toContain("0 run record(s) pruned");
+      expect(f.posts).toHaveLength(0);
+      // record + artifacts + worktree dir all intact
+      expect(fs.existsSync(recFile(f, t))).toBe(true);
+      expect(fs.existsSync(hb)).toBe(true);
+      expect(fs.existsSync(start)).toBe(true);
+      expect(fs.existsSync(wt)).toBe(true);
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
+
+  // audit dispatch-watchdog F4: clip_start head-clips (ellipsis + LAST max-1
+  // chars; the tail is kept - the ticket id is the discriminator). DEAD
+  // digest list rows: 4 dead tickets under a 47-char repo name -> the
+  // 66-col repo/ticket rows clip to 30 cols, head dropped.
+  test("4 dead tickets, long repo name: digest rows head-clip (… + last 29)", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const repo = "a-very-long-repository-name-for-clipping-tests";
+      for (const n of [7, 8, 10, 11]) {
+        const t = TID(n);
+        const d = path.join(f.wtDir, repo, t);
+        fs.mkdirSync(d, { recursive: true });
+        age(d, 30);
+        plantRunning(f, t);
+      }
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // 4 dead -> ONE digest embed (flood guard)
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe("pi-bg \u00b7 4 dead tickets swept");
+      for (const n of [7, 8, 10, 11]) {
+        const line = `${repo}/${TID(n)}`;
+        expect(line.length).toBeGreaterThan(30);
+        // head clipped: ellipsis + last 29 (ticket end kept)
+        expect(em.description).toContain(
+          `\u2026${line.slice(line.length - 29)}`,
+        );
+        // head dropped: the repo prefix is not in the clipped row
+        expect(em.description).not.toContain(line.slice(0, 28));
+      }
+      for (const l of codeLines(em)) {
+        expect(l.length).toBeLessThanOrEqual(40);
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  // audit dispatch-watchdog F4: the single-ticket DEAD embed (wd_build) uses
+  // clip_start on the wt row (tail kept, 29-col budget -> last 28 chars)
+  // - and clip_end on the repo row (head kept). A 46-char repo name forces
+  // both.
+  test("single dead ticket, long repo: wt row head-clips, repo row tail-clips", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(12);
+      const repo = "a-very-long-repository-name-for-clipping-tests";
+      const d = path.join(f.wtDir, repo, t);
+      fs.mkdirSync(d, { recursive: true });
+      age(d, 30);
+      plantRunning(f, t);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      expect(em.title).toBe("DEAD \u00b7 watchdog sweep");
+      // wt row: HEAD clip - ellipsis + last 28 (29-col budget), head dropped
+      expect(em.description).toContain(`\u2026${d.slice(d.length - 28)}`);
+      expect(em.description).not.toContain(d.slice(0, 28));
+      // repo row: TAIL clip - first 28 + ellipsis, the repo tail dropped
+      expect(em.description).toContain(
+        `\u251c repo   : ${repo.slice(0, 28)}\u2026`,
+      );
+      expect(em.description).not.toContain(repo.slice(29));
+      for (const l of codeLines(em)) {
+        expect(l.length).toBeLessThanOrEqual(40);
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
 });
 
 /**
@@ -1332,6 +1526,43 @@ describe("watchdog #52: STALLED classification (live process, stale hb)", () => 
       f.close();
     }
   }, 30_000);
+
+  // audit dispatch-watchdog F4: clip_start head-clips the STALLED list row
+  // (ellipsis + LAST 29 cols; a long repo name must not eat the ticket id).
+  test("long repo name: STALLED row head-clips (… + last 29, ticket kept)", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(4);
+      const repo = "a-very-long-repository-name-for-clipping-tests";
+      const wt = path.join(f.tmp, "wt", repo, t);
+      fs.mkdirSync(wt, { recursive: true });
+      const cg = path.join(f.tmp, "cg", "pi-bg", t);
+      fs.mkdirSync(cg, { recursive: true });
+      fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+      const hb = path.join(f.art, `pi-bg-${t}-hb`);
+      fs.writeFileSync(hb, "");
+      const old = new Date(Date.now() - 15 * 60 * 1000);
+      fs.utimesSync(hb, old, old);
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`STALLED ${repo}/${t}`);
+      expect(f.posts).toHaveLength(1);
+      const em = f.posts[0].embeds[0];
+      const line = `${repo}/${t}`;
+      expect(line.length).toBeGreaterThan(30);
+      // head clipped: ellipsis + last 29 (the ticket id is fully visible)
+      expect(em.description).toContain(`\u2026${line.slice(line.length - 29)}`);
+      expect(em.description).toContain(t);
+      // head dropped: the repo prefix is not in the clipped row
+      expect(em.description).not.toContain(line.slice(0, 28));
+      for (const l of codeLines(em)) {
+        expect(l.length).toBeLessThanOrEqual(40);
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1407,6 +1638,55 @@ describe("#142: HUNG detection (alive tree, quiet session)", () => {
         "utf8",
       ),
     ) as Record<string, unknown>;
+
+  // audit dispatch-watchdog F7: session discovery is -newermt "$rstart" at
+  // BOTH the HUNG and the events sweep. A jsonl older than the record's
+  // `started` predates the run (a leftover of a previous session in the
+  // same cwd) and must not count: without the filter the 185m-quiet
+  // leftover fires HUNG (35m threshold), and the events sweep (baseline
+  // pre-seeded 240m old) would call the 185m mtime newer and fire
+  // SESS-WRITE.
+  test("jsonl older than run start: -newermt keeps it out of HUNG + events", async () => {
+    const f = fixture();
+    let sleep: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      bless(f);
+      const t = HT(5);
+      sleep = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await Bun.sleep(100);
+      // jsonl 185m old; the record's started is 120m old (plant default):
+      // the session file PREDATES the run
+      plant(f, t, {
+        jsonlAgeMin: 185,
+        hbAgeMin: 0,
+        livePid: String(sleep.pid),
+      });
+      // pre-seed the events baseline so the sweep DIFFS instead of
+      // baselining: cgPids = current membership (no child-left), sessMtime
+      // = 240m ago - OLDER than the jsonl mtime, so an unfiltered cur_mt
+      // (185m) would compare newer and fire SESS-WRITE
+      const recF = path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`);
+      const rj = JSON.parse(fs.readFileSync(recF, "utf8"));
+      rj.cgPids = [sleep.pid];
+      rj.sessMtime = Math.floor((Date.now() - 240 * 60 * 1000) / 1000);
+      fs.writeFileSync(recF, JSON.stringify(rj));
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // HUNG sweep: the leftover jsonl is filtered out -> not judgeable
+      expect(r.out).not.toContain("HUNG cwd/");
+      // events sweep: no cur mtime -> no SESS-WRITE, no CHILD-LEFT
+      expect(r.out).not.toContain("SESS-WRITE");
+      expect(r.out).not.toContain("CHILD-LEFT");
+      expect(f.posts).toHaveLength(0);
+    } finally {
+      if (sleep) sleep.kill("SIGKILL");
+      f.close();
+    }
+  }, 30_000);
 
   test("live process + 35m-quiet jsonl + fresh hb -> HUNG post, flag, no kill", async () => {
     const f = fixture();
@@ -2568,6 +2848,47 @@ describe("#53: dead-letter consumption", () => {
       f.close();
     }
   }, 30_000);
+
+  // audit dispatch-watchdog F3: the re-post must parse the embedded body as
+  // JSON. A torn write leaves a marker + malformed JSON: re-posting a
+  // non-object body breaks the webhook bus (the bridge expects an object),
+  // so the letter is kept for forensics instead - no post, no crash, and
+  // the next sweep behaves identically.
+  test("malformed embedded JSON: no recoverable body -> kept, no post, idempotent", async () => {
+    const f = fixture();
+    bless(f);
+    const t = TID(8);
+    const p = path.join(f.art, `pi-bg-${t}-webhook-failed`);
+    fs.writeFileSync(
+      p,
+      [
+        `ticket   : ${t}`,
+        "http     : 000 (3 attempts)",
+        "when     : 2026-10-06T00:00:00Z",
+        "response : ",
+        "--- body json ---",
+        '{"content": "[bg:worker:DIED] torn',
+        "",
+      ].join("\n"),
+    );
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(
+        `dead letter ${p}: no recoverable body - kept for forensics`,
+      );
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(p)).toBe(true);
+      // the next sweep behaves identically (no crash, no partial state)
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain("no recoverable body - kept for forensics");
+      expect(f.posts).toHaveLength(0);
+      expect(fs.existsSync(p)).toBe(true);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2958,6 +3279,58 @@ describe("#143: mid-run events (child-left / sess-write)", () => {
       expect(f.posts).toHaveLength(2);
       expect(f.posts[1].embeds[0].title).toBe("DEAD \u00b7 watchdog sweep");
       expect(rec(f, t).state).toBe("killed");
+    } finally {
+      w?.kill("SIGKILL");
+      g?.kill("SIGKILL");
+      await Promise.all([w?.exited, g?.exited]);
+      f.close();
+    }
+  }, 30_000);
+
+  // audit dispatch-watchdog F2: the child-left marker distinguishes a pid
+  // that is ALIVE but no longer in the ticket cgroup, "(out)" (moved /
+  // escaped), from a pid whose /proc entry is gone (external kill).
+  test("pid alive but outside the cgroup -> child-left with (out) marker", async () => {
+    const f = fixture();
+    bless(f);
+    const t = ET(7);
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    let g: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      w = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      g = Bun.spawn(["sleep", "300"], {
+        cwd: f.tmp,
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const gp = g.pid;
+      plant(f, t, [String(w.pid), String(gp)], 300);
+      await f.run(); // baseline: both pids recorded
+      // the child left the ticket cgroup (moved elsewhere) but did NOT die
+      setProcs(f, t, [String(w.pid)]);
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain(`CHILD-LEFT cwd/${t}`);
+      // (out) = /proc still alive: distinct from the /proc-gone form
+      expect(r2.out).toContain(`${gp}(out)`);
+      expect(r2.out).not.toContain(`pids ${gp} left`);
+      expect(fs.existsSync(`/proc/${gp}`)).toBe(true);
+      // post shape: the (out) marker rides the embed + the dead log
+      expect(f.posts).toHaveLength(1);
+      expect(f.posts[0].embeds[0].title).toBe(`CHILD-LEFT \u00b7 ${t}`);
+      expect(f.posts[0].embeds[0].description).toContain(`${gp}(out)`);
+      expect(deadlog(f)).toMatch(
+        new RegExp(`child-left: pids ${gp}\\(out\\) left cgroup`, "m"),
+      );
+      // sweep 3: baseline refreshed -> nothing new
+      const r3 = await f.run();
+      expect(r3.code).toBe(0);
+      expect(r3.out).not.toContain("CHILD-LEFT");
+      expect(f.posts).toHaveLength(1);
     } finally {
       w?.kill("SIGKILL");
       g?.kill("SIGKILL");
