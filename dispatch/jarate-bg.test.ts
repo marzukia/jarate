@@ -450,13 +450,22 @@ describe("cgroup-dir leak (2026-09-14): fixture spawns stay out of the real cgro
  * stderr names the real user cgroup root, the ticket dir is created there
  * mid-run, and drained + reaped on exit (no leak).
  */
-const realUserSvc = `/sys/fs/cgroup/user.slice/user-${process.getuid()}.slice/user@${process.getuid()}.service`;
-// Requires a live systemd user session owning the real cgroup root. The
-// default escape parent (user@uid.service) is unobservable without one —
-// e.g. CI runners, where every pi-bg spawn overrides PI_BG_CG_ROOT — so
-// skip rather than fail. (Same env-gate class as root-only concurrency
+const uid = process.getuid();
+const realUserSvc = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service`;
+// Requires the test process itself to run inside the real user-session
+// cgroup: cgroup v2 only allows joining descendants of one's own subtree.
+// The GH runner has a user@uid.service, but job steps run under
+// system.slice — the escape into user@uid.service is unobservable there,
+// so skip rather than fail. (Same env-gate class as root-only concurrency
 // test #41.) The fake-root suites already pin the escape mechanism itself.
-const describeDefaultCg = fs.existsSync(realUserSvc) ? describe : describe.skip;
+const inRealUserSvc =
+  fs
+    .readFileSync("/proc/self/cgroup", "utf8")
+    .split("\n")
+    .find((l) => l.startsWith("0::/"))
+    ?.startsWith(`0::/user.slice/user-${uid}.slice/user@${uid}.service`) ??
+  false;
+const describeDefaultCg = inRealUserSvc ? describe : describe.skip;
 
 describeDefaultCg(
   "cgroup escape default path (no PI_BG_CG_ROOT): real user cgroup root",
@@ -467,7 +476,7 @@ describeDefaultCg(
       const fx = fixture();
       fx.seedMainCreds();
       delete fx.env.PI_BG_CG_ROOT;
-      expect(fs.existsSync(realUserSvc)).toBe(true); // user manager owns it
+      expect(inRealUserSvc).toBe(true); // we are inside the user session
       // sleep long enough to observe the ticket cgroup dir mid-run
       fs.writeFileSync(
         path.join(fx.tmp, "bin", "pi"),
