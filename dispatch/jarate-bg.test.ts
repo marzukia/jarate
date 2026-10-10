@@ -3826,11 +3826,11 @@ exec /usr/bin/curl "$@"`,
  * floor (PI_BG_PRUNE_AGE_H, default 24h; 0 = no floor) and reaps the slug
  * dir when it is empty. Pruning is an OPT-IN (PI_BG_PRUNE_SESSIONS=1);
  * the default is KEEP (2026-09-25 incident: the old destructive default
- * deleted live sessions with ~11B tokens of billing data). PI_BG_KEEP_
- * SESSION=1 always wins (backwards-compat kill-switch). It must never
- * delete a transcript that is still younger than the floor (cost capture
- * + death-reason reads finish within seconds of the run) and never break
- * the callback.
+ * deleted live sessions with ~11B tokens of billing data). 2026-10-10
+ * (Andryo, Cardinal Rule: NEVER delete session files): the prune ability
+ * is removed at the code level - bg_prune_session is a permanent no-op
+ * regardless of any env flag. These tests pin that contract: no session
+ * file may ever be deleted by the exit trap.
  */
 describe("session prune: exit trap drops the run's own transcript (2026-09-23)", () => {
   // mirror of the script's session slug: --<path minus leading />-separated--
@@ -3888,12 +3888,12 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
 
   const USAGE = { input: 100, output: 40, cacheRead: 0, cacheWrite: 0 };
 
-  test("opt-in + N=0 (no floor): prunes the fresh session + empty slug dir, cost still captured, callback OK", async () => {
+  test("opt-in + N=0 (no floor): session KEPT - prune is a permanent no-op (2026-10-10)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sessionPi(fx, USAGE);
     fx.env.PI_BG_PRUNE_AGE_H = "0";
-    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt-in: without it the default keeps
+    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt-in is inert now: nothing may delete
     fx.env.JARATE_TOKEN_COST_PRICING_OFFLINE = "1"; // tokens only, no curl
     const h = hook();
     fx.env.PI_DISPATCH_WEBHOOK = h.url;
@@ -3901,11 +3901,11 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
     try {
       const r = await fx.run(["worker", "--project", "myproj", "prune task"]);
       expect(r.code).toBe(0);
-      // cost capture read the transcript BEFORE the prune: tokens in record
+      // cost capture read the transcript BEFORE the (now no-op) prune: tokens in record
       expect(fx.records()[0].tokens?.total).toBe(140);
-      // transcript pruned (N=0 = no floor) and the now-empty slug dir reaped
-      expect(fs.existsSync(sessFile(fx))).toBe(false);
-      expect(fs.existsSync(sessDir(fx))).toBe(false);
+      // transcript KEPT even with opt-in + no floor: no deletion, ever
+      expect(fs.existsSync(sessFile(fx))).toBe(true);
+      expect(fs.existsSync(sessDir(fx))).toBe(true);
       // the run still posted its normal OK callback
       expect(h.posts).toHaveLength(1);
       expect(h.posts[0].embeds[0].title).toMatch(/^worker · OK · \d+m\d{2}s$/);
@@ -3961,21 +3961,21 @@ describe("session prune: exit trap drops the run's own transcript (2026-09-23)",
     delete fx.env.PI_BG_PRUNE_AGE_H;
   });
 
-  test("default 24h floor + opt-in: a 2-day-old transcript is pruned + slug dir reaped", async () => {
+  test("opt-in + old transcript: session KEPT - prune is a permanent no-op (2026-10-10)", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     sessionPi(fx, USAGE, "2 days ago");
-    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt in: the default would keep it
+    fx.env.PI_BG_PRUNE_SESSIONS = "1"; // opt in: the no-op keeps it anyway
     // backdate the run start FURTHER than the file mtime so bg_session_file
     // still discovers it (2d old > 3d run start) while the file is past the
-    // default 24h floor
+    // default 24h floor - and the no-op still must not delete it
     fx.env.PI_BG_RUN_START_EPOCH = String(
       Math.floor(Date.now() / 1000) - 3 * 86400,
     );
     const r = await fx.run(["worker", "old transcript task"]);
     expect(r.code).toBe(0);
-    expect(fs.existsSync(sessFile(fx))).toBe(false);
-    expect(fs.existsSync(sessDir(fx))).toBe(false);
+    expect(fs.existsSync(sessFile(fx))).toBe(true);
+    expect(fs.existsSync(sessDir(fx))).toBe(true);
     delete fx.env.PI_BG_PRUNE_SESSIONS;
     delete fx.env.PI_BG_RUN_START_EPOCH;
   });

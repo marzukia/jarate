@@ -1527,6 +1527,11 @@ bg_on_exit() {
 #   - single confirmed file only: never glob-deletes. Any error (missing
 #     file, missing dir, permissions) -> return 0; never fails the run.
 bg_prune_session() {
+  # 2026-10-10 (Andryo, Cardinal Rule): NEVER delete session files. The prune
+  # ability is REMOVED, not just defaulted off - permanent no-op. If prune is
+  # ever re-added it must come through Andryo with a different mechanism.
+  return 0
+  # --- original body below (unreachable) ---
   local sf sf_dir n
   [ "${PI_BG_PRUNE_SESSIONS:-}" = "1" ] || return 0
   [ "${PI_BG_KEEP_SESSION:-}" = "1" ] && return 0
