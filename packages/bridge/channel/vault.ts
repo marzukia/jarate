@@ -47,6 +47,7 @@ import {
   sendDiscordMessage,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
+import { defaultDispatchWebhook } from "./restart-wake";
 import type { ChannelConfig } from "./types";
 
 // ─── Constants (env-overridable for tests) ───────────────────────────────
@@ -186,6 +187,7 @@ export function __vaultResetForTest(): void {
     stopVaultCore(entry.vault);
   }
   vaultEntries.clear();
+  __vaultSetWakeWebhookForTest(null);
 }
 
 /** Test hook: drop the registry entry for a path WITHOUT stopping the
@@ -474,6 +476,87 @@ function unlinkPublished(st: VaultState, id: string): void {
   } catch {
     // already gone (sweep / terminal settle raced)
   }
+}
+
+// ─── Wake webhook (pi-bg dispatch bus) ────────────────────────────────────
+//
+// Incident 2026-10-14 (ppgrid PAT): the owner's approval tap edited the
+// card but never woke the agent — a component interaction is not a
+// message, so the pi session slept until the owner asked "where's your
+// notification?". The wake posts to the SAME webhook pi-bg's launcher
+// uses for callbacks ($PI_DISPATCH_WEBHOOK or the first line of
+// ~/.config/pi-dispatch/webhook; resolved per post so rotation is safe),
+// with the "[bg:" content prefix the bridge's isBgWebhook filter
+// requires. Best-effort: a failed wake never blocks the vault.
+
+const WAKE_POST_TIMEOUT_MS = 5_000;
+const WAKE_POST_ATTEMPTS = 2;
+const WAKE_POST_BACKOFF_MS = 500;
+
+/** Default resolver: the pi-bg dispatch bus (see section header).
+ *  Module-level so tests can substitute a fake URL (not a config). */
+let wakeWebhookFn: () => string | null = defaultDispatchWebhook;
+
+/** Test hook: substitute the wake-webhook resolver (null = default). */
+export function __vaultSetWakeWebhookForTest(
+  fn: (() => string | null) | null,
+): void {
+  wakeWebhookFn = fn ?? defaultDispatchWebhook;
+}
+
+export function approvalWakeText(c: VaultCredential, st: VaultState): string {
+  const head = `[bg:vault] approved ${c.id} (${c.kind}/${c.name}, ${c.level})`;
+  if (c.level === "one-shot") {
+    const s = Math.max(1, Math.round(st.claimMs / 1000));
+    return `${head} — claim within ${s}s: jarate vault-run ${c.id} -- <cmd>`;
+  }
+  return `${head} — jarate vault-run ${c.id} -- <cmd>`;
+}
+
+export function consumedWakeText(c: VaultCredential, rc: number): string {
+  return `[bg:vault] consumed ${c.id} rc=${rc}`;
+}
+
+async function postVaultWake(
+  st: VaultState,
+  ev: "approved" | "consumed",
+  cred: VaultCredential,
+  rc?: number,
+): Promise<void> {
+  const content =
+    ev === "approved"
+      ? approvalWakeText(cred, st)
+      : consumedWakeText(cred, rc ?? -1);
+  const url = wakeWebhookFn();
+  if (!url) {
+    audit(st, "wake", credFields(cred), { wake: ev, result: "no-webhook" });
+    return;
+  }
+  const body = JSON.stringify({ content });
+  let ok = false;
+  for (let i = 1; i <= WAKE_POST_ATTEMPTS; i++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(WAKE_POST_TIMEOUT_MS),
+      });
+      if (resp.ok) {
+        ok = true;
+        break;
+      }
+    } catch {
+      // network error: retry
+    }
+    if (i < WAKE_POST_ATTEMPTS)
+      await new Promise((r) => setTimeout(r, WAKE_POST_BACKOFF_MS * i));
+  }
+  audit(st, "wake", credFields(cred), {
+    wake: ev,
+    rc: rc ?? null,
+    result: ok ? "posted" : "failed",
+  });
 }
 
 function startupSweep(st: VaultState): void {
@@ -1683,8 +1766,18 @@ function handleConnection(st: VaultState, sock: net.Socket): void {
         const rc = typeof parsed.rc === "number" ? Math.trunc(parsed.rc) : -1;
         runCtx.runDone = true;
         const done = vaultRunDone(st, runCtx.cred.id, rc);
-        if (done) send({ ok: true });
-        else send({ ok: false, error: "usage: run not active" });
+        if (done) {
+          send({ ok: true });
+          // One-shot: the run just consumed the credential — wake the
+          // agent with the rc (fire-and-forget). Incident 2026-10-14.
+          if (runCtx.cred.level === "one-shot") {
+            void postVaultWake(st, "consumed", runCtx.cred, rc).catch((e) => {
+              console.error("[vault] wake post failed:", e);
+            });
+          }
+        } else {
+          send({ ok: false, error: "usage: run not active" });
+        }
         return finish();
       }
       send({
@@ -1834,6 +1927,11 @@ async function applyDecision(
       revokeButtons(cred.id),
       "approved",
     );
+    // Wake the agent (fire-and-forget; the card edit is the owner's
+    // feedback — a slow webhook must not delay it). Incident 2026-10-14.
+    void postVaultWake(st, "approved", cred).catch((e) => {
+      console.error("[vault] wake post failed:", e);
+    });
     return { ok: true };
   }
   // deny
