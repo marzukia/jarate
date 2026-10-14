@@ -24,9 +24,10 @@ import {
   clearRuntimeSecrets,
   getRuntimeSecrets,
 } from "./censor";
-import { parseGatewayPayload } from "./discord";
+import { isBgWebhook, parseGatewayPayload } from "./discord";
 import {
   __vaultResetForTest,
+  __vaultSetWakeWebhookForTest,
   knownNames,
   readKnownValue,
   startVault,
@@ -450,6 +451,27 @@ async function vrun(
     await c.connect();
     c.send({ op: "vrun", id, agent, cmd, timeout_s: 60 });
     return JSON.parse(await c.nextLine());
+  } finally {
+    c.close();
+  }
+}
+
+/** vrun + vdone on one socket: a full run, so the daemon learns the rc. */
+async function vrunFull(
+  f: VaultFix,
+  id: string,
+  rc: number,
+  cmd: string[] = ["true"],
+  agent = "monky",
+): Promise<{ first: any; second: any }> {
+  const c = new VaultClient(f.xdg);
+  try {
+    await c.connect();
+    c.send({ op: "vrun", id, agent, cmd, timeout_s: 60 });
+    const first = JSON.parse(await c.nextLine());
+    c.send({ op: "vdone", id, rc });
+    const second = JSON.parse(await c.nextLine());
+    return { first, second };
   } finally {
     c.close();
   }
@@ -2470,4 +2492,180 @@ describe("vaultSlash (#206): owner-gated text path", () => {
       f.cleanup();
     }
   });
+});
+
+// ─── wake webhook (pi-bg dispatch bus; incident 2026-10-14) ──────────────
+//
+// The approval tap is a component interaction, not a message — without the
+// wake post the agent slept until the owner asked where the notification
+// was. Wakes go to the pi-bg callback bus ($PI_DISPATCH_WEBHOOK or
+// ~/.config/pi-dispatch/webhook) and must start with "[bg:" to pass
+// the bridge's isBgWebhook inbound filter.
+
+describe("wake webhook (pi-bg dispatch bus)", () => {
+  const WAKE_URL = "https://dispatch.local/webhooks/vault/fake";
+
+  const wakeCalls = (fd: FakeDiscord) =>
+    fd.calls.filter((c) => c.url === WAKE_URL);
+
+  async function waitForWake(
+    fd: FakeDiscord,
+    n: number,
+    ms = 3000,
+  ): Promise<void> {
+    const t0 = Date.now();
+    while (wakeCalls(fd).length < n) {
+      if (Date.now() - t0 > ms)
+        throw new Error(`wake post ${n} did not arrive`);
+      await tick(20);
+    }
+  }
+
+  test("approval posts a [bg:vault] wake the isBgWebhook filter accepts", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      setEnv("PI_DISPATCH_WEBHOOK", WAKE_URL);
+      const id = await makePending(f);
+      await approve(f, id);
+      await waitForWake(f.fd, 1);
+      const posts = wakeCalls(f.fd);
+      expect(posts).toHaveLength(1);
+      const content = posts[0].body.content;
+      expect(content).toBe(
+        `[bg:vault] approved ${id} (github-pat/marzukia/jarate:write, one-shot) — claim within 1s: jarate vault-run ${id} -- <cmd>`,
+      );
+      // The posted content must pass the bridge's inbound filter
+      // (webhook_id is set by Discord; content starts with "[bg:").
+      expect(isBgWebhook({ webhook_id: "w1", content })).toBe(true);
+      expect(
+        f
+          .auditEvents()
+          .some((e) => e.event === "wake" && e.result === "posted"),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("consumed posts after vdone with the child rc", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      setEnv("PI_DISPATCH_WEBHOOK", WAKE_URL);
+      const id = await makePending(f);
+      await approve(f, id);
+      await waitForWake(f.fd, 1); // approval wake
+      const r = await vrunFull(f, id, 7);
+      expect(r.first.ok).toBe(true);
+      expect(r.second.ok).toBe(true);
+      await waitForWake(f.fd, 2);
+      const posts = wakeCalls(f.fd);
+      expect(posts[posts.length - 1].body.content).toBe(
+        `[bg:vault] consumed ${id} rc=7`,
+      );
+      expect(
+        f
+          .auditEvents()
+          .some(
+            (e) => e.event === "wake" && e.result === "posted" && e.rc === 7,
+          ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("no webhook configured → silent no-op, audited", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      __vaultSetWakeWebhookForTest(() => null);
+      const id = await makePending(f);
+      await approve(f, id);
+      await tick(100); // give a stray post a chance to appear
+      expect(wakeCalls(f.fd)).toHaveLength(0);
+      expect(
+        f
+          .auditEvents()
+          .some((e) => e.event === "wake" && e.result === "no-webhook"),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("webhook failure: retried, audited failed, approve unaffected", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      __vaultSetWakeWebhookForTest(() => WAKE_URL);
+      const id = await makePending(f); // fake-Discord fetch: 200s
+      const real = globalThis.fetch;
+      globalThis.fetch = (async (input: any, init?: any) => {
+        if (String(input) === WAKE_URL) return resp(500, { message: "no" });
+        return (real as any)(input, init);
+      }) as any;
+      await approve(f, id);
+      expect(f.st.credentials.get(id)?.state).toBe("active");
+      const t0 = Date.now();
+      while (Date.now() - t0 < 2000) {
+        if (
+          f
+            .auditEvents()
+            .some((e) => e.event === "wake" && e.result === "failed")
+        )
+          break;
+        await tick(25);
+      }
+      expect(f.auditEvents().filter((e) => e.event === "wake")).toHaveLength(1);
+      expect(
+        f
+          .auditEvents()
+          .some((e) => e.event === "wake" && e.result === "failed"),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+});
+
+// ─── fresh reads (incident 2026-10-14: rotation must never be cached) ─────
+//
+// The known value crosses to the CLI at handoff time and must be read from
+// disk on EVERY handoff — the daemon must not cache it across uses (the
+// 2026-10-14 incident: a rotated known file was still served stale).
+
+describe("fresh reads (rotation never cached)", () => {
+  test("write A, claim, swap file to B: second claim injects B", async () => {
+    const f = mkVault();
+    try {
+      await f.h.ready;
+      const A = `ghp_${"a".repeat(36)}`;
+      const B = `ghp_${"b".repeat(36)}`;
+      const p = path.join(f.knownDir, "github-pat", "stale", "repo:write");
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, A, { mode: 0o600 });
+      const id = await makePending(f, {
+        agent: "monky",
+        kind: "github-pat",
+        name: "stale/repo:write",
+        level: "permanent",
+        reason: "rotation repro (incident 2026-10-14)",
+      });
+      await approve(f, id);
+      // claim 1
+      let r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(r.token).toBe(A);
+      // rotate on disk
+      fs.writeFileSync(p, B, { mode: 0o600 });
+      // claim 2 — the daemon must read B, not cache A
+      r = await vrun(f, id);
+      expect(r.ok).toBe(true);
+      expect(r.token).toBe(B);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
 });

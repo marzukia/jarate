@@ -124,6 +124,7 @@ import {
 import { performUndo } from "./undo";
 import {
   __vaultResetForTest,
+  __vaultSetWakeWebhookForTest,
   startVault,
   stopVault,
   vaultRequest,
@@ -11844,6 +11845,11 @@ describe("buildInteractionHandler: /vault subcommands (#206)", () => {
       transport: "socket",
     });
     __setVaultHandleForTest(ch.id, vaultHandle);
+    // Wake webhook is orthogonal to these interaction tests — null it
+    // for hermeticity (the real dispatch-bus URL sits outside the
+    // interaction URL contract; vault.test.ts covers the wake posts).
+    // afterEach's __vaultResetForTest restores the default resolver.
+    __vaultSetWakeWebhookForTest(() => null);
     await vaultHandle.ready;
   }
 

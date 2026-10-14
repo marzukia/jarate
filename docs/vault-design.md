@@ -218,7 +218,8 @@ Events: `request`, `approve`, `deny`, `revoke`, `use` (rc), `handoff`
 (source known|stored, envvar — never the value), `expire`
 (kind ttl|claim|window), `consumed`, `recovered-*`, `sweep`, `post-fail`,
 `non-owner-tap`, `vault-error`, `scope-reject`, `pending-reject`,
-`budget-reject`. Each line:
+`budget-reject`, `wake` (wake: approved|consumed, result
+posted|no-webhook|failed, rc on consumed). Each line:
 `{"ts":iso,"event":...,"id":...,"actor":...,...}`.
 
 ### 2.7 Threat model
@@ -279,6 +280,11 @@ Events: `request`, `approve`, `deny`, `revoke`, `use` (rc), `handoff`
 - File-mode published file carries a small JSON doc `{value, kind, envvar,
   git_header}` (metadata is not secret) instead of a bare token line; the
   **bridge** owns deletion (multi-use reads).
+- **Wake webhook** (incident 2026-10-14): approval and one-shot consumption
+  post a `[bg:vault]` message to the pi-bg dispatch bus
+  ($PI_DISPATCH_WEBHOOK or ~/.config/pi-dispatch/webhook, resolved per post)
+  so the agent is woken — the approval tap is a component interaction,
+  not a message. Best-effort; audited as `wake`.
 - `pat-*` is untouched in this change; it can be re-implemented on the vault
   (`kind=github-pat level=one-shot`) in a follow-up, then deprecated.
 
