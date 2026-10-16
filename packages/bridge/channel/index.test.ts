@@ -2536,6 +2536,42 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(isBgInbound(inbound("[bg] no colon", "3"))).toBe(false);
       expect(isBgInbound(inbound("plain", "4"))).toBe(false);
       expect(isBgInbound(inbound("see [bg: ticket", "5"))).toBe(false);
+      // #220: vault tap wakes are machine wakes too
+      expect(
+        isBgInbound(inbound("[pat: approved pat_a — run pat-run now]", "6")),
+      ).toBe(true);
+      expect(isBgInbound(inbound("[vault: revoked vault_a]", "7"))).toBe(true);
+    });
+
+    test("[pat: tap wake mid-run: queued, no arm, delivered at agent_end (#220)", async () => {
+      // The wake is posted via the dispatch webhook — to the gateway it
+      // is a bot-authored message (Beepy-style), like the [bg: callback.
+      const body = "[pat: approved pat_a — run pat-run now]";
+      const msg = {
+        ...inbound(body, "wke1"),
+        from: "Beepy",
+        fromId: "1546769099252695103",
+      };
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      const baseTimers = pendingInterrupts.size;
+      await handleInbound(pi, msg, ctx);
+      // Queued for the guaranteed re-wake...
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // ...but nothing armed: the timer count is unchanged.
+      expect(pendingInterrupts.size).toBe(baseTimers);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 2);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.body).toBe(body);
+      expect(sent[baseSends].m.details.messageId).toBe("wke1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
     test("[bg: inbound mid-run: no interrupt armed (timer count unchanged), delivered at agent_end via re-wake", async () => {

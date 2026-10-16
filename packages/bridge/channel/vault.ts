@@ -47,6 +47,7 @@ import {
   sendDiscordMessage,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
+import { type PostOpts, postBusWake } from "./restart-wake";
 import type { ChannelConfig } from "./types";
 
 // ─── Constants (env-overridable for tests) ───────────────────────────────
@@ -147,6 +148,9 @@ export interface VaultState {
   timers: Map<string, ReturnType<typeof setTimeout>[]>;
   server: net.Server | null;
   stopped: boolean;
+  /** Test hook: fetch + timing overrides for the tap-wake post
+   *  (postWakeText opts). Production: undefined (pi-bg pattern defaults). */
+  wakeOpts?: PostOpts;
 }
 
 export interface StartVaultOpts {
@@ -1736,6 +1740,56 @@ async function tapReply(
   return ok;
 }
 
+/** #220: post the tap wake to the request channel on the pi-bg bus
+ *  (postBusWake: dispatch/channel webhook first — the wake route, bot
+ *  API fallback visible-only). One line, machine-tagged: the [vault:
+ *  prefix makes isBgWebhook/isBgInbound treat the post as a machine
+ *  wake, so a mid-turn tap rides the re-wake queue and delivers at
+ *  agent_end (reuse the existing mechanism, no new one). Tap-only by
+ *  design: the /vault slash path does NOT wake (requirement scope is the
+ *  owner button tap). Exactly ONE call per state transition — the state
+ *  gate + interaction dedupe upstream guarantee it. A failed post audits
+ *  tap-wake-failed and NEVER throws (never-reject parity: a dead webhook
+ *  must not read as "vault error" to the tapper). */
+async function postTapWake(
+  st: VaultState,
+  cred: VaultCredential,
+  verb: "approve" | "deny" | "revoke",
+): Promise<void> {
+  const past = {
+    approve: "approved",
+    deny: "denied",
+    revoke: "revoked",
+  } as const;
+  const text =
+    verb === "approve"
+      ? `[vault: approved ${cred.id} — run vault-run now]`
+      : `[vault: ${past[verb]} ${cred.id}]`;
+  let ok = false;
+  try {
+    ok = await postBusWake(
+      {
+        channelId: cred.channelId,
+        botToken: st.botToken,
+        webhookUrl: st.ch.webhookUrl,
+      },
+      text,
+      st.wakeOpts,
+    );
+  } catch (e) {
+    // postBusWake never throws by construction; this is the belt (M1).
+    console.error(`[vault] tap wake post threw for ${cred.id}:`, e);
+  }
+  if (!ok) {
+    audit(st, "tap-wake-failed", credFields(cred), {
+      decision: past[verb],
+      text,
+    });
+  } else {
+    console.log(`[vault] tap wake posted (${past[verb]} ${cred.id})`);
+  }
+}
+
 /** Outcome of a decision (approve/deny/revoke) applied via the shared
  *  state transition. `reason` distinguishes the rejection classes for
  *  the caller's feedback + audit. */
@@ -2208,6 +2262,7 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         }
         return;
       }
+      await postTapWake(st, cred, verb);
       await deleteDeferredAck(st.botToken, d);
     } catch (e) {
       // Never reject (M1 parity): log + audit + best-effort feedback.

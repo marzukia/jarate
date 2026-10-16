@@ -18,6 +18,7 @@ import { censor } from "./censor";
 import { serializeEmbeds } from "./format";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 import { sanitizeSensitiveText } from "./sanitize";
+import { isMachineWakePrefix } from "./todos";
 import type {
   AttachmentContent,
   AttachmentRef,
@@ -580,13 +581,14 @@ export async function pollDiscord(configId: string): Promise<void> {
 
 /**
  * pi-bg dispatch callbacks post to the channel via webhook: author.bot is
- * true and webhook_id is set, with content prefixed "[bg:". Exempt those
- * from the other-bot filter — they are the dispatch wake mechanism.
- * Exported for tests.
+ * true and webhook_id is set, with content prefixed by a machine-wake
+ * tag ("[bg:" pi-bg callbacks, "[pat:" / "[vault:" tap wakes — #220).
+ * Exempt those from the other-bot filter — they are the dispatch wake
+ * mechanism. Exported for tests.
  */
 export function isBgWebhook(raw: any): boolean {
   if (raw?.webhook_id == null) return false;
-  if (typeof raw?.content === "string" && raw.content.startsWith("[bg:"))
+  if (typeof raw?.content === "string" && isMachineWakePrefix(raw.content))
     return true;
   // Embed-only callbacks (pi-bg Variant D): no top-level content —
   // identify by the embed author name the pi-bg webhook builder sets.

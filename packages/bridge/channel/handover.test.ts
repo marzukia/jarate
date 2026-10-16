@@ -647,6 +647,16 @@ describe("inboundSender / isHumanInbound (RCA F3)", () => {
       isHumanInbound(inb("andy", "[bg: heartbeat] 1 in-flight") as any),
     ).toBe(false);
   });
+  test("[pat:/[vault: tap-wake body → false (#220)", () => {
+    expect(
+      isHumanInbound(
+        inb("BEEPY", "[pat: approved pat_a — run pat-run now]") as any,
+      ),
+    ).toBe(false);
+    expect(
+      isHumanInbound(inb("BEEPY", "[vault: revoked vault_a]") as any),
+    ).toBe(false);
+  });
   test("empty body / (empty) → false", () => {
     expect(isHumanInbound(inb("andy", "") as any)).toBe(false);
     expect(isHumanInbound(inb("andy", "(empty)") as any)).toBe(false);

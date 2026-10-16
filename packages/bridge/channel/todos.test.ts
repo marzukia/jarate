@@ -8,8 +8,10 @@ import {
   clearBoard,
   extractTodoLines,
   isBgCallbackBody,
+  isMachineWakePrefix,
   listBoards,
   loadBoard,
+  MACHINE_WAKE_PREFIXES,
   mergeTodoLines,
   openCount,
   renderBoard,
@@ -272,6 +274,11 @@ describe("todos: worker intake", () => {
   test("isBgCallbackBody recognizes content-prefix and embed-author shapes", () => {
     expect(isBgCallbackBody("[bg: worker OK · r1]")).toBe(true);
     expect(isBgCallbackBody("[bg:worker:OK] legacy")).toBe(true);
+    // #220: vault tap wakes ride the same machine-wake classification
+    expect(isBgCallbackBody("[pat: approved pat_a — run pat-run now]")).toBe(
+      true,
+    );
+    expect(isBgCallbackBody("[vault: denied vault_a]")).toBe(true);
     expect(
       isBgCallbackBody(
         "<embed>\nAuthor: pi-bg ticket · r1\nTitle: worker · OK\n</embed>",
@@ -279,6 +286,16 @@ describe("todos: worker intake", () => {
     ).toBe(true);
     expect(isBgCallbackBody("hello TODO: world")).toBe(false);
     expect(isBgCallbackBody("")).toBe(false);
+  });
+
+  test("isMachineWakePrefix: exactly the machine-wake content prefixes", () => {
+    for (const p of MACHINE_WAKE_PREFIXES)
+      expect(isMachineWakePrefix(`${p} anything`)).toBe(true);
+    expect(isMachineWakePrefix("[bg: x]")).toBe(true);
+    expect(isMachineWakePrefix("[pat: x]")).toBe(true);
+    expect(isMachineWakePrefix("[vault: x]")).toBe(true);
+    expect(isMachineWakePrefix("hello")).toBe(false);
+    expect(isMachineWakePrefix("")).toBe(false);
   });
 });
 

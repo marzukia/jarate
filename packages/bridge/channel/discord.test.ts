@@ -1195,6 +1195,21 @@ test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only
   ).toBe(true);
   // non-webhook bot message with [bg: text is not exempt
   expect(isBgWebhook({ content: "[bg:x]", author: { bot: true } })).toBe(false);
+  // #220: vault tap wakes carry [pat: / [vault: prefixes on the bus webhook
+  expect(
+    isBgWebhook({
+      webhook_id: "w1",
+      content: "[pat: approved pat_a — run pat-run now]",
+      author: { bot: true },
+    }),
+  ).toBe(true);
+  expect(
+    isBgWebhook({
+      webhook_id: "w1",
+      content: "[vault: denied vault_a]",
+      author: { bot: true },
+    }),
+  ).toBe(true);
   // webhook without the pi-bg markers is not exempt
   expect(
     isBgWebhook({ webhook_id: "w1", content: "hello", author: { bot: true } }),

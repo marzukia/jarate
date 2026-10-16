@@ -272,10 +272,28 @@ export function mergeTodoLines(existing: Todo[], lines: string[]): Todo[] {
   return out;
 }
 
+/** Content prefixes of machine wakes on the webhook bus (#220):
+ *  "[bg:" pi-bg callbacks + restart wakes, "[pat:" / "[vault:" owner
+ *  tap wakes posted by the vault component handlers. A webhook post
+ *  carrying one of these prefixes is a MACHINE message: the poller
+ *  exempts it from the other-bot filter (isBgWebhook), an inbound is
+ *  treated as a queue-only wake (isBgInbound), and handover skips it as
+ *  human text (isHumanInbound). Extend the list HERE — every consumer
+ *  routes through isMachineWakePrefix.
+ */
+export const MACHINE_WAKE_PREFIXES = ["[bg:", "[pat:", "[vault:"] as const;
+
+/** True when a message body starts with a machine-wake prefix. */
+export function isMachineWakePrefix(body: string): boolean {
+  return MACHINE_WAKE_PREFIXES.some((p) => body.startsWith(p));
+}
+
 /**
- * True when an inbound body looks like a pi-bg webhook callback (content
- * prefixed "[bg:" or an embed whose author is "pi-bg …").
+ * True when an inbound body looks like a machine webhook callback:
+ * content prefixed with a machine-wake prefix ("[bg:" pi-bg callback,
+ * "[pat:" / "[vault:" tap wake, #220) or an embed whose author is
+ * "pi-bg …".
  */
 export function isBgCallbackBody(body: string): boolean {
-  return body.startsWith("[bg:") || /\bAuthor: pi-bg\b/.test(body);
+  return isMachineWakePrefix(body) || /\bAuthor: pi-bg\b/.test(body);
 }

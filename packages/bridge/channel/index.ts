@@ -444,13 +444,14 @@ export function queueMidTurnInbound(
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
-  // #177: [bg: machine wakes are queue-only. The re-wake queue already
-  // guarantees agent_end delivery; the interrupt only jumps the line, and
-  // a machine alert is never more urgent than the in-flight turn — so it
-  // never arms one. isPeerInbound excludes [bg: bodies from the 12s
-  // branch; this extends that exclusion to no arming at all. (2026-10-06
-  // incident: a reviewer callback posted mid-turn armed the 3s interrupt,
-  // was never consumed, and was lost at compact.)
+  // #177: machine wakes ([bg: / [pat: / [vault: — #220) are queue-only.
+  // The re-wake queue already guarantees agent_end delivery; the
+  // interrupt only jumps the line, and a machine alert is never more
+  // urgent than the in-flight turn — so it never arms one.
+  // isPeerInbound excludes them from the 12s branch; this extends that
+  // exclusion to no arming at all. (2026-10-06 incident: a reviewer
+  // callback posted mid-turn armed the 3s interrupt, was never consumed,
+  // and was lost at compact.)
   if (armInterrupt && !isBgInbound(msg)) {
     // Two 4x (12s) cases, both "let the in-flight work finish". The
     // message is queued with a guaranteed re-wake either way, so the
@@ -4153,13 +4154,14 @@ export const PEER_SENDER_HINT =
 export const PEER_SENDER_HINT_NO_FWD =
   "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
 
-/** #177: true when the inbound is a [bg: machine wake (pi-bg callback,
- *  dead-letter alert, ETL alert). Machine wakes are never more urgent than
+/** #177: true when the inbound is a machine wake (pi-bg callback,
+ *  dead-letter alert, ETL alert, or a vault tap wake — #220). Machine wakes are never more urgent than
  *  the in-flight turn: they ride the re-wake queue and deliver at agent_end,
  *  and arm no mid-run interrupt (queue-only, #177).
  *
- *  Covers both callback shapes via the shared classifier isBgCallbackBody:
- *  the "[bg:" content prefix, and the standard embed-only pi-bg completion
+ *  Covers all callback shapes via the shared classifier isBgCallbackBody:
+ *  the machine-wake content prefixes ([bg: pi-bg, [pat: / [vault: tap
+ *  wakes) and the standard embed-only pi-bg completion
  *  callback (content="", bridge body "<embed>\nAuthor: pi-bg ticket · <rid>").
  *  The 2026-10-06 incident callback was the embed-only shape. */
 export function isBgInbound(msg: ChannelMessage): boolean {

@@ -372,7 +372,7 @@ export async function postWakeText(
  *  missing file = null). This is the route the framed wake posts through.
  */
 export function defaultDispatchWebhook(
-  home: string = os.homedir(),
+  home: string = process.env.HOME || os.homedir(),
 ): string | null {
   const env = process.env.PI_DISPATCH_WEBHOOK?.trim();
   if (env) return env;
@@ -387,6 +387,24 @@ export function defaultDispatchWebhook(
   } catch {
     return null;
   }
+}
+
+/** Post a one-line MACHINE wake to the pi-bg bus (#220 tap wakes).
+ *  WEBHOOK FIRST: the channel/dispatch webhook post carries webhook_id
+ *  and a machine-wake prefix ([bg: / [pat: / [vault: — the caller must
+ *  set one), so isBgWebhook exempts it from the other-bot filter and the
+ *  poller lands it as a turn. That is the wake route: Discord does not
+ *  deliver a bot's OWN messages to that bot, so the bot API post (the
+ *  fallback for configs without a webhook) is visible in-channel but
+ *  wakes nothing — same ordering as runRestartWake. Egress-censored,
+ *  bounded (postWakeText), never throws. */
+export async function postBusWake(
+  target: WakeTarget,
+  text: string,
+  opts: PostOpts = {},
+): Promise<boolean> {
+  const webhookUrl = target.webhookUrl || defaultDispatchWebhook() || undefined;
+  return postWakeText({ ...target, webhookUrl }, egressText(text), opts);
 }
 
 // ─── orchestrator ────────────────────────────────────────────────────────
@@ -443,13 +461,8 @@ export async function runRestartWake(
   );
   // Bus webhook resolution: the channel config's webhookUrl when set,
   // else the pi-bg dispatch bus (the [bg: route that wakes the agent).
-  const target: WakeTarget = {
-    ...deps.target,
-    webhookUrl: deps.target.webhookUrl || defaultDispatchWebhook() || undefined,
-  };
-  // egressText = the single egress choke point (docs/secret-censor.md):
-  // ticket/task text comes from run records and can carry secrets.
-  const ok = await postWakeText(target, egressText(message), {
+  // egressText = the single egress choke point (docs/secret-censor.md).
+  const ok = await postBusWake(deps.target, message, {
     ...deps.postOpts,
     fetchImpl: deps.fetchImpl ?? deps.postOpts?.fetchImpl,
   });

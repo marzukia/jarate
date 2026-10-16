@@ -39,7 +39,12 @@ import {
 import { fmtTokensLC } from "./ctxwatch";
 import { jobsView } from "./jobs";
 import { formatTaskLine, loadTasks } from "./tasks";
-import { defaultHome, loadBoard, renderBoardPlain } from "./todos";
+import {
+  defaultHome,
+  isMachineWakePrefix,
+  loadBoard,
+  renderBoardPlain,
+} from "./todos";
 import { getDefaultChannel, loadChannelConfig } from "./types";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -648,8 +653,9 @@ const NON_HUMAN_SENDERS = new Set(["beepy"]);
  * asks" list used to read like a pi-bg server log):
  *  - carries a <channel-ctx> sender (bridge-injected wakes don't)
  *  - the sender is not the bot relay (Beepy)
- *  - the body has free text: not empty, not a pi-bg <embed>, not a [bg:
- *    heartbeat, not a bare <todo-board> block (stripped already).
+ *  - the body has free text: not empty, not a pi-bg <embed>, not a
+ *    machine-wake line ([bg: heartbeat, [pat:/[vault: tap wake — #220),
+ *    not a bare <todo-board> block (stripped already).
  */
 export function isHumanInbound(e: SessionEntry): boolean {
   const sender = inboundSender(e);
@@ -658,7 +664,7 @@ export function isHumanInbound(e: SessionEntry): boolean {
   const body = stripPromptFraming(inboundBody(e));
   if (!body || body === "(empty)") return false;
   if (body.startsWith("<embed>")) return false;
-  if (body.startsWith("[bg:")) return false;
+  if (isMachineWakePrefix(body)) return false;
   return true;
 }
 

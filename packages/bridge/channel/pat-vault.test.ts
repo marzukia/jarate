@@ -78,6 +78,10 @@ class FakeDiscord {
         this.callbackSpent.add(cb[1]);
         return resp(204, null);
       }
+      // Dispatch-bus webhook (#220 tap wake) — a DIFFERENT url from the
+      // interaction webhook (/api/v10/webhooks/app1/intok-*).
+      if (method === "POST" && url === WAKE_WH)
+        return resp(200, { id: `wake-${++this.msgSeq}` });
       if (method === "POST" && /\/channels\/[^/]+\/messages$/.test(url)) {
         if (this.postStatus !== 200)
           return resp(this.postStatus, { message: "stubbed" });
@@ -105,12 +109,22 @@ class FakeDiscord {
     }) as any;
   }
 
-  /** Followups posted on the interaction webhook (post-defer replies). */
+  /** Followups posted on the interaction webhook (post-defer replies).
+   *  The /api/v10/ segment keeps the dispatch-bus webhook (#220) out. */
   followups(): Array<{ url: string; body: any }> {
     return this.calls
       .filter(
-        (c) => c.method === "POST" && /\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
+        (c) =>
+          c.method === "POST" &&
+          /\/api\/v10\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
       )
+      .map((c) => ({ url: c.url, body: c.body }));
+  }
+
+  /** Dispatch-bus webhook posts (#220 tap wakes). */
+  webhookPosts(): Array<{ url: string; body: any }> {
+    return this.calls
+      .filter((c) => c.method === "POST" && c.url === WAKE_WH)
       .map((c) => ({ url: c.url, body: c.body }));
   }
 
@@ -163,6 +177,10 @@ class FakeDiscord {
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
 const OWNER = "108801968763305984";
+
+/** Dispatch-bus webhook the tap wake (#220) posts through — the same
+ *  route pi-bg uses; in tests it is stubbed, never the box's real URL. */
+const WAKE_WH = "https://discord.example/api/webhooks/9/tap";
 const OTHER = "215356028869541889";
 const FINE_TOKEN = `github_pat_${"f".repeat(30)}`;
 const CLASSIC_TOKEN = `ghp_${"c".repeat(36)}`;
@@ -220,7 +238,20 @@ function mkVault(
       botToken: "tok-ch1",
       ownerUserId: OWNER,
       ownerUserIds: [OWNER],
+      // #220: the tap-wake bus route (stubbed); without it the wake falls
+      // back to defaultDispatchWebhook, which the HOME isolation below
+      // pins to "none".
+      webhookUrl: WAKE_WH,
     } as any);
+
+  // Isolate HOME + the dispatch-webhook env: the tap wake (#220)
+  // resolves defaultDispatchWebhook from $PI_DISPATCH_WEBHOOK / $HOME/
+  // .config/pi-dispatch/webhook when ch.webhookUrl is unset — the box's
+  // real file must never be the wake route under test.
+  const realHome = process.env.HOME;
+  const realDispatchWh = process.env.PI_DISPATCH_WEBHOOK;
+  process.env.HOME = tmp;
+  delete process.env.PI_DISPATCH_WEBHOOK;
 
   const h = startPatVault({
     ch,
@@ -256,6 +287,10 @@ function mkVault(
       globalThis.fetch = realFetch;
       clearRegistryCache();
       __patVaultResetForTest();
+      if (realHome === undefined) delete process.env.HOME;
+      else process.env.HOME = realHome;
+      if (realDispatchWh === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
+      else process.env.PI_DISPATCH_WEBHOOK = realDispatchWh;
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
@@ -817,6 +852,175 @@ describe("one-callback discipline", () => {
 });
 
 // ─── state machine & gates (F1, F4, F5) ─────────────────────────────────────
+
+// ─── tap wake (#220): owner decision wakes the agent on the pi-bg bus ──────
+
+describe("tap wake (#220): owner decision wakes the agent on the pi-bg bus", () => {
+  test("approve: ONE webhook wake post, [pat: tag + id + next action", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-wa", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      const posts = f.fd.webhookPosts();
+      expect(posts.length).toBe(1);
+      expect(posts[0].url).toBe(WAKE_WH);
+      expect(posts[0].body.content).toBe(
+        `[pat: approved ${req.id} — run pat-run now]`,
+      );
+      // The transition itself is intact (state + audit).
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+      expect(f.auditLines().some((l) => l.includes("event=approve"))).toBe(
+        true,
+      );
+      expect(
+        f.auditLines().some((l) => l.includes("event=tap-wake-failed")),
+      ).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("deny: ONE webhook wake post [pat: denied <id>]", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-wd", `pat:deny:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      const posts = f.fd.webhookPosts();
+      expect(posts.length).toBe(1);
+      expect(posts[0].body.content).toBe(`[pat: denied ${req.id}]`);
+      expect(f.st.requests.get(req.id)!.state).toBe("denied");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("non-owner tap: NO wake post, no tap-wake-failed audit", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-wn", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      expect(f.fd.webhookPosts().length).toBe(0);
+      expect(f.st.requests.get(req.id)!.state).toBe("pending");
+      expect(
+        f.auditLines().some((l) => l.includes("event=tap-wake-failed")),
+      ).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("already-handled re-tap: still exactly ONE wake (no double-wake)", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      const d = (id: string, verb: string) =>
+        mkD(id, `pat:${verb}:${req.id}`, { message: { id: req.messageId } });
+      await f.h.handlePatComponent(d("i-w1", "approve"));
+      await f.h.handlePatComponent(d("i-w2", "approve"));
+      expect(f.fd.webhookPosts().length).toBe(1);
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("gateway redelivery (same d.id): deduped, no second wake", async () => {
+    const f = mkVault();
+    try {
+      const req = await makePending(f);
+      const d = mkD("i-wr", `pat:approve:${req.id}`, {
+        message: { id: req.messageId },
+      });
+      await f.h.handlePatComponent(d);
+      await f.h.handlePatComponent(d);
+      expect(f.fd.webhookPosts().length).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("failed post: audited tap-wake-failed, no throw, no error reply", async () => {
+    const f = mkVault();
+    try {
+      // Both wake routes (webhook + bot fallback) fail: the override
+      // fetchImpl replaces the FakeDiscord stub entirely.
+      f.st.wakeOpts = {
+        attempts: 1,
+        timeoutMs: 100,
+        backoffMs: 5,
+        fetchImpl: (async () => {
+          throw new Error("net down");
+        }) as unknown as typeof fetch,
+      };
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-wf", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      // Transition happened; the wake failed.
+      expect(f.st.requests.get(req.id)!.state).toBe("approved");
+      const ff = f
+        .auditLines()
+        .find((l) => l.includes("event=tap-wake-failed"));
+      expect(ff).toBeTruthy();
+      expect(ff).toContain("decision=approved");
+      // No escaped failure: no tap reply, no followup.
+      expect(f.fd.replies("i-wf").length).toBe(0);
+      expect(f.fd.followups().length).toBe(0);
+      // Handler ran to completion (the thinking ack still got cleared).
+      expect(f.fd.ackDeletes()).toBe(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("no dispatch webhook: bot fallback route posts (visible-only)", async () => {
+    const f = mkVault({
+      ch: {
+        id: "ch1",
+        name: "ch1",
+        type: "discord",
+        channel: "999",
+        botToken: "tok-ch1",
+        ownerUserId: OWNER,
+        ownerUserIds: [OWNER],
+        // no webhookUrl + HOME isolated -> defaultDispatchWebhook null
+      } as any,
+    });
+    try {
+      const req = await makePending(f);
+      await f.h.handlePatComponent(
+        mkD("i-wb", `pat:approve:${req.id}`, {
+          message: { id: req.messageId },
+        }),
+      );
+      expect(f.fd.webhookPosts().length).toBe(0);
+      const wake = f.fd
+        .channelPosts()
+        .find(
+          (c: any) =>
+            c.body.content === `[pat: approved ${req.id} — run pat-run now]`,
+        );
+      expect(wake).toBeTruthy();
+    } finally {
+      f.cleanup();
+    }
+  });
+});
 
 describe("state machine", () => {
   test("full happy path: request -> approve -> run -> done -> censor drop", async () => {

@@ -48,6 +48,7 @@ import {
   sendDiscordMessage,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
+import { type PostOpts, postBusWake } from "./restart-wake";
 import type { ChannelConfig } from "./types";
 
 // ─── Constants (all env-overridable for tests) ───────────────────────────
@@ -125,6 +126,9 @@ export interface PatVaultState {
   timers: Map<string, ReturnType<typeof setTimeout>[]>;
   server: net.Server | null;
   stopped: boolean;
+  /** Test hook: fetch + timing overrides for the tap-wake post
+   *  (postWakeText opts). Production: undefined (pi-bg pattern defaults). */
+  wakeOpts?: PostOpts;
 }
 
 export interface StartPatVaultOpts {
@@ -1248,6 +1252,48 @@ async function tapReply(
   return ok;
 }
 
+/** #220: post the tap wake to the request channel on the pi-bg bus
+ *  (postBusWake: dispatch/channel webhook first — the wake route, bot
+ *  API fallback visible-only). One line, machine-tagged: the [pat:
+ *  prefix makes isBgWebhook/isBgInbound treat the post as a machine
+ *  wake, so a mid-turn tap rides the re-wake queue and delivers at
+ *  agent_end (requirement: reuse the existing mechanism, no new one).
+ *  Exactly ONE call per state transition (owner tap) — the state gate +
+ *  interaction dedupe upstream guarantee it. A failed post audits
+ *  tap-wake-failed and NEVER throws (M1: the component handler must not
+ *  reject; a dead webhook must not read as "vault error" to the tapper).
+ */
+async function postTapWake(
+  st: PatVaultState,
+  req: PatRequest,
+  decision: "approved" | "denied",
+): Promise<void> {
+  const text =
+    decision === "approved"
+      ? `[pat: approved ${req.id} — run pat-run now]`
+      : `[pat: denied ${req.id}]`;
+  let ok = false;
+  try {
+    ok = await postBusWake(
+      {
+        channelId: req.channelId,
+        botToken: st.botToken,
+        webhookUrl: st.ch.webhookUrl,
+      },
+      text,
+      st.wakeOpts,
+    );
+  } catch (e) {
+    // postBusWake never throws by construction; this is the belt (M1).
+    console.error(`[pat-vault] tap wake post threw for ${req.id}:`, e);
+  }
+  if (!ok) {
+    audit(st, "tap-wake-failed", base(req), { decision, text });
+  } else {
+    console.log(`[pat-vault] tap wake posted (${decision} ${req.id})`);
+  }
+}
+
 function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1428,6 +1474,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         audit(st, "approve", base(req), { user: uid });
         persist(st);
         await editRequestMessage(st, req, approvedText(req), [], "approved");
+        await postTapWake(st, req, "approved");
       } else {
         req.state = "denied";
         req.deniedBy = uid;
@@ -1440,6 +1487,7 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
           [],
           "denied",
         );
+        await postTapWake(st, req, "denied");
       }
       await deleteDeferredAck(st.botToken, d);
     } catch (e) {
