@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "rag", "projects", "projects-backfill", "agents-check", "agents-bless", "pat-request", "pat-run", "pat-status"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "projects", "projects-backfill", "agents-check", "agents-bless", "pat-request", "pat-run", "pat-status"]}
 ```
 
 ## Commands
@@ -121,28 +121,6 @@ queries work.
 
 - `--regex`: query is an ERE (bad regex -> `ok:false`, `rg failed ...`).
 - `--case`: case-sensitive. Match order is deterministic (`rg --sort path`).
-
-### `rag <question> [--project P]`
-
-One-call RAG query over project knowledge. Backend = the `recall` CLI
-(TS port of pgrag; pgrag itself was removed 2026-09-10), invoked as
-`bun <recall-cli> query --json`; `--project P` maps to `RAG_PROJECT`.
-
-```json
-{
-  "ok": true, "ts": "...", "error": null,
-  "backend": "recall",
-  "question": "...", "project": "jarate",
-  "count": 3,
-  "results": [{"source": "/home/monky/memory/x.md", "content": "...", "score": 0.91}]
-}
-```
-
-- `results` = recall's `SearchRow` array verbatim (may be empty).
-- `recall` stderr is captured separately: noise on stderr never fails a
-  successful query; on failure the first stderr line lands in `error`.
-- Any failure (CLI missing, Postgres/Ollama down, non-array output) is
-  `ok:false` — never a crash.
 
 ### `projects [--project TAG] [--since YYYY-MM-DD] [--agent NAME]`
 
@@ -303,9 +281,8 @@ in the output.
 | `JARATE_CTX_LIMIT` | fallback context limit when models.json has none |
 | `JARATE_AGENT_HOMES` | colon-separated agent home list (skips auto-discovery) |
 | `JARATE_SSH_HOST` / `JARATE_SUDO_PASS` | peer-hop target override (derived when unset) / password |
-| `JARATE_RECALL_CLI` | explicit path to the recall CLI |
 | `JARATE_AGENTS_MD` | explicit AGENTS.md path (else `~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md`) |
-| `JARATE_ROOT` | repo root for the bundled recall (auto-detected otherwise) |
+| `JARATE_ROOT` | repo root (auto-detected otherwise) |
 | `JARATE_PAT_DIR` | PAT vault socket dir (default `$XDG_RUNTIME_DIR/jarate`) |
 | `JARATE_PAT_FILE_DIR` | vault published-file dir (default `$XDG_RUNTIME_DIR/jarate-pat`) |
 | `JARATE_PAT_PATS_DIR` | fine-grained token store (default `~/.config/marzukia-pats`) |

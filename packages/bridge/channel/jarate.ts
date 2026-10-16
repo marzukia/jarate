@@ -137,7 +137,6 @@ const JARATE_COMMANDS = [
   "ctx-report",
   "journal-errors",
   "memory-grep",
-  "rag",
   "pat-request",
   "pat-run",
   "pat-status",
@@ -166,7 +165,6 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
       "memory-grep <query> [--root D] [--regex]: search ~/memory, top-20 matches. " +
-      "rag <question> [--project P]: RAG query over project knowledge (recall). " +
       "pat-request <scope> <reason>: ask the channel owner for a GitHub PAT (scope: default or owner/repo:read|write). " +
       "pat-run <request-id> -- <cmd> [args]: run one command under the approved token (single use; token is injected as GH_TOKEN, never echo it; 900s cap). " +
       "pat-status [request-id]: read-only state of PAT requests (no token). " +
@@ -177,9 +175,9 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "vault-revoke <request-id>: self-revoke your pending/active credential. " +
       "vault-audit [n]: last n audit lines (default 20).",
     promptSnippet:
-      "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep, rag) as JSON",
+      "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep) as JSON",
     promptGuidelines: [
-      "Use jarate for machine state: context/cost (ctx-report), pi.service warnings (journal-errors), memory search (memory-grep), project knowledge (rag).",
+      "Use jarate for machine state: context/cost (ctx-report), pi.service warnings (journal-errors), memory search (memory-grep).",
       "jarate takes one cmd + one space-separated args string; output is a single JSON doc — check ok before trusting fields.",
     ],
     parameters: Type.Object({

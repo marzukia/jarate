@@ -151,7 +151,7 @@ describe("runJarate", () => {
     const old = process.env.JARATE_TOOL_TIMEOUT_MS;
     process.env.JARATE_TOOL_TIMEOUT_MS = "300";
     try {
-      const r = await runJarate("rag", "sleep", { env: envFor(home) });
+      const r = await runJarate("ctx-report", "sleep", { env: envFor(home) });
       expect(r.timedOut).toBe(true);
       const d = JSON.parse(jarateText(r));
       expect(d.ok).toBe(false);
@@ -180,7 +180,6 @@ describe("registerJarateTool", () => {
       "ctx-report",
       "journal-errors",
       "memory-grep",
-      "rag",
       "pat-request",
       "pat-run",
       "pat-status",
