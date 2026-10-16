@@ -1070,6 +1070,7 @@ def hdr(word, rid, rc=None):
         h = f"\u250c {word} \u00b7 {clip_start(rid, keep)}"
     return h
 prof, status, rc, verdict = E("PROFILE"), E("STATUS"), E("RC"), E("VERDICT")
+brief = E("BRIEF")
 dur = int(E("DUR") or 0)
 dstr = f"{dur//60}m{dur%60:02d}s"
 rid = E("RUN")
@@ -1088,7 +1089,14 @@ elif status == "FAIL":
     header = hdr("fail", rid, rc)
     color = RED
 elif status == "DIED":
-    title = f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}"; header = hdr("died", rid); color = ORANGE
+    # 2026-10-16 (frank ticket 20261016-121840-3696307): the launch-fail
+    # DIED carried its reason in the result field, but the title still
+    # read "DIED (no report)" - the wake line showed no report at a
+    # glance. A DIED with a brief IS a report: carry the reason in the
+    # title. No brief = truly no report (SIGKILL before any output).
+    title = (f"{prof} \u00b7 DIED ({clip_end(brief, 100)}) \u00b7 {dstr}"
+             if brief else f"{prof} \u00b7 DIED (no report) \u00b7 {dstr}")
+    header = hdr("died", rid); color = ORANGE
 else:
     title = f"{prof} \u00b7 EMPTY \u00b7 {dstr}"; header = hdr("empty", rid); color = RED
 desc_lines = [header, f"\u251c $ jarate-bg {prof}{ ' --worktree' if E('WORKTREE') == '1' else ''}"]
@@ -1629,6 +1637,37 @@ bg_session_file() {
   [ -n "$sf" ] && printf '%s' "$sf"
 }
 
+# bg_arm_resume: point the NEXT launch at this attempt's session so a
+# relaunch RESUMES instead of redoing the work from zero (2026-10-16
+# incident, frank/hydrogen: 3 tickets died rc=0 with zero output after
+# ~50 min of thinking; every relaunch was FRESH). The session uuid is the
+# final `_`-separated field of the jsonl basename (verified against real
+# files: 2026-10-16T12-35-50-173Z_01a144b6-....jsonl). pi 0.85: --session
+# <id> is the NON-interactive resume; --resume is the TUI picker and
+# would hang a background run. Attempts after the first only: resume_id
+# starts empty. Missing/unreadable session file -> fresh launch (old
+# behavior) + a log line. Never fails the run.
+bg_arm_resume() {
+  local sf base
+  sf="$(bg_session_file)" || sf=""
+  base=""
+  if [ -n "$sf" ] && [ -r "$sf" ]; then
+    base="${sf##*/}"
+    base="${base%.jsonl}"
+    case "$base" in
+      *_*) base="${base##*_}" ;;
+      *)   base="" ;;
+    esac
+  fi
+  if [ -n "$base" ]; then
+    resume_id="$base"
+    echo "[pi-bg] relaunch: resuming session $resume_id (2026-10-16)" >&2
+  else
+    resume_id=""
+    echo "[pi-bg] relaunch: no prior session file - fresh launch (2026-10-16)" >&2
+  fi
+}
+
 # bg_capture_cost: attribute THIS run's session tokens + OpenRouter-list cost
 # to the run record (2026-09-18, --project, invoice itemisation). Echoes the
 # cost (2dp) for the callback project line; empty echo = cost unknown.
@@ -1905,6 +1944,44 @@ if last:
   return 0
 }
 
+# bg_session_diag: the last assistant entry of this run's session jsonl as
+# "stop=<stopReason> err=<errorMessage-or-absent>" (2026-10-16 incident,
+# frank/hydrogen): the dead tickets' briefs said nothing - the model had
+# stopped stopReason=length (token budget exhausted mid-thinking) with no
+# errorMessage. One added brief line; ANY read/parse failure degrades to
+# today's text (echoes nothing). Never fails the run.
+bg_session_diag() {
+  local sf
+  sf="$(bg_session_file)" || sf=""
+  [ -n "$sf" ] && [ -r "$sf" ] || return 0
+  PI_BG_DIAG_FILE="$sf" python3 -c '
+import json, os
+last = None
+try:
+    fh = open(os.environ["PI_BG_DIAG_FILE"])
+except Exception:
+    raise SystemExit(0)
+for line in fh:
+    if "\"role\"" not in line:
+        continue
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    m = o.get("message") or {}
+    if m.get("role") != "assistant":
+        continue
+    last = m
+fh.close()
+if not isinstance(last, dict):
+    raise SystemExit(0)
+def clean(v):
+    return " ".join(str(v).split())[:120] if v else ""
+print("stop=" + (clean(last.get("stopReason")) or "-")
+      + " err=" + (clean(last.get("errorMessage")) or "absent"))
+' 2>/dev/null
+}
+
 # bg_silent_tail: seconds since the newest activity of this run (raw.out
 # mtime, the profile session file for this run's cwd written after run
 # start, or the attempt start). No session file (test stubs, --no-session)
@@ -1956,12 +2033,15 @@ pi_flags=( "$@" )
 SPAWN_F="$BG_TMP/pi-bg-${run_id}-spawn.md"
 { printf '%s' "$task"; printf '\n\n%s' "$STD_CONSTRAINTS"; } > "$SPAWN_F" 2>/dev/null
 chmod 600 "$SPAWN_F" 2>/dev/null || true
+# 2026-10-16 incident: relaunches resume the prior attempt's session
+# (bg_arm_resume). Empty = fresh launch; attempt 1 is always fresh.
+resume_id=""
 for attempt in 1 2 3; do
   att_start="$(date +%s)"
   if [ "$wt_mode" -eq 1 ]; then
-    ( cd "$wt_path" && exec pi -p --no-extensions "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" ) > "$rawf" 2> "$errf" &
+    ( cd "$wt_path" && exec pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" ) > "$rawf" 2> "$errf" &
   else
-    pi -p --no-extensions "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" > "$rawf" 2> "$errf" &
+    pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" > "$rawf" 2> "$errf" &
   fi
   pi_pid=$!
   wait "$pi_pid"; rc=$?; pi_pid=""
@@ -1983,6 +2063,7 @@ for attempt in 1 2 3; do
       echo "[pi-bg] DEGENERATE output (rc=0, repetition loop) - relaunching ticket once (degr1)" >&2
       bg_log_retry "degenerate"
       degen_retried=1
+      bg_arm_resume
       sleep 3
       continue
     fi
@@ -2006,11 +2087,13 @@ for attempt in 1 2 3; do
     echo "[pi-bg] SILENT death (rc=1, no output, quiet ${tail}s < ${SILENT_TAIL_MAX}s) - relaunching ticket once (retry1)" >&2
     bg_log_retry "silent"
     silent_retried=1
+    bg_arm_resume
     sleep 3
     continue
   fi
   # Local models occasionally return empty completion (rc=0 with empty stream)
   echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
+  bg_arm_resume
   sleep 3
 done
 
@@ -2058,6 +2141,12 @@ if [ -n "$webhook" ]; then
   fi
   if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
     reason="$(bg_death_reason)"
+    # 2026-10-16 (frank/hydrogen): the empty-output brief was bare (the
+    # ticket died with no report). One added line from the last session
+    # entry: why the model stopped (stop=length = token budget exhausted
+    # mid-thinking). A read/parse failure degrades to today's text
+    # (bg_session_diag echoes nothing).
+    diag="$(bg_session_diag)"
     if [ "$rc" -eq 1 ] && [ "$silent_retried" -eq 1 ]; then
       # second silent death (issue #57): the retry1 did not recover;
       # report a normal FAIL (the orchestrator decides the fix round)
@@ -2069,6 +2158,10 @@ if [ -n "$webhook" ]; then
       # local-model empty-completion quirk (retried 3x already)
       [ $rc -ne 0 ] && status="DIED" || status="EMPTY"
       [ -n "$reason" ] && brief="reason: $reason"
+    fi
+    if [ -n "$diag" ]; then
+      brief="${brief:+$brief
+}$diag"
     fi
   else
     status="OK"; [ $rc -ne 0 ] && status="FAIL"
