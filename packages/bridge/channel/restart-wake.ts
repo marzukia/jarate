@@ -372,7 +372,7 @@ export async function postWakeText(
  *  missing file = null). This is the route the framed wake posts through.
  */
 export function defaultDispatchWebhook(
-  home: string = os.homedir(),
+  home: string = process.env.HOME || os.homedir(),
 ): string | null {
   const env = process.env.PI_DISPATCH_WEBHOOK?.trim();
   if (env) return env;

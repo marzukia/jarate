@@ -48,6 +48,7 @@ import {
   sendDiscordMessage,
 } from "./discord";
 import { hasOwnerConfigured, isOwnerUser } from "./index";
+import { defaultDispatchWebhook } from "./restart-wake";
 import type { ChannelConfig } from "./types";
 
 // ─── Constants (all env-overridable for tests) ───────────────────────────
@@ -162,6 +163,7 @@ export function __patVaultResetForTest(): void {
     stopVaultCore(entry.vault);
   }
   vaultEntries.clear();
+  __patVaultSetWakeWebhookForTest(null);
 }
 
 /** Test hook: drop the registry entry for a path WITHOUT stopping the
@@ -1248,6 +1250,78 @@ async function tapReply(
   return ok;
 }
 
+/** #220: wake webhook (pi-bg dispatch bus; mirrors #218's vault wake).
+ *  The decision tap is a component interaction, not a message — without
+ *  the wake post the agent slept until it polled pat-status or the owner
+ *  typed "go". Wakes go to the pi-bg callback bus ($PI_DISPATCH_WEBHOOK
+ *  or ~/.config/pi-dispatch/webhook) and carry the "[bg:pat]" prefix the
+ *  bridge's isBgWebhook filter recognizes, so a mid-turn tap rides the
+ *  re-wake queue and delivers at agent_end (existing mechanism, #177).
+ *  Best-effort: a failed wake never blocks the tap (audited, no throw).
+ */
+const WAKE_POST_TIMEOUT_MS = 5_000;
+const WAKE_POST_ATTEMPTS = 2;
+const WAKE_POST_BACKOFF_MS = 500;
+
+/** Default resolver: the pi-bg dispatch bus (see section header).
+ *  Module-level so tests can substitute a fake URL (not a config). */
+let wakeWebhookFn: () => string | null = defaultDispatchWebhook;
+
+/** Test hook: substitute the wake-webhook resolver (null = default). */
+export function __patVaultSetWakeWebhookForTest(
+  fn: (() => string | null) | null,
+): void {
+  wakeWebhookFn = fn ?? defaultDispatchWebhook;
+}
+
+export function approvedPatWakeText(
+  req: PatRequest,
+  st: PatVaultState,
+): string {
+  const head = `[bg:pat] approved ${req.id} (${req.agent}, ${req.scope})`;
+  const s = Math.max(1, Math.round(st.claimMs / 1000));
+  return `${head} — claim within ${s}s: jarate pat-run ${req.id} -- <cmd>`;
+}
+
+export function deniedPatWakeText(req: PatRequest): string {
+  return `[bg:pat] denied ${req.id} (${req.agent}, ${req.scope})`;
+}
+
+async function postPatWake(
+  st: PatVaultState,
+  ev: "approved" | "denied",
+  req: PatRequest,
+): Promise<void> {
+  const content =
+    ev === "approved" ? approvedPatWakeText(req, st) : deniedPatWakeText(req);
+  const url = wakeWebhookFn();
+  if (!url) {
+    audit(st, "wake", base(req), { wake: ev, result: "no-webhook" });
+    return;
+  }
+  const body = JSON.stringify({ content });
+  let ok = false;
+  for (let i = 1; i <= WAKE_POST_ATTEMPTS; i++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(WAKE_POST_TIMEOUT_MS),
+      });
+      if (resp.ok) {
+        ok = true;
+        break;
+      }
+    } catch {
+      // network error: retry
+    }
+    if (i < WAKE_POST_ATTEMPTS)
+      await new Promise((r) => setTimeout(r, WAKE_POST_BACKOFF_MS * i));
+  }
+  audit(st, "wake", base(req), { wake: ev, result: ok ? "posted" : "failed" });
+}
+
 function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
   return async (d: any): Promise<void> => {
     let parsedId: string | undefined;
@@ -1428,6 +1502,11 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
         audit(st, "approve", base(req), { user: uid });
         persist(st);
         await editRequestMessage(st, req, approvedText(req), [], "approved");
+        // #220: wake the agent (fire-and-forget; the card edit is the
+        // owner's feedback — a slow webhook must not delay it).
+        void postPatWake(st, "approved", req).catch((e) => {
+          console.error("[pat-vault] wake post failed:", e);
+        });
       } else {
         req.state = "denied";
         req.deniedBy = uid;
@@ -1440,6 +1519,10 @@ function makeHandler(st: PatVaultState): (d: any) => Promise<void> {
           [],
           "denied",
         );
+        // #220: deny wakes the agent too (fire-and-forget, same as approve).
+        void postPatWake(st, "denied", req).catch((e) => {
+          console.error("[pat-vault] wake post failed:", e);
+        });
       }
       await deleteDeferredAck(st.botToken, d);
     } catch (e) {
