@@ -2,7 +2,7 @@
  * bin/jarate — JSON entrypoint contract tests (issue #17).
  *
  * Runs the real bash entrypoint against a fake HOME with stubbed externals
- * (pi-token-cost.py, journalctl, sshpass, recall CLI) and asserts the JSON
+ * (pi-token-cost.py, journalctl, sshpass) and asserts the JSON
  * discipline: exactly one doc on stdout, ok:true|false + error, stable
  * snake_case keys, no partial output.
  */
@@ -211,35 +211,14 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
     ].join("\n"),
   );
 
-  // stub recall CLI: one result, echoes RAG_PROJECT into source.
-  // NOTE: bun pre-parses shebang'd scripts as JS (">&2" breaks), so the stub
-  // is plain JS, not sh.
-  const recallStub = path.join(tmp, "recall-stub.js");
-  fs.writeFileSync(
-    recallStub,
-    [
-      "process.stdout.write(JSON.stringify([{",
-      '  source: "src:" + (process.env.RAG_PROJECT ?? ""),',
-      '  content: "chunk",',
-      "  score: 0.5,",
-      "}]));",
-      "",
-    ].join("\n"),
-  );
-
   const env = { ...process.env } as Record<string, string>;
   // Ambient-env hygiene (audit F1): scrub every var the entrypoint reads
-  // (JARATE_*, AGENT_SAY_*, RAG_PROJECT) before the explicit fixture
-  // values below are set, same explicit-scrub pattern as the dispatch
-  // #110 fixture. A caller's shell must not flip a test: RAG_PROJECT
-  // leaks into the rag tests (src:ambient), JARATE_SSH_HOST into the
-  // #147 derivation.
+  // (JARATE_*, AGENT_SAY_*) before the explicit fixture values below are
+  // set, same explicit-scrub pattern as the dispatch #110 fixture. A
+  // caller's shell must not flip a test: JARATE_SSH_HOST into the #147
+  // derivation.
   for (const k of Object.keys(env)) {
-    if (
-      k === "RAG_PROJECT" ||
-      k.startsWith("JARATE_") ||
-      k.startsWith("AGENT_SAY_")
-    ) {
+    if (k.startsWith("JARATE_") || k.startsWith("AGENT_SAY_")) {
       delete env[k];
     }
   }
@@ -250,7 +229,6 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   // peer hop stub: run_remote_probe needs a sudo password before it even
   // execs sshpass (2026-09-14: fixture was missing this -> red on main)
   env.JARATE_SUDO_PASS = "test-pass";
-  env.JARATE_RECALL_CLI = recallStub;
   fs.mkdirSync(env.XDG_RUNTIME_DIR, { recursive: true });
 
   const run = async (
@@ -290,7 +268,6 @@ describe("entrypoint", () => {
       "ctx-report",
       "journal-errors",
       "memory-grep",
-      "rag",
       "projects",
       "projects-backfill",
       "agents-check",
@@ -314,7 +291,7 @@ describe("entrypoint", () => {
     const d = doc(r);
     expect(d.ok).toBe(false);
     expect(d.error).toBe("unknown command: bogus");
-    expect(d.commands).toContain("rag");
+    expect(d.commands).toContain("projects");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
@@ -399,7 +376,6 @@ describe("ctx-report", () => {
       [["journal-errors", "--since"], "--since needs a value"],
       [["journal-errors", "--agent"], "--agent needs a value"],
       [["memory-grep", "q", "--root"], "--root needs a value"],
-      [["rag", "q", "--project"], "--project needs a value"],
       [["projects", "--project"], "--project needs a value"],
       [["projects", "--since"], "--since needs a value"],
       [["projects", "--agent"], "--agent needs a value"],
@@ -689,110 +665,6 @@ describe("memory-grep", () => {
     ]);
     expect(r3.code).toBe(2);
     expect(doc(r3).error).toContain("root not found");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-});
-
-describe("rag", () => {
-  test("wraps the recall --json array, project null by default", async () => {
-    const f = fixture();
-    const r = await f.run(["rag", "what", "is", "dispatch"]);
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.error).toBeNull();
-    expect(d.backend).toBe("recall");
-    expect(d.question).toBe("what is dispatch");
-    expect(d.project).toBeNull();
-    expect(d.count).toBe(1);
-    expect(d.results[0]).toEqual({
-      source: "src:", // RAG_PROJECT unset
-      content: "chunk",
-      score: 0.5,
-    });
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("--project is forwarded as RAG_PROJECT", async () => {
-    const f = fixture();
-    const r = await f.run(["rag", "q", "--project", "jarate"]);
-    const d = doc(r);
-    expect(d.project).toBe("jarate");
-    expect(d.results[0].source).toBe("src:jarate");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("recall failing -> ok:false with the first stderr line", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      path.join(f.tmp, "recall-stub.js"),
-      'process.stderr.write("connect ECONNREFUSED 127.0.0.1:11434\n");\nprocess.exit(1);\n',
-    );
-    const r = await f.run(["rag", "q"]);
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("recall query failed");
-    expect(d.error).toContain("ECONNREFUSED");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("non-array recall output -> ok:false", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      path.join(f.tmp, "recall-stub.js"),
-      'process.stdout.write("no results");\n',
-    );
-    const r = await f.run(["rag", "q"]);
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("expected JSON array");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("stderr noise does not fail a successful query", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      path.join(f.tmp, "recall-stub.js"),
-      [
-        'process.stderr.write("WARN: warmup\\n");',
-        'process.stdout.write(JSON.stringify([{source: "s", content: "c", score: 0.7}]));',
-        "",
-      ].join("\n"),
-    );
-    const r = await f.run(["rag", "q"]);
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.count).toBe(1);
-    expect(d.results[0].content).toBe("c");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("missing question -> ok:false usage error, rc 2", async () => {
-    const f = fixture();
-    const r = await f.run(["rag"]);
-    expect(r.code).toBe(2);
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("usage: jarate rag");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("JARATE_ROOT env is honored for recall CLI resolution", async () => {
-    const f = fixture();
-    // bun shim: command -v bun finds it, execs the real bun binary
-    const bunStub = path.join(f.bin, "bun");
-    fs.writeFileSync(
-      bunStub,
-      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
-    );
-    fs.chmodSync(bunStub, 0o755);
-    const r = await f.run(["rag", "q"], {
-      JARATE_RECALL_CLI: "",
-      JARATE_ROOT: path.join(f.tmp, "nope"),
-    });
-    expect(r.code).toBe(1);
-    expect(doc(r).error).toContain("recall CLI not found");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -2465,13 +2337,6 @@ describe("#148 --flag=value (one flag grammar)", () => {
     const r = await f.run(["memory-grep", "x", "--root=/tmp/jarate-nodir-zz"]);
     expect(r.code).toBe(2);
     expect(doc(r).error).toContain("root not found: /tmp/jarate-nodir-zz");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("rag --project= is forwarded", async () => {
-    const f = fixture();
-    const r = await f.run(["rag", "q", "--project=jarate"]);
-    expect(doc(r).project).toBe("jarate");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 

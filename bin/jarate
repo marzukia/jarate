@@ -24,7 +24,6 @@
 #                               tag historical untagged run records (worktree
 #                               path, ~/projects cwd, per-agent default)
 #   memory-grep <query>           search ~/memory, top-20 matches
-#   rag <question> [--project P]  RAG one-call over project knowledge (recall --json)
 #   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
 #   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
 #   pat-request <scope> <reason>  ask the channel owner for a GitHub PAT (JSON doc; rc 0/1/2)
@@ -51,7 +50,6 @@
 #                       with uid > 900, a home, a login shell, and
 #                       sudo-group membership (wheel/sudo)
 #   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
-#   JARATE_RECALL_CLI   path to the recall CLI (default: repo, then ~/projects/recall)
 #   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
 #                       falling back to ~/AGENTS.md when that is absent — the
 #                       live boxes keep the main profile's law in ~/AGENTS.md)
@@ -77,7 +75,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "rag" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status" "vault-request" "vault-run" "vault-status" "vault-revoke" "vault-audit")
+COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status" "vault-request" "vault-run" "vault-status" "vault-revoke" "vault-audit")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -1061,101 +1059,6 @@ cmd_memory_grep() {
     || die "memory-grep: json assembly failed"
 }
 
-# ─── rag ────────────────────────────────────────────────────────────────────
-# One-call RAG wrapper over the recall CLI (TS port of pgrag, same db `rag`).
-# `recall query --json` emits a SearchRow array: {source, content, score}.
-
-find_bun() {
-  if command -v bun >/dev/null 2>&1; then
-    command -v bun
-    return
-  fi
-  local c
-  for c in "$HOME/.local/bin/bun" "$HOME/.bun/bin/bun"; do
-    if [ -x "$c" ]; then
-      printf '%s' "$c"
-      return
-    fi
-  done
-}
-
-find_recall_cli() {
-  if [ -n "${JARATE_RECALL_CLI:-}" ]; then
-    printf '%s' "${JARATE_RECALL_CLI:-}"
-    return
-  fi
-  local c
-  for c in \
-    "$JARATE_ROOT/packages/recall/bin/recall.ts" \
-    "$HOME/projects/recall/bin/recall.ts"; do
-    if [ -f "$c" ]; then
-      printf '%s' "$c"
-      return
-    fi
-  done
-  command -v recall 2>/dev/null || true
-}
-
-cmd_rag() {
-  local project=""
-  local -a qw=()
-  while [ $# -gt 0 ]; do
-    # --flag=value -> --flag value (one flag grammar, #148)
-    case "$1" in
-      --project=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
-    esac
-    case "$1" in
-      --project) [ $# -ge 2 ] || die_usage "rag: --project needs a value"; project="$2"; shift ;;
-      -*) die_usage "rag: unknown flag: $1" ;;
-      *) qw+=("$1") ;;
-    esac
-    shift
-  done
-  local question="${qw[*]:-}"
-  [ -n "$question" ] || die_usage "rag: usage: jarate rag <question> [--project NAME]"
-
-  local bun
-  bun="$(find_bun)" || true
-  [ -n "$bun" ] || die "rag: bun not found on PATH"
-  local cli
-  cli="$(find_recall_cli)"
-  [ -n "$cli" ] || die "rag: recall CLI not found (repo packages/recall, ~/projects/recall, PATH)"
-
-  # stdout and stderr stay separate: stderr noise must not fail a
-  # successful query (F5).
-  local out rc errf err
-  errf="$(mktemp "${TMPDIR:-/tmp}/jarate-rag.XXXXXXXX")" || die "rag: mktemp failed"
-  if [ -n "$project" ]; then
-    out="$(timeout "$TMO" env RAG_PROJECT="$project" "$bun" "$cli" query --json "$question" 2>"$errf")"
-    rc=$?
-  else
-    out="$(timeout "$TMO" "$bun" "$cli" query --json "$question" 2>"$errf")"
-    rc=$?
-  fi
-  err="$(head -1 "$errf" 2>/dev/null)"
-  rm -f "$errf"
-  if [ "$rc" -eq 124 ]; then
-    die "rag: recall query timed out (${TMO}s)"
-  elif [ "$rc" -ne 0 ] || [ -z "$out" ]; then
-    die "rag: recall query failed (rc=$rc): ${err:-$(head -1 <<<"$out")}"
-  fi
-  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out" \
-    || die "rag: unexpected recall output (expected JSON array)"
-  local count
-  count="$(jq 'length' <<<"$out")"
-
-  jq -cn \
-    --arg ts "$(ts_now)" \
-    --arg question "$question" \
-    --arg project "${project:-}" \
-    --argjson count "$count" \
-    --argjson results "$out" \
-    '{ok: true, ts: $ts, error: null, backend: "recall", question: $question,
-      project: (if $project == "" then null else $project end),
-      count: $count, results: $results}' \
-    || die "rag: json assembly failed"
-}
-
 # ─── agents-check / agents-bless ───────────────────────────────────────────
 # AGENTS.md is prompt-level law: changes require the operator's explicit approval
 # (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
@@ -1623,7 +1526,6 @@ cmd_setup() {
   [ "$SETUP_DRY" = 1 ] && steps_a+=("re-run with --yes to execute (dry-run wrote nothing)")
   [ -z "$prov_key" ] && steps_a+=("LLM creds: re-run with --model-base/--model-id/--model-key (H4) — agent boots but LLM calls fail")
   steps_a+=("identity: author ~/AGENTS.md (per-agent, hand-written)")
-  steps_a+=("RAG (optional): docs/PGRAG-SETUP.md")
   steps_a+=("web search (optional): cp $SETUP_DIR/extensions/mcp-tools.ts ~/.pi/agent/extensions/ + tavily key in settings.json mcp[]")
   steps_a+=("peers (optional): invite bots to each other's guilds + peerBotIds in settings.json")
   local steps
@@ -1798,7 +1700,7 @@ main() {
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
-                     "rag", "projects", "projects-backfill",
+                     "projects", "projects-backfill",
                      "agents-check", "agents-bless",
                      "pat-request", "pat-run", "pat-status",
                      "vault-request", "vault-run", "vault-status",
@@ -1808,7 +1710,6 @@ main() {
     ctx-report) cmd_ctx_report "$@" ;;
     journal-errors) cmd_journal_errors "$@" ;;
     memory-grep) cmd_memory_grep "$@" ;;
-    rag) cmd_rag "$@" ;;
     projects) cmd_projects "$@" ;;
     projects-backfill) cmd_projects_backfill "$@" ;;
     agents-check) cmd_agents_check "$@" ;;
@@ -1826,7 +1727,7 @@ main() {
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
-                     "rag", "projects", "projects-backfill",
+                     "projects", "projects-backfill",
                      "agents-check", "agents-bless",
                      "pat-request", "pat-run", "pat-status",
                      "vault-request", "vault-run", "vault-status",
