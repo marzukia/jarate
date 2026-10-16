@@ -82,6 +82,10 @@ class FakeDiscord {
         this.callbackSpent.add(cb[1]);
         return resp(204, null);
       }
+      // Dispatch-bus webhook (#220 tap wake) — a DIFFERENT url from the
+      // interaction webhook (/api/v10/webhooks/app1/intok-*).
+      if (method === "POST" && url === WAKE_WH)
+        return resp(200, { id: `wake-${++this.msgSeq}` });
       if (method === "POST" && /\/channels\/[^/]+\/messages$/.test(url)) {
         return resp(200, { id: `msg-${++this.msgSeq}` });
       }
@@ -107,11 +111,22 @@ class FakeDiscord {
     }) as any;
   }
 
+  /** Followups posted on the interaction webhook (post-defer replies).
+   *  The /api/v10/ segment keeps the dispatch-bus webhook (#220) out. */
   followups(): Array<{ url: string; body: any }> {
     return this.calls
       .filter(
-        (c) => c.method === "POST" && /\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
+        (c) =>
+          c.method === "POST" &&
+          /\/api\/v10\/webhooks\/[^/]+\/[^/]+$/.test(c.url),
       )
+      .map((c) => ({ url: c.url, body: c.body }));
+  }
+
+  /** Dispatch-bus webhook posts (#220 tap wakes). */
+  webhookPosts(): Array<{ url: string; body: any }> {
+    return this.calls
+      .filter((c) => c.method === "POST" && c.url === WAKE_WH)
       .map((c) => ({ url: c.url, body: c.body }));
   }
 
@@ -159,6 +174,10 @@ class FakeDiscord {
 
 const OWNER = "108801968763305984";
 const OTHER = "215356028869541889";
+
+/** Dispatch-bus webhook the tap wake (#220) posts through — the same
+ *  route pi-bg uses; in tests it is stubbed, never the box's real URL. */
+const WAKE_WH = "https://discord.example/api/webhooks/9/tap";
 const FINE_TOKEN = `github_pat_${"f".repeat(30)}`;
 const CLASSIC_TOKEN = `ghp_${"c".repeat(36)}`;
 const BYO_VALUE = `sk-vault-byo-${"x".repeat(24)}`;
@@ -257,6 +276,11 @@ function mkVault(
       ownerUserId: OWNER,
       ownerUserIds: [OWNER],
     } as any);
+
+  // #220: pin the tap-wake bus to the stubbed dispatch webhook — the
+  // box's real $PI_DISPATCH_WEBHOOK / ~/.config/pi-dispatch/webhook must
+  // never be the wake route under test (the resolver reads env per post).
+  setEnv("PI_DISPATCH_WEBHOOK", WAKE_WH);
 
   // Shortened clocks (env read at startVault).
   setEnv("JARATE_VAULT_TTL_MS", "1200");
@@ -2624,6 +2648,112 @@ describe("wake webhook (pi-bg dispatch bus)", () => {
           .auditEvents()
           .some((e) => e.event === "wake" && e.result === "failed"),
       ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  // ─── #220: deny/revoke owner taps also wake (extends the approve
+  // wake above; same mechanism, new events) ─────────────────────────
+
+  test("deny posts a [bg:vault] wake the isBgWebhook filter accepts", async () => {
+    const f = mkVault();
+    try {
+      setEnv("PI_DISPATCH_WEBHOOK", WAKE_URL);
+      const id = await makePending(f);
+      await tap(f, id, "deny");
+      await waitForWake(f.fd, 1);
+      const posts = wakeCalls(f.fd);
+      expect(posts).toHaveLength(1);
+      const content = posts[0].body.content;
+      expect(content).toBe(
+        `[bg:vault] denied ${id} (github-pat/marzukia/jarate:write, one-shot)`,
+      );
+      expect(isBgWebhook({ webhook_id: "w1", content })).toBe(true);
+      expect(f.st.credentials.get(id)!.state).toBe("denied");
+      expect(
+        f
+          .auditEvents()
+          .some(
+            (e) =>
+              e.event === "wake" &&
+              e.wake === "denied" &&
+              e.result === "posted",
+          ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("revoke posts a [bg:vault] wake (kill switch on an active cred)", async () => {
+    const f = mkVault();
+    try {
+      setEnv("PI_DISPATCH_WEBHOOK", WAKE_URL);
+      const id = await makePending(f);
+      await approve(f, id);
+      await waitForWake(f.fd, 1); // approval wake
+      await tap(f, id, "revoke");
+      await waitForWake(f.fd, 2);
+      const posts = wakeCalls(f.fd);
+      expect(posts).toHaveLength(2);
+      expect(posts[1].body.content).toBe(
+        `[bg:vault] revoked ${id} (github-pat/marzukia/jarate:write, one-shot)`,
+      );
+      expect(f.st.credentials.get(id)!.state).toBe("revoked");
+      expect(
+        f
+          .auditEvents()
+          .some(
+            (e) =>
+              e.event === "wake" &&
+              e.wake === "revoked" &&
+              e.result === "posted",
+          ),
+      ).toBe(true);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("non-owner tap: no wake post, no wake audit (audit-only)", async () => {
+    const f = mkVault();
+    try {
+      const id = await makePending(f);
+      await f.h.ready;
+      const cred = f.st.credentials.get(id)!;
+      await f.h.handleVaultComponent(
+        mkD(`i-str-${id}`, `vault:approve:${id}`, {
+          message: { id: cred.messageId },
+          user: { id: OTHER, username: "Other" },
+        }),
+      );
+      await tick(100); // give a stray wake a chance to appear
+      expect(wakeCalls(f.fd)).toHaveLength(0);
+      expect(cred.state).toBe("pending");
+      expect(f.auditEvents().some((e) => e.event === "wake")).toBe(false);
+    } finally {
+      f.cleanup();
+    }
+  }, 15000);
+
+  test("re-tap after approve: already-handled, no second wake", async () => {
+    const f = mkVault();
+    try {
+      setEnv("PI_DISPATCH_WEBHOOK", WAKE_URL);
+      const id = await makePending(f);
+      await approve(f, id);
+      await waitForWake(f.fd, 1);
+      // A fresh interaction (new d.id) on the settled cred: rejected
+      // already-handled, and no second wake is posted.
+      await f.h.handleVaultComponent(
+        mkD(`i-${id}-again`, `vault:approve:${id}`, {
+          message: { id: f.st.credentials.get(id)!.messageId },
+        }),
+      );
+      await tick(100);
+      expect(wakeCalls(f.fd)).toHaveLength(1);
+      expect(f.st.credentials.get(id)!.state).toBe("active");
     } finally {
       f.cleanup();
     }

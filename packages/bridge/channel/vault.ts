@@ -517,16 +517,30 @@ export function consumedWakeText(c: VaultCredential, rc: number): string {
   return `[bg:vault] consumed ${c.id} rc=${rc}`;
 }
 
+/** #220: deny/revoke wakes — same [bg:vault] head, no next-action hint (the
+ *  agent just stops waiting on the credential). */
+export function deniedWakeText(c: VaultCredential): string {
+  return `[bg:vault] denied ${c.id} (${c.kind}/${c.name}, ${c.level})`;
+}
+
+export function revokedWakeText(c: VaultCredential): string {
+  return `[bg:vault] revoked ${c.id} (${c.kind}/${c.name}, ${c.level})`;
+}
+
 async function postVaultWake(
   st: VaultState,
-  ev: "approved" | "consumed",
+  ev: "approved" | "denied" | "revoked" | "consumed",
   cred: VaultCredential,
   rc?: number,
 ): Promise<void> {
   const content =
     ev === "approved"
       ? approvalWakeText(cred, st)
-      : consumedWakeText(cred, rc ?? -1);
+      : ev === "denied"
+        ? deniedWakeText(cred)
+        : ev === "revoked"
+          ? revokedWakeText(cred)
+          : consumedWakeText(cred, rc ?? -1);
   const url = wakeWebhookFn();
   if (!url) {
     audit(st, "wake", credFields(cred), { wake: ev, result: "no-webhook" });
@@ -1878,6 +1892,11 @@ async function applyDecision(
       [],
       "revoked",
     );
+    // #220: revoke kill-switch wakes the agent too (fire-and-forget,
+    // same as approve — a slow webhook must not delay the card edit).
+    void postVaultWake(st, "revoked", cred).catch((e) => {
+      console.error("[vault] wake post failed:", e);
+    });
     return { ok: true };
   }
   if (cred.state !== "pending") return { ok: false, reason: "already-handled" };
@@ -1942,6 +1961,10 @@ async function applyDecision(
   audit(st, "deny", credFields(cred), { user: uid, actor });
   persist(st);
   await editCredentialMessage(st, cred, deniedText(cred, who), [], "denied");
+  // #220: deny wakes the agent (fire-and-forget, same as approve).
+  void postVaultWake(st, "denied", cred).catch((e) => {
+    console.error("[vault] wake post failed:", e);
+  });
   return { ok: true };
 }
 
@@ -2306,6 +2329,8 @@ function makeHandler(st: VaultState): (d: any) => Promise<void> {
         }
         return;
       }
+      // The wake post fires inside applyDecision (#218 approved, #220
+      // denied/revoked) — one per state transition, tap and slash alike.
       await deleteDeferredAck(st.botToken, d);
     } catch (e) {
       // Never reject (M1 parity): log + audit + best-effort feedback.
