@@ -4,8 +4,7 @@
  *
  * Two passes, in order:
  *   (a) REGISTRY: exact literals from ~/.pi/agent/secrets.txt
- *       ($JARATE_SECRETS_FILE overrides) PLUS runtime PAT literals
- *       (registerRuntimeSecrets, the PAT vault), longest first.
+ *       ($JARATE_SECRETS_FILE overrides), longest first.
  *       → [REDACTED:secret#N]
  *   (b) PATTERN: built-in classes (GitHub/Switchboard/GitLab/Anthropic/
  *       OpenAI/AWS/Google/Slack/Bearer/DSN/sshpass/key-value).
@@ -83,38 +82,6 @@ export function loadRegistry(file?: string): RegistryEntry[] {
 export function clearRegistryCache(): void {
   cachedMtime = null;
   cachedEntries = [];
-}
-
-// Runtime PAT secrets: literal token strings registered by the PAT vault
-// (packages/bridge/channel/pat-vault.ts) for the lifetime of a pat-run.
-// Consulted in pass (a) alongside the file registry, longest-first, same
-// [REDACTED:secret#N] marker family (N continues the file index). The
-// github pattern in pass (b) covers the window after drop.
-let runtimeSecrets: string[] = [];
-
-/** Register PAT literals for runtime redaction (idempotent). */
-export function registerRuntimeSecrets(literals: string[]): void {
-  for (const l of literals) {
-    if (typeof l === "string" && l.length > 0 && !runtimeSecrets.includes(l)) {
-      runtimeSecrets.push(l);
-    }
-  }
-  runtimeSecrets.sort((a, b) => b.length - a.length);
-}
-
-/** Drop PAT literals (grace timer fired or the run settled). */
-export function dropRuntimeSecrets(literals: string[]): void {
-  runtimeSecrets = runtimeSecrets.filter((l) => !literals.includes(l));
-}
-
-/** Current runtime PAT literals (exported for tests). */
-export function getRuntimeSecrets(): string[] {
-  return [...runtimeSecrets];
-}
-
-/** Clear all runtime PAT literals (exported for tests). */
-export function clearRuntimeSecrets(): void {
-  runtimeSecrets = [];
 }
 
 function fingerprint(literal: string): string {
@@ -269,16 +236,9 @@ export function censor(text: string, opts: CensorOptions = {}): string {
 
   let out = text;
 
-  // (a) registry literals + runtime PAT literals, longest first. Runtime
-  // markers continue the file index (N = file entries + offset + 1).
+  // (a) registry literals, longest first.
   const reg = loadRegistry(opts.file);
-  const combined: RegistryEntry[] = [
-    ...reg,
-    ...runtimeSecrets.map((literal, i) => ({
-      index: reg.length + i + 1,
-      literal,
-    })),
-  ];
+  const combined: RegistryEntry[] = [...reg];
   combined.sort((a, b) => b.literal.length - a.literal.length);
   for (const entry of combined) {
     const before = out.length;

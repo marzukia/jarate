@@ -45,7 +45,7 @@ added.
   the agent knows what is being pointed at
 - `send-file` LLM tool: the agent uploads local file(s) to the channel in
   one message (multipart, 25 MB per-file cap) — no webdrop round-trip
-- Other bots are skipped on inbound (agent-say traffic does not burn a run;
+- Other bots are skipped on inbound (inter-agent traffic does not burn a run;
   no echo loops)
 - Message cursor is persisted per channel (`.tmp/channel-state.json`), so
   messages sent while pi was down are picked up on restart

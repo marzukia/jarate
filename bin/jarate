@@ -26,16 +26,12 @@
 #   memory-grep <query>           search ~/memory, top-20 matches
 #   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
 #   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
-#   pat-request <scope> <reason>  ask the channel owner for a GitHub PAT (JSON doc; rc 0/1/2)
-#   pat-run <id> -- <cmd> [args]  run one command under the approved token (child rc; 124 on cap)
-#   pat-status [id]               read-only PAT request state (never prints the token)
-#   vault-request <kind> <name> [level] [flags] <reason...>
-#                               ask the channel owner for a credential (JSON doc; rc 0/1/2)
-#                               level omitted → 30-min time-box default (--hours whole minutes 1m..72h, or --minutes 1..4320)
-#   vault-run <id> -- <cmd> [args]  run one command under the approved credential (child rc; 124 on cap)
-#   vault-status [id]             read-only vault request state (never prints the credential)
-#   vault-revoke <id>             revoke an approved request
-#   vault-audit [n]               last n audit-log entries (default 20)
+#
+# Local-only (2026-10-17): hall-monitor owns credentials + privileged exec.
+#   journal-errors / projects / projects-backfill read $HOME only; any
+#   requested agent home that is not $HOME (JARATE_AGENT_HOMES) yields a
+#   per-agent entry with ok:false + error "cross-user read removed: use a
+#   hall-monitor plan (SUDO_PW)". The run itself does not fail.
 #
 # Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
 # Callers use $HOME/bin/jarate — do not rely on PATH.
@@ -44,28 +40,12 @@
 #   JARATE_TOKEN_COST   path to pi-token-cost.py (default: ~/scripts, then repo)
 #   JARATE_CTX_LIMIT    context limit fallback when models.json has none
 #   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
-#   JARATE_SSH_HOST     cross-user hop target OVERRIDE (user@host as-is; a
-#                       bare user becomes user@127.0.0.1). When unset the
-#                       target is DERIVED (issue #147): the unique local user
-#                       with uid > 900, a home, a login shell, and
-#                       sudo-group membership (wheel/sudo)
-#   JARATE_SUDO_PASS    password for the sudo -S hop (else ~/.config/sudo-pass, 0600)
 #   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
 #                       falling back to ~/AGENTS.md when that is absent — the
 #                       live boxes keep the main profile's law in ~/AGENTS.md)
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
 #   JARATE_SETUP_GATE_S setup boot-gate window in seconds (default 90)
 #   JARATE_SETUP_POLL_S setup boot-gate poll interval in seconds (default 3)
-#   JARATE_PAT_DIR      PAT vault socket dir (default $XDG_RUNTIME_DIR/jarate)
-#   JARATE_PAT_FILE_DIR PAT vault published-file dir (default $XDG_RUNTIME_DIR/jarate-pat)
-#   JARATE_PAT_PATS_DIR fine-grained token store (default ~/.config/marzukia-pats)
-#   JARATE_PAT_AUDIT_FILE audit log (default ~/.jarate/pat-audit.log)
-#   JARATE_VAULT_DIR      vault data dir (default ~/.jarate/vault; audit lives here)
-#   JARATE_VAULT_SOCKET_DIR vault socket dir (default $XDG_RUNTIME_DIR/jarate)
-#   JARATE_VAULT_FILE_DIR vault published-file dir (default $XDG_RUNTIME_DIR/jarate-vault)
-#   JARATE_VAULT_AUDIT_FILE vault audit log (default <vault dir>/audit.log)
-#   JARATE_PAT_TRANSPORT socket|file (bridge side; default socket)
-#   JARATE_PAT_RUN_TIMEOUT_S wrapper command cap in seconds (default 900)
 
 set -uo pipefail
 
@@ -75,7 +55,7 @@ WARN_CAP=100   # max warning lines per agent
 GREP_CAP=20    # memory-grep top-N
 PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "projects" "projects-backfill" "agents-check" "agents-bless" "pat-request" "pat-run" "pat-status" "vault-request" "vault-run" "vault-status" "vault-revoke" "vault-audit")
+COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "projects" "projects-backfill" "agents-check" "agents-bless")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -89,74 +69,6 @@ die() {
 die_usage() {
   jq -cn --arg ts "$(ts_now)" --arg e "$1" '{ok: false, ts: $ts, error: $e}'
   exit 2
-}
-
-# ─── cross-user hop target (issue #147: derived, not configured) ───────────
-# HOP_TARGET — the ssh target of the sshpass/sudo hop, resolved once and
-# cached. Priority:
-#   1. JARATE_SSH_HOST explicit override — "user@host" kept as-is; a bare
-#      user becomes "user@127.0.0.1".
-#   2. Derivation: the UNIQUE local user with uid > 900, a home, a login
-#      shell (not nologin), and sudo-group membership (wheel on Fedora,
-#      sudo on Debian/Ubuntu; if both groups exist, either counts).
-# 0 or >1 candidates -> executable ok:false doc (rc 2) naming the
-# candidates and the exact override command. Call once per command,
-# directly (not in $(...)) so the doc reaches stdout.
-HOP_TARGET=""
-hop_target() { # $1 = invoked cmd (named in the override doc)
-  local cmd="${1:-jarate}"
-  [ -n "$HOP_TARGET" ] && return 0
-  if [ -n "${JARATE_SSH_HOST:-}" ]; then
-    case "$JARATE_SSH_HOST" in
-      *@*) HOP_TARGET="$JARATE_SSH_HOST" ;;
-      *) HOP_TARGET="${JARATE_SSH_HOST}@127.0.0.1" ;;
-    esac
-    return 0
-  fi
-  local g line members m
-  local -a sudo_users=()
-  for g in wheel sudo; do
-    if line="$(getent group "$g" 2>/dev/null)"; then
-      members="${line##*:}"
-      for m in ${members//,/ }; do
-        sudo_users+=("$m")
-      done
-    fi
-  done
-  local u _p _u _g rest shell _h
-  local -a cands=()
-  while IFS=: read -r u _p _u _g rest; do
-    [ -n "$u" ] || continue
-    [ "$_u" -gt 900 ] 2>/dev/null || continue
-    # home + shell are the LAST two fields (gecos may contain ':')
-    shell="${rest##*:}"
-    _h="${rest%:*}"
-    _h="${_h##*:}"
-    [ -n "$_h" ] || continue
-    case "$shell" in *nologin*) continue ;; esac
-    for m in "${sudo_users[@]}"; do
-      if [ "$m" = "$u" ]; then
-        cands+=("$_u:$u")
-        break
-      fi
-    done
-  done < <(getent passwd)
-  local n="${#cands[@]}"
-  if [ "$n" -eq 1 ]; then
-    HOP_TARGET="${cands[0]##*:}@127.0.0.1"
-    return 0
-  fi
-  local names="" first=""
-  if [ "$n" -gt 1 ]; then
-    local sorted
-    sorted="$(printf '%s\n' "${cands[@]}" | sort -t: -k1,1n)"
-    names="$(printf '%s\n' "$sorted" | cut -d: -f2 | paste -sd, - | sed 's/,/, /g')"
-    first="$(printf '%s\n' "$sorted" | head -n 1 | cut -d: -f2)"
-  fi
-  if [ "$n" -eq 0 ]; then
-    die_usage "jarate: cannot derive operator (candidates: none). No local user has uid>900 + home + login shell + sudo group (wheel/sudo). Set the hop target for this run: JARATE_SSH_HOST=<user>@127.0.0.1 jarate $cmd"
-  fi
-  die_usage "jarate: cannot derive operator (candidates: $names). More than one local user has uid>900 + home + login shell + sudo group (wheel/sudo). Pick one for this run: JARATE_SSH_HOST=${first}@127.0.0.1 jarate $cmd"
 }
 
 # since_is_abs <value> — 0 if $1 is an absolute journalctl datetime.
@@ -334,13 +246,14 @@ cmd_ctx_report() {
 }
 
 # ─── journal-errors ─────────────────────────────────────────────────────────
-# Per-agent pi.service warnings. Self via user journal; other agents via the
-# proven sshpass/sudo hop (pi-token-cost.py pattern).
+# Per-agent pi.service warnings. Local-only (2026-10-17): $HOME via the
+# user journal; any other requested home yields a per-agent ok:false entry
+# (cross-user read removed — hall-monitor owns the privileged read).
 
 # agent_homes — populate the global AGENT_HOMES: JARATE_AGENT_HOMES
 # (colon-separated) or $HOME + the other /home/<u> agent accounts
-# (uid > 900, not self, not the ssh hop user). Shared by journal-errors,
-# projects and projects-backfill.
+# (uid > 900, not self). Shared by journal-errors, projects and
+# projects-backfill.
 AGENT_HOMES=()
 agent_homes() {
   AGENT_HOMES=()
@@ -348,56 +261,15 @@ agent_homes() {
     IFS=':' read -r -a AGENT_HOMES <<<"$JARATE_AGENT_HOMES"
   else
     AGENT_HOMES=("$HOME")
-    # the hop user (derived; see hop_target, issue #147) is not an agent
-    local ssh_user="${HOP_TARGET%%@*}"
     local self="$(id -un)"
     local u uid
     while IFS=: read -r u _ _ uid _ _ _; do
       [ -n "$u" ] || continue
       [ "$uid" -gt 900 ] 2>/dev/null || continue
       [ "$u" = "$self" ] && continue
-      [ "$u" = "$ssh_user" ] && continue
       [ -d "/home/$u" ] && AGENT_HOMES+=("/home/$u")
     done < <(getent passwd)
   fi
-}
-
-# Remote probe for a peer agent home: prints [jarate:pi] as the first line
-# only if that user has pi.service enabled, followed by the warning lines.
-# Non-pi users (e.g. system accounts) produce no marker -> caller skips them.
-
-# sq <s> — POSIX single-quote escape: emit <s> wrapped in single quotes,
-# each ' rewritten as '\'' . The output is shell CODE that any POSIX sh
-# parses back to the literal <s> (quote, $, backtick, space, glob-safe).
-# Used to embed values in the hop's remote command string (issue #121):
-# the remote string is one double-quoted local string, so $(sq ...) is
-# evaluated locally and substituted verbatim at the outer remote-shell
-# level — never inside another single-quoted region (nested sq would
-# break; pass such values as bash -c positionals instead, see below).
-sq() {
-  local s="$1"
-  printf "'%s'" "${s//\'/\'\\\'\'}"
-}
-
-run_remote_probe() { # $1=name $2=uid $3=since
-  local host="$HOP_TARGET"
-  local pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
-  if [ -z "$pass" ]; then
-    echo "[jarate:probe] no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
-    return 1
-  fi
-  # issue #121: the password sits in NEITHER argv NOR the remote string:
-  #   - local: `sshpass -e` reads SSHPASS from env (the SSHPASS= prefix
-  #     is env, not argv; visible only to this user's /proc/<pid>/environ)
-  #   - the password rides ssh's STDIN exactly once (here-string, no argv);
-  #     the remote shell reads it into a variable, drops it in a 0600 temp
-  #     file and feeds `sudo -S < file` — never `echo '<pw>'` in remote argv
-  #   - $1/$3 are sq()-escaped in the remote string (quote/$/backtick safe,
-  #     #121 injection path), $2 is a uid digit
-  SSHPASS="$pass" timeout "$TMO" sshpass -e \
-    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-    "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u $(sq "$1") bash -c 'export XDG_RUNTIME_DIR=/run/user/$2; if systemctl --user is-enabled pi.service >/dev/null 2>&1; then echo \"[jarate:pi]\"; journalctl --user -u pi.service -p warning --since \"\$1\" -q 2>/dev/null; fi' _ $(sq "$3"); rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
-    <<<"$pass" 2>/dev/null
 }
 
 cmd_journal_errors() {
@@ -430,7 +302,6 @@ cmd_journal_errors() {
     shift
   done
 
-  hop_target journal-errors
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -439,35 +310,32 @@ cmd_journal_errors() {
   local rows="[]"
   local included=0 ok_all="true" failed=""
   for h in "${homes[@]}"; do
-    local name src err="" text=""
+    local name src err=""
     name="$(basename "$h")"
     if [ -n "$agent_filter" ] && [ "$name" != "$agent_filter" ]; then
       continue
     fi
     included=$((included + 1))
-    if [ "$h" = "$HOME" ]; then
-      src="local"
-      if text="$(timeout "$TMO" env XDG_RUNTIME_DIR="/run/user/$(id -u)" \
-        journalctl --user -u pi.service -p warning --since "$since" -q 2>/dev/null)"; then
-        :
-      else
-        err="journalctl failed (rc=$?)"
-      fi
+    if [ "$h" != "$HOME" ]; then
+      # cross-user read removed (2026-10-17): hall-monitor owns the
+      # privileged read (SUDO_PW plan); the entry carries ok:false, the
+      # run itself does not fail.
+      local row
+      row="$(jq -cn \
+        --arg name "$name" \
+        --arg error "cross-user read removed: use a hall-monitor plan (SUDO_PW)" \
+        '{ok: false, name: $name, source: "cross-user", count: null,
+          warnings: null, truncated: false, error: $error}')"
+      rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
+      continue
+    fi
+    local text=""
+    src="local"
+    if text="$(timeout "$TMO" env XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+      journalctl --user -u pi.service -p warning --since "$since" -q 2>/dev/null)"; then
+      :
     else
-      src="ssh+sudo"
-      local uid rc=0
-      uid="$(getent passwd "$name" 2>/dev/null | cut -d: -f3)"
-      text="$(run_remote_probe "$name" "$uid" "$since")" || rc=$?
-      if [ "$rc" -ne 0 ]; then
-        err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
-      elif [ -z "$text" ] || [ "${text%%$'\n'*}" != "[jarate:pi]" ]; then
-        # no pi.service for this user -> not an agent, skip the row
-        included=$((included - 1))
-        continue
-      else
-        text="${text#*$'\n'}"   # drop the marker line
-        [ "$text" = "[jarate:pi]" ] && text=""
-      fi
+      err="journalctl failed (rc=$?)"
     fi
 
     local -a wl=()
@@ -491,7 +359,8 @@ cmd_journal_errors() {
       --argjson warnings "$warnings" \
       --argjson truncated "$truncated" \
       --arg error "${err:-}" \
-      '{name: $name, source: $source, count: $count, warnings: $warnings,
+      '{ok: (if $error == "" then true else false end),
+        name: $name, source: $source, count: $count, warnings: $warnings,
         truncated: $truncated, error: (if $error == "" then null else $error end)}')"
     rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
   done
@@ -514,15 +383,15 @@ cmd_journal_errors() {
 # ─── projects ─────────────────────────────────────────────────────────────────
 # Per-project rollup over pi-bg run records (2026-09-18, invoice
 # itemisation): runs/workers/reviewers/tokens/cost_usd per project tag.
-# Untagged records roll up into "unspecified". Peer homes (0700) are
-# scanned through the sshpass/sudo hop (pi-token-cost.py pattern); a
-# failing hop degrades that agent's section (records null + error) with a
-# "warn" in the doc, overall ok:true.
+# Untagged records roll up into "unspecified". Local-only (2026-10-17):
+# only $HOME is scanned; any other requested agent home yields a per-agent
+# ok:false entry (records null + error) with a "warn" in the doc, overall
+# ok:true.
 
-# PROJ_SCAN — read-only per-agent record projection, executed under the
-# owner's home (local or via hop). Env: PI_HOME, SINCE (optional date).
+# PROJ_SCAN — read-only per-agent record projection, executed against
+# PI_HOME. Env: PI_HOME, SINCE (optional date).
 # Prints a JSON array of {run, profile, project, started, tokens, cost_usd}.
-# Single-quote free: it ships inside a remote `bash -c '...'`.
+# Single-quote free (legacy of the ssh-hop era; run locally now).
 PROJ_SCAN='import json, os
 
 home = os.environ["PI_HOME"].rstrip("/")
@@ -564,7 +433,7 @@ print(json.dumps(rows))
 # backfilled_at (skipped under DRY=1); idempotent: a record that gains a
 # tag is never touched again. Env: PI_HOME, DRY, SETS_B64.
 # Prints {scanned, tagged, skipped, error, map:[{run, project, source}]}.
-# Single-quote free: it ships inside a remote `bash -c '...'`.
+# Single-quote free (legacy of the ssh-hop era; run locally now).
 BACKFILL_SCAN='import base64, datetime, json, os, re
 
 home = os.environ["PI_HOME"].rstrip("/")
@@ -638,42 +507,21 @@ print(json.dumps({"scanned": scanned, "tagged": tagged, "skipped": skipped, "err
 '
 
 # jarate_scan <home> <b64-script> [KEY=VAL ...] — run a scanner (base64 of
-# a single-quote-free python script) under the owner of <home>. $HOME runs
-# local; any other home goes through the sshpass/sudo hop (run_remote_probe
-# pattern). KEY=VAL pairs land as env on the python (safe tokens only: the
-# remote command is one quoted string). Returns non-zero on hop failure.
+# a python script) against <home> as the current user. Local-only
+# (2026-10-17): callers pass $HOME; other homes are not scanned here.
+# KEY=VAL pairs land as env on the python (safe tokens only). Returns
+# non-zero on scan failure.
 jarate_scan() {
   local home="$1" b64="$2"; shift 2
-  local envs="" kv owner host pass
+  local envs="" kv
   for kv in "$@"; do
-    # safe tokens only (the remote command is one quoted string; a token
-    # with spaces/globs would break the remote word-splitting)
+    # safe tokens only (a token with spaces/globs would break the
+    # env word-splitting)
     [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_+./:=:-]*$ ]] || { echo "jarate_scan: bad KEY=VAL token: $kv" >&2; return 1; }
     envs="${envs:+$envs }$kv"
   done
-  if [ "$home" = "$HOME" ]; then
-    timeout "$TMO" env PI_HOME="$home" $envs python3 -c \
-      'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
-  else
-    owner="${home##*/}"
-    host="$HOP_TARGET"
-    pass="${JARATE_SUDO_PASS:-$(cat "$HOME/.config/sudo-pass" 2>/dev/null)}"
-    if [ -z "$pass" ]; then
-      echo "no sudo password: set JARATE_SUDO_PASS or write ~/.config/sudo-pass (0600)" >&2
-      return 1
-    fi
-    command -v sshpass >/dev/null 2>&1 || { echo "cross-user hop needs sshpass" >&2; return 1; }
-    # issue #121: same no-password-in-argv discipline as run_remote_probe
-    # (sshpass -e + password over ssh stdin once + 0600 remote file for
-    # sudo -S); $owner is sq()-escaped at the sudo -u slot, $home/$b64 are
-    # sq()-escaped bash -c positionals (the inner script refers to them as
-    # "$1"/"$2" — sq output must not sit inside the inner single-quoted
-    # region), $envs tokens are validated above.
-    SSHPASS="$pass" timeout "$TMO" sshpass -e \
-      ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" \
-      "read -r pw; pwf=\$(mktemp) || exit 1; chmod 600 \"\$pwf\"; printf '%s\n' \"\$pw\" > \"\$pwf\"; sudo -S < \"\$pwf\" -u $(sq "$owner") bash -c 'PI_HOME=\"\$1\" $envs python3 -c \"import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())\" \"\$2\"' _ $(sq "$home") $(sq "$b64"); rc=\$?; rm -f \"\$pwf\"; exit \$rc" \
-      <<<"$pass" 2>/dev/null
-  fi
+  timeout "$TMO" env PI_HOME="$home" $envs python3 -c \
+    'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
 }
 
 cmd_projects() {
@@ -701,7 +549,6 @@ cmd_projects() {
     esac
   done
 
-  hop_target projects
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -716,26 +563,33 @@ cmd_projects() {
       continue
     fi
     included=$((included + 1))
-    if [ "$h" = "$HOME" ]; then src="local"; else src="ssh+sudo"; fi
     recs="null"
     err=""
-    if out="$(jarate_scan "$h" "$b64" SINCE="$since" 2>/dev/null)"; then
-      if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, list) else 1)' 2>/dev/null; then
-        recs="$out"
+    if [ "$h" = "$HOME" ]; then
+      src="local"
+      if out="$(jarate_scan "$h" "$b64" SINCE="$since" 2>/dev/null)"; then
+        if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, list) else 1)' 2>/dev/null; then
+          recs="$out"
+        else
+          err="scan failed (bad scanner output)"
+        fi
       else
-        err="scan failed (bad scanner output)"
+        err="scan failed (local)"
       fi
-    elif [ "$h" = "$HOME" ]; then
-      err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
+      # cross-user read removed (2026-10-17): hall-monitor owns the
+      # privileged read (SUDO_PW plan); the entry carries ok:false, the
+      # run itself does not fail.
+      src="cross-user"
+      err="cross-user read removed: use a hall-monitor plan (SUDO_PW)"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
       --arg source "$src" \
       --argjson records "$recs" \
       --arg error "$err" \
-      '{agent: $agent, source: $source, records: $records,
+      '{ok: (if $error == "" then true else false end),
+        agent: $agent, source: $source, records: $records,
         error: (if $error == "" then null else $error end)}')" || die "projects: json assembly failed"
     rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
   done
@@ -759,11 +613,11 @@ agent_rows = []
 warn = None
 for a in agents:
     recs = a.get("records")
-    row = {"agent": a["agent"], "source": a["source"], "scanned": None, "error": None}
+    row = {"ok": a.get("ok"), "agent": a["agent"], "source": a["source"], "scanned": None, "error": None}
     if recs is None:
-        row["error"] = a.get("error") or "cross-user hop failed"
+        row["error"] = a.get("error") or "cross-user read removed: use a hall-monitor plan (SUDO_PW)"
         if warn is None:
-            warn = "agent hop failed: " + a["agent"]
+            warn = "cross-user read removed: " + a["agent"]
         agent_rows.append(row)
         continue
     row["scanned"] = len(recs)
@@ -881,7 +735,6 @@ cmd_projects_backfill() {
     esac
   done
 
-  hop_target projects-backfill
   agent_homes
   local -a homes=()
   if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
@@ -905,26 +758,33 @@ cmd_projects_backfill() {
       continue
     fi
     included=$((included + 1))
-    if [ "$h" = "$HOME" ]; then src="local"; else src="ssh+sudo"; fi
     scan="null"
     err=""
-    if out="$(jarate_scan "$h" "$b64" DRY="$dry" SETS_B64="$sets_b64" 2>/dev/null)"; then
-      if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
-        scan="$out"
+    if [ "$h" = "$HOME" ]; then
+      src="local"
+      if out="$(jarate_scan "$h" "$b64" DRY="$dry" SETS_B64="$sets_b64" 2>/dev/null)"; then
+        if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
+          scan="$out"
+        else
+          err="scan failed (bad scanner output)"
+        fi
       else
-        err="scan failed (bad scanner output)"
+        err="scan failed (local)"
       fi
-    elif [ "$h" = "$HOME" ]; then
-      err="scan failed (local)"
     else
-      err="cross-user hop failed (sshpass/sudo via $HOP_TARGET)"
+      # cross-user read removed (2026-10-17): hall-monitor owns the
+      # privileged read (SUDO_PW plan); the entry carries ok:false, the
+      # run itself does not fail.
+      src="cross-user"
+      err="cross-user read removed: use a hall-monitor plan (SUDO_PW)"
     fi
     row="$(jq -cn \
       --arg agent "$name" \
       --arg source "$src" \
       --argjson scan "$scan" \
       --arg error "$err" \
-      '{agent: $agent, source: $source, scan: $scan,
+      '{ok: (if $error == "" then true else false end),
+        agent: $agent, source: $source, scan: $scan,
         error: (if $error == "" then null else $error end)}')" || die "projects-backfill: json assembly failed"
     rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
   done
@@ -943,6 +803,7 @@ rows = []
 tot = {"scanned": 0, "tagged": 0, "skipped": 0}
 for a in data.get("agents", []):
     row = {
+        "ok": a.get("ok"),
         "agent": a["agent"],
         "source": a["source"],
         "scanned": None, "tagged": None, "skipped": None,
@@ -950,7 +811,7 @@ for a in data.get("agents", []):
     }
     s = a.get("scan")
     if s is None:
-        row["error"] = a.get("error") or "cross-user hop failed"
+        row["error"] = a.get("error") or "cross-user read removed: use a hall-monitor plan (SUDO_PW)"
     else:
         row["scanned"] = s.get("scanned")
         row["tagged"] = s.get("tagged")
@@ -1527,7 +1388,7 @@ cmd_setup() {
   [ -z "$prov_key" ] && steps_a+=("LLM creds: re-run with --model-base/--model-id/--model-key (H4) — agent boots but LLM calls fail")
   steps_a+=("identity: author ~/AGENTS.md (per-agent, hand-written)")
   steps_a+=("web search (optional): cp $SETUP_DIR/extensions/mcp-tools.ts ~/.pi/agent/extensions/ + tavily key in settings.json mcp[]")
-  steps_a+=("peers (optional): invite bots to each other's guilds + peerBotIds in settings.json")
+  steps_a+=("fleet comms (optional): hall-monitor — agents talk to each other via POST /fleet/say (no peer guild invites needed)")
   local steps
   steps="$(printf '%s\n' "${steps_a[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   local units_out dry_json
@@ -1560,135 +1421,6 @@ cmd_setup() {
     || die "setup: json assembly failed"
 }
 
-# ─── pat-* (PAT vault) ────────────────────────────────────────────────────────
-# Thin dispatchers to the sibling `jarate-pat` (bun) — the only process that
-# ever sees the token. Each passes rc through via exec (no JSON re-wrap):
-#   rc 0 ok | 1 vault error (JSON doc on stdout) | 2 usage
-
-find_jarate_pat() {
-  local d c
-  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-  for c in "${JARATE_PAT_BIN:-}" "$d/jarate-pat" "$JARATE_ROOT/bin/jarate-pat"; do
-    if [ -n "$c" ] && [ -f "$c" ]; then
-      printf '%s' "$c"
-      return 0
-    fi
-  done
-  return 1
-}
-
-cmd_pat_request() {
-  local jp
-  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
-  if [ $# -eq 1 ]; then
-    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
-    #   owner/repo:read needs a token for x
-    # first whitespace token = scope, remainder = reason (the wrapper
-    # re-joins the reason parts — here it is already joined).
-    local tail="$1" scope reason
-    scope="${tail%% *}"
-    reason="${tail#* }"
-    [ "$reason" = "$tail" ] && reason=""
-    [ -n "$reason" ] || die_usage "pat-request: usage: jarate pat-request <scope> <reason...>"
-    exec "$jp" request "$scope" "$reason"
-  fi
-  [ $# -ge 2 ] || die_usage "pat-request: usage: jarate pat-request <scope> <reason...>"
-  exec "$jp" request "$@"
-}
-
-cmd_pat_run() {
-  local jp
-  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
-  [ $# -ge 1 ] || die_usage "pat-run: usage: jarate pat-run <request-id> -- <cmd> [args...]"
-  if [ $# -eq 1 ]; then
-    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
-    #   pat_x -- gh pr create -m "fix: x"
-    # first whitespace token = id, remainder = raw string for shellWords.
-    local tail="$1" id rest
-    id="${tail%% *}"
-    rest="${tail#* }"
-    [ "$rest" = "$tail" ] && rest=""
-    exec "$jp" run-raw "$id" "$rest"
-  fi
-  # Bash path: real argv, lossless — pass through untouched (keeps `--`).
-  exec "$jp" run "$@"
-}
-
-cmd_pat_status() {
-  local jp
-  jp="$(find_jarate_pat)" || die "pat: jarate-pat not found (re-run install.sh)"
-  [ $# -le 1 ] || die_usage "pat-status: usage: jarate pat-status [request-id]"
-  exec "$jp" status "$@"
-}
-
-# ─── vault-* (generic credential vault) ─────────────────────────────────────
-# Thin dispatchers to the sibling `jarate-vault` (bun) — the only process
-# that ever sees a credential value. rc pass-through via exec:
-#   rc 0 ok | 1 vault error (JSON doc on stdout) | 2 usage
-
-find_jarate_vault() {
-  local d c
-  d="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-  for c in "${JARATE_VAULT_BIN:-}" "$d/jarate-vault" "$JARATE_ROOT/bin/jarate-vault"; do
-    if [ -n "$c" ] && [ -f "$c" ]; then
-      printf '%s' "$c"
-      return 0
-    fi
-  done
-  return 1
-}
-
-cmd_vault_request() {
-  local jv
-  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
-  if [ $# -eq 1 ]; then
-    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
-    #   github-pat marzukia/jarate:write one-shot needs a token for x
-    # jarate-vault re-splits it (shellWords) — pass through.
-    exec "$jv" request-raw "$1"
-  fi
-  exec "$jv" request "$@"
-}
-
-cmd_vault_run() {
-  local jv
-  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
-  [ $# -ge 1 ] || die_usage "vault-run: usage: jarate vault-run <request-id> -- <cmd> [args...]"
-  if [ $# -eq 1 ]; then
-    # Tool path (N4): the whole tail arrived pre-joined as ONE word:
-    #   vau_x -- gh pr create -m "fix: x"
-    # first whitespace token = id, remainder = raw string for shellWords.
-    local tail="$1" id rest
-    id="${tail%% *}"
-    rest="${tail#* }"
-    [ "$rest" = "$tail" ] && rest=""
-    exec "$jv" run-raw "$id" "$rest"
-  fi
-  # Bash path: real argv, lossless — pass through untouched (keeps `--`).
-  exec "$jv" run "$@"
-}
-
-cmd_vault_status() {
-  local jv
-  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
-  [ $# -le 1 ] || die_usage "vault-status: usage: jarate vault-status [request-id]"
-  exec "$jv" status "$@"
-}
-
-cmd_vault_revoke() {
-  local jv
-  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
-  [ $# -eq 1 ] || die_usage "vault-revoke: usage: jarate vault-revoke <request-id>"
-  exec "$jv" revoke "$1"
-}
-
-cmd_vault_audit() {
-  local jv
-  jv="$(find_jarate_vault)" || die "vault: jarate-vault not found (re-run install.sh)"
-  [ $# -le 1 ] || die_usage "vault-audit: usage: jarate vault-audit [n]"
-  exec "$jv" audit "$@"
-}
-
 # ─── dispatch ─────────────────────────────────────────────────────────────────
 
 main() {
@@ -1701,10 +1433,7 @@ main() {
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "projects", "projects-backfill",
-                     "agents-check", "agents-bless",
-                     "pat-request", "pat-run", "pat-status",
-                     "vault-request", "vault-run", "vault-status",
-                     "vault-revoke", "vault-audit"]}'
+                     "agents-check", "agents-bless"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
@@ -1714,24 +1443,13 @@ main() {
     projects-backfill) cmd_projects_backfill "$@" ;;
     agents-check) cmd_agents_check "$@" ;;
     agents-bless) cmd_agents_bless "$@" ;;
-    pat-request) cmd_pat_request "$@" ;;
-    pat-run) cmd_pat_run "$@" ;;
-    pat-status) cmd_pat_status "$@" ;;
-    vault-request) cmd_vault_request "$@" ;;
-    vault-run) cmd_vault_run "$@" ;;
-    vault-status) cmd_vault_status "$@" ;;
-    vault-revoke) cmd_vault_revoke "$@" ;;
-    vault-audit) cmd_vault_audit "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
                      "projects", "projects-backfill",
-                     "agents-check", "agents-bless",
-                     "pat-request", "pat-run", "pat-status",
-                     "vault-request", "vault-run", "vault-status",
-                     "vault-revoke", "vault-audit"]}'
+                     "agents-check", "agents-bless"]}'
       exit 2
       ;;
   esac

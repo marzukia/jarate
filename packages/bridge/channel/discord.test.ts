@@ -533,41 +533,6 @@ test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg s
   expect(getDiscordStates().get("o2")?.lastMessageId).toBe("613");
 });
 
-test("peer bot (author.id in peerBotIds) is delivered; other bots still skipped", async () => {
-  const seen: string[] = [];
-  setFetch(async (u) => {
-    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-p" });
-    if (u.includes("/messages?limit=1"))
-      return jsonResp(200, [userMsg("700", "u-1")]);
-    if (u.includes("/messages")) {
-      return jsonResp(200, [
-        // agent-say: peer agent posting as its own bot — allowed through.
-        {
-          ...userMsg("701", "peer-1"),
-          author: { id: "peer-1", username: "frank", bot: true },
-          content: "[from frank] check this",
-        },
-        // Bot not in peerBotIds — still filtered.
-        {
-          ...userMsg("702", "bot-other"),
-          author: { id: "bot-other", username: "otherbot", bot: true },
-        },
-        // Human — always delivered.
-        { ...userMsg("703", "u-1") },
-      ]);
-    }
-    return jsonResp(200, null);
-  });
-  await connectDiscord(cfg("o3", { peerBotIds: ["peer-1"] }), {
-    onMessage: (m) => seen.push(m.messageId),
-    onError: () => {},
-  });
-  await pollDiscord("o3");
-  await tick();
-  expect(seen).toEqual(["701", "703"]);
-  expect(getDiscordStates().get("o3")?.lastMessageId).toBe("703");
-});
-
 // ─── T4: cursor persistence ───────────────────────────────────────────────
 
 test("cursor persists to channel-state.json and seeds the next connect (T4)", async () => {
@@ -915,7 +880,6 @@ test("SLASH_COMMANDS registers every dispatch command, no silent drops", () => {
     "todos",
     "sleep",
     "tasks",
-    "vault",
   ]);
   // Names are unique (a duplicate would hide a drop in the list above).
   const names = SLASH_COMMANDS.map((c) => c.name);

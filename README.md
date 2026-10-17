@@ -18,7 +18,6 @@ What it ships:
   (in-turn wait).
 - **`packages/recall`** — shared RAG on Postgres + pgvector (`bun recall
   ingest|query`). TS port of the old Python pgrag; same db, no migration.
-- **`bin/agent-say`** — agent-to-agent Discord messaging.
 - **`templates/` + `scripts/init-repo.sh`** — newrepo boilerplate (repo
   governance: AGENTS/CONTRIBUTING/CI/hooks).
 
@@ -33,7 +32,6 @@ the source of truth.
 | `packages/bridge/skills/` | pi skill (`channel`) that ships with the bridge |
 | `packages/recall/` | `@jarate/recall` — RAG CLI (`bun recall ingest\|query`), `schema.sql` (dim 768, nomic-embed-text) |
 | `dispatch/` | `jarate-bg` (dispatch worker/reviewer, worktrees, cgroup escape, webhook), `jarate-wait` (in-turn wait) |
-| `bin/agent-say` | agent-to-agent Discord messaging |
 | `templates/` | newrepo boilerplate (repo governance) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
 | `install.sh` | idempotent bootstrap installer (`--dry-run`, `--jarate-dir`) |
@@ -64,7 +62,7 @@ npm install -g @earendil-works/pi-coding-agent bun
 #    (SERVERS, SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES —
 #     see packages/bridge/channel/discord.ts GATEWAY_INTENTS), invite bot
 
-# 3. bootstrap (symlinks jarate-bg/jarate-wait/agent-say/recall into the checkout)
+# 3. bootstrap (symlinks jarate-bg/jarate-wait/recall into the checkout)
 git clone https://github.com/marzukia/jarate.git ~/projects/jarate
 ~/projects/jarate/install.sh
 

@@ -54,8 +54,9 @@ egress lives:
   fields (truncated task text + raw worker output, the primary leak
   surface) and the legacy plain-text fallback body are all run through
   `jarate-censor` before the POST.
-- `bin/agent-say` — the peer message is run through `jarate-censor`
-  before the Discord POST.
+- Peer-agent messages: `bin/agent-say` is gone (gut #228) — agent-to-agent
+  traffic now flows through hall-monitor fleet comms (`POST /fleet/say`),
+  an out-of-repo egress the censor does not wrap.
 
 Known open (residual gaps, not covered by any process today):
 
@@ -68,8 +69,8 @@ Known open (residual gaps, not covered by any process today):
   wired the same one-line way (`printf '%s' "$msg" | bun <jarate>/bin/jarate-censor`).
   The guarantee scope is: **every Discord egress in this repo routes
   through `censor()`** — asserted for the bridge at source level (the
-  chokepoint test) and structurally for jarate-bg/agent-say (both post only
-  the censored strings).
+  chokepoint test) and structurally for jarate-bg (posts only the censored
+  strings).
 
 ## Redaction strategy
 

@@ -1,9 +1,10 @@
 # bun test configuration (issue #128)
 #
 # Preload redirects XDG_RUNTIME_DIR to a per-run tmpdir before any bridge
-# module loads, so test socket creation (vault.sock / pat.sock) never
-# lands in the live bridge's XDG_RUNTIME_DIR. Keep the preload wired
-# here: the regression test (channel/socket-isolation.test.ts) fails
-# when it is not active.
+# module loads, so test socket creation never lands in the live bridge's
+# XDG_RUNTIME_DIR (user-slice env isolation). No active test asserts this
+# anymore (the socket-isolation regression test was removed with the
+# vault/pat daemons); the preload stays as cheap insurance for any future
+# socket use under a real login XDG.
 [test]
 preload = ["./test/xdg-isolation.ts"]
