@@ -2,9 +2,11 @@
  * bin/jarate — JSON entrypoint contract tests (issue #17).
  *
  * Runs the real bash entrypoint against a fake HOME with stubbed externals
- * (pi-token-cost.py, journalctl, sshpass) and asserts the JSON
+ * (pi-token-cost.py, journalctl, rg, getent) and asserts the JSON
  * discipline: exactly one doc on stdout, ok:true|false + error, stable
- * snake_case keys, no partial output.
+ * snake_case keys, no partial output. Cross-user reads are gone
+ * (2026-10-17, hall-monitor owns the privileged read): a non-$HOME agent
+ * home yields an ok:false entry, never a sshpass/sudo hop.
  */
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -46,11 +48,6 @@ function fixture(): Fixture {
     "#!/bin/sh\necho 'W1 first warn'\necho 'W2 second warn'\n",
   );
   fs.chmodSync(jc, 0o755);
-
-  // stub sshpass: prints the pi-agent marker + one peer warning
-  const sp = path.join(bin, "sshpass");
-  fs.writeFileSync(sp, "#!/bin/sh\necho '[jarate:pi]'\necho 'P1 peer warn'\n");
-  fs.chmodSync(sp, 0o755);
 
   // stub rg: ripgrep is NOT preinstalled on GitHub's ubuntu-latest runner,
   // so memory-grep was red in CI while green on hosts with rg (2026-09-24).
@@ -94,14 +91,10 @@ function fixture(): Fixture {
   );
   fs.chmodSync(rg, 0o755);
 
-  // stub getent: canned passwd + group for the hop-target derivation
-  // (issue #147) — hermetic on every machine. Base = ONE candidate
-  // ("operator", uid 1000, bash, in wheel); "svc" (uid 1001, nologin)
-  // must never be a candidate; "peer-home" (uid 1002, bash, NOT in wheel)
-  // is the journal-errors peer's passwd entry (audit F8: per-name
-  // lookups answer it, so the remote probe's uid slot is non-empty) but
-  // is never a hop candidate. The 0/2-candidate tests rewrite the two
-  // files before running.
+  // stub getent: canned passwd for the agent-home discovery fallback
+  // (JARATE_AGENT_HOMES unset) — hermetic on every machine. The fixture
+  // env always sets JARATE_AGENT_HOMES, so discovery does not fire in
+  // these tests; the stub keeps the fallback path testable.
   const getentPasswd = path.join(tmp, "getent.passwd");
   const getentWheel = path.join(tmp, "getent.wheel");
   fs.writeFileSync(
@@ -215,8 +208,8 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   // Ambient-env hygiene (audit F1): scrub every var the entrypoint reads
   // (JARATE_*, AGENT_SAY_*) before the explicit fixture values below are
   // set, same explicit-scrub pattern as the dispatch #110 fixture. A
-  // caller's shell must not flip a test: JARATE_SSH_HOST into the #147
-  // derivation.
+  // caller's shell must not flip a test: stray JARATE_* env (e.g.
+  // JARATE_SSH_HOST) into the entrypoint.
   for (const k of Object.keys(env)) {
     if (k.startsWith("JARATE_") || k.startsWith("AGENT_SAY_")) {
       delete env[k];
@@ -226,9 +219,6 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
   env.PATH = `${bin}:${env.PATH ?? ""}`;
   env.XDG_RUNTIME_DIR = path.join(tmp, "xdg");
   env.JARATE_AGENT_HOMES = `${home}:${peerHome}`;
-  // peer hop stub: run_remote_probe needs a sudo password before it even
-  // execs sshpass (2026-09-14: fixture was missing this -> red on main)
-  env.JARATE_SUDO_PASS = "test-pass";
   fs.mkdirSync(env.XDG_RUNTIME_DIR, { recursive: true });
 
   const run = async (
@@ -272,14 +262,6 @@ describe("entrypoint", () => {
       "projects-backfill",
       "agents-check",
       "agents-bless",
-      "pat-request",
-      "pat-run",
-      "pat-status",
-      "vault-request",
-      "vault-run",
-      "vault-status",
-      "vault-revoke",
-      "vault-audit",
     ]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
@@ -415,7 +397,7 @@ describe("ctx-report", () => {
 });
 
 describe("journal-errors", () => {
-  test("self local + peer via ssh stub, stable row schema", async () => {
+  test("self local + peer cross-user entry, stable row schema", async () => {
     const f = fixture();
     const r = await f.run(["journal-errors"]);
     expect(r.code).toBe(0);
@@ -426,32 +408,58 @@ describe("journal-errors", () => {
     expect(Object.keys(d)).toEqual(["ok", "ts", "error", "since", "agents"]);
     expect(d.agents).toHaveLength(2);
     const [self, peer] = d.agents;
+    expect(self.ok).toBe(true);
     expect(self.source).toBe("local");
     expect(self.count).toBe(2);
     expect(self.warnings).toEqual(["W1 first warn", "W2 second warn"]);
     expect(self.error).toBeNull();
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.count).toBe(1);
-    expect(peer.warnings).toEqual(["P1 peer warn"]);
+    // the peer home is not $HOME: cross-user read removed -> ok:false
+    // entry; the run itself stays ok (rc 0)
+    expect(peer.ok).toBe(false);
+    expect(peer.source).toBe("cross-user");
+    expect(peer.count).toBeNull();
+    expect(peer.warnings).toBeNull();
+    expect(peer.truncated).toBe(false);
+    expect(peer.error).toBe(XUSER);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("peer hop failing -> row error, top-level ok:false naming the agent", async () => {
+  test("only non-local homes requested -> run still ok (rc 0)", async () => {
+    const f = fixture();
+    const peerHome = f.env.JARATE_AGENT_HOMES.split(":")[1];
+    const r = await f.run(["journal-errors"], { JARATE_AGENT_HOMES: peerHome });
+    expect(r.code).toBe(0);
+    const d = doc(r);
+    expect(d.ok).toBe(true);
+    expect(d.agents).toHaveLength(1);
+    expect(d.agents[0]).toEqual({
+      ok: false,
+      name: "peer-home",
+      source: "cross-user",
+      count: null,
+      warnings: null,
+      truncated: false,
+      error: XUSER,
+    });
+    fs.rmSync(f.tmp, { recursive: true, force: true });
+  });
+
+  test("local journalctl failing -> row error, top-level ok:false, rc 1", async () => {
     const f = fixture();
     fs.writeFileSync(
-      path.join(f.bin, "sshpass"),
-      "#!/bin/sh\necho 'ssh: refused' >&2\nexit 255\n",
+      path.join(f.bin, "journalctl"),
+      "#!/bin/sh\necho 'no systemd' >&2\nexit 1\n",
     );
-    const r = await f.run(["journal-errors"]);
+    fs.chmodSync(path.join(f.bin, "journalctl"), 0o755);
+    const r = await f.run(["journal-errors", "--agent", "home"]);
     expect(r.code).toBe(1);
     const d = doc(r);
     expect(d.ok).toBe(false);
-    expect(d.error).toContain("peer-home");
-    const peer = d.agents.find(
-      (a: { name: string }) => a.source === "ssh+sudo",
-    );
-    expect(peer.warnings).toBeNull();
-    expect(peer.error).toContain("cross-user hop failed");
+    expect(d.error).toContain("home");
+    const self = d.agents[0];
+    expect(self.source).toBe("local");
+    expect(self.warnings).toBeNull();
+    expect(self.error).toContain("journalctl failed");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
@@ -463,20 +471,6 @@ describe("journal-errors", () => {
     const d2 = doc(r2);
     expect(d2.ok).toBe(false);
     expect(d2.error).toContain("no agents matched");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("peer without the pi marker is skipped, not errored", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      path.join(f.bin, "sshpass"),
-      "#!/bin/sh\necho 'no unit here'\n",
-    );
-    const r = await f.run(["journal-errors"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.agents).toHaveLength(1);
-    expect(d.agents[0].source).toBe("local");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
@@ -1439,48 +1433,9 @@ describe("setup", () => {
 
 // ─── projects / projects-backfill ───────────────────────────────────────────
 // Cross-agent run-record rollup (2026-09-18). Hermetic: fake homes, records
-// planted under <home>/.pi-dispatch/runs, and an sshpass stub that extracts
-// the driver out of the sudo hop and execs it locally (PI_HOME selects the
-// peer's home), so the "remote" scan runs against the fixture files.
-
-/**
- * sshpass stub for the scan hop: the last arg is the remote command
- * `... sudo -S -u '<owner>' bash -c '<driver>' _ '<home>' '<b64>' ...` —
- * strip through `bash -c '`, restore the driver's positional args (the
- * sq-escaped home/b64 after the `_` placeholder; #121 injection path),
- * then run the driver as the peer would. The driver is single-quote-free
- * by construction; issue #121 moved the password to ssh stdin + a 0600
- * temp file, so the sudo'd bash -c is not the final element.
- */
-function scanSshpass(f: Fixture, fail = false): void {
-  const sp = path.join(f.bin, "sshpass");
-  fs.writeFileSync(
-    sp,
-    fail
-      ? "#!/bin/sh\necho 'ssh: refused' >&2\nexit 255\n"
-      : `#!/bin/sh
-# emulate the remote hop: find the LAST "bash -c '<driver>'" payload in the
-# remote command string, strip the known tail ("; rc=$?; ...") and eval the
-# positional args back (they are sq-escaped shell code), then run the driver.
-last=""
-for a in "$@"; do last="$a"; done
-q="'"
-pat="bash -c $q"
-case "$last" in
-  *"$pat"*)
-    rest="\${last##*"$pat"}"
-    driver="\${rest%%$q*}"
-    pos="\${rest#*"$q"}"
-    pos="\${pos%%'; rc='*}"
-    eval "set -- $pos"
-    exec sh -c "$driver" "$@"
-    ;;
-esac
-exit 0
-`,
-  );
-  fs.chmodSync(sp, 0o755);
-}
+// planted under <home>/.pi-dispatch/runs. Cross-user reads are gone
+// (2026-10-17): the peer home is not scanned — it yields an ok:false
+// cross-user entry (hall-monitor owns the privileged read now).
 
 function plantRecord(
   homeDir: string,
@@ -1496,6 +1451,10 @@ const readRecord = (homeDir: string, name: string): Record<string, unknown> =>
   JSON.parse(
     fs.readFileSync(path.join(homeDir, ".pi-dispatch", "runs", name), "utf8"),
   );
+
+// cross-user read removed (2026-10-17): the exact error a non-$HOME agent
+// home carries. Hall-monitor owns the privileged read (SUDO_PW plan).
+const XUSER = "cross-user read removed: use a hall-monitor plan (SUDO_PW)";
 
 describe("projects", () => {
   const seed = (f: Fixture) => {
@@ -1527,20 +1486,10 @@ describe("projects", () => {
       tokens: { input: 50, output: 5, cacheRead: 0, cacheWrite: 0, total: 55 },
       cost_usd: null,
     });
-    // peer home: 1 fully-priced record
-    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-ddd.json", {
-      run: "ddd",
-      profile: "worker",
-      project: "jarate",
-      started: "2026-09-09T10:00:00Z",
-      tokens: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11 },
-      cost_usd: 0.001,
-    });
   };
 
   test("cross-agent rollup: buckets, token sums, cost null semantics, sort", async () => {
     const f = fixture();
-    scanSshpass(f);
     seed(f);
     const r = await f.run(["projects"]);
     expect(r.code).toBe(0);
@@ -1559,18 +1508,24 @@ describe("projects", () => {
     ]);
     expect(d.since).toBeNull();
     expect(d.project).toBeNull();
-    expect(d.warn).toBeNull();
+    // the peer home is non-local: warn names it, its row is ok:false
+    expect(d.warn).toBe("cross-user read removed: peer-home");
     expect(d.agents).toEqual([
-      { agent: "home", source: "local", scanned: 3, error: null },
-      { agent: "peer-home", source: "ssh+sudo", scanned: 1, error: null },
+      { ok: true, agent: "home", source: "local", scanned: 3, error: null },
+      {
+        ok: false,
+        agent: "peer-home",
+        source: "cross-user",
+        scanned: null,
+        error: XUSER,
+      },
     ]);
     // sort: runs desc, then project asc
     expect(d.projects.map((p: any) => p.project)).toEqual([
       "nestfinder",
-      "jarate",
       "unspecified",
     ]);
-    const [nf, jt, un] = d.projects;
+    const [nf, un] = d.projects;
     expect(nf).toEqual({
       project: "nestfinder",
       runs: 2,
@@ -1589,23 +1544,6 @@ describe("projects", () => {
       first: "2026-09-10T10:00:00Z",
       last: "2026-09-12T10:00:00Z",
     });
-    expect(jt).toEqual({
-      project: "jarate",
-      runs: 1,
-      workers: 1,
-      reviewers: 0,
-      tokens: {
-        input: 10,
-        output: 1,
-        cache_read: 0,
-        cache_write: 0,
-        total: 11,
-      },
-      cost_usd: 0.001,
-      cost_covered: 1,
-      first: "2026-09-09T10:00:00Z",
-      last: "2026-09-09T10:00:00Z",
-    });
     expect(un).toEqual({
       project: "unspecified",
       runs: 1,
@@ -1622,7 +1560,6 @@ describe("projects", () => {
 
   test("boolean cost_usd is not priced: rollup rejects it (LOW-4)", async () => {
     const f = fixture();
-    scanSshpass(f);
     plantRecord(f.home, "pi-bg-n1.json", {
       run: "n1",
       profile: "worker",
@@ -1660,7 +1597,6 @@ describe("projects", () => {
 
   test("--project filter keeps one bucket; unknown tag -> zeroed entry", async () => {
     const f = fixture();
-    scanSshpass(f);
     seed(f);
     const r1 = await f.run(["projects", "--project", "nestfinder"]);
     const d1 = doc(r1);
@@ -1695,12 +1631,11 @@ describe("projects", () => {
 
   test("--since drops older records (string compare on started)", async () => {
     const f = fixture();
-    scanSshpass(f);
     seed(f);
     const r = await f.run(["projects", "--since", "2026-09-11"]);
     const d = doc(r);
     expect(d.since).toBe("2026-09-11");
-    // aaa (09-10) and ddd (09-09) gone; ccc (09-12) + bbb (09-11) kept
+    // aaa (09-10) gone; ccc (09-12) + bbb (09-11) kept
     expect(d.projects.map((p: any) => p.project)).toEqual([
       "nestfinder",
       "unspecified",
@@ -1714,14 +1649,21 @@ describe("projects", () => {
 
   test("--agent narrows to one agent; no match -> ok:false rc 1", async () => {
     const f = fixture();
-    scanSshpass(f);
     seed(f);
     const r1 = await f.run(["projects", "--agent", "peer-home"]);
     const d1 = doc(r1);
+    expect(r1.code).toBe(0);
+    // the peer home is non-local: single cross-user entry, no local data
     expect(d1.agents).toEqual([
-      { agent: "peer-home", source: "ssh+sudo", scanned: 1, error: null },
+      {
+        ok: false,
+        agent: "peer-home",
+        source: "cross-user",
+        scanned: null,
+        error: XUSER,
+      },
     ]);
-    expect(d1.projects.map((p: any) => p.project)).toEqual(["jarate"]);
+    expect(d1.projects).toEqual([]);
     const r2 = await f.run(["projects", "--agent", "nosuch"]);
     expect(r2.code).toBe(1);
     const d2 = doc(r2);
@@ -1730,18 +1672,17 @@ describe("projects", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("peer hop failing -> row error + warn, local data intact, still ok", async () => {
+  test("peer (non-local) -> row error + warn, local data intact, still ok", async () => {
     const f = fixture();
-    scanSshpass(f, true);
     seed(f);
     const r = await f.run(["projects"]);
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
-    expect(d.warn).toBe("agent hop failed: peer-home");
+    expect(d.warn).toBe("cross-user read removed: peer-home");
     const peer = d.agents.find((a: any) => a.agent === "peer-home");
     expect(peer.scanned).toBeNull();
-    expect(peer.error).toContain("cross-user hop failed");
+    expect(peer.error).toBe(XUSER);
     // local records still rolled up
     expect(d.projects.map((p: any) => p.project)).toEqual([
       "nestfinder",
@@ -1763,13 +1704,13 @@ describe("projects", () => {
 
   test("no run records anywhere -> ok, empty projects, zero agent scans", async () => {
     const f = fixture();
-    scanSshpass(f);
     const r = await f.run(["projects"]);
     expect(r.code).toBe(0);
     const d = doc(r);
     expect(d.ok).toBe(true);
     expect(d.projects).toEqual([]);
-    expect(d.agents.map((a: any) => a.scanned)).toEqual([0, 0]);
+    // local home scanned 0; the non-local peer is null, not 0
+    expect(d.agents.map((a: any) => a.scanned)).toEqual([0, null]);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -1809,7 +1750,6 @@ describe("projects-backfill", () => {
 
   test("--dry-run plans without writing; sources per rule", async () => {
     const f = fixture();
-    scanSshpass(f);
     seedLocal(f);
     const before = fs.readFileSync(
       path.join(f.home, ".pi-dispatch", "runs", "pi-bg-r1.json"),
@@ -1839,9 +1779,16 @@ describe("projects-backfill", () => {
       { run: "r3", project: "unspecified", source: "default" },
     ]);
     const peer = d.agents.find((a: any) => a.agent === "peer-home");
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.scanned).toBe(0);
-    expect(peer.map).toEqual([]);
+    expect(peer).toEqual({
+      ok: false,
+      agent: "peer-home",
+      source: "cross-user",
+      scanned: null,
+      tagged: null,
+      skipped: null,
+      map: null,
+      error: XUSER,
+    });
     // nothing written
     expect(
       fs.readFileSync(
@@ -1854,7 +1801,6 @@ describe("projects-backfill", () => {
 
   test("non-dict record files are not scanned: totals reconcile (LOW-5)", async () => {
     const f = fixture();
-    scanSshpass(f);
     seedLocal(f);
     const runsDir = path.join(f.home, ".pi-dispatch", "runs");
     // valid JSON that is not an object, plus a corrupt file: neither may
@@ -1876,7 +1822,6 @@ describe("projects-backfill", () => {
 
   test("real run writes project + backfilled + backfilled_at; idempotent", async () => {
     const f = fixture();
-    scanSshpass(f);
     seedLocal(f);
     const r1 = await f.run(["projects-backfill"]);
     const d1 = doc(r1);
@@ -1903,7 +1848,6 @@ describe("projects-backfill", () => {
 
   test("--set overrides derivation for the named run", async () => {
     const f = fixture();
-    scanSshpass(f);
     seedLocal(f);
     const r = await f.run(["projects-backfill", "--set", "r1=custom-tag"]);
     const d = doc(r);
@@ -1917,9 +1861,8 @@ describe("projects-backfill", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("frank home defaults to nestfinder (peer hop); --agent narrows", async () => {
+  test("frank home (non-local) -> cross-user entry; --agent narrows", async () => {
     const f = fixture();
-    scanSshpass(f);
     const frankHome = path.join(f.tmp, "frank");
     fs.mkdirSync(frankHome, { recursive: true });
     plantRecord(frankHome, "pi-bg-f1.json", {
@@ -1937,24 +1880,34 @@ describe("projects-backfill", () => {
     const homes = `${f.home}:${frankHome}`;
     const r = await f.run(["projects-backfill"], { JARATE_AGENT_HOMES: homes });
     const d = doc(r);
+    // the frank home is not $HOME: cross-user read removed — its record is
+    // not touched (no tag written), the row is ok:false, the run stays ok
     const frank = d.agents.find((a: any) => a.agent === "frank");
-    expect(frank.source).toBe("ssh+sudo");
-    expect(frank.map).toEqual([
-      { run: "f1", project: "nestfinder", source: "default" },
-    ]);
+    expect(frank).toEqual({
+      ok: false,
+      agent: "frank",
+      source: "cross-user",
+      scanned: null,
+      tagged: null,
+      skipped: null,
+      map: null,
+      error: XUSER,
+    });
+    expect("project" in readRecord(frankHome, "pi-bg-f1.json")).toBe(false);
     const local = d.agents.find((a: any) => a.agent === "home");
+    expect(local.ok).toBe(true);
     expect(local.map).toEqual([
       { run: "l1", project: "unspecified", source: "default" },
     ]);
-    expect(readRecord(frankHome, "pi-bg-f1.json").project).toBe("nestfinder");
-    // --agent narrows to the frank home only
+    // --agent narrows to the frank home only: zeroed totals, still ok
     const r2 = await f.run(["projects-backfill", "--agent", "frank"], {
       JARATE_AGENT_HOMES: homes,
     });
     const d2 = doc(r2);
+    expect(r2.code).toBe(0);
     expect(d2.agents).toHaveLength(1);
     expect(d2.agents[0].agent).toBe("frank");
-    expect(d2.total).toEqual({ scanned: 1, tagged: 0, skipped: 1 });
+    expect(d2.total).toEqual({ scanned: 0, tagged: 0, skipped: 0 });
     const r3 = await f.run(["projects-backfill", "--agent", "nosuch"], {
       JARATE_AGENT_HOMES: homes,
     });
@@ -1963,10 +1916,10 @@ describe("projects-backfill", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("peer hop failing -> row error, totals count the local agent only", async () => {
+  test("peer (non-local) -> row error, totals count the local agent only", async () => {
     const f = fixture();
-    scanSshpass(f, true);
     seedLocal(f);
+    // a record planted in the peer home: inert, never scanned
     plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-p1.json", {
       run: "p1",
       profile: "worker",
@@ -1977,8 +1930,9 @@ describe("projects-backfill", () => {
     const d = doc(r);
     expect(d.ok).toBe(true);
     const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.ok).toBe(false);
     expect(peer.scanned).toBeNull();
-    expect(peer.error).toContain("cross-user hop failed");
+    expect(peer.error).toBe(XUSER);
     expect(d.total).toEqual({ scanned: 4, tagged: 3, skipped: 1 });
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
@@ -1995,296 +1949,6 @@ describe("projects-backfill", () => {
       expect(r.code).toBe(2);
       expect(doc(r).error).toContain(frag);
     }
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-});
-
-// ─── issue #121: cross-user password off argv ───────────────────────────
-// The password used to sit in argv twice per hop: local `sshpass -p '<pw>'`
-// AND remote `echo '<pw>' | sudo -S` (both ps-visible, unquoted). Now:
-// sshpass -e (SSHPASS in env), the password rides ssh stdin exactly once
-// (here-string, no argv), the remote shell drops it in a 0600 temp file and
-// feeds `sudo -S < file`. hopStubs records every hop stage so the tests
-// can assert where the secret does and does not appear.
-describe("cross-user hop #121: password off argv", () => {
-  const PASS = "SECRETPW-JR-121";
-  type HopRec = {
-    sshpassArgs: string[];
-    sshPassEnv: string | null;
-    sshArgs: string[];
-    sshStdin: string;
-    sudoPw: string | null;
-    sudoArgs: string[];
-  };
-
-  // sshpass/ssh/sudo/systemctl stubs that record argv + env + stdin, then
-  // emulate the remote side by running the remote command locally under the
-  // fake sudo (which verifies the password it was fed from the 0600 file).
-  function hopStubs(f: Fixture): HopRec {
-    const rec = path.join(f.tmp, "hop-rec.txt");
-    fs.writeFileSync(
-      path.join(f.bin, "sshpass"),
-      `#!/bin/sh
-{
-  printf -- '--sshpass-argv--\\n'
-  for a in "$@"; do printf '%s\\n' "$a"; done
-  printf 'SSHPASS=%s\\n' "\${SSHPASS:-}"
-} >> "$HOP_REC"
-exec ssh "$@"
-`,
-    );
-    fs.writeFileSync(
-      path.join(f.bin, "ssh"),
-      `#!/bin/sh
-{
-  printf -- '--ssh-argv--\\n'
-  for a in "$@"; do printf '%s\\n' "$a"; done
-  cat > "$HOP_STDIN"
-} >> "$HOP_REC"
-last=""
-for a in "$@"; do last="$a"; done
-sh -c "$last" < "$HOP_STDIN"
-`,
-    );
-    fs.writeFileSync(
-      path.join(f.bin, "sudo"),
-      `#!/bin/sh
-{ for a in "$@"; do printf '%s\\n' "$a"; done; } > "$HOP_SUDOARGV"
-read -r _p
-printf '%s\\n' "$_p" > "$HOP_SUDOPW"
-[ "$_p" = "$HOP_EXPECT_PASS" ] || { echo "sudo: wrong password" >&2; exit 1; }
-[ "$1" = "-S" ] && shift
-[ "$1" = "-u" ] && shift 2
-exec "$@"
-`,
-    );
-    fs.writeFileSync(
-      path.join(f.bin, "systemctl"),
-      `#!/bin/sh
-[ "$1" = "--user" ] && [ "$2" = "is-enabled" ] && exit 0
-exit 1
-`,
-    );
-    for (const n of ["sshpass", "ssh", "sudo", "systemctl"])
-      fs.chmodSync(path.join(f.bin, n), 0o755);
-    return {
-      sshpassArgs: [],
-      sshArgs: [],
-      sshStdin: "",
-      sudoPw: null,
-      sudoArgs: [],
-    };
-  }
-
-  const readRec = (f: Fixture, r: HopRec): HopRec => {
-    const recFile = path.join(f.tmp, "hop-rec.txt");
-    const raw = fs.readFileSync(recFile, "utf8");
-    // the file is: --sshpass-argv-- <argv lines> SSHPASS=<pw>
-    //               --ssh-argv-- <argv lines>
-    // (ssh stdin goes to <recFile>.stdin; the fake sudo's password to
-    // sudo-pw.txt)
-    const [passPart, sshPart] = raw.split("--ssh-argv--");
-    const passLines = (passPart.split("--sshpass-argv--")[1] ?? "")
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-    r.sshPassEnv = passLines.find((l) => l.startsWith("SSHPASS=")) ?? null;
-    r.sshpassArgs = passLines.filter((l) => !l.startsWith("SSHPASS="));
-    r.sshArgs = (sshPart ?? "").trim().split("\n").filter(Boolean);
-    // the remote command is the LAST ssh arg
-    r.sshStdin = fs.readFileSync(`${recFile}.stdin`, "utf8").trim();
-    r.sudoPw = fs.existsSync(path.join(f.tmp, "sudo-pw.txt"))
-      ? fs.readFileSync(path.join(f.tmp, "sudo-pw.txt"), "utf8").trim()
-      : null;
-    r.sudoArgs = fs.existsSync(path.join(f.tmp, "sudo-argv.txt"))
-      ? fs
-          .readFileSync(path.join(f.tmp, "sudo-argv.txt"), "utf8")
-          .trim()
-          .split("\n")
-      : [];
-    return r;
-  };
-
-  const hopEnv = (f: Fixture): Record<string, string> => ({
-    HOP_REC: path.join(f.tmp, "hop-rec.txt"),
-    HOP_STDIN: `${path.join(f.tmp, "hop-rec.txt")}.stdin`,
-    HOP_SUDOPW: path.join(f.tmp, "sudo-pw.txt"),
-    HOP_SUDOARGV: path.join(f.tmp, "sudo-argv.txt"),
-    HOP_EXPECT_PASS: PASS,
-    JARATE_SUDO_PASS: PASS,
-  });
-
-  // one value carrying quote + $ + backtick in a single token
-  const ODD = "ODD'1$2`3";
-
-  test("journal-errors peer probe: password in env + ssh stdin only, sudo fed from file", async () => {
-    const f = fixture();
-    const r0 = hopStubs(f);
-    const r = await f.run(
-      [
-        "journal-errors",
-        "--agent",
-        "peer-home",
-        "--since",
-        "2026-10-01T00:00:00Z",
-      ],
-      hopEnv(f),
-    );
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    // journal-errors rows key on `name` (not `agent`)
-    const peer = d.agents.find((a: any) => a.name === "peer-home");
-    // the hop worked end-to-end: fake sudo accepted the file-fed password
-    // and the peer's pi.service "is enabled" (stub systemctl)
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.count).toBe(2);
-    expect(peer.warnings).toContain("W1 first warn");
-    const rec = readRec(f, r0);
-    // local stage: sshpass -e, password in SSHPASS env, NOT in argv
-    expect(rec.sshpassArgs).toContain("-e");
-    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
-    expect(rec.sshPassEnv).toBe(`SSHPASS=${PASS}`);
-    // remote command string: no password, no `echo '<pw>'`; new shape
-    const remote = rec.sshArgs[rec.sshArgs.length - 1];
-    expect(remote).not.toContain(PASS);
-    expect(remote).not.toMatch(/echo\s+'[^']*'/);
-    expect(remote).toContain("read -r pw");
-    expect(remote).toContain('sudo -S < "$pwf"');
-    // the password crossed ssh stdin exactly once, and sudo received it
-    expect(rec.sshStdin).toBe(PASS);
-    expect(rec.sudoPw).toBe(PASS);
-    // audit F8: the getent stub answers per-name lookups, so the remote
-    // probe's uid slot is the fixture's peer-home uid (1002), not empty
-    expect(remote).toContain("XDG_RUNTIME_DIR=/run/user/1002");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("projects peer scan: same hygiene, scanner driver still runs as peer", async () => {
-    const f = fixture();
-    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-ddd.json", {
-      run: "ddd",
-      profile: "worker",
-      project: "nestfinder",
-      started: "2026-09-10T10:00:00Z",
-      tokens: {
-        input: 100,
-        output: 10,
-        cacheRead: 5,
-        cacheWrite: 1,
-        total: 115,
-      },
-      cost_usd: 0.01,
-    });
-    const r0 = hopStubs(f);
-    const r = await f.run(["projects", "--agent", "peer-home"], hopEnv(f));
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    const peer = d.agents.find((a: any) => a.agent === "peer-home");
-    // the scan actually ran under the (fake) sudo'd driver: 1 seeded record
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.scanned).toBe(1);
-    expect(peer.error).toBeNull();
-    const rec = readRec(f, r0);
-    expect(rec.sshpassArgs).toContain("-e");
-    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
-    const remote = rec.sshArgs[rec.sshArgs.length - 1];
-    expect(remote).not.toContain(PASS);
-    expect(remote).toContain("read -r pw");
-    expect(remote).toContain('sudo -S < "$pwf"');
-    expect(rec.sshStdin).toBe(PASS);
-    expect(rec.sudoPw).toBe(PASS);
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("injection: odd peer name survives to the sudo -u slot (journal-errors)", async () => {
-    const f = fixture();
-    // peer home whose basename carries quote + $ + backtick
-    const oddHome = path.join(f.tmp, ODD);
-    const r0 = hopStubs(f);
-    const r = await f.run(
-      ["journal-errors", "--agent", ODD, "--since", "2026-10-01T00:00:00Z"],
-      { ...hopEnv(f), JARATE_AGENT_HOMES: `${f.home}:${oddHome}` },
-    );
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    const peer = d.agents.find((a: any) => a.name === ODD);
-    // the hop ran end-to-end despite the odd name: fake sudo accepted the
-    // file-fed password, stub systemctl/journalctl produced the marker + 2
-    // warnings
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.count).toBe(2);
-    expect(peer.error).toBeNull();
-    const rec = readRec(f, r0);
-    // (a) sshpass -e + SSHPASS env, no -p, no password in sshpass argv
-    expect(rec.sshpassArgs).toContain("-e");
-    expect(rec.sshpassArgs).not.toContain("-p");
-    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
-    expect(rec.sshPassEnv).toBe(`SSHPASS=${PASS}`);
-    // (b) password in NO argv: local ssh args (incl. the remote string)
-    expect(rec.sshArgs.every((a) => !a.includes(PASS))).toBe(true);
-    expect(rec.sshStdin).toBe(PASS);
-    // (c) the odd value reached the sudo line INTACT (stub-captured argv)
-    const uIdx = rec.sudoArgs.indexOf("-u");
-    expect(uIdx).toBeGreaterThan(-1);
-    expect(rec.sudoArgs[uIdx + 1]).toBe(ODD);
-    // the since positional (inner bash -c "$1") is intact too
-    expect(rec.sudoArgs).toContain("2026-10-01T00:00:00Z");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("injection: odd home survives to PI_HOME + sudo line (projects scan)", async () => {
-    const f = fixture();
-    // peer home whose basename carries quote + $ + backtick; a run record
-    // is planted UNDER it so a mangled PI_HOME yields a different scanned
-    const oddHome = path.join(f.tmp, "scan-odd", ODD);
-    plantRecord(oddHome, "pi-bg-odd.json", {
-      run: "odd",
-      profile: "worker",
-      project: "nestfinder",
-      started: "2026-09-10T10:00:00Z",
-      tokens: {
-        input: 100,
-        output: 10,
-        cacheRead: 5,
-        cacheWrite: 1,
-        total: 115,
-      },
-      cost_usd: 0.01,
-    });
-    const r0 = hopStubs(f);
-    const r = await f.run(["projects", "--agent", ODD], {
-      ...hopEnv(f),
-      JARATE_AGENT_HOMES: `${f.home}:${oddHome}`,
-    });
-    expect(r.code).toBe(0);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    const peer = d.agents.find((a: any) => a.agent === ODD);
-    // end-to-end proof PI_HOME arrived intact: the scanner listed exactly
-    // the odd dir and found the one planted record
-    expect(peer.source).toBe("ssh+sudo");
-    expect(peer.scanned).toBe(1);
-    expect(peer.error).toBeNull();
-    const rec = readRec(f, r0);
-    expect(rec.sshpassArgs).toContain("-e");
-    expect(rec.sshpassArgs).not.toContain("-p");
-    expect(rec.sshpassArgs.join(" ")).not.toContain(PASS);
-    // (b) password in NO argv, local or remote
-    expect(rec.sshArgs.every((a) => !a.includes(PASS))).toBe(true);
-    expect(rec.sshStdin).toBe(PASS);
-    // (c) owner + home reached the sudo line INTACT (stub-captured argv):
-    // -u <owner> ... bash -c <script> _ <home> <b64>
-    const uIdx = rec.sudoArgs.indexOf("-u");
-    expect(uIdx).toBeGreaterThan(-1);
-    expect(rec.sudoArgs[uIdx + 1]).toBe(ODD);
-    const cIdx = rec.sudoArgs.indexOf("-c");
-    expect(cIdx).toBeGreaterThan(-1);
-    expect(rec.sudoArgs[cIdx + 2]).toBe("_");
-    expect(rec.sudoArgs[cIdx + 3]).toBe(oddHome);
-    expect(rec.sudoArgs[cIdx + 4]).not.toBe("");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -2342,7 +2006,6 @@ describe("#148 --flag=value (one flag grammar)", () => {
 
   test("projects --project= / --since= / --agent= parity with two-word form", async () => {
     const f = fixture();
-    scanSshpass(f);
     plantRecord(f.home, "pi-bg-aaa.json", {
       run: "aaa",
       profile: "worker",
@@ -2371,7 +2034,6 @@ describe("#148 --flag=value (one flag grammar)", () => {
 
   test("projects-backfill --set=run=tag splits at the FIRST =", async () => {
     const f = fixture();
-    scanSshpass(f);
     plantRecord(f.home, "pi-bg-r1.json", {
       run: "r1",
       profile: "worker",
@@ -2404,99 +2066,81 @@ describe("#148 --flag=value (one flag grammar)", () => {
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
-
-// ─── issue #147: hop target derived, not configured ───────────────────────
-// The sshpass/sudo hop target is DERIVED (unique local user with uid > 900,
-// a home, a login shell, sudo-group membership) unless JARATE_SSH_HOST
-// overrides it. The fixture getent stub (see fixture()) makes the
-// derivation hermetic: base = one candidate "operator" (uid 1000, bash,
-// wheel), "svc" (uid 1001, nologin) is never a candidate.
-describe("#147 hop target (derived, not configured)", () => {
-  // make the ssh hop fail so the row's error names the hop target
-  function failSsh(f: Fixture) {
-    fs.writeFileSync(path.join(f.bin, "sshpass"), "#!/bin/sh\nexit 3\n");
-    fs.chmodSync(path.join(f.bin, "sshpass"), 0o755);
-  }
-
-  test("single candidate -> derived operator@127.0.0.1", async () => {
+// ─── local-only (2026-10-17): cross-user read removed ──────────────────────
+// Hall-monitor owns credentials + privileged exec now. The sshpass/sudo hop
+// (JARATE_SSH_HOST/JARATE_SUDO_PASS) is gone from the entrypoint: the fixture
+// carries no ssh machinery at all (no sshpass stub, no sudo password) — a
+// stray hop attempt would fail visibly.
+describe("local-only (cross-user read removed)", () => {
+  test("projects: peer record is inert — local rollup only, warn names peer", async () => {
     const f = fixture();
-    failSsh(f);
-    const r = await f.run(["journal-errors", "--agent", "peer-home"]);
-    const d = doc(r);
-    const peer = d.agents.find((a: any) => a.name === "peer-home");
-    expect(peer.error).toBe(
-      "cross-user hop failed (sshpass/sudo via operator@127.0.0.1)",
-    );
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("override user@host wins as-is", async () => {
-    const f = fixture();
-    failSsh(f);
-    const r = await f.run(["journal-errors", "--agent", "peer-home"], {
-      JARATE_SSH_HOST: "admin@10.2.0.9",
+    plantRecord(f.home, "pi-bg-x1.json", {
+      run: "x1",
+      profile: "worker",
+      project: "nestfinder",
+      started: "2026-09-10T10:00:00Z",
+      tokens: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0, total: 6 },
+      cost_usd: 0.01,
     });
-    const d = doc(r);
-    const peer = d.agents.find((a: any) => a.name === "peer-home");
-    expect(peer.error).toBe(
-      "cross-user hop failed (sshpass/sudo via admin@10.2.0.9)",
-    );
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("override bare user -> user@127.0.0.1", async () => {
-    const f = fixture();
-    failSsh(f);
-    const r = await f.run(["journal-errors", "--agent", "peer-home"], {
-      JARATE_SSH_HOST: "franky",
+    plantRecord(f.env.JARATE_AGENT_HOMES.split(":")[1], "pi-bg-x2.json", {
+      run: "x2",
+      profile: "worker",
+      project: "jarate",
+      started: "2026-09-10T10:00:00Z",
+      tokens: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0, total: 6 },
+      cost_usd: 0.01,
     });
+    const r = await f.run(["projects"]);
+    expect(r.code).toBe(0);
     const d = doc(r);
-    const peer = d.agents.find((a: any) => a.name === "peer-home");
-    expect(peer.error).toBe(
-      "cross-user hop failed (sshpass/sudo via franky@127.0.0.1)",
-    );
+    expect(d.ok).toBe(true);
+    expect(d.warn).toBe("cross-user read removed: peer-home");
+    // the peer record (project "jarate") is NOT in the rollup
+    expect(d.projects.map((p: any) => p.project)).toEqual(["nestfinder"]);
+    expect(d.projects[0].runs).toBe(1);
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.ok).toBe(false);
+    expect(peer.source).toBe("cross-user");
+    expect(peer.scanned).toBeNull();
+    expect(peer.error).toBe(XUSER);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 
-  test("zero candidates -> ok:false doc, candidates: none, exact override", async () => {
+  test("projects-backfill: peer record stays untouched, totals local-only", async () => {
     const f = fixture();
-    fs.writeFileSync(f.getentWheel, "wheel:x:10:\n");
-    const r = await f.run(["journal-errors"]);
-    expect(r.code).toBe(2);
+    plantRecord(f.home, "pi-bg-b1.json", {
+      run: "b1",
+      profile: "worker",
+      cwd: "/tmp/x",
+      started: "2026-09-01T00:00:00Z",
+    });
+    const peerHome = f.env.JARATE_AGENT_HOMES.split(":")[1];
+    plantRecord(peerHome, "pi-bg-b2.json", {
+      run: "b2",
+      profile: "worker",
+      cwd: "/tmp/y",
+      started: "2026-09-01T00:00:00Z",
+    });
+    const before = fs.readFileSync(
+      path.join(peerHome, ".pi-dispatch", "runs", "pi-bg-b2.json"),
+      "utf8",
+    );
+    const r = await f.run(["projects-backfill"]);
+    expect(r.code).toBe(0);
     const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("cannot derive operator (candidates: none)");
-    expect(d.error).toContain("wheel/sudo");
-    expect(d.error).toContain(
-      "JARATE_SSH_HOST=<user>@127.0.0.1 jarate journal-errors",
-    );
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("two candidates -> ok:false doc naming both + pick-one override", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      f.getentPasswd,
-      [
-        "root:x:0:0:root:/root:/usr/sbin/nologin",
-        "operator:x:1000:1000:Operator:/home/operator:/bin/bash",
-        "agentpeer:x:1001:1001:Peer:/home/agentpeer:/bin/zsh",
-        "",
-      ].join("\n"),
-    );
-    fs.writeFileSync(f.getentWheel, "wheel:x:10:agentpeer,operator\n");
-    const r = await f.run(["projects", "--project", "x"]);
-    expect(r.code).toBe(2);
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    // candidates sorted by uid, comma+space separated
-    expect(d.error).toContain(
-      "cannot derive operator (candidates: operator, agentpeer)",
-    );
-    // pick-one names the LOWEST-uid candidate first
-    expect(d.error).toContain(
-      "JARATE_SSH_HOST=operator@127.0.0.1 jarate projects",
-    );
+    expect(d.ok).toBe(true);
+    expect(d.total).toEqual({ scanned: 1, tagged: 1, skipped: 0 });
+    const peer = d.agents.find((a: any) => a.agent === "peer-home");
+    expect(peer.ok).toBe(false);
+    expect(peer.map).toBeNull();
+    expect(peer.error).toBe(XUSER);
+    // the peer record was not tagged (no cross-user write)
+    expect(
+      fs.readFileSync(
+        path.join(peerHome, ".pi-dispatch", "runs", "pi-bg-b2.json"),
+        "utf8",
+      ),
+    ).toBe(before);
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
