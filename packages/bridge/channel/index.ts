@@ -1876,6 +1876,14 @@ function detectAttachmentFiles(text: string): string[] {
   return out;
 }
 
+/** No-reply token: a final that is exactly this (trim + case-insensitive)
+ *  closes the turn WITHOUT posting anything. Lets the agent stay silent on
+ *  system pings (watchdog events, heartbeats, duplicate deliveries). */
+const NO_REPLY = "NO_REPLY";
+export function isNoReply(text: string): boolean {
+  return text.trim().toUpperCase() === NO_REPLY;
+}
+
 /** Send final text, auto-attaching any local files referenced in it. */
 async function sendFinalWithFiles(
   ch: ChannelConfig,
@@ -3591,6 +3599,20 @@ export default function (pi: ExtensionAPI) {
     const early = earlySendText(msg);
     const text = early ?? finalText(msg);
     if (!text) return;
+    if (isNoReply(text)) {
+      // Silence chosen: close the turn (ack + live text) without posting.
+      // earlySent keeps collectFinals from re-posting it at agent_end.
+      earlySent.add(msg);
+      if (isLiveTextChannel(ch)) await deleteLiveText(ch);
+      if (ch.type === "discord") {
+        const inboundId = lastInboundIds.get(ch.id);
+        const token = getDiscordToken(ch.id) || ch.botToken;
+        const channelId = getDiscordChannelId(ch.id) || ch.channel;
+        if (inboundId && token && channelId)
+          unreactMessage(token, channelId, inboundId, "👀").catch(() => {});
+      }
+      return;
+    }
     earlySent.add(msg);
     if (early !== null && isLiveTextChannel(ch)) {
       // SPEC B: intermediate text (text + toolCall) with forwarding on
@@ -3971,6 +3993,16 @@ export default function (pi: ExtensionAPI) {
       userStoppedRun = false;
 
       for (const f of finals) {
+        if (isNoReply(f.text)) {
+          // Silence chosen: clear the ack if threaded, post nothing.
+          if (ch.type === "discord" && f.replyTo) {
+            const token = getDiscordToken(ch.id) || ch.botToken;
+            const channelId = getDiscordChannelId(ch.id);
+            if (token && channelId)
+              unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
+          }
+          continue;
+        }
         if (recordFinalRepeat(ch.id, f.text)) {
           // Repetition loop (seen across the whole run, incl. the
           // message_end path): one warning, abort, skip the repeated final.
