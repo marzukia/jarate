@@ -5417,14 +5417,17 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
       const r = await fx.run(["worker", "test task"]);
       expect(r.code).toBe(0);
       const lines = launchLines(st);
-      // all 3 attempts ran; attempts 2+ resumed the same session
-      expect(lines).toHaveLength(3);
+      // merged #222+#227: this fixture's final entry IS the think-trunc
+      // signature (thinking-only + stopReason=length), so the empty rc=0
+      // attempts take the trunc1 path - one resumed relaunch, then EMPTY
+      // loud with the signature; no 3rd blind attempt
+      expect(lines).toHaveLength(2);
       expect(lines[1]).toContain(`--session ${UUID}`);
-      expect(lines[2]).toContain(`--session ${UUID}`);
       const emb = hook.getBody()?.embeds?.[0];
       expect(emb?.title).toMatch(/^worker · EMPTY · \d+m\d{2}s$/);
       const result = emb.fields?.find((f: any) => f.name === "result");
-      // fix 2: the last session entry's stopReason is in the brief
+      // trunc signature is loud; the #222 session-diag line still appends
+      expect(result?.value).toContain("trunc1 did not recover");
       expect(result?.value).toContain("stop=length");
       expect(result?.value).toContain("err=absent");
     } finally {
