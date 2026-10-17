@@ -356,6 +356,17 @@ if [ "${1:-}" = "signal" ]; then
     echo "jarate-bg signal: no live process in $sig_cg (empty cgroup - the run is not here)" >&2
     exit 3
   fi
+  # #231 P1: the -killed marker is written BEFORE the signal (parity with
+  # jarate-bg-kill's sticky terminal, #51). The wrapper's exit trap fires
+  # milliseconds after the TERM - long before the receipt post below
+  # returns - and stays quiet when the marker is present, so one kill
+  # lands as ONE channel event (this receipt), not two (receipt + the
+  # wrapper's own no-output DIED).
+  sig_tmp="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
+  mkdir -p "$sig_tmp" 2>/dev/null
+  printf '%s signal:%s %s by %s; pids: %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sig_name" "$sig_id" "$(id -un)" "$sig_pids" \
+    > "$sig_tmp/pi-bg-${sig_id}-killed"
   for p in $sig_pids; do kill -"$sig_name" "$p" 2>/dev/null; done
   # bounded confirm (house shape: the jarate-bg-kill drain poll, short):
   # the receipt reports the RESULT - the orchestrator reads it, no
@@ -382,6 +393,25 @@ if [ "${1:-}" = "signal" ]; then
   else
     sig_result="still alive after ${sig_dur}s: $sig_alive"
   fi
+  # #231 P1 (parity with jarate-bg-kill): the drain confirmed the cgroup
+  # is empty - every member of the run is dead, and the wrapper's exit
+  # trap has already marked the record "done" (it runs during our drain
+  # poll). "cancelled" is the final state for a signaled run. Same
+  # audit-only posture: a missing/corrupt record never breaks the signal
+  # path.
+  if [ "$sig_gone" -eq 1 ] && [ -f "$sig_rec_dir/pi-bg-${sig_id}.json" ]; then
+    PI_BG_REC_STATE="cancelled" python3 - "$sig_rec_dir/pi-bg-${sig_id}.json" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+p = sys.argv[1]
+try:
+    rec = json.load(open(p))
+except Exception:
+    sys.exit(0)
+rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
+rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(rec, open(p, "w"), indent=2)
+PY
+  fi
   # receipt: stdout + dead log (always) + webhook (best-effort)
   sig_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   sig_repo="cwd"
@@ -399,8 +429,6 @@ if [ "${1:-}" = "signal" ]; then
     sig_webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
   fi
   if [ -n "$sig_webhook" ]; then
-    sig_tmp="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
-    mkdir -p "$sig_tmp" 2>/dev/null
     sig_bodyf="$sig_tmp/pi-bg-${sig_id}-signal-body.json"
     SIG_E_T="$sig_id" SIG_E_REPO="$sig_repo" SIG_E_SIG="$sig_name" \
     SIG_E_PIDS="$sig_pids" SIG_E_RESULT="$sig_result" SIG_E_AT="$sig_ts" \
@@ -432,19 +460,35 @@ embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
 json.dump({"embeds": [embed]}, sys.stdout)
 PY
     if [ -s "$sig_bodyf" ]; then
+      sig_respf="$sig_tmp/pi-bg-${sig_id}-signal-wb-resp.txt"
       sig_code=000
       for i in 1 2 3; do
-        sig_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$sig_webhook" \
+        sig_code="$(curl -s -o "$sig_respf" -w '%{http_code}' -X POST "$sig_webhook" \
           -H 'Content-Type: application/json' --max-time 15 --data @"$sig_bodyf" 2>/dev/null)" || sig_code="000"
         case "$sig_code" in 2*) break ;; esac
         [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
       done
       case "$sig_code" in
         2*) : ;;
-        *) echo "jarate-bg signal: webhook receipt FAILED (http=$sig_code) - dead log still updated" >&2 ;;
+        *)
+          # #231 P1: dead letter in the EXACT bg_post shape (issue #53
+          # self-contained: the JSON body is embedded after the `--- body
+          # json ---` marker). Without it, a dead webhook + the
+          # marker-suppressed wrapper DIED is a SILENT kill. The
+          # watchdog's dead-letter consumer re-posts the receipt next
+          # sweep.
+          { printf 'ticket   : %s\n' "$sig_id"
+            printf 'http     : %s (3 attempts)\n' "$sig_code"
+            printf 'when     : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'response : %s\n' "$(head -c 300 "$sig_respf" 2>/dev/null)"
+            printf 'body     : %s\n' "$sig_bodyf"
+            printf -- '--- body json ---\n'
+            cat "$sig_bodyf" 2>/dev/null; } > "$sig_tmp/pi-bg-${sig_id}-webhook-failed"
+          echo "jarate-bg signal: webhook receipt FAILED (http=$sig_code) - dead letter: $sig_tmp/pi-bg-${sig_id}-webhook-failed" >&2
+          ;;
       esac
     fi
-    rm -f "$sig_bodyf"
+    rm -f "$sig_bodyf" "$sig_tmp/pi-bg-${sig_id}-signal-wb-resp.txt" 2>/dev/null
   fi
   [ "$sig_gone" -eq 1 ] && exit 0
   exit 3
@@ -1143,25 +1187,28 @@ PY
 
 # bg_launch_fail <reason> <brief> (issue #86 + polish sweep A1): a
 # --worktree launch-fail must WAKE the orchestrator like any run failure.
-# Post the standard bg_build embed (status DIED, brief = reason) so
-# isBgWebhook (author "pi-bg ticket · <rid>") accepts the payload and the
-# pi-wait loop wakes. Plain [bg: ...] content is the fallback only when the
-# embed builder itself fails (no python3). The record is marked killed by
-# mark_launch_fail; bg_on_exit is not registered yet, so the killed state
-# survives the exit. Dead-letter + heartbeat cleanup ride the normal paths.
+# #231 P4: a launch-fail has no captured output (the run never started),
+# so the framed embed is pure chrome: post the compact one-line [bg:
+# text instead (the [bg: prefix is what wakes the agent - isBgWebhook
+# accepts the content post). The framed embed stays as the no-python3
+# fallback. The record is marked killed by mark_launch_fail; bg_on_exit
+# is not registered yet, so the killed state survives the exit. Dead-letter
+# + heartbeat cleanup ride the normal paths.
 bg_launch_fail() {
   local reason="$1" brief="$2"
   mark_launch_fail "$reason"
-  bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" "$brief" 1 ""
-  if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
-    bg_post "$BG_TMP/pi-bg-${run_id}-body.json"
+  local dline dbodyf
+  dline="[bg:${profile}:DIED] ${run_id} exit=3 / no output${brief:+ / ${brief:0:80}}"
+  dline="$(bg_censor "$dline")"
+  dbodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
+  python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$dline" > "$dbodyf" 2>/dev/null
+  if [ -s "$dbodyf" ]; then
+    bg_post "$dbodyf" || rm -f "$dbodyf"
   else
-    local bodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
-    local body
-    body="[bg:${profile}:DIED] cwd=$(pwd) task=${task:0:120}\n\n${brief}"
-    body="$(bg_censor "$body")"
-    python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body" > "$bodyf"
-    bg_post "$bodyf" || rm -f "$bodyf"
+    bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" "$brief" 1 ""
+    if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
+      bg_post "$BG_TMP/pi-bg-${run_id}-body.json"
+    fi
   fi
   rm -f "$BG_TMP/pi-bg-${run_id}-hb" 2>/dev/null
   exit 3
@@ -1173,10 +1220,11 @@ bg_launch_fail() {
 # line and NO webhook -> the orchestrator never wakes (2026-09-27: 3 nestfinder
 # workers failed `--worktree nestfinder-clone`, a ref that doesn't exist, and
 # all three died silently). Read the webhook now (same source as below) and
-# call bg_launch_fail (defined above): it posts the standard bg_build DIED
-# embed synchronously, marks the record killed, and exits 3. The full
+# call bg_launch_fail (defined above): it posts the compact one-line [bg:
+# DIED content synchronously (#231 P4: no captured output to frame), marks
+# the record killed, and exits 3. The full
 # bg_on_exit trap registers only at the end of a run that got this far, so
-# the embed post here is the one and only callback for a launch-fail.
+# the post here is the one and only callback for a launch-fail.
 if [ -z "${webhook:-}" ] && [ -n "${PI_DISPATCH_WEBHOOK:-}" ]; then
   webhook="$PI_DISPATCH_WEBHOOK"
 elif [ -z "${webhook:-}" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
@@ -1417,7 +1465,7 @@ PY
 # missing/non-empty dir must never break the exit path. SIGKILLed wrappers
 # can't run this at all — jarate-bg-kill reaps the drained cgroup dir itself.
 bg_on_exit() {
-  local ec=$?
+  local ec=$? dline dbodyf
   # heartbeat child (issue #52): stop it FIRST so its in-flight sleep can't
   # hold a member in the ticket cgroup during the drain/rmdir below
   if [ -n "${hb_pid:-}" ]; then
@@ -1446,19 +1494,36 @@ bg_on_exit() {
   # #57): the trap runs on every trapped exit (normal/INT/TERM/error);
   # a SIGKILLed wrapper leaves no rc file (watchdog then says DEAD).
   printf '%s\n' "$ec" > "$BG_TMP/pi-bg-${run_id}-rc" 2>/dev/null || true
-  # #51 sticky terminal: a manual kill writes the -killed marker BEFORE
-  # the TERM (jarate-bg-kill), so this trap sees it and stays quiet -
-  # the kill script's CANCELLED embed is the one and only terminal embed
-  # for a manual kill. Without this a graceful TERM produced DIED +
-  # KILLED for the same cancellation.
+  # #51 sticky terminal: a manual kill (jarate-bg-kill) or a cgroup
+  # signal (jarate-bg signal, #231 P1) writes the -killed marker BEFORE
+  # the TERM, so this trap sees it and stays quiet - the kill script's
+  # CANCELLED embed (or the signal's green receipt) is the one and only
+  # terminal post for a manual kill. Without this a graceful TERM
+  # produced DIED + KILLED for the same cancellation.
   if [ "$BG_CB_DONE" -eq 0 ] && [ -n "$webhook" ] && \
      [ ! -s "$BG_TMP/pi-bg-${run_id}-out.md" ] && \
      [ ! -f "$BG_TMP/pi-bg-${run_id}-killed" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
     reason="$(bg_death_reason)"
-    bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
-      "no output captured - jarate-bg exited before completion (exit=$ec)${reason:+; reason: $reason}" "$ec" ""
-    bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
+    # #231 P4: compact no-output DIED. There is no captured output to
+    # frame, so the framed embed is pure chrome: a one-line [bg: text
+    # carries the same facts (profile, ticket, exit code, reason head).
+    # The [bg: prefix is what wakes the agent (isBgWebhook accepts the
+    # content post; jarate-wait matches on the webhook id, not the
+    # content). The framed embed stays for the captured-output DIED in
+    # the main flow.
+    dline="[bg:${profile}:DIED] ${run_id} exit=${ec} / no output${reason:+ / ${reason:0:80}}"
+    dline="$(bg_censor "$dline")"
+    dbodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
+    python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$dline" > "$dbodyf" 2>/dev/null
+    if [ -s "$dbodyf" ]; then
+      bg_post "$dbodyf" || rm -f "$dbodyf"
+    else
+      # no python3 on this box: the framed DIED is the last-resort wake
+      bg_build "$BG_TMP/pi-bg-${run_id}-body.json" "DIED" \
+        "no output captured - jarate-bg exited before completion (exit=$ec)${reason:+; reason: $reason}" "$ec" ""
+      bg_post "$BG_TMP/pi-bg-${run_id}-body.json" || true
+    fi
   fi
   if [ "$ESCAPE_ACTIVE" -eq 1 ]; then
     # Drain target is the pi-bg level, NOT $CG_PARENT: the slice root is a
@@ -1940,12 +2005,15 @@ for line in fh:
         last = e
 fh.close()
 if last:
-    print(" ".join(last.split())[:200])
+    print(" ".join(last.split())[:200].rstrip())
 ' 2>/dev/null)"
     [ -n "$why" ] && { printf '%s' "$why"; return 0; }
   fi
   if [ -n "${errf:-}" ] && [ -f "$errf" ]; then
-    why="$(tail -c 400 "$errf" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | tail -c 200)"
+    # #231 P4: trim the ends - the stderr tail is the reason head of the
+    # compact one-line no-output DIED (bg_on_exit), which must stay ONE
+    # clean line
+    why="$(tail -c 400 "$errf" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | tail -c 200 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -n "$why" ] && { printf '%s' "$why"; return 0; }
   fi
   return 0

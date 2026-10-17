@@ -1187,14 +1187,15 @@ describe("#110 launcher: --wt-reuse + retryOf record tag", () => {
 });
 
 /**
- * #86 + A1 (polish sweep): launch-fail webhook. A --worktree launch-fail
- * (not a git repo / worktree add failed) exits 3 BEFORE the run record +
- * bg_on_exit register, so bg_launch_fail posts the standard bg_build DIED
- * embed itself - the payload's embed author ("pi-bg ticket · <rid>") is
- * what isBgWebhook accepts on the bridge side, so the callback wakes the
- * orchestrator. The capture hook's req.json() 500s on a non-JSON body
- * (body stays null), so a captured body is proof the payload is valid JSON
- * - the Discord 400/50109 shape check.
+ * #86 + A1 (polish sweep) + #231 P4: launch-fail webhook. A --worktree
+ * launch-fail (not a git repo / worktree add failed) exits 3 BEFORE the
+ * run record + bg_on_exit register, so bg_launch_fail posts the DIED
+ * wake itself. #231 P4: a launch-fail has no captured output, so the
+ * payload is the compact one-line [bg: content (not the framed embed) -
+ * the [bg: prefix is what isBgWebhook accepts on the bridge side, so the
+ * callback wakes the orchestrator. The capture hook's req.json() 500s on
+ * a non-JSON body (body stays null), so a captured body is proof the
+ * payload is valid JSON - the Discord 400/50109 shape check.
  */
 describe("#86: launch-fail webhook", () => {
   const capture = () => {
@@ -1214,7 +1215,7 @@ describe("#86: launch-fail webhook", () => {
     };
   };
 
-  test("not a git repo: rc 3 + DIED embed payload passes isBgWebhook", async () => {
+  test("not a git repo: rc 3 + one-line [bg: DIED content passes isBgWebhook", async () => {
     const fx = fixture();
     const hook = capture();
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
@@ -1231,21 +1232,18 @@ describe("#86: launch-fail webhook", () => {
       if (!m) throw new Error("no ticket line on stdout");
       const rid = m[1] ?? "";
       expect(rid).toMatch(/^\d{8}-\d{6}-\d+$/);
-      // A1: embed payload, not raw text - the embed author is the
-      // isBgWebhook discriminator (webhook_id is added by Discord on
-      // inbound, so the test supplies it).
-      const emb = cap.embeds?.[0];
-      expect(
-        emb,
-        `payload must be an embed: ${JSON.stringify(cap).slice(0, 200)}`,
-      ).toBeDefined();
-      expect(emb.author.name).toBe(`pi-bg ticket \u00b7 ${rid}`);
-      expect(emb.description).toContain(`\u250c died \u00b7 ${rid}`);
-      expect(emb.description).toContain("$ jarate-bg worker --worktree");
-      const result = emb.fields?.find((f: any) => f.name === "result");
-      expect(result?.value).toContain(
-        "launch-fail: --worktree needs a git repo",
+      // #231 P4: one-line [bg: content, not the framed embed (a
+      // launch-fail has no captured output to frame). The [bg: prefix
+      // is the isBgWebhook discriminator for content posts
+      // (webhook_id is added by Discord on inbound, so the test
+      // supplies it).
+      expect(cap.content).toMatch(
+        new RegExp(
+          `^\\[bg:worker:DIED\\] ${rid} exit=3 / no output / launch-fail: --worktree needs a git repo \\(cwd=`,
+        ),
       );
+      expect(cap.content.split("\n")).toHaveLength(1);
+      expect(cap.embeds).toBeUndefined();
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
@@ -1254,7 +1252,7 @@ describe("#86: launch-fail webhook", () => {
     }
   });
 
-  test("git repo + bad ref: rc 3 + embed result field has worktree add failed + ref name", async () => {
+  test("git repo + bad ref: rc 3 + one-line [bg: content has worktree add failed + ref name", async () => {
     const fx = fixture();
     const sh = (cmd: string) =>
       execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
@@ -1274,13 +1272,14 @@ describe("#86: launch-fail webhook", () => {
       expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
       const cap = hook.getBody();
       if (!cap) throw new Error("webhook not captured (or body was not JSON)");
-      const emb = cap.embeds?.[0];
-      expect(emb).toBeDefined();
-      const result = emb.fields?.find((f: any) => f.name === "result");
-      expect(result?.value).toContain(
-        `launch-fail: worktree add failed ref=${ref}`,
+      // #231 P4: one-line [bg: content carries the reason head
+      expect(cap.content).toMatch(
+        new RegExp(
+          `^\\[bg:worker:DIED\\] \\d{8}-\\d{6}-\\d+ exit=3 / no output / launch-fail: worktree add failed ref=${ref}`,
+        ),
       );
-      expect(emb.author.name).toMatch(/^pi-bg ticket \u00b7 \d{8}-\d{6}-\d+$/);
+      expect(cap.content.split("\n")).toHaveLength(1);
+      expect(cap.embeds).toBeUndefined();
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
@@ -1346,12 +1345,133 @@ describe("#53: self-contained dead letters (launcher side)", () => {
     // everything after the marker is the embedded body: valid JSON, the
     // DIED embed the bridge would have delivered
     const bodyJson = letter.split(marker).slice(1).join(marker).trim();
-    const parsed = JSON.parse(bodyJson) as {
-      embeds: { author: { name: string } }[];
-    };
-    expect(parsed.embeds[0].author.name).toMatch(
-      /^pi-bg ticket \u00b7 \d{8}-\d{6}-\d+$/,
+    const parsed = JSON.parse(bodyJson) as { content?: string };
+    // #231 P4: the launch-fail letter embeds the compact one-line [bg:
+    // content (the framed embed left that path)
+    expect(parsed.content).toMatch(
+      /^\[bg:worker:DIED\] \d{8}-\d{6}-\d+ exit=3 \/ no output \/ launch-fail: --worktree needs a git repo/,
     );
+  }, 30_000);
+});
+
+/**
+ * #231 P4: compact no-output DIED. A wrapper that dies before the run
+ * produced output (TERM/INT/early exit) used to post the full framed
+ * embed - chrome around an empty result. Now it posts a one-line [bg:
+ * text: the [bg: prefix is what wakes the agent (isBgWebhook accepts
+ * the content post; jarate-wait matches on the webhook id, not the
+ * content). The framed embed stays for the captured-output path
+ * (main flow).
+ */
+describe("#231 P4: compact no-output DIED", () => {
+  const captureAll = () => {
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      posts,
+      url: `http://127.0.0.1:${server.port}/hook`,
+      close: () => server.stop(true),
+    };
+  };
+
+  // (a) empty out.md -> one-line [bg: content (starts with [bg:), no
+  // framed embed. The stderr line is the death reason (errf tail via
+  // bg_death_reason) and rides the line as its head.
+  test("TERM'd wrapper with no output: one-line [bg: content, no embed", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fs.mkdirSync(art, { recursive: true });
+    const cap = captureAll();
+    fx.env.PI_DISPATCH_WEBHOOK = cap.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    // the fake pi writes a START marker (traps armed) + a stderr line
+    // (the death reason), then sleeps: a TERM now leaves out.md absent
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      `#!/bin/sh\ntouch "$PI_BG_TEST_START" 2>/dev/null || true\necho boom-oops >&2\nsleep 30\n`,
+    );
+    const startMarker = path.join(art, "test-start");
+    fx.env.PI_BG_TEST_START = startMarker;
+    const p = spawn(["bash", PI_BG, "worker", "compact died task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
+      let rec: any = null;
+      const t0 = Date.now();
+      while (!rec && Date.now() - t0 < 15000) {
+        let c: string[] = [];
+        try {
+          c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+        } catch {
+          c = [];
+        }
+        if (c.length === 1)
+          rec = JSON.parse(fs.readFileSync(path.join(recDir, c[0]), "utf8"));
+        await Bun.sleep(100);
+      }
+      expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
+      const m0 = Date.now();
+      while (!fs.existsSync(startMarker) && Date.now() - m0 < 15000) {
+        await Bun.sleep(100);
+      }
+      expect(fs.existsSync(startMarker)).toBe(true);
+      await Bun.sleep(300);
+      process.kill(p.pid, "SIGTERM");
+      const code = await p.exited;
+      expect(code).toBe(143);
+      expect(cap.posts).toHaveLength(1);
+      const cap0 = cap.posts[0];
+      // plain one-line content, [bg: prefix (the wake), no framed embed
+      expect(typeof cap0.content).toBe("string");
+      expect(cap0.content.startsWith("[bg:")).toBe(true);
+      expect(cap0.content).toBe(
+        `[bg:worker:DIED] ${rec.run} exit=143 / no output / boom-oops`,
+      );
+      expect(cap0.content.split("\n")).toHaveLength(1);
+      expect(cap0.embeds).toBeUndefined();
+      // the line must still wake the channel (bridge exemption)
+      expect(isBgWebhook({ ...cap0, webhook_id: "123" })).toBe(true);
+    } finally {
+      cap.close();
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 40_000);
+
+  // (b) captured output -> the main-flow callback is still the framed
+  // embed (P4 only compacts the NO-OUTPUT DIED, not a run that produced
+  // something to frame)
+  test("captured output: framed embed unchanged", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const cap = captureAll();
+    fx.env.PI_DISPATCH_WEBHOOK = cap.url;
+    try {
+      const r = await fx.run(["worker", "framed task"]);
+      expect(r.code).toBe(0);
+      expect(cap.posts).toHaveLength(1);
+      const p0 = cap.posts[0];
+      expect(p0.embeds?.[0]?.title).toMatch(/^worker \u00b7 OK/);
+      expect(p0.content).toBeUndefined();
+    } finally {
+      cap.close();
+    }
   }, 30_000);
 });
 
@@ -5104,16 +5224,168 @@ describe("#143: jarate-bg signal (mid-run intervention receipt)", () => {
       }
       expect(e.description).toContain(childPid);
       expect(isBgWebhook({ ...srv.posts[0], webhook_id: "123" })).toBe(true);
-      // no terminal-class side effects: the record is untouched
+      // #231 P1 terminal side effects: the drain confirmed the cgroup is
+      // empty, so the record is finalized cancelled (parity with
+      // jarate-bg-kill) and the -killed marker is written pre-signal
+      // (it suppresses the wrapper's own no-output DIED)
       const rec = fx.records().find((r) => r.run === t);
-      expect(rec.state).toBe("running");
+      expect(rec.state).toBe("cancelled");
+      expect(rec.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
       expect(
         fs.existsSync(path.join(fx.home, ".pi-bg-art", `pi-bg-${t}-killed`)),
-      ).toBe(false);
+      ).toBe(true);
     } finally {
       parent?.kill("SIGKILL");
       await parent?.exited;
       srv.close();
+    }
+  }, 30_000);
+
+  // #231 P1: one kill = one post. Mirror of the #51 jarate-bg-kill
+  // "one terminal embed" test, for the signal path: the -killed marker is
+  // written BEFORE the TERM, so the wrapper's exit trap - which fires
+  // milliseconds after the TERM, long before the receipt post returns -
+  // stays quiet. The channel sees the SIGNAL receipt, not a second DIED.
+  test("one kill = one post: marker pre-TERM suppresses the wrapper DIED", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fs.mkdirSync(art, { recursive: true });
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    // the fake pi writes a START marker as its first act: the wrapper
+    // registers its EXIT/TERM traps before the pi spawn, so the marker
+    // proves the traps are armed (same non-vacuity device as the #51
+    // kill test - a fast kill could otherwise land untrapped)
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      `#!/bin/sh\ntouch "$PI_BG_TEST_START" 2>/dev/null || true\nsleep 30\n`,
+    );
+    const startMarker = path.join(art, "test-start");
+    fx.env.PI_BG_TEST_START = startMarker;
+    const p = spawn(["bash", PI_BG, "worker", "signal one-post task"], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const recDir = fx.env.PI_DISPATCH_RECORD_DIR as string;
+      let rec: any = null;
+      const t0 = Date.now();
+      while (!rec && Date.now() - t0 < 15000) {
+        let c: string[] = [];
+        try {
+          c = fs.readdirSync(recDir).filter((f) => f.endsWith(".json"));
+        } catch {
+          c = [];
+        }
+        if (c.length === 1)
+          rec = JSON.parse(fs.readFileSync(path.join(recDir, c[0]), "utf8"));
+        await Bun.sleep(100);
+      }
+      expect(rec?.run).toMatch(/^\d{8}-\d{6}-\d+$/);
+      const m0 = Date.now();
+      while (!fs.existsSync(startMarker) && Date.now() - m0 < 15000) {
+        await Bun.sleep(100);
+      }
+      expect(fs.existsSync(startMarker)).toBe(true);
+      await Bun.sleep(300);
+      const s = await fx.run(["signal", rec.run, "TERM"]);
+      expect(s.code).toBe(0);
+      expect(s.out).toContain("all signaled members gone");
+      const code = await p.exited;
+      expect(code).toBe(143);
+      // (a) marker written BEFORE the TERM: the wrapper's -rc file is
+      // written by its exit trap (post-TERM), so the marker must not be
+      // newer than it
+      const markerM = fs.statSync(
+        path.join(art, `pi-bg-${rec.run}-killed`),
+      ).mtimeMs;
+      const rcM = fs.statSync(path.join(art, `pi-bg-${rec.run}-rc`)).mtimeMs;
+      expect(markerM).toBeLessThanOrEqual(rcM);
+      // (b) exactly ONE post: the SIGNAL receipt - the wrapper trap saw
+      // the marker and stayed quiet (pre-fix: DIED + SIGNAL = 2 posts)
+      expect(posts).toHaveLength(1);
+      expect(posts[0].embeds[0].title).toBe(`SIGNAL \u00b7 ${rec.run}`);
+      // record finalized cancelled (parity with jarate-bg-kill)
+      const rec2 = JSON.parse(
+        fs.readFileSync(path.join(recDir, `pi-bg-${rec.run}.json`), "utf8"),
+      );
+      expect(rec2.state).toBe("cancelled");
+      expect(rec2.finished).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      server.stop(true);
+    } finally {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    }
+  }, 40_000);
+
+  // #231 P1: a dead webhook must not make the kill silent. The marker
+  // already suppresses the wrapper DIED, so a failed receipt post dead-
+  // letters the EXACT attempted body (the bg_post shape, issue #53);
+  // the watchdog's dead-letter consumer re-posts it next sweep.
+  test("receipt post failure -> dead letter in the bg_post shape", async () => {
+    const fx = fixture();
+    const art = path.join(fx.tmp, "art");
+    fx.env.PI_BG_TMPDIR = art;
+    fs.mkdirSync(art, { recursive: true });
+    let n = 0;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async () => {
+        n++;
+        return new Response("boom", { status: 500 });
+      },
+    });
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    let w: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const t = ST(7);
+      w = Bun.spawn(["sleep", "300"], { stdout: "ignore", stderr: "ignore" });
+      plant(fx, t, [String(w.pid)]);
+      const r = await fx.run(["signal", t, "TERM"]);
+      // the signal itself succeeded (member gone); only the receipt died
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("all signaled members gone");
+      expect(r.err).toContain(`dead letter: ${art}/pi-bg-${t}-webhook-failed`);
+      expect(n).toBe(3); // 3 attempts, then the letter
+      const lf = path.join(art, `pi-bg-${t}-webhook-failed`);
+      expect(fs.existsSync(lf)).toBe(true);
+      const letter = fs.readFileSync(lf, "utf8");
+      // the EXACT bg_post shape (the watchdog 4f consumer parses it)
+      expect(letter).toContain(`ticket   : ${t}`);
+      expect(letter).toContain("http     : 500 (3 attempts)");
+      expect(letter).toContain("response : boom");
+      const marker = "--- body json ---";
+      expect(letter).toContain(marker);
+      const bodyJson = letter.split(marker).slice(1).join(marker).trim();
+      const parsed = JSON.parse(bodyJson) as any;
+      expect(parsed.embeds[0].title).toBe(`SIGNAL \u00b7 ${t}`);
+      // the re-posted body must wake the channel (bridge exemption)
+      expect(isBgWebhook({ ...parsed, webhook_id: "123" })).toBe(true);
+      w.kill("SIGKILL");
+      await w.exited;
+      w = null;
+    } finally {
+      w?.kill("SIGKILL");
+      await w?.exited;
+      server.stop(true);
     }
   }, 30_000);
 
