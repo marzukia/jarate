@@ -1194,11 +1194,17 @@ PY
 # fallback. The record is marked killed by mark_launch_fail; bg_on_exit
 # is not registered yet, so the killed state survives the exit. Dead-letter
 # + heartbeat cleanup ride the normal paths.
+# #222x#234 (2026-10-17): the brief cap is 120, not 80 - launch-fail
+# briefs carry the cwd/ref path the operator needs to act (the
+# not-a-git-repo brief = "launch-fail: --worktree needs a git repo
+# (cwd=<path> is not one)"); 80 truncated that cwd mid-path while 120
+# keeps the one-line shape and full paths. The bg_on_exit no-output cap
+# (80) stays - no operator-critical path in that brief.
 bg_launch_fail() {
   local reason="$1" brief="$2"
   mark_launch_fail "$reason"
   local dline dbodyf
-  dline="[bg:${profile}:DIED] ${run_id} exit=3 / no output${brief:+ / ${brief:0:80}}"
+  dline="[bg:${profile}:DIED] ${run_id} exit=3 / no output${brief:+ / ${brief:0:120}}"
   dline="$(bg_censor "$dline")"
   dbodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
   python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$dline" > "$dbodyf" 2>/dev/null
