@@ -91,9 +91,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
     "forwardToolCalls": false,
     "ack": false,
     "bufferFileOnly": false,
-    "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>",
-    "peerBotIds": ["<every other agent's bot user id>"],
-    "peerChannels": { "<peer bot user id>": "<their channel id>" }
+    "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>"
   }],
   "mcp": [{ "name": "tavily", "url": "<shared tavily mcp url from an existing agent>" }],
   "defaultThinkingLevel": "medium",

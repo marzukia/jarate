@@ -880,7 +880,6 @@ test("SLASH_COMMANDS registers every dispatch command, no silent drops", () => {
     "todos",
     "sleep",
     "tasks",
-    "vault",
   ]);
   // Names are unique (a duplicate would hide a drop in the list above).
   const names = SLASH_COMMANDS.map((c) => c.name);

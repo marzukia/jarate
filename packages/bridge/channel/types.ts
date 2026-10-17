@@ -50,11 +50,6 @@ export interface ChannelConfig {
   transcribe?: boolean;
   /** Message posted when a channel connects. Unset or empty = no message. */
   startupMessage?: string | null;
-  /** Peer agent channel map: bot user ID -> that peer's Discord channel
-   *  ID. Lets the bridge auto-forward an in-channel reply that targets a
-   *  peer's message (discord only). Unset = no auto-forward, c1 hint
-   *  only. */
-  peerChannels?: Record<string, string>;
 }
 
 /** Settings shape: channels live under settings.channels. */
@@ -189,19 +184,7 @@ function normalizeChannel(raw: any): ChannelConfig {
     bufferFileOnly: raw.bufferFileOnly === true,
     transcribe: raw.transcribe !== false,
     startupMessage: raw.startupMessage,
-    peerChannels: normalizePeerChannels(raw.peerChannels),
   };
-}
-
-/** peerChannels: bot user id -> peer channel id. Non-string pairs and
- *  empty values are dropped; empty result = unset. */
-function normalizePeerChannels(raw: any): Record<string, string> | undefined {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(raw)) {
-    if (typeof v === "string" && v.length > 0) out[k] = v;
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**

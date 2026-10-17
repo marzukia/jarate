@@ -15,8 +15,7 @@ When the user replies to a message, its author + text arrive as a
 `<replied-message>` block in the context — treat it as "the user is
 pointing at this".
 
-Other bots' messages are ignored (no echo loops; agent-say traffic does not
-trigger a run). Outbound messages suppress accidental pings; a real
+Other bots' messages are ignored (no echo loops). Outbound messages suppress accidental pings; a real
 `<@id>` you write still pings.
 
 ## Commands

@@ -33,11 +33,9 @@ import extension, {
   deliverDueTasks,
   deliverDueWakes,
   earlySendText,
-  FWD_MARKER,
   failurePostText,
   fence,
   fileOnlyPrompt,
-  forwardPeerReply,
   handleInbound,
   hasOwnerConfigured,
   heldChannels,
@@ -48,7 +46,6 @@ import extension, {
   isHeld,
   isNoReply,
   isOwnerUser,
-  isPeerInbound,
   isVerbose,
   LIVE_MARKER_DIR,
   LIVE_TEXT_PLACEHOLDER,
@@ -57,13 +54,9 @@ import extension, {
   matchCommand,
   midTurnQueues,
   opWindowLabel,
-  PEER_FWD_DEDUPE_MS,
-  PEER_SENDER_HINT,
-  PEER_SENDER_HINT_NO_FWD,
   parseReplyTo,
   parseUndoCount,
   parseVerboseLevel,
-  peerFwdSnapshotForTest,
   pendingAttachments,
   pendingInterrupts,
   persistLivePlaceholders,
@@ -77,7 +70,6 @@ import extension, {
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
-  resetPeerFwdForTest,
   resetRuntimeStateForTest,
   runFrame,
   runMidRunInterrupt,
@@ -909,7 +901,6 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   afterEach(async () => {
     clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
-    resetPeerFwdForTest(); // peer-forward dedupe + inbound meta leak guard
     jest.useRealTimers();
     // Drop leftover re-wake state BEFORE the cleanup agent_end, or it would
     // start an in-flight re-wake whose sendToPi continuation leaks into the
@@ -999,263 +990,6 @@ describe("extension handlers (A1/A2/A4)", () => {
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     const body = JSON.parse(post!.body);
     expect(body.message_reference?.message_id).toBe("111");
-  });
-
-  // ─── Peer agent visibility (c1 + b) ─────────────────────────────────
-  // c1: peer-authored inbounds carry a <channel-ctx> hint (the model's
-  // only signal that the sender is a peer). b: a final threaded to a
-  // peer's message is auto-forwarded to the peer's channel (one hop,
-  // [fwd]-marked, 60 s identical-text dedupe).
-
-  // Peer variant: the author id has a peerChannels mapping in the peer
-  // settings.
-  const inboundPeer = (body: string, id: string): ChannelMessage => ({
-    ...inbound(body, id),
-    from: "peer",
-    fromId: "peer-1",
-  });
-
-  // Settings variant for the peer-visibility tests: one configured peer
-  // bot (peer-1) with a known peer channel (998).
-  const peerSettings = (extra: Record<string, unknown> = {}) =>
-    fs.writeFileSync(
-      path.join(tmp, ".pi", "settings.json"),
-      JSON.stringify({
-        channels: [
-          {
-            id: "ch1",
-            name: "Test",
-            type: "discord",
-            botToken: "tok1",
-            ownerUserId: "uid",
-            ack: true,
-            peerChannels: { "peer-1": "998" },
-            ...extra,
-          },
-        ],
-      }),
-    );
-
-  test("c1: peer-authored inbound carries the peer hint in channel-ctx", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("monky: do X", "101"), ctx);
-    const content = sent.at(-1)!.m.content;
-    expect(content).toContain("<channel-ctx");
-    expect(content).toContain(PEER_SENDER_HINT);
-  });
-
-  test("c1: human inbound and [bg: webhook ticket do not carry the peer hint", async () => {
-    peerSettings();
-    await handleInbound(pi, inbound("hello human", "102"), ctx);
-    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
-    await handleInbound(
-      pi,
-      inboundPeer("[bg:worker:OK] task 42 done", "103"),
-      ctx,
-    );
-    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
-  });
-
-  test("c1: isPeerInbound classifies on peerChannels + fromId", () => {
-    const ch = {
-      id: "ch1",
-      name: "Test",
-      type: "discord" as const,
-      enabled: true,
-      channel: "ch1",
-      peerChannels: { "peer-1": "998" },
-    };
-    const base = inbound("x", "1");
-    expect(isPeerInbound(ch, { ...base, fromId: "peer-1" })).toBe(true);
-    expect(isPeerInbound(ch, base)).toBe(false); // human fromId
-    expect(isPeerInbound(ch, { ...base, fromId: undefined })).toBe(false);
-    expect(isPeerInbound(undefined, { ...base, fromId: "peer-1" })).toBe(false); // no config
-  });
-
-  test("b: final threaded to a peer message is forwarded once to the peer channel", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "111"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:111>\nok, on it" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("ok, on it");
-    expect(ownBody.message_reference?.message_id).toBe("111"); // threads in-channel as before
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1); // forwarded exactly once
-    const fwdBody = JSON.parse(fwd[0]!.body);
-    expect(fwdBody.content).toBe(`${FWD_MARKER}ok, on it`);
-    expect(fwdBody.message_reference).toBeUndefined(); // plain post, no thread
-  });
-
-  test("b: untagged final (default last-inbound thread) to a peer is forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "121"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "on it, no tag" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1);
-    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}on it, no tag`);
-  });
-
-  test("b: reply threaded to a [fwd]-marked peer message is NOT re-forwarded (loop guard)", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer(`${FWD_MARKER}ok, on it`, "131"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:131>\ngot it, working" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("got it, working");
-    expect(ownBody.message_reference?.message_id).toBe("131"); // reply still lands in-channel
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(0); // loop guard: one hop only
-  });
-
-  test("b: reply to a human message is NOT forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inbound("hello human", "141"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:141>\nhi" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(0);
-  });
-
-  test("b: agent_end final threaded to a peer message is forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "151"), ctx);
-    const final = {
-      role: "assistant",
-      content: [{ type: "text", text: "done, shipped" }],
-    };
-    await handlers.agent_end(
-      {
-        messages: [
-          {
-            customType: CHANNEL_MSG_TYPE,
-            details: { messageId: "151" },
-            content: "",
-          },
-          final,
-        ],
-      },
-      ctx,
-    );
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("done, shipped");
-    expect(ownBody.message_reference?.message_id).toBe("151");
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1);
-    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}done, shipped`);
-  });
-
-  test("b: identical text to the same peer within 60 s is deduped, after is not", async () => {
-    peerSettings();
-    const ch = loadChannelConfig(tmp)[0]!;
-    await handleInbound(pi, inboundPeer("do X", "161"), ctx);
-    const t0 = 1_000_000;
-    const r1 = await forwardPeerReply(ch, "same reply", "161", t0);
-    expect(r1).toEqual({ forwarded: true });
-    const r2 = await forwardPeerReply(
-      ch,
-      "same reply",
-      "161",
-      t0 + PEER_FWD_DEDUPE_MS - 1_000,
-    );
-    expect(r2).toEqual({ forwarded: false, reason: "dedupe" });
-    const r3 = await forwardPeerReply(
-      ch,
-      "same reply",
-      "161",
-      t0 + PEER_FWD_DEDUPE_MS + 1_000,
-    );
-    expect(r3).toEqual({ forwarded: true });
-  });
-
-  test("b: peer reply with no configured peer channel is not forwarded", async () => {
-    peerSettings({ peerChannels: undefined });
-    await handleInbound(pi, inboundPeer("do X", "171"), ctx);
-    const ch = loadChannelConfig(tmp)[0]!;
-    expect(ch.peerChannels).toBeUndefined();
-    const r = await forwardPeerReply(ch, "orphan reply", "171");
-    expect(r).toEqual({ forwarded: false, reason: "no-channel" });
-  });
-
-  test("c1: peer hint is state-aware - forward clause only while peerChannels is set", async () => {
-    peerSettings(); // peerChannels: { "peer-1": "998" }
-    await handleInbound(pi, inboundPeer("monky: do X", "184"), ctx);
-    const mapped = sent.at(-1)!.m.content;
-    expect(mapped).toContain(PEER_SENDER_HINT);
-    expect(mapped).toContain("auto-forwards that one hop");
-    expect(mapped).not.toContain(PEER_SENDER_HINT_NO_FWD);
-
-    peerSettings({ peerChannels: undefined }); // mapping absent
-    await handleInbound(pi, inboundPeer("monky: do Y", "185"), ctx);
-    const unmapped = sent.at(-1)!.m.content;
-    // No peerChannels mapping → not classified as a peer: no hint at all
-    // (the NO_FWD variant needs the mapping to know which peer it is).
-    expect(unmapped).not.toContain(PEER_SENDER_HINT);
-    expect(unmapped).not.toContain(PEER_SENDER_HINT_NO_FWD);
-  });
-
-  test("b: peerFwdAt prunes entries at the dedupe window on write", async () => {
-    peerSettings();
-    const ch = loadChannelConfig(tmp)[0]!;
-    await handleInbound(pi, inboundPeer("do X", "191"), ctx);
-    const t0 = 1_000_000;
-    // Plant two entries via the clock stub: one that will age out, one
-    // still inside the window.
-    expect(await forwardPeerReply(ch, "stale text", "191", t0)).toEqual({
-      forwarded: true,
-    });
-    expect(
-      await forwardPeerReply(ch, "fresh text", "191", t0 + 50_000),
-    ).toEqual({ forwarded: true });
-    // Third write at t0 + 60s: the stale entry (age = window) is pruned,
-    // the fresh one (10s old) is kept.
-    expect(
-      await forwardPeerReply(ch, "new text", "191", t0 + PEER_FWD_DEDUPE_MS),
-    ).toEqual({ forwarded: true });
-    const snap = peerFwdSnapshotForTest();
-    const keys = snap.map(([k]) => k);
-    expect(keys).not.toContain(`998\nstale text`); // stale is gone
-    expect(keys).toContain(`998\nfresh text`); // fresh kept
-    expect(keys).toContain(`998\nnew text`); // new present
-    expect(snap).toHaveLength(2);
   });
 
   test("A2: agent_end posts [!] + errorMessage on a failed run", async () => {
@@ -2010,117 +1744,21 @@ describe("extension handlers (A1/A2/A4)", () => {
       }
     });
 
-    // ── #165: peer-armed interrupts use the in-flight (4x) window ────
-    // 2026-10-06 abort RCA: a peer's agent-say reply landed mid-run and
-    // armed the 3s DEFAULT — the in-flight multiplier (4x, used while an
-    // interrupt is in flight) never applied to a plain in-flight run. The
-    // 3s window expired mid-REST-POST and killed the very agent-say call
-    // that was messaging that peer (pre-spawn "Operation aborted").
-    // Fix: a peer-authored mid-run inbound (isPeerInbound) arms at the
-    // 4x window like the other in-flight-armed paths; humans keep the 3s
-    // default; [bg: machine wakes arm nothing from #177 on (queue-only).
-    // The queued message always has the guaranteed re-wake as fallback,
-    // so the longer window only changes WHEN the interrupt cuts in, never
-    // WHETHER it delivers.
+    // ── arm window pins ────────────────────────────────────────────
+    // Mid-settle (an interrupt already in flight) arms at the 4x (12s)
+    // window — the rapid-fire cascade guard (the in-flight disjunct).
+    // Every other mid-run inbound arms the 3s default (quick cut-in);
+    // [bg: machine wakes arm nothing from #177 on (queue-only). The
+    // queued message always has the guaranteed re-wake as fallback, so
+    // the longer window only changes WHEN the interrupt cuts in, never
+    // WHETHER it delivers. (2026-10-06 abort RCA: a mid-run reply armed
+    // the 3s DEFAULT mid-settle and expired mid-REST-POST; the 4x
+    // window now keys off the in-flight state, not the sender.)
 
-    test("peer mid-run inbound arms the 4x in-flight window, not the 3s default (#165)", async () => {
-      peerSettings(); // peerChannels: { peer-1: 998 }
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      // Armed at 4x (12s), not the 3s default. at is read on the same
-      // virtual clock; the ±1ms tolerance covers real-Date clocks.
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
-      ).toBeLessThanOrEqual(1);
-      // The 3s default point passes with NO abort: the in-flight step
-      // gets the run's head start.
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The 4x window fires at 4x: interrupt lands, message is the next run.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pm1");
-      expect(midTurnQueues.has("ch1")).toBe(false);
-    });
-
-    test("human mid-run inbound keeps the 3s default with peer config active (#165)", async () => {
-      peerSettings(); // same fixture as the peer test: fromId is the ONLY
-      // differentiator (uid has no peerChannels mapping)
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseAborts = abortCount;
-      await handleInbound(pi, inbound("human mid-run", "hm1"), ctx);
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
-      ).toBeLessThanOrEqual(1);
-      // Human cut-in timing is unchanged: fires at 3x, not 12x.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() - 1);
-      expect(abortCount).toBe(baseAborts);
-      jest.advanceTimersByTime(1);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-    });
-
-    test("[bg: peer-authored wake is queue-only, arms nothing (#177, supersedes the #165 3s pin)", async () => {
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseAborts = abortCount;
-      const baseSends = sent.length;
-      const wake = { ...inboundPeer("[bg:etl] ticket", "bm1"), from: "bg" };
-      await handleInbound(pi, wake, ctx);
-      // Queue-only: not the 3s default, not the 12s peer window.
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      expect(pendingInterrupts.has("ch1")).toBe(false);
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 4);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The run ends → the re-wake queue owns delivery.
-      idle = true;
-      await handlers.agent_end({ messages: [] }, ctx);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("bm1");
-      expect(midTurnQueues.has("ch1")).toBe(false);
-    });
-
-    test("peer inbound with no run in flight delivers directly, arms no interrupt (#165)", async () => {
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      idle = true; // no run in flight: the 4x window must not apply
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer idle", "pi1"), ctx);
-      // Not queued, not armed — straight to pi as a fresh run.
-      expect(midTurnQueues.has("ch1")).toBe(false);
-      expect(pendingInterrupts.has("ch1")).toBe(false);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pi1");
-      // Nothing pending to fire at 3s or 12s.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends + 1);
-    });
-
-    test("peer mid-settle keeps the 4x window; #124 order intact (#165 symmetric corner)", async () => {
-      // The settle window (an interrupt already in flight) armed at 4x
-      // BEFORE #165 via the in-flight disjunct — the peer disjunct must
-      // not double it, shorten it, or reorder the #124 delivery.
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+    test("mid-settle inbound arms the 4x in-flight window; #124 order intact", async () => {
+      // The settle window (an interrupt already in flight) arms at 4x
+      // via the in-flight disjunct — the arm must not double, shorten,
+      // or reorder the #124 delivery.
       expect(idle).toBe(false);
       const baseSends = sent.length;
       const baseAborts = abortCount;
@@ -2133,12 +1771,12 @@ describe("extension handlers (A1/A2/A4)", () => {
       await Promise.resolve();
       expect(abortCount).toBe(baseAborts + 1);
       expect(sent.length).toBe(baseSends); // still settling
-      // 2. Peer m2 arrives mid-settle (interrupt in flight): 4x arm.
-      await handleInbound(pi, inboundPeer("second", "pm2"), ctx);
+      // 2. Inbound m2 arrives mid-settle (interrupt in flight): 4x arm.
+      await handleInbound(pi, inbound("second", "m2"), ctx);
       expect(midTurnQueues.get("ch1")?.length).toBe(1);
       const armed = pendingInterrupts
         .get("ch1")
-        ?.find((p) => p.messageId === "pm2");
+        ?.find((p) => p.messageId === "m2");
       expect(armed).toBeDefined();
       expect(
         Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
@@ -2163,8 +1801,46 @@ describe("extension handlers (A1/A2/A4)", () => {
       jest.advanceTimersByTime(25);
       await Promise.resolve();
       expect(sent.length).toBe(baseSends + 2);
-      expect(sent[baseSends + 1].m.details.messageId).toBe("pm2");
+      expect(sent[baseSends + 1].m.details.messageId).toBe("m2");
       expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("[bg: machine wake is queue-only, arms nothing (#177)", async () => {
+      expect(idle).toBe(false);
+      const baseAborts = abortCount;
+      const baseSends = sent.length;
+      const wake = { ...inbound("[bg:etl] ticket", "bm1"), from: "bg" };
+      await handleInbound(pi, wake, ctx);
+      // Queue-only: not the 3s default, not the 4x in-flight window.
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 4);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("bm1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("inbound with no run in flight delivers directly, arms no interrupt", async () => {
+      idle = true; // no run in flight
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inbound("idle inbound", "pi1"), ctx);
+      // Not queued, not armed — straight to pi as a fresh run.
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("pi1");
+      // Nothing pending to fire at 3s or 12s.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends + 1);
     });
 
     test("run that ends before the timeout: re-wake delivers, timer is a no-op", async () => {
@@ -2614,7 +2290,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       // python3-missing fallback only. The bridge-built body is the
       // serialized embed — no "[bg:" prefix anywhere. The 2026-10-06
       // incident lost EXACTLY this shape (msg 1556883632919150653, Beepy
-      // webhook author with no peerChannels mapping, mid-run): pre-fix isBgInbound
+      // webhook author, mid-run): pre-fix isBgInbound
       // missed it and the 3s interrupt armed + was lost at compact.
       const body = [
         "<embed>",
@@ -2632,7 +2308,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
       const baseTimers = pendingInterrupts.size;
-      // Beepy-style author: a webhook bot with no peerChannels mapping.
+      // Beepy-style author: a webhook bot.
       const msg = {
         ...inbound(body, "1556883632919150653"),
         from: "Beepy",
@@ -2699,33 +2375,6 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(abortCount).toBe(baseAborts + 1);
       expect(sent.length).toBe(baseSends + 1);
       expect(sent[baseSends].m.details.messageId).toBe("hm1");
-    });
-
-    test("peer bot speech mid-run: 12s arm (regression pin, #175)", async () => {
-      peerSettings(); // peerChannels: { peer-1: 998 }
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(armed!.messageId).toBe("pm1");
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
-      ).toBeLessThanOrEqual(1);
-      // The 3s point passes with NO abort: the in-flight run gets its
-      // head start.
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The 12s window fires on schedule.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pm1");
     });
 
     test("human arriving mid-run after a [bg: was queued: still arms (the queue does not suppress later human cuts)", async () => {
@@ -11054,7 +10703,6 @@ describe("#84: placeholder settlement (all exit paths)", () => {
 
   afterEach(async () => {
     clearDiscordStatesForTest();
-    resetPeerFwdForTest();
     jest.useRealTimers();
     stopAllOpTicks();
     stopAllCompactTicks();

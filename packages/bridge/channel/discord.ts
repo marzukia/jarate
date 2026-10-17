@@ -32,7 +32,7 @@ export const POLL_INTERVAL_MS = 5_000;
 export const POLL_BACKFILL_MS = 60_000;
 /** Gateway intents: GUILDS | INTERACTIONS | GUILD_MESSAGES | DIRECT_MESSAGES |
  *  GUILD_MESSAGE_CONTENT. INTERACTIONS (1<<1) was missing — no
- *  INTERACTION_CREATE ever arrived, so slash commands + vault buttons
+ *  INTERACTION_CREATE ever arrived, so slash commands
  *  were dead in production (RCA 2026-10-01). */
 const GATEWAY_INTENTS = 1 | (1 << 1) | (1 << 9) | (1 << 12) | (1 << 15);
 
@@ -759,7 +759,7 @@ export function allowedMentionsFor(text: string): {
 
 /** Send a text message to a Discord channel.
  *
- *  opts.components: embed a component row (e.g. PAT vault buttons).
+ *  opts.components: embed a component row.
  *  opts.replyToMessageId: reply to a specific message. */
 export async function sendDiscordMessage(
   config: ChannelConfig,
@@ -1207,7 +1207,7 @@ export function interactionUserName(d: any): string | undefined {
 /** Parse a raw gateway payload, preserving snowflake precision.
  *  Discord serializes snowflake ids as JSON strings today, but any bare
  *  integer >= 16 digits would be rounded by JSON.parse beyond 2^53 —
- *  and the vault/pat tap match compares message ids as strings, so one
+ *  and the tap match compares message ids as strings, so one
  *  lost digit rejects the tap. Bare (unquoted) long integers are quoted
  *  before parsing; string contents are untouched (the scanner tracks
  *  string state). Fast path: no 16+ digit run -> plain JSON.parse. */
@@ -1401,8 +1401,8 @@ function connectPresence(st: PresenceState): void {
         );
       }
     } else if (msg.op === 0 && msg.t === "INTERACTION_CREATE") {
-      // Dispatch log (PAT vault §0): makes type-4 (button) delivery
-      // greppable — the parked /status RCA never had this line.
+      // Dispatch log: makes interaction delivery greppable — the parked
+      // /status RCA never had this line.
       console.log(
         `[interactions] type=${msg.d.type} id=${msg.d.id} channel=${msg.d.channel_id} custom=${msg.d.data?.custom_id ?? "-"}`,
       );
@@ -1689,8 +1689,8 @@ export async function editInteractionMessage(
  *  @original) — the documented replacement for the deprecated
  *  "followup POST right after a defer edits the original" behavior.
  *  The deferred message is non-ephemeral, so the result is visible to
- *  the whole channel — deliberate: a silent vault/pat tap is a control
- *  failure (RCA 2026-10-08: every rejection reply was an ephemeral
+ *  the whole channel — deliberate: a silent tap is a control
+ *  failure (RCA 2026-10-08: every reply was an ephemeral
  *  followup on the wrong URL and the operator saw nothing). Fallback:
  *  a new followup message if @original is already gone. Errors are
  *  swallowed (must not kill the tap flow). Returns true when the reply
@@ -1758,7 +1758,7 @@ export async function deleteDeferredAck(
  *  arrive as INTERACTIONS_CREATE on the presence gateway (INTERACTIONS
  *  intent, 5431caed) and route through buildInteractionHandler into the
  *  same executor as the text path, which stays as the fallback —
- *  agent-say / peer traffic produces messages, not interactions. */
+ *  peer traffic produces messages, not interactions. */
 // NOTE: keep this list in lockstep with the runChannelCommand switch in
 // index.ts — every dispatch case needs a registered entry (and vice
 // versa). Option names are single-string args; buildInteractionHandler
@@ -1998,59 +1998,6 @@ export const SLASH_COMMANDS = [
         description:
           'list, add "<prompt>" <minutes|ISO|cron [tz]>, reschedule <id> <spec>, cancel <id> (omit: list)',
         required: false,
-      },
-    ],
-  },
-  {
-    // #206 (D5): non-button vault ops. Subcommand form (type 1); the
-    // handler in index.ts folds it back to a "status" / "approve <id>"
-    // / "deny <id>" / "ping <id>" arg for runChannelCommand.
-    name: "vault",
-    description: "Credential vault: status + owner approve/deny",
-    options: [
-      {
-        type: 1,
-        name: "status",
-        description: "List pending + active credentials",
-      },
-      {
-        type: 1,
-        name: "approve",
-        description: "Approve a pending request (owner)",
-        options: [
-          {
-            type: 3,
-            name: "id",
-            description: "request id (full or unique prefix)",
-            required: true,
-          },
-        ],
-      },
-      {
-        type: 1,
-        name: "deny",
-        description: "Deny a pending request (owner)",
-        options: [
-          {
-            type: 3,
-            name: "id",
-            description: "request id (full or unique prefix)",
-            required: true,
-          },
-        ],
-      },
-      {
-        type: 1,
-        name: "ping",
-        description: "Re-announce a pending/active request (owner)",
-        options: [
-          {
-            type: 3,
-            name: "id",
-            description: "request id (full or unique prefix)",
-            required: true,
-          },
-        ],
       },
     ],
   },

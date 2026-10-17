@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // jarate-censor: stdin -> censor() -> stdout.
 //
-// Routes out-of-bridge Discord egress (pi-bg dispatch callbacks, agent-say)
+// Routes out-of-bridge Discord egress (pi-bg dispatch callbacks)
 // through the SAME censor + registry the bridge uses (~/.pi/agent/secrets.txt
 // or $JARATE_SECRETS_FILE). Never fails the caller: on any error the raw
 // input is passed through and the exit code is 0.

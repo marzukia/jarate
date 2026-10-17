@@ -1388,7 +1388,7 @@ cmd_setup() {
   [ -z "$prov_key" ] && steps_a+=("LLM creds: re-run with --model-base/--model-id/--model-key (H4) — agent boots but LLM calls fail")
   steps_a+=("identity: author ~/AGENTS.md (per-agent, hand-written)")
   steps_a+=("web search (optional): cp $SETUP_DIR/extensions/mcp-tools.ts ~/.pi/agent/extensions/ + tavily key in settings.json mcp[]")
-  steps_a+=("peers (optional): invite bots to each other's guilds + peerBotIds in settings.json")
+  steps_a+=("fleet comms (optional): hall-monitor — agents talk to each other via POST /fleet/say (no peer guild invites needed)")
   local steps
   steps="$(printf '%s\n' "${steps_a[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
   local units_out dry_json
