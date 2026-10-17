@@ -11,7 +11,7 @@
 # jarate layout facts (2026-09-12):
 #   - NO jarate service of its own: the checkout IS the deployment
 #     (install.sh v3, "no more rsync biz"). Machine paths (~/scripts/jarate-bg,
-#     ~/bin/agent-say, packages/bridge) are symlinks into the checkout.
+#     ~/bin/jarate, packages/bridge) are symlinks into the checkout.
 #   - The long-running consumer is pi.service (pi + @jarate/bridge via
 #     settings.json "packages"), so "restart jarate" = restart pi.service.
 #   - No build step (no dist/ artifacts), so rollback is a plain

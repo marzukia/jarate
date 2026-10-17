@@ -20,17 +20,10 @@
 #        {~/.local/bin,~/scripts}/pi-bg-kill     -> <jarate>/dispatch/pi-bg-kill (shim)
 #        {~/.local/bin,~/scripts}/pi-bg-watchdog -> <jarate>/dispatch/pi-bg-watchdog (shim)
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
-#        ~/bin/agent-say     -> <jarate>/bin/agent-say
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
-#        ~/bin/jarate-pat    -> <jarate>/bin/jarate-pat   (PAT vault client)
-#        ~/bin/jarate-vault  -> <jarate>/bin/jarate-vault (generic credential vault client)
 #        ~/projects/recall   -> <jarate>/packages/recall   (only if the dest
 #                               is absent or already this symlink)
-#   5. seeds ~/.config/agent-fleet/peers.json (agent-say peer-name
-#      resolution) from dispatch/peers.json (local, gitignored) or
-#      dispatch/peers.example.json (placeholders) + this agent's own channel.
-#      One-time write: an existing file is never clobbered.
 #
 # Deploy after a git pull = nothing. Code is live at the checkout; restart pi
 # only to pick up bridge (channel/) changes.
@@ -46,7 +39,6 @@
 #   - never touches ~/.pi/agent/settings.json (prints the line to set)
 #   - never restarts or kills pi processes; prints a restart reminder
 #   - never rsyncs or copies repo files; only symlinks + package installs
-#     (+ the one-time peers.json seed, which never clobbers)
 #   - machine-local state (node_modules, .venv, __pycache__, sessions) lives
 #     in the checkout and is gitignored
 #
@@ -64,7 +56,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --jarate-dir) JARATE_DIR="${2:?--jarate-dir needs a path}"; shift ;;
     --clone-url) CLONE_URL="${2:?--clone-url needs a url}"; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,25p'; exit 0 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,26p'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -173,11 +165,8 @@ for tool in jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchd
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
 link_into "$HOME/scripts/jarate"     "$JARATE_DIR/bin/jarate"
-link_into "$HOME/bin/agent-say"      "$JARATE_DIR/bin/agent-say"
 link_into "$HOME/bin/jarate-diff"    "$JARATE_DIR/bin/jarate-diff"
 link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
-link_into "$HOME/bin/jarate-pat"     "$JARATE_DIR/bin/jarate-pat"
-link_into "$HOME/bin/jarate-vault"   "$JARATE_DIR/bin/jarate-vault"
 
 # --- 3a. PATH verify (issue #71, #151) -------------------------------------
 # Assert every family member resolves in the unit's PATH AND is jarate-owned
@@ -189,7 +178,7 @@ link_into "$HOME/bin/jarate-vault"   "$JARATE_DIR/bin/jarate-vault"
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
 FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh"
-for tool in $FAMILY_TOOLS agent-say jarate jarate-pat jarate-diff jarate-vault; do
+for tool in $FAMILY_TOOLS jarate jarate-diff; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
     echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2
@@ -237,39 +226,7 @@ else
   echo "  recall: $RECALL_DEST exists (not this symlink); left untouched"
 fi
 
-# --- 3b. agent-fleet peers seed (agent-say peer names) ----------------------
-# One-time: the peers file is machine state (operators add peers), so an
-# existing file is never clobbered. Seed = the local roster
-# dispatch/peers.json (gitignored; copy dispatch/peers.example.json and
-# fill in real channel ids) PLUS this agent's own channel (name = $USER,
-# id from settings.json — the file is never written, only read).
-PEERS_DEST="$HOME/.config/agent-fleet/peers.json"
-PEERS_SRC="$JARATE_DIR/dispatch/peers.json"
-[ -f "$PEERS_SRC" ] || PEERS_SRC="$JARATE_DIR/dispatch/peers.example.json"
-if [ -f "$PEERS_DEST" ]; then
-  echo "  peers: $PEERS_DEST (exists, unchanged)"
-else
-  self=""
-  if command -v jq >/dev/null 2>&1 && [ -f "$HOME/.pi/agent/settings.json" ]; then
-    self="$(jq -r '[.channels[]? | select(.type == "discord") | .channel // empty] | .[0] // empty' "$HOME/.pi/agent/settings.json" 2>/dev/null || true)"
-  fi
-  if [ "$DRY" = 1 ]; then
-    echo "  peers: [dry-run] would seed $PEERS_DEST (local roster + own channel)"
-  else
-    mkdir -p "$(dirname "$PEERS_DEST")"
-    if [ -n "$self" ] && command -v jq >/dev/null 2>&1 && [ -f "$PEERS_SRC" ]; then
-      jq --arg u "${USER:-agent}" --arg c "$self" '. + {($u): $c}' \
-        "$PEERS_SRC" > "$PEERS_DEST"
-    elif [ -f "$PEERS_SRC" ]; then
-      cp "$PEERS_SRC" "$PEERS_DEST"
-    else
-      echo '{}' > "$PEERS_DEST"
-    fi
-    echo "  peers: seeded $PEERS_DEST (from ${PEERS_SRC#"$JARATE_DIR"/})"
-  fi
-fi
-
-# --- 3c. live marker dir (issue #191 M2) ------------------------------------
+# --- 3b. live marker dir (issue #191 M2) ------------------------------------
 # /var/tmp/jarate-live: the per-agent liveness markers (<uid>, 0644) the
 # bridge touches every poll cycle; the watchdog's fleet liveness sweep
 # (another user) reads everyone's, so the dir is sticky world-writable

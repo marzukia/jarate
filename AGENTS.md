@@ -12,9 +12,8 @@ agent stack). Read this before touching anything.
   TS port of the old Python pgrag (removed 2026-09-10); db `rag` unchanged.
 - `dispatch/` — `jarate-bg`, `jarate-wait` bash scripts (+ `pi-*` deprecation
   shims; the orchestration machinery).
-- `bin/agent-say` — agent-to-agent messaging.
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
-- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook), PAT-VAULT.md (PAT vault runbook).
+- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
 - `.githooks/pre-commit` — biome gate; `core.hooksPath` is set by install.sh.
 
 ## Commands
@@ -23,7 +22,6 @@ agent stack). Read this before touching anything.
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit   # must stay clean
 cd packages/bridge && bun x bun test       # 923 pass, 0 fail
-# PAT vault (jarate pat-request/pat-run/pat-status): docs/PAT-VAULT.md
 cd packages/recall && bun x tsc --noEmit   # must stay clean
 cd packages/recall && bun test             # unit + integration (integration
                                            # skips if Postgres/Ollama unreachable)

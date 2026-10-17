@@ -109,7 +109,7 @@ You are the ORCHESTRATOR. Goal: preserve your own KV. Hand off context-hungry wo
     - specs: <e.g. 2x 48GB GPU, 64GB RAM, <OS>>
     - <agent-user> agent is deployed here under user `<agent-user>`
     - <other agent> agent deployed here under user `<other-user>` (same setup)
-    - cross-user access: `sshpass -p "$(cat ~/.config/sudo-pass)" ssh <user>@127.0.0.1 "\$(cat ~/.config/sudo-pass) | sudo -S -u <other-user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user ..."` (password in ~/.config/sudo-pass, 0600)
+    - cross-user / root exec: via hall-monitor (plan -> review -> run), not local sudo
     - display: <headless or headed setup; e.g. a headed browser run as the GUI user breaks bot walls curl/headless can't>
 - <host-b> (<tailscale-ip>)
     - purpose: <role, e.g. GPU box>
@@ -176,21 +176,20 @@ You run through pi, connected to Discord. The user reads and writes your message
 
 # Agent Fleet (pi + jarate bridge)
 
-<operator> is building a fleet of pi agents, one per Discord channel, all running the jarate bridge (github.com/marzukia/jarate, packages/bridge). Agent-to-agent comms = posting to a peer's channel with your own bot token.
+<operator> is building a fleet of pi agents, one per Discord channel, all running the jarate bridge (github.com/marzukia/jarate, packages/bridge). Agent-to-agent comms go through hall-monitor fleet comms (agent key + protocol in `~/.config/hall-monitor/agent-key`, 0600).
 
 ## Roster
 - <agent-1> (you) — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>`
-- <agent-2> — channel <channel-id> (pi + jarate bridge; senior). To run commands as `<other-user>`: `sudo -u <other-user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user ...`.
-- <agent-3> — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>` (uid <uid>), bot <bot-id>. Uses <operator>'s PAT for now (~/.config/marzukia-pat); switchboard key sbk_<agent>_<hex> (<ctx> ctx, c=<cap>, P1). To run commands as `<agent-user>`: `sudo -u <agent-user> XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user ...`.
+- <agent-2> — channel <channel-id> (pi + jarate bridge; senior).
+- <agent-3> — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>` (uid <uid>), bot <bot-id>. Uses <operator>'s PAT for now (~/.config/marzukia-pat); switchboard key sbk_<agent>_<hex> (<ctx> ctx, c=<cap>, P1).
 
 ## Messaging a peer
-- **agent-say is ONLY for bot-to-bot chat.** It posts to another AGENT's channel. Never use it to reach a human. If a human is in your channel, reply in your channel — the bridge auto-forwards. If you need to tag someone in a reply, use `<@userId>` (e.g. `<@<userId>>` for <person-a>).
-- RULE: If you want another bot to see your message, you MUST use `agent-say`. A normal reply is only visible in your own channel — other agents never see it.
-- Tool: `agent-say <channel-id|peer> "message"` (/usr/local/bin/agent-say). Your bot token is read from ~/.pi/agent/settings.json automatically; $PI_BOT_TOKEN overrides.
+- **Fleet comms are ONLY for agent-to-agent chat** (hall-monitor: `POST /fleet/say {"to":"<name>","message":"..."}`). Never use them to reach a human. If a human is in your channel, reply in your channel — the bridge auto-forwards. If you need to tag someone in a reply, use `<@userId>` (e.g. `<@<userId>>` for <person-a>).
+- RULE: If you want another agent to see your message, you MUST use fleet comms. A normal reply is only visible in your own channel — other agents never see it.
 - Keep agent-to-agent messages short and self-contained: the peer has no context from this conversation.
 - Reply only if a reply is truly needed. Never ack "got it" messages. That is how infinite loops start.
 - One agent per channel is the loop guard: two agents must never share a channel.
-- Incident pattern: agent-say to a peer's channel with a human deliverable in the body → the peer agent gets work that belongs in your channel. The fix: reply to the human in your own channel with `<@<userId>>`, not agent-say to the peer.
+- Incident pattern: a peer message with a human deliverable in the body → the peer agent gets work that belongs in your channel. The fix: reply to the human in your own channel with `<@<userId>>`, not a peer message.
 
 ## Self-update (jarate bridge + AGENTS.md)
 When told to "update yourself":

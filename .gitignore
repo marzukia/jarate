@@ -9,4 +9,3 @@ dist/
 !.env.example
 *.local
 .deploy-state
-dispatch/peers.json

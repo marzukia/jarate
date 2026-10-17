@@ -48,9 +48,7 @@ bun test          # unit + integration (integration needs Postgres + Ollama;
 ```
 
 Integration suite: the DROP/CREATE route needs a PG admin over ssh+sudo
-(the agent role has no CREATEDB). Working route on marzuki-hydrogen:
-`RECALL_PG_ADMIN_USER=andryo RECALL_PG_ADMIN_PASS="$(cat ~/.config/sudo-pass)"`
-(the default `root` is dead there: ssh root key-denied). CI runs no
+(the agent role has no CREATEDB). CI runs no
 Postgres/Ollama services, so the suite skips there (separate ticket).
 
 ## Rules (see PLAN.md)
