@@ -72,7 +72,8 @@ bash install.sh --dry-run          # installer regression check
 
 1. Branch `pi-bg/<id>` or `feature/<name>` from `main`.
 2. Commit, push, `gh pr create --base main`
-   (`GH_TOKEN=$(cat ~/.config/marzukia-pat)`).
+   (GitHub via hall-monitor vault: claim `gh_pat` in a plan; `GH_TOKEN=$gh_pat gh ...` -
+   injected for that run only).
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
    merge. Nohup form (foreground launch is rejected, rc 4, #144):
