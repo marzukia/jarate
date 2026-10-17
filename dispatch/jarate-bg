@@ -1692,6 +1692,13 @@ silent_retried=0
 degr1f="$BG_TMP/pi-bg-${run_id}-degr1"
 degen_retried=0
 degen_final=0
+# output-truncation relaunch (2026-10-17 Frank wave): mirror of the
+# silent-death retry1 - ONE relaunch behind a <ticket>.trunc1 marker;
+# a second truncation reports EMPTY loud (trunc_final) with the actual
+# signature instead of burning the 3-attempt blind retry budget.
+trunc1f="$BG_TMP/pi-bg-${run_id}-trunc1"
+trunc_retried=0
+trunc_final=0
 
 # bg_session_file: the profile session jsonl written for this run after run
 # start (shared by bg_silent_tail and bg_capture_cost so both consumers stay
@@ -2056,6 +2063,52 @@ print("stop=" + (clean(last.get("stopReason")) or "-")
 ' 2>/dev/null
 }
 
+# bg_think_trunc: output-truncation signature (2026-10-17 Frank worker
+# wave RCA): the LAST assistant message of this run's session file is
+# thinking-only with stopReason=length - the model spent the whole
+# maxTokens output budget on reasoning and the completion was cut off
+# before any tool call or text. pi ends the turn (no tool calls), prints
+# no text (raw.out 0 bytes), exits rc=0 - indistinguishable from the
+# "local model empty completion" quirk without this check. Blind retries
+# just re-run the same truncation (39/39 attempts in the 2026-10-16/17
+# nf-check waves hit it). Echoes a one-line signature when present;
+# echoes nothing otherwise. Failure-tolerant: never fails the run.
+bg_think_trunc() {
+  local sf
+  sf="$(bg_session_file)"
+  [ -n "$sf" ] || return 0
+  PI_BG_TRUNC_FILE="$sf" python3 -c '
+import json, os
+last = None
+try:
+    fh = open(os.environ["PI_BG_TRUNC_FILE"])
+except Exception:
+    raise SystemExit(0)
+for line in fh:
+    if "\"role\":\"assistant\"" not in line:
+        continue
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    m = o.get("message") or {}
+    if m.get("role") == "assistant":
+        last = m
+fh.close()
+if last is None or last.get("stopReason") != "length":
+    raise SystemExit(0)
+kinds = [c.get("type") for c in last.get("content", []) if isinstance(c, dict)]
+# truncated but produced text -> not the silent signature
+if "text" in kinds:
+    raise SystemExit(0)
+out = (last.get("usage") or {}).get("output")
+sig = "model hit max output tokens mid-thinking (stopReason=length, thinking-only final message"
+if out:
+    sig += ", %s output tokens" % out
+print(sig + ")")
+' 2>/dev/null
+}
+
 # bg_silent_tail: seconds since the newest activity of this run (raw.out
 # mtime, the profile session file for this run's cwd written after run
 # start, or the attempt start). No session file (test stubs, --no-session)
@@ -2141,8 +2194,8 @@ for attempt in 1 2 3; do
       sleep 3
       continue
     fi
-    # healthy output: pending retry1/degr1 markers are consumed (recovered)
-    rm -f "$retry1f" "$degr1f" 2>/dev/null || true
+    # healthy output: pending retry1/degr1/trunc1 markers are consumed (recovered)
+    rm -f "$retry1f" "$degr1f" "$trunc1f" 2>/dev/null || true
     break
   fi
   # --- empty output: classify before deciding whether to relaunch ---
@@ -2164,6 +2217,30 @@ for attempt in 1 2 3; do
     bg_arm_resume
     sleep 3
     continue
+  fi
+  # output truncation (2026-10-17 Frank wave): rc=0 + empty because the
+  # model hit maxTokens mid-thinking (thinking-only final message). Not
+  # the transient empty-completion quirk - ONE relaunch (thinking length
+  # varies run to run), then report EMPTY loud with the signature.
+  if [ "$rc" -eq 0 ]; then
+    trunc="$(bg_think_trunc)"
+    if [ -n "$trunc" ]; then
+      if [ "$trunc_retried" -eq 1 ]; then
+        echo "[pi-bg] second truncated completion ($trunc) - reporting EMPTY, no further retry" >&2
+        trunc_final=1
+        break
+      fi
+      # arm-resume this run's session (#227 review F3, #222 landed): the
+      # truncated final message is thinking-only, resume is the correct
+      # continuation
+      touch "$trunc1f" 2>/dev/null || true
+      echo "[pi-bg] TRUNCATED completion (rc=0, no output: $trunc) - relaunching ticket once (trunc1)" >&2
+      bg_log_retry "think-trunc"
+      trunc_retried=1
+      bg_arm_resume
+      sleep 3
+      continue
+    fi
   fi
   # Local models occasionally return empty completion (rc=0 with empty stream)
   echo "[pi-bg] empty completion (attempt $attempt), retrying..." >&2
@@ -2226,6 +2303,14 @@ if [ -n "$webhook" ]; then
       # report a normal FAIL (the orchestrator decides the fix round)
       status="FAIL"
       brief="silent death x2 (rc=1, no output; retry1 did not recover - issue #57)"
+      [ -n "$reason" ] && brief="$brief; reason: $reason"
+    elif [ "$trunc_final" -eq 1 ]; then
+      # output truncation reproduced on the one relaunch (2026-10-17
+      # Frank wave): EMPTY with the actual signature - the orchestrator
+      # sees WHY the run produced nothing and can act (raise maxTokens,
+      # split the task) instead of staring at a blank brief
+      status="EMPTY"
+      brief="no output: model hit max output tokens mid-thinking (stopReason=length, thinking-only final message); trunc1 did not recover - raise maxTokens or split the task"
       [ -n "$reason" ] && brief="$brief; reason: $reason"
     else
       # empty output: rc!=0 means pi died (killed/crashed), rc==0 is the
