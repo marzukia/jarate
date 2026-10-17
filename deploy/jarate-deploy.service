@@ -9,4 +9,4 @@ WorkingDirectory=%h/projects/jarate
 # User units run as the agent user; no User= key here.
 # deploy.sh sets PATH (bun) and XDG_RUNTIME_DIR itself.
 ExecStart=%h/projects/jarate/deploy/deploy.sh
-TimeoutStartSec=600
+TimeoutStartSec=1800

@@ -30,6 +30,11 @@
 # Only bash + git + bun + systemctl/journalctl (user) are required.
 
 set -euo pipefail
+# Ignore SIGPIPE script-wide (#235): a systemd timeout kill TERMs the whole
+# cgroup, including the `tee` of the log pipe below. When the foreground
+# step dies, bash's "Terminated" job notification would hit that dead pipe
+# and die (141) BEFORE the TERM trap in main can record the fail.
+trap '' PIPE
 
 # bun is not on monky's default PATH in all systemd contexts.
 export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
@@ -199,7 +204,9 @@ main() {
   DEPLOY_TRIED=""
   DEPLOY_PREV="$prev_commit"
   on_exit() {
-    local ec=$?
+    # $1 optional: the TERM trap passes the captured exit code (143) —
+    # `trap - EXIT` in that handler would clobber $? before this reads it.
+    local ec="${1:-$?}"
     if [[ $ec -ne 0 && -n "$DEPLOY_TRIED" ]]; then
       record_fail "$DEPLOY_TRIED" "$DEPLOY_PREV"
       log "recorded fail #$(state_fail_count) on $DEPLOY_TRIED (backoff after 3)"
@@ -207,6 +214,13 @@ main() {
     return 0
   }
   trap on_exit EXIT
+  # #235: a systemd timeout kill is a SIGTERM to the whole cgroup. An
+  # untrapped TERM exits the shell WITHOUT running the EXIT trap, so
+  # record_fail never fired, the 3-fail backoff never accumulated, and the
+  # next tick (~30s) restarted the same gate: livelock. The TERM trap clears
+  # EXIT first (the EXIT trap would otherwise re-fire on the resulting shell
+  # exit -> record_fail twice) and passes the captured exit code (143).
+  trap 'ec=$?; trap - EXIT; on_exit "$ec"' TERM
 
   if [[ $FORCE -eq 0 && "$deployed" == "$new_commit" ]]; then
     log "up to date ($deployed)"
