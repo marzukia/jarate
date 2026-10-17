@@ -50,7 +50,6 @@ import {
   getDiscordStates,
   getDiscordToken,
   interactionUserId,
-  interactionUserName,
   loadChannelStateFile,
   loadDiscordAttachment,
   loadPersistedCursors,
@@ -87,7 +86,6 @@ import {
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
-import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
 import {
   loadRewakeQueue,
@@ -173,27 +171,12 @@ import {
   type UsageStats,
   usageFrame,
 } from "./usage";
-import { startVault, stopVault, type VaultHandle, vaultSlash } from "./vault";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
 
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
-// PAT vault handles per channel (L4: once per process per socket path;
-// start on connect, stopPatVault on shutdown — refcounted internally).
-const patVaultHandles = new Map<string, PatVaultHandle>();
-// Generic vault handles per channel (same L4 refcount pattern).
-const vaultHandles = new Map<string, VaultHandle>();
-/** Test hook: register/clear the vault handle for a channel (the
- *  production wiring happens in connectDiscord). #206. */
-export function __setVaultHandleForTest(
-  chId: string,
-  h: VaultHandle | null,
-): void {
-  if (h) vaultHandles.set(chId, h);
-  else vaultHandles.delete(chId);
-}
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -2118,7 +2101,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree|vault)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2638,31 +2621,9 @@ export default function (pi: ExtensionAPI) {
             // cleared ~2-3h after boot, no audit trail). unref'd, idempotent;
             // JARATE_SLASH_REPUT_MS=0 disables.
             startSlashReput(bt);
-            // PAT vault: started alongside the interaction handler;
-            // state persists in <cwd>/.tmp (same dir as channel-state).
-            // L4: once per process per socket path; refcounted stop on
-            // shutdown.
-            const vh = startPatVault({
-              pi,
-              ctx,
-              ch,
-              botToken: bt,
-              stateDir: path.join(ctx.cwd, ".tmp"),
-            });
-            patVaultHandles.set(ch.id, vh);
-            // Generic vault: started alongside the PAT vault; state lives
-            // in ~/.jarate/vault (its own dir, L4 refcounted).
-            const vh2 = startVault({
-              pi,
-              ctx,
-              ch,
-              botToken: bt,
-              stateDir: path.join(ctx.cwd, ".tmp"),
-            });
-            vaultHandles.set(ch.id, vh2);
             setDiscordInteractionHandler(
               bt,
-              buildInteractionHandler(pi, ctx, ch, bt, vh, vh2),
+              buildInteractionHandler(pi, ctx, ch, bt),
             );
           }
           // startupMessage is posted by the poller once the bot's own user
@@ -3017,16 +2978,6 @@ export default function (pi: ExtensionAPI) {
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
-        const vh = patVaultHandles.get(ch.id);
-        if (vh) {
-          stopPatVault(vh);
-          patVaultHandles.delete(ch.id);
-        }
-        const vh2 = vaultHandles.get(ch.id);
-        if (vh2) {
-          stopVault(vh2);
-          vaultHandles.delete(ch.id);
-        }
         if (ch.botToken) {
           stopDiscordPresence(ch.botToken);
           setDiscordInteractionHandler(ch.botToken, null);
@@ -4198,15 +4149,16 @@ export function isBgInbound(msg: ChannelMessage): boolean {
   return isBgCallbackBody(msg.body.trimStart());
 }
 
-/** c1: true when the inbound is authored by a known peer bot. Bg-webhook
- *  tickets ([bg: prefix) are excluded even if their author id matches —
- *  those are machine wakes, not a peer speaking. */
+/** c1: true when the inbound is authored by a known peer bot (a
+ *  peerChannels mapping for the author id). Bg-webhook tickets ([bg:
+ *  prefix) are excluded even if their author id matches — those are
+ *  machine wakes, not a peer speaking. */
 export function isPeerInbound(
   ch: ChannelConfig | undefined,
   msg: ChannelMessage,
 ): boolean {
-  const peerIds = ch?.peerBotIds ?? [];
-  if (!msg.fromId || !peerIds.includes(msg.fromId)) return false;
+  const peerChans = ch?.peerChannels ?? {};
+  if (!msg.fromId || !(msg.fromId in peerChans)) return false;
   return !isBgInbound(msg);
 }
 
@@ -4324,10 +4276,10 @@ function prunePeerFwd(now: number): void {
  * Posts "[fwd] <text>" to the peer's channel. No-op (forwarded:false)
  * when: no target / no bot token, the reply itself is already marked,
  * the target is unknown (not in the recent-inbound map), the target's
- * author is not a configured peer bot, the target carries the [fwd]
- * marker (loop guard), no peer channel is configured for that bot, the
- * peer channel is our own, or an identical forward to that channel
- * landed within PEER_FWD_DEDUPE_MS (dedupe). Best effort: a failed post
+ * author is unknown, the target carries the [fwd] marker (loop guard),
+ * no peer channel is configured for the target's author, the peer
+ * channel is our own, or an identical forward to that channel landed
+ * within PEER_FWD_DEDUPE_MS (dedupe). Best effort: a failed post
  * never rejects.
  */
 export async function forwardPeerReply(
@@ -4344,8 +4296,7 @@ export async function forwardPeerReply(
     const meta = inboundMeta.get(replyTo);
     if (!meta) return { forwarded: false, reason: "unknown-target" };
     const authorId = meta.authorId;
-    if (!authorId || !(ch.peerBotIds ?? []).includes(authorId))
-      return { forwarded: false, reason: "not-peer" };
+    if (!authorId) return { forwarded: false, reason: "not-peer" };
     if (meta.body.startsWith(FWD_MARKER))
       return { forwarded: false, reason: "loop-guard" };
     const targetChannel = ch.peerChannels?.[authorId];
@@ -4390,29 +4341,14 @@ export function buildInteractionHandler(
   ctx: ExtensionContext,
   ch: ChannelConfig,
   botToken: string,
-  vaultRef?: { handlePatComponent(d: any): Promise<void> } | null,
-  vault2Ref?: { handleVaultComponent(d: any): Promise<void> } | null,
 ): (d: any) => Promise<void> {
   return async (d: any) => {
-    // Type-4 (button) events go to the vaults. The .catch is the M1
-    // dispatch-side backstop: each component handler never rejects by
-    // construction (top-level catch), but the gateway branch calls this
-    // handler un-awaited inside a sync-only try/catch — an escaped
-    // rejection would crash the whole bridge (Node 22 defaults to
-    // unhandled-rejections=throw).
-    // MESSAGE_COMPONENT (button/select) events go to the vaults — type 3
-    // per the current Discord spec (it was 4 in the old numbering; the
-    // type-4 gate + missing INTERACTIONS intent is why every tap fell
-    // through to the slash-command path, RCA 2026-10-01).
-    if (d?.type === 3) {
-      vaultRef
-        ?.handlePatComponent(d)
-        .catch((e) => console.error("[interactions] vault handler failed:", e));
-      vault2Ref
-        ?.handleVaultComponent(d)
-        .catch((e) => console.error("[interactions] vault handler failed:", e));
-      return;
-    }
+    // MESSAGE_COMPONENT (button/select) events: type 3 per the current
+    // Discord spec (it was 4 in the old numbering). The vault was the
+    // only component producer — drop them before the command path (the
+    // gateway branch calls this handler un-awaited inside a sync-only
+    // try/catch; a reply here would need an ack the tap never gets).
+    if (d?.type === 3) return;
     // Config fallback covers the pre-resolution window where no gateway
     // state exists yet (and keeps tests simple).
     const cid = getDiscordChannelId(ch.id) || ch.channel;
@@ -4446,18 +4382,6 @@ export function buildInteractionHandler(
           ].includes(o?.name),
         )
       : undefined;
-    // /vault (#206): subcommand form — the first option is the
-    // subcommand (type 1); its "id" option (type 3) is the credential
-    // id. Fold back to "status" / "approve <id>" for runChannelCommand.
-    let vaultArg: string | undefined;
-    if (d.data?.name === "vault" && Array.isArray(d.data.options)) {
-      const sub = d.data.options.find((o: any) => o?.type === 1);
-      const subOpts = Array.isArray(sub?.options) ? sub.options : [];
-      const idOpt = subOpts.find((o: any) => o?.name === "id");
-      vaultArg = sub
-        ? `${sub.name}${idOpt?.value != null ? ` ${String(idOpt.value)}` : ""}`
-        : "";
-    }
     let text: string | undefined;
     try {
       const r = await runChannelCommand(
@@ -4465,13 +4389,9 @@ export function buildInteractionHandler(
         ctx,
         ch,
         d.data?.name,
-        vaultArg ?? opt?.value ?? undefined,
+        opt?.value ?? undefined,
         interactionUserId(d),
         true,
-        {
-          guildId: d.guild_id != null ? String(d.guild_id) : undefined,
-          username: interactionUserName(d),
-        },
       );
       text = r.btw
         ? undefined
@@ -5360,7 +5280,6 @@ async function runChannelCommand(
   arg: string | undefined,
   fromId: string | undefined,
   native: boolean,
-  opts?: { guildId?: string; username?: string },
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
   const isOwner = isOwnerUser(ch, fromId);
   // A recognised command is NEVER handed to the agent as plain text when the
@@ -6154,24 +6073,6 @@ async function runChannelCommand(
         ),
       };
     }
-    case "vault": {
-      // #206 (D5): owner-gated text path for the credential vault.
-      // status | approve <id> | deny <id> | ping <id>. Non-owner ->
-      // visible error + audit (inside vaultSlash); the transitions
-      // share applyDecision() with the button taps.
-      const h = vaultHandles.get(ch.id);
-      if (!h) return { immediate: fence("[!] vault not running") };
-      const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
-      const r = await vaultSlash(
-        h.vault,
-        parts[0] ?? "status",
-        parts[1],
-        fromId ?? "",
-        opts?.username ?? fromId ?? "",
-        opts?.guildId,
-      );
-      return { immediate: fence(r.text) };
-    }
     default:
       return {};
   }
@@ -6737,7 +6638,6 @@ export async function handleInbound(
         cmd.arg,
         msg.fromId,
         false,
-        undefined,
       );
       if (r.btw) {
         noAck();

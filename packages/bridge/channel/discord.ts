@@ -668,15 +668,9 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
 
   const { config, callbacks } = state;
   if (state.botUserId && raw.author?.id === state.botUserId) return false; // skip self
-  const peerBots = config.peerBotIds ?? [];
-  // Skip other bots unless exempt: [bg: webhook wakes, or peer agents
-  // posting into this channel via agent-say (author.id in peerBotIds).
-  if (
-    raw.author?.bot &&
-    !isBgWebhook(raw) &&
-    !peerBots.includes(String(raw.author.id))
-  )
-    return false;
+  // Skip other bots unless exempt: [bg: webhook wakes (the dispatch
+  // wake mechanism — see isBgWebhook).
+  if (raw.author?.bot && !isBgWebhook(raw)) return false;
 
   const channelMsg = buildChannelMessageFromRaw(config, raw);
 

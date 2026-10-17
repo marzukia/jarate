@@ -7,7 +7,6 @@ import { fmtTokensLC } from "./ctxwatch";
 import {
   clearDiscordStatesForTest,
   getChannelCursor,
-  interactionUserId,
   loadPersistedCursors,
   pollDiscord,
   seedChannelStateForTest,
@@ -17,7 +16,6 @@ import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
-  __setVaultHandleForTest,
   bashToolEssential,
   buildInteractionHandler,
   buildRepliedMessageBlock,
@@ -123,13 +121,6 @@ import {
   resolveSystemdUnit,
 } from "./types";
 import { performUndo } from "./undo";
-import {
-  __vaultResetForTest,
-  __vaultSetWakeWebhookForTest,
-  startVault,
-  stopVault,
-  vaultRequest,
-} from "./vault";
 import { clearWorktreeState } from "./worktree";
 
 /** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
@@ -1016,7 +1007,8 @@ describe("extension handlers (A1/A2/A4)", () => {
   // peer's message is auto-forwarded to the peer's channel (one hop,
   // [fwd]-marked, 60 s identical-text dedupe).
 
-  // Peer variant: the author id is in the peer settings' peerBotIds.
+  // Peer variant: the author id has a peerChannels mapping in the peer
+  // settings.
   const inboundPeer = (body: string, id: string): ChannelMessage => ({
     ...inbound(body, id),
     from: "peer",
@@ -1037,7 +1029,6 @@ describe("extension handlers (A1/A2/A4)", () => {
             botToken: "tok1",
             ownerUserId: "uid",
             ack: true,
-            peerBotIds: ["peer-1"],
             peerChannels: { "peer-1": "998" },
             ...extra,
           },
@@ -1065,14 +1056,14 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
   });
 
-  test("c1: isPeerInbound classifies on peerBotIds + fromId", () => {
+  test("c1: isPeerInbound classifies on peerChannels + fromId", () => {
     const ch = {
       id: "ch1",
       name: "Test",
       type: "discord" as const,
       enabled: true,
       channel: "ch1",
-      peerBotIds: ["peer-1"],
+      peerChannels: { "peer-1": "998" },
     };
     const base = inbound("x", "1");
     expect(isPeerInbound(ch, { ...base, fromId: "peer-1" })).toBe(true);
@@ -1235,10 +1226,10 @@ describe("extension handlers (A1/A2/A4)", () => {
     peerSettings({ peerChannels: undefined }); // mapping absent
     await handleInbound(pi, inboundPeer("monky: do Y", "185"), ctx);
     const unmapped = sent.at(-1)!.m.content;
-    expect(unmapped).toContain(PEER_SENDER_HINT_NO_FWD);
-    expect(unmapped).toContain("use agent-say"); // agent-say directive present
-    expect(unmapped).not.toContain("auto-forwards that one hop");
+    // No peerChannels mapping → not classified as a peer: no hint at all
+    // (the NO_FWD variant needs the mapping to know which peer it is).
     expect(unmapped).not.toContain(PEER_SENDER_HINT);
+    expect(unmapped).not.toContain(PEER_SENDER_HINT_NO_FWD);
   });
 
   test("b: peerFwdAt prunes entries at the dedupe window on write", async () => {
@@ -2033,7 +2024,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     // WHETHER it delivers.
 
     test("peer mid-run inbound arms the 4x in-flight window, not the 3s default (#165)", async () => {
-      peerSettings(); // peerBotIds: [peer-1]
+      peerSettings(); // peerChannels: { peer-1: 998 }
       await handlers.session_start?.(null, ctx); // configRoot for peer lookup
       expect(idle).toBe(false);
       const baseSends = sent.length;
@@ -2064,7 +2055,7 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     test("human mid-run inbound keeps the 3s default with peer config active (#165)", async () => {
       peerSettings(); // same fixture as the peer test: fromId is the ONLY
-      // differentiator (uid is not in peerBotIds)
+      // differentiator (uid has no peerChannels mapping)
       await handlers.session_start?.(null, ctx); // configRoot for peer lookup
       expect(idle).toBe(false);
       const baseAborts = abortCount;
@@ -2623,7 +2614,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       // python3-missing fallback only. The bridge-built body is the
       // serialized embed — no "[bg:" prefix anywhere. The 2026-10-06
       // incident lost EXACTLY this shape (msg 1556883632919150653, Beepy
-      // webhook author not in peerBotIds, mid-run): pre-fix isBgInbound
+      // webhook author with no peerChannels mapping, mid-run): pre-fix isBgInbound
       // missed it and the 3s interrupt armed + was lost at compact.
       const body = [
         "<embed>",
@@ -2641,7 +2632,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
       const baseTimers = pendingInterrupts.size;
-      // Beepy-style author: a webhook bot NOT in peerBotIds.
+      // Beepy-style author: a webhook bot with no peerChannels mapping.
       const msg = {
         ...inbound(body, "1556883632919150653"),
         from: "Beepy",
@@ -2711,7 +2702,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("peer bot speech mid-run: 12s arm (regression pin, #175)", async () => {
-      peerSettings(); // peerBotIds: [peer-1]
+      peerSettings(); // peerChannels: { peer-1: 998 }
       await handlers.session_start?.(null, ctx); // configRoot for peer lookup
       const baseSends = sent.length;
       const baseAborts = abortCount;
@@ -5248,76 +5239,6 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     );
     expect(edit).toBeDefined();
     expect(JSON.parse(edit!.body).content).toContain("boom");
-  });
-
-  test("type-3 (MESSAGE_COMPONENT) events route to the vault handlers, not the command path", async () => {
-    let patCalled = false;
-    let vaultCalled = false;
-    const h = buildInteractionHandler(
-      pi,
-      ctx,
-      ch,
-      "tok-i",
-      {
-        handlePatComponent: async () => {
-          patCalled = true;
-        },
-      },
-      {
-        handleVaultComponent: async () => {
-          vaultCalled = true;
-        },
-      },
-    );
-    await h({
-      id: "i3",
-      token: "tok123",
-      application_id: "app1",
-      channel_id: "888",
-      // live guild shape: actor at member.user, no top-level user
-      member: { user: { id: "owner1", username: "OwnerOne" } },
-      type: 3,
-      data: {
-        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
-      },
-    });
-    expect(patCalled).toBe(true);
-    expect(vaultCalled).toBe(true);
-    // The router itself made no network call — the component handlers own
-    // the ack (they no-op for non-matching custom_ids).
-    expect(calls.length).toBe(0);
-  });
-
-  test("type-3 guild-shape payload resolves the actor through the shared path (F4)", async () => {
-    // The live type-3 (button tap) payload has no top-level user and no
-    // message — the actor is at member.user. The index router forwards the
-    // payload intact to the component handlers, and those resolve the actor
-    // via the SAME shared helper (interactionUserId) the tap path uses —
-    // see vault.test.ts "guild payload (live capture 2026-10-08)" tests
-    // for the real-handler side.
-    let resolved: string | undefined;
-    let resolvedName: string | undefined;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i", null, {
-      handleVaultComponent: async (dd: any) => {
-        resolved = interactionUserId(dd);
-        resolvedName = dd?.member?.user?.username;
-      },
-    });
-    await h({
-      id: "i3",
-      token: "tok123",
-      application_id: "app1",
-      channel_id: "888",
-      guild_id: "guild1",
-      type: 3,
-      member: { user: { id: "owner1", username: "OwnerOne" } },
-      data: {
-        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
-      },
-    });
-    expect(resolved).toBe("owner1"); // member.user resolved, not ""
-    expect(resolvedName).toBe("OwnerOne"); // payload forwarded intact
-    expect(calls.length).toBe(0); // the router itself made no network call
   });
 
   test("command path with a missing name fails readable, not TypeError", async () => {
@@ -7925,7 +7846,6 @@ describe("handoff mechanism B (size-gated restart)", () => {
       type: "discord",
       botToken: "tok1",
       ownerUserId: "uid",
-      peerBotIds: ["bot-a"],
       default: true,
     },
   ];
@@ -8345,7 +8265,6 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
       type: "discord",
       botToken: "tok1",
       ownerUserId: "uid",
-      peerBotIds: ["bot-a"],
       default: true,
     },
   ];
@@ -10078,62 +9997,6 @@ describe("wave 2c bridge commands", () => {
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined }); // bare /jobs: view, no arg
   });
 
-  test("text /vault routes to the vault handler (#206: matchCommand + case vault)", async () => {
-    // The plain-text path (matchCommand regex -> runChannelCommand case
-    // "vault") is distinct from the slash-command path: a misfired regex or
-    // a dropped switch case silently answers "unknown command" or hands
-    // "/vault status" to the agent as a prompt.
-    // The startup path auto-registers a vault handle per connected channel
-    // (async), so pin the no-handle state explicitly for a deterministic
-    // refusal.
-    __setVaultHandleForTest("ch1", null);
-    expect(matchCommand("/vault status")).toEqual({
-      name: "vault",
-      arg: "status",
-    });
-    expect(matchCommand("/vault")).toEqual({ name: "vault", arg: undefined });
-    // no vault handle: visible refusal, not a prompt
-    await handleInbound(pi, inbound("/vault status", "mv0"), ctx);
-    expect(posts().some((t) => t.includes("vault not running"))).toBe(true);
-    // real vault on the channel: the text command reaches vaultSlash
-    const vtmp = path.join(tmp, "vault");
-    const vh = startVault({
-      ch: {
-        id: "ch1",
-        name: "Test",
-        type: "discord",
-        botToken: "tok1",
-        ownerUserId: OWNER,
-      } as any,
-      botToken: "tok1",
-      stateDir: path.join(vtmp, "state"),
-      xdgDir: path.join(vtmp, "xdg"),
-      vaultDir: vtmp,
-      knownDir: path.join(vtmp, "known"),
-      secretsDir: path.join(vtmp, "secrets"),
-      stateFile: path.join(vtmp, "state.json"),
-      auditFile: path.join(vtmp, "audit.log"),
-      legacyPatsDir: path.join(vtmp, "legacy"),
-      legacyDefaultPatFile: path.join(vtmp, "marzukia-pat"),
-      transport: "socket",
-    });
-    __setVaultHandleForTest("ch1", vh);
-    try {
-      await vh.ready;
-      fetchCalls.length = 0;
-      await handleInbound(pi, inbound("/vault status", "mv1"), ctx);
-      expect(
-        posts().some((t) =>
-          t.includes("vault: no pending or active credentials"),
-        ),
-      ).toBe(true);
-    } finally {
-      stopVault(vh);
-      __setVaultHandleForTest("ch1", null);
-      __vaultResetForTest();
-    }
-  });
-
   test("runUsageLine: pricing matches pi-token-cost.py (#40)", () => {
     expect(
       runUsageLine({
@@ -11737,338 +11600,5 @@ describe("live marker (#191 M2)", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  });
-});
-
-// ─── /vault interaction subcommands (#206, D5) ─────────────────────────────
-// The `vault` entry in SLASH_COMMANDS routes to vaultSlash with the SAME
-// state transitions as button taps. These tests wire a REAL vault
-// (socket transport, mkdtemp XDG) into a bridge channel via
-// __setVaultHandleForTest and drive buildInteractionHandler the way
-// Discord would. No network: fetch is stubbed.
-
-describe("buildInteractionHandler: /vault subcommands (#206)", () => {
-  const realFetch = globalThis.fetch;
-  const VAULT_ENV_KEYS = [
-    "JARATE_VAULT_TTL_MS",
-    "JARATE_VAULT_CLAIM_MS",
-    "JARATE_VAULT_CENSOR_GRACE_MS",
-    "JARATE_VAULT_HOUR_MS",
-    "JARATE_VAULT_MAX_PENDING",
-  ];
-
-  let calls: Array<{ url: string; method: string; body: any }>;
-  let urlViolations: string[] = [];
-  let tmp: string;
-  let vaultHandle: any;
-  let pi: any;
-  const ctx: any = {
-    cwd: "/tmp",
-    isIdle: () => true,
-    hasPendingMessages: () => false,
-    abort: () => {},
-    compact: () => {},
-    modelRegistry: { getAvailable: () => [] },
-    getContextUsage: () => undefined,
-    model: { id: "cur", name: "Cur" },
-  };
-
-  const ch = {
-    id: "ich",
-    name: "IntTest",
-    type: "discord",
-    botToken: "tok-i",
-    channel: "888",
-    ownerUserId: "owner1",
-  } as any;
-
-  const d = (
-    name: string,
-    extra: Record<string, unknown> = {},
-    userId = "owner1",
-  ) => ({
-    id: "i1",
-    token: "tok123",
-    application_id: "app1",
-    channel_id: "888",
-    guild_id: "guild1",
-    // Live guild shape (capture 2026-10-08): the actor lives at
-    // member.user; guild INTERACTION_CREATE payloads carry NO top-level
-    // user. The one top-level-only (DM/older-shape) test in this file is
-    // "status (owner)" below — the helper must still accept it.
-    member: {
-      user: {
-        id: userId,
-        username: userId === "owner1" ? "OwnerOne" : "Somebody",
-      },
-    },
-    data: { name, options: [] as any[], ...extra },
-  });
-
-  function jsonResp(status: number, data: unknown) {
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      json: async () => data,
-      text: async () => JSON.stringify(data ?? ""),
-    };
-  }
-
-  /** Fetch stub recording every call; channel message POSTs get real ids.
-   *  F2: every call is checked against the interaction URL contract
-   *  (plus the vault's plain channel-message routes); violations are
-   *  asserted clean in afterEach. */
-  function stubFetch() {
-    calls = [];
-    urlViolations = [];
-    let msgSeq = 0;
-    globalThis.fetch = (async (url: any, init?: any) => {
-      const method = init?.method ?? "GET";
-      const body =
-        method !== "GET" && init?.body
-          ? JSON.parse(init.body as string)
-          : undefined;
-      const v = interactionUrlViolation(String(url), method, true);
-      if (v) urlViolations.push(v);
-      calls.push({ url: String(url), method, body });
-      if (method === "POST" && String(url).includes("/channels/888/messages")) {
-        return jsonResp(200, { id: `m${++msgSeq}` });
-      }
-      return jsonResp(204, null);
-    }) as any;
-    return calls;
-  }
-
-  /** Deferred-ack edits (defer-first design): immediate results land as
-   *  PATCH /webhooks/.../messages/@original, not as a followup POST. */
-  function deferredTexts(): string[] {
-    return calls
-      .filter(
-        (c) =>
-          c.method === "PATCH" &&
-          c.url.includes("/webhooks/app1/tok123/messages/@original"),
-      )
-      .map((c) => String(c.body?.content ?? ""));
-  }
-
-  async function installVault(): Promise<void> {
-    stubFetch();
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-vault-"));
-    const xdg = path.join(tmp, "xdg");
-    for (const k of VAULT_ENV_KEYS) {
-      process.env[k] =
-        k === "JARATE_VAULT_MAX_PENDING"
-          ? "5"
-          : k === "JARATE_VAULT_HOUR_MS"
-            ? "600"
-            : "200";
-    }
-    process.env.JARATE_VAULT_TTL_MS = "1200";
-    process.env.JARATE_VAULT_CLAIM_MS = "800";
-    // known value the github-pat requests resolve against (vault known/ dir
-    // layout: <kind>/<owner>/<name>), token shape per validateValueShape
-    const knownDir = path.join(tmp, "vault", "known");
-    fs.mkdirSync(path.join(knownDir, "github-pat", "marzukia"), {
-      recursive: true,
-    });
-    fs.writeFileSync(
-      path.join(knownDir, "github-pat", "marzukia", "jarate:write"),
-      `github_pat_${"f".repeat(30)}`,
-      { mode: 0o600 },
-    );
-    pi = { setModel: () => {}, sendMessage: async () => ({}) };
-    vaultHandle = startVault({
-      ch,
-      botToken: ch.botToken,
-      stateDir: path.join(tmp, "state"),
-      xdgDir: xdg,
-      vaultDir: path.join(tmp, "vault"),
-      knownDir: path.join(tmp, "vault", "known"),
-      secretsDir: path.join(tmp, "vault", "secrets"),
-      stateFile: path.join(tmp, "vault", "state.json"),
-      auditFile: path.join(tmp, "vault", "audit.log"),
-      legacyPatsDir: path.join(tmp, "legacy-pats"),
-      legacyDefaultPatFile: path.join(tmp, "marzukia-pat"),
-      transport: "socket",
-    });
-    __setVaultHandleForTest(ch.id, vaultHandle);
-    // Wake webhook is orthogonal to these interaction tests — null it
-    // for hermeticity (the real dispatch-bus URL sits outside the
-    // interaction URL contract; vault.test.ts covers the wake posts).
-    // afterEach's __vaultResetForTest restores the default resolver.
-    __vaultSetWakeWebhookForTest(() => null);
-    await vaultHandle.ready;
-  }
-
-  function auditEvents(): any[] {
-    const p = path.join(tmp, "vault", "audit.log");
-    if (!fs.existsSync(p)) return [];
-    return fs
-      .readFileSync(p, "utf8")
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l));
-  }
-
-  afterEach(() => {
-    // F2: no interaction call may land outside the allowed routes.
-    expect(urlViolations).toEqual([]);
-    globalThis.fetch = realFetch;
-    if (vaultHandle) {
-      stopVault(vaultHandle);
-      vaultHandle = undefined;
-      __vaultResetForTest();
-    }
-    __setVaultHandleForTest(ch.id, null);
-    if (tmp) {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      tmp = undefined as any;
-    }
-    for (const k of VAULT_ENV_KEYS) delete process.env[k];
-    clearDiscordStatesForTest();
-  });
-
-  test("no vault on the channel: visible error, no crash", async () => {
-    stubFetch();
-    pi = { setModel: () => {}, sendMessage: async () => ({}) };
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(d("vault", { options: [{ type: 1, name: "status" }] }) as any);
-    expect(deferredTexts().at(-1)).toContain("vault not running");
-  });
-
-  test("status (owner): lists the pending request in the reply", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    // DM/older payload shape: top-level user ONLY (no member) — the single
-    // test in this file that keeps this shape; interactionUserId must still
-    // resolve the owner from it (F1). If the top-level fallback were gone,
-    // uid would be "" and this owner-only command would refuse.
-    await h({
-      ...d("vault", { options: [{ type: 1, name: "status" }] }),
-      user: { id: "owner1", username: "OwnerOne" },
-      member: undefined,
-    } as any);
-    const text = deferredTexts().at(-1)!;
-    expect(text).toContain("[vault: 1 pending, 0 active]");
-    expect(text).toContain("github-pat/marzukia/jarate:write");
-    expect(text).toContain("one-shot");
-    // message link uses the interaction's guild id
-    expect(text).toContain("https://discord.com/channels/guild1/888/");
-  });
-
-  test("approve (owner): same transition as a tap — active, card edited, audit actor slash:", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d("vault", {
-        options: [
-          {
-            type: 1,
-            name: "approve",
-            options: [{ type: 3, name: "id", value: id }],
-          },
-        ],
-      }) as any,
-    );
-    const cred = (vaultHandle.vault.credentials as any).get(id);
-    expect(cred.state).toBe("active");
-    // audit: the SAME event as a tap, actor names the slash path
-    const ev = auditEvents().find((e) => e.event === "approve");
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:owner1");
-    // card edited (the request message, not a new post)
-    const edits = calls.filter(
-      (c) => c.method === "PATCH" && c.url.includes("/channels/888/messages/"),
-    );
-    expect(edits.length).toBe(1);
-    expect(edits[0].body.embeds[0].title).toContain("approved");
-    expect(String(edits[0].body.content)).toContain(`jarate vault-run ${id}`);
-  });
-
-  test("deny (owner): denied state + audit actor slash:", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d("vault", {
-        options: [
-          {
-            type: 1,
-            name: "deny",
-            options: [{ type: 3, name: "id", value: id }],
-          },
-        ],
-      }) as any,
-    );
-    const cred = (vaultHandle.vault.credentials as any).get(id);
-    expect(cred.state).toBe("denied");
-    const ev = auditEvents().find((e) => e.event === "deny");
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:owner1");
-  });
-
-  test("non-owner: visible error + audited, state unchanged", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d(
-        "vault",
-        {
-          options: [
-            {
-              type: 1,
-              name: "approve",
-              options: [{ type: 3, name: "id", value: id }],
-            },
-          ],
-        },
-        "someone-else",
-      ) as any,
-    );
-    expect(deferredTexts().at(-1)).toContain(
-      "[!] only the owner can use /vault",
-    );
-    expect((vaultHandle.vault.credentials as any).get(id).state).toBe(
-      "pending",
-    );
-    const ev = auditEvents().find(
-      (e) => e.event === "slash-rejected" && e.reason === "not-owner",
-    );
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:someone-else");
   });
 });
