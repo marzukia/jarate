@@ -61,6 +61,7 @@ import extension, {
   pendingInterrupts,
   persistLivePlaceholders,
   popChannelQueuedInbound,
+  popOldestQueuedInbound,
   prunePendingBatches,
   queuedAcks,
   queueMidTurnInbound,
@@ -2827,6 +2828,45 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(react).toBeUndefined();
     });
 
+    test("#231 P2: [bg: inbound mid-run queues silently (no [queued] post)", async () => {
+      ctx.isIdle = () => false; // a run is in flight
+      await handleInbound(
+        pi,
+        inbound("[bg:worker:OK] 20261017-000000-1 · test task", "m1"),
+        ctx,
+      );
+      await flush();
+      // queued for the re-wake exactly as a human message is…
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      // …but no "[queued] N in line" post (no human waits in line).
+      expect(
+        fetchCalls.find(
+          (c) =>
+            c.method === "POST" &&
+            String(JSON.parse(c.body).content).includes("[queued]"),
+        ),
+      ).toBeUndefined();
+      // the entry still re-wakes at agent_end (queue semantics unchanged)
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(1);
+      expect(sent[0].m.details.messageId).toBe("m1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("#231 P2: human inbound mid-run still posts the [queued] line", async () => {
+      ctx.isIdle = () => false;
+      await handleInbound(pi, inbound("hello", "m1"), ctx);
+      await flush();
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      const ack = fetchCalls.find(
+        (c) =>
+          c.method === "POST" &&
+          String(JSON.parse(c.body).content).includes("[queued] 1 in line"),
+      );
+      expect(ack).toBeDefined();
+    });
+
     test("'. queue' parks in the re-wake queue and does NOT arm the interrupt", async () => {
       jest.useFakeTimers();
       idle = false;
@@ -3489,6 +3529,92 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.session_start?.(null, ctx);
     process.env.HOME = oldHome;
     expect(sent.length).toBe(sentBefore);
+  });
+});
+
+describe("re-wake in-turn consumed marker (#231 P3)", () => {
+  let tmp = "";
+  let oldHome = "";
+  const stateDir = () => path.join(tmp, ".pi-dispatch-state");
+  const markerDir = () => path.join(tmp, ".pi-dispatch", "in-turn-consumed");
+  const writeMarker = (id: string) => {
+    fs.mkdirSync(markerDir(), { recursive: true });
+    fs.writeFileSync(path.join(markerDir(), id), "");
+  };
+  const base = {
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord" as const,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  };
+  const bgInbound = (id: string): ChannelMessage => ({
+    ...base,
+    messageId: id,
+    from: "pi-bg",
+    fromId: "wa-1",
+    body: `[bg:worker:OK] 20261017-000000-1 · task ${id}`,
+  });
+  const humanInbound = (id: string): ChannelMessage => ({
+    ...base,
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body: `human text ${id}`,
+  });
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "itc-test-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp; // hasInTurnConsumedMarker resolves $HOME live
+    setRuntimeStateDir(stateDir());
+    midTurnQueues.clear();
+    queuedAcks.clear();
+    heldChannels.clear();
+  });
+
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    setRuntimeStateDir(null);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("queued [bg: entry WITH a consumed marker is dropped, next entry popped", () => {
+    queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
+    queueMidTurnInbound("ch1", bgInbound("222"), "t", "discord/Test", "t");
+    // jarate-wait consumed the OLDEST in turn; the other keeps its wake
+    writeMarker("111");
+    const popped = popOldestQueuedInbound();
+    expect(popped?.msg.messageId).toBe("222");
+    // the consumed copy is gone from memory AND the survival file…
+    expect(midTurnQueues.has("ch1")).toBe(false);
+    const file = loadRewakeQueue(stateDir(), "ch1");
+    // …the popped copy (222) stays pending — it commits via sendToPi on
+    // delivery; the dropped copy (111) is committed as delivered
+    expect(file.pending.map((p) => p.msg.messageId)).toEqual(["222"]);
+    expect(file.delivered).toContain("111");
+  });
+
+  test("queued [bg: entry WITHOUT a marker is delivered (timeout path)", () => {
+    queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
+    const popped = popOldestQueuedInbound();
+    expect(popped?.msg.messageId).toBe("111");
+    expect(midTurnQueues.has("ch1")).toBe(false);
+  });
+
+  test("human entry with a marker file for its id is still delivered", () => {
+    queueMidTurnInbound(
+      "ch1",
+      humanInbound("333"),
+      "t",
+      "discord/Test",
+      "t",
+      false,
+    );
+    writeMarker("333"); // the marker only gates [bg: wakes
+    const popped = popOldestQueuedInbound();
+    expect(popped?.msg.messageId).toBe("333");
   });
 });
 
@@ -10483,27 +10609,26 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
   });
 
   test("crash with a live [queued] line: ack id survives in the file, restored + deleted exactly once", async () => {
-    // ── Process 1: callback queued mid-run; the [queued] ack POST
-    // resolves (fake id "w1") and its id is mirrored into the file
+    // ── Process 1: a HUMAN inbound queued mid-run; its [queued] ack
+    // POST resolves (fake id "w1") and its id is mirrored into the
+    // file. (#231 P2: [bg: inbounds queue silently — no ack line — so
+    // the line-survival contract is exercised on the human entry; the
+    // [bg: entry joins in the ack-less shape below.)
     const p1 = mkProcess();
     const ctx1 = mkCtx(false);
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound("fix the thing", "2000"), ctx1, false);
     setChannelCursor("ch1", "2000");
     await waitFor(
       () =>
         queuedAcks.get("2000")?.ackId === "w1" &&
         loadRewakeQueue(rewakeDir(), "ch1").pending[0]?.ackId === "w1",
     );
-    // an OLD-SHAPE entry (pre-fix writer: no ackId key on disk) joins
-    // the file — compat: it must still load and drain
+    // an ACK-LESS [bg: entry (the #231 P2 shape, and any pre-fix
+    // writer: no ackId key on disk) joins the file — it must still
+    // load and drain
     rewakeAddPending(rewakeDir(), "ch1", {
       msg: inbound("[bg:worker:OK] 3000", "3000"),
       queuedAt: Date.now(),
@@ -10512,7 +10637,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
       fs.readFileSync(path.join(rewakeDir(), "rewake-ch1.json"), "utf8"),
     ) as { pending: Array<Record<string, unknown>> };
     expect(raw.pending[0].ackId).toBe("w1");
-    expect(raw.pending[1].ackId).toBeUndefined(); // old shape on disk
+    expect(raw.pending[1].ackId).toBeUndefined(); // no line on disk
 
     // ── CRASH: no session_shutdown. Memory (incl. the ack map) dies
     // with the process, the ack line stays in Discord, the file
@@ -10525,16 +10650,16 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
     script.scan = [];
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    // the survival drain re-queued BOTH entries (old shape loads)…
+    // the survival drain re-queued BOTH entries (ack-less loads)…
     expect(midTurnQueues.get("ch1")?.length).toBe(2);
     // …and restored ONLY the entry whose ack survived, at its line
-    // position — the old-shape entry has no (nonexistent) line
+    // position — the [bg: entry has no (nonexistent) line
     expect(queuedAcks.get("2000")?.ackId).toBe("w1");
     expect(queuedAcks.get("2000")?.pos).toBe(1);
     expect(queuedAcks.has("3000")).toBe(false);
 
     // the wake run ends -> the re-wake pop delivers the survived
-    // callback and consumes the restored ack
+    // inbound and consumes the restored ack
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
         String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
@@ -10542,7 +10667,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     );
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     const delivered = customSends(p2.sent).filter((s) =>
-      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      String(s.m.details?.body ?? "").includes("fix the thing"),
     );
     expect(delivered).toHaveLength(1);
     // the kept [queued] line is deleted EXACTLY ONCE: the crash left
@@ -10554,7 +10679,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
       ),
     ).toHaveLength(1);
     expect(queuedAcks.get("2000")).toBeUndefined();
-    // the old-shape entry is still queued (no line to delete) and the
+    // the [bg: entry is still queued (no line to delete) and the
     // delivered set now holds the committed id
     const f2 = loadRewakeQueue(rewakeDir(), "ch1");
     expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
