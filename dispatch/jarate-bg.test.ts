@@ -670,8 +670,35 @@ const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
 
 const KILL = path.join(import.meta.dir, "jarate-bg-kill");
 
-// fake ids in year 2099: never collide with real tickets in /tmp
-const TID = (n: number) => `20991231-235959-${n}`;
+// Fake ids in year 2099: never collide with real tickets (real run ids
+// carry the real date - jarate-bg run_id). The id encodes user+process,
+// all digits to stay valid for the ticket validators
+// (^[0-9]{8}-[0-9]{6}-[0-9]+$ in the jarate-bg-watchdog sweep and in
+// jarate-bg-kill/-tail):
+//   group 2 = uid (4 digits, zero-padded) + n (2 digits, zero-padded)
+//   group 3 = this process's pid (zero-padded to >= 6; unbounded -
+//             pid_max is 4194304 on these boxes, pids run 6-7 digits)
+// Why structural: a fixture path under sticky /tmp is only shared by the
+// SAME owner. A same-path collision needs an identical uid group, i.e.
+// the same user, who may unlink (sticky-bit owner rule) and rewrite
+// 0644 files. Cross-user leftovers - jimmy-owned /tmp/pi-bg-...-out.md
+// EACCES-ing monky's+frank's deploy tests, incident 2026-10-17 - are
+// impossible. Two concurrent runs of one user differ in the pid group;
+// same user + recycled pid later is the same owner, so the rmLegacy
+// (force) cleanup and writeFileSync still work.
+// Length budget: "jarate/<t>" must fit the STALLED embed row clip
+// (LINE_W=30, watchdog) -> TID <= 23 chars; met with a <=9999 uid
+// (guarded) and the unbounded pid group. n is capped at 99 (2 digits);
+// the pi-bg-tail fixture family below takes n 31-33, the watchdog
+// fixtures n 1-24 - the same family separation the old minute tag
+// (235958 vs 235959) gave.
+const TID_UID = os.userInfo().uid;
+if (TID_UID > 9999)
+  throw new Error(`TID encoding needs a <=9999 uid, got ${TID_UID}`);
+const TID = (n: number) => {
+  if (n > 99) throw new Error(`TID n must fit 2 digits, got ${n}`);
+  return `20991231-${String(TID_UID).padStart(4, "0")}${String(n).padStart(2, "0")}-${String(process.pid).padStart(6, "0")}`;
+};
 
 /** True when any live process's cmdline contains needle (orphan probe). */
 function liveProcWith(needle: string): boolean {
@@ -845,7 +872,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
-    const id = "20991231-235958-1";
+    const id = TID(31);
     fs.writeFileSync(path.join(art, `pi-bg-${id}-raw.out`), "fresh line\n");
     const env = { ...process.env } as Record<string, string>;
     env.HOME = tmp;
@@ -860,7 +887,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
-    const id = "20991231-235958-2";
+    const id = TID(32);
     const legacy = `/tmp/pi-bg-${id}-raw.out`;
     fs.writeFileSync(legacy, "legacy line\n");
     try {
@@ -881,7 +908,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     const env = { ...process.env } as Record<string, string>;
     env.HOME = tmp;
     env.PI_BG_TMPDIR = path.join(tmp, "art");
-    const r = await runScript(TAIL, ["20991231-235958-3"], env, tmp);
+    const r = await runScript(TAIL, [TID(33)], env, tmp);
     expect(r.code).toBe(2);
     expect(r.err).toContain("no live output");
   });
