@@ -54,9 +54,9 @@ egress lives:
   fields (truncated task text + raw worker output, the primary leak
   surface) and the legacy plain-text fallback body are all run through
   `jarate-censor` before the POST.
-- Peer-agent messages: `bin/agent-say` is gone (gut #228) — agent-to-agent
-  traffic now flows through hall-monitor fleet comms (`POST /fleet/say`),
-  an out-of-repo egress the censor does not wrap.
+- Peer-agent messages: agent-to-agent traffic flows through hall-monitor
+  fleet comms (`POST /fleet/say`), an out-of-repo egress the censor does
+  not wrap.
 
 Known open (residual gaps, not covered by any process today):
 
