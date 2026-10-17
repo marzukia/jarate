@@ -2573,6 +2573,174 @@ describe("#57: silent-death retry + RCA config fixes", () => {
   }, 60_000);
 });
 
+describe("think-trunc: maxTokens hit mid-thinking (2026-10-17 Frank worker wave)", () => {
+  // RCA: the model spends the whole maxTokens output budget on
+  // reasoning; the completion is cut off mid-thinking
+  // (stopReason=length) with a thinking-only final message - no tool
+  // calls, no text. pi ends the turn, prints nothing, exits rc=0:
+  // byte-identical to the transient "empty completion" quirk, but
+  // deterministic for the task. The wrapper relaunches ONCE on this
+  // signature (trunc1 marker, retry logged in the record); a second
+  // truncation reports EMPTY loud with the actual signature instead
+  // of burning the 3-attempt blind retry budget with a blank brief.
+  const capture = () => {
+    const posts: Array<{ embeds: any[] }> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      posts,
+      close: () => server.stop(true),
+    };
+  };
+
+  const artDir = (fx: { home: string }) => path.join(fx.home, ".pi-bg-art");
+
+  // fake pi: for the first `die` launches it writes a session jsonl
+  // whose last assistant message is thinking-only + stopReason=length,
+  // prints nothing, exits rc=0; afterwards it prints healthy output.
+  // The state file doubles as a launch counter.
+  const truncStubPi = (fx: { tmp: string }, die: number) => {
+    const state = path.join(fx.tmp, "pi-trunc-state");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\nif [ "$n" -le "${die}" ]; then\n  s="--\${PWD#/}"; s=$(printf '%s' "$s" | sed 's#/#-#g'); s="\${s}--"\n  d="$HOME/.pi/agent-worker/sessions/$s"\n  mkdir -p "$d"\n  printf '%s\\n' '{"type":"session","version":3,"id":"trunc-\${n}","timestamp":"2026-10-17T04:00:00Z","cwd":"$PWD"}' '{"type":"message","id":"a\${n}","parentId":null,"timestamp":"2026-10-17T04:00:10Z","message":{"role":"assistant","content":[{"type":"thinking","text":"geometry geometry geometry"}],"api":"openai-completions","provider":"vllm","model":"qwen-test","usage":{"input":100,"output":16384,"cacheRead":0,"cacheWrite":0,"totalTokens":16484},"stopReason":"length"}}' > "$d/sess-\${n}.jsonl"\n  exit 0\nfi\necho trunc-retry-ok\n`,
+    );
+    fs.chmodSync(piBin, 0o755);
+    return state;
+  };
+
+  test("truncation once, then healthy -> OK, trunc1 consumed, retry logged", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = truncStubPi(fx, 1);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "trunc once task"]);
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("trunc-retry-ok");
+      // exactly two launches (original + one relaunch)
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("2");
+      const runId = fx.records()[0].run;
+      // trunc1 marker written before the relaunch, consumed on recovery
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-trunc1`)),
+      ).toBe(false);
+      expect(
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
+      ).toBe("0");
+      const rec = fx.records()[0];
+      expect(rec.retries).toHaveLength(1);
+      expect(rec.retries[0].reason).toBe("think-trunc");
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+      expect(
+        em.fields.find((f: { name: string }) => f.name === "result").value,
+      ).toContain("trunc-retry-ok");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("truncation x2 -> EMPTY loud with signature, no 3rd launch", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = truncStubPi(fx, Number.MAX_SAFE_INTEGER);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "trunc twice task"]);
+      expect(r.code).toBe(0); // pi exits 0; the status is in the embed
+      // exactly two launches - the marker gates a third
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("2");
+      const runId = fx.records()[0].run;
+      // marker kept (unconsumed)
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-trunc1`)),
+      ).toBe(true);
+      expect(
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-rc`), "utf8")
+          .trim(),
+      ).toBe("0");
+      const rec = fx.records()[0];
+      expect(rec.retries).toHaveLength(1);
+      expect(rec.retries[0].reason).toBe("think-trunc");
+      // one EMPTY callback with the actual signature (no blank brief)
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · EMPTY · \d+m\d{2}s$/);
+      const brief = em.fields.find((f: { name: string }) => f.name === "result")
+        .value as string;
+      expect(brief).toContain("max output tokens mid-thinking");
+      expect(brief).toContain("stopReason=length");
+      expect(brief).toContain("trunc1 did not recover");
+      // artifacts: out.md blank, raw.out 0 bytes (the observed signature)
+      expect(
+        fs
+          .readFileSync(path.join(artDir(fx), `pi-bg-${runId}-out.md`), "utf8")
+          .trim(),
+      ).toBe("");
+      expect(
+        fs.statSync(path.join(artDir(fx), `pi-bg-${runId}-raw.out`)).size,
+      ).toBe(0);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("empty completion without truncation signature -> unchanged 3-attempt behavior", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = path.join(fx.tmp, "pi-empty-state");
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    fs.writeFileSync(
+      piBin,
+      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\nexit 0\n`,
+    );
+    fs.chmodSync(piBin, 0o755);
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "empty stream task"]);
+      expect(r.code).toBe(0);
+      // no signature in the session dir -> the pre-existing blind retry
+      // budget (3 attempts) is untouched
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("3");
+      const runId = fx.records()[0].run;
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-trunc1`)),
+      ).toBe(false);
+      expect(fx.records()[0].retries ?? []).toHaveLength(0);
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · EMPTY · \d+m\d{2}s$/);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+});
+
 describe("#52: heartbeat (hb artifact, created at dispatch, gone on exit)", () => {
   test("hb file exists mid-run, ticks, and is removed on exit; no orphan child", async () => {
     const fx = fixture();
