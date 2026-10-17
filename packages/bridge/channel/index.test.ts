@@ -48,6 +48,7 @@ import extension, {
   isCompacting,
   isEssentialToolCall,
   isHeld,
+  isNoReply,
   isOwnerUser,
   isPeerInbound,
   isVerbose,
@@ -230,6 +231,20 @@ describe("chunkText", () => {
     const chunks = chunkText("a".repeat(250), 100);
     expect(chunks.every((c) => c.length <= 100)).toBe(true);
     expect(chunks.join("")).toBe("a".repeat(250));
+  });
+});
+
+describe("isNoReply", () => {
+  test("exact token (trim + case-insensitive)", () => {
+    expect(isNoReply("NO_REPLY")).toBe(true);
+    expect(isNoReply("no_reply")).toBe(true);
+    expect(isNoReply("  No_ReplY  ")).toBe(true);
+  });
+  test("non-matches stay postable", () => {
+    expect(isNoReply("NO_REPLY.")).toBe(false);
+    expect(isNoReply("NO_REPLY extra")).toBe(false);
+    expect(isNoReply("·")).toBe(false);
+    expect(isNoReply("")).toBe(false);
   });
 });
 
