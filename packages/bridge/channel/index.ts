@@ -449,32 +449,86 @@ export function queueMidTurnInbound(
   return q.length;
 }
 
+// ─── In-turn consumed marker (#231 P3) ──────────────────────────────────
+// jarate-wait writes one marker file per DISCORD MESSAGE id on rc 0
+// (~/.pi-dispatch/in-turn-consumed/<id>, dir 0700, >1h pruned on its
+// start). A [bg: callback the agent consumed IN TURN therefore has a
+// marker before any re-wake drain can pop its queued copy: the bridge
+// queued the message at arrival T0, jarate-wait saw the same message at
+// T1 >= T0 and wrote the marker, the drain consults at T2 > T1. A wait
+// timeout (rc 3) writes no marker -> the re-wake delivers as today (the
+// fix's failure mode IS today's behavior). Keyed on the message id, never
+// the ticket: the ticket's other messages keep their wakes.
+export function inTurnConsumedDir(home = defaultHome()): string {
+  return path.join(home, ".pi-dispatch", "in-turn-consumed");
+}
+
+/** #231 P3: does the Discord message id carry an in-turn consumed
+ *  marker? Never throws (missing dir/file = false; a non-numeric id is
+ *  no snowflake, so no file). */
+export function hasInTurnConsumedMarker(
+  messageId: string,
+  home = defaultHome(),
+): boolean {
+  if (!/^\d+$/.test(messageId)) return false;
+  try {
+    return fs.statSync(path.join(inTurnConsumedDir(home), messageId)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Pop the globally oldest queued inbound across all channels (FIFO).
  *  Held channels (#39) are skipped: their buffer drains on /hold off,
- *  not at agent_end. */
+ *  not at agent_end. #231 P3: a queued [bg: entry whose message id has
+ *  an in-turn consumed marker is DROPPED (logged) and the next entry
+ *  popped — the agent already consumed that callback in turn, so the
+ *  re-wake is the double-delivery copy. Human entries never drop (the
+ *  marker only gates [bg: wakes). */
 export function popOldestQueuedInbound(): {
   channelId: string;
   msg: ChannelMessage;
 } | null {
   ensureRuntimeStateLoaded();
-  let oldest: {
-    channelId: string;
-    msg: ChannelMessage;
-    queuedAt: number;
-  } | null = null;
-  for (const [channelId, q] of midTurnQueues) {
-    if (heldChannels.has(channelId)) continue;
-    const head = q[0];
-    if (!head) continue;
-    if (!oldest || head.queuedAt < oldest.queuedAt)
-      oldest = { channelId, msg: head.msg, queuedAt: head.queuedAt };
+  for (;;) {
+    let oldest: {
+      channelId: string;
+      msg: ChannelMessage;
+      queuedAt: number;
+    } | null = null;
+    for (const [channelId, q] of midTurnQueues) {
+      if (heldChannels.has(channelId)) continue;
+      const head = q[0];
+      if (!head) continue;
+      if (!oldest || head.queuedAt < oldest.queuedAt)
+        oldest = { channelId, msg: head.msg, queuedAt: head.queuedAt };
+    }
+    if (!oldest) return null;
+    const q = midTurnQueues.get(oldest.channelId)!;
+    // The head can move between scan and shift (a delete or interrupt
+    // cancel splices it): recompute on a stale snapshot instead of
+    // shifting the wrong entry.
+    if (q[0]?.queuedAt !== oldest.queuedAt) continue;
+    const drop =
+      isBgInbound(oldest.msg) && hasInTurnConsumedMarker(oldest.msg.messageId);
+    q.shift();
+    if (q.length === 0) midTurnQueues.delete(oldest.channelId);
+    consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
+    if (drop) {
+      // Consumed in turn = delivered: record the id (dedupes the
+      // startup history scan) and clear it from the survival file.
+      rewakeCommitDelivered(
+        runtimeStateDir,
+        oldest.channelId,
+        oldest.msg.messageId,
+      );
+      console.log(
+        `[channel] dropped in-turn-consumed [bg: re-wake ${oldest.msg.messageId} (${oldest.channelId})`,
+      );
+      continue;
+    }
+    return { channelId: oldest.channelId, msg: oldest.msg };
   }
-  if (!oldest) return null;
-  const q = midTurnQueues.get(oldest.channelId)!;
-  if (q[0].queuedAt === oldest.queuedAt) q.shift();
-  if (q.length === 0) midTurnQueues.delete(oldest.channelId);
-  consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
-  return { channelId: oldest.channelId, msg: oldest.msg };
 }
 
 /** Drop all queued inbounds for a channel (/stop, shutdown drain).
@@ -6597,6 +6651,11 @@ export async function handleInbound(
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
     noAck();
+    // #231 P2: [bg: machine wakes queue SILENTLY — no "[queued] N in
+    // line" post. No human waits in a machine-wake line, so the line is
+    // pure channel noise. The entry still queues (and re-wakes) exactly
+    // as today; human inbounds keep the post (the line IS their ack).
+    if (isBgInbound(msg)) return true;
     sendDiscordMessage(ch, fence(`[queued] ${pos} in line`), {
       replyToMessageId: msg.messageId,
     })

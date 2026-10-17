@@ -359,3 +359,62 @@ describe("jarate-wait #166 review LOW: poll parse noise stays off stderr", () =>
     expect(r.err).not.toContain("JSONDecodeError");
   });
 });
+
+describe("jarate-wait #231 P3: in-turn consumed marker", () => {
+  const itcDir = (f: Fixture): string =>
+    path.join(f.tmp, "home", ".pi-dispatch", "in-turn-consumed");
+
+  test("rc 0 writes a marker for the Discord message id (dir 0700)", async () => {
+    const f = fixture();
+    f.setMsgs(
+      JSON.stringify([
+        {
+          id: "m-cb",
+          webhook_id: "wh-1",
+          author: { id: WA_ID },
+          content: "cb",
+        },
+      ]),
+    );
+    const r = await f.run(["--since", "100", "--timeout", "5", "--check", "1"]);
+    expect(r.code).toBe(0);
+    const dir = itcDir(f);
+    expect(fs.existsSync(path.join(dir, "m-cb"))).toBe(true);
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  test("rc 3 (timeout) writes no marker", async () => {
+    const f = fixture();
+    const r = await f.run(["--since", "100", "--timeout", "2", "--check", "1"]);
+    expect(r.code).toBe(3);
+    expect(fs.existsSync(itcDir(f))).toBe(false);
+  });
+
+  test("rc 2 (human) writes no marker", async () => {
+    const f = fixture();
+    f.setMsgs(
+      JSON.stringify([
+        { id: "m-h", author: { id: "user-9", global_name: "Andryo" } },
+      ]),
+    );
+    const r = await f.run(["--since", "100", "--timeout", "5", "--check", "1"]);
+    expect(r.code).toBe(2);
+    expect(fs.existsSync(itcDir(f))).toBe(false);
+  });
+
+  test("start prunes markers older than 1 hour, keeps fresh ones", async () => {
+    const f = fixture();
+    const dir = itcDir(f);
+    fs.mkdirSync(dir, { recursive: true });
+    const stale = path.join(dir, "old-1");
+    const fresh = path.join(dir, "fresh-1");
+    fs.writeFileSync(stale, "");
+    fs.writeFileSync(fresh, "");
+    const t = Date.now() / 1000;
+    fs.utimesSync(stale, t - 7200, t - 7200); // 2 h old -> pruned
+    const r = await f.run(["--since", "100", "--timeout", "2", "--check", "1"]);
+    expect(r.code).toBe(3);
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+  });
+});

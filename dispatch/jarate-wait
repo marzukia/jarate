@@ -13,6 +13,10 @@
 # config (all from ~/.pi/agent/settings.json, no secrets in this repo):
 #   bot token + channel id from channels[0]
 #   webhook author id from ~/.config/pi-dispatch/webhook_author
+# #231 P3: on rc 0 the wait writes the in-turn consumed marker
+#   ~/.pi-dispatch/in-turn-consumed/<discord-message-id> (dir 0700,
+#   >1h old markers pruned on start). The bridge's re-wake drain drops
+#   a queued [bg: entry carrying that marker (double-delivery dedup).
 set -euo pipefail
 
 since=""; timeout=300; check=5
@@ -56,6 +60,16 @@ done
 }
 wa="$(head -1 "${HOME}/.config/pi-dispatch/webhook_author" 2>/dev/null || true)"
 [ -n "$wa" ] || { echo "webhook_author missing" >&2; exit 2; }
+
+# #231 P3: in-turn consumed marker (see rc 0 branch). The bridge's
+# re-wake drain drops a queued [bg: entry when a marker for its Discord
+# message id exists, so prune markers older than 1 hour on start: a
+# re-wake drain lands seconds after the turn ends, anything older is
+# stale (already drained, or its run long gone).
+ITC_DIR="${HOME}/.pi-dispatch/in-turn-consumed"
+if [ -d "$ITC_DIR" ]; then
+  find "$ITC_DIR" -maxdepth 1 -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
+fi
 
 end=$(( $(date +%s) + timeout ))
 while [ "$(date +%s)" -lt "$end" ]; do
@@ -106,7 +120,16 @@ EOF
     newid="${rest%%$'\t'*}"
     detail="${rest#*$'\t'}"
     if [ "$code" = "0" ]; then
-      echo "CALLBACK $newid"; printf '%s\n' "$detail"; exit 0
+      echo "CALLBACK $newid"; printf '%s\n' "$detail"
+      # #231 P3: mark this Discord MESSAGE id as consumed in turn. The
+      # bridge's re-wake drain (popOldestQueuedInbound) sees the marker
+      # and drops the queued copy — killing the double-delivery turn.
+      # Keyed on the message id: the ticket's other messages keep their
+      # wakes. Marker failure = today's behavior (the re-wake turn still
+      # happens); the rc stays 0.
+      { mkdir -p "$ITC_DIR" && chmod 700 "$ITC_DIR" \
+          && touch "$ITC_DIR/$newid"; } 2>/dev/null || true
+      exit 0
     else
       echo "HUMAN $newid: ${detail}"; exit 2
     fi
