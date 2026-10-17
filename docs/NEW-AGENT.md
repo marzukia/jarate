@@ -60,7 +60,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 
 | file | contents |
 |---|---|
-| `~/.config/marzukia-pat` | the operator's PAT (copy from an existing agent, chmod 600) - GitHub for now |
+| (none) | no PAT file - GitHub via hall-monitor vault: claim `gh_pat` in a plan; `$gh_pat` is injected as env for that run only |
 | `~/.config/pi-dispatch/webhook` | the jarate-bg callback webhook, first line, chmod 600 |
 | `~/.config/webdrop/config.toml` | copy from an existing agent |
 | `~/.hermes/.env` | copy from an existing agent (OPENROUTER key; credits may be $0 - the LLM does NOT use it, only image gen) |
@@ -163,7 +163,8 @@ exits on stdin EOF. `pi -c` = continue latest session (persistence).
 ```bash
 sudo -u <name> bash -lc '
   mkdir -p ~/projects && cd ~/projects
-  git clone https://x-access-token:$(cat ~/.config/marzukia-pat)@github.com/marzukia/jarate.git
+  # inside a hall-monitor vault plan (claim gh_pat; $gh_pat injected):
+  git clone https://x-access-token:$gh_pat@github.com/marzukia/jarate.git
   cd jarate && ./install.sh'
 ```
 

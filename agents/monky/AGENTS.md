@@ -181,7 +181,7 @@ You run through pi, connected to Discord. The user reads and writes your message
 ## Roster
 - <agent-1> (you) — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>`
 - <agent-2> — channel <channel-id> (pi + jarate bridge; senior).
-- <agent-3> — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>` (uid <uid>), bot <bot-id>. Uses <operator>'s PAT for now (~/.config/marzukia-pat); switchboard key sbk_<agent>_<hex> (<ctx> ctx, c=<cap>, P1).
+- <agent-3> — channel <channel-id> (pi + jarate bridge), host: <host-a>, user `<agent-user>` (uid <uid>), bot <bot-id>. GitHub via hall-monitor vault `gh_pat` claim (no local PAT file); switchboard key sbk_<agent>_<hex> (<ctx> ctx, c=<cap>, P1).
 
 ## Messaging a peer
 - **Fleet comms are ONLY for agent-to-agent chat** (hall-monitor: `POST /fleet/say {"to":"<name>","message":"..."}`). Never use them to reach a human. If a human is in your channel, reply in your channel — the bridge auto-forwards. If you need to tag someone in a reply, use `<@userId>` (e.g. `<@<userId>>` for <person-a>).
