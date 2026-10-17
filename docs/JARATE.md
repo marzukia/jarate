@@ -69,28 +69,37 @@ unavailable.
 ### `journal-errors [--since S] [--agent NAME]`
 
 `pi.service` warnings (journalctl `-p warning`) per agent on this host.
-`--since` takes an absolute datetime only (relative forms like `-1h` are
-rejected, usage error): `2026-09-13T00:00:00Z`, `2026-09-13 00:00:00`
-(the space form is re-joined), or a bare date. Default: one hour back,
-absolute UTC.
+Local-only (2026-10-17): hall-monitor owns the privileged cross-user
+read; `$HOME` is read via the user journal. `--since` takes an absolute
+datetime only (relative forms like `-1h` are rejected, usage error):
+`2026-09-13T00:00:00Z`, `2026-09-13 00:00:00` (the space form is
+re-joined), or a bare date. Default: one hour back, absolute UTC.
 
 ```json
 {
   "ok": true, "ts": "...", "error": null, "since": "2026-09-13T03:00:00Z",
   "agents": [
-    {"name": "monky", "source": "local", "count": 1,
-     "warnings": ["..."], "truncated": false, "error": null}
+    {"ok": true, "name": "frank", "source": "local", "count": 1,
+     "warnings": ["..."], "truncated": false, "error": null},
+    {"ok": false, "name": "monky", "source": "cross-user", "count": null,
+     "warnings": null, "truncated": false,
+     "error": "cross-user read removed: use a hall-monitor plan (SUDO_PW)"}
   ]
 }
 ```
 
-- Discovery: self + every local user with a `/home/<u>` (uid > 900), each
-  probed for a `pi.service` user unit. A peer without the unit is silently
-  skipped.
-- Rows: `source` = `local`; `warnings` capped at 100 lines (`truncated` true
-  when cut); row `error` set when the probe itself failed (row `warnings` =
-  `null` then).
-- `ok:false` when any agent row errored or no agents matched `--agent`.
+- Discovery: `$HOME` + every local user with a `/home/<u>` (uid > 900),
+  or a `JARATE_AGENT_HOMES` override (colon-separated). No `pi.service`
+  unit probe: every home on the list yields a row.
+- Rows: for `$HOME`, `source` = `local`; `warnings` capped at 100 lines
+  (`truncated` true when cut); row `error` set when the journalctl call
+  itself failed (row `warnings` = `null` then). Any other home yields
+  `source: "cross-user"`, `ok: false`, `warnings: null`, `count: null`,
+  and `error` = "cross-user read removed: use a hall-monitor plan
+  (SUDO_PW)".
+- Top-level `ok` stays `true` with cross-user rows (the run does not
+  fail, rc 0). `ok: false` (rc 1) only when the local journalctl call
+  failed; `ok: false` (rc 1) also when no agent matched `--agent`.
 
 ### `memory-grep <query> [--root D] [--regex] [--case]`
 
