@@ -4119,22 +4119,24 @@ export function buildRepliedMessageBlock(rm?: {
  *  other signal that the sender is a peer (a peer message arrives like
  *  any channel message), so the hint states where a normal reply lands
  *  (this channel only), the one case the bridge auto-forwards (a reply
- *  threaded to the peer's message), and the general tool (agent-say).
+ *  threaded to the peer's message), and the general tool (hall-monitor
+ *  fleet comms).
  *  Present ONLY for peer-authored messages. Used while a peerChannels
  *  mapping exists for the peer; see PEER_SENDER_HINT_NO_FWD for the
  *  pre-configuration window. */
 export const PEER_SENDER_HINT =
-  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only; the peer sees it ONLY when your reply targets their message (the bridge auto-forwards that one hop). For anything else, use agent-say <their channel>.";
+  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only; the peer sees it ONLY when your reply targets their message (the bridge auto-forwards that one hop). For anything else, use hall-monitor fleet comms: POST /fleet/say to <their name>.";
 
 /** c1: no-forward variant of PEER_SENDER_HINT, used while ch.peerChannels
  *  has no mapping for this peer (the pre-configuration window). The
  *  bridge cannot auto-forward in that state (no target channel — the
  *  forward no-ops with reason "no-channel"), so the hint must not promise
- *  the one hop: a threaded reply does NOT reach the peer, and agent-say
- *  is the only path (the 2026-10-05 RCA failure mode is a model that
+ *  the one hop: a threaded reply does NOT reach the peer, and hall-monitor
+ *  fleet comms (POST /fleet/say) are the only path (the 2026-10-05 RCA
+ *  failure mode is a model that
  *  threads a reply and assumes the peer saw it). */
 export const PEER_SENDER_HINT_NO_FWD =
-  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
+  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use hall-monitor fleet comms: POST /fleet/say to <their name>.";
 
 /** #177: true when the inbound is a [bg: machine wake (pi-bg callback,
  *  dead-letter alert, ETL alert). Machine wakes are never more urgent than

@@ -9,10 +9,9 @@
  * Unterminated quote or trailing backslash -> throw (the caller maps the
  * message into its own usage error / JSON doc).
  *
- * Users: bin/jarate-pat (N4), bin/jarate-vault (N4), and the bridge
- * `jarate` tool (packages/bridge/channel/jarate.ts), which re-splits the
- * tool's single `args` string with this parser before spawning bin/jarate.
- * Do not fork this implementation — import it.
+ * Users: the bridge `jarate` tool (packages/bridge/channel/jarate.ts),
+ * which re-splits the tool's single `args` string with this parser before
+ * spawning bin/jarate. Do not fork this implementation — import it.
  */
 export function shellWords(s: string): string[] {
   const words: string[] = [];

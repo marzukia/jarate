@@ -28,15 +28,11 @@ export interface JarateResult {
  * Spawn $HOME/bin/jarate with [cmd, args]. Mirrors runShellPassthrough's
  * timeout/cap idiom (index.ts): SIGKILL on timeout, first 20k chars kept.
  * `detached: true` puts the child in its own process group so the timeout
- * kill also takes down grandchild helpers (a hung `ssh`/`bun` holding the
+ * kill also takes down grandchild helpers (a hung helper holding the
  * stdout pipe would otherwise delay the close event past the cap).
  *
- * `opts.timeoutMs` (N2): per-call cap. The default `jarateTimeoutMs()`
- * (30s, bridge env) is right for the read-only ops; `pat-run` needs the
- * wrapper cap (900s) + 120s socket overhead, so execute() passes
- * `timeoutMs: 1_020_000` for it. (v2 tried to ride the cap through the
- * CHILD env — the setTimeout lives in the bridge process, so that never
- * worked.)
+ * `opts.timeoutMs`: per-call cap; defaults to `jarateTimeoutMs()` (30s,
+ * overridable via JARATE_TOOL_TIMEOUT_MS for tests).
  */
 export function runJarate(
   cmd: string,
@@ -49,7 +45,7 @@ export function runJarate(
   return new Promise((resolve) => {
     let p: ReturnType<typeof spawn>;
     // One flag grammar (#148): the tool's single args string is re-split
-    // with the SAME shellWords parser the vault/pat tool paths use, so the
+    // with the shared shellWords parser (bin/shell-words.ts), so the
     // entrypoint sees real argv (quoted values, --flag=value, two-word
     // re-joins). Unparseable -> executable JSON doc, no spawn.
     let argv: string[];
@@ -134,23 +130,15 @@ export function jarateText(r: JarateResult, timeoutMs?: number): string {
 }
 
 const JARATE_COMMANDS = [
+  "setup",
   "ctx-report",
   "journal-errors",
   "memory-grep",
-  "pat-request",
-  "pat-run",
-  "pat-status",
-  "vault-request",
-  "vault-run",
-  "vault-status",
-  "vault-revoke",
-  "vault-audit",
+  "projects",
+  "projects-backfill",
+  "agents-check",
+  "agents-bless",
 ];
-
-/** Per-call bridge cap for pat-run / vault-run: wrapper command cap
- *  (900s) + 120s socket/wrapper overhead (N2). */
-const RUN_TIMEOUT_MS = 1_020_000;
-const RUN_DEFAULT_CAP_S = "900";
 
 /**
  * Register the single `jarate` tool (cmd + args string). Subcommands are
@@ -161,19 +149,15 @@ export function registerJarateTool(pi: ExtensionAPI): void {
     name: "jarate",
     label: "jarate ops",
     description:
-      "Machine-ops helpers as JSON (ok:true|false + error, snake_case, read-only). " +
+      "Machine-ops helpers as JSON (ok:true|false + error, snake_case). " +
+      "setup <bot-token> <channel> [--yes]: fresh-node FTUE (default dry-run; --yes executes). " +
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
       "memory-grep <query> [--root D] [--regex]: search ~/memory, top-20 matches. " +
-      "pat-request <scope> <reason>: ask the channel owner for a GitHub PAT (scope: default or owner/repo:read|write). " +
-      "pat-run <request-id> -- <cmd> [args]: run one command under the approved token (single use; token is injected as GH_TOKEN, never echo it; 900s cap). " +
-      "pat-status [request-id]: read-only state of PAT requests (no token). " +
-      "vault-request <kind> <name> [level] [--label L] [--hours N | --minutes N] [--envvar VAR] [--from-env VAR] <reason>: " +
-      "ask the owner for a credential (kind: github-pat|api-key|password; level: one-shot|time-boxed|permanent, omitted → 30-min time-box default; --hours whole minutes 1m..72h, --minutes 1..4320). " +
-      "vault-run <request-id> -- <cmd> [args]: run a command under the approved credential (token injected as env, never echo it; 900s cap). " +
-      "vault-status [request-id]: read-only vault state (no value). " +
-      "vault-revoke <request-id>: self-revoke your pending/active credential. " +
-      "vault-audit [n]: last n audit lines (default 20).",
+      "projects [--project T] [--since D] [--agent A]: per-project rollup over pi-bg run records (runs/tokens/cost; untagged -> unspecified). " +
+      "projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]: tag historical untagged run records. " +
+      "agents-check: AGENTS.md vs manifest (drift tripwire, read-only). " +
+      "agents-bless [note]: rewrite the AGENTS.md manifest (re-bless an approved change).",
     promptSnippet:
       "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep) as JSON",
     promptGuidelines: [
@@ -200,24 +184,12 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       _ctx,
     ) {
       const args = params.args ?? "";
-      // pat-run / vault-run: per-call timeout + the wrapper command cap in
-      // the child env (N2). Everything else: defaults (30s, process.env).
-      const isRun = params.cmd === "pat-run" || params.cmd === "vault-run";
-      const r = isRun
-        ? await runJarate(params.cmd, args, {
-            env: {
-              ...process.env,
-              JARATE_PAT_RUN_TIMEOUT_S: RUN_DEFAULT_CAP_S,
-              JARATE_VAULT_RUN_TIMEOUT_S: RUN_DEFAULT_CAP_S,
-            },
-            timeoutMs: RUN_TIMEOUT_MS,
-          })
-        : await runJarate(params.cmd, args);
+      const r = await runJarate(params.cmd, args);
       return {
         content: [
           {
             type: "text",
-            text: jarateText(r, isRun ? RUN_TIMEOUT_MS : undefined),
+            text: jarateText(r),
           },
         ],
         details: {},
