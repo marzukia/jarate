@@ -5786,7 +5786,7 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
     }
   }, 60_000);
 
-  test("--worktree outside a git repo: DIED title names the cwd, not 'no report' (c)", async () => {
+  test("--worktree outside a git repo: DIED post names the cwd, not 'no report' (c)", async () => {
     const fx = fixture();
     const hook = capture();
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
@@ -5795,18 +5795,22 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
       // fixture cwd (os.tmpdir) is not inside a git repo
       const r = await fx.run(["worker", "--worktree", "t"]);
       expect(r.code).toBe(3);
-      const emb = hook.getBody()?.embeds?.[0];
-      expect(emb).toBeDefined();
-      // fix 3: the launch-fail reason was already in the result field;
-      // the title still read "DIED (no report)". Now the title carries
-      // the reason (incl. the cwd) so the wake line is actionable.
-      expect(emb.title).toMatch(/^worker · DIED \(/);
-      expect(emb.title).toContain("--worktree needs a git repo");
-      expect(emb.title).toContain(fx.tmp);
-      expect(emb.title).not.toContain("no report");
-      const result = emb.fields?.find((f: any) => f.name === "result");
-      expect(result?.value).toContain("--worktree needs a git repo");
-      expect(result?.value).toContain(fx.tmp);
+      // #222x#234: #234 made the launch-fail DIED a plain one-line
+      // content post (no framed embed); #222's intent - the post names
+      // the cwd, not "no report" - holds on the content line. The
+      // fixture cwd is /tmp/pibg-test-XXXXXXXX (21 chars); the full
+      // not-a-git-repo brief is 79 chars, well under the 120 cap, so
+      // the exact cwd string survives untruncated.
+      const body = hook.getBody();
+      expect(body?.embeds).toBeUndefined();
+      const content = body?.content;
+      expect(content).toMatch(/^\[bg:worker:DIED\] \d{8}-\d{6}-\d+ exit=3 /);
+      expect(content).toContain("exit=3");
+      expect(content).toContain("no output");
+      expect(content).toContain("--worktree needs a git repo");
+      expect(content).toContain(fx.tmp);
+      expect(content).not.toContain("no report");
+      expect(content.split("\n")).toHaveLength(1);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;
