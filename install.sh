@@ -22,8 +22,8 @@
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
-#        ~/projects/recall   -> <jarate>/packages/recall   (only if the dest
-#                               is absent or already this symlink)
+#   5. cleans up a stale ~/projects/recall symlink left by pre-2026-10-17
+#      installs (the repo no longer ships packages/recall)
 #
 # Deploy after a git pull = nothing. Code is live at the checkout; restart pi
 # only to pick up bridge (channel/) changes.
@@ -217,13 +217,18 @@ elif [ "$DRY" -eq 0 ]; then
   exit 1
 fi
 
-# recall: only adopt if the dest is absent or already our symlink (a live
-# deployed dir with .venv/.git is migrated manually, see DEPLOY.md)
+# recall: removed from the repo 2026-10-17 (fleet order). Stale-symlink
+# cleanup: if the box link still points at the (now gone) packages/recall,
+# remove it. Anything else (a live dir, a foreign symlink) is left
+# untouched; the rag Postgres data is kept but unused.
 RECALL_DEST="$HOME/projects/recall"
-if [ ! -e "$RECALL_DEST" ] || { [ -L "$RECALL_DEST" ] && [ "$(readlink "$RECALL_DEST")" = "$JARATE_DIR/packages/recall" ]; }; then
-  link_into "$RECALL_DEST" "$JARATE_DIR/packages/recall"
-else
-  echo "  recall: $RECALL_DEST exists (not this symlink); left untouched"
+if [ -L "$RECALL_DEST" ] && [ ! -e "$RECALL_DEST" ]; then
+  case "$(readlink "$RECALL_DEST")" in
+    "$JARATE_DIR/packages/recall" | "$JARATE_DIR_RAW/packages/recall")
+      echo "  recall: removing stale symlink $RECALL_DEST (target gone)"
+      run rm -f "$RECALL_DEST"
+      ;;
+  esac
 fi
 
 # --- 3b. live marker dir (issue #191 M2) ------------------------------------

@@ -168,11 +168,10 @@ sudo -u <name> bash -lc '
   cd jarate && ./install.sh'
 ```
 
-install.sh (idempotent): `bun install` in the bridge, 8 pointer symlinks
-plus a conditional recall link - ~/scripts/{jarate-bg, jarate-wait, jarate-bg-tail,
+install.sh (idempotent): `bun install` in the bridge, pointer symlinks -
+~/scripts/{jarate-bg, jarate-wait, jarate-bg-tail,
 jarate-bg-kill, jarate-bg-watchdog, pi-bg, pi-wait, pi-bg-tail, pi-bg-kill,
-pi-bg-watchdog, jarate}, ~/bin/{jarate-diff, jarate}, and
-~/projects/recall (only if absent or already this symlink). The checkout IS
+pi-bg-watchdog, jarate}, ~/bin/{jarate-diff, jarate}. The checkout IS
 the deployment - `git pull --ff-only` is the update procedure. Only bridge
 changes need a pi.service restart.
 

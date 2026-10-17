@@ -102,7 +102,7 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
 2. `GET /users/@me` — validates the token, records the bot id
 3. `GET /channels/<id>` — validates the channel; rejects DMs with a hint
 4. clone/checkout `~/projects/jarate` + `./install.sh` (idempotent; symlinks
-   `jarate-bg`/`jarate-wait`/`recall`, `bun install` in the
+   `jarate-bg`/`jarate-wait`, `bun install` in the
    bridge, creates `/var/tmp/jarate-live` (1777) for the agent liveness
    markers — issue #191 M2)
 5. merge `~/.pi/agent/settings.json`: bridge `packages` entry, the channel
@@ -138,8 +138,8 @@ structure:
 
 Optional, runbooks in this repo:
 
-- **RAG** — [PGRAG-SETUP.md](PGRAG-SETUP.md): Postgres + pgvector, Ollama
-  `nomic-embed-text` (768-dim), `bun recall ingest/query`
+- **RAG** — removed 2026-10-17 (fleet order); the rag Postgres data is kept
+  but unused
 - **Web search (Tavily)** — `cp extensions/mcp-tools.ts
   ~/.pi/agent/extensions/` + a `tavilyApiKey` in settings.json `mcp[]`
   (key in the query string; restart after)
