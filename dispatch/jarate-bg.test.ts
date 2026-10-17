@@ -2603,15 +2603,33 @@ describe("think-trunc: maxTokens hit mid-thinking (2026-10-17 Frank worker wave)
   const artDir = (fx: { home: string }) => path.join(fx.home, ".pi-bg-art");
 
   // fake pi: for the first `die` launches it writes a session jsonl
-  // whose last assistant message is thinking-only + stopReason=length,
-  // prints nothing, exits rc=0; afterwards it prints healthy output.
-  // The state file doubles as a launch counter.
-  const truncStubPi = (fx: { tmp: string }, die: number) => {
+  // whose last assistant message matches the requested shape, prints
+  // nothing, exits rc=0; afterwards it prints healthy output. The state
+  // file doubles as a launch counter. kind selects the last message's
+  // content kinds (thinking = the positive signature); stopReason and
+  // malformed parameterize the negative guards of bg_think_trunc
+  // (visible text, tool calls, end_turn, broken json line).
+  const truncStubPi = (
+    fx: { tmp: string },
+    die: number,
+    kind: "thinking" | "thinking+text" | "thinking+toolCall" = "thinking",
+    stopReason = "length",
+    malformed = false,
+  ) => {
     const state = path.join(fx.tmp, "pi-trunc-state");
     const piBin = path.join(fx.tmp, "bin", "pi");
+    const content =
+      kind === "thinking+text"
+        ? '[{"type":"thinking","text":"geometry geometry geometry"},{"type":"text","text":"partial visible answer"}]'
+        : kind === "thinking+toolCall"
+          ? '[{"type":"thinking","text":"geometry geometry geometry"},{"type":"toolCall","id":"tc-1","name":"bash","arguments":{"command":"echo hi"}}]'
+          : '[{"type":"thinking","text":"geometry geometry geometry"}]';
+    const message = malformed
+      ? `{"type":"message","id":"a\${n}","parentId":null,"timestamp":"2026-10-17T04:00:10Z","message":{"role":"assistant","content":[{"type":"thinking","text":"broken`
+      : `{"type":"message","id":"a\${n}","parentId":null,"timestamp":"2026-10-17T04:00:10Z","message":{"role":"assistant","content":${content},"api":"openai-completions","provider":"vllm","model":"qwen-test","usage":{"input":100,"output":16384,"cacheRead":0,"cacheWrite":0,"totalTokens":16484},"stopReason":"${stopReason}"}}`;
     fs.writeFileSync(
       piBin,
-      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\nif [ "$n" -le "${die}" ]; then\n  s="--\${PWD#/}"; s=$(printf '%s' "$s" | sed 's#/#-#g'); s="\${s}--"\n  d="$HOME/.pi/agent-worker/sessions/$s"\n  mkdir -p "$d"\n  printf '%s\\n' '{"type":"session","version":3,"id":"trunc-\${n}","timestamp":"2026-10-17T04:00:00Z","cwd":"$PWD"}' '{"type":"message","id":"a\${n}","parentId":null,"timestamp":"2026-10-17T04:00:10Z","message":{"role":"assistant","content":[{"type":"thinking","text":"geometry geometry geometry"}],"api":"openai-completions","provider":"vllm","model":"qwen-test","usage":{"input":100,"output":16384,"cacheRead":0,"cacheWrite":0,"totalTokens":16484},"stopReason":"length"}}' > "$d/sess-\${n}.jsonl"\n  exit 0\nfi\necho trunc-retry-ok\n`,
+      `#!/bin/sh\nn=$(cat ${state} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > ${state}\nif [ "$n" -le "${die}" ]; then\n  s="--\${PWD#/}"; s=$(printf '%s' "$s" | sed 's#/#-#g'); s="\${s}--"\n  d="$HOME/.pi/agent-worker/sessions/$s"\n  mkdir -p "$d"\n  printf '%s\\n' '{"type":"session","version":3,"id":"trunc-\${n}","timestamp":"2026-10-17T04:00:00Z","cwd":"$PWD"}' '${message}' > "$d/sess-\${n}.jsonl"\n  exit 0\nfi\necho trunc-retry-ok\n`,
     );
     fs.chmodSync(piBin, 0o755);
     return state;
@@ -2738,6 +2756,85 @@ describe("think-trunc: maxTokens hit mid-thinking (2026-10-17 Frank worker wave)
       delete fx.env.PI_BG_WB_BACKOFF;
       hook.close();
     }
+  }, 60_000);
+
+  // The four negative guards of bg_think_trunc: a last assistant message
+  // that is NOT thinking-only + stopReason=length must print no signature.
+  // Each case asserts the wrapper never took the trunc path (no TRUNCATED
+  // stderr line, no trunc1 marker, no think-trunc retry, generic EMPTY
+  // brief without the signature) and fell through to the pre-existing
+  // 3-attempt blind retry budget instead.
+  const negativeCase = async (
+    task: string,
+    opts: {
+      kind?: "thinking" | "thinking+text" | "thinking+toolCall";
+      stopReason?: string;
+      malformed?: boolean;
+    },
+  ) => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const state = truncStubPi(
+      fx,
+      Number.MAX_SAFE_INTEGER,
+      opts.kind ?? "thinking",
+      opts.stopReason ?? "length",
+      opts.malformed ?? false,
+    );
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", task]);
+      expect(r.code).toBe(0); // pi exits 0; the status is in the embed
+      // no signature printed -> the blind 3-attempt budget ran, no trunc1
+      // one-relaunch
+      expect(fs.readFileSync(state, "utf8").trim()).toBe("3");
+      // bg_think_trunc printed nothing: the wrapper's TRUNCATED line is the
+      // only stderr output gated on a non-empty signature
+      expect(r.err).not.toContain("TRUNCATED completion");
+      const runId = fx.records()[0].run;
+      expect(
+        fs.existsSync(path.join(artDir(fx), `pi-bg-${runId}-trunc1`)),
+      ).toBe(false);
+      expect(fx.records()[0].retries ?? []).toHaveLength(0);
+      expect(hook.posts).toHaveLength(1);
+      const em = hook.posts[0].embeds[0];
+      expect(em.title).toMatch(/^worker · EMPTY · \d+m\d{2}s$/);
+      // generic EMPTY: the brief is empty (the result field is omitted
+      // when blank) or carries no signature
+      const briefField = em.fields?.find(
+        (f: { name: string }) => f.name === "result",
+      );
+      expect(briefField?.value ?? "").not.toContain(
+        "max output tokens mid-thinking",
+      );
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  };
+
+  test("negative: final message carries visible text -> no signature", async () => {
+    await negativeCase("trunc neg text task", { kind: "thinking+text" });
+  }, 60_000);
+
+  test("negative: final message carries tool calls -> no signature", async () => {
+    // a toolCall final message ships stopReason=toolUse in real pi
+    // sessions - not the stopReason=length truncation signature
+    await negativeCase("trunc neg toolcall task", {
+      kind: "thinking+toolCall",
+      stopReason: "toolUse",
+    });
+  }, 60_000);
+
+  test("negative: thinking-only final with stopReason=end_turn -> no signature", async () => {
+    await negativeCase("trunc neg end turn task", { stopReason: "end_turn" });
+  }, 60_000);
+
+  test("negative: malformed session file (broken json line) -> no signature", async () => {
+    await negativeCase("trunc neg malformed task", { malformed: true });
   }, 60_000);
 });
 

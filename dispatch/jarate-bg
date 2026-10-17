@@ -2074,6 +2074,10 @@ for attempt in 1 2 3; do
         trunc_final=1
         break
       fi
+      # coexistence (#227 review F3, 2026-10-17): when #222's bg_arm_resume
+      # lands in main, arm-resume this run's session here - the truncated
+      # final message is thinking-only, so resume is the correct
+      # continuation; until then fresh relaunch is intentional.
       touch "$trunc1f" 2>/dev/null || true
       echo "[pi-bg] TRUNCATED completion (rc=0, no output: $trunc) - relaunching ticket once (trunc1)" >&2
       bg_log_retry "think-trunc"
