@@ -670,8 +670,35 @@ const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
 
 const KILL = path.join(import.meta.dir, "jarate-bg-kill");
 
-// fake ids in year 2099: never collide with real tickets in /tmp
-const TID = (n: number) => `20991231-235959-${n}`;
+// Fake ids in year 2099: never collide with real tickets (real run ids
+// carry the real date - jarate-bg run_id). The id encodes user+process,
+// all digits to stay valid for the ticket validators
+// (^[0-9]{8}-[0-9]{6}-[0-9]+$ in the jarate-bg-watchdog sweep and in
+// jarate-bg-kill/-tail):
+//   group 2 = uid (4 digits, zero-padded) + n (2 digits, zero-padded)
+//   group 3 = this process's pid (zero-padded to >= 6; unbounded -
+//             pid_max is 4194304 on these boxes, pids run 6-7 digits)
+// Why structural: a fixture path under sticky /tmp is only shared by the
+// SAME owner. A same-path collision needs an identical uid group, i.e.
+// the same user, who may unlink (sticky-bit owner rule) and rewrite
+// 0644 files. Cross-user leftovers - jimmy-owned /tmp/pi-bg-...-out.md
+// EACCES-ing monky's+frank's deploy tests, incident 2026-10-17 - are
+// impossible. Two concurrent runs of one user differ in the pid group;
+// same user + recycled pid later is the same owner, so the rmLegacy
+// (force) cleanup and writeFileSync still work.
+// Length budget: "jarate/<t>" must fit the STALLED embed row clip
+// (LINE_W=30, watchdog) -> TID <= 23 chars; met with a <=9999 uid
+// (guarded) and the unbounded pid group. n is capped at 99 (2 digits);
+// the pi-bg-tail fixture family below takes n 31-33, the watchdog
+// fixtures n 1-24 - the same family separation the old minute tag
+// (235958 vs 235959) gave.
+const TID_UID = os.userInfo().uid;
+if (TID_UID > 9999)
+  throw new Error(`TID encoding needs a <=9999 uid, got ${TID_UID}`);
+const TID = (n: number) => {
+  if (n > 99) throw new Error(`TID n must fit 2 digits, got ${n}`);
+  return `20991231-${String(TID_UID).padStart(4, "0")}${String(n).padStart(2, "0")}-${String(process.pid).padStart(6, "0")}`;
+};
 
 /** True when any live process's cmdline contains needle (orphan probe). */
 function liveProcWith(needle: string): boolean {
@@ -845,7 +872,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
-    const id = "20991231-235958-1";
+    const id = TID(31);
     fs.writeFileSync(path.join(art, `pi-bg-${id}-raw.out`), "fresh line\n");
     const env = { ...process.env } as Record<string, string>;
     env.HOME = tmp;
@@ -860,7 +887,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     tmpDirs.push(tmp);
     const art = path.join(tmp, "art");
     fs.mkdirSync(art, { recursive: true });
-    const id = "20991231-235958-2";
+    const id = TID(32);
     const legacy = `/tmp/pi-bg-${id}-raw.out`;
     fs.writeFileSync(legacy, "legacy line\n");
     try {
@@ -881,7 +908,7 @@ describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
     const env = { ...process.env } as Record<string, string>;
     env.HOME = tmp;
     env.PI_BG_TMPDIR = path.join(tmp, "art");
-    const r = await runScript(TAIL, ["20991231-235958-3"], env, tmp);
+    const r = await runScript(TAIL, [TID(33)], env, tmp);
     expect(r.code).toBe(2);
     expect(r.err).toContain("no live output");
   });
@@ -5233,6 +5260,282 @@ describe("#143: jarate-bg signal (mid-run intervention receipt)", () => {
       expect(deadlog(fx)).toBe("");
     } finally {
       // fixture close is handled by the global afterEach
+    }
+  }, 30_000);
+});
+
+/**
+ * 2026-10-16 incident (frank, hydrogen): three worker tickets died with
+ * zero output after ~50 min of thinking. Every relaunch of the retry
+ * loop was FRESH - pi redid the whole job from scratch on each attempt,
+ * and the wake line read "DIED (no report)" even when the reason was
+ * already known (stopReason=length in the session jsonl, or a launch-fail
+ * brief that only the result field carried).
+ *
+ * Fix, three parts in dispatch/jarate-bg:
+ *   1. relaunches RESUME the prior attempt's session: pi 0.85's
+ *      non-interactive resume is --session <uuid> (--resume is the TUI
+ *      picker and would hang a background run - verified against the
+ *      real binary). The uuid is the final `_`-separated field of the
+ *      session jsonl basename. Missing session file -> fresh launch
+ *      (old behavior) + a log line.
+ *   2. empty-output deaths add one brief line from the last session
+ *      entry: stop=<stopReason> err=<errorMessage-or-absent>.
+ *   3. a DIED embed WITH a brief now carries it in the title.
+ */
+describe("2026-10-16: relaunches resume the prior session + empty-death diagnostics", () => {
+  const UUID = "01999999-aaaa-bbbb-cccc-dddddddddddd";
+
+  const capture = () => {
+    let body: any = null;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") body = (await req.json()) as any;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    return {
+      url: `http://127.0.0.1:${server.port}/hook`,
+      getBody: () => body,
+      close: () => server.stop(true),
+    };
+  };
+
+  // The stub pi records every launch line and (unless no-session) writes
+  // a minimal session jsonl - header + user + one assistant entry whose
+  // stopReason is "length" (the incident signature: token budget out
+  // mid-thinking, no errorMessage). Variants:
+  //   recover       attempt 2 (sees --session) prints a report, exit 0
+  //   always-empty  every attempt prints nothing, exit 0 (EMPTY path)
+  //   always-die    every attempt prints nothing, exit 2 (DIED path)
+  //   always-silent every attempt prints nothing, exit 1 (#57 silent x2)
+  //   no-session    never writes a session file (fresh-fallback path)
+  const resumeStubPi = (
+    fx: { tmp: string },
+    variant:
+      | "recover"
+      | "always-empty"
+      | "always-die"
+      | "always-silent"
+      | "no-session",
+  ) => {
+    const piBin = path.join(fx.tmp, "bin", "pi");
+    const launches = path.join(fx.tmp, "pi-launches.log");
+    const slug = `--${fx.tmp.slice(1).replace(/\//g, "-")}--`;
+    const sessionWrite =
+      variant === "no-session"
+        ? ""
+        : [
+            `d="$PI_CODING_AGENT_DIR/sessions/${slug}"`,
+            `mkdir -p "$d"`,
+            `f="$d/2026-10-16T00-00-00-000Z_${UUID}.jsonl"`,
+            `[ -f "$f" ] || {`,
+            `printf '%s\\n' '{"type":"session","version":3,"id":"${UUID}","timestamp":"2026-10-16T00:00:00.000Z","cwd":"'"$PWD"'"}' > "$f"`,
+            `printf '%s\\n' '{"type":"message","id":"aaaaaaaa","parentId":null,"timestamp":"2026-10-16T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"t"}]}}' >> "$f"`,
+            `printf '%s\\n' '{"type":"message","id":"bbbbbbbb","parentId":"aaaaaaaa","timestamp":"2026-10-16T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"mid-thinking"}],"stopReason":"length"}}' >> "$f"`,
+            `}`,
+          ].join("\n");
+    const act =
+      variant === "recover"
+        ? `if [ "$n" -ge 2 ]; then echo resumed-report-ok; fi`
+        : variant === "always-die"
+          ? `exit 2`
+          : variant === "always-silent"
+            ? `exit 1`
+            : "";
+    fs.writeFileSync(
+      piBin,
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' "$*" >> "${launches}"`,
+        `case " $* " in *" --session "*) n=2 ;; *) n=1 ;; esac`,
+        sessionWrite,
+        act,
+        `exit 0`,
+      ].join("\n"),
+    );
+    fs.chmodSync(piBin, 0o755);
+    return { launches };
+  };
+
+  const launchLines = (st: { launches: string }) =>
+    fs.readFileSync(st.launches, "utf8").trim().split("\n");
+
+  test("empty completion then recovery: attempt 2 resumes the session (a)", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.seedMainCreds();
+    const st = resumeStubPi(fx, "recover");
+    try {
+      const r = await fx.run(["worker", "test task"]);
+      expect(r.code).toBe(0);
+      const lines = launchLines(st);
+      expect(lines, `launches:\n${lines.join("\n")}`).toHaveLength(2);
+      // attempt 1: fresh (no --session)
+      expect(lines[0]).not.toContain("--session");
+      // attempt 2: --session <uuid>, the uuid of the file the stub wrote
+      const slug2 = `--${fx.tmp.slice(1).replace(/\//g, "-")}--`;
+      const sess = path.join(
+        fx.home,
+        ".pi",
+        "agent-worker",
+        "sessions",
+        slug2,
+        `2026-10-16T00-00-00-000Z_${UUID}.jsonl`,
+      );
+      expect(fs.existsSync(sess)).toBe(true);
+      const m = path
+        .basename(sess)
+        .replace(/\.jsonl$/, "")
+        .match(/_([^_]+)$/);
+      expect(m?.[1]).toBe(UUID);
+      expect(lines[1]).toContain(`--session ${UUID}`);
+      // and the run recovered: one OK callback with the resumed report
+      const emb = hook.getBody()?.embeds?.[0];
+      expect(emb?.title).toMatch(/^worker · OK · \d+m\d{2}s$/);
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain("resumed-report-ok");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("always-empty (rc=0 x3): EMPTY brief carries stop=length err=absent (b)", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.seedMainCreds();
+    const st = resumeStubPi(fx, "always-empty");
+    try {
+      const r = await fx.run(["worker", "test task"]);
+      expect(r.code).toBe(0);
+      const lines = launchLines(st);
+      // all 3 attempts ran; attempts 2+ resumed the same session
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).toContain(`--session ${UUID}`);
+      expect(lines[2]).toContain(`--session ${UUID}`);
+      const emb = hook.getBody()?.embeds?.[0];
+      expect(emb?.title).toMatch(/^worker · EMPTY · \d+m\d{2}s$/);
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      // fix 2: the last session entry's stopReason is in the brief
+      expect(result?.value).toContain("stop=length");
+      expect(result?.value).toContain("err=absent");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("always-die (rc=2 x3): DIED embed carries the reason in title + brief", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.seedMainCreds();
+    const st = resumeStubPi(fx, "always-die");
+    try {
+      const r = await fx.run(["worker", "test task"]);
+      expect(r.code).toBe(2); // pi's rc propagates; the status is in the embed
+      const lines = launchLines(st);
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).toContain(`--session ${UUID}`);
+      const emb = hook.getBody()?.embeds?.[0];
+      // fix 3: DIED WITH a brief is a report - the title carries it
+      expect(emb?.title).toMatch(/^worker · DIED \(/);
+      expect(emb?.title).not.toContain("no report");
+      expect(emb?.title).toContain("stop=length");
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain("stop=length");
+      expect(result?.value).toContain("err=absent");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("silent death x2 (rc=1): retry1 resumes; FAIL brief carries stop=length", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.seedMainCreds();
+    const st = resumeStubPi(fx, "always-silent");
+    try {
+      const r = await fx.run(["worker", "test task"]);
+      expect(r.code).toBe(1); // pi's rc propagates; the status is in the embed
+      const lines = launchLines(st);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).not.toContain("--session");
+      expect(lines[1]).toContain(`--session ${UUID}`);
+      const emb = hook.getBody()?.embeds?.[0];
+      expect(emb?.title).toMatch(/^worker · FAIL \(rc=1\) · \d+m\d{2}s$/);
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain("silent death x2");
+      expect(result?.value).toContain("stop=length");
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("no session file: relaunches stay fresh + logged (fallback)", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.seedMainCreds();
+    const st = resumeStubPi(fx, "no-session");
+    try {
+      const r = await fx.run(["worker", "test task"]);
+      expect(r.code).toBe(0);
+      const lines = launchLines(st);
+      expect(lines).toHaveLength(3);
+      for (const l of lines) expect(l).not.toContain("--session");
+      expect(r.err).toContain(
+        "relaunch: no prior session file - fresh launch (2026-10-16)",
+      );
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
+    }
+  }, 60_000);
+
+  test("--worktree outside a git repo: DIED title names the cwd, not 'no report' (c)", async () => {
+    const fx = fixture();
+    const hook = capture();
+    fx.env.PI_DISPATCH_WEBHOOK = hook.url;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      // fixture cwd (os.tmpdir) is not inside a git repo
+      const r = await fx.run(["worker", "--worktree", "t"]);
+      expect(r.code).toBe(3);
+      const emb = hook.getBody()?.embeds?.[0];
+      expect(emb).toBeDefined();
+      // fix 3: the launch-fail reason was already in the result field;
+      // the title still read "DIED (no report)". Now the title carries
+      // the reason (incl. the cwd) so the wake line is actionable.
+      expect(emb.title).toMatch(/^worker · DIED \(/);
+      expect(emb.title).toContain("--worktree needs a git repo");
+      expect(emb.title).toContain(fx.tmp);
+      expect(emb.title).not.toContain("no report");
+      const result = emb.fields?.find((f: any) => f.name === "result");
+      expect(result?.value).toContain("--worktree needs a git repo");
+      expect(result?.value).toContain(fx.tmp);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      hook.close();
     }
   }, 30_000);
 });

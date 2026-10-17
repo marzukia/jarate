@@ -14,11 +14,6 @@ actual work; most of it is waiting on npm.
 - [ ] Who may talk to it: by default EVERYONE in the channel (no whitelist
       feature in the bridge). Owner commands gated by `ownerUserId`.
 
-Bot guild access (gotcha): for agent-say to work BOTH ways, the new bot must
-be in every peer's server AND every peer bot must be in the new bot's
-server. The operator invites the bots; tokens alone do not grant server
-membership.
-
 ## 1. Unix user
 
 ```bash
@@ -28,9 +23,6 @@ echo <name>:<password> | chpasswd
 loginctl enable-linger <name>   # user units start at boot
 ```
 
-Fleet convention: the operator user password lives in `~/.config/sudo-pass`
-(0600) on each agent home - never in docs or code (a literal lived in
-public git history until the 2026-09-13 scrub + rotation).
 Note the uid - XDG_RUNTIME_DIR=/run/user/<uid> is needed for every
 `systemctl --user` call as another user.
 
@@ -68,7 +60,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 
 | file | contents |
 |---|---|
-| `~/.config/marzukia-pat` | the operator's PAT (copy from an existing agent, chmod 600) - GitHub for now |
+| (none) | no PAT file - GitHub via hall-monitor vault: claim `gh_pat` in a plan; `$gh_pat` is injected as env for that run only |
 | `~/.config/pi-dispatch/webhook` | the jarate-bg callback webhook, first line, chmod 600 |
 | `~/.config/webdrop/config.toml` | copy from an existing agent |
 | `~/.hermes/.env` | copy from an existing agent (OPENROUTER key; credits may be $0 - the LLM does NOT use it, only image gen) |
@@ -99,9 +91,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
     "forwardToolCalls": false,
     "ack": false,
     "bufferFileOnly": false,
-    "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>",
-    "peerBotIds": ["<every other agent's bot user id>"],
-    "peerChannels": { "<peer bot user id>": "<their channel id>" }
+    "startupMessage": "<name> (pi) online - <ctx> ctx, switchboard/<provider>"
   }],
   "mcp": [{ "name": "tavily", "url": "<shared tavily mcp url from an existing agent>" }],
   "defaultThinkingLevel": "medium",
@@ -173,14 +163,15 @@ exits on stdin EOF. `pi -c` = continue latest session (persistence).
 ```bash
 sudo -u <name> bash -lc '
   mkdir -p ~/projects && cd ~/projects
-  git clone https://x-access-token:$(cat ~/.config/marzukia-pat)@github.com/marzukia/jarate.git
+  # inside a hall-monitor vault plan (claim gh_pat; $gh_pat injected):
+  git clone https://x-access-token:$gh_pat@github.com/marzukia/jarate.git
   cd jarate && ./install.sh'
 ```
 
 install.sh (idempotent): `bun install` in the bridge, 8 pointer symlinks
 plus a conditional recall link - ~/scripts/{jarate-bg, jarate-wait, jarate-bg-tail,
 jarate-bg-kill, jarate-bg-watchdog, pi-bg, pi-wait, pi-bg-tail, pi-bg-kill,
-pi-bg-watchdog, jarate}, ~/bin/{agent-say, jarate-diff, jarate}, and
+pi-bg-watchdog, jarate}, ~/bin/{jarate-diff, jarate}, and
 ~/projects/recall (only if absent or already this symlink). The checkout IS
 the deployment - `git pull --ff-only` is the update procedure. Only bridge
 changes need a pi.service restart.
@@ -234,9 +225,7 @@ Verification checklist (all must pass before declaring done):
 1. startup message appears in the channel.
 2. LLM path: `SELECT status, count(*) FROM llm_requests WHERE agent='<name>' GROUP BY 1`
    -> only 200s, rows accumulating.
-3. agent-say round trip from an existing agent into the new channel.
-4. agent-say the OTHER way (needs the bot-guild invites from step 0).
-5. One real jarate-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
+3. One real jarate-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
    webhook + role profile + artifacts. Nohup form (foreground launch is
    rejected with rc 4, issue #144):
    `nohup ~/scripts/jarate-bg worker "smoke test: reply OK" > smoke.log 2>&1 &`
@@ -246,18 +235,6 @@ Verification checklist (all must pass before declaring done):
 For each existing agent (monky, frank, jimmy, ...):
 - AGENTS.md roster: add the new agent (channel, bot id, user, uid, key,
   priority, onboard date).
-- `~/.pi/agent/settings.json` channel block: add the new bot's user id to
-  `peerBotIds` (otherwise agent-say from the new agent is silently dropped
-  by the other-bot filter) AND map its user id to its channel id in
-  `peerChannels` (the peer-visibility feature: the [fwd] auto-forward
-  needs to know where to relay replies to that peer's message).
-- `~/.config/agent-fleet/peers.json` on every existing agent: add the new
-  agent. agent-say validates targets against this file (unknown numeric
-  ids exit 4, peer names must exist as keys) and the file is never
-  clobbered — update it by hand. Also add the new agent to the local
-  `dispatch/peers.json` (gitignored; seeded from
-  `dispatch/peers.example.json` — keep both in sync on roster changes,
-  install.sh's seed source).
 - Detached restart so the running agent survives:
   `(sleep 5; XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart pi.service) &`
 

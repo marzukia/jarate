@@ -177,16 +177,41 @@ describe("registerJarateTool", () => {
     expect(Object.keys(tools)).toEqual(["jarate"]);
     // subcommands are discoverable from the description
     for (const cmd of [
+      "setup",
       "ctx-report",
       "journal-errors",
       "memory-grep",
-      "pat-request",
-      "pat-run",
-      "pat-status",
+      "projects",
+      "projects-backfill",
+      "agents-check",
+      "agents-bless",
     ]) {
       expect(tools.jarate.description).toContain(cmd);
     }
-    expect(tools.jarate.parameters.properties.cmd).toBeDefined();
+    // gutted subcommands (hall-monitor owns credentials + privileged exec,
+    // #228) must not be advertised
+    for (const cmd of [
+      "pat-request",
+      "pat-run",
+      "pat-status",
+      "vault-request",
+      "vault-run",
+      "vault-status",
+      "vault-revoke",
+      "vault-audit",
+    ]) {
+      expect(tools.jarate.description).not.toContain(cmd);
+    }
+    expect(tools.jarate.parameters.properties.cmd.enum).toEqual([
+      "setup",
+      "ctx-report",
+      "journal-errors",
+      "memory-grep",
+      "projects",
+      "projects-backfill",
+      "agents-check",
+      "agents-bless",
+    ]);
 
     const realHome = process.env.HOME;
     process.env.HOME = home;

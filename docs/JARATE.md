@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "projects", "projects-backfill", "agents-check", "agents-bless", "pat-request", "pat-run", "pat-status"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "projects", "projects-backfill", "agents-check", "agents-bless"]}
 ```
 
 ## Commands
@@ -79,29 +79,18 @@ absolute UTC.
   "ok": true, "ts": "...", "error": null, "since": "2026-09-13T03:00:00Z",
   "agents": [
     {"name": "monky", "source": "local", "count": 1,
-     "warnings": ["..."], "truncated": false, "error": null},
-    {"name": "frank", "source": "ssh+sudo", "count": 0,
-     "warnings": [], "truncated": false, "error": null}
+     "warnings": ["..."], "truncated": false, "error": null}
   ]
 }
 ```
 
 - Discovery: self + every local user with a `/home/<u>` (uid > 900), each
-  probed for a `pi.service` user unit. Peers are probed through the
-  `sshpass + sudo -u` hop (same pattern as jarate-bg cross-user reads); a peer
-  without the unit is silently skipped.
-- Rows: `source` = `local` | `ssh+sudo`; `warnings` capped at 100 lines
-  (`truncated` true when cut); row `error` set when the hop itself failed
-  (row `warnings` = `null` then).
+  probed for a `pi.service` user unit. A peer without the unit is silently
+  skipped.
+- Rows: `source` = `local`; `warnings` capped at 100 lines (`truncated` true
+  when cut); row `error` set when the probe itself failed (row `warnings` =
+  `null` then).
 - `ok:false` when any agent row errored or no agents matched `--agent`.
-- Hop env: `JARATE_SSH_HOST` (explicit override: `user@host` as-is, a bare
-  user becomes `user@127.0.0.1`). When unset the target is DERIVED (#147):
-  the unique local user with uid > 900, a home, a login shell, and
-  sudo-group membership (`wheel` on Fedora, `sudo` on Debian/Ubuntu). 0 or
-  >1 candidates -> ok:false doc naming them + the exact override command.
-  `JARATE_SUDO_PASS` (env, else `~/.config/sudo-pass` 0600 file - never a
-  literal in code), `JARATE_AGENT_HOMES` (test
-  override: colon-separated home list).
 
 ### `memory-grep <query> [--root D] [--regex] [--case]`
 
@@ -126,9 +115,8 @@ queries work.
 
 Per-project rollup of jarate-bg run records (the `--project` tag, see
 DISPATCH.md) across every agent home on this host. Read-only. Scans
-`<home>/.pi-dispatch/runs/pi-bg-*.json` per agent; peers go through the
-same `sshpass + sudo -u` hop as journal-errors (a failing hop degrades that
-agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
+`<home>/.pi-dispatch/runs/pi-bg-*.json` per agent (a failing read degrades
+that agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
 
 ```json
 {
@@ -141,8 +129,7 @@ agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
      "first": "2026-09-01T00:00:00Z", "last": "2026-09-18T00:00:00Z"}
   ],
   "agents": [
-    {"agent": "monky", "source": "local", "scanned": 40, "error": null},
-    {"agent": "frank", "source": "ssh+sudo", "scanned": null, "error": "cross-user hop failed (...)"}
+    {"agent": "monky", "source": "local", "scanned": 40, "error": null}
   ]
 }
 ```
@@ -193,8 +180,8 @@ and never overwritten (even by `--set`). `--dry-run` plans without writing.
 
 - `map` lists only the records tagged (or would be, under `--dry-run`),
   with the derivation `source`: `set` | `worktree` | `cwd` | `default`.
-- Hop failure degrades the agent row (`scanned/tagged/skipped: null` +
-  `error`); `total` counts the agents that answered. Still `ok:true`.
+- A degraded agent row has `scanned/tagged/skipped: null` + `error`; `total`
+  counts the agents that answered. Still `ok:true`.
 - `--agent` narrows; no match -> `ok:false` rc 1.
 
 ### `agents-check`
@@ -236,42 +223,6 @@ unreadable/missing (nothing is written then). Manifest write is atomic
   fallback `~/AGENTS.md`); the manifest stays at `~/.pi/agent/.agents-md-hash`
   unless the override moves it next to the checked file.
 
-### `pat-request <scope> <reason...>`
-
-Ask the channel owner for a GitHub PAT. The bridge posts an
-Approve/Deny button message to the agent channel. rc 0 ok | 1 vault
-error | 2 usage. Scope: `default` (classic PAT) or `owner/repo:read|write`
-(fine-grained; token file in `~/.config/marzukia-pats/`). Full runbook:
-`docs/PAT-VAULT.md`.
-
-```json
-{"ok": true, "id": "pat_5b0e...", "state": "pending", "ttl": "2026-09-26T12:05:00Z"}
-```
-
-### `pat-run <request-id> -- <cmd> [args...]`
-
-Run ONE command under the approved token (single-use id). The child gets
-`GH_TOKEN` + git env-config header + `GIT_TERMINAL_PROMPT=0`; the token
-never appears in argv or on stdout. Child stdout/stderr pass through
-verbatim; the wrapper exits with the **child's rc**. Exit 124 (no JSON
-doc) = the command hit `JARATE_PAT_RUN_TIMEOUT_S` (default 900s). rc 1
-+ JSON doc = vault error, command never ran (`state: pending` / `expired`
-/ `already used`, `unknown id`, `scope: token file missing ...`).
-
-Tool path (LLM): the whole tail is ONE word; first token = id, rest is a
-raw string parsed by shell-words (no expansion, no shell). Quoting
-semantics + the bash-vs-tool path difference: `docs/PAT-VAULT.md`.
-
-### `pat-status [request-id]`
-
-Read-only. No id = this agent's non-terminal requests + budget headroom
-(5 approvals/hour rolling). With id = the full record. The token is never
-in the output.
-
-```json
-{"ok": true, "pending": [{"id": "pat_5b0e...", "state": "approved", "scope": "marzukia/jarate:write", "claim_deadline": "..."}], "budget": {"approvals_last_hour": 2, "cap": 5}}
-```
-
 ## Env overrides (tests + machines)
 
 | Var | Meaning |
@@ -280,16 +231,8 @@ in the output.
 | `JARATE_TOKEN_COST` | explicit path to pi-token-cost.py |
 | `JARATE_CTX_LIMIT` | fallback context limit when models.json has none |
 | `JARATE_AGENT_HOMES` | colon-separated agent home list (skips auto-discovery) |
-| `JARATE_SSH_HOST` / `JARATE_SUDO_PASS` | peer-hop target override (derived when unset) / password |
 | `JARATE_AGENTS_MD` | explicit AGENTS.md path (else `~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md`) |
 | `JARATE_ROOT` | repo root (auto-detected otherwise) |
-| `JARATE_PAT_DIR` | PAT vault socket dir (default `$XDG_RUNTIME_DIR/jarate`) |
-| `JARATE_PAT_FILE_DIR` | vault published-file dir (default `$XDG_RUNTIME_DIR/jarate-pat`) |
-| `JARATE_PAT_PATS_DIR` | fine-grained token store (default `~/.config/marzukia-pats`) |
-| `JARATE_PAT_AUDIT_FILE` | audit log (default `~/.jarate/pat-audit.log`) |
-| `JARATE_PAT_TRANSPORT` | `socket` (default) or `file` (bridge side) |
-| `JARATE_PAT_RUN_TIMEOUT_S` | `pat-run` command cap in seconds (default 900) |
-| `JARATE_PAT_BIN` | explicit path to the jarate-pat wrapper (tests) |
 
 ## Consumers
 

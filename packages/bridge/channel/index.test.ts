@@ -7,7 +7,6 @@ import { fmtTokensLC } from "./ctxwatch";
 import {
   clearDiscordStatesForTest,
   getChannelCursor,
-  interactionUserId,
   loadPersistedCursors,
   pollDiscord,
   seedChannelStateForTest,
@@ -17,7 +16,6 @@ import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
-  __setVaultHandleForTest,
   bashToolEssential,
   buildInteractionHandler,
   buildRepliedMessageBlock,
@@ -35,11 +33,9 @@ import extension, {
   deliverDueTasks,
   deliverDueWakes,
   earlySendText,
-  FWD_MARKER,
   failurePostText,
   fence,
   fileOnlyPrompt,
-  forwardPeerReply,
   handleInbound,
   hasOwnerConfigured,
   heldChannels,
@@ -50,7 +46,6 @@ import extension, {
   isHeld,
   isNoReply,
   isOwnerUser,
-  isPeerInbound,
   isVerbose,
   LIVE_MARKER_DIR,
   LIVE_TEXT_PLACEHOLDER,
@@ -59,13 +54,9 @@ import extension, {
   matchCommand,
   midTurnQueues,
   opWindowLabel,
-  PEER_FWD_DEDUPE_MS,
-  PEER_SENDER_HINT,
-  PEER_SENDER_HINT_NO_FWD,
   parseReplyTo,
   parseUndoCount,
   parseVerboseLevel,
-  peerFwdSnapshotForTest,
   pendingAttachments,
   pendingInterrupts,
   persistLivePlaceholders,
@@ -79,7 +70,6 @@ import extension, {
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
-  resetPeerFwdForTest,
   resetRuntimeStateForTest,
   runFrame,
   runMidRunInterrupt,
@@ -123,13 +113,6 @@ import {
   resolveSystemdUnit,
 } from "./types";
 import { performUndo } from "./undo";
-import {
-  __vaultResetForTest,
-  __vaultSetWakeWebhookForTest,
-  startVault,
-  stopVault,
-  vaultRequest,
-} from "./vault";
 import { clearWorktreeState } from "./worktree";
 
 /** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
@@ -918,7 +901,6 @@ describe("extension handlers (A1/A2/A4)", () => {
 
   afterEach(async () => {
     clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
-    resetPeerFwdForTest(); // peer-forward dedupe + inbound meta leak guard
     jest.useRealTimers();
     // Drop leftover re-wake state BEFORE the cleanup agent_end, or it would
     // start an in-flight re-wake whose sendToPi continuation leaks into the
@@ -1008,263 +990,6 @@ describe("extension handlers (A1/A2/A4)", () => {
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     const body = JSON.parse(post!.body);
     expect(body.message_reference?.message_id).toBe("111");
-  });
-
-  // ─── Peer agent visibility (c1 + b) ─────────────────────────────────
-  // c1: peer-authored inbounds carry a <channel-ctx> hint (the model's
-  // only signal that the sender is a peer). b: a final threaded to a
-  // peer's message is auto-forwarded to the peer's channel (one hop,
-  // [fwd]-marked, 60 s identical-text dedupe).
-
-  // Peer variant: the author id is in the peer settings' peerBotIds.
-  const inboundPeer = (body: string, id: string): ChannelMessage => ({
-    ...inbound(body, id),
-    from: "peer",
-    fromId: "peer-1",
-  });
-
-  // Settings variant for the peer-visibility tests: one configured peer
-  // bot (peer-1) with a known peer channel (998).
-  const peerSettings = (extra: Record<string, unknown> = {}) =>
-    fs.writeFileSync(
-      path.join(tmp, ".pi", "settings.json"),
-      JSON.stringify({
-        channels: [
-          {
-            id: "ch1",
-            name: "Test",
-            type: "discord",
-            botToken: "tok1",
-            ownerUserId: "uid",
-            ack: true,
-            peerBotIds: ["peer-1"],
-            peerChannels: { "peer-1": "998" },
-            ...extra,
-          },
-        ],
-      }),
-    );
-
-  test("c1: peer-authored inbound carries the peer hint in channel-ctx", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("monky: do X", "101"), ctx);
-    const content = sent.at(-1)!.m.content;
-    expect(content).toContain("<channel-ctx");
-    expect(content).toContain(PEER_SENDER_HINT);
-  });
-
-  test("c1: human inbound and [bg: webhook ticket do not carry the peer hint", async () => {
-    peerSettings();
-    await handleInbound(pi, inbound("hello human", "102"), ctx);
-    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
-    await handleInbound(
-      pi,
-      inboundPeer("[bg:worker:OK] task 42 done", "103"),
-      ctx,
-    );
-    expect(sent.at(-1)!.m.content).not.toContain(PEER_SENDER_HINT);
-  });
-
-  test("c1: isPeerInbound classifies on peerBotIds + fromId", () => {
-    const ch = {
-      id: "ch1",
-      name: "Test",
-      type: "discord" as const,
-      enabled: true,
-      channel: "ch1",
-      peerBotIds: ["peer-1"],
-    };
-    const base = inbound("x", "1");
-    expect(isPeerInbound(ch, { ...base, fromId: "peer-1" })).toBe(true);
-    expect(isPeerInbound(ch, base)).toBe(false); // human fromId
-    expect(isPeerInbound(ch, { ...base, fromId: undefined })).toBe(false);
-    expect(isPeerInbound(undefined, { ...base, fromId: "peer-1" })).toBe(false); // no config
-  });
-
-  test("b: final threaded to a peer message is forwarded once to the peer channel", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "111"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:111>\nok, on it" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("ok, on it");
-    expect(ownBody.message_reference?.message_id).toBe("111"); // threads in-channel as before
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1); // forwarded exactly once
-    const fwdBody = JSON.parse(fwd[0]!.body);
-    expect(fwdBody.content).toBe(`${FWD_MARKER}ok, on it`);
-    expect(fwdBody.message_reference).toBeUndefined(); // plain post, no thread
-  });
-
-  test("b: untagged final (default last-inbound thread) to a peer is forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "121"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "on it, no tag" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1);
-    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}on it, no tag`);
-  });
-
-  test("b: reply threaded to a [fwd]-marked peer message is NOT re-forwarded (loop guard)", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer(`${FWD_MARKER}ok, on it`, "131"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:131>\ngot it, working" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("got it, working");
-    expect(ownBody.message_reference?.message_id).toBe("131"); // reply still lands in-channel
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(0); // loop guard: one hop only
-  });
-
-  test("b: reply to a human message is NOT forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inbound("hello human", "141"), ctx);
-    await handlers.turn_start(null, ctx);
-    const stepFinal = {
-      role: "assistant",
-      content: [{ type: "text", text: "<reply-to:141>\nhi" }],
-    };
-    await handlers.message_end({ message: stepFinal }, ctx);
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(0);
-  });
-
-  test("b: agent_end final threaded to a peer message is forwarded", async () => {
-    peerSettings();
-    await handleInbound(pi, inboundPeer("do X", "151"), ctx);
-    const final = {
-      role: "assistant",
-      content: [{ type: "text", text: "done, shipped" }],
-    };
-    await handlers.agent_end(
-      {
-        messages: [
-          {
-            customType: CHANNEL_MSG_TYPE,
-            details: { messageId: "151" },
-            content: "",
-          },
-          final,
-        ],
-      },
-      ctx,
-    );
-    const own = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
-    );
-    const ownBody = JSON.parse(own[own.length - 1]!.body);
-    expect(ownBody.content).toBe("done, shipped");
-    expect(ownBody.message_reference?.message_id).toBe("151");
-    const fwd = fetchCalls.filter(
-      (c) => c.method === "POST" && c.url.endsWith("/channels/998/messages"),
-    );
-    expect(fwd.length).toBe(1);
-    expect(JSON.parse(fwd[0]!.body).content).toBe(`${FWD_MARKER}done, shipped`);
-  });
-
-  test("b: identical text to the same peer within 60 s is deduped, after is not", async () => {
-    peerSettings();
-    const ch = loadChannelConfig(tmp)[0]!;
-    await handleInbound(pi, inboundPeer("do X", "161"), ctx);
-    const t0 = 1_000_000;
-    const r1 = await forwardPeerReply(ch, "same reply", "161", t0);
-    expect(r1).toEqual({ forwarded: true });
-    const r2 = await forwardPeerReply(
-      ch,
-      "same reply",
-      "161",
-      t0 + PEER_FWD_DEDUPE_MS - 1_000,
-    );
-    expect(r2).toEqual({ forwarded: false, reason: "dedupe" });
-    const r3 = await forwardPeerReply(
-      ch,
-      "same reply",
-      "161",
-      t0 + PEER_FWD_DEDUPE_MS + 1_000,
-    );
-    expect(r3).toEqual({ forwarded: true });
-  });
-
-  test("b: peer reply with no configured peer channel is not forwarded", async () => {
-    peerSettings({ peerChannels: undefined });
-    await handleInbound(pi, inboundPeer("do X", "171"), ctx);
-    const ch = loadChannelConfig(tmp)[0]!;
-    expect(ch.peerChannels).toBeUndefined();
-    const r = await forwardPeerReply(ch, "orphan reply", "171");
-    expect(r).toEqual({ forwarded: false, reason: "no-channel" });
-  });
-
-  test("c1: peer hint is state-aware - forward clause only while peerChannels is set", async () => {
-    peerSettings(); // peerChannels: { "peer-1": "998" }
-    await handleInbound(pi, inboundPeer("monky: do X", "184"), ctx);
-    const mapped = sent.at(-1)!.m.content;
-    expect(mapped).toContain(PEER_SENDER_HINT);
-    expect(mapped).toContain("auto-forwards that one hop");
-    expect(mapped).not.toContain(PEER_SENDER_HINT_NO_FWD);
-
-    peerSettings({ peerChannels: undefined }); // mapping absent
-    await handleInbound(pi, inboundPeer("monky: do Y", "185"), ctx);
-    const unmapped = sent.at(-1)!.m.content;
-    expect(unmapped).toContain(PEER_SENDER_HINT_NO_FWD);
-    expect(unmapped).toContain("use agent-say"); // agent-say directive present
-    expect(unmapped).not.toContain("auto-forwards that one hop");
-    expect(unmapped).not.toContain(PEER_SENDER_HINT);
-  });
-
-  test("b: peerFwdAt prunes entries at the dedupe window on write", async () => {
-    peerSettings();
-    const ch = loadChannelConfig(tmp)[0]!;
-    await handleInbound(pi, inboundPeer("do X", "191"), ctx);
-    const t0 = 1_000_000;
-    // Plant two entries via the clock stub: one that will age out, one
-    // still inside the window.
-    expect(await forwardPeerReply(ch, "stale text", "191", t0)).toEqual({
-      forwarded: true,
-    });
-    expect(
-      await forwardPeerReply(ch, "fresh text", "191", t0 + 50_000),
-    ).toEqual({ forwarded: true });
-    // Third write at t0 + 60s: the stale entry (age = window) is pruned,
-    // the fresh one (10s old) is kept.
-    expect(
-      await forwardPeerReply(ch, "new text", "191", t0 + PEER_FWD_DEDUPE_MS),
-    ).toEqual({ forwarded: true });
-    const snap = peerFwdSnapshotForTest();
-    const keys = snap.map(([k]) => k);
-    expect(keys).not.toContain(`998\nstale text`); // stale is gone
-    expect(keys).toContain(`998\nfresh text`); // fresh kept
-    expect(keys).toContain(`998\nnew text`); // new present
-    expect(snap).toHaveLength(2);
   });
 
   test("A2: agent_end posts [!] + errorMessage on a failed run", async () => {
@@ -2019,117 +1744,21 @@ describe("extension handlers (A1/A2/A4)", () => {
       }
     });
 
-    // ── #165: peer-armed interrupts use the in-flight (4x) window ────
-    // 2026-10-06 abort RCA: a peer's agent-say reply landed mid-run and
-    // armed the 3s DEFAULT — the in-flight multiplier (4x, used while an
-    // interrupt is in flight) never applied to a plain in-flight run. The
-    // 3s window expired mid-REST-POST and killed the very agent-say call
-    // that was messaging that peer (pre-spawn "Operation aborted").
-    // Fix: a peer-authored mid-run inbound (isPeerInbound) arms at the
-    // 4x window like the other in-flight-armed paths; humans keep the 3s
-    // default; [bg: machine wakes arm nothing from #177 on (queue-only).
-    // The queued message always has the guaranteed re-wake as fallback,
-    // so the longer window only changes WHEN the interrupt cuts in, never
-    // WHETHER it delivers.
+    // ── arm window pins ────────────────────────────────────────────
+    // Mid-settle (an interrupt already in flight) arms at the 4x (12s)
+    // window — the rapid-fire cascade guard (the in-flight disjunct).
+    // Every other mid-run inbound arms the 3s default (quick cut-in);
+    // [bg: machine wakes arm nothing from #177 on (queue-only). The
+    // queued message always has the guaranteed re-wake as fallback, so
+    // the longer window only changes WHEN the interrupt cuts in, never
+    // WHETHER it delivers. (2026-10-06 abort RCA: a mid-run reply armed
+    // the 3s DEFAULT mid-settle and expired mid-REST-POST; the 4x
+    // window now keys off the in-flight state, not the sender.)
 
-    test("peer mid-run inbound arms the 4x in-flight window, not the 3s default (#165)", async () => {
-      peerSettings(); // peerBotIds: [peer-1]
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      // Armed at 4x (12s), not the 3s default. at is read on the same
-      // virtual clock; the ±1ms tolerance covers real-Date clocks.
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
-      ).toBeLessThanOrEqual(1);
-      // The 3s default point passes with NO abort: the in-flight step
-      // gets the run's head start.
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The 4x window fires at 4x: interrupt lands, message is the next run.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pm1");
-      expect(midTurnQueues.has("ch1")).toBe(false);
-    });
-
-    test("human mid-run inbound keeps the 3s default with peer config active (#165)", async () => {
-      peerSettings(); // same fixture as the peer test: fromId is the ONLY
-      // differentiator (uid is not in peerBotIds)
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseAborts = abortCount;
-      await handleInbound(pi, inbound("human mid-run", "hm1"), ctx);
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs()),
-      ).toBeLessThanOrEqual(1);
-      // Human cut-in timing is unchanged: fires at 3x, not 12x.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() - 1);
-      expect(abortCount).toBe(baseAborts);
-      jest.advanceTimersByTime(1);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-    });
-
-    test("[bg: peer-authored wake is queue-only, arms nothing (#177, supersedes the #165 3s pin)", async () => {
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      expect(idle).toBe(false);
-      const baseAborts = abortCount;
-      const baseSends = sent.length;
-      const wake = { ...inboundPeer("[bg:etl] ticket", "bm1"), from: "bg" };
-      await handleInbound(pi, wake, ctx);
-      // Queue-only: not the 3s default, not the 12s peer window.
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      expect(pendingInterrupts.has("ch1")).toBe(false);
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 4);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The run ends → the re-wake queue owns delivery.
-      idle = true;
-      await handlers.agent_end({ messages: [] }, ctx);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("bm1");
-      expect(midTurnQueues.has("ch1")).toBe(false);
-    });
-
-    test("peer inbound with no run in flight delivers directly, arms no interrupt (#165)", async () => {
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      idle = true; // no run in flight: the 4x window must not apply
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer idle", "pi1"), ctx);
-      // Not queued, not armed — straight to pi as a fresh run.
-      expect(midTurnQueues.has("ch1")).toBe(false);
-      expect(pendingInterrupts.has("ch1")).toBe(false);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pi1");
-      // Nothing pending to fire at 3s or 12s.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends + 1);
-    });
-
-    test("peer mid-settle keeps the 4x window; #124 order intact (#165 symmetric corner)", async () => {
-      // The settle window (an interrupt already in flight) armed at 4x
-      // BEFORE #165 via the in-flight disjunct — the peer disjunct must
-      // not double it, shorten it, or reorder the #124 delivery.
-      peerSettings();
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
+    test("mid-settle inbound arms the 4x in-flight window; #124 order intact", async () => {
+      // The settle window (an interrupt already in flight) arms at 4x
+      // via the in-flight disjunct — the arm must not double, shorten,
+      // or reorder the #124 delivery.
       expect(idle).toBe(false);
       const baseSends = sent.length;
       const baseAborts = abortCount;
@@ -2142,12 +1771,12 @@ describe("extension handlers (A1/A2/A4)", () => {
       await Promise.resolve();
       expect(abortCount).toBe(baseAborts + 1);
       expect(sent.length).toBe(baseSends); // still settling
-      // 2. Peer m2 arrives mid-settle (interrupt in flight): 4x arm.
-      await handleInbound(pi, inboundPeer("second", "pm2"), ctx);
+      // 2. Inbound m2 arrives mid-settle (interrupt in flight): 4x arm.
+      await handleInbound(pi, inbound("second", "m2"), ctx);
       expect(midTurnQueues.get("ch1")?.length).toBe(1);
       const armed = pendingInterrupts
         .get("ch1")
-        ?.find((p) => p.messageId === "pm2");
+        ?.find((p) => p.messageId === "m2");
       expect(armed).toBeDefined();
       expect(
         Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
@@ -2172,8 +1801,46 @@ describe("extension handlers (A1/A2/A4)", () => {
       jest.advanceTimersByTime(25);
       await Promise.resolve();
       expect(sent.length).toBe(baseSends + 2);
-      expect(sent[baseSends + 1].m.details.messageId).toBe("pm2");
+      expect(sent[baseSends + 1].m.details.messageId).toBe("m2");
       expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("[bg: machine wake is queue-only, arms nothing (#177)", async () => {
+      expect(idle).toBe(false);
+      const baseAborts = abortCount;
+      const baseSends = sent.length;
+      const wake = { ...inbound("[bg:etl] ticket", "bm1"), from: "bg" };
+      await handleInbound(pi, wake, ctx);
+      // Queue-only: not the 3s default, not the 4x in-flight window.
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 4);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends);
+      // The run ends → the re-wake queue owns delivery.
+      idle = true;
+      await handlers.agent_end({ messages: [] }, ctx);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("bm1");
+      expect(midTurnQueues.has("ch1")).toBe(false);
+    });
+
+    test("inbound with no run in flight delivers directly, arms no interrupt", async () => {
+      idle = true; // no run in flight
+      const baseSends = sent.length;
+      const baseAborts = abortCount;
+      await handleInbound(pi, inbound("idle inbound", "pi1"), ctx);
+      // Not queued, not armed — straight to pi as a fresh run.
+      expect(midTurnQueues.has("ch1")).toBe(false);
+      expect(pendingInterrupts.has("ch1")).toBe(false);
+      expect(sent.length).toBe(baseSends + 1);
+      expect(sent[baseSends].m.details.messageId).toBe("pi1");
+      // Nothing pending to fire at 3s or 12s.
+      jest.advanceTimersByTime(interruptStepTimeoutMs() * 5);
+      await Promise.resolve();
+      expect(abortCount).toBe(baseAborts);
+      expect(sent.length).toBe(baseSends + 1);
     });
 
     test("run that ends before the timeout: re-wake delivers, timer is a no-op", async () => {
@@ -2623,7 +2290,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       // python3-missing fallback only. The bridge-built body is the
       // serialized embed — no "[bg:" prefix anywhere. The 2026-10-06
       // incident lost EXACTLY this shape (msg 1556883632919150653, Beepy
-      // webhook author not in peerBotIds, mid-run): pre-fix isBgInbound
+      // webhook author, mid-run): pre-fix isBgInbound
       // missed it and the 3s interrupt armed + was lost at compact.
       const body = [
         "<embed>",
@@ -2641,7 +2308,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
       const baseTimers = pendingInterrupts.size;
-      // Beepy-style author: a webhook bot NOT in peerBotIds.
+      // Beepy-style author: a webhook bot.
       const msg = {
         ...inbound(body, "1556883632919150653"),
         from: "Beepy",
@@ -2708,33 +2375,6 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(abortCount).toBe(baseAborts + 1);
       expect(sent.length).toBe(baseSends + 1);
       expect(sent[baseSends].m.details.messageId).toBe("hm1");
-    });
-
-    test("peer bot speech mid-run: 12s arm (regression pin, #175)", async () => {
-      peerSettings(); // peerBotIds: [peer-1]
-      await handlers.session_start?.(null, ctx); // configRoot for peer lookup
-      const baseSends = sent.length;
-      const baseAborts = abortCount;
-      await handleInbound(pi, inboundPeer("peer mid-run", "pm1"), ctx);
-      expect(midTurnQueues.get("ch1")?.length).toBe(1);
-      const armed = pendingInterrupts.get("ch1")?.[0];
-      expect(armed).toBeDefined();
-      expect(armed!.messageId).toBe("pm1");
-      expect(
-        Math.abs(armed!.at - Date.now() - interruptStepTimeoutMs() * 4),
-      ).toBeLessThanOrEqual(1);
-      // The 3s point passes with NO abort: the in-flight run gets its
-      // head start.
-      jest.advanceTimersByTime(interruptStepTimeoutMs());
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts);
-      expect(sent.length).toBe(baseSends);
-      // The 12s window fires on schedule.
-      jest.advanceTimersByTime(interruptStepTimeoutMs() * 3);
-      await Promise.resolve();
-      expect(abortCount).toBe(baseAborts + 1);
-      expect(sent.length).toBe(baseSends + 1);
-      expect(sent[baseSends].m.details.messageId).toBe("pm1");
     });
 
     test("human arriving mid-run after a [bg: was queued: still arms (the queue does not suppress later human cuts)", async () => {
@@ -5248,76 +4888,6 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     );
     expect(edit).toBeDefined();
     expect(JSON.parse(edit!.body).content).toContain("boom");
-  });
-
-  test("type-3 (MESSAGE_COMPONENT) events route to the vault handlers, not the command path", async () => {
-    let patCalled = false;
-    let vaultCalled = false;
-    const h = buildInteractionHandler(
-      pi,
-      ctx,
-      ch,
-      "tok-i",
-      {
-        handlePatComponent: async () => {
-          patCalled = true;
-        },
-      },
-      {
-        handleVaultComponent: async () => {
-          vaultCalled = true;
-        },
-      },
-    );
-    await h({
-      id: "i3",
-      token: "tok123",
-      application_id: "app1",
-      channel_id: "888",
-      // live guild shape: actor at member.user, no top-level user
-      member: { user: { id: "owner1", username: "OwnerOne" } },
-      type: 3,
-      data: {
-        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
-      },
-    });
-    expect(patCalled).toBe(true);
-    expect(vaultCalled).toBe(true);
-    // The router itself made no network call — the component handlers own
-    // the ack (they no-op for non-matching custom_ids).
-    expect(calls.length).toBe(0);
-  });
-
-  test("type-3 guild-shape payload resolves the actor through the shared path (F4)", async () => {
-    // The live type-3 (button tap) payload has no top-level user and no
-    // message — the actor is at member.user. The index router forwards the
-    // payload intact to the component handlers, and those resolve the actor
-    // via the SAME shared helper (interactionUserId) the tap path uses —
-    // see vault.test.ts "guild payload (live capture 2026-10-08)" tests
-    // for the real-handler side.
-    let resolved: string | undefined;
-    let resolvedName: string | undefined;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i", null, {
-      handleVaultComponent: async (dd: any) => {
-        resolved = interactionUserId(dd);
-        resolvedName = dd?.member?.user?.username;
-      },
-    });
-    await h({
-      id: "i3",
-      token: "tok123",
-      application_id: "app1",
-      channel_id: "888",
-      guild_id: "guild1",
-      type: 3,
-      member: { user: { id: "owner1", username: "OwnerOne" } },
-      data: {
-        custom_id: "vault:approve:vault_00000000-0000-0000-0000-000000000000",
-      },
-    });
-    expect(resolved).toBe("owner1"); // member.user resolved, not ""
-    expect(resolvedName).toBe("OwnerOne"); // payload forwarded intact
-    expect(calls.length).toBe(0); // the router itself made no network call
   });
 
   test("command path with a missing name fails readable, not TypeError", async () => {
@@ -7925,7 +7495,6 @@ describe("handoff mechanism B (size-gated restart)", () => {
       type: "discord",
       botToken: "tok1",
       ownerUserId: "uid",
-      peerBotIds: ["bot-a"],
       default: true,
     },
   ];
@@ -8345,7 +7914,6 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
       type: "discord",
       botToken: "tok1",
       ownerUserId: "uid",
-      peerBotIds: ["bot-a"],
       default: true,
     },
   ];
@@ -10078,62 +9646,6 @@ describe("wave 2c bridge commands", () => {
     expect(matchCommand("/jobs")).toEqual({ name: "jobs", arg: undefined }); // bare /jobs: view, no arg
   });
 
-  test("text /vault routes to the vault handler (#206: matchCommand + case vault)", async () => {
-    // The plain-text path (matchCommand regex -> runChannelCommand case
-    // "vault") is distinct from the slash-command path: a misfired regex or
-    // a dropped switch case silently answers "unknown command" or hands
-    // "/vault status" to the agent as a prompt.
-    // The startup path auto-registers a vault handle per connected channel
-    // (async), so pin the no-handle state explicitly for a deterministic
-    // refusal.
-    __setVaultHandleForTest("ch1", null);
-    expect(matchCommand("/vault status")).toEqual({
-      name: "vault",
-      arg: "status",
-    });
-    expect(matchCommand("/vault")).toEqual({ name: "vault", arg: undefined });
-    // no vault handle: visible refusal, not a prompt
-    await handleInbound(pi, inbound("/vault status", "mv0"), ctx);
-    expect(posts().some((t) => t.includes("vault not running"))).toBe(true);
-    // real vault on the channel: the text command reaches vaultSlash
-    const vtmp = path.join(tmp, "vault");
-    const vh = startVault({
-      ch: {
-        id: "ch1",
-        name: "Test",
-        type: "discord",
-        botToken: "tok1",
-        ownerUserId: OWNER,
-      } as any,
-      botToken: "tok1",
-      stateDir: path.join(vtmp, "state"),
-      xdgDir: path.join(vtmp, "xdg"),
-      vaultDir: vtmp,
-      knownDir: path.join(vtmp, "known"),
-      secretsDir: path.join(vtmp, "secrets"),
-      stateFile: path.join(vtmp, "state.json"),
-      auditFile: path.join(vtmp, "audit.log"),
-      legacyPatsDir: path.join(vtmp, "legacy"),
-      legacyDefaultPatFile: path.join(vtmp, "marzukia-pat"),
-      transport: "socket",
-    });
-    __setVaultHandleForTest("ch1", vh);
-    try {
-      await vh.ready;
-      fetchCalls.length = 0;
-      await handleInbound(pi, inbound("/vault status", "mv1"), ctx);
-      expect(
-        posts().some((t) =>
-          t.includes("vault: no pending or active credentials"),
-        ),
-      ).toBe(true);
-    } finally {
-      stopVault(vh);
-      __setVaultHandleForTest("ch1", null);
-      __vaultResetForTest();
-    }
-  });
-
   test("runUsageLine: pricing matches pi-token-cost.py (#40)", () => {
     expect(
       runUsageLine({
@@ -11191,7 +10703,6 @@ describe("#84: placeholder settlement (all exit paths)", () => {
 
   afterEach(async () => {
     clearDiscordStatesForTest();
-    resetPeerFwdForTest();
     jest.useRealTimers();
     stopAllOpTicks();
     stopAllCompactTicks();
@@ -11737,338 +11248,5 @@ describe("live marker (#191 M2)", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
-  });
-});
-
-// ─── /vault interaction subcommands (#206, D5) ─────────────────────────────
-// The `vault` entry in SLASH_COMMANDS routes to vaultSlash with the SAME
-// state transitions as button taps. These tests wire a REAL vault
-// (socket transport, mkdtemp XDG) into a bridge channel via
-// __setVaultHandleForTest and drive buildInteractionHandler the way
-// Discord would. No network: fetch is stubbed.
-
-describe("buildInteractionHandler: /vault subcommands (#206)", () => {
-  const realFetch = globalThis.fetch;
-  const VAULT_ENV_KEYS = [
-    "JARATE_VAULT_TTL_MS",
-    "JARATE_VAULT_CLAIM_MS",
-    "JARATE_VAULT_CENSOR_GRACE_MS",
-    "JARATE_VAULT_HOUR_MS",
-    "JARATE_VAULT_MAX_PENDING",
-  ];
-
-  let calls: Array<{ url: string; method: string; body: any }>;
-  let urlViolations: string[] = [];
-  let tmp: string;
-  let vaultHandle: any;
-  let pi: any;
-  const ctx: any = {
-    cwd: "/tmp",
-    isIdle: () => true,
-    hasPendingMessages: () => false,
-    abort: () => {},
-    compact: () => {},
-    modelRegistry: { getAvailable: () => [] },
-    getContextUsage: () => undefined,
-    model: { id: "cur", name: "Cur" },
-  };
-
-  const ch = {
-    id: "ich",
-    name: "IntTest",
-    type: "discord",
-    botToken: "tok-i",
-    channel: "888",
-    ownerUserId: "owner1",
-  } as any;
-
-  const d = (
-    name: string,
-    extra: Record<string, unknown> = {},
-    userId = "owner1",
-  ) => ({
-    id: "i1",
-    token: "tok123",
-    application_id: "app1",
-    channel_id: "888",
-    guild_id: "guild1",
-    // Live guild shape (capture 2026-10-08): the actor lives at
-    // member.user; guild INTERACTION_CREATE payloads carry NO top-level
-    // user. The one top-level-only (DM/older-shape) test in this file is
-    // "status (owner)" below — the helper must still accept it.
-    member: {
-      user: {
-        id: userId,
-        username: userId === "owner1" ? "OwnerOne" : "Somebody",
-      },
-    },
-    data: { name, options: [] as any[], ...extra },
-  });
-
-  function jsonResp(status: number, data: unknown) {
-    return {
-      ok: status >= 200 && status < 300,
-      status,
-      json: async () => data,
-      text: async () => JSON.stringify(data ?? ""),
-    };
-  }
-
-  /** Fetch stub recording every call; channel message POSTs get real ids.
-   *  F2: every call is checked against the interaction URL contract
-   *  (plus the vault's plain channel-message routes); violations are
-   *  asserted clean in afterEach. */
-  function stubFetch() {
-    calls = [];
-    urlViolations = [];
-    let msgSeq = 0;
-    globalThis.fetch = (async (url: any, init?: any) => {
-      const method = init?.method ?? "GET";
-      const body =
-        method !== "GET" && init?.body
-          ? JSON.parse(init.body as string)
-          : undefined;
-      const v = interactionUrlViolation(String(url), method, true);
-      if (v) urlViolations.push(v);
-      calls.push({ url: String(url), method, body });
-      if (method === "POST" && String(url).includes("/channels/888/messages")) {
-        return jsonResp(200, { id: `m${++msgSeq}` });
-      }
-      return jsonResp(204, null);
-    }) as any;
-    return calls;
-  }
-
-  /** Deferred-ack edits (defer-first design): immediate results land as
-   *  PATCH /webhooks/.../messages/@original, not as a followup POST. */
-  function deferredTexts(): string[] {
-    return calls
-      .filter(
-        (c) =>
-          c.method === "PATCH" &&
-          c.url.includes("/webhooks/app1/tok123/messages/@original"),
-      )
-      .map((c) => String(c.body?.content ?? ""));
-  }
-
-  async function installVault(): Promise<void> {
-    stubFetch();
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-vault-"));
-    const xdg = path.join(tmp, "xdg");
-    for (const k of VAULT_ENV_KEYS) {
-      process.env[k] =
-        k === "JARATE_VAULT_MAX_PENDING"
-          ? "5"
-          : k === "JARATE_VAULT_HOUR_MS"
-            ? "600"
-            : "200";
-    }
-    process.env.JARATE_VAULT_TTL_MS = "1200";
-    process.env.JARATE_VAULT_CLAIM_MS = "800";
-    // known value the github-pat requests resolve against (vault known/ dir
-    // layout: <kind>/<owner>/<name>), token shape per validateValueShape
-    const knownDir = path.join(tmp, "vault", "known");
-    fs.mkdirSync(path.join(knownDir, "github-pat", "marzukia"), {
-      recursive: true,
-    });
-    fs.writeFileSync(
-      path.join(knownDir, "github-pat", "marzukia", "jarate:write"),
-      `github_pat_${"f".repeat(30)}`,
-      { mode: 0o600 },
-    );
-    pi = { setModel: () => {}, sendMessage: async () => ({}) };
-    vaultHandle = startVault({
-      ch,
-      botToken: ch.botToken,
-      stateDir: path.join(tmp, "state"),
-      xdgDir: xdg,
-      vaultDir: path.join(tmp, "vault"),
-      knownDir: path.join(tmp, "vault", "known"),
-      secretsDir: path.join(tmp, "vault", "secrets"),
-      stateFile: path.join(tmp, "vault", "state.json"),
-      auditFile: path.join(tmp, "vault", "audit.log"),
-      legacyPatsDir: path.join(tmp, "legacy-pats"),
-      legacyDefaultPatFile: path.join(tmp, "marzukia-pat"),
-      transport: "socket",
-    });
-    __setVaultHandleForTest(ch.id, vaultHandle);
-    // Wake webhook is orthogonal to these interaction tests — null it
-    // for hermeticity (the real dispatch-bus URL sits outside the
-    // interaction URL contract; vault.test.ts covers the wake posts).
-    // afterEach's __vaultResetForTest restores the default resolver.
-    __vaultSetWakeWebhookForTest(() => null);
-    await vaultHandle.ready;
-  }
-
-  function auditEvents(): any[] {
-    const p = path.join(tmp, "vault", "audit.log");
-    if (!fs.existsSync(p)) return [];
-    return fs
-      .readFileSync(p, "utf8")
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l));
-  }
-
-  afterEach(() => {
-    // F2: no interaction call may land outside the allowed routes.
-    expect(urlViolations).toEqual([]);
-    globalThis.fetch = realFetch;
-    if (vaultHandle) {
-      stopVault(vaultHandle);
-      vaultHandle = undefined;
-      __vaultResetForTest();
-    }
-    __setVaultHandleForTest(ch.id, null);
-    if (tmp) {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      tmp = undefined as any;
-    }
-    for (const k of VAULT_ENV_KEYS) delete process.env[k];
-    clearDiscordStatesForTest();
-  });
-
-  test("no vault on the channel: visible error, no crash", async () => {
-    stubFetch();
-    pi = { setModel: () => {}, sendMessage: async () => ({}) };
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(d("vault", { options: [{ type: 1, name: "status" }] }) as any);
-    expect(deferredTexts().at(-1)).toContain("vault not running");
-  });
-
-  test("status (owner): lists the pending request in the reply", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    // DM/older payload shape: top-level user ONLY (no member) — the single
-    // test in this file that keeps this shape; interactionUserId must still
-    // resolve the owner from it (F1). If the top-level fallback were gone,
-    // uid would be "" and this owner-only command would refuse.
-    await h({
-      ...d("vault", { options: [{ type: 1, name: "status" }] }),
-      user: { id: "owner1", username: "OwnerOne" },
-      member: undefined,
-    } as any);
-    const text = deferredTexts().at(-1)!;
-    expect(text).toContain("[vault: 1 pending, 0 active]");
-    expect(text).toContain("github-pat/marzukia/jarate:write");
-    expect(text).toContain("one-shot");
-    // message link uses the interaction's guild id
-    expect(text).toContain("https://discord.com/channels/guild1/888/");
-  });
-
-  test("approve (owner): same transition as a tap — active, card edited, audit actor slash:", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d("vault", {
-        options: [
-          {
-            type: 1,
-            name: "approve",
-            options: [{ type: 3, name: "id", value: id }],
-          },
-        ],
-      }) as any,
-    );
-    const cred = (vaultHandle.vault.credentials as any).get(id);
-    expect(cred.state).toBe("active");
-    // audit: the SAME event as a tap, actor names the slash path
-    const ev = auditEvents().find((e) => e.event === "approve");
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:owner1");
-    // card edited (the request message, not a new post)
-    const edits = calls.filter(
-      (c) => c.method === "PATCH" && c.url.includes("/channels/888/messages/"),
-    );
-    expect(edits.length).toBe(1);
-    expect(edits[0].body.embeds[0].title).toContain("approved");
-    expect(String(edits[0].body.content)).toContain(`jarate vault-run ${id}`);
-  });
-
-  test("deny (owner): denied state + audit actor slash:", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d("vault", {
-        options: [
-          {
-            type: 1,
-            name: "deny",
-            options: [{ type: 3, name: "id", value: id }],
-          },
-        ],
-      }) as any,
-    );
-    const cred = (vaultHandle.vault.credentials as any).get(id);
-    expect(cred.state).toBe("denied");
-    const ev = auditEvents().find((e) => e.event === "deny");
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:owner1");
-  });
-
-  test("non-owner: visible error + audited, state unchanged", async () => {
-    await installVault();
-    const req = await vaultRequest(vaultHandle.vault, {
-      agent: "monky",
-      kind: "github-pat",
-      name: "marzukia/jarate:write",
-      level: "one-shot",
-      reason: "integration test",
-    });
-    expect(req.ok).toBe(true);
-    const id = req.id as string;
-    const h = buildInteractionHandler(pi, ctx, ch, "tok-i");
-    await h(
-      d(
-        "vault",
-        {
-          options: [
-            {
-              type: 1,
-              name: "approve",
-              options: [{ type: 3, name: "id", value: id }],
-            },
-          ],
-        },
-        "someone-else",
-      ) as any,
-    );
-    expect(deferredTexts().at(-1)).toContain(
-      "[!] only the owner can use /vault",
-    );
-    expect((vaultHandle.vault.credentials as any).get(id).state).toBe(
-      "pending",
-    );
-    const ev = auditEvents().find(
-      (e) => e.event === "slash-rejected" && e.reason === "not-owner",
-    );
-    expect(ev).toBeDefined();
-    expect(ev.actor).toBe("slash:someone-else");
   });
 });

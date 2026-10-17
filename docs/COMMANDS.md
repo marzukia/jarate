@@ -416,30 +416,6 @@ dispatch workers get (`--worktree`): the worktree lands at
 - A conflicted merge leaves the merge in flight on the live repo:
   resolve the files, `git add`, then `/merge-worktree` again to finalize.
 
-### agent-say targets + guards
-
-`agent-say <target> "msg"` accepts a peer NAME or a numeric channel id.
-Names resolve through `~/.config/agent-fleet/peers.json` (seeded by
-`install.sh` from the local `dispatch/peers.json` — gitignored, copy
-`dispatch/peers.example.json` and fill in real channel ids — plus the
-agent's own channel); unknown names fail with `agent-say: unknown peer 'x'`
-and exit 2.
-Guards on the resolved target (2026-09-20 incident: a human deliverable
-routed to a peer's channel):
-
-- target = your OWN channel → exit 3. Reply normally — the bridge
-  auto-forwards to your channel.
-- numeric target not a value in peers.json → exit 4 (`known: ...` lists
-  the valid peers). Humans live in your own channel; a raw id that is no
-  agent's channel is a mis-route. Bypass: `AGENT_SAY_FORCE=1`.
-- message does not name the target peer → `[warn]` on stderr
-  (non-blocking nudge, the send still goes out). `AGENT_SAY_HUMANS`
-  (space-separated list of human names) sharpens the nudge: a body that
-  names a known human but not the peer warns to reply in your own channel.
-
-Keep the peers file current when the fleet roster or an agent's channel
-changes (install.sh never clobbers an existing file).
-
 ### /diff
 
 ```
@@ -550,8 +526,7 @@ Lists the command set (the canonical list lives in
 
 - **Bare `stop`** is the only slash-free command, and it must be the entire
   message.
-- **Other bots' messages are skipped** on inbound (agent-say traffic does not
-  burn a run; no echo loops).
+- **Other bots' messages are skipped** on inbound (no echo loops).
 - **pi-bg webhooks are exempt** — the dispatch callback posts to the channel
   without triggering the bot.
 - **Mid-run messages are queued, not debounced.** One message = one run: a

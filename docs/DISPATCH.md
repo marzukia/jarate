@@ -10,7 +10,6 @@ Components (all in this repo):
 - `dispatch/jarate-wait` — in-turn wait for the callback / a human message
 - `dispatch/jarate-bg-tail` — read a run's live output (`jarate-bg-tail <id> [lines] [-f]`)
 - `dispatch/jarate-bg-kill` — cancel a run via its cgroup (`jarate-bg-kill <id> [--dry-run]`)
-- `bin/agent-say` — agent-to-agent messaging (post to a peer's channel)
 
 ## Roles
 
@@ -474,19 +473,6 @@ the first new message:
 
 Bot token + channel come from `~/.pi/agent/settings.json` (`channels[0]`).
 The calling bot's own messages are skipped.
-
-## agent-say
-
-`agent-say <channel-id|peer> "message"` posts to a Discord channel as the
-calling user's pi bot. Token: `$PI_BOT_TOKEN` or first discord `botToken` in
-`~/.pi/agent/settings.json`. This is how agents talk to each other — a normal
-reply only auto-forwards to your own channel. Keep peer messages short and
-self-contained (the peer has no context).
-
-Guards: target = your own channel → exit 3 (reply normally). Target not a
-known fleet peer (peers.json value) → exit 4 (`AGENT_SAY_FORCE=1` bypass).
-Message that does not name the target peer → `[warn]` on stderr. agent-say is
-for agents, not people: for a human in your own channel, just reply.
 
 ## Decision rules
 

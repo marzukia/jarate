@@ -50,7 +50,6 @@ import {
   getDiscordStates,
   getDiscordToken,
   interactionUserId,
-  interactionUserName,
   loadChannelStateFile,
   loadDiscordAttachment,
   loadPersistedCursors,
@@ -87,7 +86,6 @@ import {
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
 import { memoryToc } from "./memory";
-import { type PatVaultHandle, startPatVault, stopPatVault } from "./pat-vault";
 import { extractQueueSuffix } from "./queue";
 import {
   loadRewakeQueue,
@@ -173,27 +171,12 @@ import {
   type UsageStats,
   usageFrame,
 } from "./usage";
-import { startVault, stopVault, type VaultHandle, vaultSlash } from "./vault";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
 
 let lastActiveChannel: ChannelConfig | null = null;
 let sessionStartTs = 0;
 let agentBusy = false;
-// PAT vault handles per channel (L4: once per process per socket path;
-// start on connect, stopPatVault on shutdown — refcounted internally).
-const patVaultHandles = new Map<string, PatVaultHandle>();
-// Generic vault handles per channel (same L4 refcount pattern).
-const vaultHandles = new Map<string, VaultHandle>();
-/** Test hook: register/clear the vault handle for a channel (the
- *  production wiring happens in connectDiscord). #206. */
-export function __setVaultHandleForTest(
-  chId: string,
-  h: VaultHandle | null,
-): void {
-  if (h) vaultHandles.set(chId, h);
-  else vaultHandles.delete(chId);
-}
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -447,32 +430,20 @@ export function queueMidTurnInbound(
   // #177: [bg: machine wakes are queue-only. The re-wake queue already
   // guarantees agent_end delivery; the interrupt only jumps the line, and
   // a machine alert is never more urgent than the in-flight turn — so it
-  // never arms one. isPeerInbound excludes [bg: bodies from the 12s
-  // branch; this extends that exclusion to no arming at all. (2026-10-06
-  // incident: a reviewer callback posted mid-turn armed the 3s interrupt,
-  // was never consumed, and was lost at compact.)
+  // never arms one. (2026-10-06 incident: a reviewer callback posted
+  // mid-turn armed the 3s interrupt, was never consumed, and was lost at
+  // compact.)
   if (armInterrupt && !isBgInbound(msg)) {
-    // Two 4x (12s) cases, both "let the in-flight work finish". The
-    // message is queued with a guaranteed re-wake either way, so the
-    // longer window only changes WHEN the interrupt cuts in:
-    // 1. An interrupt is already in flight (re-wake run in progress):
-    //    without this, rapid-fire messages cascade — each new message
-    //    arms a 3s interrupt that kills the re-wake run mid-LLM-call,
-    //    forcing a full 120K-token prefill restart.
-    // 2. #165: the sender is a known peer agent. A peer's mid-run message
-    //    is usually an echo of the exchange the in-flight step is in (the
-    //    step is often agent-say TO that peer) — the peer gets the run's
-    //    head start. 3s is far shorter than a typical LLM step + REST,
-    //    so the default killed the in-flight call mid-POST (2026-10-06:
-    //    pre-spawn kill of monky's agent-say by the very peer message it
-    //    answered). 12s lets the call complete; if it still drags past
-    //    12s the interrupt fires and the re-wake owns delivery.
-    // Human senders keep the 3s default (quick cut-in).
-    const delay =
-      interruptingChannels.has(channelId) ||
-      isPeerInbound(resolveChannel(channelId), msg)
-        ? interruptStepTimeoutMs() * 4 // 12s: give the in-flight run room
-        : undefined; // default 3s
+    // 4x (12s) case: an interrupt is already in flight (re-wake run in
+    // progress). Without this, rapid-fire messages cascade — each new
+    // message arms a 3s interrupt that kills the re-wake run mid-LLM-call,
+    // forcing a full 120K-token prefill restart. The message is queued
+    // with a guaranteed re-wake either way, so the longer window only
+    // changes WHEN the interrupt cuts in. All other senders keep the 3s
+    // default (quick cut-in).
+    const delay = interruptingChannels.has(channelId)
+      ? interruptStepTimeoutMs() * 4 // 12s: give the in-flight run room
+      : undefined; // default 3s
     armInterruptTimer(channelId, msg.messageId, delay);
   }
   return q.length;
@@ -1552,13 +1523,6 @@ const lastInboundIds = new Map<string, string>();
 // validation set for <reply-to:MSGID> on the message_end early-send path
 // (event.messages is not available there). Updated on every sendToPi.
 const runInboundIds = new Map<string, string[]>();
-// Recent inbound message metadata by message id (all channels): author id
-// + body, so an egress reply's <reply-to:MSGID> target can be classified
-// (peer agent vs human) and loop-guarded ([fwd]-marked target). Recorded
-// in handleInbound (the one inbound funnel: gateway, poll, queued re-wake).
-// Bounded; oldest entries drop off.
-const inboundMeta = new Map<string, { authorId?: string; body: string }>();
-const INBOUND_META_CAP = 200;
 // Set when /stop or a mid-run interrupt aborts a run, so agent_end does not
 // post the abort's errorMessage as if it were a model/API failure (A2).
 let userStoppedRun = false;
@@ -2118,7 +2082,7 @@ export function matchCommand(
   body: string,
 ): { name: string; arg?: string } | null {
   const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree|vault)(?:\s+([\s\S]+))?|stop)$/i,
+    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
   );
   if (!m) return null;
   return { name: m[1] ?? "stop", arg: m[2] };
@@ -2638,31 +2602,9 @@ export default function (pi: ExtensionAPI) {
             // cleared ~2-3h after boot, no audit trail). unref'd, idempotent;
             // JARATE_SLASH_REPUT_MS=0 disables.
             startSlashReput(bt);
-            // PAT vault: started alongside the interaction handler;
-            // state persists in <cwd>/.tmp (same dir as channel-state).
-            // L4: once per process per socket path; refcounted stop on
-            // shutdown.
-            const vh = startPatVault({
-              pi,
-              ctx,
-              ch,
-              botToken: bt,
-              stateDir: path.join(ctx.cwd, ".tmp"),
-            });
-            patVaultHandles.set(ch.id, vh);
-            // Generic vault: started alongside the PAT vault; state lives
-            // in ~/.jarate/vault (its own dir, L4 refcounted).
-            const vh2 = startVault({
-              pi,
-              ctx,
-              ch,
-              botToken: bt,
-              stateDir: path.join(ctx.cwd, ".tmp"),
-            });
-            vaultHandles.set(ch.id, vh2);
             setDiscordInteractionHandler(
               bt,
-              buildInteractionHandler(pi, ctx, ch, bt, vh, vh2),
+              buildInteractionHandler(pi, ctx, ch, bt),
             );
           }
           // startupMessage is posted by the poller once the bot's own user
@@ -3017,16 +2959,6 @@ export default function (pi: ExtensionAPI) {
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
-        const vh = patVaultHandles.get(ch.id);
-        if (vh) {
-          stopPatVault(vh);
-          patVaultHandles.delete(ch.id);
-        }
-        const vh2 = vaultHandles.get(ch.id);
-        if (vh2) {
-          stopVault(vh2);
-          vaultHandles.delete(ch.id);
-        }
         if (ch.botToken) {
           stopDiscordPresence(ch.botToken);
           setDiscordInteractionHandler(ch.botToken, null);
@@ -3656,10 +3588,6 @@ export default function (pi: ExtensionAPI) {
             );
         } catch {}
       }
-      // Peer auto-forward (b): the final is threaded to a peer agent's
-      // message (tagged or default last-inbound) — relay it to the
-      // peer's channel. One hop + 60 s identical-text dedupe inside.
-      if (replyTo) await forwardPeerReply(ch, rt.text, replyTo);
       // SPEC B: the final is out — delete the ephemeral live-text message
       // (best effort; the agent_end delete is the safety net for runs
       // whose final never reaches this path).
@@ -4031,10 +3959,6 @@ export default function (pi: ExtensionAPI) {
               );
           } catch {}
         }
-        // Peer auto-forward (b): same rule as the message_end path — a
-        // final delivered here (not caught by the early send) that
-        // targets a peer agent's message is relayed to the peer channel.
-        if (f.replyTo) await forwardPeerReply(ch, f.text, f.replyTo);
         // Clear the ack even when every chunk failed, so a failed reply
         // does not leave a stale 👀 on the user's message.
         if (ch.type === "discord" && f.replyTo) {
@@ -4164,27 +4088,6 @@ export function buildRepliedMessageBlock(rm?: {
   return `This message was a reply to message\n\n<replied-message${author}>\n${escapePromptText(rm.text)}\n</replied-message>`;
 }
 
-/** c1: <channel-ctx> line for peer-agent inbounds. The model has no
- *  other signal that the sender is a peer (a peer message arrives like
- *  any channel message), so the hint states where a normal reply lands
- *  (this channel only), the one case the bridge auto-forwards (a reply
- *  threaded to the peer's message), and the general tool (agent-say).
- *  Present ONLY for peer-authored messages. Used while a peerChannels
- *  mapping exists for the peer; see PEER_SENDER_HINT_NO_FWD for the
- *  pre-configuration window. */
-export const PEER_SENDER_HINT =
-  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only; the peer sees it ONLY when your reply targets their message (the bridge auto-forwards that one hop). For anything else, use agent-say <their channel>.";
-
-/** c1: no-forward variant of PEER_SENDER_HINT, used while ch.peerChannels
- *  has no mapping for this peer (the pre-configuration window). The
- *  bridge cannot auto-forward in that state (no target channel — the
- *  forward no-ops with reason "no-channel"), so the hint must not promise
- *  the one hop: a threaded reply does NOT reach the peer, and agent-say
- *  is the only path (the 2026-10-05 RCA failure mode is a model that
- *  threads a reply and assumes the peer saw it). */
-export const PEER_SENDER_HINT_NO_FWD =
-  "PEER AGENT MESSAGE: the sender is another fleet agent (a bot, not a human). An in-channel reply threads into YOUR channel only and does NOT reach the peer (no auto-forward is configured). To send anything to the peer, use agent-say <their channel>.";
-
 /** #177: true when the inbound is a [bg: machine wake (pi-bg callback,
  *  dead-letter alert, ETL alert). Machine wakes are never more urgent than
  *  the in-flight turn: they ride the re-wake queue and deliver at agent_end,
@@ -4196,18 +4099,6 @@ export const PEER_SENDER_HINT_NO_FWD =
  *  The 2026-10-06 incident callback was the embed-only shape. */
 export function isBgInbound(msg: ChannelMessage): boolean {
   return isBgCallbackBody(msg.body.trimStart());
-}
-
-/** c1: true when the inbound is authored by a known peer bot. Bg-webhook
- *  tickets ([bg: prefix) are excluded even if their author id matches —
- *  those are machine wakes, not a peer speaking. */
-export function isPeerInbound(
-  ch: ChannelConfig | undefined,
-  msg: ChannelMessage,
-): boolean {
-  const peerIds = ch?.peerBotIds ?? [];
-  if (!msg.fromId || !peerIds.includes(msg.fromId)) return false;
-  return !isBgInbound(msg);
 }
 
 function buildChannelContext(
@@ -4240,17 +4131,6 @@ function buildChannelContext(
     "Attribute precisely: when a <replied-message> block is present, the author of that block is the one who SPOKE the quoted words. Do not restate their statement as if it were the current sender's, and do not attribute their words to anyone else. Name the actual speaker when you reference what they said.",
     "To reply to a specific person's message, prefix your reply with <reply-to:MSGID> using their id from the [msgId=...] markers in this message (each part of a rapid-fire burst carries its own marker, including parts outside this block) or from the msgId= attribute of this block; the reply threads to that message and the tag is stripped before sending.",
   ];
-  if (isPeerInbound(ch, msg) && msg.fromId) {
-    // State-aware: the auto-forward clause is true only while a
-    // peerChannels mapping exists for this peer. Until the operator adds
-    // it, a threaded reply dies in-channel (the RCA failure mode), so the
-    // hint must say the peer does NOT see it.
-    lines.push(
-      ch?.peerChannels?.[msg.fromId]
-        ? PEER_SENDER_HINT
-        : PEER_SENDER_HINT_NO_FWD,
-    );
-  }
   if (ch?.instructions) lines.push(ch.instructions);
   if (opts?.btw) lines.push(BTW_HINT);
   lines.push("</channel-ctx>");
@@ -4265,120 +4145,6 @@ function buildChannelContext(
   return todoBlock ? `${block}\n\n${todoBlock}` : block;
 }
 
-// ─── Peer reply auto-forward (b) ──────────────────────────────────────
-// An in-channel reply that TARGETS a peer agent's message (threaded to
-// it, whether via <reply-to:MSGID> or the default last-inbound
-// threading) is relayed to the peer's channel through the agent-say
-// egress path: POST /channels/<peer>/messages with our own bot token.
-// Model-independent: it keys off the reply target's author, not on any
-// token the model emits. One hop: the relay carries the [fwd] marker
-// and a reply threaded to a [fwd]-marked message is never relayed again
-// (A->B->A echo guard). Identical relays to the same peer within
-// PEER_FWD_DEDUPE_MS are dropped (retry double-post guard).
-
-/** Leading marker on auto-forwarded peer replies (loop guard token). */
-export const FWD_MARKER = "[fwd] ";
-/** Identical-text dedupe window for peer auto-forwards (ms). */
-export const PEER_FWD_DEDUPE_MS = 60_000;
-/** targetChannel + text -> timestamp of the last forwarded post. */
-const peerFwdAt = new Map<string, number>();
-
-/** Record an inbound's author id + body for reply-target classification.
- *  Bounded: the oldest entry drops off when the cap is exceeded. */
-export function recordInboundMeta(
-  messageId: string,
-  authorId: string | undefined,
-  body: string,
-): void {
-  inboundMeta.set(messageId, { authorId, body });
-  while (inboundMeta.size > INBOUND_META_CAP) {
-    const oldest = inboundMeta.keys().next().value;
-    if (oldest === undefined) break;
-    inboundMeta.delete(oldest);
-  }
-}
-
-/** Clear peer-forward state (tests only). */
-export function resetPeerFwdForTest(): void {
-  inboundMeta.clear();
-  peerFwdAt.clear();
-}
-
-/** Snapshot of peerFwdAt (tests only). */
-export function peerFwdSnapshotForTest(): [string, number][] {
-  return Array.from(peerFwdAt.entries());
-}
-
-/** Drop peerFwdAt entries whose age reaches the dedupe window. An entry
- *  that old can no longer trigger a dedupe (the check is
- *  `now - t < PEER_FWD_DEDUPE_MS`), so keeping it is a pure leak; pruning
- *  on write keeps the map bounded to in-window forwards. */
-function prunePeerFwd(now: number): void {
-  for (const [key, t] of peerFwdAt) {
-    if (now - t >= PEER_FWD_DEDUPE_MS) peerFwdAt.delete(key);
-  }
-}
-
-/**
- * Auto-forward an in-channel reply that targets a peer agent's message.
- * Posts "[fwd] <text>" to the peer's channel. No-op (forwarded:false)
- * when: no target / no bot token, the reply itself is already marked,
- * the target is unknown (not in the recent-inbound map), the target's
- * author is not a configured peer bot, the target carries the [fwd]
- * marker (loop guard), no peer channel is configured for that bot, the
- * peer channel is our own, or an identical forward to that channel
- * landed within PEER_FWD_DEDUPE_MS (dedupe). Best effort: a failed post
- * never rejects.
- */
-export async function forwardPeerReply(
-  ch: ChannelConfig,
-  text: string,
-  replyTo: string | undefined,
-  now = Date.now(),
-): Promise<{ forwarded: boolean; reason?: string }> {
-  try {
-    if (!replyTo || ch.type !== "discord" || !ch.botToken)
-      return { forwarded: false, reason: "no-target" };
-    if (text.startsWith(FWD_MARKER))
-      return { forwarded: false, reason: "already-marked" };
-    const meta = inboundMeta.get(replyTo);
-    if (!meta) return { forwarded: false, reason: "unknown-target" };
-    const authorId = meta.authorId;
-    if (!authorId || !(ch.peerBotIds ?? []).includes(authorId))
-      return { forwarded: false, reason: "not-peer" };
-    if (meta.body.startsWith(FWD_MARKER))
-      return { forwarded: false, reason: "loop-guard" };
-    const targetChannel = ch.peerChannels?.[authorId];
-    if (!targetChannel) return { forwarded: false, reason: "no-channel" };
-    if (targetChannel === ch.channel)
-      return { forwarded: false, reason: "own-channel" };
-    const key = `${targetChannel}\n${text}`;
-    const last = peerFwdAt.get(key);
-    if (last !== undefined && now - last < PEER_FWD_DEDUPE_MS)
-      return { forwarded: false, reason: "dedupe" };
-    // Discord content cap headroom: the in-channel path chunks at 1900,
-    // the relay is a single post — clip over-long replies (tail lost,
-    // marker + head kept).
-    const capped = text.length > 1900 ? `${text.slice(0, 1897)}...` : text;
-    const r = await sendDiscordMessage(
-      { ...ch, id: `${ch.id}::fwd`, channel: targetChannel },
-      `${FWD_MARKER}${capped}`,
-    );
-    if (!r.success) {
-      console.error(
-        `[channel] peer forward failed: ${sanitizeSensitiveText(r.error || "")}`,
-      );
-      return { forwarded: false, reason: "send-failed" };
-    }
-    prunePeerFwd(now);
-    peerFwdAt.set(key, now);
-    return { forwarded: true };
-  } catch (e) {
-    console.error(`[channel] peer forward failed: ${sanitizeUnknownValue(e)}`);
-    return { forwarded: false, reason: "error" };
-  }
-}
-
 // ─── Native slash-command handler (INTERACTIONS_CREATE) ───────────────────
 // Defer-first: the type-5 ack lands BEFORE any command work, so a slow
 // handler or a throwing command can never produce "did not respond in
@@ -4390,29 +4156,15 @@ export function buildInteractionHandler(
   ctx: ExtensionContext,
   ch: ChannelConfig,
   botToken: string,
-  vaultRef?: { handlePatComponent(d: any): Promise<void> } | null,
-  vault2Ref?: { handleVaultComponent(d: any): Promise<void> } | null,
 ): (d: any) => Promise<void> {
   return async (d: any) => {
-    // Type-4 (button) events go to the vaults. The .catch is the M1
-    // dispatch-side backstop: each component handler never rejects by
-    // construction (top-level catch), but the gateway branch calls this
-    // handler un-awaited inside a sync-only try/catch — an escaped
-    // rejection would crash the whole bridge (Node 22 defaults to
-    // unhandled-rejections=throw).
-    // MESSAGE_COMPONENT (button/select) events go to the vaults — type 3
-    // per the current Discord spec (it was 4 in the old numbering; the
-    // type-4 gate + missing INTERACTIONS intent is why every tap fell
-    // through to the slash-command path, RCA 2026-10-01).
-    if (d?.type === 3) {
-      vaultRef
-        ?.handlePatComponent(d)
-        .catch((e) => console.error("[interactions] vault handler failed:", e));
-      vault2Ref
-        ?.handleVaultComponent(d)
-        .catch((e) => console.error("[interactions] vault handler failed:", e));
-      return;
-    }
+    // MESSAGE_COMPONENT (button/select) events: type 3 per the current
+    // Discord spec (it was 4 in the old numbering). The PAT vault
+    // (gutted 2026-10-17) was the only component producer — drop them
+    // before the command path (the
+    // gateway branch calls this handler un-awaited inside a sync-only
+    // try/catch; a reply here would need an ack the tap never gets).
+    if (d?.type === 3) return;
     // Config fallback covers the pre-resolution window where no gateway
     // state exists yet (and keeps tests simple).
     const cid = getDiscordChannelId(ch.id) || ch.channel;
@@ -4446,18 +4198,6 @@ export function buildInteractionHandler(
           ].includes(o?.name),
         )
       : undefined;
-    // /vault (#206): subcommand form — the first option is the
-    // subcommand (type 1); its "id" option (type 3) is the credential
-    // id. Fold back to "status" / "approve <id>" for runChannelCommand.
-    let vaultArg: string | undefined;
-    if (d.data?.name === "vault" && Array.isArray(d.data.options)) {
-      const sub = d.data.options.find((o: any) => o?.type === 1);
-      const subOpts = Array.isArray(sub?.options) ? sub.options : [];
-      const idOpt = subOpts.find((o: any) => o?.name === "id");
-      vaultArg = sub
-        ? `${sub.name}${idOpt?.value != null ? ` ${String(idOpt.value)}` : ""}`
-        : "";
-    }
     let text: string | undefined;
     try {
       const r = await runChannelCommand(
@@ -4465,13 +4205,9 @@ export function buildInteractionHandler(
         ctx,
         ch,
         d.data?.name,
-        vaultArg ?? opt?.value ?? undefined,
+        opt?.value ?? undefined,
         interactionUserId(d),
         true,
-        {
-          guildId: d.guild_id != null ? String(d.guild_id) : undefined,
-          username: interactionUserName(d),
-        },
       );
       text = r.btw
         ? undefined
@@ -5360,7 +5096,6 @@ async function runChannelCommand(
   arg: string | undefined,
   fromId: string | undefined,
   native: boolean,
-  opts?: { guildId?: string; username?: string },
 ): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
   const isOwner = isOwnerUser(ch, fromId);
   // A recognised command is NEVER handed to the agent as plain text when the
@@ -6154,24 +5889,6 @@ async function runChannelCommand(
         ),
       };
     }
-    case "vault": {
-      // #206 (D5): owner-gated text path for the credential vault.
-      // status | approve <id> | deny <id> | ping <id>. Non-owner ->
-      // visible error + audit (inside vaultSlash); the transitions
-      // share applyDecision() with the button taps.
-      const h = vaultHandles.get(ch.id);
-      if (!h) return { immediate: fence("[!] vault not running") };
-      const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
-      const r = await vaultSlash(
-        h.vault,
-        parts[0] ?? "status",
-        parts[1],
-        fromId ?? "",
-        opts?.username ?? fromId ?? "",
-        opts?.guildId,
-      );
-      return { immediate: fence(r.text) };
-    }
     default:
       return {};
   }
@@ -6679,7 +6396,6 @@ export async function handleInbound(
   lastActiveChannel = ch;
   if (msg.messageId) {
     lastInboundIds.set(ch.id, msg.messageId);
-    recordInboundMeta(msg.messageId, msg.fromId, msg.body);
   }
   resetFinalRepeats(ch.id); // a new inbound user message restarts the repetition counter
 
@@ -6737,7 +6453,6 @@ export async function handleInbound(
         cmd.arg,
         msg.fromId,
         false,
-        undefined,
       );
       if (r.btw) {
         noAck();

@@ -39,7 +39,6 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
      the run (non-dry) if any of the 10 is missing or shadowed by a stale
      non-symlink in the unit PATH.
    - `~/scripts/jarate` -> `<jarate>/bin/jarate`
-   - `~/bin/agent-say` -> `<jarate>/bin/agent-say`
    - `~/projects/recall` -> `<jarate>/packages/recall` (only if the dest is
      absent or already this symlink; replaces the old `pgrag` symlink)
 
@@ -55,7 +54,7 @@ Guarantees:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# done. jarate-bg/jarate-wait/agent-say/recall are symlinks - they update instantly.
+# done. jarate-bg/jarate-wait/recall are symlinks - they update instantly.
 # Only bridge (channel/) changes need a pi.service restart.
 ```
 
