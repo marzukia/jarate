@@ -11,12 +11,11 @@
 23,856  pibg-test*    <- dispatch/pi-bg.test.ts temp dirs, never removed
  8,216  pibg-wd-*     <- watchdog temp dirs
  4,894  pibg-tail*    <- tail temp dirs
- 1,577  recall-p* / recall-e* each
  42,782 total top-level entries (vs ~40 normal)
 ```
 
 ## Fix applied (ops, 2026-09-14)
-- purged pibg-*/recall-*/agent-say*/jarate-t*/loadrepo*/dispatch* older than 6h (29,306 entries)
+- purged pibg-*/agent-say*/jarate-t*/loadrepo*/dispatch* older than 6h (29,306 entries)
 - purged weasyprint-*/check-dist-*/nf-saved-motion-*/playwright*/tmpXXXX older than 1h
 - /etc/tmpfiles.d/agent-tmp.conf: `e /tmp 1777 root root 2d` (daily age-reap)
 - inodes: 1,048,576 used -> 233,803 (23%)

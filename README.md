@@ -16,8 +16,6 @@ What it ships:
 - **`dispatch/`** — orchestration: `jarate-bg` (one-shot worker/reviewer runs with
   git worktrees, cgroup escape, Discord webhook callbacks) + `jarate-wait`
   (in-turn wait).
-- **`packages/recall`** — shared RAG on Postgres + pgvector (`bun recall
-  ingest|query`). TS port of the old Python pgrag; same db, no migration.
 - **`templates/` + `scripts/init-repo.sh`** — newrepo boilerplate (repo
   governance: AGENTS/CONTRIBUTING/CI/hooks).
 
@@ -30,7 +28,6 @@ the source of truth.
 |---|---|
 | `packages/bridge/` | `@jarate/bridge` — Discord bridge for pi (TypeScript, bun, strict tsc; 300+ tests) |
 | `packages/bridge/skills/` | pi skill (`channel`) that ships with the bridge |
-| `packages/recall/` | `@jarate/recall` — RAG CLI (`bun recall ingest\|query`), `schema.sql` (dim 768, nomic-embed-text) |
 | `dispatch/` | `jarate-bg` (dispatch worker/reviewer, worktrees, cgroup escape, webhook), `jarate-wait` (in-turn wait) |
 | `templates/` | newrepo boilerplate (repo governance) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
@@ -39,17 +36,16 @@ the source of truth.
 | `docs/DEPLOY.md` | install.sh internals, deploy-after-pull, one-time box migration |
 | `docs/DISPATCH.md` | orchestration pattern: roles, worktrees, cgroup escape, callback protocol, fleet caps |
 | `docs/COMMANDS.md` | every Discord command with examples |
-| `docs/PGRAG-SETUP.md` | RAG DB + embed runbook from zero |
 | `.githooks/` | pre-commit (biome gate) |
 | `.github/workflows/ci.yml` | CI: biome + bridge typecheck/tests (context `ci`) |
 
 ## Quick start
 
-Bare box → working pi Discord agent in 9 verified steps:
+Bare box → working pi Discord agent in 8 verified steps:
 **[docs/SETUP.md](docs/SETUP.md)** (prerequisites → Discord app +
 gateway intents → `./install.sh` → `~/.pi/agent/settings.json` +
 `models.json` → `pi.service` user unit → first-run journal check →
-dispatch webhook → optional RAG → optional auto-deploy timer).
+dispatch webhook → optional auto-deploy timer).
 
 TL;DR (full detail in SETUP.md):
 
@@ -62,7 +58,7 @@ npm install -g @earendil-works/pi-coding-agent bun
 #    (SERVERS, SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES —
 #     see packages/bridge/channel/discord.ts GATEWAY_INTENTS), invite bot
 
-# 3. bootstrap (symlinks jarate-bg/jarate-wait/recall into the checkout)
+# 3. bootstrap (symlinks jarate-bg/jarate-wait into the checkout)
 git clone https://github.com/marzukia/jarate.git ~/projects/jarate
 ~/projects/jarate/install.sh
 
@@ -131,9 +127,6 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
   fire-and-forget — the webhook callback is the wake. In-turn `jarate-wait`
   is the opt-in exception (short task, human beats every wait).
   Full protocol: [docs/DISPATCH.md](docs/DISPATCH.md).
-- **recall**: every RAG query goes through the single `search()` SQL
-  function (reciprocal-rank fusion of vector + FTS). Ingest is idempotent
-  (upsert on sha256, prune on by default).
 
 ## Develop
 

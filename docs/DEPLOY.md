@@ -39,8 +39,10 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
      the run (non-dry) if any of the 10 is missing or shadowed by a stale
      non-symlink in the unit PATH.
    - `~/scripts/jarate` -> `<jarate>/bin/jarate`
-   - `~/projects/recall` -> `<jarate>/packages/recall` (only if the dest is
-     absent or already this symlink; replaces the old `pgrag` symlink)
+   - stale `~/projects/recall` symlink cleanup: a dangling link pointing at
+     the removed `packages/recall` is removed (RAG/recall removed 2026-10-17
+     (fleet order); the rag Postgres data is kept but unused); a live dir or
+     foreign link is left untouched
 
 Guarantees:
 
@@ -54,44 +56,30 @@ Guarantees:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# done. jarate-bg/jarate-wait/recall are symlinks - they update instantly.
+# done. jarate-bg/jarate-wait are symlinks - they update instantly.
 # Only bridge (channel/) changes need a pi.service restart.
 ```
 
-## recall (packages/recall)
+## RAG / recall
 
-Source of truth: `packages/recall/` in this repo (TypeScript port of the
-Python pgrag, 2026-09-10; full git history of the old pgrag repo lives
-under `packages/memory/` in the old refs). The box copy `~/projects/recall`
-is a **symlink** into the checkout; it **replaces the old `~/projects/pgrag`
-symlink** (orchestrator migrates the box link).
-
-No venv: deps install with the workspace `bun install`. Smoke test:
-
-```bash
-cd <jarate>/packages/recall && bun recall query "ping"
-```
-
-The db `rag` data is unchanged — no data migration; only the CLI moved from
-`uv run` to `bun recall`. Fresh DB setup (role, embed host, first ingest,
-env): see PGRAG-SETUP.md. `install.sh` never touches the database.
+RAG/recall removed 2026-10-17 (fleet order); the rag Postgres data is kept
+but unused. `install.sh` never touches the database.
 
 ## Migrating a box off the old rsync layout (one-time)
 
-The old layout rsynced `packages/bridge/` -> `~/.pi/agent/piscord` and
-`pgrag/` -> `~/projects/pgrag` (real dir). To migrate an agent:
+The old layout rsynced `packages/bridge/` -> `~/.pi/agent/piscord` and a
+real RAG dir into `~/projects/`. The RAG side is settled by the 2026-10-17
+removal: the old RAG dir is plain junk — `rm -rf` it (the rag Postgres data
+is kept but unused). To migrate the bridge side of an agent:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# 1. move machine-local pgrag state into the checkout
-mv ~/projects/pgrag/.venv <jarate>/packages/recall/.venv   # if present
-rm -rf ~/projects/pgrag                                     # old rsync dest
-# 2. bootstrap (makes the symlinks, bun install)
+# 1. bootstrap (makes the symlinks, bun install)
 ./install.sh --jarate-dir <jarate>
-# 3. repoint settings.json packages -> <jarate>/packages/bridge
-# 4. ONE restart:
+# 2. repoint settings.json packages -> <jarate>/packages/bridge
+# 3. ONE restart:
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service
-# 5. verified on the new tree -> sweep the old copies
+# 4. verified on the new tree -> sweep the old copies
 rm -rf ~/.pi/agent/piscord        # old bridge rsync dest (monky)
 rm -rf ~/git/piscord              # old standalone checkout (frank)
 ```
