@@ -179,7 +179,11 @@ UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin
 PATH_FAIL=0
 FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh"
 for tool in $FAMILY_TOOLS jarate jarate-diff; do
-  resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
+  # `command` is a shell builtin, not a binary: `env -i ... command -v` tries
+  # to exec /usr/bin/command, which does not exist on Debian/Ubuntu, so every
+  # lookup returned empty and install hard-failed on an otherwise healthy box.
+  # Run it through sh so the builtin is reachable, keeping the clean-env intent.
+  resolved="$(env -i PATH="$UNIT_PATH" sh -c 'command -v "$1"' _ "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
     echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2
     PATH_FAIL=1
