@@ -21,8 +21,6 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { wrapFenceLine } from "./format";
-import { FRAME_COL_MAX } from "./frame";
 
 export interface InflightJob {
   /** ticket id (run_id) via /proc/<pid>/cgroup, or null when unresolved */
@@ -300,12 +298,13 @@ function ageStr(sec: number): string {
  * (inflight + last 10 history entries); "text" = channel-ready listing
  * (inflight + last 5 history entries).
  *
- * v3 frame layout (operator 2026-09-16: "make better use of the space"):
- * - in-flight: `┣ <id> <profile> · <age>` header row (fits 40), task on
- *   `│ `-gutter continuation lines, wrapped gutter-aware.
- * - recent: `├ <state> · <age> · <id>` - state first (the signal), id
- *   last (the lookup key), no webhook noise. State labels compressed
- *   (webhook-failed -> wb-fail) so the worst row stays under 40.
+ * Markdown layout (Andryo 2026-10-18: summaries are normal markdown
+ * lists, no frame, no width budget - text wraps natively):
+ * - in-flight: `- <id> <profile> · <age> · <task>` bullets (full task
+ *   text, one line; multi-line tasks collapse to spaces).
+ * - recent: `- <state> · <age> · <id>` - state first (the signal), id
+ *   last (the lookup key), no webhook noise. Raw state names (no
+ *   compression - the 40-col budget that motivated wb-fail is gone).
  * Exported for tests.
  */
 export function formatJobsView(
@@ -317,63 +316,33 @@ export function formatJobsView(
   if (format === "json") {
     return JSON.stringify({ inflight, history: history.slice(0, 10) }, null, 2);
   }
-  const frames: string[] = [];
+  const parts: string[] = [];
   if (inflight.length === 0) {
-    frames.push("┌ jobs · none in flight\n└");
+    parts.push("**jobs · none in flight**");
   } else {
-    const lines = [`┌ jobs · ${inflight.length} in flight`];
+    const lines = [`**jobs · ${inflight.length} in flight**`, ""];
     for (const j of inflight) {
-      // id(19) + profile + age fits the 40-col budget on one row.
-      lines.push(
-        j.id
-          ? `┣ ${j.id} ${j.profile} · ${j.age}`
-          : `┣ ${j.profile} · ${j.age}`,
-      );
-      if (j.task) {
-        for (const t of j.task.split("\n")) {
-          if (!t.trim()) continue;
-          const row = `│ ${t}`;
-          lines.push(
-            ...(row.length > FRAME_COL_MAX
-              ? wrapFenceLine(row, FRAME_COL_MAX)
-              : [row]),
-          );
-        }
-      }
+      const task = j.task
+        ? j.task
+            .split("\n")
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .join(" ")
+        : "";
+      const head = j.id ? `${j.id} ${j.profile}` : j.profile;
+      lines.push(`- ${head} · ${j.age}${task ? ` · ${task}` : ""}`);
     }
-    lines.push("└");
-    frames.push(lines.join("\n"));
+    parts.push(lines.join("\n"));
   }
   const recent = history.slice(0, 5);
   if (recent.length > 0) {
-    const lines = [`┌ recent (newest first) · ${recent.length}`];
+    const lines = [`**recent (newest first) · ${recent.length}**`, ""];
     for (const h of recent) {
-      lines.push(
-        `├ ${stateLabel(h.state)} · ${ageStr(now - h.mtime)} · ${h.id}`,
-      );
+      lines.push(`- ${h.state} · ${ageStr(now - h.mtime)} · ${h.id}`);
     }
-    lines.push("└");
-    frames.push(lines.join("\n"));
+    parts.push(lines.join("\n"));
   }
-  return frames.join("\n\n");
-}
-
-/** Compressed state labels for the text view (json keeps raw states):
- *  worst case `├ wb-fail · 1h59m · <19-char id>` = 36 cols. */
-export function stateLabel(state: JobState): string {
-  switch (state) {
-    case "done":
-      return "ok";
-    case "webhook-failed":
-      return "wb-fail";
-    case "killed":
-      return "killed";
-    case "lost":
-      return "lost";
-    default:
-      // pass unknown states through (never render "undefined")
-      return state;
-  }
+  return parts.join("\n\n");
 }
 
 /** /jobs entry point: in-flight (ps) + history (/tmp artifacts).
@@ -488,25 +457,16 @@ function jobWrapFence(t: string): string {
 }
 
 const TAIL_MAX_LINES = 40;
-const TAIL_LINE_MAX = FRAME_COL_MAX; // mobile budget, same as the run frames
 
-/** Cap + hard-wrap tail output and fence it. Keeps the LAST TAIL_MAX_LINES
- *  lines (a tail is about the newest output) and splits overlong lines. */
+/** Cap + fence tail output. Keeps the LAST TAIL_MAX_LINES lines (a tail
+ *  is about the newest output). Lines ship raw - no 40-col hard wrap
+ *  (Andryo 2026-10-18: raw output wraps natively; the wrap split long
+ *  lines the operator greps for). */
 export function formatTail(out: string): string {
-  let lines = out.replace(/\n$/, "").split("\n");
+  const lines = out.replace(/\n$/, "").split("\n");
   const dropped = Math.max(0, lines.length - TAIL_MAX_LINES);
-  if (dropped > 0) lines = lines.slice(-TAIL_MAX_LINES);
-  const wrapped: string[] = [];
-  for (const l of lines) {
-    if (l.length <= TAIL_LINE_MAX) {
-      wrapped.push(l);
-      continue;
-    }
-    for (let i = 0; i < l.length; i += TAIL_LINE_MAX)
-      wrapped.push(l.slice(i, i + TAIL_LINE_MAX));
-  }
   const head = dropped > 0 ? `[..] ${dropped} earlier lines\n` : "";
-  return jobWrapFence(`${head}${wrapped.join("\n")}`);
+  return jobWrapFence(`${head}${lines.slice(-TAIL_MAX_LINES).join("\n")}`);
 }
 
 /** /jobs kill <id>: cancel an in-flight run via its cgroup. Channel line

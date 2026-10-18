@@ -199,22 +199,30 @@ function dateFromMtime(file: string): string {
 }
 
 /**
- * Build the /usage reply frame (v3 style, 40-col budget). Framed, not
- * fenced - the caller fences it (like /context).
+ * Build the /usage reply as a normal markdown list (Andryo 2026-10-18:
+ * summaries are markdown lists, no frame, no width budget). Bold header
+ * line + key: value bullets - the caller posts it UNfenced so Discord
+ * renders it as plain text (a fenced list would show the markdown
+ * literally).
  */
-export function usageFrame(label: string, span: string, s: UsageStats): string {
+export function usageSummary(
+  label: string,
+  span: string,
+  s: UsageStats,
+): string {
   // share of the TOTAL prompt (new + cached) served from cache - the
   // number operator watches; cacheRead can exceed the new-input count.
   const total = s.input + s.cacheRead;
   const pct = total > 0 ? Math.round((s.cacheRead / total) * 100) : 0;
   return [
-    `┌ usage · ${label}`,
-    `├ span   : ${span}`,
-    `├ turns  : ${s.turns.toLocaleString("en-US")}`,
-    `├ in     : ${fmtTokens(s.input)}`,
-    `├ out    : ${fmtTokens(s.output)}`,
-    `├ cached : ${fmtTokens(s.cacheRead)} (${pct}%)`,
-    `└ est    : $${estimateCost(s).toFixed(2)}`,
+    `**usage · ${label}**`,
+    "",
+    `- span: ${span}`,
+    `- turns: ${s.turns.toLocaleString("en-US")}`,
+    `- in: ${fmtTokens(s.input)}`,
+    `- out: ${fmtTokens(s.output)}`,
+    `- cached: ${fmtTokens(s.cacheRead)} (${pct}%)`,
+    `- est: $${estimateCost(s).toFixed(2)}`,
   ].join("\n");
 }
 
@@ -274,12 +282,12 @@ export async function renderUsage(
       if (d && (!earliest || d < earliest)) earliest = d;
     }
     const span = `${earliest ?? dateFromMtime(files[0])}..now`;
-    return usageFrame("lifetime", span, s);
+    return usageSummary("lifetime", span, s);
   }
 
   // default + "session": the current session file
   const file = sessionFile ?? findSessionFile(cwd);
   if (!file) return "[!] no session file found";
   const s = await summarizeSessionFile(file);
-  return usageFrame("session", dateFromName(file) ?? dateFromMtime(file), s);
+  return usageSummary("session", dateFromName(file) ?? dateFromMtime(file), s);
 }

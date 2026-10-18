@@ -139,16 +139,10 @@ export function elapsedStr(sec: number): string {
   return `${Math.floor(sec / 86400)}d`;
 }
 
-/** The `[bg:` tag + fence constants. The tag is what isBgWebhook exempts
+/** The `[bg:` tag constant. The tag is what isBgWebhook exempts
  *  (discord.ts) — without it the other-bot filter swallows the webhook
- *  copy and the wake never lands as a turn. Frame shape mirrors the
- *  pi-postcheck.sh heartbeat: `[bg: label]` line, then a code-fenced
- *  ┌/├/└ box, 40-col budget (STYLE.md chat frames). */
-const FENCE = "```";
+ *  copy and the wake never lands as a turn. */
 export const WAKE_TAG = "[bg: restart-wake]";
-
-/** Frame-body line budget: 40 cols minus the 2-char gutter. */
-const ROW_MAX = 38;
 
 export interface WakeMessageOpts {
   /** true = the last stop ran session_shutdown (planned restart). */
@@ -159,9 +153,11 @@ export interface WakeMessageOpts {
 
 /** Build the wake message. Pure — all I/O is injected by the caller.
  *
- *  Framed (code block) for the webhook bus: [bg: tag] + ┌/├/└ box.
- *  Job rows are `id profile age` — cwd/task detail lives in /jobs
- *  (STYLE.md: frames carry short state only).
+ *  Shape: the `[bg:` tag line, a bold `restart wake` header, then a flat
+ *  markdown bullet list (Andryo 2026-10-18: summaries are markdown lists,
+ *  no frame, no width budget - text wraps natively; webhook content
+ *  renders as normal Discord markdown). Job rows are
+ *  `id profile age` — cwd/task detail lives in /jobs.
  */
 export function buildWakeMessage({
   clean,
@@ -179,19 +175,14 @@ export function buildWakeMessage({
     for (const r of list) {
       const who =
         r.profile && String(r.profile).length > 0 ? String(r.profile) : "?";
-      const line = `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`;
-      // clip on code points (never split a surrogate pair)
-      const cps = Array.from(line);
       rows.push(
-        cps.length > ROW_MAX ? `${cps.slice(0, ROW_MAX - 1).join("")}…` : line,
+        `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`,
       );
     }
     if (more > 0) rows.push(`+${more} more - see /jobs`);
   }
-  const body = rows.map((r, i) =>
-    i === rows.length - 1 ? `└ ${r}` : `├ ${r}`,
-  );
-  return [WAKE_TAG, FENCE, "┌ restart wake", ...body, FENCE].join("\n");
+  const body = rows.map((r) => `- ${r}`);
+  return [WAKE_TAG, "**restart wake**", "", ...body].join("\n");
 }
 
 // ─── clean-stop marker ───────────────────────────────────────────────────

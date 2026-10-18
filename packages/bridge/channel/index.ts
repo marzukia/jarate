@@ -134,14 +134,11 @@ import {
   listBoards,
   loadBoard,
   mergeTodoLines,
-  openCount,
   renderBoard,
-  renderBoardPlain,
   sanitizeTodos,
   saveBoard,
   type TodoBoard,
   todoBoardContextBlock,
-  todoLinePlain,
 } from "./todos";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
 import {
@@ -169,7 +166,7 @@ import {
   renderUsage,
   sumRunUsage,
   type UsageStats,
-  usageFrame,
+  usageSummary,
 } from "./usage";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 import { mergeWorktree, newWorktree } from "./worktree";
@@ -5361,16 +5358,16 @@ async function runChannelCommand(
         if (!lu)
           return { immediate: "[!] no completed run yet (run one first)" };
         const at = lu.at.toISOString().slice(11, 19);
-        return { immediate: fence(usageFrame("last run", at, lu.stats)) };
+        return { immediate: usageSummary("last run", at, lu.stats) };
       }
       // Read-only token stats from the session store. Session discovery
       // reuses the /undo path: active ctx session file, else newest .jsonl
-      // under cwd's session dir (findSessionFile fallback).
+      // under cwd's session dir (findSessionFile fallback). The [!] error
+      // paths stay bare (one-liners); the stats list ships as normal
+      // markdown - unfenced, no width budget (Andryo 2026-10-18).
       try {
         const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
-        return {
-          immediate: text.startsWith("[!]") ? text : fence(text),
-        };
+        return { immediate: text };
       } catch {
         return { immediate: fence("[!] usage stats unavailable") };
       }
@@ -5379,13 +5376,13 @@ async function runChannelCommand(
       // #48: what is eating the window: top-N items by token ESTIMATE
       // (char/4, no model, no pricing) + category totals. Read-only, open
       // to all like /usage. Session discovery is the same /undo path;
-      // frame (40-col budget) is built by renderContext, errors are one
-      // [!] line, no stack.
+      // the markdown list is built by renderContext, errors are one
+      // [!] line (fenced machine one-liners stay fenced), no stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
-        // Every command reply ships in a code block (operator 2026-09-16),
-        // error paths included.
-        return { immediate: fence(text) };
+        // Success = the markdown summary list (unfenced - Andryo
+        // 2026-10-18); [!] errors stay fenced one-liners.
+        return { immediate: text.startsWith("[!]") ? fence(text) : text };
       } catch {
         return { immediate: "[!] context stats unavailable" };
       }
@@ -5674,7 +5671,11 @@ async function runChannelCommand(
         return { immediate: await jobsTail(id, n) };
       }
       // Informational, open to all channel members (private channel).
-      return { immediate: fence(jobsView(sub === "json" ? "json" : "text")) };
+      // json = machine output (fenced); text = the markdown summary list
+      // (unfenced - Andryo 2026-10-18: no fence, no width budget).
+      return {
+        immediate: sub === "json" ? fence(jobsView("json")) : jobsView("text"),
+      };
     }
     case "new-worktree": {
       // #12: create the interactive session's worktree (owner-only).
@@ -5730,9 +5731,9 @@ async function runChannelCommand(
           return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
         });
         return {
-          immediate: fence(
-            `[wake] ${pending} pending wake${pending > 1 ? "s" : ""} (of ${wakes.length} total):\n${lines.join("\n")}`,
-          ),
+          immediate: `**[wake] ${pending} pending wake${
+            pending > 1 ? "s" : ""
+          } (of ${wakes.length} total)**\n\n${lines.join("\n")}`,
         };
       }
       if (sub === "cancel") {
@@ -5763,11 +5764,9 @@ async function runChannelCommand(
           formatTaskLine(t, names.get(t.channelId) || t.channelName),
         );
         return {
-          immediate: fence(
-            `[tasks] ${pending} pending task${
-              pending > 1 ? "s" : ""
-            } (of ${tasks.length} total):\n${lines.join("\n")}`,
-          ),
+          immediate: `**[tasks] ${pending} pending task${
+            pending > 1 ? "s" : ""
+          } (of ${tasks.length} total)**\n\n${lines.join("\n")}`,
         };
       }
       if (sub === "cancel") {
@@ -5860,32 +5859,28 @@ async function runChannelCommand(
     }
     case "todos": {
       // Informational, open to all channel members (private channel).
+      // The board is a normal markdown list: bold header + bullets, full
+      // text, no fence, no width budget (Andryo 2026-10-18).
       if ((arg || "").trim().toLowerCase() === "all") {
         const names = new Map(
           loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
         );
         const parts = listBoards()
           .filter((b) => b.todos.length > 0)
-          .map((b) => {
-            const name = names.get(b.channelId) || b.channelId;
-            const open = openCount(b.todos);
-            // header fits the 40-col budget: channel names run up to
-            // 100 chars, so clip the name (never the count or glyph)
-            const suffix = ` · ${open} open`;
-            return `┌ ${fit(name, FRAME_COL_MAX - 2 - suffix.length)}${suffix}\n${b.todos
-              .map(todoLinePlain)
-              .join("\n")}\n└`;
-          });
+          .map((b) =>
+            renderBoard(b.todos, names.get(b.channelId) ?? b.channelId),
+          );
         return {
-          immediate: fence(
-            parts.length > 0 ? parts.join("\n\n") : "[todos] no open todos",
-          ),
+          immediate:
+            parts.length > 0
+              ? parts.join("\n\n")
+              : fence("[todos] no open todos"),
         };
       }
       const board = loadBoard(ch.id);
       if (!board || board.todos.length === 0)
         return { immediate: fence("[todos] no open todos") };
-      return { immediate: fence(renderBoardPlain(board.todos)) };
+      return { immediate: renderBoard(board.todos) };
     }
     case "model": {
       if (!isOwner) return ownerOnly;
@@ -6082,7 +6077,7 @@ export async function syncTodoBoard(
       }
       return;
     }
-    const text = fence(renderBoard(board.todos));
+    const text = renderBoard(board.todos);
     if (board.boardMessageId) {
       const r = await editDiscordMessage(ch, board.boardMessageId, text);
       if (!r.success)

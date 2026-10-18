@@ -60,7 +60,7 @@ import extension, {
   setSystemdRestartHookForTest,
   stopAllOpTicks,
 } from "./index";
-import { renderBoardPlain, saveBoard, type Todo } from "./todos";
+import { renderBoard, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -654,7 +654,7 @@ describe("inboundSender / isHumanInbound (RCA F3)", () => {
   test("todo-board-only body → false (framing stripped)", () => {
     expect(
       isHumanInbound(
-        inb("andy", "<todo-board>\n├ done thing\n</todo-board>") as any,
+        inb("andy", "<todo-board>\n- done thing\n</todo-board>") as any,
       ),
     ).toBe(false);
   });
@@ -1153,11 +1153,10 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
     content,
     status,
   });
-  // Fixtures are REAL renderBoardPlain output (review F1, #141): the old
-  // hand-written '├ ~~done~~' completed shape is the MARKED-UP todoLine,
-  // which renderBoardPlain never emits — a plain completed item renders as
-  // '├ done', indistinguishable from pending. That is exactly why the
-  // production Mission path reads structured openTodos, not this text.
+  // Fixtures are REAL renderBoard output (markdown, Andryo 2026-10-18):
+  // closed items are '- ~~x~~' (skipped by the parser), so the
+  // string-parse fallback is open-only. The production Mission path still
+  // reads structured openTodos — this text is the doc-scraping fallback.
 
   test("structured path: 2 pending after 3 completed → open-only line (F1 repro)", () => {
     // The reviewer's exact repro: completed items listed first (normal
@@ -1170,7 +1169,7 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
       t("open one", "pending"),
       t("open two", "pending"),
     ];
-    const board = renderBoardPlain(todos);
+    const board = renderBoard(todos);
     const k = parseKickoff(doc, {
       todoBoard: board,
       openTodos: { count: 2, items: ["open one", "open two"] },
@@ -1188,7 +1187,7 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
       t("open four", "pending"),
       t("open five", "pending"),
     ];
-    const board = renderBoardPlain(todos);
+    const board = renderBoard(todos);
     const k = parseKickoff(doc, {
       todoBoard: board,
       openTodos: {
@@ -1201,7 +1200,7 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
     );
   });
   test("structured path: all completed → '0 open'", () => {
-    const board = renderBoardPlain([
+    const board = renderBoard([
       t("done one", "completed"),
       t("done two", "completed"),
     ]);
@@ -1228,16 +1227,16 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
       t("done four", "completed"),
       t("done five", "completed"),
     ];
-    const k = parseKickoff(doc, { todoBoard: renderBoardPlain(todos) });
+    const k = parseKickoff(doc, { todoBoard: renderBoard(todos) });
     expect(k.split("\n")[0]).toBe(
       "Mission: 6 open: open one; open two; open three (+3 more)",
     );
   });
-  test("fallback KNOWN LIMIT pinned: completed shares the pending gutter", () => {
-    // Same board as the F1 repro, parsed as a string: the shown list
-    // surfaces completed items. The structured path (above) is what
-    // production uses; this pins the fallback's documented limit so it
-    // cannot silently regress again.
+  test("fallback: closed items (~~) are excluded - old gutter limit is gone", () => {
+    // Same board as the F1 repro, parsed as a string: strikethrough marks
+    // closed items, so the shown list is genuinely open-only (the old
+    // renderBoardPlain limit - completed shared the pending gutter - is
+    // gone with the markdown board).
     const todos: Todo[] = [
       t("done one", "completed"),
       t("done two", "completed"),
@@ -1245,26 +1244,24 @@ describe("boardSummaryLine open-only math (issue #140)", () => {
       t("open one", "pending"),
       t("open two", "pending"),
     ];
-    const board = renderBoardPlain(todos);
+    const board = renderBoard(todos);
     expect(parseKickoff(doc, { todoBoard: board }).split("\n")[0]).toBe(
-      "Mission: 2 open: done one; done two; done three",
+      "Mission: 2 open: open one; open two",
     );
   });
   test("fallback no header → item-count branch (synthetic shape)", () => {
-    // renderBoardPlain always emits a header; this synthetic no-header
-    // shape pins the fallback's count branch. Completed items are
-    // indistinguishable from pending here, so the count includes them
-    // (the same known limit, no-header variant).
-    const b = ["├ open a", "├ open b", "├ done c", "└"].join("\n");
+    // renderBoard always emits a header; this synthetic no-header shape
+    // pins the fallback's count branch. Closed items (~~) are excluded,
+    // so the count is open-only.
+    const b = ["- open a", "- open b", "- ~~done c~~"].join("\n");
     expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
-      "Mission: 3 todos: open a; open b; done c",
+      "Mission: 2 todos: open a; open b",
     );
   });
-  test("fallback: '├ ~~' no-op guard still strips marked-up strikethrough", () => {
-    // renderBoardPlain never emits ~~ (strikethrough is the marked-up
-    // todoLine only); the guard defends hand-written / doc-scraped
-    // marked-up strings.
-    const b = ["├ open a", "├ ~~done c~~", "└"].join("\n");
+  test("fallback: '~~' closed items are skipped (strikethrough = closed)", () => {
+    // The markdown board's closed marker is the parser's skip rule; this
+    // pins it for hand-written / doc-scraped strings too.
+    const b = ["- open a", "- ~~done c~~"].join("\n");
     expect(parseKickoff(doc, { todoBoard: b }).split("\n")[0]).toBe(
       "Mission: 1 todos: open a",
     );
@@ -1285,35 +1282,33 @@ describe("parseKickoff live state (issue #134)", () => {
     "## State",
     "- context: 246k / 262k tokens (94%)",
     "- dispatch:",
-    "┌ jobs · 1 in flight",
-    "┣ 20261003-081922-478435 worker · 01:07:43",
-    "│ task line",
-    "└",
+    "**jobs · 1 in flight**",
+    "",
+    "- 20261003-081922-478435 worker · 01:07:43 · task line",
     "- todos:",
-    "┌ todos · 2 open",
-    "├ ship the bridge",
-    "┣ wire the compact",
-    "└",
+    "**todos · 2 open**",
+    "",
+    "- ship the bridge",
+    "- **wire the compact**",
     "",
     "## Last user asks",
     "1. first ask",
     "2. Don't matter neon is down",
   ].join("\n");
   const jobsFrame = [
-    "┌ jobs · 1 in flight",
-    "┣ 20261003-081922-478435 worker · 01:07:43",
-    "│ task line",
-    "└",
+    "**jobs · 1 in flight**",
     "",
-    "┌ recent (newest first) · 1",
-    "├ ok · 2h · 20261003-010101-111111",
-    "└",
+    "- 20261003-081922-478435 worker · 01:07:43 · task line",
+    "",
+    "**recent (newest first) · 1**",
+    "",
+    "- ok · 2h · 20261003-010101-111111",
   ].join("\n");
   const board = [
-    "┌ todos · 2 open",
-    "├ ship the bridge",
-    "┣ wire the compact",
-    "└",
+    "**todos · 2 open**",
+    "",
+    "- ship the bridge",
+    "- **wire the compact**",
   ].join("\n");
 
   test("live dispatch frame → In-flight carries the ticket id", () => {
@@ -1339,7 +1334,7 @@ describe("parseKickoff live state (issue #134)", () => {
   });
   test("empty board + zero jobs → both (none)", () => {
     const k = parseKickoff(detDoc, {
-      dispatchText: "┌ jobs · none in flight\n└",
+      dispatchText: "**jobs · none in flight**",
       todoBoard: "",
     });
     const lines = k.split("\n");
@@ -1355,10 +1350,10 @@ describe("parseKickoff live state (issue #134)", () => {
   });
   test("multiple in-flight jobs → '; '-joined on one line", () => {
     const multi = [
-      "┌ jobs · 2 in flight",
-      "┣ 20261003-081922-478435 worker · 01:07:43",
-      "┣ 20261003-090000-123456 reviewer · 00:12:00",
-      "└",
+      "**jobs · 2 in flight**",
+      "",
+      "- 20261003-081922-478435 worker · 01:07:43",
+      "- 20261003-090000-123456 reviewer · 00:12:00",
     ].join("\n");
     const k = parseKickoff(detDoc, { dispatchText: multi, todoBoard: "" });
     expect(k.split("\n")[1]).toBe(
@@ -1465,8 +1460,8 @@ describe("buildSeedKickoff (F4/F8)", () => {
     ].join("\n");
     const k = buildSeedKickoff(detDoc, "/abs/handovers", "/home/monky", {
       dispatchText:
-        "┌ jobs · 1 in flight\n┣ 20261003-081922-478435 worker · 01:07:43\n└",
-      todoBoard: "┌ todos · 1 open\n├ ship it\n└",
+        "**jobs · 1 in flight**\n\n- 20261003-081922-478435 worker · 01:07:43",
+      todoBoard: "**todos · 1 open**\n\n- ship it",
     });
     expect(k).toContain("In-flight: 20261003-081922-478435 worker · 01:07:43");
     expect(k).toContain("Mission: 1 open: ship it");
@@ -1904,8 +1899,8 @@ describe("liveKickoffState scheduled pipe (issue #140)", () => {
     ];
     saveBoard({ channelId: "ch1", todos, updatedAt: "" }, tmp);
     const live = liveKickoffState(tmp);
-    // todoBoard is the REAL renderBoardPlain text (completed = plain ├)
-    expect(live.todoBoard).toBe(renderBoardPlain(todos));
+    // todoBoard is the REAL renderBoard markdown text (completed = ~~)
+    expect(live.todoBoard).toBe(renderBoard(todos));
     // openTodos: open only (pending | in_progress), board order
     expect(live.openTodos).toEqual({
       count: 2,

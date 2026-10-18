@@ -87,15 +87,14 @@ function fakeFetch(results: Array<number | Error>): {
 // ─── inflight summary builder (fixture run records) ──────────────────────
 
 describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
-  test("clean + zero inflight = framed [ok] wake, [bg: tag first line", () => {
+  test("clean + zero inflight = markdown [ok] wake, [bg: tag first line", () => {
     expect(buildWakeMessage({ clean: true, runs: [], now: T0 })).toBe(
       [
         WAKE_TAG,
-        "```",
-        "┌ restart wake",
-        "├ [ok] planned",
-        "└ no in-flight pi-bg work",
-        "```",
+        "**restart wake**",
+        "",
+        "- [ok] planned",
+        "- no in-flight pi-bg work",
       ].join("\n"),
     );
   });
@@ -105,8 +104,8 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
       "\n",
     );
     expect(lines[0]).toBe(WAKE_TAG);
-    expect(lines[3]).toBe("├ [!] unplanned - last turn interrupted");
-    expect(lines[4]).toBe("└ no in-flight pi-bg work");
+    expect(lines[3]).toBe("- [!] unplanned - last turn interrupted");
+    expect(lines[4]).toBe("- no in-flight pi-bg work");
   });
 
   test("terminal states are not inflight (done/killed ignored)", () => {
@@ -135,13 +134,12 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
     expect(buildWakeMessage({ clean: false, runs, now: T0 })).toBe(
       [
         WAKE_TAG,
-        "```",
-        "┌ restart wake",
-        "├ [!] unplanned - last turn interrupted",
-        "├ 2 in-flight",
-        "├ 20261001-103700-9 reviewer 23m",
-        "└ 20261001-115900-10 worker 30s",
-        "```",
+        "**restart wake**",
+        "",
+        "- [!] unplanned - last turn interrupted",
+        "- 2 in-flight",
+        "- 20261001-103700-9 reviewer 23m",
+        "- 20261001-115900-10 worker 30s",
       ].join("\n"),
     );
   });
@@ -155,24 +153,25 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
     );
     const lines = buildWakeMessage({ clean: true, runs, now: T0 }).split("\n");
     // oldest (i=0) listed first, newest (i>=10) dropped
-    expect(lines[4]).toBe(`├ ${MAX_INFLIGHT} in-flight`);
-    expect(lines[5]).toBe("├ 20261001-1100-0 worker 1h0m");
-    expect(lines).toContain(`└ +2 more - see /jobs`);
+    expect(lines[4]).toBe(`- ${MAX_INFLIGHT} in-flight`);
+    expect(lines[5]).toBe("- 20261001-1100-0 worker 1h0m");
+    expect(lines).toContain(`- +2 more - see /jobs`);
     expect(lines).not.toContain("20261001-1110-0");
     expect(lines).not.toContain("20261001-1111-0");
   });
 
-  test("every frame line fits the 40-col budget (long profile clips)", () => {
+  test("no width budget: long profile ships in full, never clipped", () => {
+    const profile = "x".repeat(60);
     const msg = buildWakeMessage({
       clean: true,
-      runs: [rec({ profile: "x".repeat(40) })],
+      runs: [rec({ run: "20261001-110000-1", state: "running", profile })],
       now: T0,
     });
-    for (const l of msg.split("\n"))
-      expect(Array.from(l).length).toBeLessThanOrEqual(40);
+    expect(msg).toContain(`- 20261001-110000-1 ${profile} 23m`);
+    expect(msg).not.toContain("…");
   });
 
-  test("clip never splits a surrogate pair (emoji profile stays intact)", () => {
+  test("emoji profile stays intact (no clip to split a surrogate pair)", () => {
     const emoji = "\u{1F600}"; // 2 code units, 1 code point
     const msg = buildWakeMessage({
       clean: true,
@@ -181,10 +180,7 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
     });
     const loneSurrogate =
       /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
-    for (const l of msg.split("\n")) {
-      expect(Array.from(l).length).toBeLessThanOrEqual(40);
-      expect(l.match(loneSurrogate)).toBe(null);
-    }
+    for (const l of msg.split("\n")) expect(l.match(loneSurrogate)).toBe(null);
   });
 
   test("missing profile / started degrade without crashing", () => {
@@ -196,12 +192,11 @@ describe("buildWakeMessage (issue #111 + bg-bypass frame)", () => {
     expect(msg).toBe(
       [
         WAKE_TAG,
-        "```",
-        "┌ restart wake",
-        "├ [ok] planned",
-        "├ 1 in-flight",
-        "└ 20261001-110000-1 ? 0s",
-        "```",
+        "**restart wake**",
+        "",
+        "- [ok] planned",
+        "- 1 in-flight",
+        "- 20261001-110000-1 ? 0s",
       ].join("\n"),
     );
   });
@@ -528,9 +523,9 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls[0].url).toBe("https://bus.example/hook");
     const posted = JSON.parse(calls[0].body ?? "{}");
     expect(posted.content.startsWith(WAKE_TAG)).toBe(true);
-    expect(posted.content).toContain("├ [ok] planned");
-    expect(posted.content).toContain("└ 20261001-113000-7 worker 23m");
-    expect(posted.content).toContain("```\n┌ restart wake");
+    expect(posted.content).toContain("- [ok] planned");
+    expect(posted.content).toContain("- 20261001-113000-7 worker 23m");
+    expect(posted.content).toContain("**restart wake**");
   });
 
   test("channel webhookUrl beats the resolved bus webhook", async () => {
@@ -565,12 +560,11 @@ describe("runRestartWake (issue #111)", () => {
     expect(r.message).toBe(
       [
         WAKE_TAG,
-        "```",
-        "┌ restart wake",
-        "├ [!] unplanned - last turn interrupted",
-        "├ 1 in-flight",
-        "└ 20261001-113000-7 worker 23m",
-        "```",
+        "**restart wake**",
+        "",
+        "- [!] unplanned - last turn interrupted",
+        "- 1 in-flight",
+        "- 20261001-113000-7 worker 23m",
       ].join("\n"),
     );
   });
