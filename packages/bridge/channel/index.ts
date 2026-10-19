@@ -33,7 +33,6 @@ import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
 import { renderContext } from "./context";
-import { fmtTokensLC, newCtxWatch, observeCtx } from "./ctxwatch";
 import { publishDiff } from "./diff";
 import {
   connectDiscord,
@@ -69,7 +68,7 @@ import {
   suppressAutoReact,
   unreactMessage,
 } from "./discord";
-import { mdToDiscord, styleGuard } from "./format";
+import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
@@ -207,11 +206,6 @@ export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
 export const verboseOverride = new Map<string, VerboseLevel>();
 
 // #13: per-session context-boundary trackers, keyed by session file path.
-// One pi process = one session file; /reset moves the file aside and
-// starts a new one, so a reset is a fresh key (fresh baseline). /compact
-// drops the pct, and only upward crossings fire — no special handling.
-export const ctxWatchers = new Map<string, ReturnType<typeof newCtxWatch>>();
-
 // #40: the last completed run's usage (tokens + est. cost), for
 // `/usage last`. Set at agent_end; null until the first run completes.
 export const lastRunUsage: {
@@ -3565,11 +3559,6 @@ export default function (pi: ExtensionAPI) {
     // this run's triggering ids) or, untagged, to the last inbound.
     const ch = lastActiveChannel;
     if (!ch || !agentBusy) return;
-    // #13: automatic context-boundary notice — one fenced line per 10%
-    // boundary crossed per session, upward crossings only. Posted before
-    // the run's own text so it reads as context, not reply.
-    const note = ctxBoundaryNotice(ctx);
-    if (note) sendDiscordMessage(ch, fence(note)).catch(() => {});
     const msg = event.message;
     const early = earlySendText(msg);
     const text = early ?? finalText(msg);
@@ -4323,25 +4312,6 @@ export function touchLiveMarker(dir: string = LIVE_MARKER_DIR): string | null {
   } catch {
     return null;
   }
-}
-
-/** #13: automatic context-boundary notice. Keyed by session file so a
- *  /reset (new file) starts a fresh, silent baseline. Returns the notice
- *  line or null; mutates the per-session tracker in ctxWatchers. */
-export function ctxBoundaryNotice(ctx: ExtensionContext): string | null {
-  const u = ctx.getContextUsage?.();
-  if (!u || typeof u.tokens !== "number" || !u.contextWindow) return null;
-  const pct =
-    typeof u.percent === "number"
-      ? u.percent
-      : (u.tokens / u.contextWindow) * 100;
-  const key = safeSessionFile(ctx) ?? "?";
-  let st = ctxWatchers.get(key);
-  if (!st) {
-    st = newCtxWatch();
-    ctxWatchers.set(key, st);
-  }
-  return observeCtx(st, pct, u.tokens, u.contextWindow);
 }
 
 // ─── Restart-class ops: /reset /restart /undo /redo ────────────────────

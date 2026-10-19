@@ -36,7 +36,7 @@ import {
   type SessionEntry,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import { fmtTokensLC } from "./ctxwatch";
+import { fmtTokensLC } from "./format";
 import { jobsView } from "./jobs";
 import { formatTaskLine, loadTasks } from "./tasks";
 import { defaultHome, loadBoard, renderBoard } from "./todos";
