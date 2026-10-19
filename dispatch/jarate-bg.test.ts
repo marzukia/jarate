@@ -961,7 +961,14 @@ describe("v3 embed style (mockup3): webhook payload shape", () => {
     sh("git add a.txt");
     sh("git commit -m init");
     try {
-      const r = await fx.run(["worker", "--worktree", "v3 style check"]);
+      // #253: the positional after --worktree is the REF, the task is a
+      // separate positional (the old parse swallowed the ref as the task)
+      const r = await fx.run([
+        "worker",
+        "--worktree",
+        "main",
+        "v3 style check",
+      ]);
       expect(r.code).toBe(0);
       const runId = fx.records()[0].run;
       const cap = hook.getBody();
@@ -1034,7 +1041,12 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
     const fx = fixture();
     fx.seedMainCreds();
     // fx.tmp is not a git repo (and nothing above it under /tmp is)
-    const r = await fx.run(["worker", "--worktree", "launch fail task"]);
+    const r = await fx.run([
+      "worker",
+      "--worktree",
+      "main",
+      "launch fail task",
+    ]);
     expect(r.code).toBe(3);
     expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
     expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
@@ -1072,6 +1084,32 @@ describe("#101 follow-up: launch-fail marks the run record killed", () => {
       "launch-fail: worktree add failed ref=nosuchref",
     );
     expect(recs[0].finished).toBeTruthy();
+  });
+
+  test("#253: --worktree <ref> with no task: ref is the ref (rc 2, no record)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const sh = (cmd: string) =>
+      execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
+    sh("git init -b main");
+    sh("git config user.email t@t");
+    sh("git config user.name t");
+    fs.writeFileSync(path.join(fx.tmp, "a.txt"), "a\n");
+    sh("git add a.txt");
+    sh("git commit -m init");
+    // incident 20261019-215357-2109682: `--worktree main` (no task, no "-")
+    // used to run the ticket with the task "main" - the ref was swallowed
+    // into the task position. Now: ref consumed, missing task -> usage
+    // error before the run record (zero side effects).
+    const r = await fx.run(["worker", "--worktree", "main"]);
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("missing task");
+    // zero side effects: the missing-task guard exits before the run
+    // record zone (the record dir may not even exist yet)
+    const recs = fs.existsSync(fx.env.PI_DISPATCH_RECORD_DIR)
+      ? fx.records()
+      : [];
+    expect(recs).toHaveLength(0);
   });
 });
 
@@ -1177,7 +1215,7 @@ describe("#110 launcher: --wt-reuse + retryOf record tag", () => {
     const fx = fixture();
     fx.seedMainCreds();
     gitRepo(fx);
-    const r = await fx.run(["worker", "--worktree", "wt task"]);
+    const r = await fx.run(["worker", "--worktree", "main", "wt task"]);
     expect(r.code).toBe(0);
     const recs = fx.records();
     expect(recs).toHaveLength(1);
@@ -1222,8 +1260,9 @@ describe("#86: launch-fail webhook", () => {
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
     fx.env.PI_BG_WB_BACKOFF = "0";
     try {
-      // fixture cwd (os.tmpdir) is not inside a git repo
-      const r = await fx.run(["worker", "--worktree", "t"]);
+      // fixture cwd (os.tmpdir) is not inside a git repo (#253: ref is
+      // explicit; the old parse took "t" as the task with an empty ref)
+      const r = await fx.run(["worker", "--worktree", "main", "t"]);
       expect(r.code).toBe(3);
       expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
       const cap = hook.getBody();
@@ -1323,8 +1362,9 @@ describe("#86: launch-fail webhook", () => {
       fs.existsSync(path.join(fx.home, ".config", "pi-dispatch", "webhook")),
     ).toBe(false);
     expect(fx.env.PI_DISPATCH_WEBHOOK).toBeUndefined();
-    // fixture cwd (os.tmpdir) is not inside a git repo
-    const r = await fx.run(["worker", "--worktree", "t"]);
+    // fixture cwd (os.tmpdir) is not inside a git repo (#253: ref is
+    // explicit; the old parse took "t" as the task with an empty ref)
+    const r = await fx.run(["worker", "--worktree", "main", "t"]);
     expect(r.code).toBe(3);
     expect(r.err).toContain("LAUNCH-FAIL: --worktree needs a git repo");
     // pre-fix: `line 381: webhook: unbound variable` + rc 1 (MINOR-1)
@@ -1358,7 +1398,7 @@ describe("#53: self-contained dead letters (launcher side)", () => {
     // port 9 (discard): conn refused -> all 3 attempts 000
     fx.env.PI_DISPATCH_WEBHOOK = "http://127.0.0.1:9/dl";
     fx.env.PI_BG_WB_BACKOFF = "0";
-    const r = await fx.run(["worker", "--worktree", "dl letter task"]);
+    const r = await fx.run(["worker", "--worktree", "main", "dl letter task"]);
     expect(r.code).toBe(3);
     const letters = fs
       .readdirSync(art)
@@ -4666,7 +4706,7 @@ describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () 
         [
           "bash",
           "-c",
-          `bash "${PI_BG}" worker --worktree "sigpipe task" 2>&1 | head -2`,
+          `bash "${PI_BG}" worker --worktree main "sigpipe task" 2>&1 | head -2`,
         ],
         { env: fx.env, cwd: fx.tmp, stdout: "pipe", stderr: "pipe" },
       );
@@ -5988,8 +6028,9 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
     fx.env.PI_BG_WB_BACKOFF = "0";
     try {
-      // fixture cwd (os.tmpdir) is not inside a git repo
-      const r = await fx.run(["worker", "--worktree", "t"]);
+      // fixture cwd (os.tmpdir) is not inside a git repo (#253: ref is
+      // explicit; the old parse took "t" as the task with an empty ref)
+      const r = await fx.run(["worker", "--worktree", "main", "t"]);
       expect(r.code).toBe(3);
       // #222x#234 (embed card family, 2026-10-19): #234's intent -
       // the post names the cwd, not "no report" - holds on the brief
