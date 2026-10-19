@@ -4,6 +4,7 @@ import {
   convertInlineForDiscord,
   escapeBackticksInCodeBlocks,
   escapeDiscordFormatting,
+  fmtTokensLC,
   formatMarkdownTables,
   hoistFencedUrls,
   limitHeadingDepth,
@@ -462,18 +463,18 @@ describe("hoistFencedUrls", () => {
 describe("styleGuard", () => {
   const F = (s: string) => `\`\`\`\n${s}\n\`\`\``;
 
-  test("bare [ok] tag line -> fenced (the /compact bug)", () => {
+  test("bare tag line stays plain (v4: 3.1 tags are prose; tag-fencing retired 2026-10-19)", () => {
     expect(styleGuard("[ok] compacted: 153k -> 36k")).toBe(
-      F("[ok] compacted: 153k -> 36k"),
+      "[ok] compacted: 153k -> 36k",
     );
     expect(styleGuard("[!] compact failed: timeout")).toBe(
-      F("[!] compact failed: timeout"),
+      "[!] compact failed: timeout",
     );
-    expect(styleGuard("[queued] 2 in line")).toBe(F("[queued] 2 in line"));
-    expect(styleGuard("[-] stopped")).toBe(F("[-] stopped"));
-    expect(styleGuard("[..] resetting...")).toBe(F("[..] resetting..."));
+    expect(styleGuard("[queued] 2 in line")).toBe("[queued] 2 in line");
+    expect(styleGuard("[-] stopped")).toBe("[-] stopped");
+    expect(styleGuard("[..] resetting...")).toBe("[..] resetting...");
     expect(styleGuard("[new] session (context cleared)")).toBe(
-      F("[new] session (context cleared)"),
+      "[new] session (context cleared)",
     );
   });
 
@@ -487,11 +488,9 @@ describe("styleGuard", () => {
     expect(once.split("\n").filter((l) => l.trim() === "```")).toHaveLength(2);
   });
 
-  test("consecutive [ok] + [!] lines share ONE fence", () => {
+  test("consecutive tag lines stay plain (v4)", () => {
     const block = "[ok] step 1\n[!] step 2\n[-] step 3";
-    const out = styleGuard(block);
-    expect(out).toBe(F(block));
-    expect(out.split("\n").filter((l) => l.trim() === "```")).toHaveLength(2);
+    expect(styleGuard(block)).toBe(block);
   });
 
   test("plain prose with no markers -> unchanged", () => {
@@ -577,8 +576,8 @@ describe("styleGuard", () => {
   });
 
   test("machine line between prose -> fenced, prose untouched", () => {
-    const out = styleGuard("a\n[ok] b\nc");
-    expect(out).toBe(`a\n${F("[ok] b")}\nc`);
+    const out = styleGuard('a\n{"ok": true}\nc');
+    expect(out).toBe(`a\n${F('{"ok": true}')}\nc`);
   });
 
   test("list items, headings, blockquotes, inline code -> untouched", () => {
@@ -618,34 +617,28 @@ describe("styleGuard: URLs on machine lines stay clickable (#87)", () => {
 ${s}
 \`\`\``;
 
-  test("tag+URL line through mdToDiscord ends with a bare URL outside any fence", () => {
+  test("tag+URL prose line ships plain, url clickable, no fence (v4)", () => {
     const url = "https://webdrop.example/f/abc123";
     const out = mdToDiscord(`[ok] uploaded: ${url}`);
-    const lines = out.split("\n");
-    // last line is the bare URL; nothing after it
-    expect(lines.at(-1)).toBe(url);
-    // the URL appears exactly once and no fence delimiter follows it
-    expect(out.split(url)).toHaveLength(2);
-    expect(out.slice(out.indexOf(url))).not.toContain("```");
-    // the line's remainder stayed fenced
-    expect(out).toContain("[ok] uploaded:");
+    expect(out).toBe(`[ok] uploaded: ${url}`);
+    expect(out).not.toContain("```");
   });
 
-  test("autolink <url> and backticked url on a tag line hoist bare", () => {
-    const out = styleGuard("[ok] see <https://x.test/file> for details");
-    const lines = out.split("\n");
-    expect(lines.at(-1)).toBe("https://x.test/file");
-    expect(lines[0]).toBe("```");
-    expect(lines.at(-2)).toBe("```");
-    expect(lines.slice(1, -2)).toEqual(["[ok] see for details"]);
+  test("autolink and backticked url on a tag line stay inline (v4: no fence, no hoist)", () => {
+    expect(styleGuard("[ok] see <https://x.test/file> for details")).toBe(
+      "[ok] see <https://x.test/file> for details",
+    );
     // the pipeline already turns `url` spans into <url> (autolink form)
-    const out2 = mdToDiscord("[ok] see `https://x.test/file` for details");
-    expect(out2.split("\n").at(-1)).toBe("https://x.test/file");
+    expect(mdToDiscord("[ok] see `https://x.test/file` for details")).toBe(
+      "[ok] see <https://x.test/file> for details",
+    );
   });
 
-  test("remainder empty or punctuation-only -> fence dropped, URL bare", () => {
-    // [!] carries no word char: nothing left to fence
-    expect(styleGuard("[!] https://x.test/a")).toBe("https://x.test/a");
+  test("punctuation-only tag line with url -> left as prose (v4)", () => {
+    // [!] carries no word char: pre-v4 this hoisted the URL and dropped
+    // the fence; now the line is prose and ships as written (a bare URL
+    // is clickable in Discord)
+    expect(styleGuard("[!] https://x.test/a")).toBe("[!] https://x.test/a");
   });
 
   test("URL inside a quoted JSON value stays fenced, untouched", () => {
@@ -653,14 +646,16 @@ ${s}
     expect(styleGuard(input)).toBe(F(input));
   });
 
-  test("trailing sentence punctuation is not part of the hoisted URL", () => {
-    const out = styleGuard("[ok] got it: https://x.test/a.");
-    expect(out.split("\n").at(-1)).toBe("https://x.test/a");
+  test("trailing sentence punctuation on a tag url line stays (v4: no hoist)", () => {
+    expect(styleGuard("[ok] got it: https://x.test/a.")).toBe(
+      "[ok] got it: https://x.test/a.",
+    );
   });
 
   test("machine block: url lines hoist after the shared fence", () => {
+    // hoisting still works for real machine lines (log shapes)
     const out = styleGuard(
-      "[ok] built https://x.test/a\n[!] log https://x.test/b",
+      "2026-01-01T00:00:00 built https://x.test/a\n2026-01-01T00:00:01 log https://x.test/b",
     );
     const lines = out.split("\n");
     expect(lines.at(-1)).toBe("https://x.test/b");
@@ -698,5 +693,24 @@ ${url}`;
     const out2 = mdToDiscord(`${status}\n${url}`);
     expect(out2.split("\n").at(-1)).toBe(url);
     expect(out2.slice(out2.indexOf(url))).not.toContain("```");
+  });
+});
+
+// ─── fmtTokensLC (moved from ctxwatch.test.ts — the ctx boundary notice was
+// gutted 2026-10-19; the formatter stays, /jobs frame + /compact ack use it) ──
+
+describe("fmtTokensLC", () => {
+  test("units: raw below 1k, k integer, m one decimal, lowercase", () => {
+    expect(fmtTokensLC(0)).toBe("0");
+    expect(fmtTokensLC(999)).toBe("999");
+    expect(fmtTokensLC(104_480)).toBe("104k");
+    expect(fmtTokensLC(262_144)).toBe("262k");
+    expect(fmtTokensLC(999_999)).toBe("1000k");
+    expect(fmtTokensLC(1_000_000)).toBe("1.0m");
+    expect(fmtTokensLC(2_621_440)).toBe("2.6m");
+    expect(fmtTokensLC(12_500_000)).toBe("13m");
+    expect(fmtTokensLC(-1)).toBe("?");
+    expect(fmtTokensLC(NaN)).toBe("?");
+    expect(fmtTokensLC(Infinity)).toBe("?");
   });
 });

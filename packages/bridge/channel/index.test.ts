@@ -3,7 +3,6 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fmtTokensLC } from "./ctxwatch";
 import {
   clearDiscordStatesForTest,
   getChannelCursor,
@@ -12,7 +11,7 @@ import {
   seedChannelStateForTest,
   setChannelCursor,
 } from "./discord";
-import { styleGuard } from "./format";
+import { fmtTokensLC, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
@@ -28,8 +27,6 @@ import extension, {
   clearAllInterrupts,
   clearQueuedInbound,
   collectFinals,
-  ctxBoundaryNotice,
-  ctxWatchers,
   deleteQueuedInbound,
   deliverDueTasks,
   deliverDueWakes,
@@ -5137,8 +5134,9 @@ describe("buildInteractionHandler (defer-first ack)", () => {
 
   test("raw command lines pass the same styleGuard sweep as text replies (#169)", async () => {
     // /usage last with no completed run returns a bare [!] line (no fence
-    // in the command) — the interaction edit must carry it fenced,
-    // exactly like the text path (STYLE.md 2.7).
+    // in the command) — the interaction edit carries exactly what the
+    // sweep produces: v4 (operator 2026-10-19) tag lines are prose, so
+    // it ships unfenced, same as the text path.
     const raw = "[!] no completed run yet (run one first)";
     const saved = (lastRunUsage as { value: any }).value;
     (lastRunUsage as { value: any }).value = null;
@@ -5148,7 +5146,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
       const content = JSON.parse(edit!.body).content;
       expect(content).toBe(styleGuard(raw));
-      expect(content.startsWith("```")).toBe(true); // sweep fenced it
+      expect(content).toBe(raw); // v4: tag lines ship unfenced
+      expect(content.startsWith("```")).toBe(false);
     } finally {
       (lastRunUsage as { value: any }).value = saved;
     }
@@ -9749,7 +9748,6 @@ describe("wave 2c bridge commands", () => {
     midTurnQueues.clear();
     pendingAttachments.clear();
     verboseOverride.clear();
-    ctxWatchers.clear();
     lastRunUsage.value = null;
     setRuntimeStateDir(null);
     pi = {
@@ -9898,55 +9896,6 @@ describe("wave 2c bridge commands", () => {
     expect(lines[2]).toBe("│ ~219.4k tok · ~$0.096");
     expect(lines[3]).toBe("└");
     for (const l of lines) expect([...l].length).toBeLessThanOrEqual(40);
-  });
-
-  test("message_end posts the [ctx] boundary notice, once per 10% step (#13)", async () => {
-    const ctxAt = (p: number) => ({
-      ...ctx,
-      getContextUsage: () => ({
-        tokens: Math.round((p / 100) * 262144),
-        contextWindow: 262144,
-        percent: p,
-      }),
-    });
-    const tc = {
-      role: "assistant",
-      content: [{ type: "toolCall", toolName: "read", arguments: {} }],
-    } as any;
-    await handleInbound(pi, inbound("hello", "m1"), ctxAt(38));
-    await handlers.turn_start(null, ctxAt(38));
-    // baseline: silent
-    await handlers.message_end({ message: tc }, ctxAt(38));
-    expect(posts().some((t) => t.includes("[ctx]"))).toBe(false);
-    // crosses 40: one fenced notice
-    await handlers.message_end({ message: tc }, ctxAt(41.2));
-    let ctxPosts = posts().filter((t) => t.includes("[ctx]"));
-    expect(ctxPosts).toHaveLength(1);
-    expect(ctxPosts[0]).toContain("[ctx] 41% (108k/262k)");
-    expect(ctxPosts[0].startsWith("```")).toBe(true);
-    // same step: silent
-    await handlers.message_end({ message: tc }, ctxAt(45));
-    expect(posts().filter((t) => t.includes("[ctx]"))).toHaveLength(1);
-    // /compact-style drop: silent; a new step above the baseline fires
-    await handlers.message_end({ message: tc }, ctxAt(20));
-    await handlers.message_end({ message: tc }, ctxAt(91));
-    ctxPosts = posts().filter((t) => t.includes("[ctx]"));
-    expect(ctxPosts).toHaveLength(2);
-    expect(ctxPosts[1]).toContain("[ctx] 91% (239k/262k)");
-  });
-
-  test("ctxBoundaryNotice: no getContextUsage / null / bad shape are silent", () => {
-    expect(ctxBoundaryNotice({} as any)).toBeNull();
-    expect(
-      ctxBoundaryNotice({
-        getContextUsage: () => null,
-      } as any),
-    ).toBeNull();
-    expect(
-      ctxBoundaryNotice({
-        getContextUsage: () => ({ percent: "x" }),
-      } as any),
-    ).toBeNull();
   });
 
   test("agent_end done frame carries the run usage line (#40)", async () => {

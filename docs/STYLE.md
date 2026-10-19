@@ -36,7 +36,8 @@ Last revised: 2026-10-18 (v4: summaries = markdown lists; 40-col budget in-turn 
     `┤` cancelled.
 
 ## 3 Plain text
-3.1 No emoji. ASCII state tags instead: `[ok] [!] [new] [queued] [-]`.
+3.1 No emoji. No ASCII state-tag lines either — the tag convention
+    ([ok] [!] ...) is retired (operator 2026-10-19): status = plain words.
 3.2 URLs bare or [label](url) — never in inline code (kills clickable).
 3.3 No walls of text. Short paragraphs, one idea each.
 3.4 Code: only when it is code. Numbers/ids in prose stay bare.

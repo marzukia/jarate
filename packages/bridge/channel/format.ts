@@ -500,12 +500,17 @@ export function hoistFencedUrls(md: string): string {
 
 // ─── Style guard (STYLE.md 2.7 / 3.1 / 4.4 mechanical pass) ───────────────
 
-/** Line-leading bracketed state tag: the STYLE.md 3.1 ASCII tag set
- * ([ok] [!] [new] [queued] [-]) plus the [..] op-tick tag. Letters only
- * inside the brackets (1-12), so markdown links [text](url) (where (url)
- * follows the ] directly) and numbered footnote refs [1] never match.
- * Exported for tests. */
-export const STYLE_TAG_RE = /^\[(?:[a-z]{1,12}|!|-|\.\.)\](?=\s|$)/;
+/** Lowercase compact token count: 999 -> "999", 104480 -> "104k",
+ * 2_621_440 -> "2.6m". Non-finite/negative -> "?". (Was ctxwatch.ts;
+ * the context-boundary notice was gutted 2026-10-19 - the formatter
+ * stays: /jobs run frame + /compact ack use it.) */
+export function fmtTokensLC(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "?";
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+  const m = n / 1_000_000;
+  return `${m >= 10 ? String(Math.round(m)) : m.toFixed(1)}m`;
+}
 
 /** Machine frames (STYLE.md 2.1): box-drawing chars live in fences only.
  * Exported for tests. */
@@ -550,10 +555,12 @@ function braceDepth(line: string): number {
 }
 
 /** One top-level (outside any existing fence) line is MACHINE state when
- * it is a bracketed tag, carries box-drawing frame chars, is a bare path,
- * a deterministic log line, or a JSON object line. Everything else - prose,
- * lists, headings, blockquotes, inline code - is left alone (conservative:
- * a missed fence is less bad than a mangled message). */
+ * it carries box-drawing frame chars, is a bare path, a deterministic log
+ * line, or a JSON object line. Tagged status lines ([ok] [!] ...) are
+ * PROSE per STYLE.md 3.1 (tag convention retired 2026-10-19) - left
+ * alone. Everything else - prose, lists, headings, blockquotes, inline
+ * code - is left alone too (conservative: a missed fence is less bad
+ * than a mangled message). */
 function isMachineLine(raw: string): boolean {
   const t = raw.trim();
   if (t === "") return false;
@@ -561,7 +568,6 @@ function isMachineLine(raw: string): boolean {
   if (/^#{1,6}\s/.test(t)) return false; // heading
   if (t.startsWith(">")) return false; // blockquote
   if (/^(?:[-*+]|\d{1,3}\.\s)/.test(t)) return false; // list item
-  if (STYLE_TAG_RE.test(t)) return true;
   if (STYLE_BOX_RE.test(t)) return true;
   if (STYLE_PATH_RE.test(t)) return true;
   if (STYLE_LOG_RE.test(t)) return true;
@@ -630,8 +636,9 @@ export function extractMachineUrls(
  * Deterministic mechanical fence pass (STYLE.md 2.7 / 4.4). Post-format
  * only: takes already-formatted markdown and fences top-level machine
  * state. Every /command reply and every machine output (script errors,
- * command output, logs, JSON, paths, bracketed state tags, box frames)
- * ships in a code fence.
+ * command output, logs, JSON, paths, box frames) ships in a code fence.
+ * Tagged status lines are prose (STYLE.md 3.1, tag convention retired
+ * 2026-10-19) and ship unfenced.
  *
  * - Consecutive machine lines share ONE fence (a frame or a tag block),
  *   never one fence per line.

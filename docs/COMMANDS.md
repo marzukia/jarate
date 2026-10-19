@@ -37,7 +37,6 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
 | `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
 | `/jobs tail <id> [--n N]` | fenced tail output (`[..] N earlier lines` when capped) |
-| ctx boundary notice (auto) | `[ctx] N% (tok/window)` (fenced) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `[ok] …` / `[!] …` |
@@ -257,7 +256,7 @@ label `last run`, completion time (HH:MM:SS) as the span. It is in-memory — a 
 answers `[!] no completed run yet (run one first)`. The same numbers
 land as the trailing line of the done/failed run frame (see below).
 
-### run frame usage line + [ctx] boundary notices
+### run frame usage line
 
 The done/failed frame carries one trailing line with the run's tokens and
 estimated cost (same OpenRouter list rates as `/usage`):
@@ -271,19 +270,6 @@ estimated cost (same OpenRouter list rates as `/usage`):
 ```
 
 Runs with no `usage` data (all-zero) get no trailing line.
-
-Separately, the bridge watches the context window during a run: each time
-the usage crosses an upward 10% boundary it posts ONE fenced notice
-(per boundary, per session — a restart or `/reset` re-arms, a `/compact`
-drop re-arms nothing, so a re-crossing below the last announced boundary
-is silent):
-
-```
-[ctx] 41% (108k/262k)
-```
-
-No command stands behind this; it is the operator's early warning that the
-session is filling up.
 
 ### /reset
 
