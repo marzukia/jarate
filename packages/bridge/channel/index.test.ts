@@ -5951,9 +5951,8 @@ describe("compaction-queue guard", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     jest.advanceTimersByTime(10 * 60 * 1000); // fallback: clear + drain (idle)
     jest.useRealTimers(); // let the async re-wake run on real timers
-    // the drain's handleInbound has its own awaits (memory toc readFile is
-    // scheduled mid-advanceTimersByTime, so its completion can land late
-    // under load); poll instead of a single tick
+    // the drain's handleInbound has its own async hops, so its
+    // completion can land late under load; poll instead of a single tick
     for (let i = 0; i < 200; i++) {
       if (piSends().some((s) => s.m.details?.body === "late msg")) break;
       await tick();
@@ -9233,9 +9232,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await flush(10);
     // The watchdog SYNCHRONOUSLY closed the window, deleted the op marker,
     // and posted the RESOLVED unit (the fetch mock records the post when
-    // invoked). The re-waked inbound is in flight but parked on a REAL fs
-    // read (memory toc): under fake timers its completion only arrives if
-    // it happens to ride a 0ms fake timer, which is load/cold-cache
+    // invoked). The re-waked inbound is in flight but parked on REAL
+    // async hops (fs I/O): under fake timers its completion only arrives
+    // if it happens to ride a 0ms fake timer, which is load/cold-cache
     // sensitive and flaked (issue #63: fresh-HOME runs fail
     // `expect(drained).toBeDefined()` ~1 in 4). So settle every
     // fake-timer assertion here first, then switch to REAL timers and let
