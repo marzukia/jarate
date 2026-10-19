@@ -1821,15 +1821,20 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     const f = fixture();
     const bin = path.join(f.tmp, "fbin");
     fs.mkdirSync(bin);
-    // per-RUN slow flag: $tmp/slow-<runid> (the wrapper exports
-    // PI_BG_RUN_ID into pi's env). The retry's pi must not inherit the
-    // original ticket's slowness.
+    // per-RUN slow flag: $tmp/slow-<runid>. #243: the wrapper no longer
+    // exports PI_BG_RUN_ID into pi's env (it is scrubbed at the pi
+    // launch), so the stub resolves its own run id from the spawn file
+    // it reads on stdin (/proc/self/fd/0 -> pi-bg-<runid>-spawn.md).
+    // The retry's pi must not inherit the original ticket's slowness.
     const slowBase = path.join(f.tmp, "slow");
     fs.writeFileSync(
       path.join(bin, "pi"),
       "#!/bin/sh\n" +
-        `[ -n "${"$"}{PI_BG_RUN_ID:-}" ] && ` +
-        `{ [ -f "${slowBase}-${"$"}{PI_BG_RUN_ID}" ] || ` +
+        "rf=$(readlink /proc/self/fd/0 2>/dev/null)\n" +
+        "rid=''\n" +
+        'case "$rf" in */pi-bg-*-spawn.md) rid=$(basename "$rf" | sed -e "s/^pi-bg-//" -e "s/-spawn\\.md$//");; esac\n' +
+        '[ -n "$rid" ] && ' +
+        `{ [ -f "${slowBase}-${"$"}{rid}" ] || ` +
         `[ -f "${slowBase}-ALL" ]; } && sleep 300\n` +
         "echo pi-run-ok\n",
     );
@@ -4571,4 +4576,188 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       f.close();
     }
   });
+});
+
+/**
+ * #243: ZOMBIE classification (webhook delivered, process still alive).
+ *
+ * The ticket's terminal webhook has reached the orchestrator (the
+ * -delivered marker) but a process still matches the ticket - a hung
+ * wrapper outliving delivery, or (pre-env-scrub) a same-run-id sibling.
+ * The cap slot is FREE (the jarate-bg cap scan + wd_cap exclude
+ * fresh-hb tickets carrying the marker), so the watchdog only LOGS the
+ * zombie (one dead-log line per ticket per day): no kill, no retry, no
+ * DEAD/STALLED flag, no webhook post (the orchestrator was already
+ * woken by the delivery itself).
+ */
+describe("watchdog #243: ZOMBIE (delivered webhook, process still alive)", () => {
+  const TID = (n: number) => `20991231-235959-${900 + n}`;
+  const recFile = (f: { home: string }, t: string) =>
+    path.join(f.home, ".pi-dispatch", "runs", `pi-bg-${t}.json`);
+  const deadlog = (f: { home: string }) => path.join(f.home, ".pi-bg-deadlog");
+  const wtDir = (f: { wtDir: string }, t: string) =>
+    path.join(f.wtDir, "jarate", t);
+  const age = (d: string, min: number) =>
+    fs.utimesSync(
+      d,
+      new Date(Date.now() - min * 60 * 1000),
+      new Date(Date.now() - min * 60 * 1000),
+    );
+  const bless = (f: { manifest: () => string; sha: (s: string) => string }) =>
+    fs.writeFileSync(
+      f.manifest(),
+      `${f.sha("# law v1\n")} 2026-09-14T00:00:00Z  zombie test\n`,
+    );
+  const plantRunning = (f: { home: string; tmp: string }, t: string) => {
+    const d = path.join(f.home, ".pi-dispatch", "runs");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(
+      recFile(f, t),
+      JSON.stringify(
+        {
+          run: t,
+          profile: "worker",
+          project: null,
+          cwd: path.join(f.tmp, "workdir"),
+          started: "2026-10-18T21:28:29Z",
+          delivery: "webhook",
+          state: "running",
+        },
+        null,
+        2,
+      ),
+    );
+  };
+  const liveCg = (f: { tmp: string }, t: string) => {
+    const cg = path.join(f.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), `${process.pid}\n`);
+  };
+
+  test("worktree: live cgroup + fresh hb + delivered -> ZOMBIE line, no post, deduped", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(1);
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true });
+      liveCg(f, t);
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-hb`), "");
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-delivered`), "");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`ZOMBIE jarate/${t}`);
+      expect(r.out).toContain("cap slot freed, issue #243");
+      expect(f.posts).toHaveLength(0); // orchestrator already woken: no post
+      // dead-log line (dedupe key for the day)
+      expect(fs.readFileSync(deadlog(f), "utf8")).toContain(
+        "zombie: webhook delivered, process still alive (issue #243)",
+      );
+      // not classified STALLED/DEAD, cgroup survives (no reap, no kill)
+      expect(r.out).not.toContain(`STALLED jarate/${t}`);
+      expect(r.out).not.toContain(`DEAD jarate/${t}`);
+      expect(fs.existsSync(path.join(f.tmp, "cg", "pi-bg", t))).toBe(true);
+      // second sweep same day: deduped
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`ZOMBIE jarate/${t}`);
+      expect(f.posts).toHaveLength(0);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("control: live cgroup + fresh hb WITHOUT delivered -> healthy, no ZOMBIE", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(2);
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true });
+      liveCg(f, t);
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-hb`), "");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain("ZOMBIE");
+      expect(r.out).not.toContain(`STALLED jarate/${t}`);
+      expect(f.posts).toHaveLength(0);
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("cwd sweep: running record + live cgroup + fresh hb + delivered -> ZOMBIE", async () => {
+    const f = fixture();
+    try {
+      bless(f);
+      const t = TID(3);
+      plantRunning(f, t);
+      liveCg(f, t);
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-hb`), "");
+      fs.writeFileSync(path.join(f.art, `pi-bg-${t}-delivered`), "");
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`ZOMBIE cwd/${t}`);
+      expect(f.posts).toHaveLength(0);
+      expect(fs.readFileSync(deadlog(f), "utf8")).toContain(
+        "zombie: webhook delivered, process still alive (issue #243)",
+      );
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+
+  test("wd_cap parity: a zombie (fresh hb + delivered) does not hold a retry slot", async () => {
+    const f = fixture();
+    // scrub the ambient PI_BG_* leak vars (same list as the #110 retry
+    // tests): the launched retry run inherits the watchdog's env
+    for (const k of [
+      "PI_BG_SETSID",
+      "PI_BG_SNAP",
+      "PI_BG_RUN_ID",
+      "PI_BG_TASK_FILE",
+      "PI_BG_HB_PID",
+      "SNAP_DIR",
+      "PI_BG_LANCHED_CWD",
+      "PI_BG_HB_INTERVAL",
+      "PI_BG_CMD_TIMEOUT",
+      "PI_BG_PRUNE_AGE_H",
+      "PI_BG_KEEP_SESSION",
+      "PI_BG_PRUNE_SESSIONS",
+      "PI_BG_RUN_START_EPOCH",
+    ]) {
+      delete f.env[k];
+    }
+    try {
+      bless(f);
+      const t = TID(4);
+      const wt = wtDir(f, t);
+      fs.mkdirSync(wt, { recursive: true });
+      age(wt, 30);
+      plantRunning(f, t);
+      // canonical 3-line prompt shape (retry launch: tail -n +3)
+      fs.writeFileSync(
+        path.join(f.art, `pi-bg-${t}-prompt.md`),
+        "# pi-bg worker task\n\nretry me\n",
+      );
+      // cap 1, occupied by a ZOMBIE: fresh hb + delivered marker
+      // (pre-parity-fix this HELD the retry, exactly like a live ticket)
+      fs.writeFileSync(path.join(f.art, `pi-bg-${TID(9)}-hb`), "");
+      fs.writeFileSync(path.join(f.art, `pi-bg-${TID(9)}-delivered`), "");
+      const over = {
+        PI_BG_LAUNCHER: JB,
+        PI_BG_MAX_CONCURRENT: "1",
+        PI_BG_RETRY_WAIT: "30",
+      };
+      const r1 = await f.run([], over);
+      expect(r1.code).toBe(0);
+      expect(r1.out).not.toContain("HELD (at cap");
+      expect(r1.out).toContain(`retry ${t}: DISPATCHED`);
+      const rec = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
+      expect(rec.state).toBe("killed");
+      expect(rec.deadRetry.state).toBe("dispatched");
+    } finally {
+      f.close();
+    }
+  }, 60_000);
 });

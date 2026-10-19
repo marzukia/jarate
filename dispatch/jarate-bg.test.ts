@@ -6,6 +6,7 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1935,6 +1936,238 @@ describe("#41: concurrency cap (PI_BG_MAX_CONCURRENT)", () => {
 });
 
 /**
+ * #243: a delivered webhook frees the cap slot (ZOMBIE).
+ *
+ * Incident (2026-10-18, ticket 20261018-203523-590414): the wrapper
+ * delivered out.md + rc + webhook (204) and exited, but the run's
+ * process tree kept touching the SAME ticket's hb file for another
+ * 1h38m - a NESTED jarate-bg (the worker had dispatched its own
+ * reviewer) had inherited the parent's run-identity env
+ * (PI_BG_RUN_ID + PI_BG_SNAP + PI_BG_TASK_FILE + ...), so it ran under
+ * the parent's ticket id: same hb file, run record, cgroup, out.md.
+ * The cap counted the already-delivered ticket as LIVE: 4/4 with only
+ * 3 tickets truly running.
+ *
+ * The fix has two layers:
+ *   1. Cap-side guarantee: bg_post touches pi-bg-<id>-delivered on 2xx
+ *      (and the watchdog's dead-letter re-post touches it too); the cap
+ *      scan treats a fresh-hb ticket carrying that marker as ZOMBIE -
+ *      slot freed, whatever the process tree does.
+ *   2. Root cause: the pi child gets the run-identity env scrubbed
+ *      (PI_RUN_SCRUB), so a nested jarate-bg gets a fresh ticket id and
+ *      reads its OWN task (its stdin), not the parent's prompt file.
+ */
+describe("#243: delivered webhook frees the cap slot (ZOMBIE)", () => {
+  const zart = (fx: { tmp: string }) => path.join(fx.tmp, "home", ".pi-bg-art");
+
+  test("fresh hb + delivered marker does not hold the cap slot", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const a = zart(fx);
+    fs.mkdirSync(a, { recursive: true });
+    // one live ticket whose webhook already delivered: fresh hb + marker
+    fs.writeFileSync(path.join(a, "pi-bg-20990101-111111-1-hb"), "");
+    fs.writeFileSync(path.join(a, "pi-bg-20990101-111111-1-delivered"), "");
+    // + two plain live tickets (no marker) -> 3 live of cap 3
+    for (const id of ["20990101-222222-2", "20990101-333333-3"]) {
+      fs.writeFileSync(path.join(a, `pi-bg-${id}-hb`), "");
+    }
+    fx.env.PI_BG_MAX_CONCURRENT = "3";
+    const r = await fx.run(["worker", "zombie cap task"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("pi-run-ok");
+    expect(r.err).not.toContain("at cap");
+  }, 15_000);
+
+  test("control: fresh hb WITHOUT the marker still holds the slot", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const a = zart(fx);
+    fs.mkdirSync(a, { recursive: true });
+    for (const id of ["20990101-444444-4", "20990101-555555-5"]) {
+      fs.writeFileSync(path.join(a, `pi-bg-${id}-hb`), "");
+    }
+    fx.env.PI_BG_MAX_CONCURRENT = "2"; // == live count -> at cap
+    const r = await fx.run(["worker", "zombie cap control"]);
+    expect(r.code).toBe(5);
+    expect(r.err).toMatch(/\[!\] at cap \(2\/2\)/);
+  }, 15_000);
+
+  test("2xx terminal post writes the delivered marker; slot stays freed while the hb is still touched", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async () => new Response("ok", { status: 200 }),
+    });
+    try {
+      fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+      const r = await fx.run(["worker", "zombie deliver task"]);
+      expect(r.code).toBe(0);
+      const recs = fx.records();
+      expect(recs).toHaveLength(1);
+      const id = recs[0].run;
+      expect(fs.existsSync(path.join(zart(fx), `pi-bg-${id}-delivered`))).toBe(
+        true,
+      );
+      // the incident shape: the run is delivered AND its hb file is
+      // still fresh (a process tree outliving delivery). Cap 1: the
+      // delivered ticket must not refuse the next dispatch.
+      fs.writeFileSync(path.join(zart(fx), `pi-bg-${id}-hb`), "");
+      fx.env.PI_BG_MAX_CONCURRENT = "1";
+      const r2 = await fx.run(["worker", "zombie deliver after"]);
+      expect(r2.code).toBe(0);
+      expect(r2.out).toContain("pi-run-ok");
+      expect(r2.err).not.toContain("at cap");
+    } finally {
+      server.stop(true);
+    }
+  }, 25_000);
+
+  test("failed terminal post: dead letter, NO delivered marker", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    // dead endpoint: ECONNREFUSED on all 3 attempts -> dead letter
+    fx.env.PI_DISPATCH_WEBHOOK = "http://127.0.0.1:1/hook";
+    const r = await fx.run(["worker", "zombie dead letter"]);
+    expect(r.code).toBe(0); // the run completes; only the post fails
+    const recs = fx.records();
+    expect(recs).toHaveLength(1);
+    const id = recs[0].run;
+    expect(fs.existsSync(path.join(zart(fx), `pi-bg-${id}-delivered`))).toBe(
+      false,
+    );
+    expect(
+      fs.existsSync(path.join(zart(fx), `pi-bg-${id}-webhook-failed`)),
+    ).toBe(true);
+  }, 25_000);
+
+  test("pi child env: run identity scrubbed, shared settings kept", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const dump = path.join(fx.tmp, "pi-env.txt");
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      `#!/bin/sh\nenv | sort > "${dump}"\necho pi-run-ok\n`,
+    );
+    fs.chmodSync(path.join(fx.tmp, "bin", "pi"), 0o755);
+    delete fx.env.PI_DISPATCH_WEBHOOK;
+    const r = await fx.run(["worker", "zombie env task"]);
+    expect(r.code).toBe(0);
+    const envTxt = fs.readFileSync(dump, "utf8");
+    // the parent wrapper carries the run identity; the pi child must not
+    for (const k of [
+      "PI_BG_RUN_ID=",
+      "PI_BG_HB_PID=",
+      "PI_BG_SNAP=",
+      "SNAP_DIR=",
+      "PI_BG_TASK_FILE=",
+      "PI_BG_SETSID=",
+      "PI_BG_LANCHED_CWD=",
+      "PI_BG_DAEMON=",
+      "PI_BG_ATTACHED=",
+      "PI_BG_RUN_START_EPOCH=",
+      "PI_BG_RETRY_OF=",
+    ]) {
+      expect(envTxt, `child env must not carry ${k.trim("=")}`).not.toContain(
+        k,
+      );
+    }
+    // shared settings survive the scrub: the child still resolves its
+    // own ticket identity from the same HOME / artifact dir
+    expect(envTxt).toContain(`HOME=${fx.home}\n`);
+  }, 15_000);
+
+  test("nested jarate-bg inside a run: fresh ticket + own task (incident repro)", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const parentTask = "PARENT-TASK-243";
+    const nestedTask = "NESTED-TASK-243";
+    const stubDir = path.join(fx.tmp, "zstub");
+    fs.mkdirSync(stubDir);
+    // the stub records which task it got (first line = the task; the
+    // spawn file appends the standard constraints) and, when it is the
+    // PARENT run, launches the NESTED dispatch - the incident shape
+    // (a worker dispatching its own reviewer) - then outlives it.
+    fs.writeFileSync(
+      path.join(fx.tmp, "bin", "pi"),
+      [
+        "#!/bin/sh",
+        'task="$(head -n 1)"',
+        'h=$(printf "%s" "$task" | md5sum | cut -c1-8)',
+        `printf '%s' "$task" > "${stubDir}/task-$h"`,
+        `if [ "$task" = "${parentTask}" ]; then`,
+        `  printf '%s' "${nestedTask}" | nohup bash "${PI_BG}" worker - > "${stubDir}/nested.log" 2>&1 &`,
+        "  sleep 12",
+        "fi",
+        "echo pi-run-ok",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(path.join(fx.tmp, "bin", "pi"), 0o755);
+    delete fx.env.PI_DISPATCH_WEBHOOK;
+    const p = spawn(["bash", PI_BG, "worker", parentTask], {
+      env: fx.env,
+      cwd: fx.tmp,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const hParent = createHash("md5")
+      .update(parentTask)
+      .digest("hex")
+      .slice(0, 8);
+    const hNested = createHash("md5")
+      .update(nestedTask)
+      .digest("hex")
+      .slice(0, 8);
+    const t0 = Date.now();
+    let nestedTaskFile = false;
+    while (!nestedTaskFile && Date.now() - t0 < 20_000) {
+      if (fs.existsSync(path.join(stubDir, `task-${hNested}`))) {
+        nestedTaskFile = true;
+      } else {
+        await Bun.sleep(100);
+      }
+    }
+    const [out] = await Promise.all([
+      new Response(p.stdout).text(),
+      new Response(p.stderr).text(),
+    ]);
+    const code = await p.exited;
+    expect(code).toBe(0);
+    expect(out).toContain("pi-run-ok");
+    // the parent got its OWN task
+    expect(fs.readFileSync(path.join(stubDir, `task-${hParent}`), "utf8")).toBe(
+      parentTask,
+    );
+    // the nested run got ITS OWN task from ITS stdin. Pre-fix the leaked
+    // PI_BG_SNAP + PI_BG_TASK_FILE made it re-read the PARENT's prompt
+    // file (its stdin was ignored) -> only the parent's task file exists.
+    expect(
+      nestedTaskFile,
+      `nested task file missing (nested.log: ${fs.existsSync(path.join(stubDir, "nested.log")) ? fs.readFileSync(path.join(stubDir, "nested.log"), "utf8").slice(-400) : "absent"})`,
+    ).toBe(true);
+    expect(fs.readFileSync(path.join(stubDir, `task-${hNested}`), "utf8")).toBe(
+      nestedTask,
+    );
+    // two distinct run records (pre-fix: ONE record, reused run id -
+    // the nested run overwrote the parent's record + out.md)
+    const recs = fx.records();
+    expect(recs).toHaveLength(2);
+    const ids = recs.map((r) => r.run).sort();
+    expect(new Set(ids).size).toBe(2);
+    // each ticket owns its artifacts (out.md under its own run id)
+    for (const rec of recs) {
+      expect(
+        fs.existsSync(path.join(zart(fx), `pi-bg-${rec.run}-out.md`)),
+        `out.md missing for ${rec.run}`,
+      ).toBe(true);
+    }
+  }, 40_000);
+});
+
+/**
  * #56: session isolation (setsid at launch). A nested dispatch's launcher
  * tool call can block in wait4() on the ticket; the harness bash-tool
  * timeout then signals the LAUNCHER's process group (kill to -pgid).
@@ -3233,6 +3466,9 @@ describe("#52: hb-from-birth (launcher window is liveness-covered)", () => {
     // hermeticizes). The snapshot-shaped leak also carries
     // PI_BG_RUN_ID/PI_BG_SNAP into the child - a separate identity
     // issue, not this one (review #183 F2 repro shape).
+    // #243: PI_RUN_SCRUB now removes PI_BG_HB_PID at the pi launch, so
+    // the "leak is real" precondition below asserts the SCRUB (empty),
+    // not the leak - the fork assertions still guard the topology.
     fx.env.PI_BG_NOSNAP = "1";
     fs.mkdirSync(art, { recursive: true });
     // nested launcher on the pi PATH
@@ -3261,10 +3497,16 @@ describe("#52: hb-from-birth (launcher window is liveness-covered)", () => {
         `  sleep 2.5`,
         `  m2=$(stat -c %Y "$chf" 2>/dev/null)`,
         `  echo "$m1 $m2" > ${fx.tmp}/child-hb-mtimes`,
+        // parent's hb child liveness, post-#243 (hbpid is scrubbed out of
+        // the pi env - mtime of the PARENT's hb file across the child's
+        // exit is the survival check): interval 1s, the child outlives
+        // the window by seconds, so an alive hb child must re-touch
+        `  pm1=$(stat -c %Y "${art}/$(cat ${fx.tmp}/hbfile-parent)" 2>/dev/null)`,
         `  wait $cp`,
+        `  pm2=$(stat -c %Y "${art}/$(cat ${fx.tmp}/hbfile-parent)" 2>/dev/null)`,
         `  : > ${fx.tmp}/faults`,
         `  [ -f "$chf" ] && echo child-hb-file-left >> ${fx.tmp}/faults`,
-        `  kill -0 "$(cat ${fx.tmp}/hbpid-parent)" 2>/dev/null || echo parent-hb-child-dead >> ${fx.tmp}/faults`,
+        `  [ -n "$pm1" ] && [ "$pm1" = "$pm2" ] && echo parent-hb-child-dead >> ${fx.tmp}/faults`,
         `else`,
         `  sleep 3`, // child run: outlive the parent's mtime sampling window
         `fi`,
@@ -3275,11 +3517,12 @@ describe("#52: hb-from-birth (launcher window is liveness-covered)", () => {
     fs.chmodSync(piBin, 0o755);
     const r = await fx.run(["worker", "hb nested task"]);
     expect(r.code).toBe(0);
-    // the leak is real: the parent's pi env carried PI_BG_HB_PID (an
-    // empty value would make the fork trivial and the test vacuous)
+    // #243: the scrub removed PI_BG_HB_PID from the pi env - adoption of
+    // the parent's hb child is no longer possible (pre-#243 this asserted
+    // the leak was real: a non-empty pid)
     expect(
       fs.readFileSync(path.join(fx.tmp, "hbpid-parent"), "utf8").trim(),
-    ).toMatch(/^\d+$/);
+    ).toBe("");
     // the child forked its own child: its hb file was re-touched during
     // the run (an adoption would leave it at the birth-touch mtime - the
     // adopted child touches the PARENT's file)

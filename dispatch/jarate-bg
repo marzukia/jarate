@@ -780,6 +780,16 @@ if [ "$max_c" -gt 0 ]; then
     case "${_cap_hb##*/}" in
       "pi-bg-${our_id}-hb") continue ;;
     esac
+    # ZOMBIE (issue #243): a ticket whose terminal webhook is ALREADY
+    # DELIVERED (the -delivered marker: bg_post on 2xx, the watchdog's
+    # dead-letter re-post) has freed its slot, even if its hb file is
+    # still fresh - a process tree outliving delivery (a hung wrapper,
+    # or, pre-env-scrub, a nested jarate-bg that ran under the same
+    # run id). Counting it is what left the 2026-10-18 box at 4/4 with
+    # only 3 tickets truly running.
+    _cap_tid="${_cap_hb##*/pi-bg-}"
+    _cap_tid="${_cap_tid%-hb}"
+    [ -f "$_cap_art/pi-bg-${_cap_tid}-delivered" ] && continue
     live=$(( live + 1 ))
   done < <(find "$_cap_art" -maxdepth 1 -type f -name 'pi-bg-*-hb' -newermt "@${_cap_cutoff}" 2>/dev/null)
   if [ "$live" -ge "$max_c" ]; then
@@ -1063,6 +1073,17 @@ bg_post() {
     case "$code" in
       2*) BG_CB_DONE=1; rm -f "$BG_DEAD"
           printf '%s %s\n' "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_WB_STATUS"
+          # #243: delivered marker - the cap-side proof that this
+          # ticket's terminal webhook reached the orchestrator. The cap
+          # scan treats a fresh-hb ticket carrying this marker as ZOMBIE
+          # (slot freed), so a process tree that outlives delivery can no
+          # longer hold the concurrency slot. bg_post is used only for
+          # TERMINAL posts (the mid-run signal receipt posts inline), so
+          # every marker here is a delivery the cap may rely on. The exit
+          # trap must NOT rm it: the zombie that outlives us is exactly
+          # who the marker constrains (it is pruned with the ticket's
+          # artifacts by the watchdog's run-state prune, issue #51).
+          touch "$BG_TMP/pi-bg-${run_id}-delivered" 2>/dev/null || true
           return 0 ;;
     esac
     [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
@@ -2160,15 +2181,37 @@ pi_flags=( "$@" )
 SPAWN_F="$BG_TMP/pi-bg-${run_id}-spawn.md"
 { printf '%s' "$task"; printf '\n\n%s' "$STD_CONSTRAINTS"; } > "$SPAWN_F" 2>/dev/null
 chmod 600 "$SPAWN_F" 2>/dev/null || true
+# #243: run-identity scrub for the pi child (and everything it spawns).
+# A nested jarate-bg launched from inside the run (a worker dispatching
+# its own reviewer) used to inherit this ticket's identity env:
+# PI_BG_RUN_ID -> the parent's hb file + run record + cgroup + out.md
+# (the incident: the delivered worker's cap slot stayed LIVE for 1h38m
+# on its nested reviewer's heartbeat), PI_BG_SNAP + PI_BG_TASK_FILE ->
+# the nested run re-read the PARENT's task from the parent's prompt
+# file instead of its own stdin, PI_BG_SETSID -> it skipped its own
+# setsid re-exec, PI_BG_LANCHED_CWD -> it cd'd to the parent's launcher
+# dir, PI_BG_HB_PID -> it adopted the parent's hb child, PI_BG_DAEMON
+# -> it skipped its own daemonization, PI_BG_RETRY_OF -> it tagged its
+# record as a retry of the grandparent. Scrubbing the per-ticket
+# identity gives every nested dispatch a fresh ticket. Shared settings
+# (PI_BG_TMPDIR, PI_BG_HB_INTERVAL, cap, PI_DISPATCH_WEBHOOK, ...)
+# are NOT scrubbed: a nested dispatch must write to the same artifact
+# dir and post to the same orchestrator. env -u on an absent var is a
+# no-op. Only the child's environment changes: the wrapper's own shell
+# vars (run_id, SNAP_DIR, ...) stay untouched.
+PI_RUN_SCRUB=(env -u PI_BG_RUN_ID -u PI_BG_HB_PID -u PI_BG_SNAP \
+  -u SNAP_DIR -u PI_BG_TASK_FILE -u PI_BG_SETSID -u PI_BG_LANCHED_CWD \
+  -u PI_BG_DAEMON -u PI_BG_RUN_START_EPOCH -u PI_BG_ATTACHED \
+  -u PI_BG_RETRY_OF)
 # 2026-10-16 incident: relaunches resume the prior attempt's session
 # (bg_arm_resume). Empty = fresh launch; attempt 1 is always fresh.
 resume_id=""
 for attempt in 1 2 3; do
   att_start="$(date +%s)"
   if [ "$wt_mode" -eq 1 ]; then
-    ( cd "$wt_path" && exec pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" ) > "$rawf" 2> "$errf" &
+    ( cd "$wt_path" && exec "${PI_RUN_SCRUB[@]}" pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" ) > "$rawf" 2> "$errf" &
   else
-    pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" > "$rawf" 2> "$errf" &
+    "${PI_RUN_SCRUB[@]}" pi -p --no-extensions ${resume_id:+--session "$resume_id"} "${pi_flags[@]+"${pi_flags[@]}"}" < "$SPAWN_F" > "$rawf" 2> "$errf" &
   fi
   pi_pid=$!
   wait "$pi_pid"; rc=$?; pi_pid=""
