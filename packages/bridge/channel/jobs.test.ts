@@ -14,7 +14,6 @@ import {
   parseJobsFromPs,
   promptTask,
   scanJobHistory,
-  stateLabel,
   ticketIdFromPid,
 } from "./jobs";
 
@@ -585,27 +584,25 @@ describe("formatJobsView", () => {
     },
   ];
 
-  test("text: v3 frames - in-flight header row + │-gutter task, recent state-first", () => {
+  test("text: markdown list - full task inline, recent raw states", () => {
     const out = formatJobsView(inflight, history, "text", 1_790_000_000);
     expect(out).toBe(
       [
-        "┌ jobs · 2 in flight",
-        "┣ 20260910-120000-7 worker · 00:42",
-        "│ bulk refactor",
-        "┣ reviewer · 01:00",
-        "│ no cgroup id",
-        "└",
+        "**jobs · 2 in flight**",
         "",
-        "┌ recent (newest first) · 3",
-        "├ lost · 0s · 20260910-103000-4",
-        "├ ok · 5m · 20260910-100000-1",
-        "├ wb-fail · 1h0m · 20260910-090000-7",
-        "└",
+        "- 20260910-120000-7 worker · 00:42 · bulk refactor",
+        "- reviewer · 01:00 · no cgroup id",
+        "",
+        "**recent (newest first) · 3**",
+        "",
+        "- lost · 0s · 20260910-103000-4",
+        "- done · 5m · 20260910-100000-1",
+        "- webhook-failed · 1h0m · 20260910-090000-7",
       ].join("\n"),
     );
   });
 
-  test("text: long task wraps on │ gutter, all rows stay under 40 cols", () => {
+  test("text: long task ships in full on one line, no width budget", () => {
     const long: InflightJob[] = [
       {
         id: "20260910-120000-7",
@@ -615,16 +612,17 @@ describe("formatJobsView", () => {
       },
     ];
     const out = formatJobsView(long, [], "text", 1_790_000_000);
-    for (const line of out.split("\n")) {
-      expect(line.length).toBeLessThanOrEqual(40);
-    }
-    expect(out).toContain("┣ 20260910-120000-7 worker · 12m");
-    expect(out).toContain("│ lib.sh dedup + contract test +");
-    expect(out).toContain("│ pi-restart into repo and wire the");
-    expect(out).toContain("│ webhook");
+    expect(out).toBe(
+      [
+        "**jobs · 1 in flight**",
+        "",
+        "- 20260910-120000-7 worker · 12m · lib.sh dedup + contract test + pi-restart into repo and wire the webhook",
+      ].join("\n"),
+    );
+    expect(out).not.toContain("…");
   });
 
-  test("text: worst-case recent row stays under 40 cols (wb-fail + 1h59m)", () => {
+  test("text: recent rows keep raw states, no width budget", () => {
     const worst: JobHistoryEntry[] = [
       {
         id: "20260910-103000-4",
@@ -634,21 +632,11 @@ describe("formatJobsView", () => {
       },
     ];
     const out = formatJobsView([], worst, "text", 1_790_000_000);
-    for (const line of out.split("\n")) {
-      expect(line.length).toBeLessThanOrEqual(40);
-    }
-    expect(out).toContain("├ wb-fail · 1h59m · 20260910-103000-4");
-  });
-
-  test("stateLabel compresses for the text view, json keeps raw states", () => {
-    expect(stateLabel("done")).toBe("ok");
-    expect(stateLabel("webhook-failed")).toBe("wb-fail");
-    expect(stateLabel("killed")).toBe("killed");
-    expect(stateLabel("lost")).toBe("lost");
+    expect(out).toContain("- webhook-failed · 1h59m · 20260910-103000-4");
   });
 
   test("text: no in-flight and no history is a closed empty frame", () => {
-    expect(formatJobsView([], [], "text")).toBe("┌ jobs · none in flight\n└");
+    expect(formatJobsView([], [], "text")).toBe("**jobs · none in flight**");
   });
 
   test("json: machine-readable object", () => {
@@ -689,15 +677,15 @@ describe("jobsView (recent excludes in-flight ids)", () => {
     { id: DONE, state: "done", mtime: 1_789_999_700, webhook: "200" },
   ];
 
-  // the ids on the rendered recent frame's `├` rows only
+  // the ids on the rendered recent section's `- state · age · id` bullets
   function recentIds(out: string): string[] {
     const lines = out.split("\n");
-    const i = lines.findIndex((l) => l.startsWith("┌ recent"));
+    const i = lines.findIndex((l) => l.startsWith("**recent (newest first)"));
     if (i === -1) return [];
     const ids: string[] = [];
     for (let k = i + 1; k < lines.length; k++) {
-      if (lines[k] === "└") break;
-      const m = lines[k].match(/^├ \S+ · \S+ · (\S+)$/);
+      if (lines[k].startsWith("**")) break;
+      const m = lines[k].match(/^- \S+ · \S+ · (\S+)$/);
       if (m) ids.push(m[1]);
     }
     return ids;
@@ -709,7 +697,7 @@ describe("jobsView (recent excludes in-flight ids)", () => {
     expect(ids).not.toContain(LIVE);
     expect(ids).toContain(DONE);
     // the in-flight frame is unchanged — the live job still renders there
-    expect(out).toContain(`┣ ${LIVE} worker · 51:33`);
+    expect(out).toContain(`- ${LIVE} worker · 51:33 · audit`);
   });
 
   test("json: history excludes the live id, keeps the completed id", () => {
@@ -1010,15 +998,13 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
     expect(inner.length).toBe(1 + 40);
   });
 
-  test("tail: overlong lines are hard-wrapped at 40 cols (mobile budget)", async () => {
+  test("tail: overlong lines ship raw - no 40-col hard wrap (2026-10-18)", async () => {
     const long = "x".repeat(120);
     stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
     const r = await jobsTail(ID, 40, env, scriptsDir);
     const lines = r.split("\n");
-    // fence + 3 wrapped (40*3) + "ok" + fence
-    expect(lines.length).toBe(6);
-    for (const l of lines) expect(l.length).toBeLessThanOrEqual(40);
-    expect(lines[1] + lines[2] + lines[3]).toBe(long);
+    // fence + the long line verbatim + "ok" + fence
+    expect(lines).toEqual(["```", long, "ok", "```"]);
   });
 
   test("tail: --n is clamped to [1, 200] and passed to the script", async () => {

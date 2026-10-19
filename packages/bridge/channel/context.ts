@@ -7,9 +7,11 @@
  *
  * /context parses the channel's ACTIVE session file (same discovery as
  * /usage: caller-resolved ctx session file, else findSessionFile(cwd)) and
- * reports, in one 40-col framed block:
+ * reports, as a normal markdown list (Andryo 2026-10-18: summaries are
+ * markdown lists, no frame, no width budget - text wraps natively):
  *   - top-N items by token ESTIMATE (default 10, `/context 20` accepts a
- *     count, capped at 40 to stay under Discord's 2000-char message limit)
+ *     count, capped at CONTEXT_MAX_N to stay under Discord's 2000-char
+ *     message limit)
  *   - totals by category (user / assistant / tool)
  *   - a "biggest eater" one-liner
  *
@@ -21,13 +23,8 @@
  * entry is one row (toolName + text + image data). Entries are deduped by
  * entry id, the same guard as /usage's assistant dedup. Non-conversation
  * entries (session, compaction, model_change, ...) are not counted.
- *
- * The frame obeys the 40-col mobile budget (FRAME_COL_MAX); item rows
- * are laid out at 32 or under for compactness. Box-drawing, ASCII tags,
- * no emoji.
  */
 
-import { FRAME_COL_MAX } from "./frame";
 import { findSessionFile } from "./undo";
 import { fmtTokens, linesOf } from "./usage";
 
@@ -56,20 +53,16 @@ export function estTokens(chars: number): number {
   return Math.ceil(chars / 4);
 }
 
-/** Row role abbreviation: 4 chars max so the item row stays on 32.
- *  (user/asst/tool — "assistant" is the 9-char outlier.) */
+/** Row role abbreviation: 4 chars max (user/asst/tool — "assistant" is
+ *  the 9-char outlier). */
 function ctxRole4(role: CtxRole): string {
   return role === "assistant" ? "asst" : role;
 }
 
-/** Header line: "top N/M · total X" fits FRAME_COL_MAX even for huge M
- *  (clip M, keep its tail — the count is the interesting part). */
+/** Header line: bold `context · top N/M · total X`. Full M, no clip -
+ *  no width budget (Andryo 2026-10-18). */
 function ctxHeader(shown: number, total: number, tok: string): string {
-  const fixed = `┌ top ${shown}/`.length + ` · total ${tok}`.length;
-  const m = String(total);
-  const keep = Math.max(1, FRAME_COL_MAX - fixed);
-  const mm = m.length > keep ? `…${m.slice(m.length - (keep - 1))}` : m;
-  return `┌ top ${shown}/${mm} · total ${tok}`;
+  return `**context · top ${shown}/${total} · total ${tok} (est, char/4)**`;
 }
 
 /** Compact age: 45s / 12m / 3h12m / 1d3h (max 6 chars, 32-col row layout).
@@ -237,9 +230,9 @@ export async function scanContextFile(file: string): Promise<CtxScan> {
 }
 
 /**
- * Build the /context frame (WITHOUT the outer code fence — the caller
- * wraps it). Every line stays within the 40-col mobile budget (rows are
- * laid out at 32 or under).
+ * Build the /context markdown list (WITHOUT the outer code fence - the
+ * caller decides). Bold header + bullets; no width budget, lines ship
+ * as written (Andryo 2026-10-18: text wraps natively in Discord).
  *
  * @param scan    parsed session items
  * @param n       requested top-N (already validated)
@@ -252,25 +245,22 @@ export function formatContext(
 ): string {
   const { items, totalChars, baseTs } = scan;
   const shown = Math.min(n, items.length);
-  const L: string[] = [];
-  L.push("[context] est tokens (char/4)");
-  // header re-layout (32-col row layout): "top 5/5" + k-form total; the
-  // old "top 5 of 1234 items" breached 32 with M in the thousands
-  L.push(ctxHeader(shown, items.length, fmtTokens(estTokens(totalChars))));
+  const L: string[] = [
+    ctxHeader(shown, items.length, fmtTokens(estTokens(totalChars))),
+    "",
+  ];
   const date =
     baseTs > 0 ? new Date(baseTs).toISOString().slice(0, 10) : "unknown";
-  L.push(`│ ${date} · age ${baseTs > 0 ? fmtAge(now - baseTs) : "?"}`);
+  L.push(`- ${date} · age ${baseTs > 0 ? fmtAge(now - baseTs) : "?"}`);
   for (let i = 0; i < shown; i++) {
     const it = items[i];
     const age = it.ts > 0 && baseTs > 0 ? fmtAge(it.ts - baseTs) : "?";
-    // row: │ <idx> <role4> <type10> <tok4> <age> — worst case
-    // (idx 40, toolResult, 999K, 23h59m) lands exactly on 32
     L.push(
-      `│ ${String(i + 1).padStart(2)} ${ctxRole4(it.role).padEnd(4)} ${it.type.padEnd(10)} ${fmtTokens(estTokens(it.chars)).padStart(4)} ${age}`,
+      `- ${i + 1} ${ctxRole4(it.role)} ${it.type} ${fmtTokens(estTokens(it.chars))} ${age}`,
     );
   }
-  if (shown === 0) L.push("│ (no sized items)");
-  L.push("├ totals");
+  if (shown === 0) L.push("- no sized items");
+  const totals: string[] = [];
   for (const role of ["user", "assistant", "tool"] as const) {
     let chars = 0;
     let count = 0;
@@ -279,30 +269,25 @@ export function formatContext(
         chars += it.chars;
         count += 1;
       }
-    L.push(
-      `│ ${role.padEnd(9)} ${fmtTokens(estTokens(chars)).padStart(5)}  (${count})`,
-    );
+    totals.push(`${ctxRole4(role)} ${fmtTokens(estTokens(chars))} (${count})`);
   }
+  L.push(`- totals: ${totals.join(" · ")}`);
   if (shown > 0) {
     const top = items[0];
-    // "asst" + unpadded tok keep the worst case (assistant + toolResult +
-    // 999K) at 31. The tool name drops: row 1 already carries the top
-    // item's type + tokens, and the name was the overflow.
+    // "biggest eater" one-liner: row 1 already carries the top item's
+    // type + tokens; this line names the category + role for the triage.
     L.push(
-      `└ biggest: ${ctxRole4(top.role)} ${top.type.padEnd(10)} ${fmtTokens(estTokens(top.chars)).padStart(4)}`,
+      `- biggest: ${ctxRole4(top.role)} ${top.type} ${fmtTokens(estTokens(top.chars))}`,
     );
-  } else {
-    // empty scan still closes the frame (STYLE 2.2: never ship open)
-    L.push("└ no entries");
   }
   return L.join("\n");
 }
 
-/** Max count arg: 40 rows keeps the frame under Discord's 2000-char cap. */
+/** Max count arg: 40 rows keeps the list under Discord's 2000-char cap. */
 export const CONTEXT_MAX_N = 40;
 
 /**
- * Build the /context reply (one framed block, or a one-line [!] error —
+ * Build the /context reply (one markdown list, or a one-line [!] error —
  * never a stack).
  *
  * @param arg         raw command arg ("" | "20" | other)

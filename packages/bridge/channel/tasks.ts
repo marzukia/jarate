@@ -619,7 +619,8 @@ export function formatTaskPrompt(task: ScheduledTask): string {
   return `[task] ${label} due ${due} UTC: ${task.prompt}`;
 }
 
-/** One line per task for /tasks list. */
+/** One line per task for /tasks list. Full prompt text - no width
+ *  budget, Discord wraps it natively (Andryo 2026-10-18). */
 export function formatTaskLine(
   task: ScheduledTask,
   channelName: string | undefined,
@@ -632,8 +633,7 @@ export function formatTaskLine(
       : m > 0
         ? `in ${formatDurationMs(m * 60000)}`
         : "due";
-  const prompt =
-    task.prompt.length > 60 ? `${task.prompt.slice(0, 60)}…` : task.prompt;
+  const prompt = task.prompt.replace(/\n/g, " ");
   return (
     `- ${task.id} · ${channelName || task.channelName || task.channelId} · ` +
     `${taskScheduleLabel(task)} · next ${new Date(task.nextFireAt).toISOString()} ` +

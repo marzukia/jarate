@@ -18,19 +18,21 @@ Live run state is ONE box-drawing frame in every state (live-frame unification,
 2026-09-13): `┌ working · N calls · Ts` with `│ ├` / `│ └` sub-steps while
 the run is active (the same Discord message is edited in place as calls fire
 and on a 5s tick); at run end the header flips to `┌ done` / `┤ failed` on
-that same message, `└` close. The todo board uses its own state glyphs: `├`
-pending, `┣` in progress, `├` done (strikethrough, pipe stays connected),
-`┤` cancelled, `┌` board header, `└` close. Both families are exempt from
-the bracket scheme and must stay <= 40 cols per line (mobile budget, measured 2026-09-15).
-Webhook callback embeds are framed and untagged.
+that same message, `└` close. The in-turn run frame is the ONLY framed
+output (Andryo 2026-10-18): it is exempt from the bracket scheme and must
+stay <= 40 cols per line (mobile budget, measured 2026-09-15).
+SUMMARIES (todo board, /jobs, /usage, /context, /tasks, /sleep list) ship
+as normal markdown lists - no fence, no box-drawing, no width budget, no
+truncation; in-progress = `**bold**`, closed = `~~strikethrough~~` (see
+docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 
 | command / output | tag |
 |---|---|
 | `/stop` | `[-] stopped` |
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
-| `/usage [all\|session\|last]` | `[usage] …` (error: `[!] usage: …`) |
-| `/context [N]` | fenced frame (40-col box-drawing, `[context]` tag, est tokens char/4; error: `[!] no session file found` / `[!] session file unreadable`) |
+| `/usage [all\|session\|last]` | markdown list, unfenced (`**usage · session**` + `- key: value` bullets) (error: `[!] usage: …` one-liner) |
+| `/context [N]` | markdown list, unfenced (`**context · top N/M**` + bullets, est tokens char/4); error: `[!] no session file found` / `[!] session file unreadable` |
 | `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
 | `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
@@ -43,12 +45,12 @@ Webhook callback embeds are framed and untagged.
 | `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
 | `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
-| `/jobs` | `[jobs] …` |
+| `/jobs` | markdown list, unfenced (`**jobs · N in flight**` + bullets); `json` stays fenced |
 | `/diff [git-range \| file]` | `[ok] …` (errors: `[!] …`) |
-| `/todos` | board as-is (`┌` header, `└` close); empty: `[todos] no open todos` |
-| `/sleep list` | `[wake] …` |
+| `/todos` | markdown board, unfenced (`**todos · N open**` + `- ` bullets); empty: `[todos] no open todos` |
+| `/sleep list` | markdown list, unfenced (`**[wake] N pending wakes (of M total)**` + bullets) |
 | `/sleep cancel` | `[ok] …` / `[!] …` |
-| `/tasks list` | `[tasks] …` |
+| `/tasks list` | markdown list, unfenced (`**[tasks] N pending tasks (of M total)**` + bullets) |
 | `/tasks add` | `[ok] …` / `[!] …` |
 | `/tasks reschedule` | `[ok] …` / `[!] …` |
 | `/tasks cancel` | `[ok] …` / `[!] …` |
@@ -232,20 +234,26 @@ Reads pi's session store (`~/.pi/agent/sessions/*/*.jsonl`), sums assistant
 deltas, missing and zero-usage entries skipped; a torn last line tolerated),
 and prices it at the OpenRouter list rates in
 `/home/monky/scripts/pi-token-cost.py` (prompt 0.42/1M, completion 3.00/1M,
-cacheRead 0.085/1M). One compact line, no emoji:
+cacheRead 0.085/1M). The reply is a markdown list - unfenced, no width
+budget (Andryo 2026-10-18):
 
 ```
-[usage] session   2026-09-10        | 341 turns | in 8.2M | out 61K | cacheRead 0 | est $4.13
-[usage] lifetime  2026-08-01..now   | 9,296 turns | in 627.6M | out 6.4M | est $284.39
+**usage · session**
+
+- span: 2026-09-10
+- turns: 341
+- in: 8.2M
+- out: 61K
+- cached: 0 (0%)
+- est: $4.13
 ```
 
-`cacheRead` is shown on the session line as-is (0 on our vLLM); the lifetime
-line shows it only when nonzero.
+`cached` is the share of the TOTAL prompt (new + cached) served from
+cache - 0% on our vLLM; it is always shown, even at zero.
 
 `/usage last` reports the most recent completed run (recorded on
-`agent_end`, assistant `usage` summed over the run's messages): same line
-shape, label `last run`, completion time (HH:MM:SS) in the date field. It
-is in-memory — a bridge restart clears it. Before any run completes it
+`agent_end`, assistant `usage` summed over the run's messages): same list,
+label `last run`, completion time (HH:MM:SS) as the span. It is in-memory — a bridge restart clears it. Before any run completes it
 answers `[!] no completed run yet (run one first)`. The same numbers
 land as the trailing line of the done/failed run frame (see below).
 
@@ -360,21 +368,20 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 
 In-flight via the process table (the `pi-bg` wrapper process exists only
 while a run is live); recent history from the `~/.pi-bg-art` artifacts each
-run leaves. v3 frame layout (2026-09-16): in-flight rows carry id + profile
-+ age, the task on `│ `-gutter continuation lines; recent rows are
-state-first (`ok` / `wb-fail` / `killed` / `lost`), age, then id - all rows
-stay under the 40-col budget:
+run leaves. Markdown list layout (2026-10-18): in-flight bullets carry
+id + profile + age + the full task text; recent bullets are
+state-first (raw states `done` / `webhook-failed` / `killed` / `lost`),
+age, then id - no fence, no width budget:
 
 ```
-┌ jobs · 1 in flight
-┣ 20260910-135501-48211 worker · 04:12
-│ bulk refactor of channel/
-└
+**jobs · 1 in flight**
 
-┌ recent (newest first) · 2
-├ ok · 12m · 20260910-135501-48211
-├ wb-fail · 54m · 20260910-131200-77319
-└
+- 20260910-135501-48211 worker · 04:12 · bulk refactor of channel/
+
+**recent (newest first) · 2**
+
+- done · 12m · 20260910-135501-48211
+- webhook-failed · 54m · 20260910-131200-77319
 ```
 
 The `json` format keeps the raw machine-readable object (states un-compressed,
@@ -384,7 +391,8 @@ plus the success-path webhook HTTP code when recorded).
 `jarate-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
 and the tail file is owned by the dispatch user. Output is fenced; tail
 shows the last N lines (default 40, cap 200), notes dropped lines
-(`[..] 60 earlier lines`), and hard-wraps lines to the 40-col budget.
+(`[..] 60 earlier lines`); lines ship raw - no 40-col hard wrap
+(2026-10-18).
 
 Companion bins (installed like `jarate-bg`): `jarate-bg-tail <id> [lines] [-f]`
 reads a run's live output; `jarate-bg-kill <id> [--dry-run]` cancels a run via
@@ -494,7 +502,8 @@ process dies).
 
 Owner only. Lists the agent's scheduled prompt tasks — one-shot reminders
 (`minutes` or ISO time) and recurring cron prompts — as id, channel,
-schedule, next fire, countdown and prompt excerpt. `/tasks add` schedules a
+schedule, next fire, countdown and the full prompt (no clip -
+2026-10-18). `/tasks add` schedules a
 task in THIS session (same store and fire path as the `task` tool); a
 cron spec may take an IANA timezone as its 6th token. `/tasks reschedule`
 validates the id against this session's tasks, replaces the schedule and

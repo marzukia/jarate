@@ -11,7 +11,6 @@ import {
   serializeEmbeds,
   styleGuard,
   unnestCodeBlocksFromLists,
-  wrapFenceLines,
 } from "./format";
 import type { DiscordEmbed } from "./types";
 
@@ -314,111 +313,40 @@ describe("collapseFenceTrailingBlankLines", () => {
   });
 });
 
-// ─── wrapFenceLines (STYLE.md 2.3, 40-col budget) ───────────────────────────
+// ─── fence width: NO 40-col wrap (Andryo 2026-10-18) ───────────────────────
+// The width budget is scoped to the in-turn tool-call frames (index.ts).
+// Fence CONTENT (machine output, raw logs, code) ships verbatim; Discord
+// wraps monospace lines natively.
 
-describe("wrapFenceLines", () => {
-  test("43-col frame line wraps to <=40 with pipe gutter continuation", () => {
-    const line43 = "├ frank : active, 418a56c2, restarted 17:43";
-    expect(line43.length).toBe(43);
-    // frames ship UNtagged (fence() = bare ```); tagged = code, not wrapped
-    const input = `\`\`\`\n${line43}\n└\n\`\`\``;
-    expect(wrapFenceLines(input)).toBe(
-      "```\n├ frank : active, 418a56c2, restarted\n│ 17:43\n└\n```",
-    );
+describe("fence width: no 40-col wrap (2026-10-18)", () => {
+  test("long untagged fence lines ship verbatim (mdToDiscord end-to-end)", () => {
+    const line =
+      "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiii";
+    expect(line.length).toBe(92);
+    const input = `\`\`\`\n${line}\n\`\`\``;
+    expect(mdToDiscord(input)).toBe(input);
   });
 
-  test("continuation gutter: ├/┣/│ rows keep the pipe, ┌/└/plain get 2 spaces", () => {
-    const mk = (l: string) => `\`\`\`\n${l}\n└\n\`\`\``;
-    for (const lead of ["├ x : ", "┣ x : ", "│ ├ "]) {
-      const out = wrapFenceLines(mk(lead + "y".repeat(50))).split("\n");
-      // first continuation line (out[2]) must carry the pipe gutter
-      expect(out[2].startsWith("│ ")).toBe(true);
-      expect(out[2].length).toBeLessThanOrEqual(40);
-    }
-    for (const lead of ["┌ x : ", "└ x : ", "plain "]) {
-      const out = wrapFenceLines(mk(lead + "y".repeat(50))).split("\n");
-      expect(out[2].startsWith("  ")).toBe(true);
-      expect(out[2].startsWith("│ ")).toBe(false);
-    }
-  });
-
-  test("language-tagged fences (code) are never wrapped", () => {
-    // 2026-09-15 incident: a 54-col python snippet got frame-style wrapping
-    // (mangled indentation) + mid-identifier client splits on mobile.
-    const py = "        cached_tokens=num_cached_tokens,"; // 38 cols, one 30-char token
-    const input = `\`\`\`python\ndef f(\n    enable_prompt_tokens_details: bool, ...):\n    if not enable_prompt_tokens_details:\n${py}\n\`\`\``;
-    expect(
-      input.split("\n").filter((l) => l.length > 40).length,
-    ).toBeGreaterThan(0);
-    expect(wrapFenceLines(input)).toBe(input);
-  });
-
-  test("fence lines at or under 40 are untouched", () => {
-    const line40 = `┌ ok · ${"1".repeat(33)}`;
-    expect(line40.length).toBe(40);
-    const input = `\`\`\`\n${line40}\nshort\n\`\`\``;
-    expect(wrapFenceLines(input)).toBe(input);
-  });
-
-  test("prose outside fences is never wrapped", () => {
+  test("prose outside fences is untouched; no fence line is split", () => {
     const prose =
       "this is a plain prose line that is definitely longer than 40";
     expect(prose.length).toBeGreaterThan(40);
     const input = `${prose}\n\`\`\`\n${prose}\n\`\`\`\n${prose}`;
-    expect(wrapFenceLines(input)).toBe(
-      prose +
-        "\n```\n" +
-        "this is a plain prose line that is\n" +
-        "  definitely longer than 40\n" +
-        "```\n" +
-        prose,
-    );
+    expect(mdToDiscord(input)).toBe(input);
   });
 
-  test("unbreakable word hard-breaks at the budget", () => {
-    const word = "x".repeat(50);
+  test("language-tagged fences (code) are verbatim", () => {
+    // 2026-09-15 incident: a 54-col python snippet got frame-style wrapping
+    // (mangled indentation) + mid-identifier client splits on mobile.
+    const py = "        cached_tokens=num_cached_tokens,"; // 38 cols, one 30-char token
+    const input = `\`\`\`python\ndef f(\n    enable_prompt_tokens_details: bool, ...):\n    if not enable_prompt_tokens_details:\n${py}\n\`\`\``;
+    expect(mdToDiscord(input)).toBe(input);
+  });
+
+  test("unbreakable long word in a fence ships on one line", () => {
+    const word = "x".repeat(120);
     const input = `\`\`\`\n${word}\n\`\`\``;
-    const lines = wrapFenceLines(input).split("\n");
-    expect(lines).toEqual([
-      "```",
-      "x".repeat(40),
-      `  ${"x".repeat(10)}`,
-      "```",
-    ]);
-  });
-
-  test("multi-wrap: a 92-col line takes three fence lines, all <= 40", () => {
-    const line =
-      "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiii";
-    expect(line.length).toBe(92);
-    const lines = wrapFenceLines(`\`\`\`\n${line}\n\`\`\``).split("\n");
-    expect(lines[0]).toBe("```");
-    expect(lines.at(-1)).toBe("```");
-    const body = lines.slice(1, -1);
-    expect(body).toEqual([
-      "aaaaaaaaaa bbbbbbbbbb cccccccccc",
-      "  dddddddddd eeeeeeeeee ffffffffff",
-      "  gggggggggg hhhhhhhhhh iiii",
-    ]);
-    for (const l of body) expect(l.length).toBeLessThanOrEqual(40);
-    // no chars lost: unwrapping (drop indent + join) gives the original
-    expect(body.map((l, i) => (i === 0 ? l : l.slice(2))).join(" ")).toBe(line);
-  });
-
-  test("mdToDiscord end-to-end: long fence line wraps, prose survives", () => {
-    const prose =
-      "a prose sentence that runs well past the forty col budget now";
-    const md = `\`\`\`\n├ frank : active, 418a56c2, restarted 17:43\n\`\`\`\n\n${prose}`;
-    const out = mdToDiscord(md).split("\n");
-    // prose line intact, single line, still over 40 (Discord wraps it)
-    expect(out).toContain(prose);
-    for (const l of out.slice(1, out.length - 2))
-      expect(l.length).toBeLessThanOrEqual(40);
-  });
-
-  test("idempotent: an already-wrapped fence is unchanged", () => {
-    const input = "```\n├ frank : active, 418a56c2, restarted\n  17:43\n└\n```";
-    expect(wrapFenceLines(input)).toBe(input);
+    expect(mdToDiscord(input)).toBe(input);
   });
 });
 
@@ -579,21 +507,16 @@ describe("styleGuard", () => {
     expect(styleGuard(frame)).toBe(frame);
   });
 
-  test("tagged fence: >40-col body stays VERBATIM (A2 wraps only UNTAGGED)", () => {
-    // Language-tagged fences pass through untouched: wrapFenceLine's
-    // continuation indent would break code semantics (same rule as
-    // wrapFenceLines). Regression pin for the A2 sweep: the >40 wrap
-    // applies to UNTAGGED existing fences, never to tagged ones.
+  test("existing fences: >40-col body stays VERBATIM (no width wrap)", () => {
+    // No width budget anywhere (Andryo 2026-10-18): tagged AND untagged
+    // existing fences pass through untouched.
     const codeLine =
       "def f(enable_prompt_tokens_details: bool, cached_tokens: int) -> bool:";
     expect(codeLine.length).toBeGreaterThan(40);
     const tagged = `\`\`\`python\n${codeLine}\n\`\`\``;
     expect(styleGuard(tagged)).toBe(tagged);
-    // contrast: the same >40 line in an UNTAGGED fence wraps to the budget
-    const untagged = styleGuard(`\`\`\`\n${codeLine}\n\`\`\``);
-    expect(untagged).not.toBe(`\`\`\`\n${codeLine}\n\`\`\``);
-    for (const l of untagged.split("\n").slice(1, -1))
-      expect(l.length).toBeLessThanOrEqual(40);
+    const untagged = `\`\`\`\n${codeLine}\n\`\`\``;
+    expect(styleGuard(untagged)).toBe(untagged);
   });
 
   test("idempotent: styleGuard(styleGuard(x)) === styleGuard(x)", () => {
@@ -629,13 +552,9 @@ describe("styleGuard", () => {
       F("/home/monky/projects/jarate"),
     );
     expect(styleGuard("~/scripts/pi-bg")).toBe(F("~/scripts/pi-bg"));
-    // a >40-col path wraps to the fence budget, stays fenced
+    // a >40-col path stays fenced and ships verbatim (no width wrap)
     const longPath = "/home/monky/projects/jarate/packages/bridge";
-    const wrapped = styleGuard(longPath).split("\n");
-    expect(wrapped[0]).toBe("```");
-    expect(wrapped.at(-1)).toBe("```");
-    for (const l of wrapped.slice(1, -1))
-      expect(l.length).toBeLessThanOrEqual(40);
+    expect(styleGuard(longPath)).toBe(`\`\`\`\n${longPath}\n\`\`\``);
     expect(styleGuard("wrote /tmp/x.ts for you")).toBe(
       "wrote /tmp/x.ts for you",
     );
@@ -646,13 +565,9 @@ describe("styleGuard", () => {
       F("2026-09-23 09:22:22 ERROR boom"),
     );
     expect(styleGuard("ERROR: unit failed")).toBe(F("ERROR: unit failed"));
-    // a >40-col error line is wrapped to the fence budget (STYLE.md 2.3)
+    // a >40-col error line ships fenced, verbatim (no width wrap)
     const longErr = "ERROR: Failed to start transient timer unit";
-    const wrapped = styleGuard(longErr).split("\n");
-    expect(wrapped[0]).toBe("```");
-    expect(wrapped.at(-1)).toBe("```");
-    for (const l of wrapped.slice(1, -1))
-      expect(l.length).toBeLessThanOrEqual(40);
+    expect(styleGuard(longErr)).toBe(`\`\`\`\n${longErr}\n\`\`\``);
     expect(styleGuard("Sep 23 09:22:22 host pi.service: msg")).toBe(
       F("Sep 23 09:22:22 host pi.service: msg"),
     );
@@ -678,12 +593,9 @@ describe("styleGuard", () => {
     );
   });
 
-  test("fenced lines kept to the 40-col budget", () => {
+  test("fenced lines ship verbatim (no 40-col budget)", () => {
     const long = `├ ${"a".repeat(60)}`;
-    const out = styleGuard(long).split("\n");
-    expect(out[0]).toBe("```");
-    expect(out.at(-1)).toBe("```");
-    for (const l of out.slice(1, -1)) expect(l.length).toBeLessThanOrEqual(40);
+    expect(styleGuard(long)).toBe(`\`\`\`\n${long}\n\`\`\``);
   });
 
   test("unclosed existing fence -> left alone (conservative)", () => {

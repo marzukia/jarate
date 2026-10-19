@@ -4,9 +4,11 @@
  * Runs the real bash script against a fake HOME with stubbed curl /
  * systemctl / journalctl. C1: the webhook heartbeat line is state-aware
  * ("[ok] healthy" / "[!] not healthy" - the failure path used to read
- * "[!] healthy", a lie). C8: a long token (URL) in the in-flight note is
- * chunked into 30-col pieces before word-wrap, so every frame line stays
- * inside the 40-col mobile budget with content preserved.
+ * "[!] healthy", a lie). The heartbeat is a markdown list (STYLE.md v4
+ * 2.3, PR #242 review F1) - same shape as the bridge restart-wake: tag
+ * line, bold header, plain bullets. In-flight note lines ship as raw
+ * bullets: no frame, no wrap, no width budget; a long token (URL) ships
+ * verbatim.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -187,11 +189,12 @@ describe("pi-postcheck C1: state-aware wording", () => {
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
       const hb = webhookPost(f).content;
-      expect(hb).toContain("[bg: pi-restart]");
-      expect(hb).toContain("└ [ok] healthy 90s after restart");
-      // the frame sits inside a code fence (STYLE.md 4.4)
-      expect(hb.split("\n")[1]).toBe("```");
-      expect(hb.endsWith("\n```")).toBe(true);
+      // markdown list, same shape as the bridge restart-wake (STYLE.md
+      // v4 2.3): tag line, bold header, blank line, bullets - no fence,
+      // no frame characters.
+      expect(hb).toBe(
+        "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [ok] healthy 90s after restart",
+      );
     } finally {
       f.setInflight(null);
     }
@@ -211,7 +214,7 @@ describe("pi-postcheck C1: state-aware wording", () => {
         "`[!] pi.service not active after restart`",
       );
       const hb = webhookPost(f).content;
-      expect(hb).toContain("└ [!] not healthy 90s after restart");
+      expect(hb).toContain("- [!] not healthy 90s after restart");
       expect(hb).not.toContain("[!] healthy");
     } finally {
       f.setInflight(null);
@@ -236,7 +239,7 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(ch).toContain("Main process exited, code=killed, status=1/SEGV");
       expect(ch).not.toContain("second failed line"); // head -1 only
       expect(webhookPost(f).content).toContain(
-        "└ [!] not healthy 90s after restart",
+        "- [!] not healthy 90s after restart",
       );
     } finally {
       f.setInflight(null);
@@ -274,7 +277,7 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
       expect(webhookPost(f).content).toContain(
-        "└ [ok] healthy 90s after restart",
+        "- [ok] healthy 90s after restart",
       );
       expect(webhookPost(f).content).not.toContain("systemd error");
     } finally {
@@ -298,7 +301,7 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
       expect(ch).toContain(REAL);
       expect(ch).not.toContain(SUMMARY); // the 0-failed summary is filtered
       expect(webhookPost(f).content).toContain(
-        "└ [!] not healthy 90s after restart",
+        "- [!] not healthy 90s after restart",
       );
     } finally {
       f.setInflight(null);
@@ -317,7 +320,7 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
  */
 describe("pi-postcheck: missing settings / no bot token branches", () => {
   const DEGRADED =
-    "[bg: pi-restart]\n```\n┌ pi restart heartbeat\n└ [!] not healthy 90s after restart\n```";
+    "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [!] not healthy 90s after restart";
 
   test("settings.json missing: exit 0, no channel post, degraded frame, no systemd probes", async () => {
     const f = fixture();
@@ -367,56 +370,47 @@ describe("pi-postcheck: missing settings / no bot token branches", () => {
   });
 });
 
-describe("pi-postcheck C8: long tokens chunked inside the frame", () => {
-  test("80-char URL in the in-flight note: all lines <= 40, content preserved", async () => {
+describe("pi-postcheck in-flight note: raw markdown bullets (STYLE.md v4 2.3)", () => {
+  test("80-char URL in the in-flight note: ships verbatim, no wrap, no fence", async () => {
     const f = fixture();
     fs.writeFileSync(
       path.join(f.home, ".config", "pi-dispatch", "webhook"),
       "http://127.0.0.1:1/hook\n",
     );
     const url = `https://webdrop.example/file/${"a".repeat(60)}.png`;
+    // the old 30-col budget would have chunked this
     expect(url.length).toBeGreaterThan(40);
     f.setInflight(url);
     try {
       const r = await f.run();
       expect(r.code).toBe(0);
       const hb = webhookPost(f).content;
-      for (const line of hb.split("\n")) {
-        expect(line.length).toBeLessThanOrEqual(40);
-      }
-      // note rows are the lines after "├ in-flight:" up to the close fence
-      const rows = hb
-        .split("\n")
-        .slice(hb.split("\n").indexOf("├ in-flight:") + 1)
-        .filter((l) => l.startsWith("│ ") || l.startsWith("└ "));
-      expect(rows.length).toBeGreaterThan(1); // really chunked
-      const joined = rows.map((l) => l.slice(2)).join("");
-      expect(joined).toBe(url); // no content lost
+      // no fence, no frame characters
+      expect(hb).not.toContain("```");
+      expect(hb).not.toMatch(/[┌└│├┤┣]/);
+      // the note line is ONE raw bullet - content preserved, unchunked
+      expect(hb).toContain("- in-flight:");
+      expect(hb).toContain(`- ${url}`);
       // the healthy row is intact above the note
-      expect(hb).toContain("├ [ok] healthy 90s after restart");
-      expect(hb).toContain("├ in-flight:");
+      expect(hb).toContain("- [ok] healthy 90s after restart");
     } finally {
       f.setInflight(null);
     }
   });
 
-  test("short in-flight note: plain word wrap, unchanged behavior", async () => {
+  test("multi-line note: each line its own bullet, blank lines dropped", async () => {
     const f = fixture();
     fs.writeFileSync(
       path.join(f.home, ".config", "pi-dispatch", "webhook"),
       "http://127.0.0.1:1/hook\n",
     );
-    f.setInflight("fix the pi restart loop");
+    f.setInflight("fix the pi restart loop\n\nthen redeploy");
     try {
       const r = await f.run();
       expect(r.code).toBe(0);
-      const hb = webhookPost(f).content;
-      for (const line of hb.split("\n")) {
-        expect(line.length).toBeLessThanOrEqual(40);
-      }
-      expect(hb).toContain("├ in-flight:");
-      // short single-line note ends the frame
-      expect(hb).toContain("└ fix the pi restart loop");
+      expect(webhookPost(f).content).toBe(
+        "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [ok] healthy 90s after restart\n- in-flight:\n- fix the pi restart loop\n- then redeploy",
+      );
     } finally {
       f.setInflight(null);
     }

@@ -103,13 +103,7 @@ import extension, {
 import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
-import {
-  fit,
-  loadBoard,
-  renderBoard,
-  renderBoardPlain,
-  saveBoard,
-} from "./todos";
+import { fit, loadBoard, renderBoard, saveBoard } from "./todos";
 import {
   type ChannelMessage,
   loadChannelConfig,
@@ -118,10 +112,10 @@ import {
 import { performUndo } from "./undo";
 import { clearWorktreeState } from "./worktree";
 
-/** A2 (polish sweep): styleGuard now wraps untagged fence bodies to the
- *  40-col budget (word boundaries, 2-space continuation indent). These
- *  assertions predate the wrap; collapse wrap-newlines back to a single
- *  space on the RECEIVED side before matching. */
+/** A2 (polish sweep, 2026-09-15) + 2026-10-18: styleGuard once wrapped
+ *  untagged fence bodies to the 40-col budget; the wrap is GONE (no width
+ *  budget on fences anymore), so this collapse is a no-op kept for the
+ *  historical assertions that use it. */
 const unwarped = (s: string) => s.replace(/\n +/g, " ");
 
 /** F2 (test-fidelity audit): the interaction network contract — the ONLY
@@ -3456,7 +3450,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       )
       .map((c) => JSON.parse(c.body).content);
     // agent_end posts go through mdToDiscord: the bare [!] warning line is
-    // guarded (fenced + wrapped to the 40-col budget)
+    // guarded (fenced; no 40-col wrap since 2026-10-18)
     expect(
       contents.filter((t) => t === styleGuard(REPEAT_WARNING)).length,
     ).toBe(1);
@@ -5140,8 +5134,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
 
   test("raw command lines pass the same styleGuard sweep as text replies (#169)", async () => {
     // /usage last with no completed run returns a bare [!] line (no fence
-    // in the command) — the interaction edit must carry it fenced +
-    // 40-col, exactly like the text path (STYLE.md 2.7).
+    // in the command) — the interaction edit must carry it fenced,
+    // exactly like the text path (STYLE.md 2.7).
     const raw = "[!] no completed run yet (run one first)";
     const saved = (lastRunUsage as { value: any }).value;
     (lastRunUsage as { value: any }).value = null;
@@ -5276,8 +5270,8 @@ describe("buildInteractionHandler: registered slash commands route to their disp
         options: [{ type: 3, name: "source", value: "two words" }],
       }) as any,
     );
-    // styleGuard wraps at 40 cols: assert a wrap-safe substring of the
-    // usage line (only resolveDiffSource's null path emits it).
+    // assert a substring of the usage line (only resolveDiffSource's null
+    // path emits it); fence bodies ship verbatim - no 40-col wrap.
     expect(deferredTexts().at(-1)).toContain("usage: /diff [git-range");
   });
 
@@ -6285,14 +6279,12 @@ describe("todo board (integration)", () => {
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
     const content = replyContent();
     expect(content).toBe(
-      fence(
-        renderBoardPlain([
-          { content: "fix bug", status: "in_progress" },
-          { content: "tests", status: "pending" },
-        ]),
-      ),
+      renderBoard([
+        { content: "fix bug", status: "in_progress" },
+        { content: "tests", status: "pending" },
+      ]),
     );
-    expect(content).toContain("┌ todos · 2 open");
+    expect(content).toContain("**todos · 2 open**");
   });
 
   test("/todos with an empty board says 'no open todos'", async () => {
@@ -6324,7 +6316,7 @@ describe("todo board (integration)", () => {
       tmp,
     );
     await handleInbound(pi, inbound("/todos", "m1"), ctx); // fromId "uid" ≠ owner1
-    expect(replyContent()).toContain("├ x");
+    expect(replyContent()).toContain("- x");
   });
 
   test("/todos all prints every channel's board", async () => {
@@ -6345,20 +6337,18 @@ describe("todo board (integration)", () => {
       tmp,
     );
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    // strip the code fence (machine frames are fenced) before block checks
-    const content = replyContent()
-      .replace(/^```\n/, "")
-      .replace(/\n```$/, "");
-    expect(content).toContain("┌ Test · 1 open");
-    expect(content).toContain("├ a");
-    expect(content).toContain("┌ ch2 · 0 open");
-    expect(content).toContain("├ b");
-    // each board block is framed: opens with ┌, closes with └
-    expect(content.split("\n\n").length).toBe(2);
-    for (const block of content.split("\n\n")) {
-      expect(block.startsWith("┌ ")).toBe(true);
-      expect(block.trimEnd().endsWith("└")).toBe(true);
-    }
+    const content = replyContent();
+    expect(content).toContain("**Test · 1 open**");
+    expect(content).toContain("- a");
+    expect(content).toContain("**ch2 · 0 open**");
+    expect(content).toContain("- ~~b~~");
+    // each board = bold header line, blank line, bullet list
+    const blocks = content.split("\n\n");
+    expect(blocks.length).toBe(4);
+    expect(blocks[0].startsWith("**")).toBe(true);
+    expect(blocks[2].startsWith("**")).toBe(true);
+    expect(blocks[1].startsWith("- ")).toBe(true);
+    expect(blocks[3].startsWith("- ")).toBe(true);
   });
 
   test("/todos all with no boards says 'no open todos'", async () => {
@@ -6366,7 +6356,7 @@ describe("todo board (integration)", () => {
     expect(replyContent()).toBe(fence("[todos] no open todos"));
   });
 
-  test("/todos all clips a long channel name to the 40-col budget", async () => {
+  test("/todos all ships the full channel name - no 40-col clip (2026-10-18)", async () => {
     const longName = "a".repeat(90);
     fs.writeFileSync(
       path.join(tmp, ".pi", "settings.json"),
@@ -6393,13 +6383,11 @@ describe("todo board (integration)", () => {
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
     const header = replyContent()
       .split("\n")
-      .find((l) => l.startsWith("┌ "))!;
-    // display width strips nothing here (no markdown in the header):
-    // raw length is the display length
-    expect(header.length).toBeLessThanOrEqual(40);
-    expect(header.startsWith("┌ ")).toBe(true);
-    expect(header.endsWith(" · 1 open")).toBe(true);
-    expect(header).toContain("…"); // clipped
+      .find((l) => l.startsWith("**"))!;
+    // no width budget: the full channel name ships, however long
+    expect(header).toBe(`**${longName} · 1 open**`);
+    expect(header.length).toBeGreaterThan(40);
+    expect(header).not.toContain("…");
   });
 
   test("context injection: non-empty board appended after channel-ctx", async () => {
@@ -6414,7 +6402,7 @@ describe("todo board (integration)", () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     const content = sent.at(-1)!.m.content;
     expect(content).toContain("</channel-ctx>");
-    expect(content).toContain("<todo-board>\n┣ **fix bug**\n</todo-board>");
+    expect(content).toContain("<todo-board>\n- **fix bug**\n</todo-board>");
     expect(content.indexOf("</channel-ctx>")).toBeLessThan(
       content.indexOf("<todo-board>"),
     );
@@ -6455,7 +6443,7 @@ describe("todo board (integration)", () => {
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
     expect(posts.length).toBe(1);
-    expect(JSON.parse(posts[0].body).content).toContain("┌ todos · 2 open");
+    expect(JSON.parse(posts[0].body).content).toContain("**todos · 2 open**");
 
     // 2) second call: edits the SAME message, no new post
     const r2 = await t.execute(
@@ -6470,7 +6458,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r2.content[0].text).toContain("├ ~~a~~");
+    expect(r2.content[0].text).toContain("- ~~a~~");
     posts = fetchCalls.filter(
       (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
     );
@@ -6480,8 +6468,8 @@ describe("todo board (integration)", () => {
         c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/out1"),
     );
     expect(patch).toBeDefined();
-    expect(JSON.parse(patch!.body).content).toContain("├ ~~a~~");
-    expect(JSON.parse(patch!.body).content).toContain("┌ todos · 1 open");
+    expect(JSON.parse(patch!.body).content).toContain("- ~~a~~");
+    expect(JSON.parse(patch!.body).content).toContain("**todos · 1 open**");
 
     // 3) empty list: deletes the board message, clears the state
     const r3 = await t.execute("3", { todos: [] }, undefined, undefined, ctx);
@@ -6530,7 +6518,7 @@ describe("todo board (integration)", () => {
       undefined,
       ctx,
     );
-    expect(r.content[0].text).toContain("├ ~~a~~");
+    expect(r.content[0].text).toContain("- ~~a~~");
     // state still updated; id kept so the next sync retries the edit
     const board = loadBoard("ch1", tmp);
     expect(board?.todos[0].status).toBe("completed");
@@ -6581,8 +6569,8 @@ describe("todo board (integration)", () => {
         c.method === "PATCH" && c.url.endsWith("/channels/ch1/messages/board1"),
     );
     expect(patch).toBeDefined();
-    expect(JSON.parse(patch!.body).content).toContain("├ follow up on X");
-    expect(JSON.parse(patch!.body).content).toContain("┣ **alpha**");
+    expect(JSON.parse(patch!.body).content).toContain("- follow up on X");
+    expect(JSON.parse(patch!.body).content).toContain("- **alpha**");
     // the callback still woke the agent (run forwarded to pi)
     expect(sent.length).toBeGreaterThan(0);
 
@@ -6713,7 +6701,7 @@ describe("sleep (integration)", () => {
     });
     await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
     const content = replyContent();
-    expect(content).toContain("1 pending wake (of 1 total):");
+    expect(content).toContain("**[wake] 1 pending wake (of 1 total)**");
     expect(content).toContain(w.id);
     expect(content).toContain("Test");
     expect(content).toContain(new Date(w.wakeAt).toISOString());
@@ -6841,7 +6829,7 @@ describe("sleep (integration)", () => {
     markClaimed(c.id, Date.now(), tmp);
     await handleInbound(pi, inbound("/sleep list", "m1"), ctx);
     const content = replyContent();
-    expect(content).toContain("1 pending wake (of 2 total):");
+    expect(content).toContain("**[wake] 1 pending wake (of 2 total)**");
     expect(content).toContain(p.id);
     expect(content).toContain(c.id);
   });
@@ -7037,33 +7025,91 @@ describe("tasks (integration)", () => {
     expect(replyContent()).toBe(fence("[tasks] no scheduled tasks"));
   });
 
-  test("fence rule: every command reply ships in a code block (operator 2026-09-16)", async () => {
-    const cmds = [
+  test("fence rule: machine replies fenced; summaries are markdown (2026-09-16 + 2026-10-18)", async () => {
+    // /command replies ship in a code block (operator 2026-09-16) - still
+    // true for machine one-liners, /help, and add/cancel results.
+    const fencedCmds = [
       "/help",
-      "/jobs",
-      "/todos",
-      "/tasks",
       "/tasks add",
       "/tasks reschedule",
       "/tasks cancel",
-      "/sleep",
       "/sleep cancel",
       "/model",
     ];
-    for (let i = 0; i < cmds.length; i++) {
-      await handleInbound(pi, inbound(cmds[i], `m${i}`), ctx);
+    for (let i = 0; i < fencedCmds.length; i++) {
+      await handleInbound(pi, inbound(fencedCmds[i], `m${i}`), ctx);
       const c = replyContent();
-      expect(c.startsWith("```"), `${cmds[i]} -> ${c.slice(0, 50)}`).toBe(true);
-      // A2 (polish sweep): the 40-col budget applies INSIDE the fence too
-      // (STYLE.md 2.7). Pre-fenced command output (/help, /tasks list, ...)
-      // must leave the guard already wrapped - assert every line.
-      for (const line of c.split("\n")) {
-        expect(
-          line.length <= 40,
-          `${cmds[i]} -> ${line.length} cols: ${line}`,
-        ).toBe(true);
+      expect(c.startsWith("```"), `${fencedCmds[i]} -> ${c.slice(0, 50)}`).toBe(
+        true,
+      );
+    }
+    // Summary lists (Andryo 2026-10-18): normal markdown - no fence, no
+    // box characters, no width budget. Empty-state one-liners stay fenced.
+    const summaryCmds = ["/jobs", "/todos", "/tasks", "/sleep"];
+    for (let i = 0; i < summaryCmds.length; i++) {
+      await handleInbound(pi, inbound(summaryCmds[i], `s${i}`), ctx);
+      const c = replyContent();
+      if (c.startsWith("```")) {
+        const body = c.replace(/^```\n/, "").replace(/\n```$/, "");
+        expect(body).not.toContain("\n"); // empty/error one-liner
+      } else {
+        expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
       }
     }
+    // /context + /usage (PR #242 review F4): §2.3 summaries too. With a
+    // session file present the success path ships unfenced markdown;
+    // with none, the error path is a fenced one-liner.
+    const sessions = path.join(tmp, ".pi", "agent", "sessions", "2026-09-10");
+    fs.mkdirSync(sessions, { recursive: true });
+    const sessFile = path.join(
+      sessions,
+      "2026-09-10T08-00-00-000Z_00000000-0000-0000-0000-000000000001.jsonl",
+    );
+    fs.writeFileSync(
+      sessFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "sess",
+          timestamp: "2026-09-10T08:00:00.000Z",
+          cwd: "/cwd",
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "cm1",
+          parentId: "p-cm1",
+          timestamp: "2026-09-10T08:00:01.000Z",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "do the thing" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "am1",
+          parentId: "cm1",
+          timestamp: "2026-09-10T08:00:02.000Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+          },
+        }),
+        "", // trailing blank: join gives the final newline
+      ].join("\n"),
+    );
+    await handleInbound(pi, inbound("/context", "cx1"), ctx);
+    let c = replyContent();
+    expect(c.startsWith("```")).toBe(false); // success = unfenced markdown
+    expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
+    await handleInbound(pi, inbound("/usage", "us1"), ctx);
+    c = replyContent();
+    expect(c.startsWith("```")).toBe(false);
+    expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
+    // error path (no session file): fenced one-liner
+    fs.rmSync(sessFile);
+    await handleInbound(pi, inbound("/context", "cx2"), ctx);
+    expect(replyContent()).toBe(fence("[!] no session file found"));
   });
 
   test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {
@@ -7092,7 +7138,7 @@ describe("tasks (integration)", () => {
     });
     await handleInbound(pi, inbound("/tasks list", "m1"), ctx);
     const content = unwarped(replyContent());
-    expect(content).toContain("2 pending tasks (of 2 total):");
+    expect(content).toContain("**[tasks] 2 pending tasks (of 2 total)**");
     expect(content).toContain(one.id);
     expect(content).toContain("check the build");
     expect(content).toContain("in 2h");
@@ -7425,7 +7471,7 @@ describe("tasks (integration)", () => {
     );
     await handleInbound(pi, inbound("/tasks list", "m3"), ctx);
     const content = replyContent();
-    expect(content).toContain("1 pending task (of 1 total):");
+    expect(content).toContain("**[tasks] 1 pending task (of 1 total)**");
     expect(content).toContain(t.id);
     expect(content).toContain("check the build");
     expect(content).toContain(iso);
@@ -7946,8 +7992,8 @@ describe("handoff mechanism B (size-gated restart)", () => {
     // - real ps/board are environment-dependent), not doc-scraped prose.
     setLiveKickoffStateHookForTest(() => ({
       dispatchText:
-        "┌ jobs · 1 in flight\n┣ 20261003-081922-478435 worker · 01:07:43\n└",
-      todoBoard: "┌ todos · 1 open\n├ ship it\n└",
+        "**jobs · 1 in flight**\n\n- 20261003-081922-478435 worker · 01:07:43",
+      todoBoard: "**todos · 1 open**\n\n- ship it",
     }));
 
     try {
@@ -9943,11 +9989,12 @@ describe("wave 2c bridge commands", () => {
     await handleInbound(pi, inbound("/usage last", "m3"), ctx);
     const last = posts().find((t) => t.includes("usage · last run"));
     expect(last).toBeDefined();
-    expect(last).toContain("├ in     : 1K");
-    expect(last).toContain("├ out    : 100");
-    expect(last).toContain("└ est    : $0.00");
-    // fenced frame, like the rest of the /usage family (2026-09-16 restyle)
-    expect(last!.startsWith("```")).toBe(true);
+    expect(last).toContain("- in: 1K");
+    expect(last).toContain("- out: 100");
+    expect(last).toContain("- est: $0.00");
+    // markdown list, unfenced (Andryo 2026-10-18): summaries are normal
+    // Discord markdown, no code fence, no width budget
+    expect(last!.startsWith("```")).toBe(false);
   });
 
   test("/jobs kill + tail: owner-only wrappers around pi-bg-kill/-tail (#44)", async () => {
@@ -10015,9 +10062,9 @@ describe("wave 2c bridge commands", () => {
       expect(
         posts().filter((t) => t.includes("usage: /jobs tail")).length,
       ).toBe(2);
-      // bare /jobs: v3 frame view (2026-09-16)
+      // bare /jobs: markdown list view (2026-10-18)
       await handleInbound(pi, inbound("/jobs", "m8"), ctx);
-      expect(posts().some((t) => t.includes("┌ jobs"))).toBe(true);
+      expect(posts().some((t) => t.includes("**jobs"))).toBe(true);
     } finally {
       process.env.HOME = oldHome;
     }

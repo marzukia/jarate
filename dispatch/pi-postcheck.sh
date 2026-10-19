@@ -4,8 +4,9 @@
 #    code-formatted per STYLE.md 4.4)
 # 2) posts a heartbeat to the pi-dispatch Discord WEBHOOK, content tagged
 #    "[bg: pi-restart]" (isBgWebhook exemption in the bridge - without the
-#    tag the other-bot filter swallows it) and rendered as a STYLE.md box
-#    frame. The webhook post is polled back as a turn and wakes the agent.
+#    tag the other-bot filter swallows it) and rendered as a markdown list
+#    (STYLE.md v4 2.3: summaries are markdown lists - no frame, no width
+#    budget). The webhook post is polled back as a turn and wakes the agent.
 # Portable across agent boxes: channel id + bot token come from the LOCAL
 # ~/.pi/agent/settings.json default channel; all paths are $HOME-relative.
 # Canonical home: dispatch/pi-postcheck.sh (install.sh links it into
@@ -59,7 +60,7 @@ if [ -n "$CH_ID" ] && [ -n "${TOKEN:-}" ]; then
     -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" \
     -d "$(python3 -c "import json,sys;print(json.dumps({'content': sys.argv[1]}))" "$MSG")" > /dev/null
 fi
-# 2) heartbeat frame through the webhook bus (wakes the agent)
+# 2) heartbeat through the webhook bus (wakes the agent)
 if [ -n "$HOOK" ]; then
   # C1 (polish sweep): state-aware wording. The failure path used to read
   # "[!] healthy 90s after restart" - a lie. The channel message above
@@ -69,40 +70,19 @@ if [ -n "$HOOK" ]; then
   else
     STATUS=$(printf '%s healthy 90s after restart' "$TAG")
   fi
+  # Same shape as the bridge restart-wake (STYLE.md v4 2.3): tag line,
+  # bold header, blank line, plain bullets - no fence, no width budget.
+  # Raw note lines ship as bullets (long tokens ship verbatim); blank
+  # lines are dropped.
   if [ -n "$INFLIGHT" ]; then
-    # label on its own ├ row; note wrapped at 30 cols on word boundaries,
-    # middle rows │, last row └ (2-char frame prefix included in budget)
-    NOTE=$(printf '%s' "$INFLIGHT" | awk '{
-      line = ""
-      n = split($0, w, " ")
-      # C8 (polish sweep): chunk words longer than the 30-col line budget
-      # before wrapping. A plain word wrap only moves whole words to the
-      # next line, so a long token (URL, path) overflows the frame.
-      for (i = 1; i <= n; i++) {
-        while (length(w[i]) > 30) {
-          n++
-          w[n] = substr(w[i], 31)
-          w[i] = substr(w[i], 1, 30)
-        }
-      }
-      for (i = 1; i <= n; i++) {
-        if (length(line) == 0) line = w[i]
-        else if (length(line) + 1 + length(w[i]) <= 30) line = line " " w[i]
-        else { print line; line = w[i] }
-      }
-      if (line != "") print line
-    }')
-    NLINES=$(grep -c '' <<< "$NOTE")
     NOTEROWS=''
-    I=0
     while IFS= read -r L; do
-      I=$((I + 1))
-      if [ "$I" -eq "$NLINES" ]; then P='└'; else P='│'; fi
-      NOTEROWS="${NOTEROWS}${P} ${L}"$'\n'
-    done <<< "$NOTE"
-    HB=$(printf '[bg: pi-restart]\n%s\n┌ pi restart heartbeat\n├ %s\n├ in-flight:\n%s%s' "$F" "$STATUS" "$NOTEROWS" "$F")
+      [ -n "$L" ] || continue
+      NOTEROWS="${NOTEROWS}- ${L}"$'\n'
+    done <<< "$INFLIGHT"
+    HB=$(printf '[bg: pi-restart]\n**pi restart heartbeat**\n\n- %s\n- in-flight:\n%s' "$STATUS" "$NOTEROWS")
   else
-    HB=$(printf '[bg: pi-restart]\n%s\n┌ pi restart heartbeat\n└ %s\n%s' "$F" "$STATUS" "$F")
+    HB=$(printf '[bg: pi-restart]\n**pi restart heartbeat**\n\n- %s' "$STATUS")
   fi
   curl -s -m 10 -X POST "$HOOK" -H "Content-Type: application/json" \
     -d "$(python3 -c "import json,sys;print(json.dumps({'content': sys.argv[1]}))" "$HB")" > /dev/null

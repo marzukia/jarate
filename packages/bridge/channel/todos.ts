@@ -12,7 +12,6 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FRAME_COL_MAX } from "./frame";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -155,36 +154,35 @@ export function openCount(todos: Todo[]): number {
 }
 
 /**
- * One line per item, v3 state glyph at column 1 (mockup3, 2026-09-13):
- * ├ pending, ┣ in-progress (bold), ├ done (strikethrough), ┤ cancelled.
- * Done keeps ├ (not ┘) so the vertical pipe stays connected through
- * mid-list completed items; the frame closes on its own └ row.
- * Content is clipped so the rendered line fits the 40-col mobile budget.
+ * One line per item: a normal Discord markdown bullet (Andryo 2026-10-18:
+ * summaries are markdown lists, no frame, no width budget - text wraps
+ * natively). Status semantics without the box glyph:
+ *   pending     = plain bullet
+ *   in_progress = bold
+ *   completed   = strikethrough
+ *   cancelled   = strikethrough (markdown has no second "closed" state;
+ *                 the old ┤ glyph distinction is dropped)
+ * Content ships in FULL - no truncation.
  */
 export function todoLine(t: Todo): string {
-  const c = fit(t.content, TODO_CONTENT_MAX);
   switch (t.status) {
     case "pending":
-      return `├ ${c}`;
+      return `- ${t.content}`;
     case "in_progress":
-      return `┣ **${c}**`;
+      return `- **${t.content}**`;
     case "completed":
-      return `├ ~~${c}~~`;
+      return `- ~~${t.content}~~`;
     case "cancelled":
-      return `┤ ${c}`;
+      return `- ~~${t.content}~~`;
   }
 }
 
-/** Hard mobile budget for rendered frame lines (mockup3). */
-export const TODO_LINE_MAX = FRAME_COL_MAX;
-/** Content budget: glyph + space prefix (2) leaves 30 for the text. */
-const TODO_CONTENT_MAX = TODO_LINE_MAX - 2;
-
 /**
  * Clip to max code points, trailing ellipsis when cut. Shared end-clip
- * helper (bridge index.ts uses it too). If the cut lands between a
- * backslash and the char it escapes (escaped markdown), shift the cut
- * back one so no dangling `\` sits before the ellipsis.
+ * helper (bridge index.ts uses it for the in-turn run frame lines).
+ * If the cut lands between a backslash and the char it escapes (escaped
+ * markdown), shift the cut back one so no dangling `\` sits before the
+ * ellipsis.
  */
 export function fit(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -196,40 +194,22 @@ export function fit(s: string, max: number): string {
   return `${s.slice(0, cut)}…`;
 }
 
-export function renderBoardHeader(todos: Todo[]): string {
-  return `┌ todos · ${openCount(todos)} open`;
-}
-
-/** Full board text: header + one line per item + closing bar. */
-export function renderBoard(todos: Todo[]): string {
-  const lines = [renderBoardHeader(todos)];
-  for (const t of todos) lines.push(todoLine(t));
-  lines.push("└");
-  return lines.join("\n");
+/**
+ * Board header: a plain bold line (the old `┌ todos · N open` frame top).
+ * `title` is the channel name for /todos all; the in-channel board uses
+ * the default.
+ */
+export function renderBoardHeader(todos: Todo[], title = "todos"): string {
+  return `**${title} · ${openCount(todos)} open**`;
 }
 
 /**
- * Plain line for FENCED contexts (the /todos command ships in a code block
- * since 2026-09-16, where ** / ~~ render literally). The in-channel
- * auto-board keeps the marked-up todoLine.
+ * Full board text: bold header + blank line + one bullet per item.
+ * Normal markdown - no fence, no box characters, no width budget.
  */
-export function todoLinePlain(t: Todo): string {
-  const c = fit(t.content, TODO_CONTENT_MAX);
-  switch (t.status) {
-    case "in_progress":
-      return `┣ ${c}`;
-    case "completed":
-      return `├ ${c}`;
-    default:
-      return todoLine(t);
-  }
-}
-
-/** Plain board for fenced /todos output. */
-export function renderBoardPlain(todos: Todo[]): string {
-  const lines = [renderBoardHeader(todos)];
-  for (const t of todos) lines.push(todoLinePlain(t));
-  lines.push("└");
+export function renderBoard(todos: Todo[], title = "todos"): string {
+  const lines = [renderBoardHeader(todos, title), ""];
+  for (const t of todos) lines.push(todoLine(t));
   return lines.join("\n");
 }
 

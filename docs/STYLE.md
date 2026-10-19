@@ -1,9 +1,7 @@
-# STYLE — chat + output format rules (v3)
+# STYLE — chat + output format rules (v4)
 
-Applies to: monky Discord replies, pi-bg embeds, slash-command output.
-Source of truth for the format rules; AGENTS.md "Voice" points here.
-Last revised: 2026-10-05 (2.3a raw-log exception; 4.2 rewritten to defer
-to 2.7 - PENDING APPROVAL).
+Applies to: monky Discord replies, pi-bg embeds, slash-command output. Source of truth for format rules (AGENTS.md "Voice" points here).
+Last revised: 2026-10-18 (v4: summaries = markdown lists; 40-col budget in-turn frames only).
 
 ## 1 Language
 1.1 Serious / task talk: ASD-STE100. Simple words, short sentences,
@@ -12,24 +10,30 @@ to 2.7 - PENDING APPROVAL).
 1.3 No hedging leads. Give the take; caveat in a second sentence.
 1.4 Cut words. Less, not more.
 
-## 2 Chat frames (machine state in Discord)
-2.1 Machine state goes in a code fence, rendered as a box-drawing frame.
-2.2 Full border: `┌` top, `├`/`┣` rows, `└` bottom. Never ship an open
-    frame. Wrapped continuations keep the pipe: a row on the gutter
-    (`├`/`┣`/`│`) continues with `│ ` (pipe + space); `┌`/`└`/plain lines
-    continue with two spaces. Both gutters are 2 cols. (operator 2026-09-16,
-    screenshot: bare 2-space wraps under ├ read as detached.)
-2.3 <= 40 cols per line (mobile budget, MEASURED 2026-09-15 labeled-line test on the operator's phone: 40 holds, 42 wraps; zoomed code view fits ~31 - acceptable). Wrap or shorten, never overflow.
-2.3a A frame is for SHORT machine state only (a few lines: status, a single command result, a small box). Do NOT put long lists, tables, or triage inside a frame - the monospace box wraps at ~31 cols in Discord's normal (non-zoomed) view and becomes unreadable. For content longer than ~6 lines or with many rows, use plain bullets (no box) instead. If a frame must carry more, keep every row <= ~30 cols so it survives the normal view. Exception (2026-10-05, polish sweep C9): a RAW LOG LINE (systemd/journal error) inside a fence is hard-capped at 160 chars, not wrapped - wrapping would mangle the line the operator is grepping for; pi-postcheck applies this cap.
-2.4 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra context, follow-ups, or prose go BEFORE the frame, never after. (A line after `└` breaks the box and reads as detached.)
-2.5 Blank line before a fence: yes. Blank line after a fence: only if the
-    message ends. If text must follow the fence, use a SINGLE newline
-    (a blank line renders as a visible gap in Discord).
-2.6 State glyphs: `┣` active, `├` pending/done, `┤` cancelled.
-2.7 Every /command reply ships in a code fence - success, error, and usage
-    paths alike (operator 2026-09-16). The 40-col budget applies inside the
-    fence too: plain-fence output wraps (wrapFenceLines); keep lines short
-    so wraps do not split ids or URLs.
+## 2 Frames + summaries in Discord
+2.1 Frames exist for ONE thing: in-turn tool-call run frames (bash/...
+    lines while a turn runs). Full border: `┌` top, `├`/`┣` rows, `└`
+    bottom; never ship an open frame. <= 40 cols/line (FRAME_COL_MAX;
+    mobile budget, measured 2026-09-15: 40 holds, 42 wraps). Wraps keep
+    the gutter: a row continues with `│ ` (pipe + space), plain lines
+    with two spaces. (operator 2026-09-16.)
+2.2 A frame is SELF-CONTAINED: nothing after the closing `└`. Extra
+    context goes BEFORE the frame. Blank line before a fence: yes;
+    after: only if the message ends (else a single newline).
+2.3 SUMMARIES are normal Discord markdown - no fence, no box-drawing,
+    no width budget, no truncation (Andryo 2026-10-18). Bullets are
+    `- `, full text, wrap naturally. Status via markdown: in-progress
+    = `**bold**`, closed = `~~strikethrough~~`. A list gets a bold
+    header line (`**todos · N open**`) with a BLANK line before the
+    bullets. Applies to: the todo board, /todos, /jobs, /usage,
+    /context, /tasks, /sleep list, restart wake, handover state.
+2.4 Every /command reply ships in a code fence - success, error, and
+    usage paths alike (operator 2026-09-16) - EXCEPT summary bodies,
+    which ship as markdown per 2.3 (2026-10-18). No 40-col wrap inside
+    any fence: fence bodies ship verbatim; raw log lines are hard-capped
+    at 160 chars, not wrapped (2026-10-05 C9).
+2.5 State glyphs (in-turn frames only): `┣` active, `├` pending/done,
+    `┤` cancelled.
 
 ## 3 Plain text
 3.1 No emoji. ASCII state tags instead: `[ok] [!] [new] [queued] [-]`.
@@ -40,11 +44,8 @@ to 2.7 - PENDING APPROVAL).
 ## 4 Tool output (jarate + jarate-bg)
 4.1 jarate stdout: ONE JSON document, snake_case, no color, no emoji.
     (docs/JARATE.md)
-4.2 Slash commands: defer to 2.7 - EVERY /command reply ships in a code
-    fence (success, error, and usage paths alike); bracketed tag + short
-    lines inside. (docs/COMMANDS.md tag table) [PENDING APPROVAL
-    2026-10-05, polish sweep D1: the old "fenced only when the content is
-    multi-line" clause contradicted 2.7, which superseded it.]
+4.2 Slash commands: defer to 2.4 (fence; summary bodies per 2.3).
+    (docs/COMMANDS.md tag table)
 4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
     (docs/DISPATCH.md)
 4.4 Machine output posted to Discord (script errors, command output,

@@ -637,9 +637,10 @@ describe("tasks: rendering", () => {
       nextFireAt: Date.parse("2026-09-13T06:00:00Z"),
       status: "pending" as const,
     };
+    // no width budget (Andryo 2026-10-18): the full prompt ships, unclipped
     expect(formatTaskLine(cron, "Test", NOW)).toBe(
       `- m2 · Test · cron "0 6 * * *" (system tz) · next 2026-09-13T06:00:00.000Z ` +
-        `(in 3d) · ${"x".repeat(60)}…`,
+        `(in 3d) · ${"x".repeat(80)}`,
     );
     const due = { ...cron, nextFireAt: NOW - 1000 };
     expect(formatTaskLine(due, undefined, NOW)).toContain(" (due) ·");

@@ -13,7 +13,6 @@
  *   5. convertInlineForDiscord  — headings → bold, [text](url) → text (<url>)
  */
 import { Lexer, type Token, type Tokens } from "marked";
-import { FRAME_COL_MAX } from "./frame";
 import type { DiscordEmbed } from "./types";
 
 // ─── Heading depth ─────────────────────────────────────────────────────────
@@ -377,73 +376,6 @@ export function collapseFenceTrailingBlankLines(md: string): string {
   return out.join("\n").replace(/\n+$/, "");
 }
 
-/**
- * STYLE.md 2.3 width pass: word-wrap UNtagged fence lines longer than
- * FRAME_COL_MAX (continuation indent 2 spaces). Prose OUTSIDE fences is
- * untouched — Discord wraps it natively; only monospace fence lines
- * overflow. A word with no space in budget hard-breaks at the budget.
- * LANGUAGE-TAGGED fences (```python, ```bash, ...) are never wrapped: the
- * continuation indent breaks code semantics (2026-09-15: a 54-col python
- * snippet shipped with mangled indentation + mid-identifier client splits).
- * Same fence toggle as collapseFenceTrailingBlankLines. Exported for tests.
- */
-export function wrapFenceLines(
-  md: string,
-  max: number = FRAME_COL_MAX,
-): string {
-  const lines = md.split("\n");
-  const out: string[] = [];
-  let inFence = false;
-  let fenceLang: string | null = null;
-  for (const line of lines) {
-    if (line.trimStart().startsWith("```")) {
-      if (!inFence) {
-        inFence = true;
-        fenceLang = line.trimStart().slice(3).trim().split(/\s+/)[0] || null;
-      } else {
-        inFence = false;
-        fenceLang = null;
-      }
-      out.push(line);
-      continue;
-    }
-    if (!inFence || fenceLang !== null || line.length <= max) {
-      out.push(line);
-      continue;
-    }
-    out.push(...wrapFenceLine(line, max));
-  }
-  return out.join("\n");
-}
-
-export function wrapFenceLine(line: string, max: number): string[] {
-  // Continuation gutter (STYLE.md 2.2, operator 2026-09-16 screenshot):
-  // rows that sit on the frame pipe (├/┣/│) keep the pipe on their wrap
-  // continuations; everything else (┌/└/plain) falls back to two spaces.
-  // Both gutters are 2 cols, so the line budget is unchanged.
-  const cont =
-    line.startsWith("├") || line.startsWith("┣") || line.startsWith("│")
-      ? "│ "
-      : "  ";
-  const out: string[] = [];
-  let rest = line;
-  let first = true;
-  while (rest.length > 0) {
-    const budget = first ? max : max - cont.length;
-    if (rest.length <= budget) {
-      out.push((first ? "" : cont) + rest);
-      break;
-    }
-    // break at the last word boundary in budget; hard-break when absent
-    let cut = rest.lastIndexOf(" ", budget);
-    if (cut <= 0) cut = budget;
-    out.push((first ? "" : cont) + rest.slice(0, cut));
-    rest = rest.slice(cut).replace(/^ +/, "");
-    first = false;
-  }
-  return out;
-}
-
 /** A fence line that IS a link (whole-line forms), rendered as the
  * hoisted plain line, or null when the line is not a whole-line link.
  * Exported for tests. */
@@ -481,10 +413,9 @@ export function wholeLinkLine(
  *
  * If a fence contained only hoisted lines, the fence is dropped entirely.
  *
- * Fence-aware (same toggle as wrapFenceLines). LANGUAGE-TAGGED fences
- * (```python, ```bash, ...) never get the mixed-line treatment: a URL
- * inside real code is an argument, not a link (same rule as
- * wrapFenceLines). Other code lines are left inside the fence untouched.
+ * Fence-aware. LANGUAGE-TAGGED fences (```python, ```bash, ...) never get
+ * the mixed-line treatment: a URL inside real code is an argument, not a
+ * link. Other code lines are left inside the fence untouched.
  * Exported for tests.
  */
 export function hoistFencedUrls(md: string): string {
@@ -711,7 +642,9 @@ export function extractMachineUrls(
  * - A URL on a machine line is hoisted to a BARE line after the fence
  *   (issue #87): a fenced URL is monospace, not clickable, and the
  *   clickability passes run before this one.
- * - Fenced lines are kept to the 40-col budget via wrapFenceLine.
+ * - Fence lines ship as written - NO 40-col wrap (Andryo 2026-10-18:
+ *   the width budget is scoped to in-turn tool-call frames; fence
+ *   content wraps natively in Discord).
  * - Pure, fast (single pass, anchored patterns), and idempotent:
  *   styleGuard(styleGuard(x)) === styleGuard(x).
  */
@@ -723,24 +656,14 @@ export function styleGuard(md: string): string {
     const line = lines[i]!;
     const open = fenceRun(line);
     if (open > 0) {
-      // existing fence: pass delimiter + body through; the closer is the
-      // first fence line at least as long as the opener (a ``` line nested
-      // in a ```` fence is body, not a closer). A2 (polish sweep): the body
-      // of an UNTAGGED existing fence is wrapped to the 40-col budget the
-      // same way the fence this pass creates is (command builders like
-      // /help, /tasks list, /sleep list emit pre-fenced >40-col lines).
-      // Language-tagged fences stay verbatim: the continuation indent
-      // breaks code semantics (same rule as wrapFenceLines).
-      const lang = line.trimStart().slice(open).trim().split(/\s+/)[0] || "";
+      // existing fence: pass delimiter + body through verbatim (no
+      // width wrap - Andryo 2026-10-18). The closer is the first fence
+      // line at least as long as the opener (a ``` line nested in a
+      // ```` fence is body, not a closer).
       out.push(line);
       i++;
       while (i < lines.length && fenceRun(lines[i]!) < open) {
-        const bl = lines[i]!;
-        if (lang === "" && bl.length > FRAME_COL_MAX) {
-          out.push(...wrapFenceLine(bl, FRAME_COL_MAX));
-        } else {
-          out.push(bl);
-        }
+        out.push(lines[i]!);
         i++;
       }
       if (i < lines.length) {
@@ -796,7 +719,7 @@ export function styleGuard(md: string): string {
     }
     if (rest.length > 0) {
       out.push(marker);
-      for (const rl of rest) out.push(...wrapFenceLine(rl, FRAME_COL_MAX));
+      for (const rl of rest) out.push(rl);
       out.push(marker);
     }
     out.push(...hoisted);
@@ -913,7 +836,6 @@ export function mdToDiscord(md: string): string {
   out = convertInlineForDiscord(out);
   out = collapseFenceTrailingBlankLines(out);
   out = hoistFencedUrls(out);
-  out = wrapFenceLines(out);
   // Last step: deterministic machine-state fence pass (STYLE.md 2.7/4.4)
   out = styleGuard(out);
   return out;
