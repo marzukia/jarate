@@ -16,6 +16,7 @@ import { styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
 import extension, {
+  autoCompactByToken,
   bashToolEssential,
   buildInteractionHandler,
   buildRepliedMessageBlock,
@@ -52,6 +53,7 @@ import extension, {
   LIVE_TEXT_THROTTLE_MS,
   lastRunUsage,
   matchCommand,
+  maybeAutoCompactByToken,
   midTurnQueues,
   opWindowLabel,
   parseReplyTo,
@@ -8250,6 +8252,42 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     await tick();
     expect(isCompacting("ch1")).toBe(false);
     expect(compactPosts()).toHaveLength(0);
+  });
+
+  test("stale ctx at timer fire: gate skips, no unhandled rejection (2026-10-19 pi -p exit crash)", async () => {
+    // pi -p: the session ends at run end, so the agent_settled gate timer
+    // ALWAYS fires against a replaced (dead) session: the ctx.cwd getter
+    // throws "stale". Pre-fix, that throw escaped as a REJECTED promise —
+    // the try/catch around `void maybeAutoCompactByToken` only caught
+    // sync throws — and the unhandled rejection killed `pi -p` at exit.
+    Object.defineProperty(ctx, "cwd", {
+      get() {
+        throw new Error(
+          "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+        );
+      },
+      configurable: true,
+    });
+
+    // 1. Direct call: the defensive guard makes the gate RESOLVE (not
+    // reject) on a stale ctx — the replacement session's own settle
+    // re-runs the gate.
+    await expect(maybeAutoCompactByToken(pi, ctx)).resolves.toBeUndefined();
+    expect(isCompacting("ch1")).toBe(false);
+
+    // 2. The real crash path: the armed 0ms timer with a stale ctx must
+    // not surface an unhandled rejection.
+    const rejections: unknown[] = [];
+    const onRejection = (r: unknown) => rejections.push(r);
+    process.on("unhandledRejection", onRejection);
+    try {
+      autoCompactByToken(pi, ctx);
+      await tick(50); // let the timer + rejection microtask run
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    expect(rejections).toEqual([]);
+    expect(isCompacting("ch1")).toBe(false);
   });
 });
 
