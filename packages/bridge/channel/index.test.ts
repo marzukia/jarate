@@ -7054,6 +7054,60 @@ describe("tasks (integration)", () => {
         expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
       }
     }
+    // /context + /usage (PR #242 review F4): §2.3 summaries too. With a
+    // session file present the success path ships unfenced markdown;
+    // with none, the error path is a fenced one-liner.
+    const sessions = path.join(tmp, ".pi", "agent", "sessions", "2026-09-10");
+    fs.mkdirSync(sessions, { recursive: true });
+    const sessFile = path.join(
+      sessions,
+      "2026-09-10T08-00-00-000Z_00000000-0000-0000-0000-000000000001.jsonl",
+    );
+    fs.writeFileSync(
+      sessFile,
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "sess",
+          timestamp: "2026-09-10T08:00:00.000Z",
+          cwd: "/cwd",
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "cm1",
+          parentId: "p-cm1",
+          timestamp: "2026-09-10T08:00:01.000Z",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "do the thing" }],
+          },
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "am1",
+          parentId: "cm1",
+          timestamp: "2026-09-10T08:00:02.000Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+          },
+        }),
+        "", // trailing blank: join gives the final newline
+      ].join("\n"),
+    );
+    await handleInbound(pi, inbound("/context", "cx1"), ctx);
+    let c = replyContent();
+    expect(c.startsWith("```")).toBe(false); // success = unfenced markdown
+    expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
+    await handleInbound(pi, inbound("/usage", "us1"), ctx);
+    c = replyContent();
+    expect(c.startsWith("```")).toBe(false);
+    expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
+    // error path (no session file): fenced one-liner
+    fs.rmSync(sessFile);
+    await handleInbound(pi, inbound("/context", "cx2"), ctx);
+    expect(replyContent()).toBe(fence("[!] no session file found"));
   });
 
   test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {

@@ -1343,8 +1343,8 @@ export function buildSeedKickoff(
  * In-flight prose sections — the LLM pass was retired — so scraping them
  * always yielded (none) and the fresh session was told nothing was in
  * flight, with an instruction pushing it straight to inline work.
- * The seed therefore reads the SAME sources the doc's State box renders
- * (jobsView text + the open todo board), fresh at restart time.
+ * The seed therefore reads the SAME sources the doc's State section
+ * renders (jobsView text + the open todo board), fresh at restart time.
  */
 export interface KickoffLiveState {
   /** jobsView("text"); null/"" when unknown. */
@@ -1366,7 +1366,7 @@ export const ORCHESTRATOR_PRIME_LINE =
   "ORCHESTRATOR: you have pi-bg workers (~/scripts/pi-bg). Resume in-flight dispatch and hand off context-hungry work - do not do it inline.";
 
 /** Live sources for the boot seed: the SAME calls buildHandover uses for
- *  the doc's State box (safeJobsView / safeScheduledTasks / liveTodoState).
+ *  the doc's State section (safeJobsView / safeScheduledTasks / liveTodoState).
  *  The todo board is loaded ONCE (review F1, #141): the rendered text and
  *  the structured open items must agree. */
 export function liveKickoffState(cwd: string): KickoffLiveState {

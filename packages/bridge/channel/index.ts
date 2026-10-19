@@ -5384,7 +5384,8 @@ async function runChannelCommand(
         // 2026-10-18); [!] errors stay fenced one-liners.
         return { immediate: text.startsWith("[!]") ? fence(text) : text };
       } catch {
-        return { immediate: "[!] context stats unavailable" };
+        // fenced, mirroring the /usage catch (PR #242 review F4)
+        return { immediate: fence("[!] context stats unavailable") };
       }
     }
     case "diff": {
