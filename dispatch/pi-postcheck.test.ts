@@ -2,12 +2,13 @@
  * dispatch/pi-postcheck.sh — restart health check (C1 + C8, polish sweep).
  *
  * Runs the real bash script against a fake HOME with stubbed curl /
- * systemctl / journalctl. C1: the webhook heartbeat line is state-aware
+ * systemctl / journalctl. C1: the webhook heartbeat is state-aware
  * ("[ok] healthy" / "[!] not healthy" - the failure path used to read
- * "[!] healthy", a lie). The heartbeat is a markdown list (STYLE.md v4
- * 2.3, PR #242 review F1) - same shape as the bridge restart-wake: tag
- * line, bold header, plain bullets. In-flight note lines ship as raw
- * bullets: no frame, no wrap, no width budget; a long token (URL) ships
+ * "[!] healthy", a lie). The heartbeat is an EMBED CARD (2026-10-19):
+ * one-line content `[bg: pi-restart] [ok|!] ...` (the wake marker) +
+ * one embed (postcheck · ok/fail, green/red, footer pi-postcheck).
+ * In-flight note lines ride the embed's in-flight field as RAW LINES:
+ * no frame, no wrap, no width budget; a long token (URL) ships
  * verbatim.
  */
 import { afterEach, describe, expect, test } from "bun:test";
@@ -30,6 +31,13 @@ afterEach(() => {
 interface Post {
   url: string;
   content: string;
+  embeds?: Array<{
+    title: string;
+    color: number;
+    description: string;
+    fields?: Array<{ name: string; value: string }>;
+    footer?: { text: string };
+  }>;
 }
 
 interface Fixture {
@@ -148,9 +156,14 @@ printf 'ok\\n'
         .map((c) => {
           const [url, ...rest] = c.split("\n");
           const data = rest.join("\n");
+          const j = JSON.parse(data) as {
+            content: string;
+            embeds?: Post["embeds"];
+          };
           return {
             url: url ?? "",
-            content: (JSON.parse(data) as { content: string }).content,
+            content: j.content,
+            embeds: j.embeds,
           };
         });
     },
@@ -188,13 +201,17 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(channelPost(f).content).toBe(
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
-      const hb = webhookPost(f).content;
-      // markdown list, same shape as the bridge restart-wake (STYLE.md
-      // v4 2.3): tag line, bold header, blank line, bullets - no fence,
-      // no frame characters.
-      expect(hb).toBe(
-        "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [ok] healthy 90s after restart",
+      const hb = webhookPost(f);
+      // embed card: one-line content (the [bg: wake marker) + one embed
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
       );
+      expect(hb.content).not.toContain("\n");
+      expect(hb.embeds).toHaveLength(1);
+      expect(hb.embeds[0].title).toBe("postcheck \u00b7 ok");
+      expect(hb.embeds[0].color).toBe(0x57f287);
+      expect(hb.embeds[0].footer?.text).toBe("pi-postcheck");
+      expect(hb.embeds[0].fields).toBeUndefined();
     } finally {
       f.setInflight(null);
     }
@@ -213,9 +230,13 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(channelPost(f).content).toBe(
         "`[!] pi.service not active after restart`",
       );
-      const hb = webhookPost(f).content;
-      expect(hb).toContain("- [!] not healthy 90s after restart");
-      expect(hb).not.toContain("[!] healthy");
+      const hb = webhookPost(f);
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [!] not healthy 90s after restart",
+      );
+      expect(hb.content).not.toContain("[!] healthy");
+      expect(hb.embeds?.[0].title).toBe("postcheck \u00b7 fail");
+      expect(hb.embeds?.[0].color).toBe(0xed4245);
     } finally {
       f.setInflight(null);
     }
@@ -238,8 +259,8 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(ch).toContain("`[!] pi restarted, systemd error:`");
       expect(ch).toContain("Main process exited, code=killed, status=1/SEGV");
       expect(ch).not.toContain("second failed line"); // head -1 only
-      expect(webhookPost(f).content).toContain(
-        "- [!] not healthy 90s after restart",
+      expect(webhookPost(f).content).toBe(
+        "[bg: pi-restart] [!] not healthy 90s after restart",
       );
     } finally {
       f.setInflight(null);
@@ -276,8 +297,8 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
       expect(channelPost(f).content).toBe(
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
-      expect(webhookPost(f).content).toContain(
-        "- [ok] healthy 90s after restart",
+      expect(webhookPost(f).content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
       );
       expect(webhookPost(f).content).not.toContain("systemd error");
     } finally {
@@ -300,8 +321,8 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
       expect(ch).toContain("`[!] pi restarted, systemd error:`");
       expect(ch).toContain(REAL);
       expect(ch).not.toContain(SUMMARY); // the 0-failed summary is filtered
-      expect(webhookPost(f).content).toContain(
-        "- [!] not healthy 90s after restart",
+      expect(webhookPost(f).content).toBe(
+        "[bg: pi-restart] [!] not healthy 90s after restart",
       );
     } finally {
       f.setInflight(null);
@@ -319,8 +340,7 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
  * observable side effects instead.
  */
 describe("pi-postcheck: missing settings / no bot token branches", () => {
-  const DEGRADED =
-    "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [!] not healthy 90s after restart";
+  const DEGRADED = "[bg: pi-restart] [!] not healthy 90s after restart";
 
   test("settings.json missing: exit 0, no channel post, degraded frame, no systemd probes", async () => {
     const f = fixture();
@@ -370,8 +390,8 @@ describe("pi-postcheck: missing settings / no bot token branches", () => {
   });
 });
 
-describe("pi-postcheck in-flight note: raw markdown bullets (STYLE.md v4 2.3)", () => {
-  test("80-char URL in the in-flight note: ships verbatim, no wrap, no fence", async () => {
+describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () => {
+  test("80-char URL in the in-flight note: ships verbatim in the field, no wrap, no fence", async () => {
     const f = fixture();
     fs.writeFileSync(
       path.join(f.home, ".config", "pi-dispatch", "webhook"),
@@ -384,21 +404,28 @@ describe("pi-postcheck in-flight note: raw markdown bullets (STYLE.md v4 2.3)", 
     try {
       const r = await f.run();
       expect(r.code).toBe(0);
-      const hb = webhookPost(f).content;
-      // no fence, no frame characters
-      expect(hb).not.toContain("```");
-      expect(hb).not.toMatch(/[┌└│├┤┣]/);
-      // the note line is ONE raw bullet - content preserved, unchunked
-      expect(hb).toContain("- in-flight:");
-      expect(hb).toContain(`- ${url}`);
-      // the healthy row is intact above the note
-      expect(hb).toContain("- [ok] healthy 90s after restart");
+      const hb = webhookPost(f);
+      // the content is ONE line (the [bg: wake marker) - the note no
+      // longer rides content at all
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
+      );
+      expect(hb.content).not.toContain("\n");
+      // no fence, no frame characters anywhere in the card
+      const em = hb.embeds?.[0];
+      expect(em).toBeDefined();
+      expect(JSON.stringify(em)).not.toContain("```");
+      expect(JSON.stringify(em)).not.toMatch(/[┌└│├┤┣]/);
+      // the note line is ONE raw field value - verbatim, unchunked
+      const fld = em?.fields?.[0];
+      expect(fld?.name).toBe("in-flight");
+      expect(fld?.value).toBe(url);
     } finally {
       f.setInflight(null);
     }
   });
 
-  test("multi-line note: each line its own bullet, blank lines dropped", async () => {
+  test("multi-line note: every line in the field, blank lines dropped", async () => {
     const f = fixture();
     fs.writeFileSync(
       path.join(f.home, ".config", "pi-dispatch", "webhook"),
@@ -408,9 +435,53 @@ describe("pi-postcheck in-flight note: raw markdown bullets (STYLE.md v4 2.3)", 
     try {
       const r = await f.run();
       expect(r.code).toBe(0);
-      expect(webhookPost(f).content).toBe(
-        "[bg: pi-restart]\n**pi restart heartbeat**\n\n- [ok] healthy 90s after restart\n- in-flight:\n- fix the pi restart loop\n- then redeploy",
+      const hb = webhookPost(f);
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
       );
+      expect(hb.embeds?.[0].fields?.[0].name).toBe("in-flight");
+      expect(hb.embeds?.[0].fields?.[0].value).toBe(
+        "fix the pi restart loop\nthen redeploy",
+      );
+    } finally {
+      f.setInflight(null);
+    }
+  });
+
+  test("in-flight >1024 chars: field capped at Discord's limit with overflow suffix (review MEDIUM 2026-10-19)", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    // 20 realistic ticket lines (~130 chars each) -> ~2.7KB joined: the
+    // pre-fix field value would 400 the whole webhook post
+    const lines = Array.from(
+      { length: 20 },
+      (_, i) =>
+        `20261019-071832-5730${i} worker 30:45 # JARATE - card-format all plain [bg: webhook posts (Andryo 2026-10-19)`,
+    );
+    const joined = lines.join("\n");
+    expect(joined.length).toBeGreaterThan(1024);
+    f.setInflight(joined);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      const hb = webhookPost(f);
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
+      );
+      const fields = hb.embeds?.[0].fields ?? [];
+      // Discord-shippable: no field value over the 1024 limit
+      for (const x of fields) {
+        expect(x.value.length).toBeLessThanOrEqual(1024);
+      }
+      const fld = fields[0];
+      expect(fld?.name).toBe("in-flight");
+      expect(fld?.value.startsWith(lines[0])).toBe(true);
+      expect(fld?.value).toContain("\u2026 +");
+      expect(fld?.value.endsWith("lines - see /jobs")).toBe(true);
+      expect(fld?.value).not.toBe(joined);
     } finally {
       f.setInflight(null);
     }

@@ -248,8 +248,27 @@ On completion, `jarate-bg` posts to the Discord webhook:
   A second silent death (issue #57, retry1 did not recover) is reported as
   a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
   treats it like any other FAIL (one fix round, then a decision).
-- **Legacy plain-text fallback:** if the embed builder fails, a
-  `[bg:<profile>:<status>] cwd=... task=...` content post is sent instead.
+- **Embed card family (2026-10-19):** the plain `[bg:` text cards are
+  gone. Every producer that had no framed embed (launch-fail DIED,
+  no-output DIED, the fallback below, the watchdog OOM/SILENT/AGENT-DEAD
+  posts, the pi-restart heartbeat, the restart-wake post) now ships ONE
+  content line + ONE embed: content is a single line starting with the
+  producer's existing `[bg:` tag plus a short worst-fact summary
+  (<= 120 chars) - the `[bg:` prefix on line 1 is what `isBgWebhook`
+  accepts, so the wake behavior is unchanged; the embed carries title
+  `<producer> · <STATUS>`, color (red `0xED4245` died/oom/agent-dead/
+  unplanned/fail, yellow `0xFEE75C` silent/warn/stale, green
+  `0x57F287` planned/healthy/ok), a 1-2 line description, ALL facts as
+  fields (code-fenced output snippets only in the fallback producer),
+  and a footer with the producer name only (no timestamp). Dynamic
+  operator-facing text is censored at egress (bash producers via
+  `bg_censor`; restart-wake via `egressPayload` on every string part).
+- **Plain-text fallback:** if the embed builder fails, the legacy
+  fallback posts the SAME embed card family: one content line
+  (`[bg:<profile>:<status>] ticket <rid> <status> rc=<rc>`) + one embed
+  (title `fallback · <status>`, cwd/task fields + the raw output
+  snippet code-fenced as the `output` field value - a raw text blob
+  with no fence violates STYLE.md 2.7).
 - Inbound exemption: piscord's `isBgWebhook` exempts its own callbacks
   (webhook with `[bg:` content, or embed author name starting `pi-bg`) from
   triggering a run — no echo loops.
@@ -377,13 +396,14 @@ alerts on DELTA, not level.
   rebuild) = quiet re-baseline, the dedupe stamp drops. Max 1 ALERT per
   uid per 60 min (`$PI_BG_OOM_DEDUPE_MIN`, default 60; 0 = off); a
   suppressed delta accumulates and ships with the next fired alert.
-- **Finding, not page**: `[bg: agent-watch] OOM: user-<uid>.slice
-  oom_kill +N (T total since baseline B)` content (wakes the operator
-  channel via the webhook marker) + red 40-col frame (uid, kill/oom
-  deltas with totals, max, peak with GiB conversion). M1 restarts nothing
-  and changes no MemoryMax; absent slices are skipped (M2's liveness
-  markers classify dead session vs quiet agent). `--quiet` = detect + log,
-  no post, no baseline advance; `--dry-run` = print only.
+- **Finding, not page**: the embed card family (2026-10-19) - content
+  one line `[bg: agent-watch] OOM-ALERT user-<uid>.slice oom_kill +N`
+  (wakes the operator channel via the webhook marker) + one embed
+  (title `agent-watch · OOM`, red, `oom_kill`/`oom`/`max`/`peak` fields). M1
+  restarts nothing and changes no MemoryMax; absent slices are skipped
+  (M2's liveness markers classify dead session vs quiet agent).
+  `--quiet` = detect + log, no post, no baseline advance; `--dry-run`
+  = print only.
 
 ### Agent liveness (watchdog, issue #191 M2)
 
@@ -417,12 +437,16 @@ bridge poll loop) is alive.
     An OLD boot with a still-pre-boot marker escalates like stale: the
     "agent never came up after reboot" case (age = uptime).
   - **SILENT** - marker stale, or gone after having been seen -> WARN
-    post on the ok -> silent transition (orange near-miss, one per
-    episode).
-  - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT post (red page,
-    silent -> dead). The `user@<uid>.service` cgroup (M1's
-    `PI_BG_OOM_ROOT` seam) empty/gone adds the "session gone" class to the
-    frame: the whole user session is down, not just the agent.
+    embed card on the ok -> silent transition (yellow, one per
+    episode): content `[bg: agent-watch] SILENT user-<uid> <age>` +
+    embed title `agent-watch · SILENT` with `age`/`note` (+`session`)
+    fields.
+  - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT embed card
+    (red, silent -> dead): content `[bg: agent-watch] AGENT-DEAD
+    user-<uid> <age>` + embed title `agent-watch · AGENT-DEAD`. The
+    `user@<uid>.service` cgroup (M1's `PI_BG_OOM_ROOT` seam)
+    empty/gone adds a "session gone" field: the whole user session is
+    down, not just the agent.
   - **NEVER-SEEN** - no marker ever observed -> WARN only, never dead
     (fleet deploy window: a peer's bridge may predate the marker code;
     absence of the mechanism is not evidence of death).

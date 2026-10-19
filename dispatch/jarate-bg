@@ -1187,27 +1187,44 @@ PY
 
 # bg_launch_fail <reason> <brief> (issue #86 + polish sweep A1): a
 # --worktree launch-fail must WAKE the orchestrator like any run failure.
-# #231 P4: a launch-fail has no captured output (the run never started),
-# so the framed embed is pure chrome: post the compact one-line [bg:
-# text instead (the [bg: prefix is what wakes the agent - isBgWebhook
-# accepts the content post). The framed embed stays as the no-python3
-# fallback. The record is marked killed by mark_launch_fail; bg_on_exit
-# is not registered yet, so the killed state survives the exit. Dead-letter
-# + heartbeat cleanup ride the normal paths.
+# 2026-10-19 (Andryo): EMBED CARD family (the same visual as the pi-bg
+# completion posts) - content is ONE line: `[bg:<tag>] <summary>` (the
+# [bg: prefix on line 1 is what wakes the agent - isBgWebhook), plus ONE
+# embed (title / color / description / fields / footer, no timestamp). A
+# launch-fail has no captured output (the run never started), so there is
+# no frame to carry: the facts (ticket, exit, brief) ride the fields.
+# The framed embed stays as the no-python3 fallback. The record is marked
+# killed by mark_launch_fail; bg_on_exit is not registered yet, so the
+# killed state survives the exit. Dead-letter + heartbeat cleanup ride the
+# normal paths.
 # #222x#234 (2026-10-17): the brief cap is 120, not 80 - launch-fail
 # briefs carry the cwd/ref path the operator needs to act (the
 # not-a-git-repo brief = "launch-fail: --worktree needs a git repo
 # (cwd=<path> is not one)"); 80 truncated that cwd mid-path while 120
-# keeps the one-line shape and full paths. The bg_on_exit no-output cap
+# keeps the full path in the brief field. The bg_on_exit no-output cap
 # (80) stays - no operator-critical path in that brief.
 bg_launch_fail() {
   local reason="$1" brief="$2"
   mark_launch_fail "$reason"
   local dline dbodyf
-  dline="[bg:${profile}:DIED] ${run_id} exit=3 / no output${brief:+ / ${brief:0:120}}"
-  dline="$(bg_censor "$dline")"
+  dline="[bg:${profile}:DIED] launch-fail ticket ${run_id} exit=3"
   dbodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
-  python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$dline" > "$dbodyf" 2>/dev/null
+  python3 -c '
+import json, sys
+brief = sys.argv[2]
+fields = [
+    {"name": "ticket", "value": sys.argv[3], "inline": True},
+    {"name": "exit", "value": "3 (no output)", "inline": True},
+]
+if brief:
+    fields.append({"name": "brief", "value": brief})
+print(json.dumps({"content": sys.argv[1], "embeds": [{
+    "title": "launch-fail \u00b7 DIED",
+    "color": 0xED4245,
+    "description": "the --worktree launch failed before the run started (no captured output).",
+    "fields": fields,
+    "footer": {"text": "jarate-bg"},
+}]}))' "$dline" "$(bg_censor "${brief:0:120}")" "$run_id" > "$dbodyf" 2>/dev/null
   if [ -s "$dbodyf" ]; then
     bg_post "$dbodyf" || rm -f "$dbodyf"
   else
@@ -1226,8 +1243,8 @@ bg_launch_fail() {
 # line and NO webhook -> the orchestrator never wakes (2026-09-27: 3 nestfinder
 # workers failed `--worktree nestfinder-clone`, a ref that doesn't exist, and
 # all three died silently). Read the webhook now (same source as below) and
-# call bg_launch_fail (defined above): it posts the compact one-line [bg:
-# DIED content synchronously (#231 P4: no captured output to frame), marks
+# call bg_launch_fail (defined above): it posts the [bg: DIED embed
+# card synchronously (no captured output to frame), marks
 # the record killed, and exits 3. The full
 # bg_on_exit trap registers only at the end of a run that got this far, so
 # the post here is the one and only callback for a launch-fail.
@@ -1511,17 +1528,32 @@ bg_on_exit() {
      [ ! -f "$BG_TMP/pi-bg-${run_id}-killed" ]; then
     [ -n "${pi_pid:-}" ] && kill "$pi_pid" 2>/dev/null
     reason="$(bg_death_reason)"
-    # #231 P4: compact no-output DIED. There is no captured output to
-    # frame, so the framed embed is pure chrome: a one-line [bg: text
-    # carries the same facts (profile, ticket, exit code, reason head).
-    # The [bg: prefix is what wakes the agent (isBgWebhook accepts the
-    # content post; jarate-wait matches on the webhook id, not the
-    # content). The framed embed stays for the captured-output DIED in
-    # the main flow.
-    dline="[bg:${profile}:DIED] ${run_id} exit=${ec} / no output${reason:+ / ${reason:0:80}}"
-    dline="$(bg_censor "$dline")"
+    # 2026-10-19 (Andryo): no-output DIED as the EMBED CARD family (same
+    # visual as the pi-bg completion posts): ONE content line -
+    # `[bg:<tag>] <summary>` (the [bg: prefix on line 1 is what wakes the
+    # agent; jarate-wait matches on the webhook id, not the content) -
+    # plus ONE embed (title/color/description/fields/footer). There is no
+    # captured output to frame: the facts (ticket, exit, reason head)
+    # ride the fields. The framed embed stays for the captured-output
+    # DIED in the main flow.
+    dline="[bg:${profile}:DIED] no-output ticket ${run_id} exit=${ec}"
     dbodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
-    python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$dline" > "$dbodyf" 2>/dev/null
+    python3 -c '
+import json, sys
+reason = sys.argv[2]
+fields = [
+    {"name": "ticket", "value": sys.argv[3], "inline": True},
+    {"name": "exit", "value": sys.argv[4], "inline": True},
+]
+if reason:
+    fields.append({"name": "reason", "value": reason})
+print(json.dumps({"content": sys.argv[1], "embeds": [{
+    "title": "no-output \u00b7 DIED",
+    "color": 0xED4245,
+    "description": "the wrapper exited before the run produced output (no report captured).",
+    "fields": fields,
+    "footer": {"text": "jarate-bg"},
+}]}))' "$dline" "$(bg_censor "${reason:0:80}")" "$run_id" "$ec" > "$dbodyf" 2>/dev/null
     if [ -s "$dbodyf" ]; then
       bg_post "$dbodyf" || rm -f "$dbodyf"
     else
@@ -2017,8 +2049,8 @@ if last:
   fi
   if [ -n "${errf:-}" ] && [ -f "$errf" ]; then
     # #231 P4: trim the ends - the stderr tail is the reason head of the
-    # compact one-line no-output DIED (bg_on_exit), which must stay ONE
-    # clean line
+    # no-output DIED card (bg_on_exit), which must stay ONE clean line
+    # (a single card bullet)
     why="$(tail -c 400 "$errf" 2>/dev/null | tr '\n' ' ' | tr -s ' ' | tail -c 200 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -n "$why" ] && { printf '%s' "$why"; return 0; }
   fi
@@ -2340,13 +2372,29 @@ if [ -n "$webhook" ]; then
   if [ -s "$BG_TMP/pi-bg-${run_id}-body.json" ]; then
     bg_post "$BG_TMP/pi-bg-${run_id}-body.json"
   else
-    # fallback: legacy plain text if the embed builder failed
+    # fallback: the embed builder failed - legacy card fallback in the
+    # SAME embed card family as the DIED posts (2026-10-19): ONE content
+    # line (`[bg:<profile>:<status>] ticket <rid> <status> rc=<rc>` - the
+    # wake) + ONE embed (title/color/description/fields/footer). C4
+    # (polish sweep): the raw output snippet ships code-fenced as a field
+    # value - a raw text blob with no fence violates STYLE.md 2.7.
     bodyf="$BG_TMP/pi-bg-${run_id}-body-plain.json"
-    # C4 (polish sweep): fence the raw output the same way the embed path
-    # frames it - a raw text blob with no ``` fence violates STYLE.md 2.7.
-    body="[bg:${profile}:${status}] cwd=$(pwd) task=${task:0:120}\n\n\`\`\`bash\n${out:0:400}\n\`\`\`"
-    body="$(bg_censor "$body")"
-    python3 -c 'import json,sys; print(json.dumps({"content": sys.argv[1]}))' "$body" > "$bodyf"
+    python3 -c '
+import json, sys
+status, rc, run, cwd, task, out = sys.argv[2:8]
+fields = [
+    {"name": "cwd", "value": cwd},
+    {"name": "task", "value": task[:120]},
+    {"name": "output", "value": "```bash\n" + out[:400] + "\n```"},
+]
+print(json.dumps({"content": "[bg:%s:%s] ticket %s %s rc=%s" % (sys.argv[1], status, run, status, rc), "embeds": [{
+    "title": "fallback \u00b7 " + status,
+    "color": 0x57F287 if status == "OK" else 0xED4245,
+    "description": "the embed builder was unavailable - legacy card fallback for this run.",
+    "fields": fields,
+    "footer": {"text": "jarate-bg"},
+}]}))' "${profile}" "$status" "$rc" "$run_id" "$(bg_censor "$(pwd)")" \
+      "$(bg_censor "$task")" "$(bg_censor "$out")" > "$bodyf"
     bg_post "$bodyf" || rm -f "$bodyf"
   fi
 fi
