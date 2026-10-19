@@ -1191,9 +1191,10 @@ describe("#110 launcher: --wt-reuse + retryOf record tag", () => {
  * launch-fail (not a git repo / worktree add failed) exits 3 BEFORE the
  * run record + bg_on_exit register, so bg_launch_fail posts the DIED
  * wake itself. #231 P4: a launch-fail has no captured output, so the
- * payload is the compact one-line [bg: content (not the framed embed) -
- * the [bg: prefix is what isBgWebhook accepts on the bridge side, so the
- * callback wakes the orchestrator. The capture hook's req.json() 500s on
+ * payload is the [bg: card content (tag line + bold header + fact
+ * bullets, not the framed embed) - the [bg: prefix on line 1 is what
+ * isBgWebhook accepts on the bridge side, so the callback wakes the
+ * orchestrator. The capture hook's req.json() 500s on
  * a non-JSON body (body stays null), so a captured body is proof the
  * payload is valid JSON - the Discord 400/50109 shape check.
  */
@@ -1215,7 +1216,7 @@ describe("#86: launch-fail webhook", () => {
     };
   };
 
-  test("not a git repo: rc 3 + one-line [bg: DIED content passes isBgWebhook", async () => {
+  test("not a git repo: rc 3 + [bg: DIED card passes isBgWebhook", async () => {
     const fx = fixture();
     const hook = capture();
     fx.env.PI_DISPATCH_WEBHOOK = hook.url;
@@ -1232,17 +1233,21 @@ describe("#86: launch-fail webhook", () => {
       if (!m) throw new Error("no ticket line on stdout");
       const rid = m[1] ?? "";
       expect(rid).toMatch(/^\d{8}-\d{6}-\d+$/);
-      // #231 P4: one-line [bg: content, not the framed embed (a
-      // launch-fail has no captured output to frame). The [bg: prefix
-      // is the isBgWebhook discriminator for content posts
-      // (webhook_id is added by Discord on inbound, so the test
-      // supplies it).
-      expect(cap.content).toMatch(
-        new RegExp(
-          `^\\[bg:worker:DIED\\] ${rid} exit=3 / no output / launch-fail: --worktree needs a git repo \\(cwd=`,
-        ),
+      // #231 P4 (card since 2026-10-19): [bg: card, not the framed
+      // embed (a launch-fail has no captured output to frame). The
+      // [bg: tag on line 1 is the isBgWebhook discriminator for
+      // content posts (webhook_id is added by Discord on inbound, so
+      // the test supplies it).
+      const lines = cap.content.split("\n");
+      expect(lines).toHaveLength(6);
+      expect(lines[0]).toBe(`[bg:worker:DIED]`);
+      expect(lines[1]).toBe(`**launch-fail**`);
+      expect(lines[2]).toBe(``);
+      expect(lines[3]).toBe(`- ticket ${rid}`);
+      expect(lines[4]).toBe(`- exit=3 / no output`);
+      expect(lines[5]).toMatch(
+        /^- launch-fail: --worktree needs a git repo \(cwd=/,
       );
-      expect(cap.content.split("\n")).toHaveLength(1);
       expect(cap.embeds).toBeUndefined();
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
@@ -1252,7 +1257,7 @@ describe("#86: launch-fail webhook", () => {
     }
   });
 
-  test("git repo + bad ref: rc 3 + one-line [bg: content has worktree add failed + ref name", async () => {
+  test("git repo + bad ref: rc 3 + [bg: card has worktree add failed + ref name", async () => {
     const fx = fixture();
     const sh = (cmd: string) =>
       execSync(cmd, { cwd: fx.tmp, env: { ...fx.env }, stdio: "pipe" });
@@ -1272,13 +1277,17 @@ describe("#86: launch-fail webhook", () => {
       expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
       const cap = hook.getBody();
       if (!cap) throw new Error("webhook not captured (or body was not JSON)");
-      // #231 P4: one-line [bg: content carries the reason head
+      // #231 P4 (card since 2026-10-19): the card carries the reason head
       expect(cap.content).toMatch(
         new RegExp(
-          `^\\[bg:worker:DIED\\] \\d{8}-\\d{6}-\\d+ exit=3 / no output / launch-fail: worktree add failed ref=${ref}`,
+          `^\\[bg:worker:DIED\\]\\n` +
+            `\\*\\*launch-fail\\*\\*\\n\\n` +
+            `- ticket \\d{8}-\\d{6}-\\d+\\n` +
+            `- exit=3 / no output\\n` +
+            `- launch-fail: worktree add failed ref=${ref}`,
         ),
       );
-      expect(cap.content.split("\n")).toHaveLength(1);
+      expect(cap.content.split("\n")).toHaveLength(6);
       expect(cap.embeds).toBeUndefined();
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
@@ -1346,24 +1355,24 @@ describe("#53: self-contained dead letters (launcher side)", () => {
     // DIED embed the bridge would have delivered
     const bodyJson = letter.split(marker).slice(1).join(marker).trim();
     const parsed = JSON.parse(bodyJson) as { content?: string };
-    // #231 P4: the launch-fail letter embeds the compact one-line [bg:
-    // content (the framed embed left that path)
+    // #231 P4 (card since 2026-10-19): the launch-fail letter embeds
+    // the [bg: card content (the framed embed left that path)
     expect(parsed.content).toMatch(
-      /^\[bg:worker:DIED\] \d{8}-\d{6}-\d+ exit=3 \/ no output \/ launch-fail: --worktree needs a git repo/,
+      /^\[bg:worker:DIED\]\n\*\*launch-fail\*\*\n\n- ticket \d{8}-\d{6}-\d+\n- exit=3 \/ no output\n- launch-fail: --worktree needs a git repo/,
     );
   }, 30_000);
 });
 
 /**
- * #231 P4: compact no-output DIED. A wrapper that dies before the run
+ * #231 P4: no-output DIED card. A wrapper that dies before the run
  * produced output (TERM/INT/early exit) used to post the full framed
- * embed - chrome around an empty result. Now it posts a one-line [bg:
- * text: the [bg: prefix is what wakes the agent (isBgWebhook accepts
- * the content post; jarate-wait matches on the webhook id, not the
- * content). The framed embed stays for the captured-output path
- * (main flow).
+ * embed - chrome around an empty result. Now it posts the [bg: card
+ * (tag line + bold header + fact bullets): the [bg: prefix on line 1
+ * is what wakes the agent (isBgWebhook accepts the content post;
+ * jarate-wait matches on the webhook id, not the content). The framed
+ * embed stays for the captured-output path (main flow).
  */
-describe("#231 P4: compact no-output DIED", () => {
+describe("#231 P4: no-output DIED card", () => {
   const captureAll = () => {
     const posts: any[] = [];
     const server = Bun.serve({
@@ -1381,10 +1390,10 @@ describe("#231 P4: compact no-output DIED", () => {
     };
   };
 
-  // (a) empty out.md -> one-line [bg: content (starts with [bg:), no
+  // (a) empty out.md -> [bg: card content (starts with [bg:), no
   // framed embed. The stderr line is the death reason (errf tail via
-  // bg_death_reason) and rides the line as its head.
-  test("TERM'd wrapper with no output: one-line [bg: content, no embed", async () => {
+  // bg_death_reason) and rides the card as its last bullet.
+  test("TERM'd wrapper with no output: [bg: card content, no embed", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const art = path.join(fx.tmp, "art");
@@ -1434,13 +1443,12 @@ describe("#231 P4: compact no-output DIED", () => {
       expect(code).toBe(143);
       expect(cap.posts).toHaveLength(1);
       const cap0 = cap.posts[0];
-      // plain one-line content, [bg: prefix (the wake), no framed embed
+      // card content, [bg: tag on line 1 (the wake), no framed embed
       expect(typeof cap0.content).toBe("string");
       expect(cap0.content.startsWith("[bg:")).toBe(true);
       expect(cap0.content).toBe(
-        `[bg:worker:DIED] ${rec.run} exit=143 / no output / boom-oops`,
+        `[bg:worker:DIED]\n**died (no output)**\n\n- ticket ${rec.run}\n- exit=143\n- boom-oops`,
       );
-      expect(cap0.content.split("\n")).toHaveLength(1);
       expect(cap0.embeds).toBeUndefined();
       // the line must still wake the channel (bridge exemption)
       expect(isBgWebhook({ ...cap0, webhook_id: "123" })).toBe(true);
@@ -5795,22 +5803,24 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
       // fixture cwd (os.tmpdir) is not inside a git repo
       const r = await fx.run(["worker", "--worktree", "t"]);
       expect(r.code).toBe(3);
-      // #222x#234: #234 made the launch-fail DIED a plain one-line
-      // content post (no framed embed); #222's intent - the post names
-      // the cwd, not "no report" - holds on the content line. The
-      // fixture cwd is /tmp/pibg-test-XXXXXXXX (21 chars); the full
-      // not-a-git-repo brief is 79 chars, well under the 120 cap, so
-      // the exact cwd string survives untruncated.
+      // #222x#234 (card since 2026-10-19): #234 made the launch-fail
+      // DIED a plain [bg: card post (no framed embed); #222's intent -
+      // the post names the cwd, not "no report" - holds on the brief
+      // bullet. The fixture cwd is /tmp/pibg-test-XXXXXXXX (21 chars);
+      // the full not-a-git-repo brief is 79 chars, well under the 120
+      // cap, so the exact cwd string survives untruncated.
       const body = hook.getBody();
       expect(body?.embeds).toBeUndefined();
       const content = body?.content;
-      expect(content).toMatch(/^\[bg:worker:DIED\] \d{8}-\d{6}-\d+ exit=3 /);
+      const lines = content.split("\n");
+      expect(lines[0]).toBe(`[bg:worker:DIED]`);
+      expect(lines[1]).toBe(`**launch-fail**`);
       expect(content).toContain("exit=3");
       expect(content).toContain("no output");
       expect(content).toContain("--worktree needs a git repo");
       expect(content).toContain(fx.tmp);
       expect(content).not.toContain("no report");
-      expect(content.split("\n")).toHaveLength(1);
+      expect(lines).toHaveLength(6);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;

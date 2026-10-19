@@ -248,8 +248,10 @@ On completion, `jarate-bg` posts to the Discord webhook:
   A second silent death (issue #57, retry1 did not recover) is reported as
   a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
   treats it like any other FAIL (one fix round, then a decision).
-- **Legacy plain-text fallback:** if the embed builder fails, a
-  `[bg:<profile>:<status>] cwd=... task=...` content post is sent instead.
+- **Plain-text fallback:** if the embed builder fails, a card content
+  post is sent instead (`[bg:<profile>:<status>]` tag line, bold
+  `<status>` header, `cwd`/`task` bullets, then the fenced output —
+  the same card shape as the DIED posts, 2026-10-19).
 - Inbound exemption: piscord's `isBgWebhook` exempts its own callbacks
   (webhook with `[bg:` content, or embed author name starting `pi-bg`) from
   triggering a run — no echo loops.
@@ -377,13 +379,14 @@ alerts on DELTA, not level.
   rebuild) = quiet re-baseline, the dedupe stamp drops. Max 1 ALERT per
   uid per 60 min (`$PI_BG_OOM_DEDUPE_MIN`, default 60; 0 = off); a
   suppressed delta accumulates and ships with the next fired alert.
-- **Finding, not page**: `[bg: agent-watch] OOM: user-<uid>.slice
-  oom_kill +N (T total since baseline B)` content (wakes the operator
-  channel via the webhook marker) + red 40-col frame (uid, kill/oom
-  deltas with totals, max, peak with GiB conversion). M1 restarts nothing
-  and changes no MemoryMax; absent slices are skipped (M2's liveness
-  markers classify dead session vs quiet agent). `--quiet` = detect + log,
-  no post, no baseline advance; `--dry-run` = print only.
+- **Finding, not page**: `[bg: agent-watch]` card content (tag line,
+  bold `OOM-ALERT · user-<uid>.slice` header, then the oom_kill
+  delta bullet + the max/peak GiB bullet — wakes the operator channel
+  via the webhook marker; no embed, the bold header carries the alert
+  since 2026-10-19). M1 restarts nothing and changes no MemoryMax;
+  absent slices are skipped (M2's liveness markers classify dead
+  session vs quiet agent). `--quiet` = detect + log, no post, no
+  baseline advance; `--dry-run` = print only.
 
 ### Agent liveness (watchdog, issue #191 M2)
 
@@ -417,12 +420,12 @@ bridge poll loop) is alive.
     An OLD boot with a still-pre-boot marker escalates like stale: the
     "agent never came up after reboot" case (age = uptime).
   - **SILENT** - marker stale, or gone after having been seen -> WARN
-    post on the ok -> silent transition (orange near-miss, one per
+    card post on the ok -> silent transition (near-miss, one per
     episode).
-  - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT post (red page,
-    silent -> dead). The `user@<uid>.service` cgroup (M1's
-    `PI_BG_OOM_ROOT` seam) empty/gone adds the "session gone" class to the
-    frame: the whole user session is down, not just the agent.
+  - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT card post
+    (silent -> dead). The `user@<uid>.service` cgroup (M1's
+    `PI_BG_OOM_ROOT` seam) empty/gone adds a "session gone" bullet to
+    the card: the whole user session is down, not just the agent.
   - **NEVER-SEEN** - no marker ever observed -> WARN only, never dead
     (fleet deploy window: a peer's bridge may predate the marker code;
     absence of the mechanism is not evidence of death).

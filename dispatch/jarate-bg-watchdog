@@ -108,9 +108,10 @@
 #       uids (own uid + the ~/.config/jarate/fleet-agents roster) and
 #       compares oom_kill/oom against the persisted baseline ($rec_dir/
 #       oom-baseline.json, survives restarts). Positive oom_kill delta
-#       -> OOM-ALERT post ([bg: agent-watch] content prefix wakes the
-#       channel; embed carries delta + absolute counters + memory.max +
-#       memory.peak). Baseline semantics (dead-letter pattern): first
+#       -> OOM-ALERT post ([bg: agent-watch] card wakes the
+#       channel; the card carries oom_kill delta + totals +
+#       memory.max + memory.peak, no embed - the bold header is the
+#       alert). Baseline semantics (dead-letter pattern): first
 #       sight of a uid = quiet baseline (the historical counter never
 #       alerts by itself); the baseline advances ONLY after a successful
 #       post (dead webhook -> the same delta re-posts next sweep, no
@@ -136,8 +137,8 @@
 #       "agent never came up after reboot" case) / SILENT (marker stale,
 #       or gone after having been seen -> WARN post, ok -> silent) /
 #       AGENT-DEAD (two consecutive stale sweeps -> ALERT post, silent
-#       -> dead; the user@<uid>.service cgroup empty/gone adds the
-#       "session gone" class to the frame) / NEVER-SEEN (no marker ever
+#       -> dead; the user@<uid>.service cgroup empty/gone adds a
+#       "session gone" bullet to the card) / NEVER-SEEN (no marker ever
 #       observed -> WARN only, never dead: a peer's bridge may predate
 #       the marker code). State: $rec_dir/live-state.json (same location
 #       + write discipline as oom-baseline.json: state and the dedupe
@@ -1776,50 +1777,33 @@ PY
 
 # wd_build_oom <body-file> <uid> <delta-kill> <total-kill> <base-kill>
 #   <delta-oom> <total-oom> <base-oom> <memory.max> <memory.peak>
-# OOM-ALERT finding (issue #191 M1). The body carries BOTH the
-# [bg: agent-watch] content (the webhook wake marker, isBgWebhook) and
-# the 40-col frame embed (delta + absolute counters + memory.max +
-# memory.peak, the spec's post content). memory.max "max" (uncapped)
-# passes through; byte values get a GiB rendering.
+# OOM-ALERT finding (issue #191 M1). The body is the [bg: agent-watch]
+# card (2026-10-19: tag line + bold header + fact bullets, no embed -
+# single visual object; the bold header carries the alert, same
+# aesthetic as the restart-wake content-only post): oom_kill delta +
+# totals, memory.max + memory.peak. The [bg: prefix on line 1 is the
+# webhook wake marker (isBgWebhook). memory.max "max" (uncapped) passes
+# through; byte values get a GiB rendering.
 wd_build_oom() {
   local bodyfile="$1" uid="$2" dk="$3" tk="$4" bk="$5" doo="$6" to="$7" bo="$8" mx="$9" pk="${10}"
   WD_O_UID="$uid" WD_O_DK="$dk" WD_O_TK="$tk" WD_O_BK="$bk" WD_O_DO="$doo" \
   WD_O_TO="$to" WD_O_BO="$bo" WD_O_MAX="$mx" WD_O_PEAK="$pk" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
-import json, os, sys, datetime
+import json, os, sys
 E = lambda k: os.environ.get("WD_O_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
-VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def kv(key, val):
-    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
 def gib(s):
     try:
         n = int(s)
     except ValueError:
         return s or "n/a"  # "max" (uncapped) or empty (no memory.peak)
-    return f"{n} ({n / 2**30:.1f}G)"
+    return f"{n / 2**30:.1f}G"
 uid = E("UID")
-lines = ["\u250c oom \u00b7 user-" + uid + ".slice",
-         "\u251c $ jarate-bg-watchdog",
-         kv("uid", uid),
-         kv("kill", f"+{E('DK')} ({E('TK')} total, base {E('BK')})"),
-         kv("oom", f"+{E('DO')} ({E('TO')} total, base {E('BO')})"),
-         kv("max", gib(E("MAX"))),
-         kv("peak", gib(E("PEAK"))),
-         kv("note", "agent-slice OOM kills"),
-         "\u2514"]
-content = (f"[bg: agent-watch] OOM: user-{uid}.slice oom_kill "
-           f"+{E('DK')} ({E('TK')} total since baseline {E('BK')})")
-embed = {"author": {"name": "pi-bg watchdog"},
-         "color": 15158332,  # red: kills in the agent slice (DEAD is orange)
-         "title": f"OOM-ALERT \u00b7 user-{uid}.slice",
-         "description": "```bash\n" + "\n".join(lines) + "\n```",
-         "footer": {"text": "pi-bg watchdog (oom, issue #191)"},
-         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-json.dump({"content": content, "embeds": [embed]}, sys.stdout)
+content = (f"[bg: agent-watch]\n"
+           f"**OOM-ALERT \u00b7 user-{uid}.slice**\n"
+           f"\n"
+           f"- oom_kill +{E('DK')} ({E('TK')} total, base {E('BK')})\n"
+           f"- max {gib(E('MAX'))} / peak {gib(E('PEAK'))}")
+json.dump({"content": content}, sys.stdout)
 PY
 }
 
@@ -1934,8 +1918,8 @@ fi
 #              on the ok -> silent transition (one per episode)
 #   AGENT-DEAD still stale on the NEXT sweep (two consecutive stale
 #              sweeps) -> ALERT post, silent -> dead; the user@<uid>
-#              .service cgroup empty/gone adds the "session gone" class
-#              to the frame (whole session down, not just the agent)
+#              .service cgroup empty/gone adds the "session gone" bullet
+#              to the card (whole session down, not just the agent)
 #   NEVER-SEEN no marker ever observed -> WARN only, never dead (fleet
 #              deploy window: a peer's bridge may predate the marker
 #              code; absence of the mechanism is not evidence of death)
@@ -2070,49 +2054,31 @@ PY
 }
 
 # wd_build_live <body-file> <uid> <kind> <age> <note> <session>
-# kind: SILENT (orange, near-miss, one per episode) or AGENT-DEAD (red,
-# two consecutive stale sweeps). The body carries BOTH the [bg: agent-watch]
-# content (the webhook wake marker, isBgWebhook) and the 40-col frame
-# (age + note + the session class). A session-gone AGENT-DEAD carries the
-# class in the title (the whole user session is down, not just the agent).
+# kind: SILENT (near-miss, one per episode) or AGENT-DEAD (two
+# consecutive stale sweeps). The body is the [bg: agent-watch] card
+# (2026-10-19: tag line + bold header + fact bullets, no embed -
+# single visual object; the bold header carries the alert): age + note,
+# plus a "session gone" bullet when the user session cgroup is
+# empty/gone (the whole session is down, not just the agent). The [bg:
+# prefix on line 1 is the webhook wake marker (isBgWebhook).
 wd_build_live() {
   local bodyfile="$1" uid="$2" kind="$3" age="$4" note="$5" sess="$6"
   WD_L_UID="$uid" WD_L_KIND="$kind" WD_L_AGE="$age" WD_L_NOTE="$note" \
   WD_L_SESS="$sess" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
-import json, os, sys, datetime
+import json, os, sys
 E = lambda k: os.environ.get("WD_L_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
-# 7-col labels ("session" is the longest) -> 28-col value budget
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def kv(key, val):
-    return "\u251c " + key.ljust(7) + ": " + clip_end(val, FRAME_W - 12)
 uid = E("UID")
 kind = E("KIND") or "SILENT"
-color = 15158332 if kind == "AGENT-DEAD" else 15105570  # red / orange
 sess = E("SESS") or "unknown"
-title = kind + " \u00b7 user-" + uid
-if kind == "AGENT-DEAD" and sess == "gone":
-    title += " (session gone)"
-lines = ["\u250c " + kind.lower() + " \u00b7 user-" + uid,
-         "\u251c $ jarate-bg-watchdog live",
-         kv("uid", uid),
-         kv("age", E("AGE")),
-         kv("note", E("NOTE")),
-         kv("session", sess),
-         "\u2514"]
-content = "[bg: agent-watch] " + kind + ": user-" + uid + " " + E("AGE")
-if kind == "AGENT-DEAD" and sess == "gone":
-    content += ", session gone"
-embed = {"author": {"name": "pi-bg watchdog"},
-         "color": color,
-         "title": title,
-         "description": "```bash\n" + "\n".join(lines) + "\n```",
-         "footer": {"text": "pi-bg watchdog (live, issue #191)"},
-         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-json.dump({"content": content, "embeds": [embed]}, sys.stdout)
+content = (f"[bg: agent-watch]\n"
+           f"**{kind} \u00b7 user-{uid}**\n"
+           f"\n"
+           f"- age {E('AGE')}\n"
+           f"- {E('NOTE')}")
+if sess == "gone":
+    content += "\n- session gone"
+json.dump({"content": content}, sys.stdout)
 PY
 }
 
