@@ -4929,7 +4929,17 @@ export function autoCompactByToken(
 ): void {
   setTimeout(() => {
     try {
-      void maybeAutoCompactByToken(pi, ctx);
+      // The gate is async: a throw inside REJECTS the promise, it does
+      // not hit this try/catch (sync throws only). A stale ctx (session
+      // replaced after the timer armed — pi -p always: the session ends
+      // at run end) rejects on the first ctx.cwd read; unhandled, that
+      // rejection kills `pi -p` at exit (2026-10-19 crash).
+      maybeAutoCompactByToken(pi, ctx).catch((e) => {
+        console.error(
+          "[handoff] auto-compact gate failed:",
+          sanitizeUnknownValue(e),
+        );
+      });
     } catch (e) {
       console.error(
         "[handoff] auto-compact gate failed:",
@@ -4946,9 +4956,23 @@ export async function maybeAutoCompactByToken(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
 ): Promise<void> {
-  const settings = resolveHandoffSettings(ctx.cwd);
+  // The settle timer may fire after the session was replaced or reloaded:
+  // the ctx.cwd getter throws "stale" then. Guard the first read — a
+  // stale ctx logs one line and skips the gate (the replacement session's
+  // own settle re-runs it).
+  let cwd: string;
+  try {
+    cwd = ctx.cwd;
+  } catch (e) {
+    console.error(
+      "[handoff] auto-compact gate: stale ctx, skipping:",
+      sanitizeUnknownValue(e),
+    );
+    return;
+  }
+  const settings = resolveHandoffSettings(cwd);
   if (!settings.enabled) return;
-  const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
+  const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(cwd));
   if (ch?.type !== "discord") return;
   // A compact/restart op window is open for this channel: let it settle —
   // its own settle re-runs this gate.
