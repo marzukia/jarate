@@ -99,18 +99,18 @@ describe("undo in a non-git dir (file preimages)", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toBe("[ok] undone: 2 files");
+    expect(undo.text).toBe("undone: 2 files");
     expect(undo.restarted).toBe(false);
     expect(fs.readFileSync(existing, "utf8")).toBe("before");
     expect(fs.existsSync(created)).toBe(false);
 
     const redo = performRedo();
-    expect(redo.text).toBe("[ok] redone: 2 files");
+    expect(redo.text).toBe("redone: 2 files");
     expect(fs.readFileSync(existing, "utf8")).toBe("after-edit");
     expect(fs.readFileSync(created, "utf8")).toBe("new-content");
 
     // one level deep
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 
   test("undo of a run that deleted a pre-existing file", () => {
@@ -125,11 +125,11 @@ describe("undo in a non-git dir (file preimages)", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toBe("[ok] undone: 1 file");
+    expect(undo.text).toBe("undone: 1 file");
     expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
 
     // conversation-less undo parks no redo record
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 });
 
@@ -150,19 +150,19 @@ describe("undo in a git repo", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toMatch(/^\[ok\] undone: \d+ files$/);
+    expect(undo.text).toMatch(/^undone: \d+ files$/);
     expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A");
     expect(fs.existsSync(path.join(cwd, "b.txt"))).toBe(false);
     expect(git(cwd, "rev-parse", "HEAD")).toBe(c1);
     expect(c2 !== c1).toBe(true); // sanity: the run did commit
 
     const redo = performRedo();
-    expect(redo.text).toMatch(/^\[ok\] redone: \d+ files$/);
+    expect(redo.text).toMatch(/^redone: \d+ files$/);
     expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A-modified");
     expect(fs.readFileSync(path.join(cwd, "b.txt"), "utf8")).toBe("B");
     expect(git(cwd, "rev-parse", "HEAD")).toBe(c2);
 
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 
   test("staged-only changes (no commit) are reverted", () => {
@@ -176,7 +176,7 @@ describe("undo in a git repo", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toBe("[ok] undone: 1 file");
+    expect(undo.text).toBe("undone: 1 file");
     expect(fs.readFileSync(path.join(cwd, "s.txt"), "utf8")).toBe("S");
     expect(git(cwd, "status", "--porcelain")).toBe("");
   });
@@ -197,13 +197,13 @@ describe("undo in a git repo", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toMatch(/^\[ok\] undone: \d+ files$/);
+    expect(undo.text).toMatch(/^undone: \d+ files$/);
     expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A");
     // the text file must NOT be lost when a binary file is in the same patch
     expect(fs.readFileSync(path.join(cwd, "img.bin"))).toEqual(bin);
 
     const redo = performRedo();
-    expect(redo.text).toMatch(/^\[ok\] redone: \d+ files$/);
+    expect(redo.text).toMatch(/^redone: \d+ files$/);
     expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("A-modified");
     expect(fs.readFileSync(path.join(cwd, "img.bin"))).toEqual(
       Buffer.from([0x02, 0x03, 0x04]),
@@ -479,7 +479,7 @@ describe("re-run trigger (F1)", () => {
 
     const undo = performUndo(file);
     expect(undo.reRun).toBe(true);
-    expect(undo.text).toBe("[ok] undone: conversation (re-running)");
+    expect(undo.text).toBe("undone: conversation (re-running)");
 
     // post-restart: the bridge consumes the trigger for this session
     expect(consumeRerun(file)).toBe("fix the bug");
@@ -568,7 +568,7 @@ describe("run targeting (F3/F4/F5)", () => {
     expect(latestRun(null)?.meta.assistantOutput).toBe(true);
 
     const undo = performUndo(sess);
-    expect(undo.text).toBe("[ok] undone: 1 file");
+    expect(undo.text).toBe("undone: 1 file");
     expect(fs.readFileSync(a, "utf8")).toBe("pre"); // run1's files reverted
   });
 
@@ -609,7 +609,7 @@ describe("run targeting (F3/F4/F5)", () => {
     finishRun(r2, cwd, sess, true);
 
     const redo = performRedo();
-    expect(redo.text).toBe("[!] redo stale: newer run completed");
+    expect(redo.text).toBe("redo stale: newer run completed");
     // record kept: the state is still restorable once the new turn is dealt with
     expect(fs.existsSync(path.join(storeRoot(), "redo.json"))).toBe(true);
   });
@@ -700,9 +700,9 @@ describe("performUndo + performRedo end to end", () => {
     };
     const file = makeSession(cwd, [header, trigger]);
     const r = performUndo(file);
-    expect(r.text).toBe("[!] nothing to undo");
+    expect(r.text).toBe("nothing to undo");
     expect(r.restarted).toBe(false);
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 
   test("conversation-only undo when the store has no matching run", () => {
@@ -751,7 +751,7 @@ describe("performUndo + performRedo end to end", () => {
 
     // no runs recorded (store empty) -> conversation-only revert
     const undo = performUndo(file);
-    expect(undo.text).toBe("[ok] undone: conversation (re-running)");
+    expect(undo.text).toBe("undone: conversation (re-running)");
     expect(undo.restarted).toBe(true);
     const kept = fs
       .readFileSync(file, "utf8")
@@ -764,7 +764,7 @@ describe("performUndo + performRedo end to end", () => {
     expect(consumeRerun(file)).toBe("q2");
 
     const redo = performRedo();
-    expect(redo.text).toBe("[ok] redone: conversation");
+    expect(redo.text).toBe("redone: conversation");
     expect(redo.restarted).toBe(true);
     const full = fs
       .readFileSync(file, "utf8")
@@ -815,9 +815,7 @@ describe("cap and exclusion hardening (F7/F10)", () => {
     finishRun(run, cwd, null);
 
     const undo = performUndo(null);
-    expect(undo.text).toBe(
-      "[ok] undone: 1 file (kept 1 >20MB file, not restored)",
-    );
+    expect(undo.text).toBe("undone: 1 file (kept 1 >20MB file, not restored)");
     expect(fs.readFileSync(small, "utf8")).toBe("pre"); // normal file restored
     expect(fs.existsSync(big)).toBe(true); // NOT deleted
     expect(fs.readFileSync(big, "utf8")).toBe("now small (edited)"); // content not restorable
@@ -1067,7 +1065,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     expect(undo.restarted).toBe(true);
     expect(undo.reRun).toBe(true);
     expect(undo.text).toBe(
-      "[ok] undone: 2 turns + 3 files + conversation (re-running q2)",
+      "undone: 2 turns + 3 files + conversation (re-running q2)",
     );
     // session: back to pre-2nd-turn state (through T2)
     expect(ids(sess)).toEqual(["s1", "T1", "A1", "T2"]);
@@ -1081,12 +1079,12 @@ describe("#46 /undo N (multi-turn rollback)", () => {
 
     // redo is ONE level: back to the state AFTER run 2 (pre-run-3)
     const redo = performRedo();
-    expect(redo.text).toBe("[ok] redone: 2 files + conversation");
+    expect(redo.text).toBe("redone: 2 files + conversation");
     expect(ids(sess)).toEqual(chain.map((c) => c.id));
     expect(fs.readFileSync(path.join(cwd, "a.txt"), "utf8")).toBe("a1");
     expect(fs.readFileSync(path.join(cwd, "b.txt"), "utf8")).toBe("b2");
     expect(fs.readFileSync(path.join(cwd, "c.txt"), "utf8")).toBe("c0");
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 
   test("/undo 2 (non-git): restores the selected run's files only (documented limit)", () => {
@@ -1120,7 +1118,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     // (pre-cut, kept turn); c stays c3 — run 3's change is NOT in run 2's
     // snapshot (the documented N>1 files-mode limit).
     expect(undo.text).toBe(
-      "[ok] undone: 2 turns + 1 file + conversation (re-running q2)",
+      "undone: 2 turns + 1 file + conversation (re-running q2)",
     );
     expect(fs.readFileSync(a, "utf8")).toBe("a1");
     expect(fs.readFileSync(b, "utf8")).toBe("b0");
@@ -1128,10 +1126,10 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     expect(ids(sess)).toEqual(["s1", "T1", "A1", "T2"]);
 
     const redo = performRedo();
-    expect(redo.text).toBe("[ok] redone: 1 file + conversation");
+    expect(redo.text).toBe("redone: 1 file + conversation");
     expect(fs.readFileSync(b, "utf8")).toBe("b2");
     expect(fs.readFileSync(c, "utf8")).toBe("c3"); // still run 3's file
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
   });
 
   test("N > chain length: one [!] line, no action", () => {
@@ -1147,18 +1145,18 @@ describe("#46 /undo N (multi-turn rollback)", () => {
 
     const before = fs.readFileSync(sess, "utf8");
     const r = performUndo(sess, 4);
-    expect(r.text).toBe("[!] nothing to undo: only 3 turns back");
+    expect(r.text).toBe("nothing to undo: only 3 turns back");
     expect(r.restarted).toBe(false);
     expect(r.reRun).toBe(false);
     expect(fs.readFileSync(sess, "utf8")).toBe(before); // session untouched
     expect(fs.readFileSync(f, "utf8")).toBe("v1"); // files untouched
     expect(fs.existsSync(path.join(storeRoot(), "redo.json"))).toBe(false);
     expect(fs.existsSync(path.join(storeRoot(), "rerun.json"))).toBe(false);
-    expect(performRedo().text).toBe("[!] nothing to redo");
+    expect(performRedo().text).toBe("nothing to redo");
 
     // no session at all: 0 turns back
     expect(performUndo(null, 2).text).toBe(
-      "[!] nothing to undo: only 0 turns back",
+      "nothing to undo: only 0 turns back",
     );
   });
 
@@ -1174,7 +1172,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     finishRun(r1, cwd, sess, true);
 
     const r = performUndo(sess, 1);
-    expect(r.text).toBe("[ok] undone: 1 file");
+    expect(r.text).toBe("undone: 1 file");
     expect(r.restarted).toBe(false);
     expect(fs.readFileSync(f, "utf8")).toBe("v0");
 
@@ -1189,7 +1187,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     fs.writeFileSync(f2, "v1");
     finishRun(r2, cwd2, sess2, true);
     const r2res = performUndo(sess2, 2);
-    expect(r2res.text).toBe("[!] nothing to undo: only 0 turns back");
+    expect(r2res.text).toBe("nothing to undo: only 0 turns back");
     expect(fs.readFileSync(f2, "utf8")).toBe("v1"); // untouched
   });
 
@@ -1207,20 +1205,20 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     performUndo(sess, 2);
     // the undone runs include r3 (seq 3) = the newest: an immediate redo
     // must not treat it as "newer" (legacy check compared against r2's seq)
-    expect(performRedo().text).toBe("[ok] redone: conversation");
+    expect(performRedo().text).toBe("redone: conversation");
 
     // a NEW run after the undo still makes the (kept) record stale
     performUndo(sess, 1);
     const r4 = startRun(cwd)!;
     finishRun(r4, cwd, sess, true);
-    expect(performRedo().text).toBe("[!] redo stale: newer run completed");
+    expect(performRedo().text).toBe("redo stale: newer run completed");
   });
 
   test("N=1 ack stays byte-identical; N>1 names turn count + re-run pointer", () => {
     // N=1 (default and explicit): the legacy ack, character for character
     const f1 = makeSession(dir("ack1"), chain);
     const u1 = performUndo(f1);
-    expect(u1.text).toBe("[ok] undone: conversation (re-running)");
+    expect(u1.text).toBe("undone: conversation (re-running)");
     const f1b = makeSession(dir("ack1b"), chain);
     expect(performUndo(f1b, 1).text).toBe(u1.text);
     consumeRerun(f1);
@@ -1230,7 +1228,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     // points (the kept trigger, re-run on restart)
     const f2 = makeSession(dir("ack2"), chain);
     const u2 = performUndo(f2, 2);
-    expect(u2.text).toBe("[ok] undone: 2 turns + conversation (re-running q2)");
+    expect(u2.text).toBe("undone: 2 turns + conversation (re-running q2)");
     consumeRerun(f2);
   });
 
@@ -1248,7 +1246,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     const f1 = makeSession(dir("ptrlong"), longChain);
     const u1 = performUndo(f1, 2);
     expect(u1.text).toBe(
-      `[ok] undone: 2 turns + conversation (re-running ${"x".repeat(70)})`,
+      `undone: 2 turns + conversation (re-running ${"x".repeat(70)})`,
     );
     consumeRerun(f1);
 
@@ -1266,7 +1264,7 @@ describe("#46 /undo N (multi-turn rollback)", () => {
     const f3 = makeSession(dir("ptrnl"), nlChain);
     const u3 = performUndo(f3, 2);
     expect(u3.text).toBe(
-      "[ok] undone: 2 turns + conversation (re-running line one line two)",
+      "undone: 2 turns + conversation (re-running line one line two)",
     );
   });
 });

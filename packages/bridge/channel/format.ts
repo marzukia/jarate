@@ -557,10 +557,10 @@ function braceDepth(line: string): number {
 /** One top-level (outside any existing fence) line is MACHINE state when
  * it carries box-drawing frame chars, is a bare path, a deterministic log
  * line, or a JSON object line. Tagged status lines ([ok] [!] ...) are
- * PROSE per STYLE.md 3.1 (tag convention retired 2026-10-19) - left
- * alone. Everything else - prose, lists, headings, blockquotes, inline
- * code - is left alone too (conservative: a missed fence is less bad
- * than a mangled message). */
+ * machine output per STYLE.md 3.1 (Andryo 2026-10-20) - left alone (the
+ * bridge ships those already fenced). Everything else - prose, lists,
+ * headings, blockquotes, inline code - is left alone too (conservative: a
+ * missed fence is less bad than a mangled message). */
 function isMachineLine(raw: string): boolean {
   const t = raw.trim();
   if (t === "") return false;
