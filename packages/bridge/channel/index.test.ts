@@ -911,12 +911,11 @@ describe("extension handlers (A1/A2/A4)", () => {
   test("A1: message_end early send unreacts the 👀 ack on the last inbound", async () => {
     await handleInbound(pi, inbound("hello", "m123"), ctx);
     await handlers.turn_start(null, ctx);
+    // step-final (text only) is the early-send path; intermediate
+    // (text + toolCall) lands in the SPEC B live-text slot instead
     const stepFinal = {
       role: "assistant",
-      content: [
-        { type: "text", text: "working on it" },
-        { type: "toolCall", toolName: "read", arguments: {} },
-      ],
+      content: [{ type: "text", text: "working on it" }],
     };
     await handlers.message_end({ message: stepFinal }, ctx);
 
@@ -4870,19 +4869,29 @@ describe("live intermediate text (SPEC B)", () => {
     expect(posts()).toContain("hi there");
   });
 
-  test("owner-only: verbose 0 -> early-send behavior unchanged, no live-text message", async () => {
+  test("level 0: live text posts on the first tool call, edits in place, deletes on the step-final (2026-10-19)", async () => {
     verboseOverride.set("ch1", 0);
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.message_end({ message: inter("working text") }, ctx);
+    // NOT early-sent as a standalone message: it waits in the live-text
+    // slot for the post gate (the first tool call)
+    expect(posts()).not.toContain("working text");
     await tc("read", { path: "a.txt" });
-    // intermediate text early-sent as a standalone message (today's behavior)
-    expect(posts()).toContain("working text");
-    // no live-text message: no placeholder, no edit
+    // the tool call posts the ONE ephemeral live-text message
+    const tId = idOf("working text");
+    expect(tId).toBeDefined();
+    // level 0: no tool frame, no placeholder
+    expect(posts().some((p) => p.includes("┌ working"))).toBe(false);
     expect(posts()).not.toContain(LIVE_TEXT_PLACEHOLDER);
-    expect(patches()).toHaveLength(0);
-    // and the run still ends cleanly with its final
+    // a second intermediate text edits the SAME message in place
+    jest.advanceTimersByTime(LIVE_TEXT_THROTTLE_MS + 100);
+    await handlers.message_end({ message: inter("second thought") }, ctx);
+    expect(patches(tId!)).toContain("second thought");
+    expect(posted.filter((p) => p.content === "working text")).toHaveLength(1);
+    // the step-final deletes the ephemeral message and posts as its own
     await handlers.message_end({ message: fin("done") }, ctx);
+    expect(deletes(tId!)).toHaveLength(1);
     expect(posts()).toContain("done");
   });
 
