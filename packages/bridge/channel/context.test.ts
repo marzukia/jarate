@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { matchCommand } from "./commands";
 import {
   CONTEXT_MAX_N,
   type CtxScan,
@@ -11,7 +12,6 @@ import {
   renderContext,
   scanContextFile,
 } from "./context";
-import { matchCommand } from "./index";
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────
 // Entry shapes match pi's session jsonl (see a real session file: message
