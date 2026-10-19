@@ -97,7 +97,17 @@ embed = {
 }
 lines = [l for l in inflight.splitlines() if l.strip()]
 if lines:
-    embed["fields"] = [{"name": "in-flight", "value": "\n".join(lines)}]
+    val, kept = "\n".join(lines), []
+    if len(val) > 1000:  # Discord field-value limit is 1024: an over-long
+        # field 400s the WHOLE wake post (review MEDIUM 2026-10-19)
+        total = 0
+        for l in lines:
+            if total + len(l) + 1 > 985:
+                break
+            kept.append(l)
+            total += len(l) + 1
+        val = "\n".join(kept) + f"\u2026 +{len(lines) - len(kept)} lines - see /jobs"
+    embed["fields"] = [{"name": "in-flight", "value": val}]
 print(json.dumps({"content": "[bg: pi-restart] " + status, "embeds": [embed]}))
 PY
   )

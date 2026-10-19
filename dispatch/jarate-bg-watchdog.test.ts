@@ -3486,6 +3486,7 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(body.embeds[0].footer?.text).toBe("jarate-bg-watchdog");
       const fld = cardFields(body);
       expect(fld.oom_kill).toBe("+2 (2 total, base 0)");
+      expect(fld.oom).toBe("+5 (5 total, base 0)");
       expect(fld.max).toBe("24.0G");
       expect(fld.peak).toBe("21.2G");
       // baseline advanced AFTER the successful post, dedupe stamp set
@@ -3545,6 +3546,7 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       );
       const fld2 = cardFields(f.posts[0]);
       expect(fld2.oom_kill).toBe("+3 (3 total, base 0)");
+      expect(fld2.oom).toBe("+7 (7 total, base 0)");
       expect(fld2.max).toBe("n/a");
       expect(fld2.peak).toBe("n/a");
       expect(f.baseline()[String(OWN)].oom_kill).toBe(3);
@@ -3580,6 +3582,7 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(r2.code).toBe(0);
       expect(f.posts).toHaveLength(1);
       expect(cardFields(f.posts[0]).oom_kill).toBe("+3 (3 total, base 0)");
+      expect(cardFields(f.posts[0]).oom).toBe("+6 (6 total, base 0)");
     } finally {
       f.close();
     }

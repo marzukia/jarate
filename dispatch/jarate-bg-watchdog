@@ -109,9 +109,8 @@
 #       compares oom_kill/oom against the persisted baseline ($rec_dir/
 #       oom-baseline.json, survives restarts). Positive oom_kill delta
 #       -> OOM-ALERT post ([bg: agent-watch] card wakes the
-#       channel; the card carries oom_kill delta + totals +
-#       memory.max + memory.peak, no embed - the bold header is the
-#       alert). Baseline semantics (dead-letter pattern): first
+#       channel; the card carries oom_kill + oom counters +
+#       memory.max + memory.peak as fields in ONE red embed). Baseline semantics (dead-letter pattern): first
 #       sight of a uid = quiet baseline (the historical counter never
 #       alerts by itself); the baseline advances ONLY after a successful
 #       post (dead webhook -> the same delta re-posts next sweep, no
@@ -1807,6 +1806,7 @@ json.dump({"content": content, "embeds": [{
                     "kernel OOM lines are not journaled on this box - the cgroup counters are the record."),
     "fields": [
         {"name": "oom_kill", "value": f"+{E('DK')} ({E('TK')} total, base {E('BK')})", "inline": True},
+        {"name": "oom", "value": f"+{E('DO')} ({E('TO')} total, base {E('BO')})", "inline": True},
         {"name": "max", "value": gib(E("MAX")), "inline": True},
         {"name": "peak", "value": gib(E("PEAK")), "inline": True},
     ],

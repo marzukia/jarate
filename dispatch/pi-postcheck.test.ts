@@ -447,4 +447,43 @@ describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () =
       f.setInflight(null);
     }
   });
+
+  test("in-flight >1024 chars: field capped at Discord's limit with overflow suffix (review MEDIUM 2026-10-19)", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\n",
+    );
+    // 20 realistic ticket lines (~130 chars each) -> ~2.7KB joined: the
+    // pre-fix field value would 400 the whole webhook post
+    const lines = Array.from(
+      { length: 20 },
+      (_, i) =>
+        `20261019-071832-5730${i} worker 30:45 # JARATE - card-format all plain [bg: webhook posts (Andryo 2026-10-19)`,
+    );
+    const joined = lines.join("\n");
+    expect(joined.length).toBeGreaterThan(1024);
+    f.setInflight(joined);
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      const hb = webhookPost(f);
+      expect(hb.content).toBe(
+        "[bg: pi-restart] [ok] healthy 90s after restart",
+      );
+      const fields = hb.embeds?.[0].fields ?? [];
+      // Discord-shippable: no field value over the 1024 limit
+      for (const x of fields) {
+        expect(x.value.length).toBeLessThanOrEqual(1024);
+      }
+      const fld = fields[0];
+      expect(fld?.name).toBe("in-flight");
+      expect(fld?.value.startsWith(lines[0])).toBe(true);
+      expect(fld?.value).toContain("\u2026 +");
+      expect(fld?.value.endsWith("lines - see /jobs")).toBe(true);
+      expect(fld?.value).not.toBe(joined);
+    } finally {
+      f.setInflight(null);
+    }
+  });
 });

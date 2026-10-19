@@ -1598,6 +1598,77 @@ describe("#231 P6: embed-builder fallback posts the card family", () => {
       server.stop(true);
     }
   }, 30_000);
+
+  test("fallback cwd field is censored (review LOW 2026-10-19): a registry secret in the cwd path does not ship", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const bin = path.join(fx.tmp, "bin");
+    // same seam as the sibling test: kill only the bg_build heredoc
+    fs.writeFileSync(
+      path.join(bin, "python3"),
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "-" ] && [ "$#" -eq 1 ]; then',
+        "  tf=$(mktemp) || exit 1",
+        '  cat > "$tf"',
+        '  if grep -q FRAME_W "$tf"; then rm -f "$tf"; exit 1; fi',
+        '  /usr/bin/python3 - < "$tf"',
+        "  rc=$?",
+        '  rm -f "$tf"',
+        '  exit "$rc"',
+        "fi",
+        'exec /usr/bin/python3 "$@"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(path.join(bin, "python3"), 0o755);
+    // a registry secret that rides INSIDE the cwd path
+    const secret = "censor-probe-value-9f2e";
+    const secretFile = path.join(fx.tmp, "secrets.txt");
+    fs.writeFileSync(secretFile, `${secret}\n`);
+    const secretCwd = path.join(fx.tmp, secret);
+    fs.mkdirSync(secretCwd, { recursive: true });
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    fx.env.JARATE_SECRETS_FILE = secretFile;
+    try {
+      const r = await runScript(
+        PI_BG,
+        ["worker", "cwd censor probe task"],
+        fx.env,
+        secretCwd,
+      );
+      expect(r.code).toBe(0);
+      expect(posts).toHaveLength(1);
+      const em = posts[0].embeds?.[0];
+      expect(em.title).toBe("fallback \u00b7 OK");
+      const fld = Object.fromEntries(
+        em.fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      // the raw secret is gone; the registry tag is in its place
+      expect(fld.cwd).not.toContain(secret);
+      expect(fld.cwd).toContain("[REDACTED:secret#1]");
+      // the rest of the path survives
+      expect(fld.cwd).toContain(fx.tmp);
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      delete fx.env.JARATE_SECRETS_FILE;
+      server.stop(true);
+    }
+  }, 30_000);
 });
 
 /**

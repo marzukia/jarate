@@ -2393,7 +2393,7 @@ print(json.dumps({"content": "[bg:%s:%s] ticket %s %s rc=%s" % (sys.argv[1], sta
     "description": "the embed builder was unavailable - legacy card fallback for this run.",
     "fields": fields,
     "footer": {"text": "jarate-bg"},
-}]}))' "${profile}" "$status" "$rc" "$run_id" "$(pwd)" \
+}]}))' "${profile}" "$status" "$rc" "$run_id" "$(bg_censor "$(pwd)")" \
       "$(bg_censor "$task")" "$(bg_censor "$out")" > "$bodyf"
     bg_post "$bodyf" || rm -f "$bodyf"
   fi

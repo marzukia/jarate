@@ -399,7 +399,7 @@ alerts on DELTA, not level.
 - **Finding, not page**: the embed card family (2026-10-19) - content
   one line `[bg: agent-watch] OOM-ALERT user-<uid>.slice oom_kill +N`
   (wakes the operator channel via the webhook marker) + one embed
-  (title `agent-watch · OOM`, red, `oom_kill`/`max`/`peak` fields). M1
+  (title `agent-watch · OOM`, red, `oom_kill`/`oom`/`max`/`peak` fields). M1
   restarts nothing and changes no MemoryMax; absent slices are skipped
   (M2's liveness markers classify dead session vs quiet agent).
   `--quiet` = detect + log, no post, no baseline advance; `--dry-run`
