@@ -2318,7 +2318,8 @@ export function finalText(message: unknown): string | null {
 // The operator watches the agent think: intermediate (non-final) text
 // appears as ONE ephemeral message below the tool-call block, edited in
 // place as new segments arrive, deleted when the final is sent or the
-// run ends. Gated on tool-call forwarding (verbose > 0).
+// run ends. Level-independent: live text posts at every verbose level;
+// the level gates tool-call frames only (Andryo 2026-10-19).
 /** Tail budget for the live-text message: keep the last N chars, prepend
  *  an ellipsis when cut (900 + ellipsis stays well under Discord's 2000
  *  char limit after markdown conversion). */
@@ -3092,13 +3093,15 @@ export default function (pi: ExtensionAPI) {
   };
 
   // ─── Live intermediate text (SPEC B) ──────────────────────────────────
-  // Post only on a tool_call event (first call of the run) so the message
-  // always lands BELOW the tool-call block; message_end only edits an
-  // already-posted message. Throttle: LIVE_TEXT_THROTTLE_MS between edits;
-  // skip when the content is unchanged. Every network path is best-effort
-  // — logged, never breaks the run.
+  // Available at EVERY verbose level (level 0 "text" included): the level
+  // gates the tool-call FRAMES only, never the live text. Post only on a
+  // tool_call event (first call of the run) so the message always lands
+  // BELOW the tool-call block; message_end only edits an already-posted
+  // message. Throttle: LIVE_TEXT_THROTTLE_MS between edits; skip when the
+  // content is unchanged. Every network path is best-effort — logged,
+  // never breaks the run.
   const isLiveTextChannel = (ch: ChannelConfig): boolean =>
-    ch.type === "discord" && verboseLevel(ch) > 0;
+    ch.type === "discord";
 
   const updateLiveText = async (ch: ChannelConfig, mayPost: boolean) => {
     if (!isLiveTextChannel(ch)) return;
@@ -3441,10 +3444,11 @@ export default function (pi: ExtensionAPI) {
     // SPEC B: live intermediate text. A tool call ARMS the ephemeral
     // message; it is posted on the first real intermediate text at or
     // after that point (never a placeholder), then edited in place
-    // (throttled, skip-unchanged). No-op at level 0; a run with zero tool
-    // calls or zero intermediate text never posts one.
+    // (throttled, skip-unchanged). Available at every verbose level —
+    // the level gates the frames only; a run with zero tool calls or zero
+    // intermediate text never posts one.
     liveTextArmed = true;
-    await updateLiveText(ch, lvl > 0);
+    await updateLiveText(ch, liveTextArmed);
   });
 
   // ─── Typing indicator while working ────────────────────────────────────
