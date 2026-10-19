@@ -1210,7 +1210,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     jest.advanceTimersByTime(workingMaxMs() - 5000 + 5000);
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe(fence("[!] run stalled - /stop to abort"));
+    expect(edits().at(-1)).toBe("[!] run stalled - /stop to abort");
 
     // tick is gone: advancing further must not edit the frame again
     const n = edits().length;
@@ -2063,12 +2063,12 @@ describe("extension handlers (A1/A2/A4)", () => {
 
       // The final edit (settle) must land on the ack BEFORE the delete:
       // a PATCH after the DELETE would re-create the message with a stale
-      // line that nothing cleans up.
+      // line that nothing cleans up. Op status is prose — unfenced (v4).
       const settleIdx = fetchCalls.findIndex(
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+          String(JSON.parse(c.body).content) === "[ok] interrupted",
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -2103,7 +2103,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+          String(JSON.parse(c.body).content) === "[ok] interrupted",
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -2144,13 +2144,14 @@ describe("extension handlers (A1/A2/A4)", () => {
             c.url.includes(`/channels/ch1/messages/${ackId}`),
         )
         .map((c) => String(JSON.parse(c.body).content));
-      // the tick moved while the settle wait ran...
-      expect(ackPatches).toContain(fence("[..] interrupting… 5s"));
+      // the tick moved while the settle wait ran (one-line status = prose,
+      // no fence, v4 §2.3)...
+      expect(ackPatches).toContain("[..] interrupting… 5s");
       // ...but the cap path SETTLES the tick back to the queued line (the
       // message's TRUE state — an interrupt did not happen), NOT a frozen
       // mid-interrupt line (#84 L1)...
-      expect(ackPatches.at(-1)).toBe(fence("[queued] 1 in line"));
-      expect(ackPatches).not.toContain(fence("[ok] interrupted"));
+      expect(ackPatches.at(-1)).toBe("[queued] 1 in line");
+      expect(ackPatches).not.toContain("[ok] interrupted");
       // ...and the ack is NOT deleted (it stays with the queued entry).
       expect(
         fetchCalls.some(
@@ -5515,11 +5516,12 @@ describe("compact: defer mid-run + always report", () => {
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
+    // Settle ships the bare line — op status is prose, no fence (v4 §2.3).
     expect(
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          fence(reportText),
+          reportText,
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === reportText)).toBe(false);
@@ -5551,26 +5553,24 @@ describe("compact: defer mid-run + always report", () => {
     jest.advanceTimersByTime(4999);
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1);
-    expect(edits()).toEqual([fence("[..] compacting… 5s")]);
+    expect(edits()).toEqual(["[..] compacting… 5s"]);
     // subsequent ticks keep updating the SAME message in place
     jest.advanceTimersByTime(5000);
-    expect(edits()).toEqual([
-      fence("[..] compacting… 5s"),
-      fence("[..] compacting… 10s"),
-    ]);
+    expect(edits()).toEqual(["[..] compacting… 5s", "[..] compacting… 10s"]);
     jest.advanceTimersByTime(5000);
     expect(edits()).toEqual([
-      fence("[..] compacting… 5s"),
-      fence("[..] compacting… 10s"),
-      fence("[..] compacting… 15s"),
+      "[..] compacting… 5s",
+      "[..] compacting… 10s",
+      "[..] compacting… 15s",
     ]);
 
-    // Settle: the report replaces the placeholder in place, tick stops
+    // Settle: the report replaces the placeholder in place, tick stops.
+    // Bare line, same form as the fresh-post fallback (v4 §2.3).
     opts.onComplete({ tokensBefore: 100, estimatedTokensAfter: 10 });
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe(fence("[ok] compacted: 100 -> 10"));
+    expect(edits().at(-1)).toBe("[ok] compacted: 100 -> 10");
     jest.advanceTimersByTime(60000);
     expect(edits().length).toBe(4); // no further ticks after settle
     expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
@@ -5596,10 +5596,93 @@ describe("compact: defer mid-run + always report", () => {
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          fence(failText),
+          failText,
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === failText)).toBe(false);
+  });
+
+  test("v4: compact op posts placeholder + ticks + settle BARE (no fence)", async () => {
+    jest.useFakeTimers();
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+    // the placeholder POST is the bare one-liner — status is prose (§2.3)
+    expect(channelPosts()).toContain("[..] compacting...");
+    // the 5s tick edits the SAME message in place, bare
+    jest.advanceTimersByTime(5000);
+    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    // the settle replaces it in place, bare — the fresh-post fallback form
+    opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(edits().at(-1)).toBe("[ok] compacted: 220k -> 35k");
+    jest.advanceTimersByTime(60000);
+    // nothing in the whole op window (posts + in-place edits) carries a fence
+    for (const t of [...channelPosts(), ...edits()])
+      expect(t).not.toContain("```");
+  });
+
+  test("v4: settle before the placeholder post lands -> fresh post is BARE, same text as the tick settle", async () => {
+    // Hold the placeholder POST open so onComplete runs before the tick is
+    // armed — the settle must fall back to a fresh post that carries the
+    // SAME bare line the tick settle would have posted (the old race shipped
+    // fenced via tick, bare via fallback).
+    const baseFetch = globalThis.fetch as any;
+    let plainPosts = 0;
+    const release: { fn?: () => void } = {};
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        if (plainPosts === 1) await new Promise<void>((r) => (release.fn = r));
+      }
+      return baseFetch(url, init);
+    }) as any;
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // POST still in flight -> tick not armed. Settle now.
+    const settleText = "[ok] compacted: 220k -> 35k";
+    opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
+    await tick();
+    // the fallback fresh post is bare and identical to the tick-settle form
+    expect(channelPosts().filter((t) => t === settleText)).toEqual([
+      settleText,
+    ]);
+    expect(settleText).not.toContain("```");
+    // release the placeholder: it lands bare; the tick then arms onto an
+    // already-closed window and renders null (no edit, no double post)
+    release.fn?.();
+    await tick();
+    await tick();
+    expect(channelPosts().filter((t) => t === "[..] compacting...")).toEqual([
+      "[..] compacting...",
+    ]);
+    const editContents = fetchCalls
+      .filter((c) => c.method === "PATCH")
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+    for (const t of editContents) expect(t).not.toContain("```");
+    expect(channelPosts().filter((t) => t === settleText)).toHaveLength(1);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
@@ -8567,15 +8650,13 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(shutdowns).toBe(1);
 
     // window stays open until the respawn clears it -> ticks keep going
+    // (one-line op status = prose, bare ticks per v4 §2.3)
     jest.advanceTimersByTime(4699); // t=4999
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1); // t=5000
-    expect(edits()).toEqual([fence("[..] resetting… 5s")]);
+    expect(edits()).toEqual(["[..] resetting… 5s"]);
     jest.advanceTimersByTime(5000); // t=10000
-    expect(edits()).toEqual([
-      fence("[..] resetting… 5s"),
-      fence("[..] resetting… 10s"),
-    ]);
+    expect(edits()).toEqual(["[..] resetting… 5s", "[..] resetting… 10s"]);
 
     // respawn clears the window -> ticks stop
     clearAllCompacting();
@@ -8612,15 +8693,16 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handlers.session_start?.(null, ctx);
     await tick();
 
-    // the placeholder is REPLACED in place with the FENCED final line, not
-    // re-posted (the placeholder was posted fenced — settle matches)
+    // the placeholder is REPLACED in place with the bare final line, not
+    // re-posted (status is prose — unfenced placeholder, unfenced settle;
+    // same form on both sides per v4 §2.3)
     const finalText = "[new] new session (context cleared)";
     expect(
       edits()
         .slice(editsBefore)
-        .some((t) => t === fence(finalText)),
+        .some((t) => t === finalText),
     ).toBe(true);
-    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
+    expect(channelPosts().some((t) => t === finalText)).toBe(false);
     // marker consumed
     expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
 
@@ -8631,7 +8713,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(pollUrl).toContain("after=1000");
   });
 
-  test("respawn settle without a msgId posts a FENCED final line", async () => {
+  test("respawn settle without a msgId posts a bare final line", async () => {
     const p = path.join(tmp, ".tmp", "op-marker.json");
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const finalText = "[new] new session (context cleared)";
@@ -8646,9 +8728,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     await handlers.session_start?.(null, ctx);
     await tick();
-    // fenced fresh post — same style as the fenced placeholder, never bare
-    expect(channelPosts().some((t) => t === fence(finalText))).toBe(true);
-    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    // bare fresh post — same prose form as the bare placeholder, never fenced
+    expect(channelPosts().some((t) => t === finalText)).toBe(true);
+    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
     expect(edits().some((t) => t === finalText || t === fence(finalText))).toBe(
       false,
     );
@@ -9184,8 +9266,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
       done = true;
     });
     // abort fired, settle-wait running, tick armed on the queued ack
+    // (one-line op status = prose, bare tick per v4 §2.3)
     jest.advanceTimersByTime(5000);
-    expect(ackEdits()).toEqual([fence("[..] interrupting… 5s")]);
+    expect(ackEdits()).toEqual(["[..] interrupting… 5s"]);
 
     ctx.isIdle = () => true;
     jest.advanceTimersByTime(50);
