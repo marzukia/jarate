@@ -1190,11 +1190,11 @@ describe("#110 launcher: --wt-reuse + retryOf record tag", () => {
  * #86 + A1 (polish sweep) + #231 P4: launch-fail webhook. A --worktree
  * launch-fail (not a git repo / worktree add failed) exits 3 BEFORE the
  * run record + bg_on_exit register, so bg_launch_fail posts the DIED
- * wake itself. #231 P4: a launch-fail has no captured output, so the
- * payload is the [bg: card content (tag line + bold header + fact
- * bullets, not the framed embed) - the [bg: prefix on line 1 is what
- * isBgWebhook accepts on the bridge side, so the callback wakes the
- * orchestrator. The capture hook's req.json() 500s on
+ * wake itself. Embed card family (2026-10-19): a launch-fail has no
+ * captured output to frame, so the facts (ticket/exit/brief) ride ONE
+ * embed's fields; the ONE-line content is the [bg: wake marker
+ * (isBgWebhook accepts it on the bridge side, so the callback wakes
+ * the orchestrator). The capture hook's req.json() 500s on
  * a non-JSON body (body stays null), so a captured body is proof the
  * payload is valid JSON - the Discord 400/50109 shape check.
  */
@@ -1233,22 +1233,32 @@ describe("#86: launch-fail webhook", () => {
       if (!m) throw new Error("no ticket line on stdout");
       const rid = m[1] ?? "";
       expect(rid).toMatch(/^\d{8}-\d{6}-\d+$/);
-      // #231 P4 (card since 2026-10-19): [bg: card, not the framed
-      // embed (a launch-fail has no captured output to frame). The
+      // #231 P4 (embed card family, 2026-10-19): ONE content line
+      // (the [bg: wake marker + worst fact) + ONE embed (the facts as
+      // fields; a launch-fail has no captured output to frame). The
       // [bg: tag on line 1 is the isBgWebhook discriminator for
       // content posts (webhook_id is added by Discord on inbound, so
       // the test supplies it).
-      const lines = cap.content.split("\n");
-      expect(lines).toHaveLength(6);
-      expect(lines[0]).toBe(`[bg:worker:DIED]`);
-      expect(lines[1]).toBe(`**launch-fail**`);
-      expect(lines[2]).toBe(``);
-      expect(lines[3]).toBe(`- ticket ${rid}`);
-      expect(lines[4]).toBe(`- exit=3 / no output`);
-      expect(lines[5]).toMatch(
-        /^- launch-fail: --worktree needs a git repo \(cwd=/,
+      expect(cap.content).toBe(
+        `[bg:worker:DIED] launch-fail ticket ${rid} exit=3`,
       );
-      expect(cap.embeds).toBeUndefined();
+      expect(cap.content).not.toContain("\n");
+      expect(cap.embeds).toHaveLength(1);
+      const em = cap.embeds[0];
+      expect(em.title).toBe("launch-fail \u00b7 DIED");
+      expect(em.color).toBe(0xed4245);
+      expect(em.footer?.text).toBe("jarate-bg");
+      const fld = Object.fromEntries(
+        em.fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      expect(fld.ticket).toBe(rid);
+      expect(fld.exit).toBe("3 (no output)");
+      expect(fld.brief).toMatch(
+        /^launch-fail: --worktree needs a git repo \(cwd=/,
+      );
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
@@ -1277,18 +1287,25 @@ describe("#86: launch-fail webhook", () => {
       expect(r.err).toContain("LAUNCH-FAIL: worktree add failed");
       const cap = hook.getBody();
       if (!cap) throw new Error("webhook not captured (or body was not JSON)");
-      // #231 P4 (card since 2026-10-19): the card carries the reason head
+      // #231 P4 (embed card family, 2026-10-19): ONE content line +
+      // ONE embed; the brief field carries the worktree add reason
       expect(cap.content).toMatch(
+        /^\[bg:worker:DIED\] launch-fail ticket \d{8}-\d{6}-\d+ exit=3$/,
+      );
+      expect(cap.embeds).toHaveLength(1);
+      const em2 = cap.embeds[0];
+      expect(em2.title).toBe("launch-fail \u00b7 DIED");
+      const fld2 = Object.fromEntries(
+        em2.fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      expect(fld2.brief).toMatch(
         new RegExp(
-          `^\\[bg:worker:DIED\\]\\n` +
-            `\\*\\*launch-fail\\*\\*\\n\\n` +
-            `- ticket \\d{8}-\\d{6}-\\d+\\n` +
-            `- exit=3 / no output\\n` +
-            `- launch-fail: worktree add failed ref=${ref}`,
+          `^launch-fail: worktree add failed ref=${ref} \\(ref must be a branch\\/tag\\/commit, NOT a folder name\\)$`,
         ),
       );
-      expect(cap.content.split("\n")).toHaveLength(6);
-      expect(cap.embeds).toBeUndefined();
       expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
@@ -1355,10 +1372,11 @@ describe("#53: self-contained dead letters (launcher side)", () => {
     // DIED embed the bridge would have delivered
     const bodyJson = letter.split(marker).slice(1).join(marker).trim();
     const parsed = JSON.parse(bodyJson) as { content?: string };
-    // #231 P4 (card since 2026-10-19): the launch-fail letter embeds
-    // the [bg: card content (the framed embed left that path)
+    // #231 P4 (embed card family, 2026-10-19): the launch-fail letter
+    // embeds the ONE-line [bg: DIED content (the wake) - the facts
+    // ride the embed's fields in the same body
     expect(parsed.content).toMatch(
-      /^\[bg:worker:DIED\]\n\*\*launch-fail\*\*\n\n- ticket \d{8}-\d{6}-\d+\n- exit=3 \/ no output\n- launch-fail: --worktree needs a git repo/,
+      /^\[bg:worker:DIED\] launch-fail ticket \d{8}-\d{6}-\d+ exit=3$/,
     );
   }, 30_000);
 });
@@ -1366,11 +1384,10 @@ describe("#53: self-contained dead letters (launcher side)", () => {
 /**
  * #231 P4: no-output DIED card. A wrapper that dies before the run
  * produced output (TERM/INT/early exit) used to post the full framed
- * embed - chrome around an empty result. Now it posts the [bg: card
- * (tag line + bold header + fact bullets): the [bg: prefix on line 1
- * is what wakes the agent (isBgWebhook accepts the content post;
- * jarate-wait matches on the webhook id, not the content). The framed
- * embed stays for the captured-output path (main flow).
+ * embed - chrome around an empty result. Now it posts the EMBED CARD
+ * family (2026-10-19): ONE content line (the [bg: wake) + ONE embed
+ * (the facts as fields). The framed embed stays for the captured-output
+ * path (main flow).
  */
 describe("#231 P4: no-output DIED card", () => {
   const captureAll = () => {
@@ -1390,10 +1407,10 @@ describe("#231 P4: no-output DIED card", () => {
     };
   };
 
-  // (a) empty out.md -> [bg: card content (starts with [bg:), no
-  // framed embed. The stderr line is the death reason (errf tail via
-  // bg_death_reason) and rides the card as its last bullet.
-  test("TERM'd wrapper with no output: [bg: card content, no embed", async () => {
+  // (a) empty out.md -> the [bg: DIED embed CARD (one-line content,
+  // facts as embed fields). The stderr line is the death reason (errf
+  // tail via bg_death_reason) and rides the card as the reason field.
+  test("TERM'd wrapper with no output: [bg: DIED embed card", async () => {
     const fx = fixture();
     fx.seedMainCreds();
     const art = path.join(fx.tmp, "art");
@@ -1443,13 +1460,27 @@ describe("#231 P4: no-output DIED card", () => {
       expect(code).toBe(143);
       expect(cap.posts).toHaveLength(1);
       const cap0 = cap.posts[0];
-      // card content, [bg: tag on line 1 (the wake), no framed embed
+      // embed card: ONE content line (the [bg: wake) + ONE embed with
+      // the facts (ticket/exit/reason) as fields
       expect(typeof cap0.content).toBe("string");
       expect(cap0.content.startsWith("[bg:")).toBe(true);
       expect(cap0.content).toBe(
-        `[bg:worker:DIED]\n**died (no output)**\n\n- ticket ${rec.run}\n- exit=143\n- boom-oops`,
+        `[bg:worker:DIED] no-output ticket ${rec.run} exit=143`,
       );
-      expect(cap0.embeds).toBeUndefined();
+      expect(cap0.embeds).toHaveLength(1);
+      const em = cap0.embeds[0];
+      expect(em.title).toBe("no-output \u00b7 DIED");
+      expect(em.color).toBe(0xed4245);
+      expect(em.footer?.text).toBe("jarate-bg");
+      const fld = Object.fromEntries(
+        em.fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      expect(fld.ticket).toBe(rec.run);
+      expect(fld.exit).toBe("143");
+      expect(fld.reason).toBe("boom-oops");
       // the line must still wake the channel (bridge exemption)
       expect(isBgWebhook({ ...cap0, webhook_id: "123" })).toBe(true);
     } finally {
@@ -1479,6 +1510,92 @@ describe("#231 P4: no-output DIED card", () => {
       expect(p0.content).toBeUndefined();
     } finally {
       cap.close();
+    }
+  }, 30_000);
+});
+
+/**
+ * #231 P6: the embed builder is unavailable (python3 dies on the
+ * bg_build heredoc) -> the legacy fallback posts the SAME embed card
+ * family as the DIED posts: ONE content line (the [bg: wake, with
+ * status + rc) + ONE embed (cwd/task fields + the raw output snippet
+ * code-fenced as the output field value - a raw text blob with no
+ * fence violates STYLE.md 2.7). The test seam: a fake python3 on PATH
+ * that exits 1 for the no-arg `python3 -` call whose stdin is the
+ * bg_build heredoc (identified by the FRAME_W marker) and delegates
+ * everything else (run record, cost parse, -c one-liners) to the real
+ * interpreter.
+ */
+describe("#231 P6: embed-builder fallback posts the card family", () => {
+  test("builder fails: fallback card, fenced output field, isBgWebhook", async () => {
+    const fx = fixture();
+    fx.seedMainCreds();
+    const posts: any[] = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        if (req.method === "POST") posts.push((await req.json()) as any);
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const bin = path.join(fx.tmp, "bin");
+    // the seam: kill only the bg_build heredoc (stdin script with
+    // FRAME_W, no argv); pass through every other python3 invocation
+    fs.writeFileSync(
+      path.join(bin, "python3"),
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "-" ] && [ "$#" -eq 1 ]; then',
+        "  tf=$(mktemp) || exit 1",
+        '  cat > "$tf"',
+        '  if grep -q FRAME_W "$tf"; then rm -f "$tf"; exit 1; fi',
+        '  /usr/bin/python3 - < "$tf"',
+        "  rc=$?",
+        '  rm -f "$tf"',
+        '  exit "$rc"',
+        "fi",
+        'exec /usr/bin/python3 "$@"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(path.join(bin, "python3"), 0o755);
+    fx.env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
+    fx.env.PI_BG_WB_BACKOFF = "0";
+    try {
+      const r = await fx.run(["worker", "fallback probe task"]);
+      expect(r.code).toBe(0);
+      expect(posts).toHaveLength(1);
+      const cap = posts[0];
+      const m = r.out.match(/^\[pi-bg\] ticket (\S+)/);
+      if (!m) throw new Error("no ticket line on stdout");
+      const rid = m[1] ?? "";
+      // ONE content line: the [bg: wake marker + status + rc
+      expect(cap.content).toBe(`[bg:worker:OK] ticket ${rid} OK rc=0`);
+      expect(cap.content).not.toContain("\n");
+      expect(isBgWebhook({ ...cap, webhook_id: "123" })).toBe(true);
+      // ONE embed, the card family shape
+      expect(cap.embeds).toHaveLength(1);
+      const em = cap.embeds[0];
+      expect(em.title).toBe("fallback \u00b7 OK");
+      expect(em.color).toBe(0x57f287);
+      expect(em.footer?.text).toBe("jarate-bg");
+      const fld = Object.fromEntries(
+        em.fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      expect(fld.cwd).toBe(fx.tmp);
+      expect(fld.task).toBe("fallback probe task");
+      // the raw output snippet ships code-fenced in the field value
+      expect(fld.output).toContain("```bash\n");
+      expect(fld.output).toContain("pi-run-ok");
+      expect(fld.output.endsWith("\n```"));
+    } finally {
+      delete fx.env.PI_DISPATCH_WEBHOOK;
+      delete fx.env.PI_BG_WB_BACKOFF;
+      server.stop(true);
     }
   }, 30_000);
 });
@@ -5803,24 +5920,26 @@ describe("2026-10-16: relaunches resume the prior session + empty-death diagnost
       // fixture cwd (os.tmpdir) is not inside a git repo
       const r = await fx.run(["worker", "--worktree", "t"]);
       expect(r.code).toBe(3);
-      // #222x#234 (card since 2026-10-19): #234 made the launch-fail
-      // DIED a plain [bg: card post (no framed embed); #222's intent -
+      // #222x#234 (embed card family, 2026-10-19): #234's intent -
       // the post names the cwd, not "no report" - holds on the brief
-      // bullet. The fixture cwd is /tmp/pibg-test-XXXXXXXX (21 chars);
+      // FIELD. The fixture cwd is /tmp/pibg-test-XXXXXXXX (21 chars);
       // the full not-a-git-repo brief is 79 chars, well under the 120
       // cap, so the exact cwd string survives untruncated.
       const body = hook.getBody();
-      expect(body?.embeds).toBeUndefined();
-      const content = body?.content;
-      const lines = content.split("\n");
-      expect(lines[0]).toBe(`[bg:worker:DIED]`);
-      expect(lines[1]).toBe(`**launch-fail**`);
-      expect(content).toContain("exit=3");
-      expect(content).toContain("no output");
-      expect(content).toContain("--worktree needs a git repo");
-      expect(content).toContain(fx.tmp);
-      expect(content).not.toContain("no report");
-      expect(lines).toHaveLength(6);
+      expect(body?.content).toMatch(
+        /^\[bg:worker:DIED\] launch-fail ticket \d{8}-\d{6}-\d+ exit=3$/,
+      );
+      expect(body?.embeds).toHaveLength(1);
+      const fldC = Object.fromEntries(
+        body?.embeds[0].fields.map((x: { name: string; value: string }) => [
+          x.name,
+          x.value,
+        ]),
+      ) as Record<string, string>;
+      expect(fldC.exit).toBe("3 (no output)");
+      expect(fldC.brief).toContain("--worktree needs a git repo");
+      expect(fldC.brief).toContain(fx.tmp);
+      expect(fldC.brief).not.toContain("no report");
     } finally {
       delete fx.env.PI_DISPATCH_WEBHOOK;
       delete fx.env.PI_BG_WB_BACKOFF;

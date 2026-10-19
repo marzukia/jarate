@@ -1,13 +1,16 @@
 // restart-wake — post-restart wake (issue #111, P0).
 //
 // When the pi process really starts (session_start reason "startup"), the
-// bridge posts ONE "back online" message to the agent's channel:
-//   - restart class: planned (the clean-stop marker is present + fresh)
-//     or unplanned (marker absent/stale — the last stop never ran
-//     session_shutdown: crash, OOM, SIGKILL, power loss)
-//   - inflight summary: every pi-bg run record with state=running
-//     (~/.pi-dispatch/runs/*.json): ticket id, profile, elapsed. cwd/
-//     task detail lives in /jobs (frame stays short per STYLE.md)
+// bridge posts ONE "back online" message to the agent's channel. Shape
+// (2026-10-19, Andryo: the EMBED CARD family - the same visual as the
+// pi-bg completion posts):
+//   - content is ONE line: `[bg: restart-wake] <planned|unplanned>
+//     restart, <N> in-flight` - the [bg: prefix on line 1 is what wakes
+//     the agent (isBgWebhook) and carries the worst fact
+//   - one embed: title `restart-wake · planned|unplanned` (green/red),
+//     a short description, the in-flight ticket rows as an `in-flight`
+//     field (multiline value, rows are `run profile elapsed`), and a
+//     footer with the producer name (no timestamp)
 //
 // Guards (issue #111):
 //   - never blocks startup: the caller fires and forgets (void + catch);
@@ -144,6 +147,30 @@ export function elapsedStr(sec: number): string {
  *  copy and the wake never lands as a turn. */
 export const WAKE_TAG = "[bg: restart-wake]";
 
+/** Discord embed field for the wake card. */
+export interface WakeEmbedField {
+  name: string;
+  value: string;
+  inline?: boolean;
+}
+
+/** One embed in the wake post (the EMBED CARD family, 2026-10-19,
+ *  Andryo: title / color / description / fields / footer, no timestamp). */
+export interface WakeEmbed {
+  title: string;
+  color: number;
+  description: string;
+  fields?: WakeEmbedField[];
+  footer: { text: string };
+}
+
+/** The wake post body: ONE content line (the `[bg:` wake marker + a
+ *  worst-fact summary) + exactly one embed carrying the facts. */
+export interface WakePayload {
+  content: string;
+  embeds: WakeEmbed[];
+}
+
 export interface WakeMessageOpts {
   /** true = the last stop ran session_shutdown (planned restart). */
   clean: boolean;
@@ -151,38 +178,77 @@ export interface WakeMessageOpts {
   now?: number;
 }
 
-/** Build the wake message. Pure — all I/O is injected by the caller.
+/** Build the wake post payload (2026-10-19, Andryo: the EMBED CARD
+ *  family - the same visual as the pi-bg completion posts). Pure — all
+ *  I/O is injected by the caller.
  *
- *  Shape: the `[bg:` tag line, a bold `restart wake` header, then a flat
- *  markdown bullet list (Andryo 2026-10-18: summaries are markdown lists,
- *  no frame, no width budget - text wraps natively; webhook content
- *  renders as normal Discord markdown). Job rows are
- *  `id profile age` — cwd/task detail lives in /jobs.
+ *  `content` is ONE line: `[bg: restart-wake] <planned|unplanned>
+ *  restart, <N> in-flight` - the wake marker + the worst fact (planned
+ *  vs unplanned + the in-flight count).
+ *
+ *  `embeds` holds exactly ONE embed: title `restart-wake · planned`
+ *  (green 0x57F287) / `restart-wake · unplanned` (red 0xED4245), a short
+ *  human-readable description (the no-in-flight fact lives here when the
+ *  list is empty), the in-flight ticket rows as a single `in-flight`
+ *  field (multiline value), and a footer with the producer name (no
+ *  timestamp). Job rows are `run profile elapsed` — cwd/task detail
+ *  lives in /jobs.
+ *
+ *  The in-flight rows are the actionable part - they ship as RAW LINES
+ *  in the field value: no frame, no width budget, no truncation. A
+ *  profile (or its elapsed) that is long ships whole.
+ *
+ *  Cap: at most MAX_INFLIGHT rows, oldest first (the oldest is the most
+ *  actionable: it has been running longest). Overflow appends one
+ *  `+N more - see /jobs` line instead of a per-ticket list, which would
+ *  balloon the post.
  */
-export function buildWakeMessage({
+export function buildWakePayload({
   clean,
   runs,
   now = Date.now(),
-}: WakeMessageOpts): string {
+}: WakeMessageOpts): WakePayload {
   const { list, more } = selectInflight(runs);
-  const rows: string[] = [
-    clean ? "[ok] planned" : "[!] unplanned - last turn interrupted",
-  ];
+  const klass = clean ? "planned" : "unplanned";
+  const content = `${WAKE_TAG} ${klass} restart, ${list.length} in-flight`;
+  const color = clean ? 0x57f287 : 0xed4245;
+  let description = clean
+    ? "pi restarted as planned (clean stop) - back online."
+    : "pi is back online but the last stop was NOT clean (crash, OOM, or kill) - the last turn was interrupted.";
   if (list.length === 0) {
-    rows.push("no in-flight pi-bg work");
-  } else {
-    rows.push(`${list.length} in-flight`);
-    for (const r of list) {
+    description += " No in-flight pi-bg work.";
+  }
+  const embed: WakeEmbed = {
+    title: `restart-wake \u00b7 ${klass}`,
+    color,
+    description,
+    footer: { text: "restart-wake" },
+  };
+  if (list.length > 0) {
+    const rows = list.map((r) => {
       const who =
         r.profile && String(r.profile).length > 0 ? String(r.profile) : "?";
-      rows.push(
-        `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`,
-      );
-    }
+      return `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`;
+    });
     if (more > 0) rows.push(`+${more} more - see /jobs`);
+    embed.fields = [{ name: "in-flight", value: rows.join("\n") }];
   }
-  const body = rows.map((r) => `- ${r}`);
-  return [WAKE_TAG, "**restart wake**", "", ...body].join("\n");
+  return { content, embeds: [embed] };
+}
+
+/** Censor every string part the wake ships (docs/secret-censor.md):
+ *  ticket/run ids come from run records and can carry secrets. */
+function egressPayload(p: WakePayload): WakePayload {
+  return {
+    content: egressText(p.content),
+    embeds: p.embeds.map((e) => ({
+      ...e,
+      title: egressText(e.title),
+      description: egressText(e.description),
+      footer: { text: egressText(e.footer.text) },
+      fields: e.fields?.map((f) => ({ ...f, value: egressText(f.value) })),
+    })),
+  };
 }
 
 // ─── clean-stop marker ───────────────────────────────────────────────────
@@ -305,22 +371,23 @@ export interface PostOpts {
   backoffMs?: number;
 }
 
-/** Bounded post, pi-bg bg_post pattern: up to `attempts` tries per route,
- *  hard timeout per try, backoff i*backoffMs between tries, 2xx = success.
- *  WEBHOOK FIRST (the [bg:-tagged bus post is the wake: isBgWebhook
- *  exempts it from the other-bot filter, so it lands as a turn), bot API
- *  second for configs without a webhook. Neither configured = silent
- *  no-op. Never throws — a dead network must not take startup down. */
-export async function postWakeText(
+/** Bounded post of the wake payload, pi-bg bg_post pattern: up to
+ *  `attempts` tries per route, hard timeout per try, backoff
+ *  i*backoffMs between tries, 2xx = success. WEBHOOK FIRST (the
+ *  [bg:-tagged bus post is the wake: isBgWebhook exempts it from the
+ *  other-bot filter, so it lands as a turn), bot API second for configs
+ *  without a webhook. Neither configured = silent no-op. Never throws —
+ *  a dead network must not take startup down. */
+export async function postWakePayload(
   target: WakeTarget,
-  text: string,
+  payload: WakePayload,
   opts: PostOpts = {},
 ): Promise<boolean> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const attempts = opts.attempts ?? POST_ATTEMPTS;
   const timeoutMs = opts.timeoutMs ?? POST_TIMEOUT_MS;
   const backoffMs = opts.backoffMs ?? POST_BACKOFF_MS;
-  const body = JSON.stringify({ content: text });
+  const body = JSON.stringify(payload);
   const routes: Array<{ url: string; headers: Record<string, string> }> = [];
   if (target.webhookUrl) {
     routes.push({
@@ -424,7 +491,11 @@ export async function runRestartWake(
     return { posted: false, reason: "dedup", restartClass };
   }
   const runs = readRunRecords(deps.runDir ?? defaultRunDir());
-  const message = buildWakeMessage({
+  // Build the payload now (deterministic given the snapshot). Every
+  // string part is censored at egress (egressPayload, single choke point
+  // per docs/secret-censor.md): ticket/run ids come from run records and
+  // can carry secrets.
+  const payload = buildWakePayload({
     clean: restartClass === "planned",
     runs,
     now,
@@ -440,7 +511,7 @@ export async function runRestartWake(
   };
   // egressText = the single egress choke point (docs/secret-censor.md):
   // ticket/task text comes from run records and can carry secrets.
-  const ok = await postWakeText(target, egressText(message), {
+  const ok = await postWakePayload(target, egressPayload(payload), {
     ...deps.postOpts,
     fetchImpl: deps.fetchImpl ?? deps.postOpts?.fetchImpl,
   });
@@ -451,7 +522,7 @@ export async function runRestartWake(
   return {
     posted: ok,
     reason: ok ? "posted" : "post-failed",
-    message,
+    message: payload.content,
     restartClass,
   };
 }

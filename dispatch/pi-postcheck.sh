@@ -4,9 +4,13 @@
 #    code-formatted per STYLE.md 4.4)
 # 2) posts a heartbeat to the pi-dispatch Discord WEBHOOK, content tagged
 #    "[bg: pi-restart]" (isBgWebhook exemption in the bridge - without the
-#    tag the other-bot filter swallows it) and rendered as a markdown list
-#    (STYLE.md v4 2.3: summaries are markdown lists - no frame, no width
-#    budget). The webhook post is polled back as a turn and wakes the agent.
+#    tag the other-bot filter swallows it). The webhook post is polled back
+#    as a turn and wakes the agent. Shape (2026-10-19, Andryo): the same
+#    EMBED CARD family as the other [bg: producers - content is ONE line
+#    (`[bg: pi-restart] <status>` - the wake marker on line 1), plus ONE
+#    embed (title/color/description/fields/footer, no timestamp). The
+#    in-flight note lines ride the embed's `in-flight` field as RAW LINES,
+#    verbatim (no frame, no width budget - they are the actionable part).
 # Portable across agent boxes: channel id + bot token come from the LOCAL
 # ~/.pi/agent/settings.json default channel; all paths are $HOME-relative.
 # Canonical home: dispatch/pi-postcheck.sh (install.sh links it into
@@ -65,25 +69,38 @@ if [ -n "$HOOK" ]; then
   # C1 (polish sweep): state-aware wording. The failure path used to read
   # "[!] healthy 90s after restart" - a lie. The channel message above
   # carries the detail; the heartbeat line carries only the state.
+  # 2026-10-19 (Andryo): EMBED CARD family (the same visual as the pi-bg
+  # completion posts) - ONE content line (the wake marker) + ONE embed
+  # (title/color/description/fields/footer, no timestamp). The in-flight
+  # note lines ship as the `in-flight` field (raw lines, verbatim - no
+  # frame, no width budget; blank lines dropped). No python3 -> empty
+  # body (degraded, same as before: the channel post still lands).
   if [ "$TAG" = '[!]' ]; then
     STATUS=$(printf '%s not healthy 90s after restart' "$TAG")
   else
     STATUS=$(printf '%s healthy 90s after restart' "$TAG")
   fi
-  # Same shape as the bridge restart-wake (STYLE.md v4 2.3): tag line,
-  # bold header, blank line, plain bullets - no fence, no width budget.
-  # Raw note lines ship as bullets (long tokens ship verbatim); blank
-  # lines are dropped.
-  if [ -n "$INFLIGHT" ]; then
-    NOTEROWS=''
-    while IFS= read -r L; do
-      [ -n "$L" ] || continue
-      NOTEROWS="${NOTEROWS}- ${L}"$'\n'
-    done <<< "$INFLIGHT"
-    HB=$(printf '[bg: pi-restart]\n**pi restart heartbeat**\n\n- %s\n- in-flight:\n%s' "$STATUS" "$NOTEROWS")
-  else
-    HB=$(printf '[bg: pi-restart]\n**pi restart heartbeat**\n\n- %s' "$STATUS")
-  fi
+  BODY=$(python3 - "$TAG" "$STATUS" "$INFLIGHT" <<'PY' 2>/dev/null
+import json, sys
+tag, status, inflight = sys.argv[1:4]
+if tag == "[ok]":
+    title, color, desc = (
+        "postcheck \u00b7 ok", 0x57F287,
+        "pi.service restart health check (90s after restart).")
+else:
+    title, color, desc = (
+        "postcheck \u00b7 fail", 0xED4245,
+        "pi.service restart health check FAILED (90s after restart) - the channel post carries the detail.")
+embed = {
+    "title": title, "color": color, "description": desc,
+    "footer": {"text": "pi-postcheck"},
+}
+lines = [l for l in inflight.splitlines() if l.strip()]
+if lines:
+    embed["fields"] = [{"name": "in-flight", "value": "\n".join(lines)}]
+print(json.dumps({"content": "[bg: pi-restart] " + status, "embeds": [embed]}))
+PY
+  )
   curl -s -m 10 -X POST "$HOOK" -H "Content-Type: application/json" \
-    -d "$(python3 -c "import json,sys;print(json.dumps({'content': sys.argv[1]}))" "$HB")" > /dev/null
+    -d "${BODY}" > /dev/null
 fi

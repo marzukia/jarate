@@ -1777,13 +1777,14 @@ PY
 
 # wd_build_oom <body-file> <uid> <delta-kill> <total-kill> <base-kill>
 #   <delta-oom> <total-oom> <base-oom> <memory.max> <memory.peak>
-# OOM-ALERT finding (issue #191 M1). The body is the [bg: agent-watch]
-# card (2026-10-19: tag line + bold header + fact bullets, no embed -
-# single visual object; the bold header carries the alert, same
-# aesthetic as the restart-wake content-only post): oom_kill delta +
-# totals, memory.max + memory.peak. The [bg: prefix on line 1 is the
-# webhook wake marker (isBgWebhook). memory.max "max" (uncapped) passes
-# through; byte values get a GiB rendering.
+# OOM-ALERT finding (issue #191 M1). 2026-10-19 (Andryo): EMBED CARD
+# family (the same visual as the pi-bg completion posts): content is ONE
+# line - `[bg: agent-watch] OOM-ALERT user-<uid>.slice oom_kill +<delta>`
+# (the [bg: prefix on line 1 is the webhook wake marker, isBgWebhook) -
+# plus ONE embed (title/color/description/fields/footer, no timestamp):
+# oom_kill delta + totals, memory.max + memory.peak ride the fields.
+# memory.max "max" (uncapped) passes through; byte values get a GiB
+# rendering.
 wd_build_oom() {
   local bodyfile="$1" uid="$2" dk="$3" tk="$4" bk="$5" doo="$6" to="$7" bo="$8" mx="$9" pk="${10}"
   WD_O_UID="$uid" WD_O_DK="$dk" WD_O_TK="$tk" WD_O_BK="$bk" WD_O_DO="$doo" \
@@ -1798,12 +1799,19 @@ def gib(s):
         return s or "n/a"  # "max" (uncapped) or empty (no memory.peak)
     return f"{n / 2**30:.1f}G"
 uid = E("UID")
-content = (f"[bg: agent-watch]\n"
-           f"**OOM-ALERT \u00b7 user-{uid}.slice**\n"
-           f"\n"
-           f"- oom_kill +{E('DK')} ({E('TK')} total, base {E('BK')})\n"
-           f"- max {gib(E('MAX'))} / peak {gib(E('PEAK'))}")
-json.dump({"content": content}, sys.stdout)
+content = f"[bg: agent-watch] OOM-ALERT user-{uid}.slice oom_kill +{E('DK')}"
+json.dump({"content": content, "embeds": [{
+    "title": f"agent-watch \u00b7 OOM",
+    "color": 0xED4245,
+    "description": (f"new OOM kills in user-{uid}.slice since the last sweep.\n"
+                    "kernel OOM lines are not journaled on this box - the cgroup counters are the record."),
+    "fields": [
+        {"name": "oom_kill", "value": f"+{E('DK')} ({E('TK')} total, base {E('BK')})", "inline": True},
+        {"name": "max", "value": gib(E("MAX")), "inline": True},
+        {"name": "peak", "value": gib(E("PEAK")), "inline": True},
+    ],
+    "footer": {"text": "jarate-bg-watchdog"},
+}]}, sys.stdout)
 PY
 }
 
@@ -2055,12 +2063,13 @@ PY
 
 # wd_build_live <body-file> <uid> <kind> <age> <note> <session>
 # kind: SILENT (near-miss, one per episode) or AGENT-DEAD (two
-# consecutive stale sweeps). The body is the [bg: agent-watch] card
-# (2026-10-19: tag line + bold header + fact bullets, no embed -
-# single visual object; the bold header carries the alert): age + note,
-# plus a "session gone" bullet when the user session cgroup is
-# empty/gone (the whole session is down, not just the agent). The [bg:
-# prefix on line 1 is the webhook wake marker (isBgWebhook).
+# consecutive stale sweeps). 2026-10-19 (Andryo): EMBED CARD family (the
+# same visual as the pi-bg completion posts): content is ONE line -
+# `[bg: agent-watch] <KIND> user-<uid> <age>` (the [bg: prefix on line 1
+# is the webhook wake marker, isBgWebhook) - plus ONE embed
+# (title/color/description/fields/footer, no timestamp): age + note ride
+# the fields, plus a "session gone" field when the user session cgroup is
+# empty/gone (the whole session is down, not just the agent).
 wd_build_live() {
   local bodyfile="$1" uid="$2" kind="$3" age="$4" note="$5" sess="$6"
   WD_L_UID="$uid" WD_L_KIND="$kind" WD_L_AGE="$age" WD_L_NOTE="$note" \
@@ -2071,14 +2080,23 @@ E = lambda k: os.environ.get("WD_L_" + k, "")
 uid = E("UID")
 kind = E("KIND") or "SILENT"
 sess = E("SESS") or "unknown"
-content = (f"[bg: agent-watch]\n"
-           f"**{kind} \u00b7 user-{uid}**\n"
-           f"\n"
-           f"- age {E('AGE')}\n"
-           f"- {E('NOTE')}")
+dead = kind == "AGENT-DEAD"
+desc = ("the agent has been missing for two consecutive sweeps - the session may be down."
+        if dead else "the agent marker went stale (near-miss, one post per episode).")
+fields = [
+    {"name": "age", "value": E("AGE"), "inline": True},
+    {"name": "note", "value": E("NOTE")},
+]
 if sess == "gone":
-    content += "\n- session gone"
-json.dump({"content": content}, sys.stdout)
+    fields.append({"name": "session", "value": "gone", "inline": True})
+content = f"[bg: agent-watch] {kind} user-{uid} {E('AGE')}"
+json.dump({"content": content, "embeds": [{
+    "title": f"agent-watch \u00b7 {kind}",
+    "color": 0xED4245 if dead else 0xFEE75C,
+    "description": desc,
+    "fields": fields,
+    "footer": {"text": "jarate-bg-watchdog"},
+}]}, sys.stdout)
 PY
 }
 
