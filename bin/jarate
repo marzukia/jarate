@@ -23,7 +23,6 @@
 #   projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]...
 #                               tag historical untagged run records (worktree
 #                               path, ~/projects cwd, per-agent default)
-#   memory-grep <query>           search ~/memory, top-20 matches
 #   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
 #   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
 #
@@ -52,10 +51,8 @@ set -uo pipefail
 JARATE_ROOT="${JARATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 TMO="${JARATE_TIMEOUT_S:-25}"
 WARN_CAP=100   # max warning lines per agent
-GREP_CAP=20    # memory-grep top-N
-PARSE_CAP=1000 # memory-grep: max lines parsed from rg output
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "memory-grep" "projects" "projects-backfill" "agents-check" "agents-bless")
+COMMANDS=("setup" "ctx-report" "journal-errors" "projects" "projects-backfill" "agents-check" "agents-bless")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -837,89 +834,6 @@ PY
   printf '%s\n' "$doc"
 }
 
-# ─── memory-grep ────────────────────────────────────────────────────────────
-# Search ~/memory (file-based memory), top-20 matches. Fixed strings by
-# default (-F); --regex for rg regex. Case-insensitive by default; --case to
-# pin. `--` ends flag parsing so dash-leading queries work.
-
-cmd_memory_grep() {
-  local root="$HOME/memory" mode="fixed" ci="-i"
-  local -a qw=()
-  while [ $# -gt 0 ]; do
-    # --flag=value -> --flag value (one flag grammar, #148)
-    case "$1" in
-      --root=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
-    esac
-    case "$1" in
-      --root) [ $# -ge 2 ] || die_usage "memory-grep: --root needs a value"; root="$2"; shift ;;
-      --regex) mode="regex" ;;
-      --case) ci="" ;;
-      --) shift; qw+=("$@"); break ;;
-      -*) die_usage "memory-grep: unknown flag: $1" ;;
-      *) qw+=("$1") ;;
-    esac
-    shift
-  done
-  local query="${qw[*]:-}"
-  [ -n "$query" ] || die_usage "memory-grep: usage: jarate memory-grep <query> [--root DIR] [--regex] [--case]"
-  [ -d "$root" ] || die_usage "memory-grep: root not found: $root"
-  command -v rg >/dev/null 2>&1 || die "memory-grep: rg not found on PATH"
-
-  local -a fm=()
-  [ "$mode" = "fixed" ] && fm+=(-F)
-
-  # rg exit codes: 0 = matches, 1 = no matches, >1 = error.
-  # Probe with -q first (cheap, no output), then read the lines.
-  local rc=0
-  timeout "$TMO" rg -q ${fm[@]} $ci -e "$query" "$root" 2>/dev/null || rc=$?
-  [ "$rc" -eq 124 ] && die "memory-grep: rg timed out (${TMO}s)"
-  [ "$rc" -le 1 ] || die "memory-grep: rg failed (rc=$rc)"
-  local out="" orcp=0
-  if [ "$rc" -eq 0 ]; then
-    out="$(timeout "$TMO" rg -n --no-heading --sort path ${fm[@]} $ci -e "$query" "$root" 2>/dev/null | head -n "$PARSE_CAP")"
-    orcp=$?
-    [ "$orcp" -eq 124 ] && die "memory-grep: rg timed out (${TMO}s)"
-  fi
-
-  local rows="" truncated="false"
-  local line file rest lineno text
-  # total matches = non-empty lines in out (out itself is head-capped at PARSE_CAP)
-  local total=0
-  while IFS= read -r line; do
-    [ -n "$line" ] && total=$((total + 1))
-  done <<<"$out"
-  [ "$total" -gt "$GREP_CAP" ] && truncated="true"
-  local kept=0
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    [ "$kept" -ge "$GREP_CAP" ] && break
-    file="${line%%:*}"
-    rest="${line#*:}"
-    lineno="${rest%%:*}"
-    text="${rest#*:}"
-    case "$lineno" in
-      ''|*[!0-9]*) continue ;;
-    esac
-    rows+="$(jq -cn --arg f "$file" --argjson l "$lineno" --arg t "$text" \
-      '{file: $f, line: $l, text: $t}')"$'\n'
-    kept=$((kept + 1))
-  done <<<"$out"
-  local matches
-  matches="$(printf '%s' "$rows" | jq -cs 'map(select(. != null))' 2>/dev/null)" || matches="[]"
-  local count="$total"
-
-  jq -cn \
-    --arg ts "$(ts_now)" \
-    --arg query "$query" \
-    --arg root "$root" \
-    --argjson count "$count" \
-    --argjson truncated "$truncated" \
-    --argjson matches "$matches" \
-    '{ok: true, ts: $ts, error: null, query: $query, root: $root,
-      count: $count, truncated: $truncated, matches: $matches}' \
-    || die "memory-grep: json assembly failed"
-}
-
 # ─── agents-check / agents-bless ───────────────────────────────────────────
 # AGENTS.md is prompt-level law: changes require the operator's explicit approval
 # (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
@@ -1431,14 +1345,13 @@ main() {
     "" | help | -h | --help)
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
-          commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
+          commands: ["setup", "ctx-report", "journal-errors",
                      "projects", "projects-backfill",
                      "agents-check", "agents-bless"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
     journal-errors) cmd_journal_errors "$@" ;;
-    memory-grep) cmd_memory_grep "$@" ;;
     projects) cmd_projects "$@" ;;
     projects-backfill) cmd_projects_backfill "$@" ;;
     agents-check) cmd_agents_check "$@" ;;
@@ -1447,7 +1360,7 @@ main() {
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
-          commands: ["setup", "ctx-report", "journal-errors", "memory-grep",
+          commands: ["setup", "ctx-report", "journal-errors",
                      "projects", "projects-backfill",
                      "agents-check", "agents-bless"]}'
       exit 2

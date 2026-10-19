@@ -2,7 +2,7 @@
  * bin/jarate — JSON entrypoint contract tests (issue #17).
  *
  * Runs the real bash entrypoint against a fake HOME with stubbed externals
- * (pi-token-cost.py, journalctl, rg, getent) and asserts the JSON
+ * (pi-token-cost.py, journalctl, getent) and asserts the JSON
  * discipline: exactly one doc on stdout, ok:true|false + error, stable
  * snake_case keys, no partial output. Cross-user reads are gone
  * (2026-10-17, hall-monitor owns the privileged read): a non-$HOME agent
@@ -48,48 +48,6 @@ function fixture(): Fixture {
     "#!/bin/sh\necho 'W1 first warn'\necho 'W2 second warn'\n",
   );
   fs.chmodSync(jc, 0o755);
-
-  // stub rg: ripgrep is NOT preinstalled on GitHub's ubuntu-latest runner,
-  // so memory-grep was red in CI while green on hosts with rg (2026-09-24).
-  // Implements the rg subset cmd_memory_grep uses, on top of grep:
-  //   - exit 0 (match) / 1 (no match) / 2 (error), like rg
-  //   - "file:lineno:text" lines; --sort path => sort by path, then lineno
-  //   - -F => grep -F (literal); regex mode => grep -E, so a bad regex
-  //     ("[", "(unterminated") exits 2 like a real rg failure
-  const rg = path.join(bin, "rg");
-  fs.writeFileSync(
-    rg,
-    [
-      "#!/bin/sh",
-      'mode=""; ci=""; quiet=""; pat=""; root=""',
-      "while [ $# -gt 0 ]; do",
-      '  a="$1"; shift',
-      '  case "$a" in',
-      '    -F) mode="-F" ;;',
-      '    -i) ci="-i" ;;',
-      "    -q) quiet=1 ;;",
-      "    -n | --no-heading) : ;;  # grep -r already emits file:lineno:text",
-      "    --sort) shift ;;        # consumes value 'path'; we always sort by path",
-      '    -e) pat="$1"; shift ;;',
-      "    -*) : ;;                # other rg flags: ignore",
-      '    *) root="$a" ;;',
-      "  esac",
-      "done",
-      '[ -n "$mode" ] || mode="-E"',
-      'if [ -n "$quiet" ]; then',
-      '  grep -r $mode $ci -e "$pat" "$root" >/dev/null 2>&1',
-      "  exit $?",
-      "fi",
-      'lines="$(grep -rn $mode $ci -e "$pat" "$root" 2>/dev/null)"',
-      "rc=$?",
-      '[ "$rc" -ge 2 ] && exit "$rc"  # grep error (e.g. bad regex) => like rg rc>1',
-      '[ -z "$lines" ] && exit 1    # no match',
-      "printf '%s\\n' \"$lines\" | sort -t: -k1,1 -k2,2n",
-      "exit 0",
-      "",
-    ].join("\n"),
-  );
-  fs.chmodSync(rg, 0o755);
 
   // stub getent: canned passwd for the agent-home discovery fallback
   // (JARATE_AGENT_HOMES unset) — hermetic on every machine. The fixture
@@ -183,27 +141,6 @@ print(json.dumps({"model": "m/test", "openrouter_pricing": {}, "agents": [{"home
     }),
   );
 
-  // memory
-  const mem = path.join(home, "memory");
-  fs.mkdirSync(mem, { recursive: true });
-  fs.writeFileSync(
-    path.join(mem, "2026-01-01-a.md"),
-    "# a\nneedle in a\nline two\n",
-  );
-  fs.writeFileSync(path.join(mem, "2026-01-02-b.md"), "# b\nNEEDLE in b\n");
-  // regex chars: prove fixed-string default (dot/paren are literal)
-  fs.writeFileSync(
-    path.join(mem, "2026-01-05-regex.md"),
-    [
-      "# regex chars",
-      "literal a.b line",
-      "regex axb line",
-      "a (unterminated paren",
-      "-1h window note",
-      "",
-    ].join("\n"),
-  );
-
   const env = { ...process.env } as Record<string, string>;
   // Ambient-env hygiene (audit F1): scrub every var the entrypoint reads
   // (JARATE_*, AGENT_SAY_*) before the explicit fixture values below are
@@ -257,7 +194,6 @@ describe("entrypoint", () => {
       "setup",
       "ctx-report",
       "journal-errors",
-      "memory-grep",
       "projects",
       "projects-backfill",
       "agents-check",
@@ -279,10 +215,11 @@ describe("entrypoint", () => {
 
   test("pre-joined args string and split args both work", async () => {
     const f = fixture();
-    const joined = await f.run(["memory-grep", "needle in"]);
-    const split = await f.run(["memory-grep", "needle", "in"]);
-    expect(doc(joined).count).toBe(doc(split).count);
-    expect(doc(joined).count).toBeGreaterThan(0);
+    fs.writeFileSync(path.join(f.home, "AGENTS.md"), "# law\n");
+    const joined = await f.run(["agents-bless", "a b"]);
+    const split = await f.run(["agents-bless", "a", "b"]);
+    expect(doc(joined).note).toBe(doc(split).note);
+    expect(doc(joined).note).toBe("a b");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -357,7 +294,6 @@ describe("ctx-report", () => {
       [["ctx-report", "--profile"], "--profile needs a value"],
       [["journal-errors", "--since"], "--since needs a value"],
       [["journal-errors", "--agent"], "--agent needs a value"],
-      [["memory-grep", "q", "--root"], "--root needs a value"],
       [["projects", "--project"], "--project needs a value"],
       [["projects", "--since"], "--since needs a value"],
       [["projects", "--agent"], "--agent needs a value"],
@@ -504,161 +440,6 @@ describe("journal-errors", () => {
     ]);
     expect(r3.code).toBe(2);
     expect(doc(r3).error).toContain("absolute datetime");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-});
-
-describe("memory-grep", () => {
-  test("case-insensitive fixed-string search, top-20, match schema", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "needle"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.error).toBeNull();
-    expect(Object.keys(d)).toEqual([
-      "ok",
-      "ts",
-      "error",
-      "query",
-      "root",
-      "count",
-      "truncated",
-      "matches",
-    ]);
-    expect(d.count).toBe(2);
-    expect(d.truncated).toBe(false);
-    expect(d.matches).toHaveLength(2);
-    expect(d.matches[0].file).toContain("2026-01-01-a.md");
-    expect(d.matches[0].line).toBe(2);
-    expect(d.matches[0].text).toBe("needle in a");
-    expect(d.matches[1].file).toContain("2026-01-02-b.md");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("no matches -> ok:true with empty matches", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "zzz-not-there"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.count).toBe(0);
-    expect(d.matches).toEqual([]);
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("more than 20 matches -> truncated, exactly 20 kept", async () => {
-    const f = fixture();
-    fs.writeFileSync(
-      path.join(f.home, "memory", "2026-01-03-c.md"),
-      `${Array.from({ length: 25 }, (_, i) => `x line ${i}`).join("\n")}\n`,
-    );
-    const r = await f.run(["memory-grep", "x line"]);
-    const d = doc(r);
-    expect(d.count).toBe(25);
-    expect(d.truncated).toBe(true);
-    expect(d.matches).toHaveLength(20);
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("bad regex with --regex -> ok:false rg failed", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "[", "--regex"]);
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("rg failed");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("default mode is fixed-string: regex chars match literally", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "a.b"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    // only the literal "a.b" line; "axb" must NOT match (dot is not a regex)
-    expect(d.count).toBe(1);
-    expect(d.matches[0].text).toBe("literal a.b line");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("(unterminated is a literal match, not a regex error", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "(unterminated"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.count).toBe(1);
-    expect(d.matches[0].text).toBe("a (unterminated paren");
-    // same query with --regex is a bad regex -> ok:false
-    const r2 = await f.run(["memory-grep", "(unterminated", "--regex"]);
-    const d2 = doc(r2);
-    expect(d2.ok).toBe(false);
-    expect(d2.error).toContain("rg failed");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("two identical runs -> identical match order (deterministic)", async () => {
-    const f = fixture();
-    const tree = path.join(f.tmp, "tree");
-    fs.mkdirSync(tree, { recursive: true });
-    for (let i = 1; i <= 400; i++) {
-      fs.writeFileSync(
-        path.join(tree, `f${String(i).padStart(3, "0")}.md`),
-        `matchline ${i}\nother\n`,
-      );
-    }
-    const r1 = await f.run(["memory-grep", "matchline", "--root", tree]);
-    const r2 = await f.run(["memory-grep", "matchline", "--root", tree]);
-    expect(doc(r1).count).toBe(400);
-    expect(JSON.stringify(doc(r1).matches)).toBe(
-      JSON.stringify(doc(r2).matches),
-    );
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("rg is timeout-bounded (JARATE_TIMEOUT_S honored)", async () => {
-    const f = fixture();
-    const slowRg = path.join(f.tmp, "slow-rg-bin");
-    fs.mkdirSync(slowRg, { recursive: true });
-    fs.writeFileSync(path.join(slowRg, "rg"), "#!/bin/sh\nsleep 5\nexit 0\n");
-    fs.chmodSync(path.join(slowRg, "rg"), 0o755);
-    const t0 = Date.now();
-    const r = await f.run(["memory-grep", "needle"], {
-      PATH: `${slowRg}:${f.env.PATH}`,
-      JARATE_TIMEOUT_S: "1",
-    });
-    const elapsed = (Date.now() - t0) / 1000;
-    const d = doc(r);
-    expect(d.ok).toBe(false);
-    expect(d.error).toContain("timed out");
-    expect(elapsed).toBeLessThan(4);
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("-- terminator allows dash-leading queries", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "--", "-1h window"]);
-    const d = doc(r);
-    expect(d.ok).toBe(true);
-    expect(d.query).toBe("-1h window");
-    expect(d.count).toBe(1);
-    expect(d.matches[0].text).toBe("-1h window note");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("unknown flag / missing query / missing root -> rc 2 usage errors", async () => {
-    const f = fixture();
-    const r1 = await f.run(["memory-grep", "x", "-wat"]);
-    expect(r1.code).toBe(2);
-    expect(doc(r1).error).toContain("unknown flag");
-    const r2 = await f.run(["memory-grep"]);
-    expect(r2.code).toBe(2);
-    expect(doc(r2).error).toContain("usage:");
-    const r3 = await f.run([
-      "memory-grep",
-      "x",
-      "--root",
-      path.join(f.tmp, "nope"),
-    ]);
-    expect(r3.code).toBe(2);
-    expect(doc(r3).error).toContain("root not found");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 });
@@ -886,7 +667,7 @@ function curlStub(
       'case "$method $url" in',
       '  GET\\ */users/@me) printf \'{"id":"101","username":"stubbot"}\' ;;',
       "  GET\\ */channels/123/webhooks) " +
-        (webhook403 ? wh403 + "; " : " ") +
+        (webhook403 ? `${wh403}; ` : " ") +
         (existingWebhook
           ? 'printf \'[{"id":"555","name":"Jarate"}]\''
           : "printf '[]'") +
@@ -914,7 +695,7 @@ function systemdStubs(f: Fixture, isActive = "active"): void {
     [
       "#!/bin/sh",
       'printf \'%s\\n\' "$*" >> "$(dirname "$0")/systemctl.log"',
-      'if [ "${1:-}" = "--user" ] && [ "${2:-}" = "is-active" ]; then',
+      `if [ "\${1:-}" = "--user" ] && [ "\${2:-}" = "is-active" ]; then`,
       `  echo ${isActive}`,
       "  exit 0",
       "fi",
@@ -1993,14 +1774,6 @@ describe("#148 --flag=value (one flag grammar)", () => {
     const r = await f.run(["ctx-report", "--profile=worker"]);
     expect(r.code).toBe(0);
     expect(doc(r).profile).toBe("worker");
-    fs.rmSync(f.tmp, { recursive: true, force: true });
-  });
-
-  test("memory-grep --root= is reachable (not swallowed by the query)", async () => {
-    const f = fixture();
-    const r = await f.run(["memory-grep", "x", "--root=/tmp/jarate-nodir-zz"]);
-    expect(r.code).toBe(2);
-    expect(doc(r).error).toContain("root not found: /tmp/jarate-nodir-zz");
     fs.rmSync(f.tmp, { recursive: true, force: true });
   });
 

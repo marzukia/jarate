@@ -137,5 +137,3 @@ headings clamped to ###, code blocks hoisted out of lists, tables →
 
 Embeds are serialized to readable text for the LLM. Oversized inbound
 images are resized to max 2000 px / 4 MB when `sharp` is installed.
-`MEMORY.md` in the workspace is summarized (heading TOC) into the
-channel context so the agent knows what it remembers.

@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "memory-grep", "projects", "projects-backfill", "agents-check", "agents-bless"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "projects", "projects-backfill", "agents-check", "agents-bless"]}
 ```
 
 ## Commands
@@ -100,25 +100,6 @@ re-joined), or a bare date. Default: one hour back, absolute UTC.
 - Top-level `ok` stays `true` with cross-user rows (the run does not
   fail, rc 0). `ok: false` (rc 1) only when the local journalctl call
   failed; `ok: false` (rc 1) also when no agent matched `--agent`.
-
-### `memory-grep <query> [--root D] [--regex] [--case]`
-
-Fixed-string (rg `-F`), case-INsensitive search over `~/memory` (default
-root) via ripgrep. Top-20 matches kept; `count` is capped at 1000 lines
-(`truncated` true when cut). `--` ends flag parsing so dash-leading
-queries work.
-
-```json
-{
-  "ok": true, "ts": "...", "error": null,
-  "query": "dispatch", "root": "/home/monky/memory",
-  "count": 16, "truncated": false,
-  "matches": [{"file": "/home/monky/memory/2026-09-08-x.md", "line": 12, "text": "..."}]
-}
-```
-
-- `--regex`: query is an ERE (bad regex -> `ok:false`, `rg failed ...`).
-- `--case`: case-sensitive. Match order is deterministic (`rg --sort path`).
 
 ### `projects [--project TAG] [--since YYYY-MM-DD] [--agent NAME]`
 

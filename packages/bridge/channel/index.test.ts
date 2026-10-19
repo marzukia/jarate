@@ -2532,7 +2532,10 @@ describe("extension handlers (A1/A2/A4)", () => {
       await handleInbound(pi, inboundCh("/stop", "m3"), ctx);
       jest.advanceTimersByTime(25);
       await Promise.resolve();
-      expect(sent.length).toBe(baseSends); // m1's send never happened
+      // m1's send never happened. Assert on m1's id, not total growth:
+      // the cancel-branch kick's m2 send can land inside this window
+      // (no I/O hop before send on the plain path).
+      expect(sent.some((s) => s.m?.details?.messageId === "m1")).toBe(false);
       expect(midTurnQueues.has("ch1")).toBe(false);
       // The cancel branch's re-wake kick runs handleInbound for m2
       // fire-and-forget: wait for it on the bounded clock-time budget
@@ -5865,7 +5868,7 @@ describe("compaction-queue guard", () => {
     }) as any;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     clearDiscordStatesForTest(); // no auto-react suppression leaks across tests
     jest.useRealTimers();
     clearAllCompacting();
@@ -5876,6 +5879,11 @@ describe("compaction-queue guard", () => {
     clearAllCompacting();
     globalThis.fetch = realFetch;
     fs.rmSync(tmp, { recursive: true, force: true });
+    // A settleCompacting deferred drain (setTimeout 0) scheduled by the
+    // last test's settle event can still be pending — fire it here, after
+    // the queue is cleared, so it no-ops instead of draining the NEXT
+    // test's queue (its ctx is stale; isIdle() is the mock default true).
+    await tick();
   });
 
   test("flag lifecycle: set on /compact dispatch, cleared by session_compact and session_compact_failed", async () => {

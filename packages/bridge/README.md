@@ -35,7 +35,6 @@ added.
 - File attachments are downloaded on arrival into a batch folder
   (20 MB per-file cap; oversize or failed downloads are noted in the LLM
   message, file-only messages buffer for 10 min)
-- Channel context includes a table of contents of `MEMORY.md` when present
 - Poll/send errors are sanitized before they hit the TUI log (bearer
   tokens, API keys, Discord tokens, query-string secrets)
 - Messages that arrive mid-run are debounced (2.5 s quiet window) and
@@ -144,7 +143,6 @@ channel/    extension source (TypeScript, loaded by pi via jiti)
   format.ts   markdown → Discord pipeline (headings, lists, tables, escapes)
   voice.ts    voice-note attachment detection
   btw.ts      trailing ". btw" side-question detection
-  memory.ts   MEMORY.md table of contents for channel context
   sanitize.ts  sensitive-data redaction for log lines
   image-optimizer.ts  optional sharp-based image resizing/compression
   types.ts    config and message types
