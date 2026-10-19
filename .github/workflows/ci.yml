@@ -39,6 +39,21 @@ jobs:
       - name: Test
         run: cd packages/bridge && bun x bun test
 
+  size:  # deterministic size gate: line ratchet + AST export gate (harden-repo 2026-10-20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: oven-sh/setup-bun@v2
+      - name: Install
+        run: bun install
+      - name: Size gate
+        # PRs: export gate vs origin/<base_ref>. Push to main: base_ref is
+        # empty -> "origin/" is unresolvable -> ratchet only (script falls
+        # back with a NOTE line).
+        run: bun run size -- --base "origin/${{ github.base_ref }}"
+
   bin:
     runs-on: ubuntu-latest
     timeout-minutes: 25

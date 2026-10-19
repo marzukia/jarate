@@ -82,3 +82,13 @@ bash install.sh --dry-run          # installer regression check
 - `pi.service` (never restart from within a task)
 - `marzukia/piscord` repo (legacy upstream)
 - `bun.lock` churn beyond what `bun install` does
+
+## Size gate (harden-repo, 2026-10-20)
+
+- File size is a load-bearing signal, checked by `bun run size` (CI + pre-commit).
+  >800 non-blank lines = must be in size-ratchet.json; ratcheted files may only shrink.
+  `--update` lowers budgets after a split - never to raise one.
+- >2,000-line file: no NEW top-level exports (CI export gate). New code goes to a
+  sibling module. Test files: x3 budget.
+- Task rule: a change adding code to a >2,000-line file must name the target module,
+  not the god file. "Add X to index.ts" is an invalid task.

@@ -8,10 +8,12 @@
   ],
   "scripts": {
     "lint": "bunx biome check .",
+    "size": "bun scripts/size-ratchet.ts",
     "test": "cd packages/bridge && bun x bun test && cd ../../dispatch && bun test && cd ../bin && bun test && cd ../deploy && bun test",
     "typecheck": "cd packages/bridge && bun x tsc --noEmit"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.12"
+    "@biomejs/biome": "2.5.12",
+    "typescript": "^5.9.3"
   }
 }
