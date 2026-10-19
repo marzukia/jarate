@@ -85,7 +85,6 @@ import {
 } from "./handover";
 import { registerJarateTool } from "./jarate";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
-import { memoryToc } from "./memory";
 import { extractQueueSuffix } from "./queue";
 import {
   loadRewakeQueue,
@@ -1484,8 +1483,8 @@ export async function runMidRunInterrupt(
 /** Re-render a queued entry after its Discord message was edited.
  *  Updates the stored ChannelMessage (the re-wake path re-processes it
  *  through the full inbound pipeline) and the pre-rendered interrupt text
- *  (the plain-path ctx pipeline: channel-ctx + replied-message + memory
- *  TOC + suffix-stripped body). FIFO position is kept. Returns false when
+ *  (the plain-path ctx pipeline: channel-ctx + replied-message +
+ *  suffix-stripped body). FIFO position is kept. Returns false when
  *  the message is not queued or the editor is not the owner. */
 export async function updateQueuedInbound(
   ctx: ExtensionContext,
@@ -1514,14 +1513,7 @@ export async function updateQueuedInbound(
   const { prompt: body, forceBtw } = extractBtwSuffix(content.trim());
   const channelCtx = buildChannelContext(ch, entry.msg, { btw: forceBtw });
   const repliedBlock = buildRepliedMessageBlock(entry.msg.repliedMessage);
-  const toc = await memoryToc(ctx.cwd);
-  const ctxBlock = [
-    channelCtx,
-    repliedBlock,
-    toc ? `<channel-memory>\n${toc}\n</channel-memory>` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const ctxBlock = [channelCtx, repliedBlock].filter(Boolean).join("\n\n");
   entry.text = `${ctxBlock}\n\n${body || "(empty)"}`;
   entry.title = channelTitle(ch, entry.msg);
   entry.display = body || "(empty)";
@@ -6619,18 +6611,10 @@ export async function handleInbound(
   // ── Side-question suffix: "fix the bug. btw" → brief-answer flag ─────
   const { prompt: body, forceBtw } = extractBtwSuffix(rawBody);
 
-  // Channel ctx (+ btw hint) + optional memory TOC — LLM-only, not shown
-  // in the TUI.
+  // Channel ctx (+ btw hint) — LLM-only, not shown in the TUI.
   const channelCtx = buildChannelContext(ch, msg, { btw: forceBtw });
   const repliedBlock = buildRepliedMessageBlock(msg.repliedMessage);
-  const toc = await memoryToc(ctx.cwd);
-  const ctxBlock = [
-    channelCtx,
-    repliedBlock,
-    toc ? `<channel-memory>\n${toc}\n</channel-memory>` : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const ctxBlock = [channelCtx, repliedBlock].filter(Boolean).join("\n\n");
   const withCtx = (text: string) => `${ctxBlock}\n\n${text}`;
 
   // A run is in flight (streaming or has pending messages). Mid-turn inbounds

@@ -106,13 +106,13 @@ describe("runJarate", () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  test("memory-grep --root= is reachable (value flag, not swallowed)", async () => {
+  test("projects --project= is reachable (value flag, not swallowed)", async () => {
     const home = makeJarateHome(argvStub);
-    const r = await runJarate("memory-grep", "--root=/tmp/somewhere needle", {
+    const r = await runJarate("projects", "--project=nestfinder", {
       env: envFor(home),
     });
     const d = JSON.parse(r.out);
-    expect(d.argv).toBe("memory-grep|--root=/tmp/somewhere|needle");
+    expect(d.argv).toBe("projects|--project=nestfinder");
     fs.rmSync(home, { recursive: true, force: true });
   });
 
@@ -180,7 +180,6 @@ describe("registerJarateTool", () => {
       "setup",
       "ctx-report",
       "journal-errors",
-      "memory-grep",
       "projects",
       "projects-backfill",
       "agents-check",
@@ -206,7 +205,6 @@ describe("registerJarateTool", () => {
       "setup",
       "ctx-report",
       "journal-errors",
-      "memory-grep",
       "projects",
       "projects-backfill",
       "agents-check",

@@ -4494,7 +4494,7 @@ describe("SIGPIPE hardening (#101 follow-up, Franky BUG-2 RCA, 2026-09-29)", () 
       expect(fs.existsSync(marker)).toBe(true);
       // 2) the callback landed (the run completed end-to-end)
       expect(body).not.toBeNull();
-      expect(body!.embeds[0].title).toMatch(/^worker \u00b7 OK/);
+      expect(body?.embeds[0]?.title).toMatch(/^worker \u00b7 OK/);
       // 3) the run record reached a terminal state (the EXIT trap ran:
       //    bg_mark_record; pre-fix the record was stuck "running")
       const recs = fx.records();
@@ -4564,9 +4564,9 @@ echo pi-run-ok
     expect(r.code).toBe(0);
     expect(r.out).toContain("pi-run-ok");
     const log = fs.readFileSync(paths.log, "utf8");
-    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"));
     expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
-    const ppidLine = log.split("\n").find((l) => l.startsWith("PPID-CMD:"))!;
+    const ppidLine = log.split("\n").find((l) => l.startsWith("PPID-CMD:"));
     expect(ppidLine).toContain("pi-bg worker -");
     expect(ppidLine).not.toContain("PROSE-118");
     expect(log).toContain("PS-HIT:(none)");
@@ -4606,7 +4606,7 @@ echo pi-run-ok
     const r = await fx.run(["worker", "LEGACY PROSE-42 in argv form"]);
     expect(r.code).toBe(0);
     const log = fs.readFileSync(paths.log, "utf8");
-    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"))!;
+    const argvLine = log.split("\n").find((l) => l.startsWith("ARGV:"));
     expect(argvLine).toBe("ARGV: [-p] [--no-extensions]");
     const stdinSection = log.split("STDIN:")[1] ?? "";
     expect(stdinSection).toContain("LEGACY PROSE-42 in argv form");
@@ -4622,8 +4622,8 @@ echo pi-run-ok
       new Promise<null>((res) => setTimeout(() => res(null), 20_000)),
     ]);
     expect(r).not.toBeNull();
-    expect(r!.code).toBe(2);
-    expect(r!.err).toContain("missing task");
+    expect(r?.code).toBe(2);
+    expect(r?.err ?? "").toContain("missing task");
     expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);
   });
 

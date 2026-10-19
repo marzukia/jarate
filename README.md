@@ -149,7 +149,6 @@ merge).
 ```
 
 Renders `templates/newrepo` (AGENTS.md, CLAUDE.md, CONTRIBUTING.md,
-MEMORY.md, Makefile, pre-commit hooks, CI, PR/issue templates, docs
-scaffold), `git init -b main` + initial commit. Idempotent: refuses to
+Makefile, pre-commit hooks, CI, PR/issue templates, docs scaffold), `git init -b main` + initial commit. Idempotent: refuses to
 clobber without `--force`; `--dry-run` prints the plan. See
 `templates/README.md`.

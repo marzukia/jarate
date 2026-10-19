@@ -133,7 +133,6 @@ const JARATE_COMMANDS = [
   "setup",
   "ctx-report",
   "journal-errors",
-  "memory-grep",
   "projects",
   "projects-backfill",
   "agents-check",
@@ -153,15 +152,14 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "setup <bot-token> <channel> [--yes]: fresh-node FTUE (default dry-run; --yes executes). " +
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
-      "memory-grep <query> [--root D] [--regex]: search ~/memory, top-20 matches. " +
       "projects [--project T] [--since D] [--agent A]: per-project rollup over pi-bg run records (runs/tokens/cost; untagged -> unspecified). " +
       "projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]: tag historical untagged run records. " +
       "agents-check: AGENTS.md vs manifest (drift tripwire, read-only). " +
       "agents-bless [note]: rewrite the AGENTS.md manifest (re-bless an approved change).",
     promptSnippet:
-      "jarate <cmd> <args>: machine ops (ctx-report, journal-errors, memory-grep) as JSON",
+      "jarate <cmd> <args>: machine ops (ctx-report, journal-errors) as JSON",
     promptGuidelines: [
-      "Use jarate for machine state: context/cost (ctx-report), pi.service warnings (journal-errors), memory search (memory-grep).",
+      "Use jarate for machine state: context/cost (ctx-report), pi.service warnings (journal-errors).",
       "jarate takes one cmd + one space-separated args string; output is a single JSON doc — check ok before trusting fields.",
     ],
     parameters: Type.Object({
