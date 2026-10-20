@@ -487,3 +487,50 @@ describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () =
     }
   });
 });
+
+/**
+ * issue #262 (DRY): the dispatch webhook resolver is single-sourced in
+ * dispatch/lib.sh jrate_webhook - $PI_DISPATCH_WEBHOOK wins, else the
+ * FIRST LINE (head -1) of ~/.config/pi-dispatch/webhook. The old
+ * postcheck `cat`ed the whole file: a stray second line corrupted the
+ * URL. Pins both halves of the contract.
+ */
+describe("pi-postcheck webhook resolution (issue #262)", () => {
+  test("2-line webhook file: only the first line is posted to (head -1, not cat)", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/hook\nhttp://127.0.0.1:1/stray-second-line\n",
+    );
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      // With the old `cat`, the second line would have landed inside the
+      // captured URL and broken the (url, body) capture parse below.
+      const hb = webhookPost(f);
+      expect(hb.url).toBe("http://127.0.0.1:1/hook");
+      // de-prefix (#277): content is EMPTY; the marker rides the author.
+      expect(hb.content).toBe("");
+      expect(hb.embeds?.[0].author?.name).toBe("pi-bg pi-restart \u00b7 ok");
+    } finally {
+      f.setInflight(null);
+    }
+  });
+
+  test("$PI_DISPATCH_WEBHOOK overrides the webhook file", async () => {
+    const f = fixture();
+    fs.writeFileSync(
+      path.join(f.home, ".config", "pi-dispatch", "webhook"),
+      "http://127.0.0.1:1/file-hook\n",
+    );
+    f.env.PI_DISPATCH_WEBHOOK = "http://127.0.0.1:1/env-hook";
+    try {
+      const r = await f.run();
+      expect(r.code).toBe(0);
+      expect(webhookPost(f).url).toBe("http://127.0.0.1:1/env-hook");
+    } finally {
+      f.setInflight(null);
+      delete f.env.PI_DISPATCH_WEBHOOK;
+    }
+  });
+});
