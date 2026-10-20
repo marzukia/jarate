@@ -25,17 +25,13 @@ import { styleGuard } from "./format";
 import extension, {
   clearAllCompacting,
   clearAllInterrupts,
-  clearQueuedInbound,
   fence,
   handleInbound,
   heldChannels,
   isHeld,
   lastRunUsage,
-  midTurnQueues,
   pendingAttachments,
   pendingInterrupts,
-  popChannelQueuedInbound,
-  queuedAcks,
   resetRuntimeStateForTest,
   runFrame,
   runUsageLine,
@@ -44,6 +40,12 @@ import extension, {
   stopAllCompactTicks,
   verboseOverride,
 } from "./index";
+import {
+  clearQueuedInbound,
+  midTurnQueues,
+  popChannelQueuedInbound,
+  queuedAcks,
+} from "./queue";
 import { type ChannelMessage, loadChannelConfig } from "./types";
 import { clearWorktreeState } from "./worktree";
 

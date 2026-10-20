@@ -43,7 +43,6 @@ import {
   clearCompacting,
   clearInterrupts,
   clearOpMarker,
-  clearQueuedInbound,
   compactingChannels,
   fence,
   getPendingCompact,
@@ -53,7 +52,6 @@ import {
   isCompacting,
   isHeld,
   lastRunUsage,
-  midTurnQueues,
   moveSessionFileAside,
   onDeleteStatusBlock,
   opBusyRefusal,
@@ -62,7 +60,6 @@ import {
   parseVerboseLevel,
   pendingInterrupts,
   persistChannelRuntimeState,
-  popChannelQueuedInbound,
   runRedo,
   runUndo,
   safeSessionFile,
@@ -78,6 +75,11 @@ import {
   verboseOverride,
 } from "./index";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
+import {
+  clearQueuedInbound,
+  midTurnQueues,
+  popChannelQueuedInbound,
+} from "./queue";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import { cancelWake, formatDurationMs, loadWakes } from "./sleep";
 import {

@@ -36,7 +36,6 @@ import {
   buildInteractionHandler,
   channelError,
   failurePostText,
-  hasOwnerConfigured,
   isOwnerUser,
   matchCommand,
   runChannelCommand,
@@ -90,16 +89,27 @@ import {
   shouldHandoff,
 } from "./handover";
 import { registerJarateTool } from "./jarate";
-import { extractQueueSuffix } from "./queue";
+import {
+  clearQueuedInbound,
+  consumeQueuedAck,
+  deleteQueuedInbound,
+  drainRewakeSurvival,
+  dropQueuedInbound,
+  extractQueueSuffix,
+  midTurnQueues,
+  popOldestQueuedInbound,
+  queuedAcks,
+  queueMidTurnInbound,
+  resolveChannel,
+  updateQueuedInbound,
+} from "./queue";
 import {
   loadRewakeQueue,
   rewakeAddPending,
   rewakeClearPending,
   rewakeCommitDelivered,
-  rewakePending,
   rewakeRemovePending,
   rewakeSetPendingAck,
-  rewakeUpdatePendingMsg,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
@@ -249,7 +259,7 @@ export const heldChannels = new Set<string>();
 // is set at session_start; ensureRuntimeStateLoaded re-reads the file at
 // most once per dir (a fresh process starts with a null guard, so boot
 // always loads; in-process re-starts reload via setRuntimeStateDir).
-let runtimeStateDir: string | null = null;
+export let runtimeStateDir: string | null = null;
 let runtimeStateLoadedFor: string | null = null;
 /** Set the runtime-state dir + reset the load guard. Exported for tests. */
 export function setRuntimeStateDir(dir: string | null): void {
@@ -268,7 +278,7 @@ export function resetRuntimeStateForTest(): void {
   compactPlaceholders.clear();
   setLivePlaceholderSnapshot(null);
 }
-function ensureRuntimeStateLoaded(): void {
+export function ensureRuntimeStateLoaded(): void {
   const dir = runtimeStateDir ?? "";
   if (runtimeStateLoadedFor === dir) return;
   runtimeStateLoadedFor = dir;
@@ -310,329 +320,9 @@ export function persistChannelRuntimeState(
 // extension instance per process, registered in the extension body).
 export let onDeleteStatusBlock: ((ch: ChannelConfig) => Promise<void>) | null =
   null;
-// ─── Mid-turn re-wake queue ─────────────────────────────────────────────
-// An inbound that arrives while a run is in flight is NOT steered into the
-// in-flight run (pi's deliverAs:"steer" folds it in, and if the run ends
-// before a model step consumes it the message is swallowed with no new
-// turn). Instead we queue the FULL ChannelMessage here — per channel, in
-// arrival order — and re-run it as a fresh inbound at agent_end, which
-// guarantees a dedicated new run. One entry = one message = one re-wake run.
-interface QueuedInbound {
-  msg: ChannelMessage;
-  queuedAt: number;
-  /** Pre-rendered LLM text (channel ctx + body/attachments), captured at
-   *  queue time so the mid-run interrupt can force-deliver it without async
-   *  re-rendering (re-rendering is async and would widen the send/abort
-   *  race window). The re-wake path still re-renders via handleInbound. */
-  text?: string;
-  title?: string;
-  display?: string;
-}
-export const midTurnQueues = new Map<string, QueuedInbound[]>();
-
-// ─── Queue acks ([queued] N in line) ─────────────────────────────────────
-// One ack message per queued inbound, keyed by the inbound's Discord
-// message id. Deleted when the entry is consumed/dropped; renumbered when
-// an entry ahead of it leaves the line (delete or consume).
-export const queuedAcks = new Map<
-  string,
-  { ackId: string; fromId?: string; pos: number }
->();
 // Workspace root captured at session_start — lets module-level queue
 // helpers resolve ChannelConfig without a ctx.
-let configRoot: string | null = null;
-
-function resolveChannel(channelId: string): ChannelConfig | undefined {
-  return configRoot
-    ? getChannel(loadChannelConfig(configRoot), channelId)
-    : undefined;
-}
-
-/** Drop the stored ack for a consumed/dropped message, then renumber the
- *  acks of the entries still in line. The REST delete is fire-and-forget
- *  unless `deletes` is given — the shutdown drain passes one and awaits
- *  it, because the process may exit before an unawaited delete lands. */
-function consumeQueuedAck(
-  channelId: string,
-  messageId: string,
-  deletes?: Promise<unknown>[],
-): void {
-  const ack = queuedAcks.get(messageId);
-  if (ack) {
-    queuedAcks.delete(messageId);
-    const ch = resolveChannel(channelId);
-    if (ch) {
-      const del = deleteDiscordMessage(ch, ack.ackId).catch(() => {});
-      if (deletes) deletes.push(del);
-    }
-  }
-  renumberQueuedAcks(channelId);
-  persistLivePlaceholders(); // #84: the ack line left (or was renumbered)
-}
-
-/** Re-edit the channel's remaining queued acks so positions stay true
- *  after an entry ahead of them left the line. No-op when already correct.
- *  The ack is one-line op status — prose, unfenced (STYLE.md v4 §2.3). */
-function renumberQueuedAcks(channelId: string): void {
-  const ch = resolveChannel(channelId);
-  if (!ch) return;
-  const q = midTurnQueues.get(channelId) ?? [];
-  q.forEach((e, i) => {
-    const ack = queuedAcks.get(e.msg.messageId);
-    if (!ack || ack.pos === i + 1) return;
-    ack.pos = i + 1;
-    editDiscordMessage(ch, ack.ackId, `[queued] ${i + 1} in line`).catch(
-      () => {},
-    );
-  });
-}
-
-/** Queue a mid-turn inbound for a re-wake. Returns the new queue depth
- *  (the message's 1-based position in its channel's line). `armInterrupt`
- *  defaults to true; ". queue"-suffixed messages pass false so they wait
- *  their turn instead of jumping it. */
-export function queueMidTurnInbound(
-  channelId: string,
-  msg: ChannelMessage,
-  text?: string,
-  title?: string,
-  display?: string,
-  armInterrupt = true,
-): number {
-  let q = midTurnQueues.get(channelId);
-  if (!q) {
-    q = [];
-    midTurnQueues.set(channelId, q);
-  }
-  const entry: QueuedInbound = {
-    msg,
-    queuedAt: Date.now(),
-    text,
-    title,
-    display,
-  };
-  q.push(entry);
-  // #180 (survival path): mirror the entry into the per-channel state
-  // file. session_shutdown clears MEMORY only; the file is what a
-  // respawn drains. Synchronous tmp+rename right after the push — the
-  // in-memory → file window is the same tick, no await in between.
-  rewakeAddPending(runtimeStateDir, channelId, {
-    msg,
-    queuedAt: entry.queuedAt,
-  });
-  console.log(
-    `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
-  );
-  // #177: [bg: machine wakes are queue-only. The re-wake queue already
-  // guarantees agent_end delivery; the interrupt only jumps the line, and
-  // a machine alert is never more urgent than the in-flight turn — so it
-  // never arms one. (2026-10-06 incident: a reviewer callback posted
-  // mid-turn armed the 3s interrupt, was never consumed, and was lost at
-  // compact.)
-  if (armInterrupt && !isBgInbound(msg)) {
-    // 4x (12s) case: an interrupt is already in flight (re-wake run in
-    // progress). Without this, rapid-fire messages cascade — each new
-    // message arms a 3s interrupt that kills the re-wake run mid-LLM-call,
-    // forcing a full 120K-token prefill restart. The message is queued
-    // with a guaranteed re-wake either way, so the longer window only
-    // changes WHEN the interrupt cuts in. All other senders keep the 3s
-    // default (quick cut-in).
-    const delay = interruptingChannels.has(channelId)
-      ? interruptStepTimeoutMs() * 4 // 12s: give the in-flight run room
-      : undefined; // default 3s
-    armInterruptTimer(channelId, msg.messageId, delay);
-  }
-  return q.length;
-}
-
-// ─── In-turn consumed marker (#231 P3) ──────────────────────────────────
-// jarate-wait writes one marker file per DISCORD MESSAGE id on rc 0
-// (~/.pi-dispatch/in-turn-consumed/<id>, dir 0700, >1h pruned on its
-// start). A [bg: callback the agent consumed IN TURN therefore has a
-// marker before any re-wake drain can pop its queued copy: the bridge
-// queued the message at arrival T0, jarate-wait saw the same message at
-// T1 >= T0 and wrote the marker, the drain consults at T2 > T1. A wait
-// timeout (rc 3) writes no marker -> the re-wake delivers as today (the
-// fix's failure mode IS today's behavior). Keyed on the message id, never
-// the ticket: the ticket's other messages keep their wakes.
-export function inTurnConsumedDir(home = defaultHome()): string {
-  return path.join(home, ".pi-dispatch", "in-turn-consumed");
-}
-
-/** #231 P3: does the Discord message id carry an in-turn consumed
- *  marker? Never throws (missing dir/file = false; a non-numeric id is
- *  no snowflake, so no file). */
-export function hasInTurnConsumedMarker(
-  messageId: string,
-  home = defaultHome(),
-): boolean {
-  if (!/^\d+$/.test(messageId)) return false;
-  try {
-    return fs.statSync(path.join(inTurnConsumedDir(home), messageId)).isFile();
-  } catch {
-    return false;
-  }
-}
-
-/** Pop the globally oldest queued inbound across all channels (FIFO).
- *  Held channels (#39) are skipped: their buffer drains on /hold off,
- *  not at agent_end. #231 P3: a queued [bg: entry whose message id has
- *  an in-turn consumed marker is DROPPED (logged) and the next entry
- *  popped — the agent already consumed that callback in turn, so the
- *  re-wake is the double-delivery copy. Human entries never drop (the
- *  marker only gates [bg: wakes). */
-export function popOldestQueuedInbound(): {
-  channelId: string;
-  msg: ChannelMessage;
-} | null {
-  ensureRuntimeStateLoaded();
-  for (;;) {
-    let oldest: {
-      channelId: string;
-      msg: ChannelMessage;
-      queuedAt: number;
-    } | null = null;
-    for (const [channelId, q] of midTurnQueues) {
-      if (heldChannels.has(channelId)) continue;
-      const head = q[0];
-      if (!head) continue;
-      if (!oldest || head.queuedAt < oldest.queuedAt)
-        oldest = { channelId, msg: head.msg, queuedAt: head.queuedAt };
-    }
-    if (!oldest) return null;
-    const q = midTurnQueues.get(oldest.channelId)!;
-    // The head can move between scan and shift (a delete or interrupt
-    // cancel splices it): recompute on a stale snapshot instead of
-    // shifting the wrong entry.
-    if (q[0]?.queuedAt !== oldest.queuedAt) continue;
-    const drop =
-      isBgInbound(oldest.msg) && hasInTurnConsumedMarker(oldest.msg.messageId);
-    q.shift();
-    if (q.length === 0) midTurnQueues.delete(oldest.channelId);
-    consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
-    if (drop) {
-      // Consumed in turn = delivered: record the id (dedupes the
-      // startup history scan) and clear it from the survival file.
-      rewakeCommitDelivered(
-        runtimeStateDir,
-        oldest.channelId,
-        oldest.msg.messageId,
-      );
-      console.log(
-        `[channel] dropped in-turn-consumed [bg: re-wake ${oldest.msg.messageId} (${oldest.channelId})`,
-      );
-      continue;
-    }
-    return { channelId: oldest.channelId, msg: oldest.msg };
-  }
-}
-
-/** Drop all queued inbounds for a channel (/stop, shutdown drain).
- *  `deletes` collects the ack-delete promises so the caller can await
- *  them (session_shutdown must — the process dies right after). Returns
- *  the count dropped. `keepFile` (session_shutdown only): the in-memory
- *  drain is the fast path (ack cleanup); the #180 state file is the
- *  SURVIVAL path and must outlive the process. */
-export function clearQueuedInbound(
-  channelId: string,
-  deletes?: Promise<unknown>[],
-  opts?: { keepFile?: boolean },
-): number {
-  const q = midTurnQueues.get(channelId);
-  if (!q) return 0;
-  for (const e of q) {
-    consumeQueuedAck(channelId, e.msg.messageId, deletes);
-    if (!opts?.keepFile)
-      rewakeRemovePending(runtimeStateDir, channelId, e.msg.messageId);
-  }
-  const n = q.length;
-  midTurnQueues.delete(channelId);
-  return n;
-}
-
-/** #180 (survival drain): re-queue persisted pending entries into the
- *  in-memory re-wake queue at a real process start. The file is left in
- *  place — entries are pruned from it exactly when committed to pi
- *  (sendToPi) or dropped, so a second death before delivery re-drains
- *  the same file and the message is still delivered exactly once.
- *  Returns the count re-queued. Exported for tests. */
-export function drainRewakeSurvival(
-  stateDir: string,
-  channels: ChannelConfig[],
-): number {
-  let n = 0;
-  for (const ch of channels) {
-    if (ch.type !== "discord") continue;
-    const pending = rewakePending(stateDir, ch.id);
-    if (pending.length === 0) continue;
-    const q = midTurnQueues.get(ch.id) ?? [];
-    for (const e of pending) {
-      // Fresh process: midTurnQueues is empty; the guard is for
-      // in-process reuse and is idempotent either way.
-      if (q.some((x) => x.msg.messageId === e.msg.messageId)) continue;
-      q.push({ msg: e.msg, queuedAt: e.queuedAt });
-      // #194 interaction: the fresh process has an EMPTY queuedAcks
-      // map, but the `[queued] N in line` line survived the restart
-      // (the crash-settle keeps it alive when a rewake entry is
-      // restored) — restore its id at its line position so the
-      // re-wake drain's consumeQueuedAck deletes it exactly once.
-      if (e.ackId)
-        queuedAcks.set(e.msg.messageId, {
-          ackId: e.ackId,
-          pos: q.length,
-        });
-      n += 1;
-    }
-    midTurnQueues.set(ch.id, q);
-  }
-  if (n > 0)
-    console.log(
-      `[channel] rewake survival: re-queued ${n} queued inbound(s) from state files`,
-    );
-  return n;
-}
-
-/** Pop the oldest queued inbound for ONE channel (#39 /hold off drain).
- *  Returns null when the channel's line is empty. */
-export function popChannelQueuedInbound(
-  channelId: string,
-): QueuedInbound | null {
-  const q = midTurnQueues.get(channelId);
-  if (!q || q.length === 0) return null;
-  const e = q.shift()!;
-  if (q.length === 0) midTurnQueues.delete(channelId);
-  consumeQueuedAck(channelId, e.msg.messageId);
-  return e;
-}
-
-/** Drop one queued entry by id WITHOUT delivering it (#186 F1): the
- *  delivery already happened through another path (the cursor-replay
- *  direct send) and its commit must not leave the drained copy behind
- *  for the agent_end re-wake to pop — that second pop is exactly the
- *  double delivery. Consume the ack like a pop would. No-op when the
- *  id is not queued (the normal pop-then-send order reaches here with
- *  the entry already out of the line). */
-function dropQueuedInbound(channelId: string, messageId: string): void {
-  const q = midTurnQueues.get(channelId);
-  if (!q) return;
-  const idx = q.findIndex((e) => e.msg.messageId === messageId);
-  if (idx === -1) return;
-  q.splice(idx, 1);
-  if (q.length === 0) midTurnQueues.delete(channelId);
-  consumeQueuedAck(channelId, messageId);
-}
-
-/** Remove one armed interrupt timer (the queue entry for it is gone).
- *  No-op when the message never armed one. */
-export function disarmInterrupt(channelId: string, messageId: string): void {
-  const list = pendingInterrupts.get(channelId);
-  if (!list) return;
-  const i = list.findIndex((p) => p.messageId === messageId);
-  if (i === -1) return;
-  clearTimeout(list[i].timer);
-  list.splice(i, 1);
-  if (list.length === 0) pendingInterrupts.delete(channelId);
-}
+export let configRoot: string | null = null;
 
 // ─── Mid-run interrupt ─────────────────────────────────────────────────
 // A PLAIN message that arrives while a run is active is queued for a
@@ -1497,90 +1187,6 @@ export async function runMidRunInterrupt(
     stopOpTick(`interrupt:${channelId}`);
   }
 }
-// ─── Queue control: edit + delete of queued inbounds ─────────────────────
-// The re-wake queue keeps the FULL ChannelMessage per entry, so the
-// Discord MESSAGE_UPDATE / MESSAGE_DELETE gateway events (routed per
-// channel in discord.ts) can target an entry by message id. Owner-only,
-// same isOwner rule as the channel commands.
-
-/** Re-render a queued entry after its Discord message was edited.
- *  Updates the stored ChannelMessage (the re-wake path re-processes it
- *  through the full inbound pipeline) and the pre-rendered interrupt text
- *  (the plain-path ctx pipeline: channel-ctx + replied-message +
- *  suffix-stripped body). FIFO position is kept. Returns false when
- *  the message is not queued or the editor is not the owner. */
-export async function updateQueuedInbound(
-  ctx: ExtensionContext,
-  channelId: string,
-  messageId: string,
-  content: string,
-  attachments: AttachmentRef[],
-  authorId: string | undefined,
-): Promise<boolean> {
-  const q = midTurnQueues.get(channelId);
-  const entry = q?.find((e) => e.msg.messageId === messageId);
-  if (!entry) return false;
-  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
-  if (hasOwnerConfigured(ch) && !isOwnerUser(ch, authorId)) return false;
-  entry.msg.body = content;
-  entry.msg.attachments = attachments;
-  // #186 (F2): rewrite the FILE copy too — the file is the survival
-  // path; a restart before delivery must drain the edited
-  // body/attachments, not the pre-edit msg.
-  rewakeUpdatePendingMsg(runtimeStateDir, channelId, messageId, entry.msg);
-
-  // Plain-path re-render (same pipeline as handleInbound's no-attachment
-  // branch). Entries queued WITH attachments keep their stored file-folder
-  // text stale for the interrupt path; the re-wake path (the common one)
-  // re-downloads and re-renders them fully from entry.msg.
-  const { prompt: body, forceBtw } = extractBtwSuffix(content.trim());
-  const channelCtx = buildChannelContext(ch, entry.msg, { btw: forceBtw });
-  const repliedBlock = buildRepliedMessageBlock(entry.msg.repliedMessage);
-  const ctxBlock = [channelCtx, repliedBlock].filter(Boolean).join("\n\n");
-  entry.text = `${ctxBlock}\n\n${body || "(empty)"}`;
-  entry.title = channelTitle(ch, entry.msg);
-  entry.display = body || "(empty)";
-  console.log(
-    `[channel] queued inbound ${messageId} re-rendered from message edit`,
-  );
-  return true;
-}
-
-/** Drop a queued entry after its Discord message was deleted. Removes the
- *  entry, disarms its interrupt timer, deletes the "[queued] N in line"
- *  ack, and renumbers the remaining line. Owner-only. */
-export async function deleteQueuedInbound(
-  ctx: ExtensionContext,
-  channelId: string,
-  messageId: string,
-): Promise<void> {
-  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
-  const q = midTurnQueues.get(channelId);
-  const idx = q ? q.findIndex((e) => e.msg.messageId === messageId) : -1;
-  const ack = queuedAcks.get(messageId);
-  if (idx === -1 && !ack) return; // never queued, no ack: not ours
-  if (hasOwnerConfigured(ch)) {
-    const fromId = idx !== -1 && q ? q[idx].msg.fromId : ack?.fromId;
-    if (!isOwnerUser(ch, fromId)) return; // owner only
-  }
-  if (idx !== -1 && q) {
-    q.splice(idx, 1);
-    if (q.length === 0) midTurnQueues.delete(channelId);
-    disarmInterrupt(channelId, messageId);
-    // #180: the operator deleted the message — the survived copy must
-    // not resurrect it on the next restart.
-    rewakeRemovePending(runtimeStateDir, channelId, messageId);
-    console.log(
-      `[channel] queued inbound ${messageId} dropped (message deleted)`,
-    );
-  }
-  if (ack) {
-    queuedAcks.delete(messageId);
-    if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
-  }
-  renumberQueuedAcks(channelId);
-}
-
 // Last inbound Discord message id per channel — the 👀 ack target. The
 // message_end early-send path unreacts it (A1: step-finals carry no
 // replyTo, so the agent_end unreact branch never sees them).
@@ -3947,7 +3553,7 @@ const CHANNEL_FORMAT_HINTS: Record<ChannelConfig["type"], string> = {
     "Discord message: markdown supported (bold, bullets, code blocks); keep it compact for chat reading.",
 };
 
-function channelTitle(
+export function channelTitle(
   ch: ChannelConfig | undefined,
   msg: ChannelMessage,
 ): string {
