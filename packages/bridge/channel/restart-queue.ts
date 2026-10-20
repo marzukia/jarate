@@ -6,8 +6,8 @@
 // never re-fetches it — the 2026-10-06 incident (pi-bg callback queued
 // 04:19:44, process restarted 04:19:52, callback never consumed).
 //
-// Two complementary survival layers, both keyed on the [bg: / pi-bg
-// machine-wake contract (isBgWebhook in discord.ts):
+// Two complementary survival layers, both keyed on the machine-wake
+// contract (isBgWebhook in discord.ts: ANY webhook-posted message):
 //
 //   option 2 (primary): every queued inbound is mirrored into a
 //     per-channel state file (<stateDir>/rewake-<channelId>.json, the

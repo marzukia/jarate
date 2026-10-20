@@ -486,7 +486,7 @@ test("other bots are skipped; cursor still advances (T3)", async () => {
   expect(getDiscordStates().get("o1")?.lastMessageId).toBe("602");
 });
 
-test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg skipped", async () => {
+test("webhook-posted bot messages are delivered (any content); plain bot msg skipped", async () => {
   const seen: any[] = [];
   setFetch(async (u) => {
     if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-w" });
@@ -509,7 +509,8 @@ test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg s
           ...userMsg("612", "bot-other"),
           author: { id: "bot-other", username: "otherbot", bot: true },
         },
-        // Webhook author id but human content — not a dispatch wake.
+        // Webhook author id, no [bg: prefix — still delivered: any
+        // webhook post is a machine wake (Andryo 2026-10-20).
         {
           ...userMsg("613", "1546765929298272346"),
           author: { id: "1546765929298272346", username: "monky", bot: true },
@@ -526,9 +527,10 @@ test("pi-bg webhook ([bg:, author.bot, webhook_id) is delivered; plain bot msg s
   });
   await pollDiscord("o2");
   await tick();
-  // Only the [bg: webhook message reached the handler — the dispatch wake.
-  expect(seen.map((m) => m.messageId)).toEqual(["611"]);
+  // Both webhook messages reached the handler; the plain bot msg was skipped.
+  expect(seen.map((m) => m.messageId)).toEqual(["611", "613"]);
   expect(seen[0].body).toBe("[bg:worker:OK] task 42 done");
+  expect(seen[1].body).toBe("just a webhook note");
   // Cursor advanced past all three.
   expect(getDiscordStates().get("o2")?.lastMessageId).toBe("613");
 });
@@ -1137,8 +1139,8 @@ test("parseGatewayPayload fast path: no 16+ digit run -> plain JSON.parse (RCA 2
   expect(quoteLongIntegers('{"a":123}')).toBe('{"a":123}');
 });
 
-test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only)", () => {
-  // legacy plain-text callback
+test("isBgWebhook exempts ANY webhook-posted bot message (no keyword filter)", () => {
+  // legacy plain-text dispatch callback
   expect(
     isBgWebhook({
       webhook_id: "w1",
@@ -1146,7 +1148,7 @@ test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only
       author: { bot: true },
     }),
   ).toBe(true);
-  // embed-only callback (Variant D): no top-level content, identified by embed author
+  // embed-only callback (Variant D) — still exempt
   expect(
     isBgWebhook({
       webhook_id: "w1",
@@ -1157,12 +1159,11 @@ test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only
       ],
     }),
   ).toBe(true);
-  // non-webhook bot message with [bg: text is not exempt
-  expect(isBgWebhook({ content: "[bg:x]", author: { bot: true } })).toBe(false);
-  // webhook without the pi-bg markers is not exempt
+  // webhook without the [bg: prefix / pi-bg embed name IS exempt now
+  // (Andryo 2026-10-20: react to any webhook)
   expect(
     isBgWebhook({ webhook_id: "w1", content: "hello", author: { bot: true } }),
-  ).toBe(false);
+  ).toBe(true);
   expect(
     isBgWebhook({
       webhook_id: "w1",
@@ -1170,7 +1171,9 @@ test("isBgWebhook exempts pi-bg dispatch callbacks (content prefix or embed-only
       author: { bot: true },
       embeds: [{ author: { name: "other thing" } }],
     }),
-  ).toBe(false);
+  ).toBe(true);
+  // non-webhook bot message with [bg: text is NOT exempt
+  expect(isBgWebhook({ content: "[bg:x]", author: { bot: true } })).toBe(false);
   expect(isBgWebhook(null)).toBe(false);
 });
 
