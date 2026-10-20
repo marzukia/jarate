@@ -1003,7 +1003,7 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
     }
   }, 30_000);
 
-  test("held record: re-flagged daily until the retry fires (stays running)", async () => {
+  test("held record: re-flagged daily until the retry hits the retired stub (terminal)", async () => {
     const f = fixture();
     // Scrub the ambient PI_BG_* leak vars (mirrors retryFixture's list,
     // plus PI_BG_HB_PID): the bare fixture only scrubs PI_SERVICE/
@@ -1050,13 +1050,11 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
       const over = {
         PI_BG_LAUNCHER: JB,
         PI_BG_MAX_CONCURRENT: "1",
-        // Headroom, not the fix. Both CI reds (37473320280 at 8s,
-        // 37484172676 at 30s) were the same non-timing cause: the
-        // 1-line prompt (empty after `tail -n +3`) plus the ambient
-        // PI_BG_* leak in wrapper envs - fixed above. 30s is kept as
-        // headroom for a slow clean-env launch (worktree add, cgroup
-        // escape); the production default stays 8s.
-        PI_BG_RETRY_WAIT: "30",
+        // hall-monitor #35: JB is the retired stub (exit 10, no run
+        // record) - it writes its log in ms, so 2s of record-poll head
+        // room is ample (the pre-retirement 30s covered worktree add +
+        // cgroup escape for a real launch).
+        PI_BG_RETRY_WAIT: "2",
       };
       const r1 = await f.run([], over);
       expect(r1.code).toBe(0);
@@ -1084,27 +1082,24 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
         "running",
       );
 
-      // a slot frees: the retry fires and closes the record
+      // a slot frees: the retry re-dispatches - into the retired stub
+      // (hall-monitor #35): terminal-held, the record closes in the
+      // retry section, and no retry record is ever born
       fs.rmSync(path.join(f.art, `pi-bg-${TID(9)}-hb`));
       const r4 = await f.run([], over);
-      expect(r4.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r4.out).toContain(`retry ${t}: launcher retired`);
       const rec4 = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
       expect(rec4.state).toBe("killed");
-      expect(rec4.deadRetry.state).toBe("dispatched");
-      // clean up the retry record so the reaper/prune see a settled box
+      expect(rec4.deadRetry.state).toBe("retired");
       const recIds = fs
         .readdirSync(path.join(f.home, ".pi-dispatch", "runs"))
         .filter((n) => n !== `pi-bg-${t}.json`);
-      for (const n of recIds) {
-        const rj = JSON.parse(
-          fs.readFileSync(path.join(f.home, ".pi-dispatch", "runs", n), "utf8"),
-        );
-        rj.state = "killed";
-        fs.writeFileSync(
-          path.join(f.home, ".pi-dispatch", "runs", n),
-          JSON.stringify(rj),
-        );
-      }
+      expect(recIds).toEqual([]);
+      // terminal: the next sweep is quiet (record done + retired marker)
+      const n = f.posts.length;
+      const r5 = await f.run([], over);
+      expect(r5.out).not.toContain(`retry ${t}:`);
+      expect(f.posts).toHaveLength(n);
     } finally {
       f.close();
     }
@@ -1864,7 +1859,11 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     const env = f.env;
     env.PATH = `${bin}:${env.PATH ?? ""}`;
     env.PI_BG_LAUNCHER = JB; // re-dispatch through the in-repo launcher
-    env.PI_BG_RETRY_WAIT = "10";
+    // hall-monitor #35: JB is the RETIRED stub (exit 10, no run record),
+    // so a retry never materializes a run - these tests pin that
+    // terminal contract. 2s is ample for the stub's log write (it exits
+    // in ms; the wait is a record-poll loop).
+    env.PI_BG_RETRY_WAIT = "2";
     env.PI_BG_MAX_CONCURRENT = "0"; // cap off unless a test sets it
     env.PI_BG_ALLOW_FOREGROUND = "1";
     for (const k of [
@@ -1902,47 +1901,9 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
           .filter((n) => /^pi-bg-\d{8}-\d{6}-\d+\.json$/.test(n))
           .map((n) => n.slice(6, -5))
       : [];
-  const cgFile = (f: F, t: string) =>
-    path.join(f.tmp, "cg", "pi-bg", t, "cgroup.procs");
-  const cgLive = (f: F, t: string) => {
-    try {
-      return fs.readFileSync(cgFile(f, t), "utf8").trim().length > 0;
-    } catch {
-      return false;
-    }
-  };
-  // SIGKILL the ticket's whole process group (untrapable -> DEAD class);
-  // the fake cgroup.procs file is what the kernel drops on death
-  const killTicket = (f: F, t: string) => {
-    const p = cgFile(f, t);
-    if (!fs.existsSync(p)) return;
-    for (const line of fs.readFileSync(p, "utf8").split("\n")) {
-      const pid = parseInt(line, 10);
-      if (!pid) continue;
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {
-        /* gone */
-      }
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        /* gone */
-      }
-    }
-    fs.writeFileSync(p, "");
-  };
   const age = (p: string, min: number) => {
     const d = new Date(Date.now() - min * 60 * 1000);
     fs.utimesSync(p, d, d);
-  };
-  const waitFor = async (fn: () => boolean, ms: number) => {
-    const end = Date.now() + ms;
-    while (Date.now() < end) {
-      if (fn()) return true;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-    return fn();
   };
   const mkRepo = (f: F, name: string) => {
     const d = path.join(f.tmp, name);
@@ -1956,42 +1917,6 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     sh("git add a.txt");
     sh("git commit -q -m init");
     return d;
-  };
-  // detached launcher run (the nohup form) + wait for the wrapper to be
-  // fully up (cgroup escape + pid file)
-  const launchBg = async (
-    f: F,
-    cwd: string,
-    args: string[],
-    task: string,
-    t: string,
-  ): Promise<string> => {
-    const log = path.join(
-      f.tmp,
-      `launch-${Date.now()}-${Math.floor(Math.random() * 1e6)}.log`,
-    );
-    // non-blocking: bun's execSync waits for the WHOLE process group
-    // (the wrapper + its pi) before returning. spawn + the waitFor
-    // (cgLive) poll below is the readiness gate.
-    const child = spawn(
-      [
-        "sh",
-        "-c",
-        `cd ${shq(cwd)} && printf '%s' ${shq(task)} | nohup bash ${shq(JB)} ${args.map(shq).join(" ")} - > ${shq(log)} 2>&1`,
-      ],
-      {
-        env: { ...f.env, PI_BG_RUN_ID: t },
-        stdio: ["ignore", "ignore", "ignore"],
-      },
-    );
-    child.unref();
-    const up = await waitFor(() => cgLive(f, t), 30_000);
-    if (!up) {
-      throw new Error(
-        `ticket ${t} did not start:\n${fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "(no log)"}`,
-      );
-    }
-    return t;
   };
   const bless = (f: F) =>
     fs.writeFileSync(
@@ -2030,6 +1955,40 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
         2,
       ),
     );
+  };
+  // plant a worktree run in the SIGKILL shape (record + stored prompt +
+  // started marker + stale hb + empty cgroup): the dir sweep's DEAD
+  // fixture for the retired-launcher tests - the stubbed jarate-bg
+  // cannot launch a live run, so the original is planted, not launched.
+  const plantWtRun = (f: F, t: string, wt: string, prompt: string) => {
+    plantRec(f, t, wt);
+    fs.writeFileSync(
+      path.join(f.art, `pi-bg-${t}-prompt.md`),
+      `# pi-bg worker task\n\n${prompt}\n`,
+    );
+    fs.writeFileSync(path.join(f.art, `pi-bg-${t}-started`), "");
+    const hb = path.join(f.art, `pi-bg-${t}-hb`);
+    fs.writeFileSync(hb, "");
+    age(hb, 15); // > STALL_MIN (10)
+    const cg = path.join(f.tmp, "cg", "pi-bg", t);
+    fs.mkdirSync(cg, { recursive: true });
+    fs.writeFileSync(path.join(cg, "cgroup.procs"), "");
+  };
+  // backdate this ticket's dead-log line a day (the per-day dedupe
+  // expires -> a cross-day re-flag would fire if not terminal)
+  const backdateDeadlog = (f: F, t: string) => {
+    const p = path.join(f.home, ".pi-bg-deadlog");
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    const lines = fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .map((l) =>
+        l.startsWith(`${today} ${t} `) ? l.replace(today, yesterday) : l,
+      );
+    fs.writeFileSync(p, `${lines.join("\n").trimEnd()}\n`);
   };
   // plant a CWD run record (no wt field) + stored prompt + stale hb +
   // empty cgroup dir (the SIGKILL shape): the cwd sweep's DEAD fixture
@@ -2075,105 +2034,89 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     return fa;
   };
 
-  test("SIGKILL mid-run -> re-dispatched ONCE into the SAME worktree (retryOf), retry callback fires", async () => {
+  test("SIGKILL mid-run -> retry lands on the retired launcher: terminal-held, human decision (hall-monitor #35)", async () => {
     const f = retryFixture();
     bless(f);
     const t1 = RT(1);
-    let t2 = "";
     try {
       const repo = mkRepo(f, "repo");
-      fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
-      await launchBg(
-        f,
-        repo,
-        ["worker", "--worktree"],
-        "issue-110 kill me",
-        t1,
-      );
-      killTicket(f, t1);
-      age(path.join(f.wtDir, "repo", t1), 30); // wt mtime > AGE_MIN (20)
-      age(path.join(f.art, `pi-bg-${t1}-hb`), 15); // hb > STALL_MIN (10)
+      const wt = path.join(f.wtDir, "repo", t1);
+      execSync(`git worktree add -q -b pi-bg/${t1} ${shq(wt)}`, {
+        cwd: repo,
+        env: f.env,
+        stdio: "pipe",
+      });
+      age(wt, 30); // wt mtime > AGE_MIN (20)
+      plantWtRun(f, t1, wt, "issue-110 kill me");
       const r = await f.run();
       expect(r.code).toBe(0);
-      expect(r.out).toContain(`retry ${t1}: DISPATCHED`);
+      expect(r.out).toContain(`retry ${t1}: launcher retired`);
       const rec1 = rec(f, t1);
       expect(rec1.state).toBe("killed");
-      expect((rec1.deadRetry as { state: string }).state).toBe("dispatched");
-      t2 = (rec1.deadRetry as { ticket: string }).ticket;
-      expect(t2).toMatch(/^\d{8}-\d{6}-\d+$/);
-      expect(t2).not.toBe(t1);
-      expect(rec(f, t2).retryOf).toBe(t1);
-      // SAME worktree: the retry launched in the original dir; no 2nd dir
-      expect(rec(f, t2).cwd).toBe(
-        fs.realpathSync(path.join(f.wtDir, "repo", t1)),
-      );
-      expect(fs.existsSync(path.join(f.wtDir, "repo", t2))).toBe(false);
-      // the retry re-runs the SAME stored prompt; fast pi -> OK callback
-      const got = await waitFor(() => !!postByTicket(f, t2), 30_000);
-      expect(got).toBe(true);
-      expect(postOrThrow(f, t2).title).toContain("OK");
-      // the original's DEAD embed shows the retry action at the reason head
+      expect((rec1.deadRetry as { state: string }).state).toBe("retired");
+      // the retry never became a run: the stub exits 10 with no run
+      // record, and the worktree dir is never created for it
+      expect(recIds(f)).toEqual([t1]);
+      expect(fs.readdirSync(path.join(f.wtDir, "repo"))).toEqual([t1]);
+      // the DEAD embed carries the human decision at the reason head
       const dead = postOrThrow(f, t1);
       expect(dead.title).toBe("DEAD \u00b7 watchdog sweep");
-      expect(dead.description).toContain("retry dispatched (issue #110");
-      expect(recIds(f).sort()).toEqual([t1, t2].sort());
+      expect(dead.description).toContain("human decision: re-dispatch");
+      // terminal: no re-flag, no re-dispatch on a later sweep
+      const n = f.posts.length;
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`retry ${t1}:`);
+      expect(recIds(f)).toEqual([t1]);
+      expect(f.posts).toHaveLength(n);
     } finally {
-      killTicket(f, t2);
       f.close();
     }
-  }, 90_000);
+  }, 60_000);
 
-  test("kill the retry too -> second-death embed, human wake only, no third dispatch", async () => {
+  test("retry retired: cross-day the record is terminal (no re-flag, no third dispatch)", async () => {
     const f = retryFixture();
     bless(f);
     const t1 = RT(2);
-    let t2 = "";
     try {
       const repo = mkRepo(f, "repo");
-      fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
-      fs.writeFileSync(path.join(f.tmp, "slow-ALL"), ""); // retry (unknown id yet) slow too
-      await launchBg(
-        f,
-        repo,
-        ["worker", "--worktree"],
-        "kill me and my retry",
-        t1,
-      );
-      killTicket(f, t1);
-      age(path.join(f.wtDir, "repo", t1), 30);
-      age(path.join(f.art, `pi-bg-${t1}-hb`), 15);
+      const wt = path.join(f.wtDir, "repo", t1);
+      execSync(`git worktree add -q -b pi-bg/${t1} ${shq(wt)}`, {
+        cwd: repo,
+        env: f.env,
+        stdio: "pipe",
+      });
+      age(wt, 30);
+      plantWtRun(f, t1, wt, "kill me and my retry");
       const r1 = await f.run();
-      expect(r1.out).toContain(`retry ${t1}: DISPATCHED`);
-      t2 = (rec(f, t1).deadRetry as { ticket: string }).ticket;
-      const up = await waitFor(() => cgLive(f, t2), 30_000);
-      expect(up).toBe(true);
-      killTicket(f, t2);
-      age(path.join(f.art, `pi-bg-${t2}-hb`), 15);
-      const r2 = await f.run();
-      expect(r2.code).toBe(0);
-      // wt-chain retry: the repo name, not "cwd" (review F4)
-      expect(r2.out).toContain(`DEAD repo/${t2}`);
-      expect(r2.out).toContain("second death in chain (issue #110)");
-      expect(r2.out).not.toContain("DISPATCHED");
-      const rec2 = rec(f, t2);
-      expect(rec2.state).toBe("killed");
-      expect(rec2.deadRetry).toBeUndefined();
-      expect(recIds(f).sort()).toEqual([t1, t2].sort());
-      const em2 = postOrThrow(f, t2);
-      expect(em2.title).toBe("DEAD \u00b7 watchdog sweep");
-      expect(em2.description).toContain("second death in chain (issue");
-      // third sweep: quiet (dead-log dedupe + terminal states)
+      expect(r1.code).toBe(0);
+      expect(r1.out).toContain(`retry ${t1}: launcher retired`);
+      expect(rec(f, t1).state).toBe("killed");
+      expect((rec(f, t1).deadRetry as { state: string }).state).toBe("retired");
+      // no retry run was ever born, so no second death can occur
+      expect(recIds(f)).toEqual([t1]);
+      const em1 = postOrThrow(f, t1);
+      expect(em1.title).toBe("DEAD \u00b7 watchdog sweep");
+      expect(em1.description).toContain("human decision: re-dispatch");
+      // same day: dead-log dedupe - nothing
       const n = f.posts.length;
+      const r2 = await f.run();
+      expect(r2.out).not.toContain(`retry ${t1}:`);
+      expect(f.posts).toHaveLength(n);
+      // next day: the record is terminal (killed + retired) - the
+      // record_done guard suppresses the re-flag; a pre-#51 record would
+      // have re-posted here. The human decision stands without churn.
+      backdateDeadlog(f, t1);
       const r3 = await f.run();
-      expect(r3.code).toBe(0);
+      expect(r3.out).not.toContain(`DEAD repo/${t1}`);
+      expect(r3.out).not.toContain(`retry ${t1}:`);
       expect(f.posts).toHaveLength(n);
     } finally {
-      killTicket(f, t2);
       f.close();
     }
-  }, 120_000);
+  }, 60_000);
 
-  test("first death at full cap -> HELD; slot frees -> fires on a later sweep", async () => {
+  test("first death at full cap -> HELD; slot frees -> retry hits the retired stub (terminal-held)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "4";
@@ -2211,21 +2154,25 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r2.out).toContain(`retry ${t}: HELD (at cap 4/4)`);
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(1);
-      // a slot frees: the later sweep fires it
+      // a slot frees: the later sweep re-dispatches - into the retired
+      // stub (hall-monitor #35): terminal-held, no run record, record
+      // closed. The human re-dispatches via the fleet.
       fs.rmSync(path.join(f.art, "pi-bg-20991211-000000-777-hb"));
       const r3 = await f.run();
-      expect(r3.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r3.out).toContain(`retry ${t}: launcher retired`);
       const rec3 = rec(f, t);
       expect(rec3.state).toBe("killed");
-      expect((rec3.deadRetry as { state: string }).state).toBe("dispatched");
-      const t2 = (rec3.deadRetry as { ticket: string }).ticket;
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
-      killTicket(f, t2);
+      expect((rec3.deadRetry as { state: string }).state).toBe("retired");
+      expect(recIds(f)).toEqual([t]); // the retry never became a run
+      // terminal: no re-dispatch on a later sweep
+      const n = f.posts.length;
+      const r4 = await f.run();
+      expect(r4.out).not.toContain(`retry ${t}:`);
+      expect(f.posts).toHaveLength(n);
     } finally {
       f.close();
     }
-  }, 90_000);
+  }, 60_000);
 
   test("pre-#101 record (no stored prompt) -> plain DEAD embed only, no retry", async () => {
     const f = retryFixture();
@@ -2351,59 +2298,56 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     }
   }, 60_000);
 
-  test("idempotency: double sweep + crash window (marker without close) never double-dispatch", async () => {
+  test("crash window: dispatched marker without a record reconciles into the retired stub, never a run", async () => {
     const f = retryFixture();
     bless(f);
     const t1 = RT(7);
-    let t2 = "";
+    const tGhost = "20991220-101010-999";
     try {
       const repo = mkRepo(f, "repo");
-      fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
-      fs.writeFileSync(path.join(f.tmp, "slow-ALL"), ""); // retry stays alive
-      await launchBg(
-        f,
-        repo,
-        ["worker", "--worktree"],
-        "issue-110 idempotency",
-        t1,
-      );
-      killTicket(f, t1);
-      age(path.join(f.wtDir, "repo", t1), 30);
-      age(path.join(f.art, `pi-bg-${t1}-hb`), 15);
-      const r1 = await f.run();
-      expect(r1.out).toContain(`retry ${t1}: DISPATCHED`);
-      t2 = (rec(f, t1).deadRetry as { ticket: string }).ticket;
-      const up = await waitFor(() => cgLive(f, t2), 30_000);
-      expect(up).toBe(true);
-      // double sweep with the retry still running: no second dispatch
-      const r2 = await f.run();
-      expect(r2.out).not.toContain("DISPATCHED");
-      expect(r2.out).not.toContain("HELD (at cap");
-      expect(rec(f, t1).state).toBe("killed");
-      expect(recIds(f).sort()).toEqual([t1, t2].sort());
-      // crash window: the watchdog died after marking dispatched but
-      // before closing the original -> state back to "running"
+      const wt = path.join(f.wtDir, "repo", t1);
+      execSync(`git worktree add -q -b pi-bg/${t1} ${shq(wt)}`, {
+        cwd: repo,
+        env: f.env,
+        stdio: "pipe",
+      });
+      age(wt, 30);
+      plantWtRun(f, t1, wt, "issue-110 idempotency");
+      // crash window: the watchdog died after marking the retry
+      // dispatched but before the launch result landed. The stub exits
+      // 10 with no run record, so the ghost can never become a run -
+      // a double-dispatch is impossible by construction.
       const r1j = rec(f, t1);
-      r1j.state = "running";
+      r1j.deadRetry = { state: "dispatched", ticket: tGhost };
       fs.writeFileSync(recFileOf(f, t1), JSON.stringify(r1j, null, 2));
-      const r3 = await f.run();
-      expect(r3.out).toContain(`retry ${t1}: chain confirmed (${t2})`);
+      const r1 = await f.run();
+      expect(r1.code).toBe(0);
+      // reconcile (dispatched + no ghost record) -> held -> re-dispatch
+      // -> retired stub: terminal, record closed
+      expect(r1.out).toContain(`retry ${t1}: launcher retired`);
+      expect(r1.out).not.toContain("DISPATCHED");
       expect(rec(f, t1).state).toBe("killed");
-      expect(recIds(f).sort()).toEqual([t1, t2].sort()); // no third ticket
+      expect((rec(f, t1).deadRetry as { state: string }).state).toBe("retired");
+      expect(recIds(f)).toEqual([t1]); // the ghost never became a run
+      // later sweep: quiet (terminal + dead-log dedupe)
+      const n = f.posts.length;
+      const r2 = await f.run();
+      expect(r2.code).toBe(0);
+      expect(r2.out).not.toContain(`retry ${t1}:`);
+      expect(recIds(f)).toEqual([t1]);
+      expect(f.posts).toHaveLength(n);
     } finally {
-      killTicket(f, t2);
       f.close();
     }
-  }, 120_000);
+  }, 60_000);
 
-  test("cwd run: first death at full cap -> HELD, record stays running; slot frees -> fires on a later sweep (review F1)", async () => {
+  test("cwd run: first death at full cap -> HELD, record stays running; slot frees -> retired stub (terminal-held, review F1)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "2";
     const t = RT(8);
     plantCwdRun(f, t, "cwd held task");
     const filler = plantFillers(f);
-    let t2 = "";
     try {
       const r1 = await f.run();
       expect(r1.code).toBe(0);
@@ -2423,37 +2367,36 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r2.out).toContain(`retry ${t}: HELD (at cap 2/2)`);
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(1);
-      // a slot frees: the later sweep fires it (T3 shape, cwd variant)
+      // a slot frees: the later sweep re-dispatches - into the retired
+      // stub (hall-monitor #35): terminal-held, no run record, record
+      // closed by the retry section (the cwd sweep deduped, so its audit
+      // mark already ran) - the human re-dispatches via the fleet
       fs.rmSync(filler);
       const r3 = await f.run();
       expect(r3.code).toBe(0);
-      expect(r3.out).toContain(`retry ${t}: DISPATCHED`);
-      // no worktree claim for a cwd run (review F4a)
-      expect(r3.out).toContain(`(retry_of=${t}, same cwd)`);
+      expect(r3.out).toContain(`retry ${t}: launcher retired`);
       const rec3 = rec(f, t);
       expect(rec3.state).toBe("killed");
-      expect((rec3.deadRetry as { state: string }).state).toBe("dispatched");
-      t2 = (rec3.deadRetry as { ticket: string }).ticket;
-      expect(t2).toMatch(/^\d{8}-\d{6}-\d+$/);
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
-      killTicket(f, t2);
+      expect((rec3.deadRetry as { state: string }).state).toBe("retired");
+      expect(recIds(f)).toEqual([t]); // the retry never became a run
+      // terminal: no re-dispatch on a later sweep
+      const n = f.posts.length;
+      const r4 = await f.run();
+      expect(r4.out).not.toContain(`retry ${t}:`);
+      expect(f.posts).toHaveLength(n);
     } finally {
       f.close();
     }
-  }, 90_000);
+  }, 60_000);
 
-  test("quiet + PI_BG_WATCHDOG_RETRY=1: retry fully functional, zero posts (review F2)", async () => {
+  test("quiet + PI_BG_WATCHDOG_RETRY=1: retry lands on the retired stub, zero posts (review F2)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "2";
     const t = RT(9);
     plantCwdRun(f, t, "cwd quiet-retry task");
     const filler = plantFillers(f);
-    // retry pi stays slow: no OK callback can race the zero-post asserts
-    fs.writeFileSync(path.join(f.tmp, "slow-ALL"), "");
     const q = { PI_BG_WATCHDOG_RETRY: "1" };
-    let t2 = "";
     try {
       const r1 = await f.run(["--quiet"], q);
       expect(r1.code).toBe(0);
@@ -2468,24 +2411,23 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r1b.out).toContain("retry_on=0");
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(0);
-      // a slot frees + override: fires, record advances, still zero posts
+      // a slot frees + override: the re-dispatch lands on the retired
+      // stub (hall-monitor #35) - terminal-held, record closed, still
+      // zero posts (the quiet contract is no posts, even for retries)
       fs.rmSync(filler);
       const r2 = await f.run(["--quiet"], q);
       expect(r2.code).toBe(0);
-      expect(r2.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r2.out).toContain(`retry ${t}: launcher retired`);
       expect(r2.out).toContain("retry_on=1");
       const rec2 = rec(f, t);
       expect(rec2.state).toBe("killed");
-      expect((rec2.deadRetry as { state: string }).state).toBe("dispatched");
-      t2 = (rec2.deadRetry as { ticket: string }).ticket;
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
+      expect((rec2.deadRetry as { state: string }).state).toBe("retired");
+      expect(recIds(f)).toEqual([t]); // the retry never became a run
       expect(f.posts).toHaveLength(0);
-      killTicket(f, t2);
     } finally {
       f.close();
     }
-  }, 90_000);
+  }, 60_000);
 
   test("live retry in the original dir: no spurious STALLED re-flag of the original after midnight (review F3)", async () => {
     const f = retryFixture();
