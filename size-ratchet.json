@@ -6,7 +6,7 @@
   "packages/bridge/channel/handover.test.ts": 2387,
   "packages/bridge/channel/handover.ts": 1409,
   "packages/bridge/channel/index.test.ts": 4181,
-  "packages/bridge/channel/index.ts": 3799,
+  "packages/bridge/channel/index.ts": 3815,
   "packages/bridge/channel/undo.ts": 1090,
   "packages/bridge/channel/commands.ts": 1279
 }
