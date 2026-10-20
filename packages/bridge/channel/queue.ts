@@ -31,9 +31,9 @@ import {
   interruptStepTimeoutMs,
   isBgInbound,
   pendingInterrupts,
-  persistLivePlaceholders,
   runtimeStateDir,
 } from "./index";
+import { persistLivePlaceholders } from "./live";
 import {
   rewakeAddPending,
   rewakeCommitDelivered,

@@ -25,7 +25,6 @@ import { styleGuard } from "./format";
 import extension, {
   clearAllCompacting,
   clearAllInterrupts,
-  fence,
   handleInbound,
   heldChannels,
   isHeld,
@@ -37,9 +36,9 @@ import extension, {
   runUsageLine,
   setInterruptCtx,
   setRuntimeStateDir,
-  stopAllCompactTicks,
   verboseOverride,
 } from "./index";
+import { fence, stopAllCompactTicks } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,

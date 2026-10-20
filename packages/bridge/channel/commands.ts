@@ -35,16 +35,13 @@ import { resolveHandoffSettings } from "./handover";
 import {
   agentBusy,
   archiveStaleSessions,
-  armCompactTick,
   beginCompacting,
   beginRestartOp,
   buildChannelContext,
-  COMPACT_PLACEHOLDER,
   clearCompacting,
   clearInterrupts,
   clearOpMarker,
   compactingChannels,
-  fence,
   getPendingCompact,
   handleInbound,
   interruptCancelled,
@@ -68,13 +65,18 @@ import {
   sessionStartTs,
   setHeld,
   setPendingCompact,
-  settleCompactTick,
   setUserStoppedRun,
   VERBOSE_LEVEL_NAMES,
   verboseLevel,
   verboseOverride,
 } from "./index";
 import { jobsKill, jobsTail, jobsView } from "./jobs";
+import {
+  armCompactTick,
+  COMPACT_PLACEHOLDER,
+  fence,
+  settleCompactTick,
+} from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,

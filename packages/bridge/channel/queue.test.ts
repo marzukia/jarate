@@ -23,9 +23,9 @@ import extension, {
   setInterruptCtx,
   setRuntimeStateDir,
   setSystemdRestartHookForTest,
-  stopAllOpTicks,
   verboseOverride,
 } from "./index";
+import { stopAllOpTicks } from "./live";
 import {
   clearQueuedInbound,
   deleteQueuedInbound,

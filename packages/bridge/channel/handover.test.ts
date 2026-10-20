@@ -58,8 +58,8 @@ import extension, {
   setHandoffRestartArmed,
   setHandoverCompleteForTest,
   setSystemdRestartHookForTest,
-  stopAllOpTicks,
 } from "./index";
+import { stopAllOpTicks } from "./live";
 import { renderBoard, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
 
