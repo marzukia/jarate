@@ -1,6 +1,6 @@
 ---
 name: channel
-description: Transparent Discord channel bridge (bot token). Messages forwarded as plain user messages. Responses auto-forwarded to last active channel. Reply context injected on replies. send-file tool uploads files. Commands: /stop, /btw, /help, /status, /reset, /verbose.
+description: Transparent Discord channel bridge (bot token). Messages forwarded as plain user messages. Responses auto-forwarded to last active channel. Reply context injected on replies. LLM tools: send-file, todo, sleep, task, jarate. Commands: 22 slash commands + bare stop + ! shell (full list below).
 ---
 
 # Channel — Transparent Bridge
@@ -20,12 +20,22 @@ Other bots' messages are ignored (no echo loops). Outbound messages suppress acc
 
 ## Commands
 
-- `stop` / `/stop` — anyone: abort the in-flight run
-- `/btw <question>` — anyone: quick side question, answer briefly
-- `/help` — anyone: list the commands
-- `/status` — owner: context-window usage, model, uptime
-- `/reset` — owner: abort and restart the pi session
-- `/verbose on|off` — owner: toggle tool-call forwarding until restart
+Anyone: `stop` / `/stop` (abort the in-flight run), `/btw <question>` (quick
+side question, answer briefly), `/help` (list the commands).
+
+Owner: `/status` (context-window usage, model, uptime), `/usage` (token
+usage), `/context [N]` (window breakdown), `/reset` (start a new session),
+`/restart` (restart pi, resume this session), `/undo [N]` / `/redo` (revert
+assistant turns, reapply an undo), `/verbose [0|1|2|on|off]` (tool-call
+detail level; bare `/verbose` toggles), `/hold [on|off]` (buffer inbound
+messages), `/compact` (compact session context), `/handover` (compact via the
+handover doc), `/model [name]` (switch or list models), `/jobs` (+ `kill`/
+`tail` for pi-bg dispatches), `/todos` (channel todo board), `/sleep`
+(list/cancel pending session wakes), `/tasks` (schedule prompt tasks),
+`/diff [range|file]` (publish a diff to a viewer URL), `/new-worktree [ref]`
+/ `/merge-worktree [squash]` (worktree flow).
+
+`! <cmd>` runs a shell command in the working directory (owner, 60 s cap).
 
 A trailing `. btw` on any message marks it as a side question; answer
 briefly instead of diving into work.
@@ -129,7 +139,8 @@ not a tone issue — read the `author=` tag before you quote or paraphrase.
 
 ### Discord
 
-Standard bot token + REST API polling (5s interval). Reacts with 👀 to
+Bot token + gateway `MESSAGE_CREATE` push, with a REST backfill poller (60 s
+while the gateway is up, 5 s while it is down). Reacts with 👀 to
 acknowledge new messages unless the channel sets `ack: false` (then the
 typing indicator is the only "seen" signal). Responses auto-formatted for Discord (deep
 headings clamped to ###, code blocks hoisted out of lists, tables →

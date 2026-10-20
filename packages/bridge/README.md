@@ -1,16 +1,18 @@
-# piscord
+# @jarate/bridge
 
-Discord channel bridge for pi.
+Discord channel bridge for pi (the `channel/` package of the jarate
+monorepo; `marzukia/piscord` is the legacy standalone upstream).
 
 The bridge is transparent. A channel message arrives at the agent as a plain
 user message. The agent's response is forwarded back to the channel that
 last messaged it. The agent sees a small `<channel-ctx>` block (channel type,
-sender, format hints) so it can tailor its answer. No extra LLM tools are
-added.
+sender, format hints) so it can tailor its answer. Five LLM tools are added:
+`send-file`, `todo`, `sleep`, `task`, and `jarate`.
 
 ## Features
 
-- Discord via bot token (REST polling, 5 s)
+- Discord via bot token: gateway `MESSAGE_CREATE` push, with a REST poller
+  as backfill (60 s while the gateway is up, 5 s while it is down)
 - Long answers are split into Discord-sized messages (under 2000 chars).
   Fenced code blocks are never split mid-block
 - Replies are threaded to the message that triggered them. In a multi-person
@@ -23,8 +25,11 @@ added.
 - Mid-run assistant text is forwarded live as each step finalizes, so the
   channel shows progress while the agent works (not just the typing indicator)
 - Leaked thinking tags are stripped before sending
-- Commands: `stop` / `/stop`, `/btw <question>`, `/help` (anyone),
-  `/status`, `/reset`, `/verbose on|off` (owner)
+- Commands: 22 slash commands + bare `stop` + `!` shell (owner) — full
+  list: `/stop`, `/btw`, `/help`, `/status`, `/usage`, `/context`, `/reset`,
+  `/restart`, `/undo`, `/redo`, `/verbose`, `/hold`, `/compact`, `/handover`,
+  `/model`, `/jobs`, `/todos`, `/sleep`, `/tasks`, `/diff`, `/new-worktree`,
+  `/merge-worktree` (see the Commands section)
 - Voice notes: audio attachments are labeled `[voice note: name (12s)]`
   and delivered immediately instead of waiting for follow-up text
 - `/btw <question>` and a trailing `. btw` ask a quick side question the
@@ -37,8 +42,9 @@ added.
   message, file-only messages buffer for 10 min)
 - Poll/send errors are sanitized before they hit the TUI log (bearer
   tokens, API keys, Discord tokens, query-string secrets)
-- Messages that arrive mid-run are debounced (2.5 s quiet window) and
-  delivered as one steer, so the agent pivots at the next step boundary
+- Messages that arrive mid-run are queued, not debounced: one message = one
+  run, delivered at run end (and armed as a mid-run interrupt that takes
+  over if the current step is still going after ~3 s)
 - Reply context: when a message replies to another message, the referenced
   message's author + text are injected as a `<replied-message>` block so
   the agent knows what is being pointed at
@@ -56,22 +62,25 @@ added.
 - `send-file {files: string[]}` — upload local file(s) to the active
   Discord channel in one message. Images render in a grid. 25 MB per-file
   cap, unknown extensions sent as `application/octet-stream`.
+- `todo` — channel todo board (add/list/done/clear).
+- `sleep` — durable "wake me at X" scheduler for this session.
+- `task` — schedule, change or cancel prompt tasks (one-shot + cron).
+- `jarate` — one tool over the `$HOME/bin/jarate` JSON entrypoint (issue #17).
 
 ## Install
 
-pi supports git package sources. Add the repo URL to `packages` in your
-`.pi/settings.json` (a deploy key or credential is needed for private
-repos):
+The bridge ships as the `packages/bridge` directory of the jarate monorepo
+(marzukia/jarate). Add the checkout path to `packages` in your
+`.pi/settings.json` — the fleet boxes point at their checkout:
 
 ```json
 {
-  "packages": ["git@github.com:marzukia/piscord"]
+  "packages": ["<path-to-jarate-checkout>/packages/bridge"]
 }
 ```
 
-pi clones the repo, installs its dependencies, and loads the extension from
-the `channel/` directory at session start. Update by re-running the pi
-package install/update (git fetch + dependency repair), then restart pi.
+pi loads the extension from the `channel/` directory at session start.
+Update by pulling the checkout (`git pull --ff-only`) and restarting pi.
 
 ## Reply threading
 
@@ -126,26 +135,53 @@ carries the thread.
 
 ### Commands
 
-- `stop` / `/stop` — anyone in the channel aborts the in-flight run
-- `/btw <question>` — anyone: quick side question, answered briefly
-- `/help` — anyone: list the commands
-- `/status` — owner: context-window usage, model, uptime
-- `/reset` — owner: abort and restart the pi session
-- `/verbose on|off` — owner: toggle tool-call forwarding until restart
-  (bare `/verbose` toggles)
+Anyone: `stop` / `/stop` (abort the in-flight run), `/btw <question>` (quick
+side question), `/help` (list the commands).
+
+Owner: `/status` (context-window usage, model, uptime), `/usage` (token
+usage), `/context [N]` (window breakdown), `/reset` (new session),
+`/restart` (restart pi, resume this session), `/undo [N]` / `/redo` (revert
+reapply turns), `/verbose [0|1|2|on|off]` (tool-call detail level, bare
+`/verbose` toggles), `/hold [on|off]` (buffer inbound messages), `/compact`
+(compact session context), `/handover` (compact via the handover doc),
+`/model [name]` (switch or list models), `/jobs` (+ `kill`/`tail` for pi-bg
+dispatches), `/todos`, `/sleep [list|cancel <id>]`, `/tasks [list|add|...]`,
+`/diff [range|file]` (publish a diff to a viewer URL), `/new-worktree [ref]`
+/ `/merge-worktree [squash]`.
+
+`! <cmd>` runs a shell command in the working directory (owner, 60 s cap).
 
 ## Layout
 
 ```
 channel/    extension source (TypeScript, loaded by pi via jiti)
-  index.ts    bridge logic: inbound/outbound, commands, chunking, debounce
-  discord.ts  Discord REST client: poll, send, react, typing, gateway presence
+  index.ts    bridge logic: inbound/outbound, commands, chunking, mid-turn queue
+  discord.ts  Discord client: gateway MESSAGE_CREATE + REST backfill poll,
+              send, react, typing, presence
+  queue.ts    `. queue` suffix detection (park without arming an interrupt)
+  frame.ts    in-turn tool-call frame column budget
   format.ts   markdown → Discord pipeline (headings, lists, tables, escapes)
-  voice.ts    voice-note attachment detection
-  btw.ts      trailing ". btw" side-question detection
-  sanitize.ts  sensitive-data redaction for log lines
-  image-optimizer.ts  optional sharp-based image resizing/compression
+  sanitize.ts sensitive-data redaction for log lines
+  censor.ts   secret egress censor (docs/secret-censor.md)
   types.ts    config and message types
+  voice.ts    voice-note attachment detection
+  transcribe.ts  voice-note transcription via whisper.cpp
+  btw.ts      trailing ". btw" side-question detection
+  image-optimizer.ts  optional sharp-based image resizing/compression
+  context.ts  /context window breakdown
+  usage.ts    /usage token usage
+  diff.ts     /diff viewer URL publishing
+  jobs.ts     /jobs dispatch scan + history
+  todos.ts    /todos board
+  tasks.ts    scheduled prompt tasks
+  sleep.ts    session sleep scheduler
+  undo.ts     /undo + /redo (store + revert)
+  worktree.ts /new-worktree + /merge-worktree
+  handover.ts /handover compaction
+  restart-queue.ts  re-wake queue survival across restart
+  restart-wake.ts   post-restart wake
+  fleet-run.ts  fleet dispatch run detection
+  jarate.ts   `jarate` LLM tool
   *.test.ts   bun:test suites for the helpers
 skills/     bundled skill: channel configuration reference
 ```

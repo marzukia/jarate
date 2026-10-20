@@ -46,31 +46,36 @@ or `~/.config/pi-dispatch/webhook`), `jarate-bg` warns at dispatch:
 All agents share one vLLM endpoint (8 concurrent sequences max). Concurrent
 jarate-bg dispatches = concurrent generation streams = queue depth.
 
-- **monky: max 3** concurrent dispatches (workers + reviewers combined)
+- **monky: max 4** concurrent dispatches (workers + reviewers combined)
 - **frank: max 3**
 
-operator, 2026-09-10. (A temporary monky cap of 2 followed a queue scare that
+operator, 2026-09-10; monky cap raised to 4 (Andryo 2026-10-05). (A
+temporary monky cap of 2 followed a queue scare that
 turned out to be a 524K-ctx session starving the prefix cache, not worker
 count - restored to 3 the same day. Keep fleet sessions compacted well under
 ~300K: big resident contexts evict prefix blocks for everyone.) Count live
 before dispatching:
 
 ```bash
-ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l
+find ~/.pi-bg-art -maxdepth 1 -name 'pi-bg-*-hb' -mmin -2 | wc -l
 ```
 
-Enforced in code since 2026-09-13 (issue #41): `jarate-bg` counts this user's
-live `pi-bg worker|reviewer` processes before exec'ing the agent and
+Enforced in code since 2026-09-13 (issue #41); since issue #123 the cap
+counts live tickets via heartbeat files, not processes: `jarate-bg` counts
+this user's fresh `pi-bg-*-hb` files in `~/.pi-bg-art` (newer than 3
+heartbeat intervals, default 30s) before exec'ing the agent and
 refuses at the cap with
 `[!] at cap (N/M), try again later or jarate-bg-kill a ticket` + exit 5.
 `PI_BG_MAX_CONCURRENT` sets the cap (default 3; 0 = unlimited, operator
-escape hatch). The ps count above stays the manual cross-check.
+escape hatch). The hb-file count above stays the manual cross-check (the
+old `ps aux | grep` cross-check is dead: the shims `exec` the real script,
+so argv says `jarate-bg`, and the grep returns 0 for a loaded fleet).
 
 Per-box override (RCA #57 fix 2, 2026-09-14): when `PI_BG_MAX_CONCURRENT`
 is unset, `jarate-bg` reads `~/.config/pi-dispatch/max-concurrent` (one integer,
 created per box) before falling back to the fleet default of 3. monky's box
-pins `2` — the fleet shares one vLLM endpoint and 3 concurrent dispatches
-starved the model stream (issue #57). The env var still wins for per-dispatch
+pins `4` (Andryo 2026-10-05) - the fleet shares one vLLM endpoint, so the
+cap is set per box. The env var still wins for per-dispatch
 overrides, so `PI_BG_MAX_CONCURRENT=0` remains the unlimited escape hatch.
 
 ## The flow (default: fire-and-forget)
@@ -130,6 +135,20 @@ jarate-bg [worker|reviewer] [--worktree <ref>] [--project <tag>] [pi flags...] "
   silent death reports a normal `FAIL` (no third launch); the retry is
   logged in the run record. A loud exit 1 (output present) is NOT the
   #57 signature and fails immediately with no retry.
+- **DEGENERATE completion (issue #57 class B, PR #76):** rc=0 with output
+  that `bg_degenerate` flags as a repetition loop (vocabulary collapse:
+  top-15 word coverage ≥ 0.60 AND distinct-word ratio ≤ 0.30, 200+ tokens,
+  thresholds `PI_BG_DEGEN_*`) → the SAME ticket is relaunched ONCE behind a
+  `<ticket>.degr1` marker; a second degenerate completion reports a normal
+  `FAIL` with the signature (no third launch).
+- **THINK-TRUNC completion (2026-10-17 Frank wave):** rc=0, empty output,
+  and the run's last session message is thinking-only with
+  `stopReason=length` (the model spent the whole maxTokens budget on
+  reasoning) → ONE relaunch behind a `<ticket>.trunc1` marker; a second
+  truncation reports `EMPTY` loud with the maxTokens signature instead of
+  a blank brief (raise maxTokens / split the task).
+- All four retry classes live in the SAME `for attempt in 1 2 3` loop; a
+  healthy completion consumes any pending `retry1`/`degr1`/`trunc1` marker.
 - Exit code = pi's exit code.
 
 ### Cgroup escape (automatic, persistent)
@@ -225,9 +244,9 @@ On exit (terminal state or normal completion, before the callback build),
 
 Callback embed: when a tag is set, the frame gains ONE line —
 `│ pj <tag> · $<cost, 2dp>` (or `$-` when cost is null) — appended LAST,
-right before the `└` close, on purpose: the ~1.8k callback truncation eats
-the tail, never the identity header. The line is clipped to the 40-col
-frame budget.
+right before the `└` close, on purpose: the callback truncation (task field
+200 chars, result brief 400 chars) eats the tail, never the identity header.
+The line is clipped to the 40-col frame budget.
 
 Rollup: `jarate projects` aggregates records by tag across agents (see
 JARATE.md).
@@ -249,8 +268,10 @@ On completion, `jarate-bg` posts to the Discord webhook:
   `task` (first 200 chars),
   `result` (first 400 chars), plus `prompt` / `full output` links when
   `webdrop` is available (7d TTL).
-- **Status values:** `OK` (rc=0), `FAIL (rc=N)`, `EMPTY` (all attempts
-  whitespace). For reviewers, a trailing `VERDICT: PASS|FAIL` in the output
+- **Status values:** `OK` (rc=0), `FAIL (rc=N)` (incl. a second degenerate
+  completion, reported with the signature), `EMPTY` (all attempts
+  whitespace, or a second think-trunc with the maxTokens signature). For
+  reviewers, a trailing `VERDICT: PASS|FAIL` in the output
   (last 300 chars) is the real signal and drives the green/red title.
   A second silent death (issue #57, retry1 did not recover) is reported as
   a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
@@ -288,7 +309,8 @@ on the agent host is a tmpfs that a reboot wipes; 2026-09-13: a wiped
 as DEAD). `$PI_BG_TMPDIR` still overrides the dir. For one release,
 `jarate-bg-watchdog` and `jarate-bg-tail` also check the legacy `/tmp` location so
 runs started before the upgrade still resolve. Data source for `/jobs`
-history (follow-up: the bridge scan still points at `PI_BG_TMPDIR||/tmp`):
+history (the bridge scan resolves `$PI_BG_TMPDIR || ~/.pi-bg-art` and also
+scans the legacy `/tmp` for pre-flip runs):
 
 - `pi-bg-<id>-raw.out` — live output (tee'd from the first attempt on)
 - `pi-bg-<id>-out.md` — final output (non-empty = run completed)

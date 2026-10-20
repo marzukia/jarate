@@ -18,13 +18,14 @@ PR.
 bunx biome check .            # repo root: 0 diagnostics (pre-commit enforces staged files)
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit
-cd packages/bridge && bun x bun test  # 482 pass, 0 fail
+cd packages/bridge && bun x bun test  # 1114 pass, 0 fail
 bash install.sh --dry-run     # if install.sh changed
 ```
 
 The pre-commit hook (`.githooks/pre-commit`) runs biome on staged
-TS/JS/JSON and fails fast on violations. `install.sh` sets
-`core.hooksPath .githooks` on every checkout it syncs. The `ci` workflow
+TS/JS/JSON and fails fast on violations. It is enabled per checkout via
+repo-local git config `core.hooksPath .githooks` (not set by install.sh).
+The `ci` workflow
 (biome + bridge jobs) re-runs everything on the PR; the branch rule
 references context `ci` when the org upgrades to Pro.
 
@@ -53,7 +54,7 @@ inbound ack). See AGENTS.md § Style + `docs/STYLE.md` §3.1. (operator,
 ## Verification
 - biome: <result>
 - tsc: <result>
-- tests: <result, e.g. 482 pass / 0 fail>
+- tests: <result, e.g. 1114 pass / 0 fail>
 - install.sh --dry-run: <if touched>
 - anything else you ran
 ```

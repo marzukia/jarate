@@ -6,20 +6,21 @@ agent stack). Read this before touching anything.
 ## Layout
 
 - `packages/bridge/` — the Discord bridge, `@jarate/bridge` (TypeScript, bun,
-  strict tsc). Source of truth for the bridge; the live boxes run rsync
-  copies of this dir.
+  strict tsc). Source of truth for the bridge; the live boxes run from
+  their checkout (symlinks only, no rsync — see `docs/DEPLOY.md`).
 - `dispatch/` — `jarate-bg`, `jarate-wait` bash scripts (+ `pi-*` deprecation
   shims; the orchestration machinery).
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
 - `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
-- `.githooks/pre-commit` — biome gate; `core.hooksPath` is set by install.sh.
+- `.githooks/pre-commit` — biome gate; enabled per checkout via repo-local
+  git config `core.hooksPath .githooks` (not set by install.sh).
 
 ## Commands
 
 ```bash
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit   # must stay clean
-cd packages/bridge && bun x bun test       # 923 pass, 0 fail
+cd packages/bridge && bun x bun test       # 1114 pass, 0 fail
 bunx biome check .                 # from repo root; 0 diagnostics
 bunx biome check --write .         # fix formatting + safe lints
 bash install.sh --dry-run          # installer regression check
@@ -60,7 +61,7 @@ bash install.sh --dry-run          # installer regression check
 
 ## Test expectations
 
-- Any change under `packages/bridge/`: tsc clean + all 482 tests pass, before
+- Any change under `packages/bridge/`: tsc clean + all 1114 tests pass, before
   committing.
 - Biome must be clean at the repo root before committing (pre-commit hook
   enforces it; if you bypass git, run `bunx biome check .`).
