@@ -64,7 +64,13 @@
 #       survives). Cap full -> held in the run record (deadRetry),
 #       fired by a later sweep on a free slot. The retry's own death =
 #       SECOND death = human wake only, no third attempt. HUNG/STALLED
-#       are never auto-retried. Placement: the watchdog, not the wrapper
+#       are never auto-retried. RETIRED (hall-monitor #35, 2026-10-20):
+#       the launcher is now a stub (exit 10, no run record). A retry
+#       that lands on the retirement notice is marked deadRetry.state=
+#       retired - TERMINAL (the record closes, no re-dispatch, no daily
+#       re-flag): the DEAD embed carries the human decision (re-dispatch
+#       via the fleet: POST /api/fleet/dispatch). No new run enters the
+#       retired path. Placement: the watchdog, not the wrapper
 #       trap - DEAD means the traps never ran (that is the death class);
 #       #57's SILENT retry stays in the wrapper because SILENT is only
 #       judgeable from inside (rc + quiet tail, process still alive).
@@ -524,7 +530,9 @@ wd_retry_launcher() {
 # stored prompt, no retryOf, no live dispatch marker) are the CALLER's;
 # this function owns the cap decision + the launch + the markers.
 # rc: 0 dispatched, 1 held (cap full / launch never started),
-#     2 not retryable (launcher/prompt/dir missing -> embed only)
+#     2 not retryable (launcher/prompt/dir missing -> embed only),
+#     3 launcher retired (hall-monitor #35: the launch log carries the
+#       retirement notice - the retry is terminal-held, human decides)
 wd_dead_retry_dispatch() {
   local t="$1" wt="$2"
   local pf="$BG_TMP/pi-bg-${t}-prompt.md"
@@ -578,11 +586,23 @@ wd_dead_retry_dispatch() {
     sleep 1
   done
   if [ ! -f "${rec_dir}/pi-bg-${new_id}.json" ]; then
+    local lg="$BG_TMP/pi-bg-${new_id}-launch.log"
+    if grep -q "jarate-bg: RETIRED (hall-monitor #35" "$lg" 2>/dev/null; then
+      # hall-monitor #35: the launch path is a stub (exit 10, no run
+      # record). The retry is TERMINAL-held: the launcher will never
+      # start a run again, so a later sweep must not re-attempt (that
+      # would be a daily no-op launch + embed churn). The DEAD embed
+      # (already posted at the classification site) carries the human
+      # decision: re-dispatch via the fleet.
+      wd_rec_set_deadretry "$t" retired "-"
+      echo "[pi-bg-watchdog] retry $t: launcher retired (hall-monitor #35) - retry terminal-held; human decision: re-dispatch via the fleet (POST /api/fleet/dispatch)"
+      return 3
+    fi
     # launch failed before its record (cap race, launch-fail, no
     # profile): back to held - a later sweep retries; the DEAD embed
     # was already posted with the retry reason
     wd_rec_set_deadretry "$t" held "-"
-    echo "[pi-bg-watchdog] retry $t: launch $new_id did not start - back to held (log: $BG_TMP/pi-bg-${new_id}-launch.log)"
+    echo "[pi-bg-watchdog] retry $t: launch $new_id did not start - back to held (log: $lg)"
     return 1
   fi
   wd_rec_close "$t" "dead retry dispatched: $new_id (issue #110)"
@@ -624,12 +644,21 @@ wd_dead_retry_decide() {
         return 2
       fi
       ;;
+    retired)
+      # hall-monitor #35: the launcher is a stub - the retry is
+      # terminal-held. Never re-dispatch; the embed carries the human
+      # decision (re-dispatch via the fleet). The head must survive the
+      # 29-char reason kv budget (the tail is clipped in the embed).
+      WDR_ACTION="human decision: re-dispatch via the fleet (hall-monitor #35)"
+      return 2
+      ;;
   esac
   wd_dead_retry_dispatch "$t" "$wt"
   rc=$?
   case $rc in
     0) WDR_ACTION="retry dispatched (issue #110)" ;;
     1) WDR_ACTION="retry held: at cap - fires on a later sweep (issue #110)" ;;
+    3) WDR_ACTION="human decision: re-dispatch via the fleet (hall-monitor #35)" ;;
     *) return 2 ;;
   esac
   return 0
@@ -968,6 +997,10 @@ fi
 #     drop back to held so the cap check runs again). Never re-launchs:
 #     a dispatched marker with a live retry record means the chain is
 #     already owned.
+#   retired: TERMINAL (hall-monitor #35) - the launcher is a stub; the
+#     record closed at the classification site, so the running-only
+#     filter below never picks it up. It is listed here for the audit
+#     trail only.
 if retry_gate && [ -d "$rec_dir" ]; then
   retry_list="$(python3 - "$rec_dir" <<'PY' 2>/dev/null
 import glob, json, os, sys
@@ -1010,6 +1043,16 @@ PY
       done
     fi
     wd_dead_retry_dispatch "$hrt" "${hwt:--}" || true
+    # hall-monitor #35: a retry that lands on the retired stub is
+    # TERMINAL. Close the record here - the classification-site audit
+    # mark already ran (or dead-log deduped) for this record, and a
+    # running+retired pair would re-flag DEAD on the next day before it
+    # could close.
+    IFS=$'\x1f' read -r _ _ hst _ _ _ _ _ < <(wd_rec_fields "$hrt")
+    if [ "$hst" = "retired" ]; then
+      wd_rec_close "$hrt" "retry terminal-held: launcher retired (hall-monitor #35)"
+      echo "[pi-bg-watchdog] retry $hrt: record closed (launcher retired)"
+    fi
   done <<< "$retry_list"
 fi
 
