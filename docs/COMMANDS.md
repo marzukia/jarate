@@ -9,10 +9,15 @@ Access: **anyone** = any member of the channel; **owner** = the configured
 
 ## Output tags
 
-Every command / system output the user sees starts with ONE ASCII tag
+Every machine /command reply the user sees starts with ONE ASCII tag
 (kimaki style, no emoji). Bracketed state tags: `[ok]` applied / success,
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
-`[queued]` in line, `[-]` stopped / none. Read-only list commands carry a
+`[queued]` in line, `[-]` stopped / none. **Tag scope (Andryo 2026-10-20):**
+`[ok]`/`[!]` are machine output only (fenced /command replies, pi-postcheck
+lines, bg-card embeds). Chat one-liners (op status: compacted, restart wake,
+interrupted, run failure) ship as plain words with no tag. Queue acks and
+the mid-run interrupt are SILENT at verbose 0, post at verbose 1+.
+Read-only list commands carry a
 bracketed content tag (`[status]`, `[usage]`, `[jobs]`, `[wake]`, `[todos]`, `[model]`, `[tasks]`).
 Live run state is ONE box-drawing frame in every state (live-frame unification,
 2026-09-13): `┌ working · N calls · Ts` with `│ ├` / `│ └` sub-steps while
@@ -31,7 +36,7 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/stop` | `[-] stopped` |
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
-| `/usage [all\|session\|last]` | markdown list, unfenced (`**usage · session**` + `- key: value` bullets) (error: `[!] usage: …` one-liner) |
+| `/usage [all\|session\|last]` | markdown list, unfenced (`**usage · session**` + `- key: value` bullets) (error: bare plain one-liner; stats failure: `[!] usage stats unavailable` fenced) |
 | `/context [N]` | markdown list, unfenced (`**context · top N/M**` + bullets, est tokens char/4); error: `[!] no session file found` / `[!] session file unreadable` |
 | `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
@@ -39,10 +44,10 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/jobs tail <id> [--n N]` | fenced tail output (`[..] N earlier lines` when capped) |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
-| `/undo` / `/redo` | `[ok] …` / `[!] …` |
+| `/undo` / `/redo` | `undone: …` / `nothing to undo` (bare plain words) |
 | `/verbose [0\|1\|2\|on\|off]` | `[ok] verbose: 1 (essential)` |
 | `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
-| `/compact` | `[queued] …` / `[..] …` / `[ok] …` / `[!] …` |
+| `/compact` | `[queued] …` (verbose 1+) / `[..] …` / `compacted: …` / `compact failed: …` (bare) |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
 | `/jobs` | markdown list, unfenced (`**jobs · N in flight**` + bullets); `json` stays fenced |
 | `/diff [git-range \| file]` | `[ok] …` (errors: `[!] …`) |
@@ -55,9 +60,9 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/tasks cancel` | `[ok] …` / `[!] …` |
 | `/btw` usage, other usage errors | `[!] usage: …` |
 | owner-only rejection | `[!] owner only` |
-| queue ack | `[queued] N in line` |
-| run failure post | `[!] …` |
-| repetition loop | `[!] …` |
+| queue ack | `[queued] N in line` (SILENT at verbose 0) |
+| run failure post | bare plain one-liner (no tag) |
+| repetition loop | bare plain one-liner (no tag) |
 | `!` shell (non-owner) | `[!] …` |
 
 New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
@@ -116,7 +121,7 @@ channel (steered steps are already forwarded live).
 ```
 
 Owner only. Channel-wide queue mode (#39). While held, **every** plain
-message is parked in the re-wake queue — even while idle — each one acked
+message is parked in the re-wake queue — even while idle — each one acked (verbose 1+; silent at verbose 0)
 `[queued] N in line`, none of them starting a run and none arming the
 mid-run interrupt. Commands (`/stop`, `/verbose`, …) still work normally.
 
@@ -186,7 +191,7 @@ run the benchmark suite . queue
 ```
 
 The suffix is stripped before delivery, so the agent receives `run the
-benchmark suite`. The message still gets its `[queued] N in line` ack. This is
+benchmark suite`. The message still gets its `[queued] N in line` ack (verbose 1+; silent at verbose 0). This is
 the tool for "do this next, but don't interrupt what you're doing".
 
 ### /btw
@@ -253,7 +258,7 @@ cache - 0% on our vLLM; it is always shown, even at zero.
 `/usage last` reports the most recent completed run (recorded on
 `agent_end`, assistant `usage` summed over the run's messages): same list,
 label `last run`, completion time (HH:MM:SS) as the span. It is in-memory — a bridge restart clears it. Before any run completes it
-answers `[!] no completed run yet (run one first)`. The same numbers
+answers `no completed run yet (run one first)` (bare). The same numbers
 land as the trailing line of the done/failed run frame (see below).
 
 ### run frame usage line
@@ -323,14 +328,14 @@ compaction instructions. Completion shows up as a `session_compact` event, not
 an immediate reply.
 
 While pi is compacting, messages sent to the channel are queued
-(`[queued] N in line`) instead of starting a run, so they cannot interrupt or
+(`[queued] N in line`, verbose 1+; silent at verbose 0) instead of starting a run, so they cannot interrupt or
 kill the compaction; they drain in order when the compaction settles. While
 ANY channel is compacting, queued messages from every channel wait without
 arming the mid-run interrupt (compaction is session-wide; an interrupt
 aborts it). Commands behave the same: `/status`, `/jobs`, `/sleep` stay
 read-only, `/stop` clears the window and stops (owner only; a non-owner
 `/stop` mid-compaction gets an immediate `[!] owner only` instead of being
-queued), `/compact` answers `[!] already compacting`, everything else is
+queued), `/compact` answers `already compacting` (bare), everything else is
 queued. If no completion event arrives, the
 window clears itself after 10 minutes (logged with a warning).
 
@@ -526,7 +531,7 @@ Lists the command set (the canonical list lives in
   without triggering the bot.
 - **Mid-run messages are queued, not debounced.** One message = one run: a
   message that lands while a run is in flight waits in the re-wake queue
-  (acked `[queued] N in line`); it is delivered as a fresh run when the
+  (acked `[queued] N in line` at verbose 1+; silent at verbose 0); it is delivered as a fresh run when the
   current run ends. Each queued plain message also arms a mid-run interrupt:
   if the current step is still in flight after the 3000 ms grace (env
   `PISCORD_INTERRUPT_STEP_TIMEOUT_MS`), the step is aborted and the message

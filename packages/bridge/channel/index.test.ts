@@ -531,7 +531,7 @@ describe("parseUndoCount (#46 /undo N)", () => {
     expect(parseUndoCount("007")).toBe(7);
   });
 
-  test("0, negative, non-numeric -> null (one [!] line, no action)", () => {
+  test("0, negative, non-numeric -> null (one line, no action)", () => {
     expect(parseUndoCount("0")).toBeNull();
     expect(parseUndoCount("-1")).toBeNull();
     expect(parseUndoCount("abc")).toBeNull();
@@ -570,16 +570,16 @@ describe("failurePostText (A2)", () => {
   });
 
   test("error stopReason posts the errorMessage", () => {
-    expect(failurePostText([failure("error", "boom")], false)).toBe("[!] boom");
+    expect(failurePostText([failure("error", "boom")], false)).toBe("boom");
   });
 
   test("error without errorMessage posts a fallback", () => {
-    expect(failurePostText([failure("error")], false)).toBe("[!] run failed");
+    expect(failurePostText([failure("error")], false)).toBe("run failed");
   });
 
   test("aborted with errorMessage posts when the run was not user-stopped", () => {
     expect(failurePostText([failure("aborted", "interrupted")], false)).toBe(
-      "[!] interrupted",
+      "interrupted",
     );
   });
 
@@ -608,7 +608,7 @@ describe("failurePostText (A2)", () => {
         [failure("error", "boom line1\n    at stack frame (x.js:1:1)")],
         false,
       ),
-    ).toBe("[!] boom line1");
+    ).toBe("boom line1");
   });
 
   test("run-level timeout posts the short marker", () => {
@@ -617,13 +617,13 @@ describe("failurePostText (A2)", () => {
         [failure("error", "request timed out after 30000ms")],
         false,
       ),
-    ).toBe("[!] timed out");
+    ).toBe("timed out");
   });
 
   test("run-level rate limit posts the short marker", () => {
     expect(
       failurePostText([failure("error", "429 Too Many Requests")], false),
-    ).toBe("[!] rate limited, retrying");
+    ).toBe("rate limited, retrying");
   });
 
   test("aborted with errorMessage is silent when the user stopped the run", () => {
@@ -985,7 +985,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(body.message_reference?.message_id).toBe("111");
   });
 
-  test("A2: agent_end posts [!] + errorMessage on a failed run", async () => {
+  test("A2: agent_end posts errorMessage on a failed run", async () => {
     await handleInbound(pi, inbound("hello", "m1"), ctx);
     const failure = {
       role: "assistant",
@@ -1000,8 +1000,8 @@ describe("extension handlers (A1/A2/A4)", () => {
     );
     const post = posts[posts.length - 1]; // last: earlier POSTs are the activity placeholder
     expect(post).toBeDefined();
-    // Machine output ships fenced (STYLE.md 4.4): the guard fences it
-    expect(JSON.parse(post!.body).content).toBe(styleGuard("[!] boom"));
+    // Op status is bare prose (no fence, no tag - v4 §2.3 + 2026-10-20):
+    expect(JSON.parse(post!.body).content).toBe(styleGuard("boom"));
   });
 
   test("A2: user /stop abort is not posted as a run error", async () => {
@@ -1209,7 +1209,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     jest.advanceTimersByTime(workingMaxMs() - 5000 + 5000);
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe(fence("[!] run stalled - /stop to abort"));
+    expect(edits().at(-1)).toBe("run stalled - /stop to abort");
 
     // tick is gone: advancing further must not edit the frame again
     const n = edits().length;
@@ -1694,7 +1694,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         posts.some(
           (p) =>
             String(JSON.parse(p.body).content) ===
-            styleGuard("[!] rate limited, retrying"),
+            styleGuard("rate limited, retrying"),
         ),
       ).toBe(true);
     });
@@ -2049,6 +2049,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     };
 
     test("tick: success path settles the tick before the ack delete", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       await handleInbound(pi, inbound("redirect me", "m1"), ctx);
       await ackFlush(); // ack post resolves -> tick armed on the ack id
@@ -2062,12 +2063,12 @@ describe("extension handlers (A1/A2/A4)", () => {
 
       // The final edit (settle) must land on the ack BEFORE the delete:
       // a PATCH after the DELETE would re-create the message with a stale
-      // line that nothing cleans up.
+      // line that nothing cleans up. Op status is prose — unfenced (v4).
       const settleIdx = fetchCalls.findIndex(
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+          String(JSON.parse(c.body).content) === "interrupted",
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -2079,6 +2080,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("tick: cancel path settles the tick before the ack delete", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       ctx.abort = () => {
         abortCount += 1;
@@ -2102,7 +2104,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === fence("[ok] interrupted"),
+          String(JSON.parse(c.body).content) === "interrupted",
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -2116,6 +2118,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("tick: settle-cap path settles the tick back to the queued line (#84 L1)", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       ctx.abort = () => {
         abortCount += 1;
@@ -2143,13 +2146,14 @@ describe("extension handlers (A1/A2/A4)", () => {
             c.url.includes(`/channels/ch1/messages/${ackId}`),
         )
         .map((c) => String(JSON.parse(c.body).content));
-      // the tick moved while the settle wait ran...
-      expect(ackPatches).toContain(fence("[..] interrupting… 5s"));
+      // the tick moved while the settle wait ran (one-line status = prose,
+      // no fence, v4 §2.3)...
+      expect(ackPatches).toContain("[..] interrupting… 5s");
       // ...but the cap path SETTLES the tick back to the queued line (the
       // message's TRUE state — an interrupt did not happen), NOT a frozen
       // mid-interrupt line (#84 L1)...
-      expect(ackPatches.at(-1)).toBe(fence("[queued] 1 in line"));
-      expect(ackPatches).not.toContain(fence("[ok] interrupted"));
+      expect(ackPatches.at(-1)).toBe("[queued] 1 in line");
+      expect(ackPatches).not.toContain("interrupted");
       // ...and the ack is NOT deleted (it stays with the queued entry).
       expect(
         fetchCalls.some(
@@ -2169,6 +2173,80 @@ describe("extension handlers (A1/A2/A4)", () => {
           c.url.includes(`/channels/ch1/messages/${ackId}`),
       ).length;
       expect(ackPatchesAfter).toBe(patchesBefore);
+    });
+
+    // ── Queue ack + interrupt verbosity (2026-10-20) ──────────────────
+    // Verbose 0: the "[queued] N in line" ack and the mid-run interrupt
+    // (which only ticks that ack) are SILENT. Verbose 1+: both post.
+    // The entry always queues (and re-wakes) - only the line changes.
+    test("verbose 0 (default): mid-run inbound queues silently - no [queued] line, no interrupt tick, entry still delivered", async () => {
+      // The default fixture channel has no forwardToolCalls: level 0.
+      expect(verboseLevel(loadChannelConfig(ctx.cwd)[0]!)).toBe(0);
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      await ackFlush();
+      // Queued for the re-wake, but the ack line never posts.
+      expect(midTurnQueues.get("ch1")?.length).toBe(1);
+      expect(queuedAcks.has("m1")).toBe(false);
+      const ackPosts = fetchCalls.filter(
+        (c) =>
+          c.method === "POST" &&
+          c.url.endsWith("/channels/ch1/messages") &&
+          String(JSON.parse(c.body).content).includes("in line"),
+      );
+      expect(ackPosts.length).toBe(0);
+
+      // The interrupt fires: no ack to tick, so it is fully silent -
+      // no tick edit, no settle post - and the entry still goes through
+      // as a fresh run.
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await ackFlush();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+      expect(
+        fetchCalls.some(
+          (c) =>
+            c.method === "PATCH" && c.url.includes("/channels/ch1/messages/"),
+        ),
+      ).toBe(false);
+      expect(
+        fetchCalls.some(
+          (c) =>
+            c.method === "POST" &&
+            c.url.endsWith("/channels/ch1/messages") &&
+            String(JSON.parse(c.body).content).includes("interrupt"),
+        ),
+      ).toBe(false);
+    });
+
+    test("verbose 1: mid-run inbound posts the [queued] line and the interrupt settles it", async () => {
+      verboseOverride.set("ch1", 1);
+      await handlers.session_start?.(null, ctx); // configRoot for ack REST
+      await handleInbound(pi, inbound("redirect me", "m1"), ctx);
+      await ackFlush();
+      const ackId = queuedAcks.get("m1")?.ackId;
+      expect(ackId).toBeDefined();
+      expect(
+        fetchCalls.some(
+          (c) =>
+            c.method === "POST" &&
+            c.url.endsWith("/channels/ch1/messages") &&
+            String(JSON.parse(c.body).content) === "[queued] 1 in line",
+        ),
+      ).toBe(true);
+
+      // The interrupt settles the ack in place (the one visible edit).
+      jest.advanceTimersByTime(interruptStepTimeoutMs());
+      await ackFlush();
+      expect(abortCount).toBe(1);
+      expect(sent.length).toBe(1);
+      const ackPatches = fetchCalls
+        .filter(
+          (c) =>
+            c.method === "PATCH" &&
+            c.url.includes(`/channels/ch1/messages/${ackId}`),
+        )
+        .map((c) => String(JSON.parse(c.body).content));
+      expect(ackPatches).toContain("interrupted");
     });
   });
 
@@ -2794,6 +2872,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("queued ack shows the position in line (and suppresses the 👀)", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("first", "m1"), ctx);
       await flush();
@@ -2850,6 +2929,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("#231 P2: human inbound mid-run still posts the [queued] line", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("hello", "m1"), ctx);
       await flush();
@@ -2863,6 +2943,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("'. queue' parks in the re-wake queue and does NOT arm the interrupt", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       jest.useFakeTimers();
       idle = false;
       await handleInbound(pi, inbound("later. queue", "m1"), ctx);
@@ -2907,6 +2988,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("mid-sentence 'queue' is NOT treated as the suffix", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("put it in the queue", "m1"), ctx);
       await flush();
@@ -3004,6 +3086,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("delete cleans up the ack and renumbers the remaining line", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("first", "m1"), ctx);
@@ -3030,6 +3113,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("delete is owner-only", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       fs.writeFileSync(
         path.join(tmp, ".pi", "settings.json"),
         JSON.stringify({
@@ -3054,6 +3138,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
 
     test("consumed re-wake drops its ack and renumbers the rest", async () => {
+      verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
       await handlers.session_start?.(null, ctx); // configRoot for ack REST
       ctx.isIdle = () => false;
       await handleInbound(pi, inbound("first", "m1"), ctx);
@@ -3251,6 +3336,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(JSON.parse(acks[0].body).content).toContain(
       "[buffered] 2 files - send text to attach them",
     );
+    // v4: the [buffered] ack ships BARE - no code fence (STYLE §3.1 ruling,
+    // 2026-10-20; pins the unfence so a re-added fence fails this test)
+    expect(JSON.parse(acks[0].body).content).not.toContain("```");
     // No regression: text after buffer consumes the batch with file context.
     fetchCalls.length = 0;
     await handleInbound(pi, inbound("look at these", "m402"), ctx);
@@ -3448,7 +3536,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
       )
       .map((c) => JSON.parse(c.body).content);
-    // agent_end posts go through mdToDiscord: the bare [!] warning line is
+    // agent_end posts go through mdToDiscord: the bare warning line is
     // guarded (fenced; no 40-col wrap since 2026-10-18)
     expect(
       contents.filter((t) => t === styleGuard(REPEAT_WARNING)).length,
@@ -4014,6 +4102,7 @@ describe("#39 /hold", () => {
   });
 
   test("held + idle: plain message queues, no run, no interrupt armed", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     await handleInbound(pi, inbound("/hold on", "m1"), ctx);
     expect(
       posts().some((t) =>
@@ -4848,7 +4937,7 @@ describe("live intermediate text (SPEC B)", () => {
     };
     await handlers.agent_end({ messages: [failure] }, ctx);
     expect(deletes(tId!)).toHaveLength(1);
-    expect(posts().some((p) => p === styleGuard("[!] boom"))).toBe(true);
+    expect(posts().some((p) => p === styleGuard("boom"))).toBe(true);
   });
 
   test("no-tools-no-status: zero tool calls -> no live-text message at all", async () => {
@@ -5142,11 +5231,11 @@ describe("buildInteractionHandler (defer-first ack)", () => {
   });
 
   test("raw command lines pass the same styleGuard sweep as text replies (#169)", async () => {
-    // /usage last with no completed run returns a bare [!] line (no fence
+    // /usage last with no completed run returns a bare line (no fence, no tag
     // in the command) — the interaction edit carries exactly what the
     // sweep produces: v4 (operator 2026-10-19) tag lines are prose, so
     // it ships unfenced, same as the text path.
-    const raw = "[!] no completed run yet (run one first)";
+    const raw = "no completed run yet (run one first)";
     const saved = (lastRunUsage as { value: any }).value;
     (lastRunUsage as { value: any }).value = null;
     try {
@@ -5520,15 +5609,16 @@ describe("compact: defer mid-run + always report", () => {
     // fresh post — no double message when the compact lands. k/m form
     // (fmtTokensLC) so the line fits the 40-col budget even at 9-digit
     // token counts.
-    const reportText = "[ok] compacted: 220k -> 35k";
+    const reportText = "compacted: 220k -> 35k";
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
+    // Settle ships the bare line — op status is prose, no fence (v4 §2.3).
     expect(
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          fence(reportText),
+          reportText,
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === reportText)).toBe(false);
@@ -5560,26 +5650,24 @@ describe("compact: defer mid-run + always report", () => {
     jest.advanceTimersByTime(4999);
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1);
-    expect(edits()).toEqual([fence("[..] compacting… 5s")]);
+    expect(edits()).toEqual(["[..] compacting… 5s"]);
     // subsequent ticks keep updating the SAME message in place
     jest.advanceTimersByTime(5000);
-    expect(edits()).toEqual([
-      fence("[..] compacting… 5s"),
-      fence("[..] compacting… 10s"),
-    ]);
+    expect(edits()).toEqual(["[..] compacting… 5s", "[..] compacting… 10s"]);
     jest.advanceTimersByTime(5000);
     expect(edits()).toEqual([
-      fence("[..] compacting… 5s"),
-      fence("[..] compacting… 10s"),
-      fence("[..] compacting… 15s"),
+      "[..] compacting… 5s",
+      "[..] compacting… 10s",
+      "[..] compacting… 15s",
     ]);
 
-    // Settle: the report replaces the placeholder in place, tick stops
+    // Settle: the report replaces the placeholder in place, tick stops.
+    // Bare line, same form as the fresh-post fallback (v4 §2.3).
     opts.onComplete({ tokensBefore: 100, estimatedTokensAfter: 10 });
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe(fence("[ok] compacted: 100 -> 10"));
+    expect(edits().at(-1)).toBe("compacted: 100 -> 10");
     jest.advanceTimersByTime(60000);
     expect(edits().length).toBe(4); // no further ticks after settle
     expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
@@ -5597,7 +5685,7 @@ describe("compact: defer mid-run + always report", () => {
     );
     opts.onError(new Error("model down"));
     await tick();
-    const failText = "[!] compact failed: model down";
+    const failText = "compact failed: model down";
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
@@ -5605,10 +5693,93 @@ describe("compact: defer mid-run + always report", () => {
       edits.some(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
-          fence(failText),
+          failText,
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === failText)).toBe(false);
+  });
+
+  test("v4: compact op posts placeholder + ticks + settle BARE (no fence)", async () => {
+    jest.useFakeTimers();
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // settle the fire-and-forget placeholder post (microtasks, no timers)
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+    // the placeholder POST is the bare one-liner — status is prose (§2.3)
+    expect(channelPosts()).toContain("[..] compacting...");
+    // the 5s tick edits the SAME message in place, bare
+    jest.advanceTimersByTime(5000);
+    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    // the settle replaces it in place, bare — the fresh-post fallback form
+    opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(edits().at(-1)).toBe("compacted: 220k -> 35k");
+    jest.advanceTimersByTime(60000);
+    // nothing in the whole op window (posts + in-place edits) carries a fence
+    for (const t of [...channelPosts(), ...edits()])
+      expect(t).not.toContain("```");
+  });
+
+  test("v4: settle before the placeholder post lands -> fresh post is BARE, same text as the tick settle", async () => {
+    // Hold the placeholder POST open so onComplete runs before the tick is
+    // armed — the settle must fall back to a fresh post that carries the
+    // SAME bare line the tick settle would have posted (the old race shipped
+    // fenced via tick, bare via fallback).
+    const baseFetch = globalThis.fetch as any;
+    let plainPosts = 0;
+    const release: { fn?: () => void } = {};
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        if (plainPosts === 1) await new Promise<void>((r) => (release.fn = r));
+      }
+      return baseFetch(url, init);
+    }) as any;
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // POST still in flight -> tick not armed. Settle now.
+    const settleText = "compacted: 220k -> 35k";
+    opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
+    await tick();
+    // the fallback fresh post is bare and identical to the tick-settle form
+    expect(channelPosts().filter((t) => t === settleText)).toEqual([
+      settleText,
+    ]);
+    expect(settleText).not.toContain("```");
+    // release the placeholder: it lands bare; the tick then arms onto an
+    // already-closed window and renders null (no edit, no double post)
+    release.fn?.();
+    await tick();
+    await tick();
+    expect(channelPosts().filter((t) => t === "[..] compacting...")).toEqual([
+      "[..] compacting...",
+    ]);
+    const editContents = fetchCalls
+      .filter((c) => c.method === "PATCH")
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+    for (const t of editContents) expect(t).not.toContain("```");
+    expect(channelPosts().filter((t) => t === settleText)).toHaveLength(1);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
@@ -5633,9 +5804,7 @@ describe("compact: defer mid-run + always report", () => {
       channelPosts().some(
         (t) =>
           t ===
-          styleGuard(
-            "[!] compact failed: Nothing to compact (session too small)",
-          ),
+          styleGuard("compact failed: Nothing to compact (session too small)"),
       ),
     ).toBe(true);
   });
@@ -5647,7 +5816,7 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
     expect(
-      channelPosts().some((t) => t.includes("[!] compact failed: boom-ctx")),
+      channelPosts().some((t) => t.includes("compact failed: boom-ctx")),
     ).toBe(true);
     expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
       false,
@@ -5964,6 +6133,7 @@ describe("compaction-queue guard", () => {
   });
 
   test("plain message while compacting: queued with ack, interrupt NOT armed", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     ctx.compact = () => {};
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     ctx.isIdle = () => false; // compaction now in flight
@@ -6081,7 +6251,7 @@ describe("compaction-queue guard", () => {
     expect(pendingInterrupts.has("ch1")).toBe(false);
   });
 
-  test("/compact while compacting: '[!] already compacting', single dispatch", async () => {
+  test("/compact while compacting: 'already compacting', single dispatch", async () => {
     let compacts = 0;
     ctx.compact = () => {
       compacts++;
@@ -6091,9 +6261,9 @@ describe("compaction-queue guard", () => {
     await handleInbound(pi, inbound("/compact again", "m2"), ctx);
     await tick();
     expect(compacts).toBe(1);
-    expect(
-      channelPosts().some((t) => t.includes("[!] already compacting")),
-    ).toBe(true);
+    expect(channelPosts().some((t) => t.includes("already compacting"))).toBe(
+      true,
+    );
     expect(isCompacting("ch1")).toBe(true); // window unchanged
   });
 
@@ -6105,9 +6275,9 @@ describe("compaction-queue guard", () => {
     // (F5: names the ACTIVE op — compaction, not a restart)
     await handleInbound(pi, inbound("/reset", "m2"), ctx);
     await tick();
-    expect(
-      channelPosts().some((t) => t.includes("[!] already compacting")),
-    ).toBe(true);
+    expect(channelPosts().some((t) => t.includes("already compacting"))).toBe(
+      true,
+    );
     // a queued-eligible command (/undo) still waits like a plain message
     await handleInbound(pi, inbound("/undo", "m3"), ctx);
     await tick();
@@ -7853,7 +8023,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(marker.op).toBe("handoff");
     expect(marker.seeded).toBe(false);
     expect(marker.finalText).toBe(
-      "[ok] context handoff -> new session (file was 1.5 MB)",
+      "context handoff -> new session (file was 1.5 MB)",
     );
     // restart chain: bounded shutdown + systemd restart
     expect(shutdowns).toBe(1);
@@ -7908,7 +8078,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     const marker = JSON.parse(fs.readFileSync(markerPath(), "utf8"));
     expect(marker.op).toBe("handoff");
     expect(marker.finalText).toBe(
-      "[ok] context handoff -> new session (file was 2.5 MB)",
+      "context handoff -> new session (file was 2.5 MB)",
     );
   });
 
@@ -8000,7 +8170,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
       channelId: "ch1",
       at: Date.now(),
       msgId: "out1",
-      finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
+      finalText: "context handoff -> new session (file was 1.5 MB)",
       seeded: false,
     });
     // issue #134: the seed carries LIVE dispatch + board state (pinned here
@@ -8034,7 +8204,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
       // placeholder replaced with the final line
       expect(
         edits().some((t) =>
-          t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+          t.includes("context handoff -> new session (file was 1.5 MB)"),
         ),
       ).toBe(true);
     } finally {
@@ -8063,7 +8233,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
       channelId: "ch1",
       at: Date.now(),
       msgId: "out1",
-      finalText: "[ok] context handoff -> new session (file was 1.5 MB)",
+      finalText: "context handoff -> new session (file was 1.5 MB)",
       seeded: true,
     });
     await handlers.session_start?.(null, ctx);
@@ -8071,7 +8241,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(markerPath())).toBe(false);
     expect(
       edits().some((t) =>
-        t.includes("[ok] context handoff -> new session (file was 1.5 MB)"),
+        t.includes("context handoff -> new session (file was 1.5 MB)"),
       ),
     ).toBe(true);
   });
@@ -8507,6 +8677,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   });
 
   test("/reset drains queued inbounds before shutdown (#84 L2): acks deleted, not orphaned", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     await handlers.session_start?.(null, ctx); // configRoot for ack REST
     // a run is in flight: a plain message queues + posts an ack
     ctx.isIdle = () => false;
@@ -8534,6 +8705,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   });
 
   test("/reset keeps a HELD channel's buffer (#84 L2, A4 parity): no drain", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     await handlers.session_start?.(null, ctx); // configRoot for ack REST
     // hold the channel, then buffer a message (held queues even while idle)
     await handleInbound(pi, inbound("/hold on", "mh1"), ctx);
@@ -8576,15 +8748,13 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(shutdowns).toBe(1);
 
     // window stays open until the respawn clears it -> ticks keep going
+    // (one-line op status = prose, bare ticks per v4 §2.3)
     jest.advanceTimersByTime(4699); // t=4999
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1); // t=5000
-    expect(edits()).toEqual([fence("[..] resetting… 5s")]);
+    expect(edits()).toEqual(["[..] resetting… 5s"]);
     jest.advanceTimersByTime(5000); // t=10000
-    expect(edits()).toEqual([
-      fence("[..] resetting… 5s"),
-      fence("[..] resetting… 10s"),
-    ]);
+    expect(edits()).toEqual(["[..] resetting… 5s", "[..] resetting… 10s"]);
 
     // respawn clears the window -> ticks stop
     clearAllCompacting();
@@ -8593,6 +8763,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   });
 
   test("inbound during the /reset window: queued with an ack, no interrupt armed", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
     expect(isCompacting("ch1")).toBe(true);
@@ -8621,15 +8792,16 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handlers.session_start?.(null, ctx);
     await tick();
 
-    // the placeholder is REPLACED in place with the FENCED final line, not
-    // re-posted (the placeholder was posted fenced — settle matches)
+    // the placeholder is REPLACED in place with the bare final line, not
+    // re-posted (status is prose — unfenced placeholder, unfenced settle;
+    // same form on both sides per v4 §2.3)
     const finalText = "[new] new session (context cleared)";
     expect(
       edits()
         .slice(editsBefore)
-        .some((t) => t === fence(finalText)),
+        .some((t) => t === finalText),
     ).toBe(true);
-    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
+    expect(channelPosts().some((t) => t === finalText)).toBe(false);
     // marker consumed
     expect(fs.existsSync(path.join(tmp, ".tmp", "op-marker.json"))).toBe(false);
 
@@ -8640,7 +8812,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(pollUrl).toContain("after=1000");
   });
 
-  test("respawn settle without a msgId posts a FENCED final line", async () => {
+  test("respawn settle without a msgId posts a bare final line", async () => {
     const p = path.join(tmp, ".tmp", "op-marker.json");
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const finalText = "[new] new session (context cleared)";
@@ -8655,9 +8827,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     await handlers.session_start?.(null, ctx);
     await tick();
-    // fenced fresh post — same style as the fenced placeholder, never bare
-    expect(channelPosts().some((t) => t === fence(finalText))).toBe(true);
-    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    // bare fresh post — same prose form as the bare placeholder, never fenced
+    expect(channelPosts().some((t) => t === finalText)).toBe(true);
+    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
     expect(edits().some((t) => t === finalText || t === fence(finalText))).toBe(
       false,
     );
@@ -8774,7 +8946,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await tick();
     expect(
       channelPosts().some((t) =>
-        t.includes("[!] nothing to undo: only 1 turn back"),
+        t.includes("nothing to undo: only 1 turn back"),
       ),
     ).toBe(true);
     expect(isCompacting("ch1")).toBe(false);
@@ -8844,7 +9016,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     expect(marker.op).toBe("undo");
     expect(marker.finalText).toContain(
-      "[ok] undone: 2 turns + conversation (re-running q2)",
+      "undone: 2 turns + conversation (re-running q2)",
     );
   });
 
@@ -9157,13 +9329,13 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handleInbound(pi, inbound("/reset", "m4"), ctx);
     await tick();
     expect(
-      channelPosts().filter((t) => t.includes("[!] already restarting")).length,
+      channelPosts().filter((t) => t.includes("already restarting")).length,
     ).toBe(1);
     // F5: /compact while resetting names the ACTIVE op, not itself
     await handleInbound(pi, inbound("/compact", "m4b"), ctx);
     await tick();
     expect(
-      channelPosts().filter((t) => t.includes("[!] already restarting")).length,
+      channelPosts().filter((t) => t.includes("already restarting")).length,
     ).toBe(2);
 
     await handleInbound(pi, inbound("/status", "m5"), ctx);
@@ -9193,8 +9365,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
       done = true;
     });
     // abort fired, settle-wait running, tick armed on the queued ack
+    // (one-line op status = prose, bare tick per v4 §2.3)
     jest.advanceTimersByTime(5000);
-    expect(ackEdits()).toEqual([fence("[..] interrupting… 5s")]);
+    expect(ackEdits()).toEqual(["[..] interrupting… 5s"]);
 
     ctx.isIdle = () => true;
     jest.advanceTimersByTime(50);
@@ -9241,6 +9414,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
   });
 
   test("#28 partial: no respawn after ~15s -> watchdog closes the window, drains the queue, posts the RESOLVED unit", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     jest.useFakeTimers();
     const got: string[] = [];
     // restart hook that never settles: the unit never respawns
@@ -9277,7 +9451,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     // 14.9s later: the failure is not yet declared
     jest.advanceTimersByTime(14_999);
     expect(isCompacting("ch1")).toBe(true);
-    expect(channelPosts().some((t) => t.includes("[!] restart failed"))).toBe(
+    expect(channelPosts().some((t) => t.includes("restart failed"))).toBe(
       false,
     );
 
@@ -9297,7 +9471,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(isCompacting("ch1")).toBe(false); // op window closed
     expect(
       channelPosts().some((t) =>
-        t.includes("[!] restart failed - check unit pi.service"),
+        t.includes("restart failed - check unit pi.service"),
       ),
     ).toBe(true); // RESOLVED unit name in the channel
     // no stale marker left to settle some future boot
@@ -9934,9 +10108,7 @@ describe("wave 2c bridge commands", () => {
 
   test("/usage last: empty before any run, then the last run's line (#40)", async () => {
     await handleInbound(pi, inbound("/usage last", "m1"), ctx);
-    expect(posts().some((t) => t.includes("[!] no completed run yet"))).toBe(
-      true,
-    );
+    expect(posts().some((t) => t.includes("no completed run yet"))).toBe(true);
     await handleInbound(pi, inbound("hello", "m2"), ctx);
     await handlers.turn_start(null, ctx);
     await handlers.agent_end(
@@ -10659,6 +10831,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
   });
 
   test("crash with a live [queued] line: ack id survives in the file, restored + deleted exactly once", async () => {
+    verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     // ── Process 1: a HUMAN inbound queued mid-run; its [queued] ack
     // POST resolves (fake id "w1") and its id is mirrored into the
     // file. (#231 P2: [bg: inbounds queue silently — no ack line — so
@@ -10958,9 +11131,7 @@ describe("#84: placeholder settlement (all exit paths)", () => {
       true,
     );
     // 2. the interrupt tick settled and the ack line was consumed
-    expect(editsTo("out2").some((t) => t.includes("[ok] interrupted"))).toBe(
-      true,
-    );
+    expect(editsTo("out2").some((t) => t.includes("interrupted"))).toBe(true);
     expect(deleted("out2")).toBe(true);
     // 3. the spliced entry went through to pi as a fresh run (threaded)
     const rew = sent.find(

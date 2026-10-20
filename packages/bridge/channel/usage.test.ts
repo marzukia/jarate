@@ -343,10 +343,10 @@ describe("renderUsage", () => {
   test("unknown arg -> usage error; missing session file handled", async () => {
     setHome("h-empty");
     expect(await renderUsage("bogus", "/cwd", null)).toBe(
-      "[!] usage: /usage [all|session|last]",
+      "usage: /usage [all|session|last]",
     );
     expect(await renderUsage(undefined, "/cwd", null)).toBe(
-      "[!] no session file found",
+      "no session file found",
     );
   });
 
@@ -355,7 +355,7 @@ describe("renderUsage", () => {
     fs.mkdirSync(emptyHome, { recursive: true });
     process.env.HOME = emptyHome;
     expect(await renderUsage("all", "/cwd", null)).toBe(
-      "[!] no session files found",
+      "no session files found",
     );
   });
 });

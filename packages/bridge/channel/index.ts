@@ -366,7 +366,8 @@ function consumeQueuedAck(
 }
 
 /** Re-edit the channel's remaining queued acks so positions stay true
- *  after an entry ahead of them left the line. No-op when already correct. */
+ *  after an entry ahead of them left the line. No-op when already correct.
+ *  The ack is one-line op status — prose, unfenced (STYLE.md v4 §2.3). */
 function renumberQueuedAcks(channelId: string): void {
   const ch = resolveChannel(channelId);
   if (!ch) return;
@@ -375,7 +376,7 @@ function renumberQueuedAcks(channelId: string): void {
     const ack = queuedAcks.get(e.msg.messageId);
     if (!ack || ack.pos === i + 1) return;
     ack.pos = i + 1;
-    editDiscordMessage(ch, ack.ackId, fence(`[queued] ${i + 1} in line`)).catch(
+    editDiscordMessage(ch, ack.ackId, `[queued] ${i + 1} in line`).catch(
       () => {},
     );
   });
@@ -1070,11 +1071,14 @@ export function opWindowLabel(channelId: string): OpLabel | null {
 
 /** Double-op refusal text (F5, owner 2026-09-11): name the ACTIVE op —
  *  a compaction window says "already compacting", a restart-class op
- *  window says "already restarting". */
+ *  window says "already restarting". One-line op status = prose, ships
+ *  unfenced (STYLE.md v4 §2.3). */
 function opBusyRefusal(channelId: string): string {
+  // Bare chat one-liner - plain words, no tag (machine output only, Andryo
+  // 2026-10-20).
   return opWindowLabel(channelId) === "compacting"
-    ? fence("[!] already compacting")
-    : fence("[!] already restarting");
+    ? "already compacting"
+    : "already restarting";
 }
 
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
@@ -1123,7 +1127,7 @@ function beginCompacting(
     // terminal line (a frozen counting tick is the stale placeholder this
     // fix kills), then clear + drain as before. No-op for restart-class ops
     // (their tick is not armed; the op marker covers them).
-    settleCompactTick(ch.id, "[!] compact stalled");
+    settleCompactTick(ch.id, "compact stalled");
     clearCompacting(ch.id, true);
     drainQueuedAfterCompact(pi, ctx);
   }, COMPACT_FALLBACK_MS);
@@ -1151,6 +1155,7 @@ interface OpTickEntry {
   since: number;
   timer: ReturnType<typeof setInterval>;
   render: (secs: number) => string | null;
+  fenced: boolean;
 }
 const opTicks = new Map<string, OpTickEntry>();
 
@@ -1160,19 +1165,24 @@ export function opTickLine(label: string, secs: number): string {
   return `[..] ${label}… ${inc}s`;
 }
 
-/** Live status frames render inside a code fence (style guide v3):
- * box-drawing chars stay aligned on mobile, no markdown mangling.
- * operator 2026-09-14. */
+/** Fenced block (STYLE.md v4): fences are for /command replies (§2.4),
+ * in-turn working frames (§2.1), and machine output (§4.4). One-line
+ * op status ([..]) is PROSE and ships unfenced (§2.3); [ok]/[!] tags are
+ * machine output ONLY (Andryo 2026-10-20). The v3 box-drawing alignment
+ * rationale applies only to multi-line frames, not single status lines. */
 export const fence = (s: string): string => `\`\`\`
 ${s}
 \`\`\``;
 
-/** Arm (or re-arm, same key) a live tick on a placeholder message. */
+/** Arm (or re-arm, same key) a live tick on a placeholder message.
+ *  `fenced` (default false): multi-line working frames post inside a
+ *  code fence (§2.1); one-line op status ticks post bare (§2.3). */
 export function armOpTick(
   key: string,
   ch: ChannelConfig,
   msgId: string,
   render: (secs: number) => string | null,
+  fenced = false,
 ): void {
   const prev = opTicks.get(key);
   if (prev) clearInterval(prev.timer);
@@ -1185,21 +1195,34 @@ export function armOpTick(
       clearInterval(entry.timer); // paused; entry kept for the settle
       return;
     }
-    editDiscordMessage(entry.ch, entry.msgId, fence(text)).catch(() => {});
+    editDiscordMessage(
+      entry.ch,
+      entry.msgId,
+      entry.fenced ? fence(text) : text,
+    ).catch(() => {});
   }, 5000);
   (timer as any).unref?.();
-  opTicks.set(key, { ch, msgId, since, timer, render });
+  opTicks.set(key, { ch, msgId, since, timer, render, fenced });
 }
 
 /** Replace the ticking placeholder in place with the final line. Returns
  *  false when no tick was armed (native slash path / settle raced the
- *  post) — the caller then falls back to a fresh post. */
-export function settleOpTick(key: string, text: string): boolean {
+ *  post) — the caller then falls back to a fresh post. `fenced` matches
+ *  the tick that armed (default false: one-line op status is prose, §2.3
+ *  — the same settle must produce the SAME bare form as the fresh-post
+ *  fallback). */
+export function settleOpTick(
+  key: string,
+  text: string,
+  fenced = false,
+): boolean {
   const entry = opTicks.get(key);
   if (!entry) return false;
   clearInterval(entry.timer);
   opTicks.delete(key);
-  editDiscordMessage(entry.ch, entry.msgId, fence(text)).catch(() => {});
+  editDiscordMessage(entry.ch, entry.msgId, fenced ? fence(text) : text).catch(
+    () => {},
+  );
   return true;
 }
 
@@ -1222,7 +1245,8 @@ export function stopAllOpTicks(): void {
 }
 
 // ─── Compact placeholder (built on the shared op-tick) ──────────────
-export const COMPACT_PLACEHOLDER = fence("[..] compacting...");
+// One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
+export const COMPACT_PLACEHOLDER = "[..] compacting...";
 
 export function armCompactTick(ch: ChannelConfig, msgId: string): void {
   armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>
@@ -1377,7 +1401,7 @@ export async function runMidRunInterrupt(
       );
       // Settle the tick before the delete: the final edit must land while
       // the ack message still exists (same race as the success path).
-      settleOpTick(`interrupt:${channelId}`, `[ok] interrupted`);
+      settleOpTick(`interrupt:${channelId}`, `interrupted`);
       consumeQueuedAck(channelId, messageId);
       // #180: the entry is dropped (never sent to pi) — prune the
       // survived copy so a restart does not re-deliver the cancel.
@@ -1439,7 +1463,7 @@ export async function runMidRunInterrupt(
     // the ack message in place, so the final edit must land while the
     // message still exists. consumeQueuedAck then deletes it.
     const tickKey = `interrupt:${channelId}`;
-    settleOpTick(tickKey, `[ok] interrupted`);
+    settleOpTick(tickKey, `interrupted`);
     consumeQueuedAck(channelId, messageId); // entry is owned by the fresh run
     sendToPi(
       pi,
@@ -1571,7 +1595,7 @@ let userStoppedRun = false;
 // final or on a new inbound user message.
 const finalReps = new Map<string, string[]>();
 export const REPEAT_WARNING =
-  "[!] repetition loop detected - run stopped. Say /reset if it persists.";
+  "repetition loop detected - run stopped. Say /reset if it persists.";
 
 /** Record a posted final; true on the third consecutive identical one. */
 export function recordFinalRepeat(channelId: string, text: string): boolean {
@@ -2268,7 +2292,9 @@ export function failurePostText(
   if (last.stopReason === "error" || (last.stopReason === "aborted" && err)) {
     const t = channelError(err);
     if (t === null) return null;
-    return `[!] ${t || "run failed"}`;
+    // Bare chat one-liner - plain words, no tag (machine output only,
+    // Andryo 2026-10-20).
+    return `${t || "run failed"}`;
   }
   return null;
 }
@@ -2990,7 +3016,7 @@ export default function (pi: ExtensionAPI) {
         editDiscordMessage(
           t.ch,
           t.msgId,
-          fence("[!] compact interrupted - restart"),
+          "compact interrupted - restart",
         ).catch(() => {}),
       );
     }
@@ -3074,22 +3100,29 @@ export default function (pi: ExtensionAPI) {
     const ch = lastActiveChannel;
     if (!ch || !statusMsgId) return;
     const key = `working:${ch.id}`;
-    armOpTick(key, ch, statusMsgId, () => {
-      if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
-      const wch = lastActiveChannel;
-      if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
-      const secs = Math.floor((Date.now() - runStartedAt) / 1000);
-      // #84 L3: cap the frame's lifetime. A run that never ends would
-      // count up forever — settle to the true state (stalled) and stop.
-      if (Date.now() - runStartedAt >= workingMaxMs()) {
-        settleOpTick(key, "[!] run stalled - /stop to abort");
-        return null;
-      }
-      // UNFENCED body: armOpTick fences exactly once (review F1).
-      const body = workingFrameBody(wch, Math.floor(secs / 5) * 5);
-      persistLivePlaceholders(); // #84: keep the crash-settle body fresh
-      return body;
-    });
+    armOpTick(
+      key,
+      ch,
+      statusMsgId,
+      () => {
+        if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
+        const wch = lastActiveChannel;
+        if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
+        const secs = Math.floor((Date.now() - runStartedAt) / 1000);
+        // #84 L3: cap the frame's lifetime. A run that never ends would
+        // count up forever — settle to the true state (stalled) and stop.
+        if (Date.now() - runStartedAt >= workingMaxMs()) {
+          settleOpTick(key, "run stalled - /stop to abort");
+          return null;
+        }
+        // UNFENCED body: the fenced=true tick arg fences it exactly once
+        // (review F1).
+        const body = workingFrameBody(wch, Math.floor(secs / 5) * 5);
+        persistLivePlaceholders(); // #84: keep the crash-settle body fresh
+        return body;
+      },
+      true,
+    );
   };
 
   // ─── Live intermediate text (SPEC B) ──────────────────────────────────
@@ -3324,11 +3357,9 @@ export default function (pi: ExtensionAPI) {
       const ch = chOf(c.channelId);
       if (!ch) continue;
       rest.push(
-        editDiscordMessage(
-          ch,
-          c.msgId,
-          fence("[!] compact interrupted - restart"),
-        ).catch(() => {}),
+        editDiscordMessage(ch, c.msgId, "compact interrupted - restart").catch(
+          () => {},
+        ),
       );
     }
     for (const q of state.queueAcks) {
@@ -3596,7 +3627,7 @@ export default function (pi: ExtensionAPI) {
         // repeated final, abort the run, post one warning line instead.
         userStoppedRun = true;
         if (ch.type === "discord")
-          sendDiscordMessage(ch, fence(REPEAT_WARNING)).catch(() => {});
+          sendDiscordMessage(ch, REPEAT_WARNING).catch(() => {});
         try {
           ctx.abort();
         } catch {}
@@ -3654,7 +3685,7 @@ export default function (pi: ExtensionAPI) {
     if (err !== null) {
       const t = channelError(err);
       if (t !== null)
-        sendDiscordMessage(pc.ch, styleGuard(`[!] compact failed: ${t}`)).catch(
+        sendDiscordMessage(pc.ch, styleGuard(`compact failed: ${t}`)).catch(
           () => {},
         );
     }
@@ -4250,7 +4281,7 @@ export function buildInteractionHandler(
         : (r.immediate ?? (r.consumed ? undefined : fence("ok")));
     } catch (e) {
       const t = channelError(e);
-      if (t !== null) text = `[!] command failed: ${t}`;
+      if (t !== null) text = `command failed: ${t}`;
     }
     // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
     // machine-state lines; already-fenced immediates pass through unchanged.
@@ -4439,10 +4470,10 @@ export function consumeOpMarker(pi: ExtensionAPI, ctx: ExtensionContext): void {
     `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
   );
   if (m.msgId)
-    editDiscordMessage(ch, m.msgId, fence(m.finalText)).catch(() =>
-      sendDiscordMessage(ch, fence(m.finalText)).catch(() => {}),
+    editDiscordMessage(ch, m.msgId, m.finalText).catch(() =>
+      sendDiscordMessage(ch, m.finalText).catch(() => {}),
     );
-  else sendDiscordMessage(ch, fence(m.finalText)).catch(() => {});
+  else sendDiscordMessage(ch, m.finalText).catch(() => {});
 }
 
 /** Flip seeded=true on the handoff op marker (F4 crash-safety flip). */
@@ -4576,7 +4607,8 @@ function beginRestartOp(
   });
   writeOpMarker(ctx, ch, op, finalText, marker);
   if (ch.type !== "discord") return Promise.resolve(null);
-  return sendDiscordMessage(ch, fence(`[..] ${label}...`))
+  // One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
+  return sendDiscordMessage(ch, `[..] ${label}...`)
     .then((r) => {
       if (r.success && r.messageId) {
         updateOpMarkerMsgId(ctx, ch.id, r.messageId);
@@ -4622,7 +4654,7 @@ function armRestartWatchdog(
     clearOpMarker(ctx); // the respawn that would settle it never came
     clearCompacting(ch.id); // also drops the pending op-shutdown timer
     drainQueuedAfterCompact(pi, ctx);
-    const line = fence(`[!] restart failed - check unit ${unit}`);
+    const line = `restart failed - check unit ${unit}`;
     if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
     // F7 (design v2, PR2): a swallowed restart leaves THIS process alive
     // and the unit "active" — systemd will never auto-respawn it. Die on
@@ -4852,7 +4884,7 @@ export async function maybeHandoffRestart(
   // seeds the fresh session from the doc (the ONLY seed gate). F5: move
   // the EXPLICIT live file at shutdown; F2: archive the other stale
   // .jsonl so the respawn's 'pi -c' resume target is provably small.
-  const finalText = `[ok] context handoff -> new session (file was ${mb} MB)`;
+  const finalText = `context handoff -> new session (file was ${mb} MB)`;
   const placeholderP = beginRestartOp(
     pi,
     ctx,
@@ -5020,7 +5052,8 @@ async function runRedo(
 // ─── /compact: execute + report ─────────────────────────────────────────
 // pi's ctx.compact() is fire-and-forget and swallows failures silently
 // (the dist IIFE only calls onError when one is passed). Always report:
-// onComplete → token delta, onError → [!] line. A sync throw returns the
+// onComplete → token delta, onError → one line (plain words, no tag -
+// op status is prose, Andryo 2026-10-20). A sync throw returns the
 // sanitized error message (null on success) so the caller reports it on
 // its own path (command reply vs channel post).
 function startCompact(
@@ -5033,10 +5066,9 @@ function startCompact(
   const report = (text: string) => {
     // Replace the ticking placeholder in place when one is armed; the
     // fresh-post fallback covers the native slash path and the (impossible
-    // in practice) settle-before-post race. settleOpTick wraps its arg in
-    // a fence itself, so the guard only applies to the fresh-post path
-    // (fence(styleGuard(x)) would double-fence; styleGuard is a no-op on
-    // the single tag lines that reach the settle path).
+    // in practice) settle-before-post race. Both settle paths post the
+    // SAME bare line: status is prose (STYLE.md v4 §2.3), and styleGuard
+    // is a no-op on the plain one-liner that reaches the fresh-post path.
     const guarded = styleGuard(text);
     if (!settleCompactTick(ch.id, text))
       sendDiscordMessage(ch, guarded).catch(() => {});
@@ -5057,13 +5089,13 @@ function startCompact(
             : null;
         report(
           before != null && after != null
-            ? `[ok] compacted: ${fmtTokensLC(before)} -> ${fmtTokensLC(after)}`
-            : "[ok] compacted",
+            ? `compacted: ${fmtTokensLC(before)} -> ${fmtTokensLC(after)}`
+            : "compacted",
         );
       },
       onError: (err) => {
         const t = channelError(err);
-        if (t !== null) report(`[!] compact failed: ${t}`);
+        if (t !== null) report(`compact failed: ${t}`);
         clearCompacting(pending.ch.id);
       },
     });
@@ -5345,16 +5377,15 @@ async function runChannelCommand(
       const scope = (arg ?? "").trim().toLowerCase();
       if (scope === "last") {
         const lu = lastRunUsage.value;
-        if (!lu)
-          return { immediate: "[!] no completed run yet (run one first)" };
+        if (!lu) return { immediate: "no completed run yet (run one first)" };
         const at = lu.at.toISOString().slice(11, 19);
         return { immediate: usageSummary("last run", at, lu.stats) };
       }
       // Read-only token stats from the session store. Session discovery
       // reuses the /undo path: active ctx session file, else newest .jsonl
-      // under cwd's session dir (findSessionFile fallback). The [!] error
-      // paths stay bare (one-liners); the stats list ships as normal
-      // markdown - unfenced, no width budget (Andryo 2026-10-18).
+      // under cwd's session dir (findSessionFile fallback). The error
+      // paths stay bare (one-liners, no tag); the stats list ships as
+      // normal markdown - unfenced, no width budget (Andryo 2026-10-18).
       try {
         const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
         return { immediate: text };
@@ -5468,7 +5499,7 @@ async function runChannelCommand(
         ch,
         "restart",
         "restarting",
-        "[ok] restarted - session resumed",
+        "restarted - session resumed",
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native
@@ -5629,7 +5660,7 @@ async function runChannelCommand(
         sendDiscordMessage(
           ch,
           styleGuard(
-            "[!] handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
+            "handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
           ),
         ).catch(() => {});
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
@@ -6634,7 +6665,12 @@ export async function handleInbound(
     // pure channel noise. The entry still queues (and re-wakes) exactly
     // as today; human inbounds keep the post (the line IS their ack).
     if (isBgInbound(msg)) return true;
-    sendDiscordMessage(ch, fence(`[queued] ${pos} in line`), {
+    // Verbose 0: queue acks + interrupt notifications are SILENT (Andryo
+    // 2026-10-20) - no "[queued] N in line" line, and the mid-run interrupt
+    // ticks only edit the ack message, so it stays silent too. The entry
+    // still queues (and re-wakes) exactly as today; verbose 1+ posts it.
+    if (verboseLevel(ch) === 0) return true;
+    sendDiscordMessage(ch, `[queued] ${pos} in line`, {
       replyToMessageId: msg.messageId,
     })
       .then((res) => {
@@ -6759,11 +6795,11 @@ export async function handleInbound(
         // the user must know the file was received and is waiting on text.
         noAck();
         const n = msg.attachments.length;
+        // Bare one-liner, no [ok]/[!] tag (machine output only, Andryo
+        // 2026-10-20) - the summary is the later todo board post.
         sendDiscordMessage(
           ch,
-          fence(
-            `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
-          ),
+          `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
           { replyToMessageId: msg.messageId },
         ).catch(() => {});
         return;

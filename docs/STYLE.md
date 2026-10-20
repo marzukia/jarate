@@ -1,7 +1,7 @@
 # STYLE — chat + output format rules (v4)
 
 Applies to: monky Discord replies, pi-bg embeds, slash-command output. Source of truth for format rules (AGENTS.md "Voice" points here).
-Last revised: 2026-10-18 (v4: summaries = markdown lists; 40-col budget in-turn frames only).
+Last revised: 2026-10-20 (v4: summaries = markdown lists; 40-col budget in-turn frames only; 2026-10-20 ruling: [ok]/[!] tags = machine output only, queue/interrupt acks silent at verbose 0).
 
 ## 1 Language
 1.1 Serious / task talk: ASD-STE100. Simple words, short sentences,
@@ -36,8 +36,12 @@ Last revised: 2026-10-18 (v4: summaries = markdown lists; 40-col budget in-turn 
     `┤` cancelled.
 
 ## 3 Plain text
-3.1 No emoji. No ASCII state-tag lines either — the tag convention
-    ([ok] [!] ...) is retired (operator 2026-10-19): status = plain words.
+3.1 No emoji. [ok]/[!] are MACHINE OUTPUT only (Andryo 2026-10-20):
+    fenced /command replies, pi-postcheck lines, bg-card embeds. Chat
+    one-liners (compacted, restart wake, interrupted, run failure) are
+    plain words - no tag. Queue acks ([queued] N in line) + the
+    mid-run interrupt (ticks the ack) are SILENT at verbose 0, post at
+    verbose 1+.
 3.2 URLs bare or [label](url) — never in inline code (kills clickable).
 3.3 No walls of text. Short paragraphs, one idea each.
 3.4 Code: only when it is code. Numbers/ids in prose stay bare.

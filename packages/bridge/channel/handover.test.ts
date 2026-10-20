@@ -2254,7 +2254,7 @@ describe("session_before_compact wiring", () => {
     );
     expect(compacts).toBe(1);
     expect(
-      channelPosts().some((p: string) => p.includes("[!] handoff disabled")),
+      channelPosts().some((p: string) => p.includes("handoff disabled")),
     ).toBe(true);
   });
 

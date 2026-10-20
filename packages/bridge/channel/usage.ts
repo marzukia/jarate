@@ -246,7 +246,7 @@ export async function renderUsage(
     scope !== "all" &&
     scope !== "last"
   )
-    return "[!] usage: /usage [all|session|last]";
+    return "usage: /usage [all|session|last]";
 
   if (scope === "all") {
     const base = sessionsBaseDir();
@@ -270,9 +270,9 @@ export async function renderUsage(
       }
       collect(base); // files directly under base, if any
     } catch {
-      return "[!] no session files found";
+      return "no session files found";
     }
-    if (files.length === 0) return "[!] no session files found";
+    if (files.length === 0) return "no session files found";
     const seen = new Set<string>();
     let s: UsageStats = { ...EMPTY };
     for (const f of files) {
@@ -286,7 +286,7 @@ export async function renderUsage(
 
   // default + "session": the current session file
   const file = sessionFile ?? findSessionFile(cwd);
-  if (!file) return "[!] no session file found";
+  if (!file) return "no session file found";
   const s = await summarizeSessionFile(file);
   return usageSummary("session", dateFromName(file) ?? dateFromMtime(file), s);
 }

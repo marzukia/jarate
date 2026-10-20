@@ -526,7 +526,7 @@ The human beats every wait.
 - One wait at a time per turn (one pair of hands). Multiple workers: dispatch
   all, confirm, end turn — callbacks arrive as separate wakes; answer each as
   it lands.
-- Messages that arrive while a run is in flight get a visible position ack:
+- Messages that arrive while a run is in flight get a visible position ack (verbose 1+; silent at verbose 0):
   `[queued] N in line` (N = slot in that channel's re-wake queue). A trailing
   `. queue` parks a message there without arming the mid-run interrupt; the
   owner can edit or delete a queued message and the queue follows. Details:

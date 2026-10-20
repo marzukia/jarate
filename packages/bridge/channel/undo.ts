@@ -786,8 +786,8 @@ export function truncateSession(sessionFile: string, n = 1): string[] | null {
  * Number of complete turns on the session's active path (a turn = an
  * assistant message with a trigger strictly root-ward of it). 0 when the
  * file is missing, unreadable, or holds no complete turn. Used to
- * validate /undo N BEFORE any state changes (N > chain length = one [!]
- * line, no action). The walk is lockstep with turnKeepIdx: countTurns >= n
+ * validate /undo N BEFORE any state changes (N > chain length = one line,
+ * no action). The walk is lockstep with turnKeepIdx: countTurns >= n
  * iff truncateSession(file, n) would cut.
  */
 export function countTurns(sessionFile: string | null): number {
@@ -953,11 +953,12 @@ function undoAck(
   const suffix =
     skipped > 0 ? ` (kept ${skipped} >20MB file, not restored)` : "";
   if (parts.length === 0) {
-    if (skipped > 0)
-      return `[ok] undone: kept ${skipped} >20MB file (not restored)`;
-    return "[!] nothing to undo";
+    if (skipped > 0) return `undone: kept ${skipped} >20MB file (not restored)`;
+    return "nothing to undo";
   }
-  return `[ok] undone: ${parts.join(" + ")}${suffix}`;
+  // Plain words, no tag (op status is chat one-liner prose, Andryo
+  // 2026-10-20): the restarted path ships this bare as the op final.
+  return `undone: ${parts.join(" + ")}${suffix}`;
 }
 
 /**
@@ -967,19 +968,20 @@ function undoAck(
  * at that run's own start (startRun on turn_start), so it IS the
  * pre-Nth-run state — and truncates the session at that run's trigger.
  * ONE restart covers all N turns. Parks a one-level redo record.
- * N > chain length -> one [!] line, no action (validated before any
- * state changes).
+ * N > chain length -> one line, no action (validated before any state
+ * changes).
  *
- * Output: N=1 keeps the legacy ack byte-identical. N>1 names how many
- * turns were rolled back and where the session now points — the kept
- * trigger, which is re-run on restart (F1), truncated to 70 chars.
+ * Output: N=1 is the legacy single-line ack (one line, plain words - the
+ * 2026-10-20 ruling retired the [ok]/[!] tags from op status). N>1 names
+ * how many turns were rolled back and where the session now points — the
+ * kept trigger, which is re-run on restart (F1), truncated to 70 chars.
  */
 export function performUndo(sessionFile: string | null, n = 1): UndoResult {
   if (n > 1) {
     const turns = countTurns(sessionFile);
     if (n > turns)
       return {
-        text: `[!] nothing to undo: only ${turns} turn${
+        text: `nothing to undo: only ${turns} turn${
           turns === 1 ? "" : "s"
         } back`,
         restarted: false,
@@ -1013,7 +1015,7 @@ export function performUndo(sessionFile: string | null, n = 1): UndoResult {
     }
   }
   if (files === 0 && skipped === 0 && (!removed || removed.length === 0)) {
-    return { text: "[!] nothing to undo", restarted: false, reRun: false };
+    return { text: "nothing to undo", restarted: false, reRun: false };
   }
   // F1: park the re-run trigger. The kept trigger is now the last line.
   let reRun = false;
@@ -1072,7 +1074,7 @@ export function performUndo(sessionFile: string | null, n = 1): UndoResult {
     const parts = [`${n} turns`];
     if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
     parts.push("conversation");
-    text = `[ok] undone: ${parts.join(" + ")}`;
+    text = `undone: ${parts.join(" + ")}`;
     if (skipped > 0) text += ` (kept ${skipped} >20MB file, not restored)`;
     if (reRun && keptText)
       text += ` (re-running ${keptText.replace(/\s+/g, " ").slice(0, 70)})`;
@@ -1086,8 +1088,7 @@ export function performUndo(sessionFile: string | null, n = 1): UndoResult {
 /** /redo: reapply the undone run (one level deep). */
 export function performRedo(): UndoResult {
   const rec = readRedo();
-  if (!rec)
-    return { text: "[!] nothing to redo", restarted: false, reRun: false };
+  if (!rec) return { text: "nothing to redo", restarted: false, reRun: false };
   // F4: if a NEWER run completed after this undo, the session has lines
   // appended past our cut point; re-appending the removed tail would strand
   // the new turn off-path. Refuse instead (record is kept).
@@ -1099,7 +1100,7 @@ export function performRedo(): UndoResult {
     const newer = latestRun(rec.sessionFile);
     if (newer && Number(newer.meta.seq ?? 0) > covered) {
       return {
-        text: "[!] redo stale: newer run completed",
+        text: "redo stale: newer run completed",
         restarted: false,
         reRun: false,
       };
@@ -1138,12 +1139,12 @@ export function performRedo(): UndoResult {
     fs.rmSync(redoPath(), { force: true });
   } catch {}
   if (files === 0 && !conversation)
-    return { text: "[!] nothing to redo", restarted: false, reRun: false };
+    return { text: "nothing to redo", restarted: false, reRun: false };
   const parts: string[] = [];
   if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
   if (conversation) parts.push("conversation");
   return {
-    text: `[ok] redone: ${parts.join(" + ")}`,
+    text: `redone: ${parts.join(" + ")}`,
     restarted: conversation,
     reRun: false,
   };
