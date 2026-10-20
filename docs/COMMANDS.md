@@ -121,7 +121,7 @@ channel (steered steps are already forwarded live).
 ```
 
 Owner only. Channel-wide queue mode (#39). While held, **every** plain
-message is parked in the re-wake queue — even while idle — each one acked
+message is parked in the re-wake queue — even while idle — each one acked (verbose 1+; silent at verbose 0)
 `[queued] N in line`, none of them starting a run and none arming the
 mid-run interrupt. Commands (`/stop`, `/verbose`, …) still work normally.
 
@@ -191,7 +191,7 @@ run the benchmark suite . queue
 ```
 
 The suffix is stripped before delivery, so the agent receives `run the
-benchmark suite`. The message still gets its `[queued] N in line` ack. This is
+benchmark suite`. The message still gets its `[queued] N in line` ack (verbose 1+; silent at verbose 0). This is
 the tool for "do this next, but don't interrupt what you're doing".
 
 ### /btw
@@ -328,7 +328,7 @@ compaction instructions. Completion shows up as a `session_compact` event, not
 an immediate reply.
 
 While pi is compacting, messages sent to the channel are queued
-(`[queued] N in line`) instead of starting a run, so they cannot interrupt or
+(`[queued] N in line`, verbose 1+; silent at verbose 0) instead of starting a run, so they cannot interrupt or
 kill the compaction; they drain in order when the compaction settles. While
 ANY channel is compacting, queued messages from every channel wait without
 arming the mid-run interrupt (compaction is session-wide; an interrupt
@@ -531,7 +531,7 @@ Lists the command set (the canonical list lives in
   without triggering the bot.
 - **Mid-run messages are queued, not debounced.** One message = one run: a
   message that lands while a run is in flight waits in the re-wake queue
-  (acked `[queued] N in line`); it is delivered as a fresh run when the
+  (acked `[queued] N in line` at verbose 1+; silent at verbose 0); it is delivered as a fresh run when the
   current run ends. Each queued plain message also arms a mid-run interrupt:
   if the current step is still in flight after the 3000 ms grace (env
   `PISCORD_INTERRUPT_STEP_TIMEOUT_MS`), the step is aborted and the message

@@ -3337,6 +3337,9 @@ describe("extension handlers (A1/A2/A4)", () => {
     expect(JSON.parse(acks[0].body).content).toContain(
       "[buffered] 2 files - send text to attach them",
     );
+    // v4: the [buffered] ack ships BARE - no code fence (STYLE §3.1 ruling,
+    // 2026-10-20; pins the unfence so a re-added fence fails this test)
+    expect(JSON.parse(acks[0].body).content).not.toContain("```");
     // No regression: text after buffer consumes the batch with file context.
     fetchCalls.length = 0;
     await handleInbound(pi, inbound("look at these", "m402"), ctx);

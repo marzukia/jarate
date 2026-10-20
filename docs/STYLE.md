@@ -1,7 +1,7 @@
 # STYLE — chat + output format rules (v4)
 
 Applies to: monky Discord replies, pi-bg embeds, slash-command output. Source of truth for format rules (AGENTS.md "Voice" points here).
-Last revised: 2026-10-18 (v4: summaries = markdown lists; 40-col budget in-turn frames only).
+Last revised: 2026-10-20 (v4: summaries = markdown lists; 40-col budget in-turn frames only; 2026-10-20 ruling: [ok]/[!] tags = machine output only, queue/interrupt acks silent at verbose 0).
 
 ## 1 Language
 1.1 Serious / task talk: ASD-STE100. Simple words, short sentences,
