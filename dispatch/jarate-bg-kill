@@ -31,14 +31,21 @@
 # exits: 0 = killed (or dry-run), 2 = bad usage / unknown ticket
 set -uo pipefail
 
+# Shared dispatch contracts (issue #262: ticket regex, webhook resolver,
+# record/cgroup paths, retry shape, frame helpers) - dispatch/lib.sh +
+# dispatch/jrate_common.py. The scripts are invoked through install.sh
+# symlinks; lib.sh resolves its own real path for JRATE_LIB_DIR.
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 mkdir -p "$BG_TMP" 2>/dev/null
-CG_ROOT="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
+CG_ROOT="$(jrate_cg_root)"
 KILL_WAIT="${PI_BG_KILL_WAIT:-10}"
 # run records (issue #51 + #86 short-id resolution): the same dir jarate-bg
-# writes state=running/done/killed records into. Defined up front: the id
-# validator below resolves short ids against it.
-REC_DIR="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
+# writes state=running/done/killed records into (single derivation in
+# lib.sh, issue #262). Defined up front: the id validator below resolves
+# short ids against it.
+REC_DIR="$(jrate_rec_dir)"
 
 id="" dry=0
 while [ $# -gt 0 ]; do
@@ -54,41 +61,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$id" ] || { echo "usage: jarate-bg-kill <ticket-id> [--dry-run]" >&2; exit 2; }
-if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
-  # Short id (issue #86): the strict full-id regex used to be the only
-  # accepted form, so the natural cleanup call `jarate-bg-kill 2332046` exited
-  # 2; with the caller's stderr on /dev/null (as the incident loop had it)
-  # that was a silent no-op and four live workers died un-killled. A
-  # 7+ digit numeric arg is resolved against the run records: the ticket
-  # suffix must match EXACTLY ONE record file. 0 matches or 2+ matches ->
-  # exit 2 with a clear error on stderr (check the exit code; read stderr).
-  if [[ "$id" =~ ^[0-9]{7,}$ ]]; then
-    matches=()
-    for rf in "$REC_DIR"/pi-bg-*.json; do
-      [ -f "$rf" ] || continue
-      base="${rf##*/}"; base="${base#pi-bg-}"; base="${base%.json}"
-      [[ "$base" =~ ^[0-9]{8}-[0-9]{6}-([0-9]{7,})$ ]] || continue
-      [ "${BASH_REMATCH[1]}" = "$id" ] && matches+=("$base")
-    done
-    case "${#matches[@]}" in
-      1)
-        echo "jarate-bg-kill: short id $id -> ${matches[0]} (run record)" >&2
-        id="${matches[0]}"
-        ;;
-      0)
-        echo "jarate-bg-kill: no run record in $REC_DIR matches short id '$id' (want the full id, or a unique 7+ digit suffix)" >&2
-        exit 2
-        ;;
-      *)
-        echo "jarate-bg-kill: short id '$id' is ambiguous, matches: ${matches[*]} (use the full id)" >&2
-        exit 2
-        ;;
-    esac
-  else
-    echo "jarate-bg-kill: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix resolved from $REC_DIR)" >&2
-    exit 2
-  fi
-fi
+# id validation + short-id resolution (issue #262: the regex + the record
+# scan live in lib.sh, shared with jarate-bg signal).
+# Short id (issue #86): the strict full-id regex used to be the only
+# accepted form, so the natural cleanup call `jarate-bg-kill 2332046` exited
+# 2; with the caller's stderr on /dev/null (as the incident loop had it)
+# that was a silent no-op and four live workers died un-killled. A
+# 7+ digit numeric arg is resolved against the run records: the ticket
+# suffix must match EXACTLY ONE record file. 0 matches or 2+ matches ->
+# exit 2 with a clear error on stderr (check the exit code; read stderr).
+id_orig="$id"
+id_rc=0
+id="$(jrate_resolve_ticket "$id" "$REC_DIR" "jarate-bg-kill")" || id_rc=$?
+case "$id_rc" in
+  0) ;;
+  2) echo "jarate-bg-kill: '$id_orig' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix resolved from $REC_DIR)" >&2; exit 2 ;;
+  *) exit 2 ;;
+esac
 
 # temp-file cleanup (issue: /tmp inode exhaustion, 2026-09-14): the
 # kill-body.json webhook payload is scratch. The EXIT trap unlinks it on
@@ -132,21 +121,6 @@ fi
 # dies with its process, and the KILL phase's cgroup.kill is the backstop.
 cg_procs() { cat "$CG/cgroup.procs" 2>/dev/null | sort -un; }
 
-# pids whose /proc/<pid>/stat ppid is $1
-children_of() {
-  local want="$1" c s
-  for c in /proc/[0-9]*; do
-    # read builtin, no fork: a tr-per-pid subshell made a full /proc scan
-    # ~5s on a 1k-process host (2026-09-15), which consumed the KILL_WAIT
-    # grace before any signal was sent
-    IFS= read -r s 2>/dev/null < "$c/stat" || continue
-    s="${s#*) }"  # drop 'pid (comm)' — comm may contain spaces
-    [ "${s#* }" = "${s}" ] && continue
-    set -- $s
-    [ "$2" = "$want" ] && basename "$c"
-  done
-}
-
 # 0 when /proc/<pid>/stat says the process is a group leader (pgrp == pid).
 # stat fields after 'pid (comm)': state ppid pgrp session ...
 is_group_leader() {
@@ -157,26 +131,11 @@ is_group_leader() {
   [ "${3:-}" = "$want" ]
 }
 
-# cgroup members plus every descendant (the cgroup v2 move carries the whole
-# subtree, so descendants close the fallback case where escape failed)
-list_tree() {
-  local p d c queue=() next=()
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    echo "$p"
-    queue=("$p")
-    while [ "${#queue[@]}" -gt 0 ]; do
-      next=()
-      for d in "${queue[@]}"; do
-        for c in $(children_of "$d"); do
-          echo "$c"
-          next+=("$c")
-        done
-      done
-      queue=("${next[@]+"${next[@]}"}")
-    done
-  done < <(cg_procs)
-}
+# cgroup members plus every descendant: the /proc ppid scan + the BFS live
+# in lib.sh (issue #262, shared with jarate-bg signal). The cgroup v2 move
+# carries the whole subtree, so descendants close the fallback case where
+# escape failed.
+list_tree() { jrate_list_tree "$CG"; }
 
 print_tree() {
   echo "process tree for $id (would be killed):"
@@ -277,37 +236,19 @@ printf '%s killed %s by %s after %ss; pids: %s\n' \
 # Same audit-only posture as jarate-bg: a missing/corrupt record never
 # breaks the kill path.
 if [ -f "$REC_DIR/pi-bg-${id}.json" ]; then
-  PI_BG_REC_STATE="cancelled" python3 - "$REC_DIR/pi-bg-${id}.json" <<'PY' 2>/dev/null || true
-import datetime, json, os, sys
-p = sys.argv[1]
-try:
-    rec = json.load(open(p))
-except Exception:
-    sys.exit(0)
-rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
-rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-json.dump(rec, open(p, "w"), indent=2)
-PY
+  jrate_rec_set_state "$REC_DIR/pi-bg-${id}.json" "cancelled"
 fi
 
 # --- kind=kill webhook event (same URL source + embed shape as jarate-bg) ---
-webhook="${PI_DISPATCH_WEBHOOK:-}"
-if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
-  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
-fi
+webhook="$(jrate_webhook)"
 if [ -n "$webhook" ]; then
   bodyf="$BG_TMP/pi-bg-${id}-kill-body.json"
   KILL_T="$id" KILL_PIDS="$(echo "$pids0" | tr ' ' ',' | cut -c1-200)" KILL_DUR="$dur" \
   python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import FRAME_W, ORANGE_DEAD, clip_start, kv
 E = lambda k: os.environ.get("KILL_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15): every frame line <= 40
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def clip_start(s, max):
-    s = str(s)
-    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
 def rid_line(prefix, rid):
     # the rid lines are the only overflow risk (7-digit pid): keep the
     # tail - the pid end is the discriminator
@@ -321,12 +262,12 @@ rid = E("T")
 title = "pi-bg " + rid + " \u00b7 CANCELLED"
 meta = [rid_line("\u250c cancelled \u00b7 ", rid),
         rid_line("\u251c $ jarate-bg-kill ", rid),
-        "\u251c " + "pids".ljust(6) + " : " + clip_end(E("PIDS"), 29),
+        kv("pids", E("PIDS")),
         "\u251c " + "wait".ljust(6) + " : " + E("DUR") + "s (TERM->KILL)",
         "\u251c " + "state".ljust(6) + " : cancelled on request",
         "\u2514"]
 embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
-         "color": 15105570,  # orange, same as jarate-bg DIED
+         "color": ORANGE_DEAD,  # orange, same as jarate-bg DIED
          "title": title,
          "description": "```bash\n" + "\n".join(meta) + "\n```",
          "footer": {"text": "pi-bg kill"},
@@ -334,13 +275,11 @@ embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
 json.dump({"embeds": [embed]}, sys.stdout)
 PY
   if [ -s "$bodyf" ]; then
-    ok=0; code=000
-    for i in 1 2 3; do
-      code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$webhook" \
-        -H 'Content-Type: application/json' --max-time 15 --data @"$bodyf" 2>/dev/null)" || code="000"
-      case "$code" in 2*) ok=1; break ;; esac
-      [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
-    done
+    ok=0
+    # Shared retry shape (issue #262, lib.sh jrate_wb_post): 3 tries,
+    # escalating backoff PI_BG_WB_BACKOFF seconds (default 3s/6s);
+    # PI_BG_WB_BACKOFF=0 = no sleep (test seam).
+    code="$(jrate_wb_post "$webhook" "$bodyf" /dev/null)" && ok=1
     if [ "$ok" -eq 0 ]; then
       # self-contained letter (issue #53): the watchdog re-posts it on a
       # later sweep. The body is embedded NOW (rm -f below would dangle

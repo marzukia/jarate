@@ -11,13 +11,17 @@
 # bot-id fetch keeps failing after retries, the wait also ends rc 3, with a
 # stderr diagnostic (nothing arrived; the caller reports / re-waits / drops).
 # config (all from ~/.pi/agent/settings.json, no secrets in this repo):
-#   bot token + channel id from channels[0]
+#   bot token + channel id from the default channel (bridge parity:
+#   first enabled channel marked default, else first enabled)
 #   webhook author id from ~/.config/pi-dispatch/webhook_author
 # #231 P3: on rc 0 the wait writes the in-turn consumed marker
 #   ~/.pi-dispatch/in-turn-consumed/<discord-message-id> (dir 0700,
 #   >1h old markers pruned on start). The bridge's re-wake drain drops
 #   a queued [bg: entry carrying that marker (double-delivery dedup).
 set -euo pipefail
+# shared contract (issue #262): the settings channel selection
+# (jrate_common.default_channel, bridge parity) - dispatch/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 
 since=""; timeout=300; check=5
 while [ $# -gt 0 ]; do
@@ -32,8 +36,18 @@ done
 [ -n "$since" ] || { echo "--since <message-id> required" >&2; exit 2; }
 
 cfg="${HOME}/.pi/agent/settings.json"
-token="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["botToken"])')"
-channel="$(python3 -c 'import json;print(json.load(open("'"$cfg"'"))["channels"][0]["channel"])')"
+# channel selection = bridge parity (jrate_common.default_channel: the
+# first enabled channel marked default, else the first enabled one -
+# the raw channels[0] pick predated the enabled/default fields)
+read -r token channel < <(python3 - "$cfg" <<'PY' 2>/dev/null
+import json, os, sys
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import default_channel
+d = json.load(open(sys.argv[1]))
+c = default_channel(d.get("channels", []))
+print(c.get("botToken", ""), c.get("channel", ""))
+PY
+)
 # issue #120: the bot token never sits in curl's argv (a bare `ps` leaked
 # it). It rides a curl config fed on STDIN (`curl -K -`): the printf is a
 # bash builtin (no child argv to leak), only the config bytes cross the

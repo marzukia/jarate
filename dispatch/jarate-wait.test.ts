@@ -55,7 +55,13 @@ function fixture(): Fixture {
   fs.mkdirSync(path.join(home, ".config", "pi-dispatch"), { recursive: true });
   fs.writeFileSync(
     path.join(home, ".pi", "agent", "settings.json"),
-    JSON.stringify({ channels: [{ botToken: TOKEN, channel: CHANNEL }] }),
+    // models the live settings shape: channels carry enabled/default and
+    // selection is bridge parity (jrate_common.default_channel, issue #262)
+    JSON.stringify({
+      channels: [
+        { botToken: TOKEN, channel: CHANNEL, enabled: true, default: true },
+      ],
+    }),
   );
   fs.writeFileSync(
     path.join(home, ".config", "pi-dispatch", "webhook_author"),
@@ -416,5 +422,51 @@ describe("jarate-wait #231 P3: in-turn consumed marker", () => {
     expect(r.code).toBe(3);
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.existsSync(fresh)).toBe(true);
+  });
+});
+
+/**
+ * issue #262 (DRY): the settings channel selection is single-sourced in
+ * dispatch/jrate_common.py default_channel (bridge parity,
+ * channel/types.ts getDefaultChannel): the first ENABLED channel marked
+ * default, else the first enabled one. The old raw channels[0] pick
+ * would have taken a disabled/legacy entry.
+ */
+describe("jarate-wait channel selection (issue #262, bridge parity)", () => {
+  const writeSettings = (f: Fixture, channels: unknown[]): void => {
+    fs.writeFileSync(
+      path.join(f.tmp, "home", ".pi", "agent", "settings.json"),
+      JSON.stringify({ channels }),
+    );
+  };
+
+  test("disabled channels[0] is skipped: the enabled default channel polls", async () => {
+    const f = fixture();
+    writeSettings(f, [
+      { botToken: "tok-off", channel: "chan-off", enabled: false },
+      { botToken: TOKEN, channel: CHANNEL, enabled: true, default: true },
+    ]);
+    const r = await f.run(["--since", "42", "--timeout", "2", "--check", "1"]);
+    expect(r.code).toBe(3);
+    const msgCall = calls(f.capture).find((c) => c.includes("/channels/"));
+    expect(msgCall).toBeDefined();
+    expect(msgCall).toContain(
+      `https://discord.com/api/v10/channels/${CHANNEL}/messages?after=42&limit=50`,
+    );
+    expect(msgCall).not.toContain("chan-off");
+  });
+
+  test("no default flag: the first enabled channel polls (bridge parity)", async () => {
+    const f = fixture();
+    writeSettings(f, [
+      { botToken: "tok-a", channel: "chan-a", enabled: false },
+      { botToken: TOKEN, channel: CHANNEL, enabled: true },
+    ]);
+    const r = await f.run(["--since", "42", "--timeout", "2", "--check", "1"]);
+    expect(r.code).toBe(3);
+    const msgCall = calls(f.capture).find((c) => c.includes("/channels/"));
+    expect(msgCall).toBeDefined();
+    expect(msgCall).toContain(`/channels/${CHANNEL}/messages`);
+    expect(msgCall).not.toContain("chan-a");
   });
 });

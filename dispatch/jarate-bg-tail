@@ -11,6 +11,8 @@
 # ticket ids are jarate-bg run_ids: YYYYMMDD-HHMMSS-NNNNN
 # exits: 0 = ok, 2 = bad usage / unknown ticket
 set -uo pipefail
+# shared contract (issue #262): the ticket id regex - dispatch/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 
 BG_TMP="${PI_BG_TMPDIR:-${HOME}/.pi-bg-art}"
 id="" lines=40 follow=0
@@ -32,7 +34,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$id" ] || { echo "usage: jarate-bg-tail <ticket-id> [lines] [-f]" >&2; exit 2; }
-if ! [[ "$id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
+if ! [[ "$id" =~ $JRATE_TICKET_RE ]]; then
   echo "jarate-bg-tail: '$id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN)" >&2
   exit 2
 fi

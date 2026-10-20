@@ -33,10 +33,34 @@
 #     watchdog's mid-run events). rc 0 = all signaled members gone,
 #     3 = still alive after PI_BG_SIGNAL_WAIT, 2 = usage/unknown.
 #
+# RUN-IDENTITY CONTRACT (single-sourced for dispatch; issue #262).
+# A ticket/run id is `<YYYYMMDD-HHMMSS>-<suffix>`: 8-digit UTC date,
+# 6-digit UTC time, and a NUMERIC SUFFIX OF VARIABLE WIDTH (the
+# watchdog mints <stamp>-$RANDOM, 1-5 digits; the retired launcher
+# minted <stamp>-$). Every producer/consumer validates against the
+# regex - never assume a fixed suffix width:
+#   regex:     ^[0-9]{8}-[0-9]{6}-[0-9]+$  (lib.sh JRATE_TICKET_RE)
+#   record:    <rec-dir>/pi-bg-<id>.json   (lib.sh jrate_rec_dir)
+#   cgroup:    <cg-root>/pi-bg/<id>        (lib.sh jrate_cg_root)
+#   artifacts: $PI_BG_TMPDIR/pi-bg-<id>-*  (watchdog bg_artifact_glob)
+#   short id:  a unique 7+ digit suffix of <id> (issue #86;
+#              lib.sh jrate_resolve_ticket scans the run records)
+# The bridge side of the contract - the [bg: wake marker - is
+# isBgWebhook in packages/bridge/channel/format.ts.
+#
+# Shared logic (ticket regex, webhook resolver, record/cgroup paths,
+# retry shape, frame helpers) lives in dispatch/lib.sh +
+# dispatch/jrate_common.py (issue #262).
+#
 # Exit codes: 0/3 signal receipt (gone / still alive) | 2 usage (signal)
 #             | 10 launch path retired (this is not a failure of a run).
 
 set -uo pipefail
+
+# Shared dispatch contracts (issue #262). The scripts are invoked through
+# install.sh symlinks; lib.sh resolves its own real path, so JRATE_LIB_DIR
+# (the python import root) points at this checkout's dispatch/.
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 
 # --- SIGPIPE hardening (kept from the launcher; #101 follow-up) -----------
 # A dispatcher that pipes us into `head` used to kill the launcher before
@@ -89,65 +113,29 @@ if [ "${1:-}" = "signal" ]; then
     KILL | 9) sig_name="KILL" ;;
     *) echo "jarate-bg signal: unknown signal '$sig_name' (want TERM or KILL)" >&2; exit 2 ;;
   esac
-  sig_rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
-  if ! [[ "$sig_id" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]]; then
-    # short id: same resolution as jarate-bg-kill (unique 7+ digit suffix
-    # in the record dir)
-    if [[ "$sig_id" =~ ^[0-9]{7,}$ ]]; then
-      sig_matches=()
-      for rf in "$sig_rec_dir"/pi-bg-*.json; do
-        [ -f "$rf" ] || continue
-        sig_base="${rf##*/}"; sig_base="${sig_base#pi-bg-}"; sig_base="${sig_base%.json}"
-        [[ "$sig_base" =~ ^[0-9]{8}-[0-9]{6}-([0-9]{7,})$ ]] || continue
-        [ "${BASH_REMATCH[1]}" = "$sig_id" ] && sig_matches+=("$sig_base")
-      done
-      case "${#sig_matches[@]}" in
-        1) echo "jarate-bg signal: short id $sig_id -> ${sig_matches[0]} (run record)" >&2; sig_id="${sig_matches[0]}" ;;
-        0) echo "jarate-bg signal: no run record in $sig_rec_dir matches short id '$sig_id' (want the full id, or a unique 7+ digit suffix)" >&2; exit 2 ;;
-        *) echo "jarate-bg signal: short id '$sig_id' is ambiguous, matches: ${sig_matches[*]} (use the full id)" >&2; exit 2 ;;
-      esac
-    else
-      echo "jarate-bg signal: '$sig_id' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix)" >&2
-      exit 2
-    fi
-  fi
-  sig_cg="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg/$sig_id"
+  sig_rec_dir="$(jrate_rec_dir)"
+  # ticket-id validation + short-id resolution (issue #262: the regex +
+  # the record scan live in lib.sh, shared with jarate-bg-kill).
+  # NOTE: the suffix is variable width (PID / $RANDOM) - never re-impose
+  # a fixed 5-digit width here.
+  sig_orig="$sig_id"
+  sig_rc=0
+  sig_id="$(jrate_resolve_ticket "$sig_id" "$sig_rec_dir" "jarate-bg signal")" || sig_rc=$?
+  case "$sig_rc" in
+    0) ;;
+    2) echo "jarate-bg signal: '$sig_orig' is not a ticket id (want YYYYMMDD-HHMMSS-NNNNN, or a unique 7+ digit suffix)" >&2; exit 2 ;;
+    *) exit 2 ;;
+  esac
+  sig_cg="$(jrate_cg_root)/pi-bg/$sig_id"
   if [ ! -d "$sig_cg" ]; then
     echo "jarate-bg signal: no cgroup for ticket '$sig_id' ($sig_cg missing) - unknown ticket, run in caller cgroup (no escape), or already reaped" >&2
     exit 2
   fi
-  # tree enumeration (same shape as jarate-bg-kill): the cgroup members
-  # plus every descendant (a real cgroup v2 move carries the whole
-  # subtree; the /proc walk closes the escape-failed case)
-  sig_children_of() {
-    local want="$1" c s
-    for c in /proc/[0-9]*; do
-      IFS= read -r s 2>/dev/null < "$c/stat" || continue
-      s="${s#*) }"  # drop 'pid (comm)' - comm may contain spaces
-      [ "${s#* }" = "${s}" ] && continue
-      set -- $s
-      [ "$2" = "$want" ] && basename "$c"
-    done
-  }
-  sig_list_tree() {
-    local p d c queue=() next=()
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      echo "$p"
-      queue=("$p")
-      while [ "${#queue[@]}" -gt 0 ]; do
-        next=()
-        for d in "${queue[@]}"; do
-          for c in $(sig_children_of "$d"); do
-            echo "$c"
-            next+=("$c")
-          done
-        done
-        queue=("${next[@]+"${next[@]}"}")
-      done
-    done < <(cat "$sig_cg/cgroup.procs" 2>/dev/null | sort -un)
-  }
-  sig_pids="$(sig_list_tree | sort -un | tr '\n' ' ')"
+  # tree enumeration (same shape as jarate-bg-kill; the /proc scan + BFS
+  # live in lib.sh, issue #262): the cgroup members plus every descendant
+  # (a real cgroup v2 move carries the whole subtree; the /proc walk
+  # closes the escape-failed case)
+  sig_pids="$(jrate_list_tree "$sig_cg" | sort -un | tr '\n' ' ')"
   sig_pids="${sig_pids% }"
   if [ "$sig_dry" -eq 1 ]; then
     echo "process tree for $sig_id (would be signaled $sig_name):"
@@ -205,17 +193,7 @@ if [ "${1:-}" = "signal" ]; then
   # audit-only posture: a missing/corrupt record never breaks the signal
   # path.
   if [ "$sig_gone" -eq 1 ] && [ -f "$sig_rec_dir/pi-bg-${sig_id}.json" ]; then
-    PI_BG_REC_STATE="cancelled" python3 - "$sig_rec_dir/pi-bg-${sig_id}.json" <<'PY' 2>/dev/null || true
-import datetime, json, os, sys
-p = sys.argv[1]
-try:
-    rec = json.load(open(p))
-except Exception:
-    sys.exit(0)
-rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
-rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-json.dump(rec, open(p, "w"), indent=2)
-PY
+    jrate_rec_set_state "$sig_rec_dir/pi-bg-${sig_id}.json" "cancelled"
   fi
   # receipt: stdout + dead log (always) + webhook (best-effort)
   sig_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -229,24 +207,16 @@ PY
     "$(date -u +%Y-%m-%d)" "$sig_id" "$sig_repo" "$sig_ts" \
     "signal: $sig_name sent to pids $sig_pids by $(id -un); $sig_result" \
     >> "${HOME}/.pi-bg-deadlog" 2>/dev/null || true
-  sig_webhook="${PI_DISPATCH_WEBHOOK:-}"
-  if [ -z "$sig_webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
-    sig_webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
-  fi
+  sig_webhook="$(jrate_webhook)"
   if [ -n "$sig_webhook" ]; then
     sig_bodyf="$sig_tmp/pi-bg-${sig_id}-signal-body.json"
     SIG_E_T="$sig_id" SIG_E_REPO="$sig_repo" SIG_E_SIG="$sig_name" \
     SIG_E_PIDS="$sig_pids" SIG_E_RESULT="$sig_result" SIG_E_AT="$sig_ts" \
     python3 - > "$sig_bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import GREEN_ALIVE, kv
 E = lambda k: os.environ.get("SIG_E_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
-VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as the watchdog)
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def kv(key, val):
-    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
 t = E('T')
 lines = ["\u250c signal \u00b7 " + t,
          "\u251c $ jarate-bg signal " + E('SIG'),
@@ -257,7 +227,7 @@ lines = ["\u250c signal \u00b7 " + t,
          kv("at", E('AT')),
          "\u2514"]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
-         "color": 3066993,  # green: alive run, informational (issue #143)
+         "color": GREEN_ALIVE,  # green: alive run, informational (issue #143)
          "title": "SIGNAL \u00b7 " + t,
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg signal (issue #143)"},
@@ -266,13 +236,10 @@ json.dump({"embeds": [embed]}, sys.stdout)
 PY
     if [ -s "$sig_bodyf" ]; then
       sig_respf="$sig_tmp/pi-bg-${sig_id}-signal-wb-resp.txt"
-      sig_code=000
-      for i in 1 2 3; do
-        sig_code="$(curl -s -o "$sig_respf" -w '%{http_code}' -X POST "$sig_webhook" \
-          -H 'Content-Type: application/json' --max-time 15 --data @"$sig_bodyf" 2>/dev/null)" || sig_code="000"
-        case "$sig_code" in 2*) break ;; esac
-        [ "$i" -lt 3 ] && sleep $(( i * 3 * ${PI_BG_WB_BACKOFF:-1} ))
-      done
+      # Shared retry shape (issue #262, lib.sh jrate_wb_post): 3 tries,
+      # escalating backoff PI_BG_WB_BACKOFF seconds (default 3s/6s);
+      # PI_BG_WB_BACKOFF=0 = no sleep (test seam).
+      sig_code="$(jrate_wb_post "$sig_webhook" "$sig_bodyf" "$sig_respf")"
       case "$sig_code" in
         2*) : ;;
         *)

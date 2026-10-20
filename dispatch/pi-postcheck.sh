@@ -16,9 +16,13 @@
 # Canonical home: dispatch/pi-postcheck.sh (install.sh links it into
 # ~/scripts; pi-restart invokes $HOME/scripts/pi-postcheck.sh).
 set -u
+# Shared contracts (issue #262 DRY): the webhook resolver ($PI_DISPATCH_WEBHOOK
+# else head -1 of the webhook file) and the settings channel selection
+# (bridge parity, jrate_common.default_channel) - dispatch/lib.sh.
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
 F='```'
 SETTINGS="$HOME/.pi/agent/settings.json"
-HOOK=$(cat "$HOME/.config/pi-dispatch/webhook" 2>/dev/null || true)
+HOOK="$(jrate_webhook)"
 INFLIGHT=$(cat "$HOME/.config/pi-inflight.md" 2>/dev/null || true)
 MSG=''
 TAG='[ok]'
@@ -28,13 +32,15 @@ if [ ! -f "$SETTINGS" ]; then
   MSG='`[!] pi-postcheck: settings.json missing`'
   TAG='[!]'
 else
-  read -r CH_ID TOKEN < <(python3 -c "
-import json
-d = json.load(open('$SETTINGS'))
-chs = [c for c in d.get('channels', []) if c.get('enabled')]
-c = next((x for x in chs if x.get('default')), chs[0] if chs else {})
-print(c.get('channel', ''), c.get('botToken', ''))
-" 2>/dev/null)
+  read -r CH_ID TOKEN < <(python3 - "$SETTINGS" <<'PY' 2>/dev/null
+import json, os, sys
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import default_channel
+d = json.load(open(sys.argv[1]))
+c = default_channel(d.get("channels", []))
+print(c.get("channel", ""), c.get("botToken", ""))
+PY
+)
   if [ -z "$TOKEN" ]; then
     MSG='`[!] pi-postcheck: no bot token in settings.json`'
     TAG='[!]'
@@ -81,15 +87,17 @@ if [ -n "$HOOK" ]; then
     STATUS=$(printf '%s healthy 90s after restart' "$TAG")
   fi
   BODY=$(python3 - "$TAG" "$STATUS" "$INFLIGHT" <<'PY' 2>/dev/null
-import json, sys
+import json, os, sys
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import GREEN_OK, RED_FAIL
 tag, status, inflight = sys.argv[1:4]
 if tag == "[ok]":
     title, color, desc = (
-        "postcheck \u00b7 ok", 0x57F287,
+        "postcheck \u00b7 ok", GREEN_OK,
         "pi.service restart health check (90s after restart).")
 else:
     title, color, desc = (
-        "postcheck \u00b7 fail", 0xED4245,
+        "postcheck \u00b7 fail", RED_FAIL,
         "pi.service restart health check FAILED (90s after restart) - the channel post carries the detail.")
 embed = {
     "title": title, "color": color, "description": desc,

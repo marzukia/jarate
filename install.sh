@@ -232,14 +232,24 @@ if [ -L "$RECALL_DEST" ] && [ ! -e "$RECALL_DEST" ]; then
 fi
 
 # --- 3b. live marker dir (issue #191 M2) ------------------------------------
-# /var/tmp/jarate-live: the per-agent liveness markers (<uid>, 0644) the
-# bridge touches every poll cycle; the watchdog's fleet liveness sweep
-# (another user) reads everyone's, so the dir is sticky world-writable
-# like /tmp. /var/tmp, not /tmp: the marker must survive a reboot so the
-# sweep can classify BOOT-GAP (marker older than kernel btime) instead of
-# alerting on a fresh boot. Created only when absent: a dir another agent
-# created first is already shared (1777) and un-chmoddable by us.
+# The per-agent liveness markers (<uid>, 0644) the bridge touches every
+# poll cycle; the watchdog's fleet liveness sweep (another user) reads
+# everyone's, so the dir is sticky world-writable like /tmp. /var/tmp,
+# not /tmp: the marker must survive a reboot so the sweep can classify
+# BOOT-GAP (marker older than kernel btime) instead of alerting on a
+# fresh boot. The default path is single-sourced in dispatch/lib.sh
+# (JRATE_LIVE_DIR_DEFAULT; the bridge writes ${JARATE_LIVE_DIR:-<default>},
+# the watchdog reads it - issue #262). Created only when absent: a dir
+# another agent created first is already shared (1777) and un-chmoddable
+# by us.
 LIVE_MARKER_DIR=/var/tmp/jarate-live
+if [ -f "$JARATE_DIR/dispatch/lib.sh" ]; then
+  # lib.sh is the single source for the default; the fallback literal
+  # only fires when it cannot be read (fresh-HOME --dry-run, clone not
+  # executed yet)
+  . "$JARATE_DIR/dispatch/lib.sh"
+  LIVE_MARKER_DIR="$JRATE_LIVE_DIR_DEFAULT"
+fi
 if [ -d "$LIVE_MARKER_DIR" ]; then
   echo "  live marker: $LIVE_MARKER_DIR (exists, unchanged)"
 else
