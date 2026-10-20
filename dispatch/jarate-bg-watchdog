@@ -384,8 +384,10 @@ rc_of() {
 #        carries retryOf=T1; T1's record is closed (killed).
 #     -> cap full: deadRetry={held} (posted with the DEAD alert); a
 #        later sweep (the retry section) fires it on a free slot.
-#        A launch that never starts its record (cap race, launch-fail)
-#        drops back to held.
+#        A launch that never starts its record (cap race, launch-fail,
+#        or the post-retirement stub - issue #35 gut, 2026-10-20: the
+#        launcher exits 10 before any record exists) drops back to
+#        held with the launch-failure reason in the DEAD embed.
 #   second death (the retry dies: its record has retryOf)
 #     -> embed only + human wake (FAIL-loop rule: one round, then human).
 #   HUNG/STALLED: not auto-retried (issue #110 non-goal).
@@ -549,6 +551,7 @@ wd_dead_retry_dispatch() {
   if [ "$maxc" -gt 0 ] && [ "$live" -ge "$maxc" ]; then
     wd_rec_set_deadretry "$t" held "-"
     retry_held=$((retry_held + 1))
+    WDR_HOLD="at cap $live/$maxc"
     echo "[pi-bg-watchdog] retry $t: HELD (at cap $live/$maxc) - fires on a later sweep"
     return 1
   fi
@@ -579,9 +582,11 @@ wd_dead_retry_dispatch() {
   done
   if [ ! -f "${rec_dir}/pi-bg-${new_id}.json" ]; then
     # launch failed before its record (cap race, launch-fail, no
-    # profile): back to held - a later sweep retries; the DEAD embed
-    # was already posted with the retry reason
+    # profile, or the retired-launch stub - issue #35 gut): back to
+    # held - a later sweep retries; the DEAD embed was already posted
+    # with the retry reason
     wd_rec_set_deadretry "$t" held "-"
+    WDR_HOLD="launch ${new_id} did not start (see ${BG_TMP}/pi-bg-${new_id}-launch.log)"
     echo "[pi-bg-watchdog] retry $t: launch $new_id did not start - back to held (log: $BG_TMP/pi-bg-${new_id}-launch.log)"
     return 1
   fi
@@ -601,9 +606,11 @@ wd_dead_retry_dispatch() {
 # caller's pipes. Called for DEAD class only (SILENT is owned by #57's
 # in-wrapper retry; HUNG/STALLED are not auto-retried).
 WDR_ACTION=""
+WDR_HOLD=""
 wd_dead_retry_decide() {
   local t="$1" wt="$3" rc
   WDR_ACTION=""
+  WDR_HOLD=""
   [ -f "${rec_dir}/pi-bg-${t}.json" ] || return 2  # pre-#51: embed only
   local st rt drS drT
   IFS=$'\x1f' read -r st rt drS drT _ _ _ _ < <(wd_rec_fields "$t")
@@ -629,7 +636,7 @@ wd_dead_retry_decide() {
   rc=$?
   case $rc in
     0) WDR_ACTION="retry dispatched (issue #110)" ;;
-    1) WDR_ACTION="retry held: at cap - fires on a later sweep (issue #110)" ;;
+    1) WDR_ACTION="retry held: ${WDR_HOLD:-at cap} - fires on a later sweep (issue #110)" ;;
     *) return 2 ;;
   esac
   return 0

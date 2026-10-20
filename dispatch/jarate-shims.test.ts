@@ -29,12 +29,14 @@ const PAIRS: [string, string, string[]][] = [
   ["pi-bg-tail", "jarate-bg-tail", ["--help"]],
   ["pi-bg-watchdog", "jarate-bg-watchdog", ["--help"]],
 ];
-// rc-passthrough probes (no args unless noted): all must exit 2
-const RC2: [string, string[]][] = [
-  ["pi-bg", []],
-  ["pi-wait", []],
-  ["pi-bg-kill", []],
-  ["pi-bg-tail", []],
+// rc-passthrough probes (no args unless noted): the completion-side
+// shims exit 2 (usage); pi-bg's launch path is the RETIRED stub
+// (hall-monitor #35) and exits 10 with the fleet notice.
+const RC: [string, string[], number][] = [
+  ["pi-bg", [], 10],
+  ["pi-wait", [], 2],
+  ["pi-bg-kill", [], 2],
+  ["pi-bg-tail", [], 2],
 ];
 
 describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
@@ -79,14 +81,23 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
     });
   }
 
-  for (const [shim, args] of RC2) {
-    test(`${shim}: exit code passthrough (rc 2 usage error)`, async () => {
+  for (const [shim, args, wantRc] of RC) {
+    test(`${shim}: exit code passthrough (rc ${wantRc})`, async () => {
       const r = Bun.spawn([join(D, shim), ...args], {
         stdout: "pipe",
         stderr: "pipe",
       });
-      const rc = await r.exited;
-      expect(rc).toBe(2);
+      const [out, rc] = await Promise.all([
+        new Response(r.stdout).text(),
+        r.exited,
+      ]);
+      expect(rc).toBe(wantRc);
+      if (shim === "pi-bg") {
+        // the stub's ticket-line slot carries the fleet endpoint
+        expect(out).toContain(
+          "POST http://100.95.144.25:8001/api/fleet/dispatch",
+        );
+      }
     });
   }
 

@@ -224,10 +224,10 @@ Verification checklist (all must pass before declaring done):
 1. startup message appears in the channel.
 2. LLM path: `SELECT status, count(*) FROM llm_requests WHERE agent='<name>' GROUP BY 1`
    -> only 200s, rows accumulating.
-3. One real jarate-bg worker smoke run (`smoke test: reply OK`, 2-5s) - confirms
-   webhook + role profile + artifacts. Nohup form (foreground launch is
-   rejected with rc 4, issue #144):
-   `nohup ~/scripts/jarate-bg worker "smoke test: reply OK" > smoke.log 2>&1 &`
+3. One real fleet worker smoke run (`smoke test: reply OK`) - confirms
+   webhook + role profile + artifacts. jarate-bg is RETIRED (hall-monitor
+   #35, 2026-10-20): dispatch via the fleet (see the dispatch/jarate-bg
+   retirement notice).
 
 ## 8. Update every existing agent
 

@@ -1003,7 +1003,7 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
     }
   }, 30_000);
 
-  test("held record: re-flagged daily until the retry fires (stays running)", async () => {
+  test("held record: re-flagged daily; launch lands on the retired stub, stays running (#35 gut)", async () => {
     const f = fixture();
     // Scrub the ambient PI_BG_* leak vars (mirrors retryFixture's list,
     // plus PI_BG_HB_PID): the bare fixture only scrubs PI_SERVICE/
@@ -1053,10 +1053,11 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
         // Headroom, not the fix. Both CI reds (37473320280 at 8s,
         // 37484172676 at 30s) were the same non-timing cause: the
         // 1-line prompt (empty after `tail -n +3`) plus the ambient
-        // PI_BG_* leak in wrapper envs - fixed above. 30s is kept as
-        // headroom for a slow clean-env launch (worktree add, cgroup
-        // escape); the production default stays 8s.
-        PI_BG_RETRY_WAIT: "30",
+        // PI_BG_* leak in wrapper envs - fixed above. The launch
+        // now lands on the retired stub (issue #35 gut), which exits
+        // instantly with no record - 5s of poll headroom is plenty
+        // (30s pushed this test past its timeout).
+        PI_BG_RETRY_WAIT: "5",
       };
       const r1 = await f.run([], over);
       expect(r1.code).toBe(0);
@@ -1084,27 +1085,19 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
         "running",
       );
 
-      // a slot frees: the retry fires and closes the record
+      // a slot frees: the retry launch fires but lands on the retired
+      // stub (rc 10, no run record) - back to held, record stays running
       fs.rmSync(path.join(f.art, `pi-bg-${TID(9)}-hb`));
       const r4 = await f.run([], over);
-      expect(r4.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r4.out).toContain(`retry ${t}: launch `);
+      expect(r4.out).toContain("did not start - back to held");
       const rec4 = JSON.parse(fs.readFileSync(recFile(f, t), "utf8"));
-      expect(rec4.state).toBe("killed");
-      expect(rec4.deadRetry.state).toBe("dispatched");
-      // clean up the retry record so the reaper/prune see a settled box
-      const recIds = fs
-        .readdirSync(path.join(f.home, ".pi-dispatch", "runs"))
-        .filter((n) => n !== `pi-bg-${t}.json`);
-      for (const n of recIds) {
-        const rj = JSON.parse(
-          fs.readFileSync(path.join(f.home, ".pi-dispatch", "runs", n), "utf8"),
-        );
-        rj.state = "killed";
-        fs.writeFileSync(
-          path.join(f.home, ".pi-dispatch", "runs", n),
-          JSON.stringify(rj),
-        );
-      }
+      expect(rec4.state).toBe("running");
+      expect(rec4.deadRetry.state).toBe("held");
+      // the stub never writes a retry record: only the original exists
+      expect(fs.readdirSync(path.join(f.home, ".pi-dispatch", "runs"))).toEqual(
+        [`pi-bg-${t}.json`],
+      );
     } finally {
       f.close();
     }
@@ -1887,6 +1880,100 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
   };
 
   const shq = (s: string) => JSON.stringify(s);
+  // Fake PRE-retirement launcher (the shape the in-flight tickets were
+  // born with): run record + cgroup + hb + prompt file + pi run + OK
+  // callback, minimal. The #110 state-machine tests (launch-based) run
+  // against it; the planted-state tests keep PI_BG_LAUNCHER=JB (the
+  // retired stub) and assert the post-gut retry behavior.
+  const legacyLauncher = (f: F): string => {
+    const p = path.join(f.tmp, "legacy-bg");
+    fs.writeFileSync(
+      p,
+      `#!/bin/sh
+set -u
+if [ -z "\${FAKE_BG_SETSID:-}" ]; then
+  FAKE_BG_SETSID=1 export FAKE_BG_SETSID
+  exec setsid "$0" "$@"
+fi
+profile="" wt_mode="" wt_reuse="" pj=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    worker|reviewer) profile="$1" ;;
+    --worktree) wt_mode=1 ;;
+    --wt-reuse) wt_reuse="$2"; shift ;;
+    --project) pj="$2"; shift ;;
+  esac
+  shift
+done
+run_id="\${PI_BG_RUN_ID:?PI_BG_RUN_ID}"
+task="$(cat)"
+bg_tmp="\${PI_BG_TMPDIR:?PI_BG_TMPDIR}"
+rec_dir="\${PI_DISPATCH_RECORD_DIR:?PI_DISPATCH_RECORD_DIR}"
+cg_root="\${PI_BG_CG_ROOT:?PI_BG_CG_ROOT}"
+wt_root="\${PI_BG_WT_DIR:?PI_BG_WT_DIR}"
+mkdir -p "$rec_dir" "$bg_tmp"
+wt=""
+if [ -n "$wt_reuse" ]; then
+  wt="$wt_reuse"
+elif [ -n "$wt_mode" ]; then
+  wt="$wt_root/$(basename "$(pwd)")/$run_id"
+  git worktree add -q -b "pi-bg/$run_id" "$wt"
+fi
+[ -n "$wt" ] && cd "$wt"
+cg="$cg_root/pi-bg/$run_id"
+mkdir -p "$cg"
+echo $$ > "$cg/cgroup.procs"
+printf '# pi-bg %s task\\n\\n%s\\n' "$profile" "$task" > "$bg_tmp/pi-bg-\${run_id}-prompt.md"
+: > "$bg_tmp/pi-bg-\${run_id}-hb"
+LB_RUN="$run_id" LB_PROFILE="$profile" LB_CWD="$(pwd -P)" LB_WT="$wt" LB_RETRY_OF="\${PI_BG_RETRY_OF:-}" python3 - "$rec_dir/pi-bg-\${run_id}.json" <<'PY'
+import datetime, json, os, sys
+rec = {
+    "run": os.environ["LB_RUN"],
+    "profile": os.environ["LB_PROFILE"],
+    "project": None,
+    "cwd": os.environ["LB_CWD"],
+    "started": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "delivery": "webhook",
+    "state": "running",
+}
+if os.environ["LB_WT"]:
+    rec["wt"] = os.environ["LB_WT"]
+if os.environ["LB_RETRY_OF"]:
+    rec["retryOf"] = os.environ["LB_RETRY_OF"]
+json.dump(rec, open(sys.argv[1], "w"), indent=2)
+PY
+pi_bin="$(command -v pi)"
+PI_BG_RUN_ID="$run_id" "$pi_bin" -p "$task" > "$bg_tmp/pi-bg-\${run_id}-raw.out" 2>&1 &
+pi_pid=$!
+wait "$pi_pid"
+rc=$?
+LB_RUN="$run_id" LB_RC="$rc" python3 - "$rec_dir/pi-bg-\${run_id}.json" <<'PY'
+import datetime, json, os, sys
+p = sys.argv[1]
+rec = json.load(open(p))
+if rec.get("state") == "running":
+    rec["state"] = "done" if int(os.environ["LB_RC"]) == 0 else "killed"
+    rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    json.dump(rec, open(p, "w"), indent=2)
+PY
+if [ "$rc" -eq 0 ] && [ -n "\${PI_DISPATCH_WEBHOOK:-}" ]; then
+  LB_RUN="$run_id" python3 - <<'PY' | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "\${PI_DISPATCH_WEBHOOK}" >/dev/null 2>&1
+import datetime, json, os
+rid = os.environ["LB_RUN"]
+embed = {"author": {"name": "pi-bg ticket \u00b7 " + rid},
+         "title": "worker \u00b7 OK \u00b7 0m01s",
+         "description": "ok callback",
+         "footer": {"text": "pi-bg"},
+         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+print(json.dumps({"embeds": [embed]}))
+PY
+fi
+exit "$rc"
+`,
+    );
+    fs.chmodSync(p, 0o755);
+    return p;
+  };
   const recDirOf = (f: F) => path.join(f.home, ".pi-dispatch", "runs");
   const recFileOf = (f: F, t: string) =>
     path.join(recDirOf(f), `pi-bg-${t}.json`);
@@ -1977,7 +2064,7 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       [
         "sh",
         "-c",
-        `cd ${shq(cwd)} && printf '%s' ${shq(task)} | nohup bash ${shq(JB)} ${args.map(shq).join(" ")} - > ${shq(log)} 2>&1`,
+        `cd ${shq(cwd)} && printf '%s' ${shq(task)} | nohup bash ${shq(f.env.PI_BG_LAUNCHER ?? JB)} ${args.map(shq).join(" ")} - > ${shq(log)} 2>&1`,
       ],
       {
         env: { ...f.env, PI_BG_RUN_ID: t },
@@ -2083,6 +2170,9 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     try {
       const repo = mkRepo(f, "repo");
       fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
+      // pre-retirement launcher: the in-flight ticket was born before
+      // the gut, so its launch + the retry re-dispatch both work
+      f.env.PI_BG_LAUNCHER = legacyLauncher(f);
       await launchBg(
         f,
         repo,
@@ -2091,6 +2181,7 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
         t1,
       );
       killTicket(f, t1);
+
       age(path.join(f.wtDir, "repo", t1), 30); // wt mtime > AGE_MIN (20)
       age(path.join(f.art, `pi-bg-${t1}-hb`), 15); // hb > STALL_MIN (10)
       const r = await f.run();
@@ -2132,6 +2223,7 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       const repo = mkRepo(f, "repo");
       fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
       fs.writeFileSync(path.join(f.tmp, "slow-ALL"), ""); // retry (unknown id yet) slow too
+      f.env.PI_BG_LAUNCHER = legacyLauncher(f); // pre-retirement launcher
       await launchBg(
         f,
         repo,
@@ -2173,7 +2265,7 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     }
   }, 120_000);
 
-  test("first death at full cap -> HELD; slot frees -> fires on a later sweep", async () => {
+  test("first death at full cap -> HELD; slot frees -> launch lands on the retired stub, back to held (#35 gut)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "4";
@@ -2211,17 +2303,20 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r2.out).toContain(`retry ${t}: HELD (at cap 4/4)`);
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(1);
-      // a slot frees: the later sweep fires it
+      // a slot frees: the later sweep fires the launch - post-gut it
+      // lands on the retired stub (rc 10, no run record): back to held,
+      // record stays running, no retry ticket born (issue #35 gut)
       fs.rmSync(path.join(f.art, "pi-bg-20991211-000000-777-hb"));
       const r3 = await f.run();
-      expect(r3.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r3.code).toBe(0);
+      expect(r3.out).toContain(`retry ${t}: launch `);
+      expect(r3.out).toContain("did not start - back to held");
       const rec3 = rec(f, t);
-      expect(rec3.state).toBe("killed");
-      expect((rec3.deadRetry as { state: string }).state).toBe("dispatched");
-      const t2 = (rec3.deadRetry as { ticket: string }).ticket;
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
-      killTicket(f, t2);
+      expect(rec3.state).toBe("running");
+      expect((rec3.deadRetry as { state: string }).state).toBe("held");
+      // the ticket field keeps the attempted id (set_deadretry only
+      // overwrites on non-empty); the point is no record exists for it
+      expect(recIds(f)).toEqual([t]); // the stub never writes a record
     } finally {
       f.close();
     }
@@ -2360,6 +2455,7 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       const repo = mkRepo(f, "repo");
       fs.writeFileSync(path.join(f.tmp, `slow-${t1}`), "");
       fs.writeFileSync(path.join(f.tmp, "slow-ALL"), ""); // retry stays alive
+      f.env.PI_BG_LAUNCHER = legacyLauncher(f); // pre-retirement launcher
       await launchBg(
         f,
         repo,
@@ -2396,14 +2492,13 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     }
   }, 120_000);
 
-  test("cwd run: first death at full cap -> HELD, record stays running; slot frees -> fires on a later sweep (review F1)", async () => {
+  test("cwd run: first death at full cap -> HELD, record stays running; slot frees -> retired stub, back to held (review F1, #35 gut)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "2";
     const t = RT(8);
     plantCwdRun(f, t, "cwd held task");
     const filler = plantFillers(f);
-    let t2 = "";
     try {
       const r1 = await f.run();
       expect(r1.code).toBe(0);
@@ -2423,27 +2518,23 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r2.out).toContain(`retry ${t}: HELD (at cap 2/2)`);
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(1);
-      // a slot frees: the later sweep fires it (T3 shape, cwd variant)
+      // a slot frees: the later sweep fires the launch - the retired
+      // stub (rc 10) never starts a record: back to held, record stays
+      // running (the #110 invariant the F1 review guards)
       fs.rmSync(filler);
       const r3 = await f.run();
       expect(r3.code).toBe(0);
-      expect(r3.out).toContain(`retry ${t}: DISPATCHED`);
-      // no worktree claim for a cwd run (review F4a)
-      expect(r3.out).toContain(`(retry_of=${t}, same cwd)`);
-      const rec3 = rec(f, t);
-      expect(rec3.state).toBe("killed");
-      expect((rec3.deadRetry as { state: string }).state).toBe("dispatched");
-      t2 = (rec3.deadRetry as { ticket: string }).ticket;
-      expect(t2).toMatch(/^\d{8}-\d{6}-\d+$/);
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
-      killTicket(f, t2);
+      expect(r3.out).toContain(`retry ${t}: launch `);
+      expect(r3.out).toContain("did not start - back to held");
+      expect(rec(f, t).state).toBe("running");
+      expect((rec(f, t).deadRetry as { state: string }).state).toBe("held");
+      expect(recIds(f)).toEqual([t]); // the stub never writes a record
     } finally {
       f.close();
     }
   }, 90_000);
 
-  test("quiet + PI_BG_WATCHDOG_RETRY=1: retry fully functional, zero posts (review F2)", async () => {
+  test("quiet + PI_BG_WATCHDOG_RETRY=1: retry wired end-to-end (launch attempt + hold), zero posts (review F2, #35 gut)", async () => {
     const f = retryFixture();
     bless(f);
     f.env.PI_BG_MAX_CONCURRENT = "2";
@@ -2453,7 +2544,6 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
     // retry pi stays slow: no OK callback can race the zero-post asserts
     fs.writeFileSync(path.join(f.tmp, "slow-ALL"), "");
     const q = { PI_BG_WATCHDOG_RETRY: "1" };
-    let t2 = "";
     try {
       const r1 = await f.run(["--quiet"], q);
       expect(r1.code).toBe(0);
@@ -2468,20 +2558,18 @@ describe("#110: DEAD-class auto retry (watchdog state machine)", () => {
       expect(r1b.out).toContain("retry_on=0");
       expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(0);
-      // a slot frees + override: fires, record advances, still zero posts
+      // a slot frees + override: the launch attempt runs (retired stub:
+      // rc 10, no record) and holds - still zero posts
       fs.rmSync(filler);
       const r2 = await f.run(["--quiet"], q);
       expect(r2.code).toBe(0);
-      expect(r2.out).toContain(`retry ${t}: DISPATCHED`);
+      expect(r2.out).toContain(`retry ${t}: launch `);
+      expect(r2.out).toContain("did not start - back to held");
       expect(r2.out).toContain("retry_on=1");
-      const rec2 = rec(f, t);
-      expect(rec2.state).toBe("killed");
-      expect((rec2.deadRetry as { state: string }).state).toBe("dispatched");
-      t2 = (rec2.deadRetry as { ticket: string }).ticket;
-      expect(rec(f, t2).retryOf).toBe(t);
-      expect(recIds(f).sort()).toEqual([t, t2].sort());
+      expect(rec(f, t).state).toBe("running");
+      expect((rec(f, t).deadRetry as { state: string }).state).toBe("held");
+      expect(recIds(f)).toEqual([t]);
       expect(f.posts).toHaveLength(0);
-      killTicket(f, t2);
     } finally {
       f.close();
     }

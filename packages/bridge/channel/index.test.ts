@@ -11,6 +11,7 @@ import {
   seedChannelStateForTest,
   setChannelCursor,
 } from "./discord";
+import { isFleetRun } from "./fleet-run";
 import { fmtTokensLC, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
@@ -108,6 +109,12 @@ import {
 } from "./types";
 import { performUndo } from "./undo";
 import { clearWorktreeState } from "./worktree";
+
+// Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
+// suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;
+// the gate treats that as a fleet run and would skip all channel startup
+// in every test. Clear it here (the fleet-gate describe re-sets it).
+delete process.env.PI_SESSION_ID;
 
 /** A2 (polish sweep, 2026-09-15) + 2026-10-18: styleGuard once wrapped
  *  untagged fence bodies to the 40-col budget; the wrap is GONE (no width
@@ -11594,5 +11601,128 @@ describe("live marker (#191 M2)", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
+  let tmp = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let sent: { m: any; o?: any }[] = [];
+  let fetchCalls: { url: string; method: string }[] = [];
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-fleet-"));
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "uid",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    handlers = {};
+    sent = [];
+    midTurnQueues.clear();
+    pendingAttachments.clear();
+    verboseOverride.clear();
+    resetRuntimeStateForTest();
+    fetchCalls = [];
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: () => {},
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: (m: any, o?: any) => {
+        sent.push({ m, o });
+      },
+    };
+    extension(pi);
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    // URL-aware mock: channel "ch1" resolves to Discord id 111 via the DM
+    // list; a persisted cursor seeds the #180 scan window. (The generic
+    // {id:"out1"} shape is not iterable, so guild/DM traversal would fail.)
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      fetchCalls.push({ url: u, method: init?.method ?? "GET" });
+      let body: any = { id: "out1" };
+      if (u.includes("/users/@me/guilds")) body = [];
+      else if (u.includes("/users/@me/channels"))
+        body = [{ name: "ch1", id: "111" }];
+      else if (u.endsWith("/users/@me")) body = { id: "999" };
+      else if (u.includes("/messages")) body = [];
+      return {
+        ok: true,
+        status: 200,
+        json: async () => body,
+        text: async () => "",
+      };
+    }) as any;
+    // persisted cursor (the previous process's last message): with it the
+    // #180 startup scan has a window to fetch
+    fs.mkdirSync(path.join(tmp, ".tmp"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".tmp", "channel-state.json"),
+      JSON.stringify({ channels: {}, cursors: { "111": "123456" } }),
+    );
+  });
+
+  afterEach(() => {
+    clearDiscordStatesForTest();
+    resetRuntimeStateForTest();
+    delete process.env.PI_SESSION_ID;
+  });
+
+  test("isFleetRun: the wrapper's fleetwork- session id only", () => {
+    expect(isFleetRun()).toBe(false); // unset (interactive shells)
+    // pi sets PI_SESSION_ID to its own UUID for interactive sessions -
+    // only the run wrapper's fleetwork-<ticket> pin gates the channel
+    process.env.PI_SESSION_ID = "01a0ccd0-0e87-75ec-bfa0-7d382f5274";
+    expect(isFleetRun()).toBe(false);
+    process.env.PI_SESSION_ID = "fleetwork-35";
+    expect(isFleetRun()).toBe(true);
+  });
+
+  test("fleet run: session_start gates ALL channel startup (no connect, no scan, no wake)", async () => {
+    process.env.PI_SESSION_ID = "fleetwork-35";
+    await handlers.session_start?.({ reason: "startup" }, ctx);
+    // the pilot failure shape: dispatch runs 3/5/6 posted restart-wake
+    // cards onto the interactive channel on start. Now: zero Discord
+    // REST (no connect /users/@me, no #180 scan messages?before=),
+    // zero outbound (no wake post).
+    expect(fetchCalls).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+  });
+
+  test("interactive run: startup connect + #180 scan proceed unchanged", async () => {
+    process.env.PI_SESSION_ID = "01a0ccd0-0e87-75ec-bfa0-7d382f5274";
+    await handlers.session_start?.({ reason: "startup" }, ctx);
+    // the #180 scan is fire-and-forget; give it loop turns to fetch
+    for (
+      let i = 0;
+      i < 40 && !fetchCalls.some((c) => c.url.includes("before="));
+      i++
+    )
+      await new Promise((r) => setTimeout(r, 10));
+    // connect REST (bot identity) + the bounded startup history scan
+    // (before=<persisted cursor>)
+    expect(fetchCalls.some((c) => c.url.includes("/users/@me"))).toBe(true);
+    expect(fetchCalls.some((c) => c.url.includes("before=123456"))).toBe(true);
   });
 });

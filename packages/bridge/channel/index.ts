@@ -68,6 +68,7 @@ import {
   suppressAutoReact,
   unreactMessage,
 } from "./discord";
+import { isFleetRun } from "./fleet-run";
 import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
@@ -2580,6 +2581,22 @@ export default function (pi: ExtensionAPI) {
 
     const enabled = channels.filter((c) => c.enabled);
     if (enabled.length === 0) return;
+
+    // Fleet-run gate (hall-monitor #35 gut, 2026-10-20): a fleetwork
+    // dispatch run skips ALL channel startup activity — connect, #180
+    // re-wake drain + history scan, the post-restart wake + its startup
+    // recovery kick, tool registration, sched pollers. The channel is
+    // the interactive agent's runtime; the run's own events go through
+    // the fleetwork wrapper. (Pilot 2026-10-20: dispatch runs 3/5/6
+    // each posted an "unplanned restart" wake card onto the agent's
+    // channel on start, re-waking it with a ticket event about a
+    // different process.)
+    if (isFleetRun()) {
+      console.log(
+        "[channel] fleet dispatch run - channel startup gated (no connect, no scans, no tools)",
+      );
+      return;
+    }
 
     // #180: re-wake survival (same startup machinery as the wake below;
     // reason "startup" = a real process start, the same guard

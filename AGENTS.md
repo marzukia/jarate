@@ -75,8 +75,8 @@ bash install.sh --dry-run          # installer regression check
    injected for that run only).
 3. PR description: what / why / verification (see CONTRIBUTING template).
 4. Adversarial reviewer agent verdict `VERDICT: PASS` is required before
-   merge. Nohup form (foreground launch is rejected, rc 4, #144):
-   `nohup ~/scripts/jarate-bg reviewer "adversarially review <branch/PR> ..." > review.log 2>&1 &`
+   merge. Review runs dispatch to the fleet (jarate-bg is RETIRED -
+   hall-monitor #35, 2026-10-20; see the dispatch/jarate-bg stub).
 5. Merge only on PASS + green `ci` (biome + bridge jobs).
 
 ## Do-not-touch list
