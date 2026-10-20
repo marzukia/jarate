@@ -30,10 +30,15 @@
  * Single-writer assumption: same as the sleep tool — one pi process per
  * HOME, read-modify-write without a lock.
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { CLAIM_TTL_MS, formatDurationMs, MAX_WAKE_MS } from "./sleep";
+import {
+  createDurableStore,
+  generateStoreId,
+  parseFutureIsoParam,
+  parseMinutesParam,
+} from "./durable-store";
+import { formatDurationMs, MAX_WAKE_MS } from "./sleep";
 import { defaultHome } from "./todos";
 
 export interface ScheduledTask {
@@ -71,59 +76,52 @@ export function tasksPath(home = defaultHome()): string {
   return path.join(tasksDir(home), "tasks.json");
 }
 
+/** Per-entry validation for loadTasks; null drops the entry. */
+function validateTask(raw: unknown): ScheduledTask | null {
+  const t = raw as any;
+  if (typeof t?.id !== "string" || !t.id) return null;
+  if (typeof t?.channelId !== "string" || !t.channelId) return null;
+  if (typeof t?.prompt !== "string" || !t.prompt) return null;
+  if (typeof t?.nextFireAt !== "number" || !Number.isFinite(t.nextFireAt))
+    return null;
+  if (t.kind !== "at" && t.kind !== "cron") return null;
+  const task: ScheduledTask = {
+    id: t.id,
+    channelId: t.channelId,
+    prompt: t.prompt,
+    kind: t.kind,
+    createdAt: typeof t.createdAt === "number" ? t.createdAt : t.nextFireAt,
+    nextFireAt: t.nextFireAt,
+    status: t.status === "claimed" ? "claimed" : "pending",
+  };
+  if (typeof t.channelName === "string" && t.channelName)
+    task.channelName = t.channelName;
+  if (t.kind === "at" && typeof t.atMs === "number") task.atMs = t.atMs;
+  if (t.kind === "cron" && typeof t.cron === "string" && t.cron)
+    task.cron = t.cron;
+  if (t.kind === "cron" && typeof t.tz === "string" && t.tz) task.tz = t.tz;
+  if (typeof t.lastFiredAt === "number") task.lastFiredAt = t.lastFiredAt;
+  if (t.status === "claimed" && typeof t.claimedAt === "number")
+    task.claimedAt = t.claimedAt;
+  return task;
+}
+
+const taskStore = createDurableStore<ScheduledTask>({
+  dir: tasksDir,
+  file: tasksPath,
+  wrapperKey: "tasks",
+  validate: validateTask,
+  dueAt: (t) => t.nextFireAt,
+});
+
 /** All tasks on disk; missing/corrupt file -> empty list. */
 export function loadTasks(home = defaultHome()): ScheduledTask[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(tasksPath(home), "utf8");
-  } catch {
-    return [];
-  }
-  try {
-    const data = JSON.parse(raw);
-    if (!data || !Array.isArray(data.tasks)) return [];
-    const out: ScheduledTask[] = [];
-    for (const t of data.tasks) {
-      if (typeof t?.id !== "string" || !t.id) continue;
-      if (typeof t?.channelId !== "string" || !t.channelId) continue;
-      if (typeof t?.prompt !== "string" || !t.prompt) continue;
-      if (typeof t?.nextFireAt !== "number" || !Number.isFinite(t.nextFireAt))
-        continue;
-      if (t.kind !== "at" && t.kind !== "cron") continue;
-      const task: ScheduledTask = {
-        id: t.id,
-        channelId: t.channelId,
-        prompt: t.prompt,
-        kind: t.kind,
-        createdAt: typeof t.createdAt === "number" ? t.createdAt : t.nextFireAt,
-        nextFireAt: t.nextFireAt,
-        status: t.status === "claimed" ? "claimed" : "pending",
-      };
-      if (typeof t.channelName === "string" && t.channelName)
-        task.channelName = t.channelName;
-      if (t.kind === "at" && typeof t.atMs === "number") task.atMs = t.atMs;
-      if (t.kind === "cron" && typeof t.cron === "string" && t.cron)
-        task.cron = t.cron;
-      if (t.kind === "cron" && typeof t.tz === "string" && t.tz) task.tz = t.tz;
-      if (typeof t.lastFiredAt === "number") task.lastFiredAt = t.lastFiredAt;
-      if (t.status === "claimed" && typeof t.claimedAt === "number")
-        task.claimedAt = t.claimedAt;
-      out.push(task);
-    }
-    return out;
-  } catch {
-    return [];
-  }
+  return taskStore.load(home);
 }
 
 /** Save all tasks atomically (tmp file in the same dir, rename over). */
 export function saveTasks(tasks: ScheduledTask[], home = defaultHome()): void {
-  const dir = tasksDir(home);
-  fs.mkdirSync(dir, { recursive: true });
-  const target = tasksPath(home);
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ tasks }, null, 2));
-  fs.renameSync(tmp, target);
+  taskStore.save(tasks, home);
 }
 
 /**
@@ -131,25 +129,7 @@ export function saveTasks(tasks: ScheduledTask[], home = defaultHome()): void {
  * never throws, called once per process start. Files are tasks.json.*.tmp.
  */
 export function collectOrphanTaskTmpFiles(home = defaultHome()): number {
-  const dir = tasksDir(home);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return 0; // no dir yet — nothing to collect
-  }
-  const target = path.basename(tasksPath(home));
-  let removed = 0;
-  for (const n of names) {
-    if (!n.startsWith(`${target}.`) || !n.endsWith(".tmp")) continue;
-    try {
-      fs.unlinkSync(path.join(dir, n));
-      removed++;
-    } catch {
-      // best-effort; a locked/dead tmp file can stay, it is harmless
-    }
-  }
-  return removed;
+  return taskStore.collectOrphans(home);
 }
 
 // ─── Cron ──────────────────────────────────────────────────────────────────
@@ -425,27 +405,14 @@ export function parseTaskSpec(
   }
 
   if (hasAt) {
-    const t = Date.parse(String(params.at));
-    if (Number.isNaN(t))
-      return {
-        error: `invalid at: "${params.at}" (ISO time, e.g. 2026-09-10T15:00:00Z)`,
-      };
-    if (t <= now) return { error: `at must be in the future: ${params.at}` };
-    if (t - now > MAX_WAKE_MS)
-      return { error: "at too far out (max 30d from now)" };
-    return { spec: { kind: "at", atMs: t, nextFireAt: t } };
+    const r = parseFutureIsoParam(String(params.at), "at", now, MAX_WAKE_MS);
+    if (r.ms === undefined) return { error: r.error! };
+    return { spec: { kind: "at", atMs: r.ms, nextFireAt: r.ms } };
   }
 
-  const minutes =
-    typeof params.minutes === "number"
-      ? params.minutes
-      : Number(params.minutes);
-  if (!Number.isFinite(minutes))
-    return { error: `minutes must be a number, got "${params.minutes}"` };
-  if (minutes <= 0) return { error: "minutes must be greater than 0" };
-  const ms = minutes * 60000;
-  if (ms > MAX_WAKE_MS) return { error: `minutes too large (max 43200 = 30d)` };
-  return { spec: { kind: "at", atMs: now + ms, nextFireAt: now + ms } };
+  const r = parseMinutesParam(params.minutes as number | string, MAX_WAKE_MS);
+  if (r.ms === undefined) return { error: r.error! };
+  return { spec: { kind: "at", atMs: now + r.ms, nextFireAt: now + r.ms } };
 }
 
 // ─── Scheduling / lifecycle ────────────────────────────────────────────────
@@ -459,9 +426,9 @@ export function scheduleTask(opts: {
   home?: string;
   now?: number;
 }): ScheduledTask {
-  const home = opts.home;
+  const home = opts.home ?? defaultHome();
   const now = opts.now ?? Date.now();
-  const id = `${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const id = generateStoreId(now);
   const task: ScheduledTask = {
     id,
     channelId: opts.channelId,
@@ -482,11 +449,7 @@ export function scheduleTask(opts: {
 
 /** Remove a task by id (pending or claimed). True when something was removed. */
 export function cancelTask(id: string, home = defaultHome()): boolean {
-  const tasks = loadTasks(home);
-  const next = tasks.filter((t) => t.id !== id);
-  if (next.length === tasks.length) return false;
-  saveTasks(next, home);
-  return true;
+  return taskStore.removeById(id, home);
 }
 
 /**
@@ -501,7 +464,7 @@ export function rescheduleTask(
   channelId: string,
   home = defaultHome(),
 ): { task?: ScheduledTask; error?: string } {
-  const tasks = loadTasks(home);
+  const tasks = taskStore.load(home);
   const t = tasks.find((x) => x.id === id && x.channelId === channelId);
   if (!t) return { error: `no task with id ${id}` };
   if (t.status === "claimed")
@@ -520,7 +483,7 @@ export function rescheduleTask(
   if (spec.kind === "at" && spec.atMs !== undefined) updated.atMs = spec.atMs;
   if (spec.kind === "cron" && spec.cron) updated.cron = spec.cron;
   if (spec.kind === "cron" && spec.tz) updated.tz = spec.tz;
-  saveTasks(
+  taskStore.save(
     tasks.map((x) => (x.id === id ? updated : x)),
     home,
   );
@@ -533,14 +496,7 @@ export function markTaskClaimed(
   now = Date.now(),
   home = defaultHome(),
 ): void {
-  const tasks = loadTasks(home);
-  let changed = false;
-  const next = tasks.map((t) => {
-    if (t.id !== id) return t;
-    changed = true;
-    return { ...t, status: "claimed" as const, claimedAt: now };
-  });
-  if (changed) saveTasks(next, home);
+  taskStore.claim(id, now, home);
 }
 
 /**
@@ -556,10 +512,10 @@ export function completeTask(
   now = Date.now(),
   home = defaultHome(),
 ): boolean {
-  const tasks = loadTasks(home);
+  const tasks = taskStore.load(home);
   const t = tasks.find((x) => x.id === id);
   if (!t) return false;
-  if (t.kind === "at") return cancelTask(id, home);
+  if (t.kind === "at") return taskStore.removeById(id, home);
   const next =
     nextCronFire(t.cron!, now, t.tz) ?? now + CRON_CAP_MINUTES * 60000;
   const nextTasks = tasks.map((x) =>
@@ -573,7 +529,7 @@ export function completeTask(
         }
       : x,
   );
-  saveTasks(nextTasks, home);
+  taskStore.save(nextTasks, home);
   return true;
 }
 
@@ -587,11 +543,7 @@ export function dueTasks(
   now = Date.now(),
   home = defaultHome(),
 ): ScheduledTask[] {
-  return loadTasks(home).filter((t) => {
-    if (t.channelId !== channelId) return false;
-    if (t.status === "pending") return t.nextFireAt <= now;
-    return now - (t.claimedAt ?? t.nextFireAt) > CLAIM_TTL_MS;
-  });
+  return taskStore.due(channelId, now, home);
 }
 
 // ─── Rendering ─────────────────────────────────────────────────────────────
