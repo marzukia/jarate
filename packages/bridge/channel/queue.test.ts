@@ -22,7 +22,6 @@ import extension, {
   setHeld,
   setInterruptCtx,
   setRuntimeStateDir,
-  setSystemdRestartHookForTest,
   verboseOverride,
 } from "./index";
 import { stopAllOpTicks } from "./live";
@@ -36,6 +35,7 @@ import {
   queueMidTurnInbound,
   updateQueuedInbound,
 } from "./queue";
+import { setSystemdRestartHookForTest } from "./restart-ops";
 import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
 import type { ChannelMessage } from "./types";
 

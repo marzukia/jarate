@@ -34,13 +34,10 @@ import { fmtTokensLC, styleGuard } from "./format";
 import { resolveHandoffSettings } from "./handover";
 import {
   agentBusy,
-  archiveStaleSessions,
   beginCompacting,
-  beginRestartOp,
   buildChannelContext,
   clearCompacting,
   clearInterrupts,
-  clearOpMarker,
   compactingChannels,
   getPendingCompact,
   handleInbound,
@@ -49,18 +46,12 @@ import {
   isCompacting,
   isHeld,
   lastRunUsage,
-  moveSessionFileAside,
   onDeleteStatusBlock,
   opBusyRefusal,
   opWindowLabel,
-  parseUndoCount,
   parseVerboseLevel,
   pendingInterrupts,
   persistChannelRuntimeState,
-  runRedo,
-  runUndo,
-  safeSessionFile,
-  scheduleOpShutdown,
   sendToPi,
   sessionStartTs,
   setHeld,
@@ -82,6 +73,17 @@ import {
   midTurnQueues,
   popChannelQueuedInbound,
 } from "./queue";
+import {
+  archiveStaleSessions,
+  beginRestartOp,
+  clearOpMarker,
+  moveSessionFileAside,
+  parseUndoCount,
+  runRedo,
+  runUndo,
+  safeSessionFile,
+  scheduleOpShutdown,
+} from "./restart-ops";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import { cancelWake, formatDurationMs, loadWakes } from "./sleep";
 import {
