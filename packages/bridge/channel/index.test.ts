@@ -10134,17 +10134,20 @@ describe("wave 2c bridge commands", () => {
     expect(last!.startsWith("```")).toBe(false);
   });
 
-  test("/jobs kill + tail: owner-only wrappers around pi-bg-kill/-tail (#44)", async () => {
+  test("/jobs kill + tail: owner-only wrappers around jarate-bg-kill/-tail (#44)", async () => {
     const home = path.join(tmp, "home");
     const scripts = path.join(home, "scripts");
     fs.mkdirSync(scripts, { recursive: true });
-    fs.writeFileSync(path.join(scripts, "pi-bg-kill"), "#!/bin/sh\nexit 0\n");
     fs.writeFileSync(
-      path.join(scripts, "pi-bg-tail"),
+      path.join(scripts, "jarate-bg-kill"),
+      "#!/bin/sh\nexit 0\n",
+    );
+    fs.writeFileSync(
+      path.join(scripts, "jarate-bg-tail"),
       "#!/bin/sh\necho 'line one'\necho 'line two'\n",
     );
-    fs.chmodSync(path.join(scripts, "pi-bg-kill"), 0o755);
-    fs.chmodSync(path.join(scripts, "pi-bg-tail"), 0o755);
+    fs.chmodSync(path.join(scripts, "jarate-bg-kill"), 0o755);
+    fs.chmodSync(path.join(scripts, "jarate-bg-tail"), 0o755);
     const oldHome = process.env.HOME;
     process.env.HOME = home;
     try {

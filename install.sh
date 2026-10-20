@@ -19,6 +19,8 @@
 #        {~/.local/bin,~/scripts}/pi-bg-tail     -> <jarate>/dispatch/pi-bg-tail (shim)
 #        {~/.local/bin,~/scripts}/pi-bg-kill     -> <jarate>/dispatch/pi-bg-kill (shim)
 #        {~/.local/bin,~/scripts}/pi-bg-watchdog -> <jarate>/dispatch/pi-bg-watchdog (shim)
+#        {~/.local/bin,~/scripts}/pi-postcheck.sh -> <jarate>/dispatch/pi-postcheck.sh
+#        {~/.local/bin,~/scripts}/pi-restart     -> <jarate>/dispatch/pi-restart
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
@@ -155,12 +157,14 @@ fi
 
 # --- 3. pointer links --------------------------------------------------------
 # Dispatch family (issue #150 + #151): 5 jarate-* entrypoints + 5 pi-*
-# deprecation shims + pi-postcheck.sh (polish sweep C1), linked into BOTH
+# deprecation shims + pi-postcheck.sh (polish sweep C1) + pi-restart
+# (issue #260), linked into BOTH
 # ~/.local/bin and ~/scripts. install.sh OWNS these names: stale entries
 # (pi-dispatch-era files, symlinks to old checkouts) are re-pointed, one
 # auditable line per change.
 for tool in jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog \
-            pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh; do
+            pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh \
+            pi-restart; do
   link_owned "$HOME/.local/bin/$tool" "$JARATE_DIR/dispatch/$tool"
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
@@ -177,7 +181,7 @@ link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 # never dispatch a job. Hard fail outside dry-run.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh"
+FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-bg pi-wait pi-bg-tail pi-bg-kill pi-bg-watchdog pi-postcheck.sh pi-restart"
 for tool in $FAMILY_TOOLS jarate jarate-diff; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
@@ -196,7 +200,8 @@ for tool in $FAMILY_TOOLS jarate jarate-diff; do
     # loudly instead of at dispatch time.
     case "$tool" in
       jarate-bg|jarate-wait|jarate-bg-tail|jarate-bg-kill|jarate-bg-watchdog|\
-      pi-bg|pi-wait|pi-bg-tail|pi-bg-kill|pi-bg-watchdog|pi-postcheck.sh) ;;
+      pi-bg|pi-wait|pi-bg-tail|pi-bg-kill|pi-bg-watchdog|pi-postcheck.sh|\
+      pi-restart) ;;
       *) continue ;;
     esac
     sum_installed="$(sha256sum "$resolved" 2>/dev/null | cut -d' ' -f1 || true)"

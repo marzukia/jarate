@@ -955,7 +955,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   const ID = "20260914-091714-3097";
 
   test("bad id -> usage line, script never spawned", async () => {
-    stub("pi-bg-kill", "#!/bin/sh\necho should-not-run\n");
+    stub("jarate-bg-kill", "#!/bin/sh\necho should-not-run\n");
     expect(await jobsKill("nope", env, scriptsDir)).toContain(
       "[!] usage: /jobs kill <id>",
     );
@@ -965,7 +965,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   });
 
   test("kill: script exit 0 -> [ok] killed <id>, fenced", async () => {
-    stub("pi-bg-kill", "#!/bin/sh\nexit 0\n");
+    stub("jarate-bg-kill", "#!/bin/sh\nexit 0\n");
     const r = await jobsKill(ID, env, scriptsDir);
     expect(r).toContain(`[ok] killed ${ID}`);
     expect(r.startsWith("```")).toBe(true);
@@ -973,23 +973,23 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
 
   test("kill: script exit 2 (unknown ticket) -> [!] with the script's reason", async () => {
     stub(
-      "pi-bg-kill",
-      "#!/bin/sh\necho \"pi-bg-kill: no cgroup for ticket 'X'\" >&2\nexit 2\n",
+      "jarate-bg-kill",
+      "#!/bin/sh\necho \"jarate-bg-kill: no cgroup for ticket 'X'\" >&2\nexit 2\n",
     );
     const r = await jobsKill("20260910-120000-999", env, scriptsDir);
-    expect(r).toContain("[!] pi-bg-kill: no cgroup");
+    expect(r).toContain("[!] jarate-bg-kill: no cgroup");
   });
 
   test("kill: missing script -> not-found line, no throw", async () => {
     const r = await jobsKill(ID, env, scriptsDir);
-    expect(r).toContain("pi-bg-kill not found at");
+    expect(r).toContain("jarate-bg-kill not found at");
     expect(r).toContain(scriptsDir);
   });
 
   test("tail: output is fenced, capped to the last 40 lines, dropped count noted", async () => {
     let body = "#!/bin/sh\n";
     for (let i = 1; i <= 100; i++) body += `echo "line ${i}"\n`;
-    stub("pi-bg-tail", body);
+    stub("jarate-bg-tail", body);
     const r = await jobsTail(ID, 100, env, scriptsDir);
     const inner = r.slice(4, -4).split("\n");
     expect(inner[0]).toBe("[..] 60 earlier lines");
@@ -1000,7 +1000,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
 
   test("tail: overlong lines ship raw - no 40-col hard wrap (2026-10-18)", async () => {
     const long = "x".repeat(120);
-    stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
+    stub("jarate-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
     const r = await jobsTail(ID, 40, env, scriptsDir);
     const lines = r.split("\n");
     // fence + the long line verbatim + "ok" + fence
@@ -1008,14 +1008,14 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   });
 
   test("tail: --n is clamped to [1, 200] and passed to the script", async () => {
-    stub("pi-bg-tail", '#!/bin/sh\necho "n=$2"\n');
+    stub("jarate-bg-tail", '#!/bin/sh\necho "n=$2"\n');
     expect(await jobsTail(ID, 500, env, scriptsDir)).toContain("n=200");
     expect(await jobsTail(ID, 12, env, scriptsDir)).toContain("n=12");
     expect(await jobsTail(ID, 0, env, scriptsDir)).toContain("n=40");
   });
 
   test("tail: empty output -> [!] no output", async () => {
-    stub("pi-bg-tail", "#!/bin/sh\nexit 0\n");
+    stub("jarate-bg-tail", "#!/bin/sh\nexit 0\n");
     const r = await jobsTail(ID, 40, env, scriptsDir);
     expect(r).toContain(`[!] no output for ${ID}`);
   });

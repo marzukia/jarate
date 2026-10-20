@@ -13,8 +13,10 @@
 #    verbatim (no frame, no width budget - they are the actionable part).
 # Portable across agent boxes: channel id + bot token come from the LOCAL
 # ~/.pi/agent/settings.json default channel; all paths are $HOME-relative.
-# Canonical home: dispatch/pi-postcheck.sh (install.sh links it into
-# ~/scripts; pi-restart invokes $HOME/scripts/pi-postcheck.sh).
+# Canonical home: dispatch/pi-postcheck.sh (install.sh links it into both
+# ~/.local/bin and ~/scripts; pi-restart invokes
+# $HOME/scripts/pi-postcheck.sh). pi-restart itself is tracked at
+# dispatch/pi-restart (issue #260) and linked the same way.
 set -u
 F='```'
 SETTINGS="$HOME/.pi/agent/settings.json"
