@@ -60,10 +60,7 @@ function fixture() {
   delete env.PI_BG_WT_DIR;
   delete env.PI_BG_SIGNAL_WAIT;
 
-  const run = async (
-    args: string[],
-    stdin?: string,
-  ): Promise<RunResult> => {
+  const run = async (args: string[], stdin?: string): Promise<RunResult> => {
     const p = spawn(["bash", PI_BG, ...args], {
       env,
       cwd: tmp,
@@ -108,7 +105,9 @@ describe("launch path retired (hall-monitor #35): stub contract", () => {
     // the fleet endpoint (dispatchers read it with `head -1 log`)
     expect(r.out.trim().split("\n")[0]).toBe(RETIRE_LINE);
     // the full notice rides stderr (the nohup 2>&1 log carries both)
-    expect(r.err).toContain("POST http://100.95.144.25:8001/api/fleet/dispatch");
+    expect(r.err).toContain(
+      "POST http://100.95.144.25:8001/api/fleet/dispatch",
+    );
     expect(r.err).toContain("/srv/fleetwork/work/<ticket>");
     expect(r.err).toContain("/srv/fleetwork/<repo>.git");
     expect(r.err).toContain("[bg: fleetwork]");
@@ -136,7 +135,9 @@ describe("launch path retired (hall-monitor #35): stub contract", () => {
     const r = await fx.run(["--help"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("RETIRED");
-    expect(r.out).toContain("POST http://100.95.144.25:8001/api/fleet/dispatch");
+    expect(r.out).toContain(
+      "POST http://100.95.144.25:8001/api/fleet/dispatch",
+    );
     expect(r.out).toContain("jarate-bg signal");
   });
 
@@ -154,12 +155,15 @@ describe("launch path retired (hall-monitor #35): stub contract", () => {
 describe("pi-bg shim: retirement passthrough", () => {
   test("pi-bg execs the stub: deprecation line + rc 10 + stdout identity", async () => {
     const fx = fixture();
-    const p = spawn(["bash", path.join(import.meta.dir, "pi-bg"), "worker", "t"], {
-      env: fx.env,
-      cwd: fx.tmp,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const p = spawn(
+      ["bash", path.join(import.meta.dir, "pi-bg"), "worker", "t"],
+      {
+        env: fx.env,
+        cwd: fx.tmp,
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     const [out, err] = await Promise.all([
       new Response(p.stdout).text(),
       new Response(p.stderr).text(),

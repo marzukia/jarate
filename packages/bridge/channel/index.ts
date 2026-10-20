@@ -68,6 +68,7 @@ import {
   suppressAutoReact,
   unreactMessage,
 } from "./discord";
+import { isFleetRun } from "./fleet-run";
 import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
@@ -96,6 +97,7 @@ import {
   rewakeUpdatePendingMsg,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
+import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
@@ -203,23 +205,6 @@ export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
   2: "all",
 };
 export const verboseOverride = new Map<string, VerboseLevel>();
-
-/**
- * Fleet dispatch run (hall-monitor fleetwork, 2026-10-20): the run
- * wrapper pins PI_SESSION_ID=fleetwork-<ticket> (pi sets its own UUID
- * for interactive sessions; the wrapper export is the discriminator) and
- * runs pi with CWD /srv/fleetwork/work/<ticket>. The channel extension
- * is the agent-interactive bg runtime — a dispatch run must not connect
- * the channel, drain/scan the re-wake queue, or register channel tools.
- * Run events flow through the fleetwork wrapper ([bg: fleetwork]
- * <ticket> lines), not this bridge. (Pilot 2026-10-20: dispatch runs
- * 3/5/6 each posted an "unplanned restart" wake card to the agent's own
- * channel on start, re-waking the interactive agent with a ticket event
- * about a different process.)
- */
-export function isFleetRun(): boolean {
-  return (process.env.PI_SESSION_ID ?? "").startsWith("fleetwork-");
-}
 
 // #13: per-session context-boundary trackers, keyed by session file path.
 // #40: the last completed run's usage (tokens + est. cost), for
@@ -2599,11 +2584,13 @@ export default function (pi: ExtensionAPI) {
 
     // Fleet-run gate (hall-monitor #35 gut, 2026-10-20): a fleetwork
     // dispatch run skips ALL channel startup activity — connect, #180
-    // re-wake drain + history scan, tool registration, sched pollers.
-    // The channel is the interactive agent's runtime; the run's own
-    // events go through the fleetwork wrapper. (The removed restart
-    // wake + its startup recovery kick were the two paths the pilot
-    // runs took onto the agent's channel.)
+    // re-wake drain + history scan, the post-restart wake + its startup
+    // recovery kick, tool registration, sched pollers. The channel is
+    // the interactive agent's runtime; the run's own events go through
+    // the fleetwork wrapper. (Pilot 2026-10-20: dispatch runs 3/5/6
+    // each posted an "unplanned restart" wake card onto the agent's
+    // channel on start, re-waking it with a ticket event about a
+    // different process.)
     if (isFleetRun()) {
       console.log(
         "[channel] fleet dispatch run - channel startup gated (no connect, no scans, no tools)",
@@ -2738,6 +2725,60 @@ export default function (pi: ExtensionAPI) {
           sanitizeUnknownValue(e),
         );
       }
+    }
+
+    // Post-restart wake (issue #111, P0): on a real process start
+    // (reason "startup"), post ONE "back online" message — planned /
+    // unplanned restart class + the in-flight pi-bg summary — to the
+    // default channel. Fire-and-forget: never blocks or fails startup;
+    // no channel/token/webhook = silent no-op; two startups racing
+    // within 60s post once.
+    {
+      const wakeCh =
+        defaultCh ?? enabled.find((c) => c.type === "discord") ?? null;
+      // event?.reason: the test harness fires session_start(null, ctx);
+      // real pi always passes the event (reason "startup" on process start)
+      void runRestartWake({
+        reason: event?.reason,
+        stateDir: rewakeStateDir,
+        target:
+          wakeCh && (wakeCh.botToken || wakeCh.webhookUrl)
+            ? {
+                channelId: getDiscordChannelId(wakeCh.id) ?? wakeCh.channel,
+                botToken: wakeCh.botToken,
+                webhookUrl: wakeCh.webhookUrl,
+              }
+            : null,
+      })
+        .then((r) => {
+          if (r.posted) {
+            console.log(
+              `[wake] posted restart wake (${r.restartClass}) to ${wakeCh?.id}`,
+            );
+            return;
+          }
+          if (r.reason === "dedup") return; // a racing start owns the post
+          // #180: the wake post never lands — the wake inbound is what
+          // starts the run whose agent_end re-wakes the survived queue.
+          // Kick the oldest entry directly (the bridge is idle at
+          // startup; if a run is live, its agent_end owns the queue and
+          // the pop is left to it — no double delivery).
+          const queued = ctx.isIdle() ? popOldestQueuedInbound() : null;
+          if (queued) {
+            console.log(
+              `[channel] wake post failed: delivering queued inbound directly (${queued.channelId})`,
+            );
+            handleInbound(pi, queued.msg, ctx, true).catch((e) =>
+              console.error(
+                "[channel] wake-fail direct delivery failed:",
+                sanitizeUnknownValue(e),
+              ),
+            );
+          }
+        })
+        .catch((e) =>
+          console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
+        );
     }
 
     // #180 (option 1): bounded startup history scan — ONE fetch per
@@ -2903,6 +2944,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    // Clean-stop marker (issue #111): the next process start classifies
+    // this stop as PLANNED; a crash that never runs this hook leaves no
+    // marker, so the wake says unplanned. In-process /new and /reload
+    // also fire this — harmless, the marker is only consumed on a real
+    // process start.
+    writeCleanStop(path.join(workspaceRoot, ".tmp"));
     if (typingTimer) {
       clearInterval(typingTimer);
       typingTimer = null;

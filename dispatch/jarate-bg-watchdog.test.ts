@@ -1095,9 +1095,9 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
       expect(rec4.state).toBe("running");
       expect(rec4.deadRetry.state).toBe("held");
       // the stub never writes a retry record: only the original exists
-      expect(
-        fs.readdirSync(path.join(f.home, ".pi-dispatch", "runs")),
-      ).toEqual([`pi-bg-${t}.json`]);
+      expect(fs.readdirSync(path.join(f.home, ".pi-dispatch", "runs"))).toEqual(
+        [`pi-bg-${t}.json`],
+      );
     } finally {
       f.close();
     }

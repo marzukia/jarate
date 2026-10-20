@@ -11,6 +11,7 @@ import {
   seedChannelStateForTest,
   setChannelCursor,
 } from "./discord";
+import { isFleetRun } from "./fleet-run";
 import { fmtTokensLC, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import { ORCHESTRATOR_PRIME_LINE, writeHandover } from "./handover";
@@ -41,7 +42,6 @@ import extension, {
   isBgInbound,
   isCompacting,
   isEssentialToolCall,
-  isFleetRun,
   isHeld,
   isNoReply,
   isOwnerUser,
