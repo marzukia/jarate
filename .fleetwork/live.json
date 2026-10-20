@@ -1,1 +1,0 @@
-{"tokens": {"input": 402723, "output": 84287, "cache_read": 15611648, "cache_write": 0, "reasoning": 58613, "total": 16098658}, "turns": 127, "cost": 0.0, "wall": 2380, "updated_at": "2026-10-20T08:05:00Z", "session_file": "/home/monky/.pi/agent/sessions/--srv-fleetwork-work-7--/2026-10-20T07-25-20-054Z_fleetwork-7.jsonl", "parse_error": null}
