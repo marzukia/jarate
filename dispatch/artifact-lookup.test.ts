@@ -114,7 +114,8 @@ function wdFixture(n: number) {
       fs.rmSync(legacy(suf), { force: true });
     }
   };
-  const run = (args: string[] = ["--dry-run"]) => runScript(WD, args, env, tmp);
+  const run = (args: string[] = ["--dry-run"]) =>
+    runScript(WD, args, env, tmp);
   return { tmp, art, legacy, rmLegacy, run };
 }
 
