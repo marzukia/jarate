@@ -61,14 +61,18 @@ inbound ack). See AGENTS.md § Style + `docs/STYLE.md` §3.1. (operator,
 ## Review gate
 
 **Every PR requires an adversarial reviewer agent verdict
-(`VERDICT: PASS`) before merge.** Dispatch:
+(`VERDICT: PASS`) before merge.** Review runs dispatch to the fleet
+(jarate-bg is RETIRED - hall-monitor #35, 2026-10-20):
 
 ```bash
-nohup ~/scripts/jarate-bg reviewer "Adversarial review of PR <#> / branch <name>
-in <repo>. Read the diff vs main. Check: behavior changes, test coverage,
-install.sh idempotency, live-box safety (no settings.json/piscord checkout
-edits, no pi restarts). End with VERDICT: PASS or VERDICT: FAIL and ranked
-findings." > review.log 2>&1 &
+curl -s -X POST http://100.95.144.25:8001/api/fleet/dispatch \
+  -H "X-Agent-Key: $(tail -1 ~/.config/hall-monitor/agent-key)" \
+  -H 'Content-Type: application/json' -d '{"agent": "<you>", "host": "hydrogen",
+    "repo": "<repo>", "base_ref": "main", "project": "<repo>",
+    "profile": {"model": "hydrogen/qwen3.8-27b"},
+    "limits": {"wall_timeout": 3600},
+    "brief": "Adversarial review of PR <#> / branch <name> in <repo>. Read the diff vs main. Check: behavior changes, test coverage, install.sh idempotency, live-box safety (no settings.json/piscord checkout edits, no pi restarts). End with VERDICT: PASS or VERDICT: FAIL and ranked findings."}'
+```
 ```
 
 - Reviewer findings are actionable: one fix round by a worker, then re-review

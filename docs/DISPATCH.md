@@ -1,12 +1,19 @@
 # Dispatch (orchestration pattern)
 
+> **Retirement note (hall-monitor #35, 2026-10-20):** `jarate-bg`'s launch
+> path is RETIRED (stub, rc 10). New dispatches go to hall-monitor
+> fleetwork (`POST http://100.95.144.25:8001/api/fleet/dispatch`); in-flight
+> tickets dispatched before retirement keep running under the old topology,
+> and the watchdog/tail/kill completion side stays alive until they drain.
+> See `dispatch/jarate-bg` for the full notice.
+
 The main agent (monky) is the **orchestrator**. It keeps its own context (KV)
 lean by handing self-contained work to `worker` agents and verification to
 `reviewer` agents. Everything returns through the Discord webhook bus.
 
 Components (all in this repo):
 
-- `dispatch/jarate-bg` — dispatch a one-shot pi run on a role profile
+- `dispatch/jarate-bg` — dispatch a one-shot pi run on a role profile (**RETIRED 2026-10-20, hall-monitor #35 — stub, see banner**)
 - `dispatch/jarate-wait` — in-turn wait for the callback / a human message
 - `dispatch/jarate-bg-tail` — read a run's live output (`jarate-bg-tail <id> [lines] [-f]`)
 - `dispatch/jarate-bg-kill` — cancel a run via its cgroup (`jarate-bg-kill <id> [--dry-run]`)

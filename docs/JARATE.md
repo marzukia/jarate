@@ -230,8 +230,9 @@ unreadable/missing (nothing is written then). Manifest write is atomic
   `jarate {cmd, args}` — the entrypoint is the single source of truth for
   the JSON shape; the tool spawns `$HOME/bin/jarate` (30s cap, process-group
   kill, 20k output cap) and returns the doc as text.
-- **jarate-bg workers**: no extensions — they run the same entrypoint via plain
-  bash (`~/scripts/jarate`).
+- **jarate-bg workers** (launch path RETIRED 2026-10-20, hall-monitor #35 -
+  fleet is the dispatch): no extensions — they run the same entrypoint via
+  plain bash (`~/scripts/jarate`).
 - **jarate-bg-watchdog**: runs `agents-check` every sweep (15 min) as the
   AGENTS.md drift tripwire; see DISPATCH.md.
 - **Deploy**: `install.sh` symlinks `~/bin/jarate` and `~/scripts/jarate`
