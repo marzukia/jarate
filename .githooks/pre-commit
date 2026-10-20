@@ -7,6 +7,14 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
 STAGED="$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(ts|tsx|js|jsx|mts|cts|mjs|cjs|json)$' || true)"
+
+# Size gate (harden-repo, 2026-10-20): line ratchet on the working tree,
+# every commit (before the early exit: bloat in the tree must be caught even
+# on code-file-less commits). --base HEAD makes the export gate a no-op at
+# commit time (diff HEAD...HEAD is empty); CI runs the full gate against the
+# PR base ref.
+bun run size -- --base HEAD || { echo "size gate failed"; exit 1; }
+
 if [ -z "$STAGED" ]; then
   exit 0
 fi
