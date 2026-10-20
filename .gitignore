@@ -10,3 +10,4 @@ dist/
 *.local
 .deploy-state
 .tmp/
+.fleetwork/
