@@ -579,19 +579,15 @@ export async function pollDiscord(configId: string): Promise<void> {
 }
 
 /**
- * pi-bg dispatch callbacks post to the channel via webhook: author.bot is
- * true and webhook_id is set, with content prefixed "[bg:". Exempt those
- * from the other-bot filter — they are the dispatch wake mechanism.
+ * Bot messages posted via webhook are the machine-wake lane
+ * (hall-monitor cards, pi-bg dispatch callbacks, restart-wake):
+ * author.bot is true and webhook_id is set. ANY webhook_id exempts
+ * them from the other-bot filter - no keyword/tag filter (Andryo
+ * 2026-10-20: react to any webhook, the [bg: prefix was pointless).
  * Exported for tests.
  */
 export function isBgWebhook(raw: any): boolean {
-  if (raw?.webhook_id == null) return false;
-  if (typeof raw?.content === "string" && raw.content.startsWith("[bg:"))
-    return true;
-  // Embed-only callbacks (pi-bg Variant D): no top-level content —
-  // identify by the embed author name the pi-bg webhook builder sets.
-  const authorName = raw?.embeds?.[0]?.author?.name;
-  return typeof authorName === "string" && authorName.startsWith("pi-bg");
+  return raw?.webhook_id != null;
 }
 
 // ─── Shared inbound delivery (poll + gateway) ───────────────────────────
@@ -668,8 +664,8 @@ export function deliverInboundMessage(state: DiscordState, raw: any): boolean {
 
   const { config, callbacks } = state;
   if (state.botUserId && raw.author?.id === state.botUserId) return false; // skip self
-  // Skip other bots unless exempt: [bg: webhook wakes (the dispatch
-  // wake mechanism — see isBgWebhook).
+  // Skip other bots unless exempt: any webhook-posted message (the
+  // machine-wake lane — see isBgWebhook).
   if (raw.author?.bot && !isBgWebhook(raw)) return false;
 
   const channelMsg = buildChannelMessageFromRaw(config, raw);

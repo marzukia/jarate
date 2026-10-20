@@ -142,9 +142,10 @@ export function elapsedStr(sec: number): string {
   return `${Math.floor(sec / 86400)}d`;
 }
 
-/** The `[bg:` tag constant. The tag is what isBgWebhook exempts
- *  (discord.ts) — without it the other-bot filter swallows the webhook
- *  copy and the wake never lands as a turn. */
+/** The `[bg:` tag constant. The tag is prose separation for the wake
+ *  card, NOT the wake predicate — isBgWebhook (discord.ts) exempts ANY
+ *  webhook-posted message (Andryo 2026-10-20); without a webhook_id the
+ *  other-bot filter swallows the message and the wake never lands. */
 export const WAKE_TAG = "[bg: restart-wake]";
 
 /** Discord embed field for the wake card. */
@@ -374,9 +375,9 @@ export interface PostOpts {
 /** Bounded post of the wake payload, pi-bg bg_post pattern: up to
  *  `attempts` tries per route, hard timeout per try, backoff
  *  i*backoffMs between tries, 2xx = success. WEBHOOK FIRST (the
- *  [bg:-tagged bus post is the wake: isBgWebhook exempts it from the
- *  other-bot filter, so it lands as a turn), bot API second for configs
- *  without a webhook. Neither configured = silent no-op. Never throws —
+ *  webhook post IS the wake: isBgWebhook exempts any webhook-posted
+ *  message from the other-bot filter, so it lands as a turn), bot API
+ *  second for configs without a webhook. Neither configured = silent no-op. Never throws —
  *  a dead network must not take startup down. */
 export async function postWakePayload(
   target: WakeTarget,
