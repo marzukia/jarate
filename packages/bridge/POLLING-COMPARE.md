@@ -29,7 +29,7 @@ poller kept as a backfill safety net (60s interval while the gateway is up, 5s w
   no-op — own messages get ingested until identity resolves (retried each poll, `:529-534`).
 - **Retry**: `discordFetch` retries up to 3 attempts, honoring 429 `retry_after`
   (`discord.ts:72-110`). On poll error: exponential backoff pause
-  `5s * 2^n` capped at **60s** via `pollPauseUntil` (`discord.ts:564-568`). A
+  `5s * 2^n` capped at **60s** via `pollPauseUntil` (`discord.ts:565-570`). A
   `state.polling` flag skips timer ticks while a poll is in flight (`discord.ts:524`),
   so a slow poll adds its full in-flight time to backfill latency.
 - **Per-poll latency bound**: 0–60s (interval) + poll in-flight time (0–~4.5s with 429
@@ -77,7 +77,7 @@ poller kept as a backfill safety net (60s interval while the gateway is up, 5s w
    **Done (cursor persistence, `.tmp/channel-state.json`)**: the cursor survives
    restarts and the first poll backfills the downtime window.
 4. **Latency spikes during errors** — poll backoff pauses ingestion for up to 60s
-   (`discord.ts:564-568`), and in-flight polls skip timer ticks entirely
+   (`discord.ts:565-570`), and in-flight polls skip timer ticks entirely
    (`discord.ts:524`). A 429 during a burst delays *all* queued messages.
    **Mitigated 2026-09-08**: the backoff now only delays the 60s backfill, not the
    gateway's live lane.

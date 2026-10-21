@@ -270,9 +270,15 @@ On completion, `jarate-bg` posts to the Discord webhook:
   `webdrop` is available (7d TTL).
 - **Status values:** `OK` (rc=0), `FAIL (rc=N)` (incl. a second degenerate
   completion, reported with the signature), `EMPTY` (all attempts
-  whitespace, or a second think-trunc with the maxTokens signature). For
-  reviewers, a trailing `VERDICT: PASS|FAIL` in the output
-  (last 300 chars) is the real signal and drives the green/red title.
+  whitespace, or a second think-trunc with the maxTokens signature),
+  `DIED` (no report - launch-fail, OOM, or kill before a completion
+  callback; the wrapper or the watchdog posts the DIED card). For
+  reviewers, a `VERDICT: PASS|FAIL` line in the output (any position) is
+  the real signal and drives the green/red title: the gate scans the
+  WHOLE output, case-insensitive and markdown/spacing-tolerant (last
+  match wins), with fallbacks to a bare trailing `PASS`/`FAIL` line and a
+  bold `**PASS**`/`**FAIL**` token. The old gate (last-300-chars, case-
+  sensitive grep) false-FAILed ~25% of clean PASS reviews.
   A second silent death (issue #57, retry1 did not recover) is reported as
   a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
   treats it like any other FAIL (one fix round, then a decision).
