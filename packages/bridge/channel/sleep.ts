@@ -26,9 +26,14 @@
  * write can double-wake (accepted, bounded by TTL), a lost scheduleWake
  * write can drop a scheduled wake (known gap, outside at-least-once).
  */
-import * as fs from "node:fs";
 import * as path from "node:path";
 
+import {
+  createDurableStore,
+  generateStoreId,
+  parseFutureIsoParam,
+  parseMinutesParam,
+} from "./durable-store";
 import { defaultHome } from "./todos";
 
 export interface SleepWake {
@@ -55,8 +60,8 @@ export interface WakeAtResult {
 }
 
 /** A claimed wake is re-delivered after this long (crash between claim and
- *  injection). */
-export const CLAIM_TTL_MS = 10 * 60 * 1000;
+ *  injection). Shared with the task tool — defined in durable-store.ts. */
+export { CLAIM_TTL_MS } from "./durable-store";
 /** Max sleep length: 30 days. */
 export const MAX_WAKE_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -70,50 +75,43 @@ export function wakesPath(home = defaultHome()): string {
 
 // ─── State file ────────────────────────────────────────────────────────────
 
+/** Per-entry validation for loadWakes; null drops the entry. */
+function validateWake(raw: unknown): SleepWake | null {
+  const w = raw as any;
+  if (typeof w?.id !== "string" || !w.id) return null;
+  if (typeof w?.channelId !== "string" || !w.channelId) return null;
+  if (typeof w?.wakeAt !== "number" || !Number.isFinite(w.wakeAt)) return null;
+  const wake: SleepWake = {
+    id: w.id,
+    channelId: w.channelId,
+    wakeAt: w.wakeAt,
+    createdAt: typeof w.createdAt === "number" ? w.createdAt : w.wakeAt,
+    status: w.status === "claimed" ? "claimed" : "pending",
+  };
+  if (typeof w.channelName === "string" && w.channelName)
+    wake.channelName = w.channelName;
+  if (typeof w.note === "string" && w.note) wake.note = w.note;
+  if (w.status === "claimed" && typeof w.claimedAt === "number")
+    wake.claimedAt = w.claimedAt;
+  return wake;
+}
+
+const wakeStore = createDurableStore<SleepWake>({
+  dir: sleepsDir,
+  file: wakesPath,
+  wrapperKey: "wakes",
+  validate: validateWake,
+  dueAt: (w) => w.wakeAt,
+});
+
 /** All wakes on disk; missing/corrupt file -> empty list. */
 export function loadWakes(home = defaultHome()): SleepWake[] {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(wakesPath(home), "utf8");
-  } catch {
-    return [];
-  }
-  try {
-    const data = JSON.parse(raw);
-    if (!data || !Array.isArray(data.wakes)) return [];
-    const out: SleepWake[] = [];
-    for (const w of data.wakes) {
-      if (typeof w?.id !== "string" || !w.id) continue;
-      if (typeof w?.channelId !== "string" || !w.channelId) continue;
-      if (typeof w?.wakeAt !== "number" || !Number.isFinite(w.wakeAt)) continue;
-      const wake: SleepWake = {
-        id: w.id,
-        channelId: w.channelId,
-        wakeAt: w.wakeAt,
-        createdAt: typeof w.createdAt === "number" ? w.createdAt : w.wakeAt,
-        status: w.status === "claimed" ? "claimed" : "pending",
-      };
-      if (typeof w.channelName === "string" && w.channelName)
-        wake.channelName = w.channelName;
-      if (typeof w.note === "string" && w.note) wake.note = w.note;
-      if (w.status === "claimed" && typeof w.claimedAt === "number")
-        wake.claimedAt = w.claimedAt;
-      out.push(wake);
-    }
-    return out;
-  } catch {
-    return [];
-  }
+  return wakeStore.load(home);
 }
 
 /** Save all wakes atomically (tmp file in the same dir, rename over). */
 export function saveWakes(wakes: SleepWake[], home = defaultHome()): void {
-  const dir = sleepsDir(home);
-  fs.mkdirSync(dir, { recursive: true });
-  const target = wakesPath(home);
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ wakes }, null, 2));
-  fs.renameSync(tmp, target);
+  wakeStore.save(wakes, home);
 }
 
 // ─── Scheduling ────────────────────────────────────────────────────────────
@@ -138,28 +136,17 @@ export function parseWakeAt(
     return { error: "pass minutes (number) or until (ISO time)" };
 
   if (hasUntil) {
-    const t = Date.parse(String(params.until));
-    if (Number.isNaN(t))
-      return {
-        error: `invalid until: "${params.until}" (ISO time, e.g. 2026-09-10T15:00:00Z)`,
-      };
-    if (t <= now)
-      return { error: `until must be in the future: ${params.until}` };
-    if (t - now > MAX_WAKE_MS)
-      return { error: "until too far out (max 30d from now)" };
-    return { wakeAt: t };
+    const r = parseFutureIsoParam(
+      String(params.until),
+      "until",
+      now,
+      MAX_WAKE_MS,
+    );
+    return r.ms === undefined ? { error: r.error! } : { wakeAt: r.ms };
   }
 
-  const minutes =
-    typeof params.minutes === "number"
-      ? params.minutes
-      : Number(params.minutes);
-  if (!Number.isFinite(minutes))
-    return { error: `minutes must be a number, got "${params.minutes}"` };
-  if (minutes <= 0) return { error: "minutes must be greater than 0" };
-  const ms = minutes * 60 * 1000;
-  if (ms > MAX_WAKE_MS) return { error: `minutes too large (max 43200 = 30d)` };
-  return { wakeAt: now + ms };
+  const r = parseMinutesParam(params.minutes as number | string, MAX_WAKE_MS);
+  return r.ms === undefined ? { error: r.error! } : { wakeAt: now + r.ms };
 }
 
 /** Record a wake for a channel. Returns the stored entry. */
@@ -171,9 +158,9 @@ export function scheduleWake(opts: {
   home?: string;
   now?: number;
 }): SleepWake {
-  const home = opts.home;
+  const home = opts.home ?? defaultHome();
   const now = opts.now ?? Date.now();
-  const id = `${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const id = generateStoreId(now);
   const wake: SleepWake = {
     id,
     channelId: opts.channelId,
@@ -189,11 +176,7 @@ export function scheduleWake(opts: {
 
 /** Remove a wake by id (pending or claimed). True when something was removed. */
 export function cancelWake(id: string, home = defaultHome()): boolean {
-  const wakes = loadWakes(home);
-  const next = wakes.filter((w) => w.id !== id);
-  if (next.length === wakes.length) return false;
-  saveWakes(next, home);
-  return true;
+  return wakeStore.removeById(id, home);
 }
 
 /** Mark a wake claimed (before injection). No-op when the id is gone. */
@@ -202,14 +185,7 @@ export function markClaimed(
   now = Date.now(),
   home = defaultHome(),
 ): void {
-  const wakes = loadWakes(home);
-  let changed = false;
-  const next = wakes.map((w) => {
-    if (w.id !== id) return w;
-    changed = true;
-    return { ...w, status: "claimed" as const, claimedAt: now };
-  });
-  if (changed) saveWakes(next, home);
+  wakeStore.claim(id, now, home);
 }
 
 /**
@@ -220,11 +196,7 @@ export function markClaimed(
  * True when something was removed.
  */
 export function completeWake(id: string, home = defaultHome()): boolean {
-  const wakes = loadWakes(home);
-  const next = wakes.filter((w) => w.id !== id);
-  if (next.length === wakes.length) return false;
-  saveWakes(next, home);
-  return true;
+  return wakeStore.removeById(id, home);
 }
 
 /**
@@ -236,12 +208,12 @@ export function cancelPendingWakes(
   channelId: string,
   home = defaultHome(),
 ): number {
-  const wakes = loadWakes(home);
+  const wakes = wakeStore.load(home);
   const next = wakes.filter(
     (w) => !(w.channelId === channelId && w.status === "pending"),
   );
   const removed = wakes.length - next.length;
-  if (removed > 0) saveWakes(next, home);
+  if (removed > 0) wakeStore.save(next, home);
   return removed;
 }
 
@@ -250,25 +222,7 @@ export function cancelPendingWakes(
  * never throws, called once per process start. Files are wakes.json.*.tmp.
  */
 export function collectOrphanTmpFiles(home = defaultHome()): number {
-  const dir = sleepsDir(home);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return 0; // no dir yet — nothing to collect
-  }
-  const target = path.basename(wakesPath(home));
-  let removed = 0;
-  for (const n of names) {
-    if (!n.startsWith(`${target}.`) || !n.endsWith(".tmp")) continue;
-    try {
-      fs.unlinkSync(path.join(dir, n));
-      removed++;
-    } catch {
-      // best-effort; a locked/dead tmp file can stay, it is harmless
-    }
-  }
-  return removed;
+  return wakeStore.collectOrphans(home);
 }
 
 /**
@@ -281,11 +235,7 @@ export function dueWakes(
   now = Date.now(),
   home = defaultHome(),
 ): SleepWake[] {
-  return loadWakes(home).filter((w) => {
-    if (w.channelId !== channelId) return false;
-    if (w.status === "pending") return w.wakeAt <= now;
-    return now - (w.claimedAt ?? w.wakeAt) > CLAIM_TTL_MS;
-  });
+  return wakeStore.due(channelId, now, home);
 }
 
 // ─── Rendering ─────────────────────────────────────────────────────────────
