@@ -33,10 +33,10 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
    gitignored, machine-local).
 3. **pointer links** — symlinks, never copies:
    - dispatch family (issue #151): each of `jarate-bg`, `jarate-wait`,
-     `jarate-bg-tail`, `jarate-bg-kill`, `jarate-bg-watchdog` and the five
-     `pi-*` deprecation shims is linked into BOTH `~/.local/bin` and
-     `~/scripts` -> `<jarate>/dispatch/<name>`. Post-install verify fails
-     the run (non-dry) if any of the 10 is missing or shadowed by a stale
+     `jarate-bg-tail`, `jarate-bg-kill`, `jarate-bg-watchdog`, the five
+     `pi-*` deprecation shims, and `pi-postcheck.sh` is linked into BOTH
+     `~/.local/bin` and `~/scripts` -> `<jarate>/dispatch/<name>`. Post-install verify fails
+     the run (non-dry) if any of the 11 is missing or shadowed by a stale
      non-symlink in the unit PATH.
    - `~/scripts/jarate` -> `<jarate>/bin/jarate`
    - stale `~/projects/recall` symlink cleanup: a dangling link pointing at

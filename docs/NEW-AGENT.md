@@ -67,7 +67,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
 | `~/.pi/agent/secrets.env` | per-agent extension secrets, chmod 600 (e.g. `TAVILY_API_KEY` for the MCP bridge; keys are referenced from `settings.json` as `${VAR}`) |
 | `~/.pi/agent/settings.json` | see below |
 | `~/.pi/agent/models.json` | see below |
-| `~/.pi/agent/AGENTS.md` | identity + roster + rules (copy an existing one, rewrite identity/roster) |
+| `~/AGENTS.md` | identity + roster + rules (copy an existing one, rewrite identity/roster; pi reads the law from the working directory, and the unit sets `WorkingDirectory=%h`) |
 | `~/.config/systemd/user/pi.service` | see below |
 | `~/.pi/agent-worker/settings.json` | **THE TRAP** - see step 6 |
 | `~/.pi/agent-reviewer/settings.json` | **THE TRAP** - see step 6 |
@@ -141,7 +141,7 @@ Wants=network-online.target
 
 [Service]
 Environment=HOME=/home/<name>
-Environment=PATH=/home/<name>/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/<name>/.local/bin:/home/<name>/bin:/home/<name>/scripts:/usr/local/bin:/usr/bin:/bin
 Environment=NODE_OPTIONS=--heapsnapshot-near-heap-limit=1
 EnvironmentFile=/home/<name>/.hermes/.env
 EnvironmentFile=/home/<name>/.pi/agent/secrets.env
@@ -255,7 +255,7 @@ github-invites, bootstrap-project).
 - Dispatch cap per agent: <operator> sets per agent (e.g. 3 for senior agents, 2 for new ones).
 - Fresh agents get latest bridge commands by pulling main + restarting their
   pi.service (new commands like /tasks, /diff only exist after the merge).
-- /tmp on the agent host is a 32G tmpfs: it wipes on reboot. jarate-bg artifacts now
+- /tmp on the agent host is a 63G tmpfs: it wipes on reboot. jarate-bg artifacts now
   live in ~/.pi-bg-art (PR #35); anything else you park in /tmp is volatile.
 - OOM history: 13 Sep 2026, 11:24-11:49 kernel OOM slide wedged the box
   until a power reset (61 kills). Size new heavy units with memory caps.

@@ -1,5 +1,8 @@
 # Wave 3 queue (2026-09-15, operator GO "all of those")
 
+**Status: wave closed — every Wave A/B row merged or closed (commit refs
+below). This is a work-queue snapshot, not live state.**
+
 11 open issues. Ordering minimizes same-file merge conflicts + puts security first.
 
 ## Wave A

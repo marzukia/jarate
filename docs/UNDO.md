@@ -1,7 +1,7 @@
 # /undo [N] + /redo — design
 
-Commands implemented in `piscord/channel/undo.ts` (store + revert logic),
-hooked into `piscord/channel/index.ts` (lifecycle + command dispatch).
+Commands implemented in `packages/bridge/channel/undo.ts` (store + revert logic),
+hooked into `packages/bridge/channel/index.ts` (lifecycle + command dispatch).
 Owner-only, like `/reset`.
 
 `/undo` reverts the last assistant turn; `/undo N` reverts the last **N**
@@ -27,7 +27,7 @@ So conversation revert = **truncate the JSONL + respawn + re-run**:
 - Walk the active path leaf→root (`parentId` chain) to the **Nth
   trigger** (N default 1): each complete turn = one assistant message
   plus the closest **trigger** root-ward of it (a `role:user` message or
-  the `custom_message` entries piscord queues — channel inbound arrives as
+  the `custom_message` entries the bridge queues — channel inbound arrives as
   the latter, so both must count). Keep the file through that trigger.
   N=1 lands on exactly the original cut point (last assistant's trigger).
   If the path holds fewer than N complete turns — no assistant left, or
@@ -200,7 +200,7 @@ re-derivation.
 
 ## Verification
 
-`piscord/channel/undo.test.ts` + `index.test.ts` F1 bridge
+`packages/bridge/channel/undo.test.ts` + `index.test.ts` F1 bridge
 tests: encPath round-trip; non-git modify+create undo/redo; deletion
 undo; git worktree+staged+commit undo/redo; **binary file undo/redo
 (F2)**; untracked keep/drop; session truncation (incl. in-flight trigger,

@@ -10,68 +10,92 @@ User complaint: "the polling shit is bad and doesn't work good with agents like 
 **Gateway MESSAGE_CREATE ingestion** (since 2026-09-08, `49b7abe`), with the REST
 poller kept as a backfill safety net (60s interval while the gateway is up, 5s while down).
 
-- A `setInterval` fires `pollDiscord()` every **5000 ms** per configured channel
-  (`channel/discord.ts:17` `POLL_INTERVAL_MS = 5_000`, `:206` `setInterval(...)`).
+- A `setInterval` fires `pollDiscord()` per configured channel at a
+  **dynamic** interval: **60000 ms** backfill while the gateway is up,
+  **5000 ms** while it is down (`channel/discord.ts:30-32` `POLL_INTERVAL_MS`/
+  `POLL_BACKFILL_MS`, `:485-495` `currentPollIntervalMs`/`restartPollTimer`).
 - Each poll: `GET /channels/{id}/messages?after={lastMessageId}&limit=10`
-  (`channel/discord.ts:242-243`). Bootstraps with `?limit=1` to seed the cursor
-  (`channel/discord.ts:184-188`).
-- **Dedupe** is the cursor alone: `state.lastMessageId` advances per message inside the
-  result loop (`channel/discord.ts:249-250`). No in-memory seen-set. At-least-once: on
-  fetch error the cursor is not advanced, so the next poll re-reads.
-- **Self-skip**: bot's own user id resolved via `/users/@me` (`discord.ts:158-167`);
-  messages from it are skipped (`discord.ts:251`). If `botUserId` is null the skip is a
-  no-op — own messages get ingested until identity resolves (retried each poll, `:230-234`).
+  (`channel/discord.ts:545-547`). Bootstraps with `?limit=1` to seed the cursor
+  (`:258-262`) — only when no persisted cursor exists: cursors now survive
+  restarts in `.tmp/channel-state.json` (`:255, 391-397`), so a restart resumes
+  exactly where it left off instead of re-reading history.
+- **Dedupe** is the shared per-channel cursor: `deliverInboundMessage` drops
+  anything at or below `state.lastMessageId` (`discord.ts:660-661`) and advances it
+  on delivery (`:662-663`) — one delivery path for both the gateway and the poll
+  lane. No in-memory seen-set. At-least-once: on fetch error the cursor is not
+  advanced, so the next poll re-reads.
+- **Self-skip**: bot's own user id resolved via `/users/@me` (`discord.ts:257`);
+  messages from it are skipped (`discord.ts:666`). If `botUserId` is null the skip is a
+  no-op — own messages get ingested until identity resolves (retried each poll, `:529-534`).
 - **Retry**: `discordFetch` retries up to 3 attempts, honoring 429 `retry_after`
-  (`discord.ts:53-77`). On poll error: exponential backoff pause
-  `5s * 2^n` capped at **60s** via `pollPauseUntil` (`discord.ts:294-296`). A
-  `state.polling` flag skips timer ticks while a poll is in flight (`discord.ts:225-227`),
-  so a slow poll adds its full in-flight time to message latency.
-- **Per-poll latency bound**: 0–5s (interval) + poll in-flight time (0–~4.5s with 429
-  retries) + up to 60s of error backoff. Typical user-visible delay: ~0–5s.
+  (`discord.ts:72-110`). On poll error: exponential backoff pause
+  `5s * 2^n` capped at **60s** via `pollPauseUntil` (`discord.ts:565-570`). A
+  `state.polling` flag skips timer ticks while a poll is in flight (`discord.ts:524`),
+  so a slow poll adds its full in-flight time to backfill latency.
+- **Per-poll latency bound**: 0–60s (interval) + poll in-flight time (0–~4.5s with 429
+  retries) + up to 60s of error backoff. Live messages ride the gateway (hundreds of
+  ms); the poll only bounds the backfill.
 - **Inbound gateway** (updated 2026-09-08, `49b7abe`): the per-token WebSocket
   IDENTIFYs with `GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | GUILD_MESSAGE_CONTENT`
   (`discord.ts` `GATEWAY_INTENTS`) and ingests `MESSAGE_CREATE` directly — presence,
   `INTERACTIONS_CREATE` (slash commands), and messages all ride one socket. The REST
   poller is a 60s backfill safety net while the gateway is up (5s when it is down).
-- **Busy-turn handling** (`channel/index.ts`): when a run is active
-  (`runActive = !ctx.isIdle() || hasPendingMessages()`, `index.ts:718`), inbound messages
-  go into a per-channel in-memory `burstBuffers` map (`index.ts:64-65`) and are merged
-  into one `pi.sendMessage(..., { triggerTurn: true, deliverAs: "steer" })` after a
-  **2500 ms** quiet window (`index.ts:65, 719-735`). Idle messages forward immediately
-  with the same steer semantics (`index.ts:738, 743-751`).
+- **Busy-turn handling** (`channel/index.ts`): when a run is active, inbound
+  messages are **queued, not merged** — each one is appended to the per-channel
+  `midTurnQueues` FIFO (`index.ts:327`) with a `[queued] N in line` ack (verbose 1+,
+  silent at verbose 0) and armed as a mid-run interrupt: if the current step is still
+  going after ~3 s (`PISCORD_INTERRUPT_STEP_TIMEOUT_MS`, default 3000, `index.ts:665-667`),
+  the step is interrupted and the message takes over as a new run. At run end each
+  queued message is delivered verbatim as its own run (one message = one run); the
+  queue survives a process restart (`restart-queue.ts`, #180). Idle messages forward
+  immediately.
 - **Attachment-only messages** (files, no text) are buffered in `pendingAttachments`
   with a **10 min TTL** until a follow-up text arrives
   (`index.ts:225-228, 660-671`).
 - **Ack UX**: 👀 reaction on each new message unless a command suppressed it
-  (`discord.ts:279-288, 313-319`); un-reacted on turn end (`index.ts:425-431`).
-- **Outage behaviour**: on restart, the cursor re-seeds to the *current* last message
-  (`discord.ts:184-188`), so anything sent while the agent was down is **not replayed**.
+  (`discord.ts:683`); un-reacted on turn end (`index.ts:3628` area).
+- **Outage behaviour**: cursors persist across restarts (`.tmp/channel-state.json`,
+  `discord.ts:255, 391-397`), so anything sent while the agent was down **is replayed**
+  by the first poll after connect (the 2026-07-09 "not replayed" behavior is gone).
 
 ## flaws (ranked by user impact)
 
 1. **5s polling floor on every message** — even when Discord could deliver in <200 ms.
-   This is the "it lags" complaint. `discord.ts:17,206`.
+   This is the "it lags" complaint. `discord.ts:30,495`. **Done 2026-09-08
+   (`49b7abe`)**: live messages ride the gateway; the 5s poll only runs while the
+   gateway is down.
 2. **Steer delay stacks: poll + burst buffer** — a message sent while the agent is
    working waits up to 5s (poll) + 2.5s (burst window) before reaching the LLM, and
    rapid messages are *rewritten* into a numbered merge (`index.ts:719-735`), changing
    wording and losing per-message reply targeting (only the last id is kept, `:732`).
+   **Done (midTurnQueues)**: mid-run messages are queued verbatim (one message = one
+   run), with per-message ids and reply targeting intact; the poll no longer gates
+   live ingestion.
 3. **Missed messages on startup / after downtime** — cursor seeds from the last message
    at connect time; nothing sent before the first successful poll is ever seen
    (`discord.ts:184-188`). A gateway session with resume + replay would not miss these.
+   **Done (cursor persistence, `.tmp/channel-state.json`)**: the cursor survives
+   restarts and the first poll backfills the downtime window.
 4. **Latency spikes during errors** — poll backoff pauses ingestion for up to 60s
-   (`discord.ts:294-296`), and in-flight polls skip timer ticks entirely
-   (`discord.ts:225-227`). A 429 during a burst delays *all* queued messages.
+   (`discord.ts:565-570`), and in-flight polls skip timer ticks entirely
+   (`discord.ts:524`). A 429 during a burst delays *all* queued messages.
+   **Mitigated 2026-09-08**: the backoff now only delays the 60s backfill, not the
+   gateway's live lane.
 5. **In-memory only, no persistence** — burst buffers, pending attachment batches, and
    the message cursor all live in process state; a crash mid-turn silently drops
    un-forwarded messages (`index.ts:61-65, 228`; `discord.ts:25-35`). Kimaki persists
    queue state and uses thread-scoped ingress serialization.
+   **Partially done**: the cursor persists (see flaw 3) and the mid-turn re-wake queue
+   survives a process restart (`restart-queue.ts`, #180); pending attachment batches
+   are still in-memory.
 6. **Self-echo window before identity resolves** — if `/users/@me` fails at connect,
    own messages are ingested (agent hears itself) until the first poll resolves it
    (`discord.ts:158-167, 251`).
 7. **`limit=10` cursor is fine but single-threaded per channel** — a very chatty channel
    (>10 msg/5s) works (cursor catches up next tick) but every extra message costs an
    extra REST call in a tight loop; at guild scale this is where rate limits bite.
-   `discord.ts:242`.
+   `discord.ts:545`. **Reduced**: the poll is a 60s backfill now, so the per-channel
+   REST budget is ~10x lower.
 
 ## kimaki mechanism
 
@@ -107,8 +131,11 @@ Repo: github.com/remorses/kimaki (cloned at /tmp/kimaki). Agent = the `cli` pack
 **Why kimaki reacts better for a long-running agent:** push (no interval), resume
 replay (no miss window), FIFO queue drained at idle (no fixed 2.5s merge window, no
 wording rewrite), and per-thread serialization that makes concurrent ingress
-race-free. The two systems' core difference: piscord *asks Discord every 5s what
-happened*; kimaki *lets Discord tell it, and queues what arrives while busy*.
+race-free. The two systems' core difference (as of the 2026-07-09 study):
+piscord *asks Discord every 5s what happened*; kimaki *lets Discord tell it, and
+queues what arrives while busy*. Since the 2026-09-08 gateway rewrite piscord
+has converged on that model: push ingestion plus a per-channel FIFO queue for
+busy turns.
 
 ## fixes for piscord (ranked)
 
@@ -128,12 +155,16 @@ happened*; kimaki *lets Discord tell it, and queues what arrives while busy*.
    message verbatim; on `agent_end` (`index.ts:445` area) drain the queue and send each
    message as its own steer (or one combined message that keeps each original text, no
    renumbering). Keeps mid-turn races safe because pi's `deliverAs: "steer"` already
-   serializes into the active turn.
+   serializes into the active turn. **Done (post 2026-09, `midTurnQueues`)**: the burst
+   rewrite is gone; the per-channel FIFO delivers each queued message verbatim as its
+   own run at run end, with a mid-run interrupt taking over if the step is still going.
 3. **Persist the cursor + pending inbound** across restarts. Write
    `lastMessageId` (and pending attachment batches) to `.tmp/channel-state.json` on
    each advance; seed from it at connect before falling back to `?limit=1`
    (`discord.ts:184-188`). Fixes the startup/downtime miss window even without
-   gateway resume.
+   gateway resume. **Done (cursor half)**: `lastMessageId` persists per channel in
+   `.tmp/channel-state.json` and seeds at connect (`discord.ts:255, 391-397`); pending
+   attachment batches are still in-memory.
 4. **Bound in-flight poll latency** while polling still exists: shorten
    `POLL_INTERVAL_MS` to ~1000-2000ms only as an interim (REST budget: one guild-
    scoped messages GET/s per channel is well under the 50 req/5s bucket), and make
@@ -146,4 +177,6 @@ happened*; kimaki *lets Discord tell it, and queues what arrives while busy*.
    fix, READY supplies it synchronously.
 6. **Minor**: raise `limit=10` → `limit=50` on the poll path (fewer backfill calls);
    add a `lastPoll` timestamp to the existing `ChannelStatus` type (`types.ts`) for
-   observability of ingest staleness.
+   observability of ingest staleness. Status: the `lastPoll` field landed on
+   `ChannelStatus` (`types.ts:132`) — that type is currently dead code (see the
+   dead-code sweep issue); the `limit` raise is still open.

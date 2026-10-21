@@ -20,11 +20,15 @@
 - /etc/tmpfiles.d/agent-tmp.conf: `e /tmp 1777 root root 2d` (daily age-reap)
 - inodes: 1,048,576 used -> 233,803 (23%)
 
-## TODO (code)
-- pi-bg.test.ts (and wd/tail tests): remove temp dirs in afterEach
-- pi-bg/pi-wait/watchdog runtime: unlink own /tmp files on exit (trap EXIT)
-- consider TMPDIR=<repo>/.tmp for test temp (off the shared tmpfs)
+## TODO (code) — all done (verified against main, 2026-10-21)
+- [x] pi-bg.test.ts (and wd/tail tests): remove temp dirs in afterEach
+      (file-level `afterEach` in dispatch/*.test.ts)
+- [x] pi-bg/pi-wait/watchdog runtime: unlink own /tmp files on exit (trap EXIT)
+      (jarate-bg `bg_on_exit` EXIT trap)
+- [x] consider TMPDIR=<repo>/.tmp for test temp (off the shared tmpfs)
+      (artifacts default to ~/.pi-bg-art)
 
 ## Detection
 `df -i /tmp` — alert at >80%. Suggested: jarate ctx-report or watchdog
-adds inode usage; tripwire at 90%.
+adds inode usage; tripwire at 90%. Not implemented (no `df -i`/inode
+sweep in watchdog or bridge as of the 2026-10-20 audit).

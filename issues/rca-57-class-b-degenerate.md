@@ -81,9 +81,10 @@ time). Fails identically before and after the change.
 
 ## Deployment note
 Live ~/scripts/pi-bg == repo main before this PR (verified by diff).
-After merge: rsync dispatch/ to live boxes (or the existing deploy
-path); the degr1 marker is additive - old in-flight tickets are
-unaffected. No pi.service restart required for the dispatcher itself.
+After merge: pull main on the live boxes (the checkout IS the deployment -
+dispatch/ is symlinked, no rsync); the degr1 marker is additive - old
+in-flight tickets are unaffected. No pi.service restart required for the
+dispatcher itself.
 
 ## Confidence
 HIGH on the diagnosis (rc/session/raw.out artifacts are unambiguous:

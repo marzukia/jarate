@@ -387,7 +387,7 @@ shows the last N lines (default 40, cap 200), notes dropped lines
 
 Companion bins (installed like `jarate-bg`): `jarate-bg-tail <id> [lines] [-f]`
 reads a run's live output; `jarate-bg-kill <id> [--dry-run]` cancels a run via
-its cgroup and posts a `KILLED` webhook event.
+its cgroup and posts a `CANCELLED` webhook event.
 
 ### /new-worktree + /merge-worktree
 
@@ -400,8 +400,9 @@ its cgroup and posts a `KILLED` webhook event.
 Owner only. Gives the MAIN interactive session the same worktree flow the
 dispatch workers get (`--worktree`): the worktree lands at
 `$PI_BG_WT_DIR/<repo>/<ticket>` (default `~/.pi-bg-wt`), branch
-`pi-bg/<ticket>`, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, same shape as
-`jarate-bg`). One worktree per repo at a time; state in `<repo>/.tmp/worktree.json`.
+`pi-bg/<ticket>`, ticket `YYYYMMDD-HHMMSS-NNNN` (UTC, 4-digit random
+suffix; `jarate-bg` tickets use the same 3-group shape with a
+variable-width PID suffix). One worktree per repo at a time; state in `<repo>/.tmp/worktree.json`.
 
 - `new-worktree` refuses when one is already active, and answers `[!]` when
   the cwd is not a git repo.
@@ -527,8 +528,8 @@ Lists the command set (the canonical list lives in
 - **Bare `stop`** is the only slash-free command, and it must be the entire
   message.
 - **Other bots' messages are skipped** on inbound (no echo loops).
-- **pi-bg webhooks are exempt** — the dispatch callback posts to the channel
-  without triggering the bot.
+- **jarate-bg webhooks are exempt** — the dispatch callback (embed author
+  `pi-bg ticket · <rid>`) posts to the channel without triggering the bot.
 - **Mid-run messages are queued, not debounced.** One message = one run: a
   message that lands while a run is in flight waits in the re-wake queue
   (acked `[queued] N in line` at verbose 1+; silent at verbose 0); it is delivered as a fresh run when the
