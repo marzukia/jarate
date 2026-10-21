@@ -253,8 +253,16 @@ export function mergeTodoLines(existing: Todo[], lines: string[]): Todo[] {
 }
 
 /**
- * True when an inbound body looks like a pi-bg webhook callback (content
- * prefixed "[bg:" or an embed whose author is "pi-bg …").
+ * True when an inbound body looks like a machine-wake callback (pi-bg
+ * producer card):
+ *  - an embed whose author is `pi-bg …` — the 2026-10-21 de-prefix shape
+ *    (producers post content "" + an embed author starting `pi-bg`;
+ *    serializeEmbeds renders it as `Author: pi-bg …`)
+ *  - OR the legacy content prefix `[bg:` — kept for ONE release (2026-10-21
+ *    operator decision: strip the visible `[bg:` prefix from jarate
+ *    producers): in-flight channel history and dead-letter re-posts (P5,
+ *    verbatim) still ship the old shape, and hall-monitor's webhooks are
+ *    not restyled yet. Drop this arm after the migration release.
  */
 export function isBgCallbackBody(body: string): boolean {
   return body.startsWith("[bg:") || /\bAuthor: pi-bg\b/.test(body);

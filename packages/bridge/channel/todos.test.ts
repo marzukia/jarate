@@ -235,8 +235,10 @@ describe("todos: rendering", () => {
 
 describe("todos: worker intake", () => {
   test("extractTodoLines picks 'TODO: ' lines anywhere in the body", () => {
+    // the 2026-10-21 de-prefix shape: content "" - the body is the
+    // serialized embed (wake via the Author: pi-bg marker)
     const body =
-      "[bg: worker OK · r1]\n\n<embed>\nresult: ```bash\ndone\nTODO: follow up on X\nTODO:verify Y\nTODO:   zed  \nno todo here TODO later\n``` \n</embed>";
+      "<embed>\nAuthor: pi-bg ticket \u00b7 r1\nTitle: worker\nresult: ```bash\ndone\nTODO: follow up on X\nTODO:verify Y\nTODO:   zed  \nno todo here TODO later\n``` \n</embed>";
     expect(extractTodoLines(body)).toEqual([
       "follow up on X",
       "verify Y",

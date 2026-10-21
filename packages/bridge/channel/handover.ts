@@ -381,8 +381,8 @@ export function extractDeterministic(
     : inboundCorpus;
 
   // Last user asks (RCA F3): HUMAN channel inbounds only, last 2 — the old
-  // list read like a pi-bg server log (Beepy <embed> webhooks, [bg:
-  // heartbeats, bridge-injected wakes). Fallback: user-role span messages.
+  // list read like a pi-bg server log (Beepy <embed> webhooks, machine-wake
+  // cards, bridge-injected wakes). Fallback: user-role span messages.
   const asks: string[] = [];
   for (const e of branchEntries) {
     if (e.type === "custom_message" && e.customType === "channel-inbound") {
@@ -640,7 +640,7 @@ export function inboundSender(e: SessionEntry): string | null {
 }
 
 /** Non-human senders on channel inbounds: the Beepy relay webhook (pi-bg
- *  callbacks, [bg: heartbeats). Case-insensitive. */
+ *  callbacks, machine-wake cards). Case-insensitive. */
 const NON_HUMAN_SENDERS = new Set(["beepy"]);
 
 /**
@@ -648,8 +648,8 @@ const NON_HUMAN_SENDERS = new Set(["beepy"]);
  * asks" list used to read like a pi-bg server log):
  *  - carries a <channel-ctx> sender (bridge-injected wakes don't)
  *  - the sender is not the bot relay (Beepy)
- *  - the body has free text: not empty, not a pi-bg <embed>, not a [bg:
- *    heartbeat, not a bare <todo-board> block (stripped already).
+ *  - the body has free text: not empty, not a pi-bg <embed>, not a legacy
+ *    [bg: line (one release), not a bare <todo-board> (stripped already).
  */
 export function isHumanInbound(e: SessionEntry): boolean {
   const sender = inboundSender(e);

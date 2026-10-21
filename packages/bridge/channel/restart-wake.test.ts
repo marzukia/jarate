@@ -88,11 +88,14 @@ function fakeFetch(results: Array<number | Error>): {
 // ─── inflight summary builder (fixture run records) ──────────────────────
 
 describe("buildWakePayload (issue #111 + embed card family)", () => {
-  test("clean + zero inflight = one-line [bg: content + green planned embed", () => {
+  test("clean + zero inflight = empty content + green planned embed (Author: pi-bg marker)", () => {
     const p = buildWakePayload({ clean: true, runs: [], now: T0 });
-    expect(p.content).toBe(`${WAKE_TAG} planned restart, 0 in-flight`);
+    // 2026-10-21 de-prefix: no visible [bg: line - the marker is the
+    // embed author (serialized to `Author: pi-bg …` for isBgCallbackBody)
+    expect(p.content).toBe("");
     expect(p.embeds).toHaveLength(1);
     const e = p.embeds[0];
+    expect(e.author?.name).toBe(`${WAKE_TAG} \u00b7 planned`);
     expect(e.title).toBe("restart-wake \u00b7 planned");
     expect(e.color).toBe(0x57f287);
     expect(e.description).toBe(
@@ -104,8 +107,9 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
 
   test("unclean + zero inflight = red unplanned embed, no-in-flight fact in description", () => {
     const p = buildWakePayload({ clean: false, runs: [], now: T0 });
-    expect(p.content).toBe(`${WAKE_TAG} unplanned restart, 0 in-flight`);
     const e = p.embeds[0];
+    expect(p.content).toBe("");
+    expect(e.author?.name).toBe("pi-bg restart-wake \u00b7 unplanned");
     expect(e.title).toBe("restart-wake \u00b7 unplanned");
     expect(e.color).toBe(0xed4245);
     expect(e.description).toBe(
@@ -120,7 +124,7 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
       rec({ run: "b", state: "killed", reason: "pi-bg-kill" }),
     ];
     const p = buildWakePayload({ clean: true, runs, now: T0 });
-    expect(p.content).toBe(`${WAKE_TAG} planned restart, 0 in-flight`);
+    expect(p.content).toBe("");
     expect(p.embeds[0].description).toContain("No in-flight pi-bg work.");
     expect(p.embeds[0].fields).toBeUndefined();
   });
@@ -139,7 +143,7 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
       }),
     ];
     const p = buildWakePayload({ clean: false, runs, now: T0 });
-    expect(p.content).toBe(`${WAKE_TAG} unplanned restart, 2 in-flight`);
+    expect(p.content).toBe("");
     expect(p.embeds[0].fields).toEqual([
       {
         name: "in-flight",
@@ -156,9 +160,7 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
       }),
     );
     const p = buildWakePayload({ clean: true, runs, now: T0 });
-    expect(p.content).toBe(
-      `${WAKE_TAG} planned restart, ${MAX_INFLIGHT} in-flight`,
-    );
+    expect(p.content).toBe("");
     const value = p.embeds[0].fields?.[0]?.value ?? "";
     const lines = value.split("\n");
     // oldest (i=0) listed first, newest (i>=10) dropped
@@ -198,7 +200,7 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
       runs: [{ run: "20261001-110000-1", state: "running" } as RunRecord],
       now: T0,
     });
-    expect(p.content).toBe(`${WAKE_TAG} planned restart, 1 in-flight`);
+    expect(p.content).toBe("");
     expect(p.embeds[0].fields).toEqual([
       { name: "in-flight", value: "20261001-110000-1 ? 0s" },
     ]);
@@ -360,9 +362,10 @@ describe("postWakePayload (issue #111)", () => {
   const target: WakeTarget = { channelId: "1545018100590846033" };
   const opts = { backoffMs: 1, timeoutMs: 50 };
   const payload = (): WakePayload => ({
-    content: `${WAKE_TAG} planned restart, 0 in-flight`,
+    content: "",
     embeds: [
       {
+        author: { name: "pi-bg restart-wake \u00b7 planned" },
         title: "restart-wake \u00b7 planned",
         color: 0x57f287,
         description:
@@ -436,7 +439,7 @@ describe("postWakePayload (issue #111)", () => {
     expect(calls).toHaveLength(3);
   });
 
-  test("webhook FIRST when both configured (the [bg: bus is the wake route)", async () => {
+  test("webhook FIRST when both configured (the webhook bus is the wake route)", async () => {
     const { impl, calls } = fakeFetch([200]);
     await expect(
       postWakePayload(
@@ -538,11 +541,14 @@ describe("runRestartWake (issue #111)", () => {
     expect(r.restartClass).toBe("planned");
     expect(calls).toHaveLength(1);
     // the channel config has no webhookUrl -> the pi-bg bus resolves it,
-    // and the [bg: post is the FIRST route
+    // and the webhook post is the FIRST route (isBgWebhook)
     expect(calls[0].url).toBe("https://bus.example/hook");
     const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toBe(`${WAKE_TAG} planned restart, 1 in-flight`);
+    expect(posted.content).toBe("");
     expect(posted.embeds).toHaveLength(1);
+    expect(posted.embeds[0].author.name).toBe(
+      "pi-bg restart-wake \u00b7 planned",
+    );
     expect(posted.embeds[0].title).toBe("restart-wake \u00b7 planned");
     expect(posted.embeds[0].color).toBe(0x57f287);
     expect(posted.embeds[0].footer.text).toBe("restart-wake");
@@ -566,9 +572,9 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls[0].url).toBe("https://ch.example/hook");
   });
 
-  test("unclean + inflight message body matches the builder", async () => {
+  test("unclean + inflight posted card matches the builder", async () => {
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
-    const { impl } = fakeFetch([200]);
+    const { impl, calls } = fakeFetch([200]);
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
@@ -580,7 +586,14 @@ describe("runRestartWake (issue #111)", () => {
     });
     expect(r.posted).toBe(true);
     expect(r.restartClass).toBe("unclean");
-    expect(r.message).toBe(`${WAKE_TAG} unplanned restart, 1 in-flight`);
+    const posted = JSON.parse(calls[0].body ?? "{}");
+    expect(posted.content).toBe("");
+    expect(posted.embeds[0].author.name).toBe(
+      "pi-bg restart-wake \u00b7 unplanned",
+    );
+    expect(posted.embeds[0].fields).toEqual([
+      { name: "in-flight", value: "20261001-113000-7 worker 23m" },
+    ]);
   });
 
   test("dedup: second startup within 60s does not post", async () => {

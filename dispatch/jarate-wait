@@ -16,7 +16,7 @@
 # #231 P3: on rc 0 the wait writes the in-turn consumed marker
 #   ~/.pi-dispatch/in-turn-consumed/<discord-message-id> (dir 0700,
 #   >1h old markers pruned on start). The bridge's re-wake drain drops
-#   a queued [bg: entry carrying that marker (double-delivery dedup).
+#   a queued machine-wake entry carrying that marker (double-delivery dedup).
 set -euo pipefail
 
 since=""; timeout=300; check=5
@@ -62,7 +62,7 @@ wa="$(head -1 "${HOME}/.config/pi-dispatch/webhook_author" 2>/dev/null || true)"
 [ -n "$wa" ] || { echo "webhook_author missing" >&2; exit 2; }
 
 # #231 P3: in-turn consumed marker (see rc 0 branch). The bridge's
-# re-wake drain drops a queued [bg: entry when a marker for its Discord
+# re-wake drain drops a queued machine-wake entry when a marker for its Discord
 # message id exists, so prune markers older than 1 hour on start: a
 # re-wake drain lands seconds after the turn ends, anything older is
 # stale (already drained, or its run long gone).

@@ -419,7 +419,7 @@ export function queueMidTurnInbound(
   console.log(
     `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
   );
-  // #177: [bg: machine wakes are queue-only. The re-wake queue already
+  // #177: machine wakes are queue-only. The re-wake queue already
   // guarantees agent_end delivery; the interrupt only jumps the line, and
   // a machine alert is never more urgent than the in-flight turn — so it
   // never arms one. (2026-10-06 incident: a reviewer callback posted
@@ -444,7 +444,7 @@ export function queueMidTurnInbound(
 // ─── In-turn consumed marker (#231 P3) ──────────────────────────────────
 // jarate-wait writes one marker file per DISCORD MESSAGE id on rc 0
 // (~/.pi-dispatch/in-turn-consumed/<id>, dir 0700, >1h pruned on its
-// start). A [bg: callback the agent consumed IN TURN therefore has a
+// start). A machine-wake callback the agent consumed IN TURN therefore has a
 // marker before any re-wake drain can pop its queued copy: the bridge
 // queued the message at arrival T0, jarate-wait saw the same message at
 // T1 >= T0 and wrote the marker, the drain consults at T2 > T1. A wait
@@ -472,11 +472,11 @@ export function hasInTurnConsumedMarker(
 
 /** Pop the globally oldest queued inbound across all channels (FIFO).
  *  Held channels (#39) are skipped: their buffer drains on /hold off,
- *  not at agent_end. #231 P3: a queued [bg: entry whose message id has
- *  an in-turn consumed marker is DROPPED (logged) and the next entry
+ *  not at agent_end. #231 P3: a queued machine-wake entry whose message id
+ *  has an in-turn consumed marker is DROPPED (logged) and the next entry
  *  popped — the agent already consumed that callback in turn, so the
  *  re-wake is the double-delivery copy. Human entries never drop (the
- *  marker only gates [bg: wakes). */
+ *  marker only gates machine-wake entries). */
 export function popOldestQueuedInbound(): {
   channelId: string;
   msg: ChannelMessage;
@@ -515,7 +515,7 @@ export function popOldestQueuedInbound(): {
         oldest.msg.messageId,
       );
       console.log(
-        `[channel] dropped in-turn-consumed [bg: re-wake ${oldest.msg.messageId} (${oldest.channelId})`,
+        `[channel] dropped in-turn-consumed machine-wake re-wake ${oldest.msg.messageId} (${oldest.channelId})`,
       );
       continue;
     }
@@ -2783,7 +2783,7 @@ export default function (pi: ExtensionAPI) {
 
     // #180 (option 1): bounded startup history scan — ONE fetch per
     // channel (messages?before=<cursor>&limit=$PISCORD_REWAKE_LOOKBACK,
-    // default 50) re-queueing any [bg:/pi-bg webhook post the old
+    // default 50) re-queueing any machine-wake (webhook_id) post the old
     // process RECEIVED (cursor already past it) but never committed to
     // pi. Backstop for the primary file layer: the cursor-vs-queue-file
     // micro-window and any other pre-queue loss. Dedupes against the
@@ -4172,15 +4172,15 @@ export function buildRepliedMessageBlock(rm?: {
   return `This message was a reply to message\n\n<replied-message${author}>\n${escapePromptText(rm.text)}\n</replied-message>`;
 }
 
-/** #177: true when the inbound is a [bg: machine wake (pi-bg callback,
+/** #177: true when the inbound is a machine wake (pi-bg callback,
  *  dead-letter alert, ETL alert). Machine wakes are never more urgent than
  *  the in-flight turn: they ride the re-wake queue and deliver at agent_end,
  *  and arm no mid-run interrupt (queue-only, #177).
  *
- *  Covers both callback shapes via the shared classifier isBgCallbackBody:
- *  the "[bg:" content prefix, and the standard embed-only pi-bg completion
- *  callback (content="", bridge body "<embed>\nAuthor: pi-bg ticket · <rid>").
- *  The 2026-10-06 incident callback was the embed-only shape. */
+ *  Classifies via isBgCallbackBody: the 2026-10-21 de-prefix shape
+ *  (content="", body = serialized embed starting `Author: pi-bg`) and the
+ *  legacy "[bg:" content prefix (one release: in-flight history, dead
+ *  letters, not-yet-restyled cross-repo producers). */
 export function isBgInbound(msg: ChannelMessage): boolean {
   return isBgCallbackBody(msg.body.trimStart());
 }
@@ -6677,7 +6677,7 @@ export async function handleInbound(
     // Ack = one line with the position; suppress the 👀 so the line IS the
     // ack. The ack id is tracked for edit/delete cleanup + renumbering.
     noAck();
-    // #231 P2: [bg: machine wakes queue SILENTLY — no "[queued] N in
+    // #231 P2: machine wakes queue SILENTLY — no "[queued] N in
     // line" post. No human waits in a machine-wake line, so the line is
     // pure channel noise. The entry still queues (and re-wakes) exactly
     // as today; human inbounds keep the post (the line IS their ack).

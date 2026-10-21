@@ -1748,7 +1748,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     // Mid-settle (an interrupt already in flight) arms at the 4x (12s)
     // window — the rapid-fire cascade guard (the in-flight disjunct).
     // Every other mid-run inbound arms the 3s default (quick cut-in);
-    // [bg: machine wakes arm nothing from #177 on (queue-only). The
+    // machine wakes arm nothing from #177 on (queue-only). The
     // queued message always has the guaranteed re-wake as fallback, so
     // the longer window only changes WHEN the interrupt cuts in, never
     // WHETHER it delivers. (2026-10-06 abort RCA: a mid-run reply armed
@@ -1805,11 +1805,20 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
-    test("[bg: machine wake is queue-only, arms nothing (#177)", async () => {
+    test("machine wake (Author: pi-bg) is queue-only, arms nothing (#177)", async () => {
       expect(idle).toBe(false);
       const baseAborts = abortCount;
       const baseSends = sent.length;
-      const wake = { ...inbound("[bg:etl] ticket", "bm1"), from: "bg" };
+      // the 2026-10-21 de-prefix shape: content "" + one embed whose
+      // author starts pi-bg (the bridge-built body is the serialized
+      // embed)
+      const wake = {
+        ...inbound(
+          "<embed>\nAuthor: pi-bg etl \u00b7 t1\nTitle: etl \u00b7 OK\nresult: ticket\n</embed>",
+          "bm1",
+        ),
+        from: "bg",
+      };
       await handleInbound(pi, wake, ctx);
       // Queue-only: not the 3s default, not the 4x in-flight window.
       expect(midTurnQueues.get("ch1")?.length).toBe(1);
@@ -2257,14 +2266,16 @@ describe("extension handlers (A1/A2/A4)", () => {
     });
   });
 
-  describe("mid-run interrupt (#177 [bg: queue-only)", () => {
-    // #177: [bg:-prefixed webhook inbounds (pi-bg callbacks, dead-letter
-    // alerts, ETL alerts) ride the re-wake queue and deliver at agent_end;
-    // they arm NO mid-run interrupt — the queue already guarantees
-    // delivery, the interrupt only jumps the line, and a machine alert is
-    // never more urgent than the in-flight turn. Human 3s arming and
-    // peer-bot 12s arming (#165/#175) are untouched; a later human cut-in
-    // still arms even with a [bg: entry queued ahead of it.
+  describe("mid-run interrupt (#177 machine-wake queue-only)", () => {
+    // #177: machine-wake webhook inbounds (pi-bg callbacks - the
+    // `Author: pi-bg` embed author, or legacy `[bg:` content -
+    // dead-letter re-posts, not-yet-restyled cross-repo producers) ride
+    // the re-wake queue and deliver at agent_end; they arm NO mid-run
+    // interrupt — the queue already guarantees delivery, the interrupt
+    // only jumps the line, and a machine alert is never more urgent than
+    // the in-flight turn. Human 3s arming and peer-bot 12s arming
+    // (#165/#175) are untouched; a later human cut-in still arms even
+    // with a machine-wake entry queued ahead of it.
     let abortCount: number;
     let idle: boolean;
 
@@ -2291,17 +2302,26 @@ describe("extension handlers (A1/A2/A4)", () => {
       jest.useRealTimers();
     });
 
-    test("isBgInbound classifies on the [bg: prefix (leading whitespace ok)", () => {
+    test("isBgInbound classifies the machine-wake shapes (legacy [bg: prefix + Author: pi-bg embed marker)", () => {
       expect(isBgInbound(inbound("[bg:worker:OK] x", "1"))).toBe(true);
       expect(isBgInbound(inbound("  [bg:etl] y", "2"))).toBe(true);
       expect(isBgInbound(inbound("[bg] no colon", "3"))).toBe(false);
       expect(isBgInbound(inbound("plain", "4"))).toBe(false);
       expect(isBgInbound(inbound("see [bg: ticket", "5"))).toBe(false);
+      // the 2026-10-21 de-prefix shape: content "" + embed author pi-bg
+      // (serializeEmbeds renders it as "Author: pi-bg …")
+      expect(
+        isBgInbound(
+          inbound("<embed>\nAuthor: pi-bg ticket \u00b7 r1\n</embed>", "6"),
+        ),
+      ).toBe(true);
     });
 
     test("[bg:pat] tap wake mid-run: queued, no arm, delivered at agent_end (#220)", async () => {
       // The wake is posted via the dispatch webhook — to the gateway it
       // is a bot-authored message (Beepy-style), like the [bg: callback.
+      // Legacy `[bg:` content shape (producer outside this repo - restyle
+      // lands with the migration arm's one-release window).
       const body =
         "[bg:pat] approved pat_a (monky, triage) — claim within 60s: jarate pat-run pat_a -- <cmd>";
       const msg = {
@@ -2331,7 +2351,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
-    test("[bg: inbound mid-run: no interrupt armed (timer count unchanged), delivered at agent_end via re-wake", async () => {
+    test("legacy [bg: content inbound mid-run: no interrupt armed (migration arm, one release), delivered at agent_end via re-wake", async () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
       const baseTimers = pendingInterrupts.size;
@@ -2363,13 +2383,15 @@ describe("extension handlers (A1/A2/A4)", () => {
 
     test("embed-only pi-bg callback (content='', Author: pi-bg) mid-run: queued, no arm, delivered at agent_end — EXACT lost-callback shape (2026-10-06, ticket 3580612)", async () => {
       // The standard pi-bg completion callback is embed-only by
-      // construction (dispatch/jarate-bg bg_build: content='', embed
-      // author "pi-bg ticket · <rid>"); plain "[bg:" content is the
-      // python3-missing fallback only. The bridge-built body is the
-      // serialized embed — no "[bg:" prefix anywhere. The 2026-10-06
-      // incident lost EXACTLY this shape (msg 1556883632919150653, Beepy
-      // webhook author, mid-run): pre-fix isBgInbound
-      // missed it and the 3s interrupt armed + was lost at compact.
+      // construction (content='', embed author "pi-bg ticket · <rid>") -
+      // and since 2026-10-21 the de-prefix shape of EVERY jarate
+      // producer. Legacy "[bg:" content (in-flight posts, dead letters,
+      // not-yet-restyled cross-repo producers) is the other arm.
+      // The bridge-built body is the serialized embed — no "[bg:" prefix
+      // anywhere. The 2026-10-06 incident lost EXACTLY this shape
+      // (msg 1556883632919150653, Beepy webhook author, mid-run):
+      // pre-fix isBgInbound missed it and the 3s interrupt armed + was
+      // lost at compact.
       const body = [
         "<embed>",
         "Author: pi-bg ticket · 20261006-040516-3580612",
@@ -2415,7 +2437,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(midTurnQueues.has("ch1")).toBe(false);
     });
 
-    test("[bg: inbound idle: immediate delivery, nothing queued or armed (regression pin)", async () => {
+    test("legacy [bg: content inbound idle: immediate delivery, nothing queued or armed (regression pin)", async () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
       idle = true; // no run in flight
@@ -2455,18 +2477,17 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(sent[baseSends].m.details.messageId).toBe("hm1");
     });
 
-    test("human arriving mid-run after a [bg: was queued: still arms (the queue does not suppress later human cuts)", async () => {
+    test("human arriving mid-run after a machine wake (Author: pi-bg) was queued: still arms (the queue does not suppress later human cuts)", async () => {
       const baseSends = sent.length;
       const baseAborts = abortCount;
-      // 1. [bg: wake lands mid-run: queued, no arm.
-      await handleInbound(
-        pi,
-        inbound("[bg:worker:OK] task 44 done", "bm1"),
-        ctx,
-      );
+      // 1. Machine wake (the 2026-10-21 de-prefix shape) lands mid-run:
+      // queued, no arm.
+      const wakeBody =
+        "<embed>\nAuthor: pi-bg worker \u00b7 r44\nTitle: worker \u00b7 OK\nresult: task 44 done\n</embed>";
+      await handleInbound(pi, inbound(wakeBody, "bm1"), ctx);
       expect(midTurnQueues.get("ch1")?.length).toBe(1);
       expect(pendingInterrupts.has("ch1")).toBe(false);
-      // 2. Human arrives while the [bg: is queued: the cut-in still arms.
+      // 2. Human arrives while the wake is queued: the cut-in still arms.
       await handleInbound(pi, inbound("human cut", "hm1"), ctx);
       expect(midTurnQueues.get("ch1")?.length).toBe(2);
       const armed = pendingInterrupts
@@ -2482,7 +2503,8 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(abortCount).toBe(baseAborts + 1);
       expect(sent.length).toBe(baseSends + 1);
       expect(sent[baseSends].m.details.messageId).toBe("hm1");
-      // ...and the [bg: entry stays queued for its agent_end re-wake.
+      // ...and the machine-wake entry stays queued for its agent_end
+      // re-wake.
       expect(midTurnQueues.get("ch1")?.length).toBe(1);
       expect(midTurnQueues.get("ch1")?.[0]?.msg.messageId).toBe("bm1");
     });
@@ -2909,11 +2931,14 @@ describe("extension handlers (A1/A2/A4)", () => {
       expect(react).toBeUndefined();
     });
 
-    test("#231 P2: [bg: inbound mid-run queues silently (no [queued] post)", async () => {
+    test("#231 P2: machine wake (Author: pi-bg) mid-run queues silently (no [queued] post)", async () => {
       ctx.isIdle = () => false; // a run is in flight
       await handleInbound(
         pi,
-        inbound("[bg:worker:OK] 20261017-000000-1 · test task", "m1"),
+        inbound(
+          "<embed>\nAuthor: pi-bg worker \u00b7 20261017-000000-1\nTitle: worker \u00b7 OK\nresult: test task\n</embed>",
+          "m1",
+        ),
         ctx,
       );
       await flush();
@@ -3644,7 +3669,9 @@ describe("re-wake in-turn consumed marker (#231 P3)", () => {
     messageId: id,
     from: "pi-bg",
     fromId: "wa-1",
-    body: `[bg:worker:OK] 20261017-000000-1 · task ${id}`,
+    // the 2026-10-21 de-prefix shape: the serialized embed (content "",
+    // author starts pi-bg)
+    body: `<embed>\nAuthor: pi-bg worker \u00b7 20261017-000000-${id}\nTitle: worker \u00b7 OK\nresult: task ${id}\n</embed>`,
   });
   const humanInbound = (id: string): ChannelMessage => ({
     ...base,
@@ -3670,7 +3697,7 @@ describe("re-wake in-turn consumed marker (#231 P3)", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("queued [bg: entry WITH a consumed marker is dropped, next entry popped", () => {
+  test("queued machine-wake entry WITH a consumed marker is dropped, next entry popped", () => {
     queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
     queueMidTurnInbound("ch1", bgInbound("222"), "t", "discord/Test", "t");
     // jarate-wait consumed the OLDEST in turn; the other keeps its wake
@@ -3686,7 +3713,7 @@ describe("re-wake in-turn consumed marker (#231 P3)", () => {
     expect(file.delivered).toContain("111");
   });
 
-  test("queued [bg: entry WITHOUT a marker is delivered (timeout path)", () => {
+  test("queued machine-wake entry WITHOUT a marker is delivered (timeout path)", () => {
     queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
     const popped = popOldestQueuedInbound();
     expect(popped?.msg.messageId).toBe("111");
@@ -3702,7 +3729,7 @@ describe("re-wake in-turn consumed marker (#231 P3)", () => {
       "t",
       false,
     );
-    writeMarker("333"); // the marker only gates [bg: wakes
+    writeMarker("333"); // the marker only gates machine wakes
     const popped = popOldestQueuedInbound();
     expect(popped?.msg.messageId).toBe("333");
   });
@@ -6745,8 +6772,10 @@ describe("todo board (integration)", () => {
       },
       tmp,
     );
+    // the 2026-10-21 de-prefix shape: content "" - the bridge-built body
+    // is the serialized embed (the wake rides Author: pi-bg)
     const body =
-      "[bg: worker OK · r1]\n\n<embed>\nAuthor: pi-bg ticket · r1\nTitle: worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
+      "<embed>\nAuthor: pi-bg ticket \u00b7 r1\nTitle: worker\nresult: done\nTODO: follow up on X\nTODO: verify the deploy\n</embed>";
     await handleInbound(pi, inbound(body, "m1"), ctx);
 
     let board = loadBoard("ch1", tmp);
@@ -10312,7 +10341,8 @@ describe("wave 2c bridge commands", () => {
 //     path); a real process start (reason "startup") drains the file back
 //     into the queue and the normal agent_end re-wake delivers it.
 //   option 1 (backstop): the same startup does one bounded history scan
-//     (before=<cursor>) re-queueing undelivered [bg:/pi-bg webhook posts.
+//     (before=<cursor>) re-queueing undelivered machine-wake webhook
+//     posts (webhook_id - the [bg: content prefix was never the gate).
 //
 // These tests model REAL process boundaries: fresh pi + fresh handlers,
 // clearDiscordStatesForTest between "processes", persisted state files
@@ -10343,22 +10373,47 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     isRoom: false,
   });
 
-  /** Raw REST [bg: webhook post (the pi-bg callback shape). */
+  /** Raw REST machine-wake post (the 2026-10-21 de-prefix shape: empty
+   *  content + one embed whose author starts `pi-bg`). */
   const bgRaw = (id: string) => ({
     id,
     webhook_id: "7000",
-    content: `[bg:worker:OK] ${id}`,
+    content: "",
+    embeds: [
+      {
+        author: { name: `pi-bg worker \u00b7 ${id}` },
+        title: "worker \u00b7 OK",
+        description: `task ${id} done`,
+      },
+    ],
     timestamp: new Date().toISOString(),
     author: { id: "7000", bot: true, username: "beepy" },
   });
-  /** Raw REST restart-wake post (the bridge's own wake). */
+  /** Raw REST restart-wake post (the bridge's own wake, 2026-10-21
+   *  shape: empty content + the Author: pi-bg marker). */
   const wakeRaw = (id: string) => ({
     id,
     webhook_id: "7000",
-    content: "[bg: restart-wake] clean",
+    content: "",
+    embeds: [
+      {
+        author: { name: "pi-bg restart-wake \u00b7 planned" },
+        title: "restart-wake \u00b7 planned",
+        description:
+          "pi restarted as planned (clean stop) - back online. No in-flight pi-bg work.",
+        footer: { text: "restart-wake" },
+      },
+    ],
     timestamp: new Date().toISOString(),
     author: { id: "7000", bot: true, username: "beepy" },
   });
+  /** The bridge-built body for a raw machine-wake post (the
+   *  serializeEmbeds shape - what the in-process handler sees). */
+  const bgBody = (id: string) =>
+    `<embed>\nAuthor: pi-bg worker \u00b7 ${id}\nTitle: worker \u00b7 OK\ntask ${id} done\n</embed>`;
+  /** The edited machine-wake body (F2: an edit lands on the same id). */
+  const bgBodyEdited =
+    "<embed>\nAuthor: pi-bg worker \u00b7 2000\nTitle: worker \u00b7 OK\ntask 2000 done EDITED\n</embed>";
 
   /** One fake pi "process": fresh handler table + fresh send capture. */
   const mkProcess = () => {
@@ -10483,12 +10538,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     // delivery advances the cursor PAST the queued inbound (the incident)
     setChannelCursor("ch1", "2000");
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
@@ -10520,13 +10570,13 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     // the wake post comes in via the poll → direct send (idle)
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg restart-wake"),
       ),
     );
     // the wake run ends → re-wake delivers the survived callback
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     const delivered = customSends(p2.sent).filter((s) =>
-      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
     );
     expect(delivered).toHaveLength(1); // exactly once
     // commit: pending pruned, id recorded for the scan dedupe
@@ -10577,12 +10627,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     setChannelCursor("ch1", "2000");
     // a later (human) receipt advances the cursor past the callback —
     // the scan window (before=<cursor>) now contains it; human posts
@@ -10600,18 +10645,51 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg restart-wake"),
       ),
     );
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     expect(
       customSends(p2.sent).filter((s) =>
-        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     ).toHaveLength(1); // delivered via the scan-re-queued entry
     const f2 = loadRewakeQueue(rewakeDir(), "ch1");
     expect(f2.pending).toEqual([]);
     expect(f2.delivered).toContain("2000");
+  });
+
+  test("migration arm: legacy [bg: content webhook post survives a restart (one release)", async () => {
+    // In-flight channel history + dead-letter re-posts still carry the
+    // pre-2026-10-21 shape (content "[bg:…", no embed). The scan gate
+    // is webhook_id (isBgWebhook) and classification keeps the legacy
+    // prefix arm one release — a legacy post must re-queue exactly like
+    // the de-prefix shape.
+    const p1 = mkProcess();
+    const ctx1 = mkCtx(false);
+    await p1.handlers.session_start?.(null, ctx1);
+    await waitFor(() => p1.handlers.agent_end !== undefined);
+    setChannelCursor("ch1", "1000");
+    setChannelCursor("ch1", "3002"); // a later receipt advances past it
+    await p1.handlers.session_shutdown?.();
+
+    const p2 = mkProcess();
+    const ctx2 = mkCtx(true);
+    const legacyRaw = {
+      id: "3001",
+      webhook_id: "7000",
+      content: "[bg:worker:OK] 3001",
+      timestamp: new Date().toISOString(),
+      author: { id: "7000", bot: true, username: "beepy" },
+    };
+    script.polls = [[], [], []];
+    script.scan = [legacyRaw];
+    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+    await new Promise((r) => setTimeout(r, 150));
+    await pollDiscord("ch1");
+    expect(
+      loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["3001"]); // re-queued, not dropped as a stray bot post
   });
 
   test("in-process /new//reload (reason != startup) clears the file, not just memory", async () => {
@@ -10620,12 +10698,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     await p1.handlers.session_shutdown?.(); // memory drained, file kept
     expect(
       loadRewakeQueue(rewakeDir(), "ch1").pending.map((p) => p.msg.messageId),
@@ -10649,12 +10722,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
     setHeld("ch1", true);
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     setChannelCursor("ch1", "2000");
     await p1.handlers.session_shutdown?.();
     expect(midTurnQueues.get("ch1")).toBeUndefined(); // memory wiped
@@ -10687,12 +10755,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000"); // W: pre-op cursor (rewind point)
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     // receipt advances the cursor past the queued inbound
     setChannelCursor("ch1", "2000");
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
@@ -10722,13 +10785,13 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     );
     // the replay run ends -> the re-wake must NOT pop the drained copy
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     const delivered = customSends(p2.sent).filter((s) =>
-      String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+      String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
     );
     expect(delivered).toHaveLength(1); // was 2 at 6753cec9 (replay + re-wake)
     expect(midTurnQueues.get("ch1")).toBeUndefined();
@@ -10747,12 +10810,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     setChannelCursor("ch1", "2000");
     setChannelCursor("ch1", "1000"); // op rewind, persisted
     await p1.handlers.session_shutdown?.();
@@ -10769,7 +10827,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     );
     // the scan fetch (in flight during the replay commit) has landed
@@ -10782,7 +10840,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     expect(
       customSends(p2.sent).filter((s) =>
-        String(s.m.details?.body ?? "").includes("[bg:worker:OK] 2000"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     ).toHaveLength(1); // exactly once
   });
@@ -10793,36 +10851,22 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     await p1.handlers.session_start?.(null, ctx1);
     await waitFor(() => p1.handlers.agent_end !== undefined);
     setChannelCursor("ch1", "1000");
-    await handleInbound(
-      p1.pi,
-      inbound("[bg:worker:OK] 2000", "2000"),
-      ctx1,
-      false,
-    );
+    await handleInbound(p1.pi, inbound(bgBody("2000"), "2000"), ctx1, false);
     setChannelCursor("ch1", "2000");
     expect(midTurnQueues.get("ch1")?.length).toBe(1);
     // the owner edits the queued message (MESSAGE_UPDATE route)
     expect(
-      await updateQueuedInbound(
-        ctx1,
-        "ch1",
-        "2000",
-        "[bg:worker:OK] 2000 EDITED",
-        [],
-        "uid",
-      ),
+      await updateQueuedInbound(ctx1, "ch1", "2000", bgBodyEdited, [], "uid"),
     ).toBe(true);
     // memory re-rendered AND the file copy rewritten (F2)
-    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(
-      "[bg:worker:OK] 2000 EDITED",
-    );
+    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(bgBodyEdited);
     expect(loadRewakeQueue(rewakeDir(), "ch1").pending[0].msg.body).toBe(
-      "[bg:worker:OK] 2000 EDITED",
+      bgBodyEdited,
     );
     await p1.handlers.session_shutdown?.();
     // the file kept the EDITED msg across the restart boundary
     expect(loadRewakeQueue(rewakeDir(), "ch1").pending[0].msg.body).toBe(
-      "[bg:worker:OK] 2000 EDITED",
+      bgBodyEdited,
     );
 
     clearDiscordStatesForTest();
@@ -10832,18 +10876,17 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     script.scan = [];
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
     // the survival drain re-queues the EDITED body, not the stale one
-    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(
-      "[bg:worker:OK] 2000 EDITED",
-    );
+    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(bgBodyEdited);
   });
 
   test("crash with a live [queued] line: ack id survives in the file, restored + deleted exactly once", async () => {
     verboseOverride.set("ch1", 1); // verbose 1: the [queued] ack posts
     // ── Process 1: a HUMAN inbound queued mid-run; its [queued] ack
     // POST resolves (fake id "w1") and its id is mirrored into the
-    // file. (#231 P2: [bg: inbounds queue silently — no ack line — so
+    // file. (#231 P2: machine-wake inbounds queue silently — no ack
+    // line — so
     // the line-survival contract is exercised on the human entry; the
-    // [bg: entry joins in the ack-less shape below.)
+    // the machine-wake entry joins in the ack-less shape below.)
     const p1 = mkProcess();
     const ctx1 = mkCtx(false);
     await p1.handlers.session_start?.(null, ctx1);
@@ -10856,11 +10899,11 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
         queuedAcks.get("2000")?.ackId === "w1" &&
         loadRewakeQueue(rewakeDir(), "ch1").pending[0]?.ackId === "w1",
     );
-    // an ACK-LESS [bg: entry (the #231 P2 shape, and any pre-fix
+    // an ACK-LESS machine-wake entry (the #231 P2 shape, and any pre-fix
     // writer: no ackId key on disk) joins the file — it must still
     // load and drain
     rewakeAddPending(rewakeDir(), "ch1", {
-      msg: inbound("[bg:worker:OK] 3000", "3000"),
+      msg: inbound(bgBody("3000"), "3000"),
       queuedAt: Date.now(),
     });
     const raw = JSON.parse(
@@ -10883,7 +10926,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     // the survival drain re-queued BOTH entries (ack-less loads)…
     expect(midTurnQueues.get("ch1")?.length).toBe(2);
     // …and restored ONLY the entry whose ack survived, at its line
-    // position — the [bg: entry has no (nonexistent) line
+    // position — the machine-wake entry has no (nonexistent) line
     expect(queuedAcks.get("2000")?.ackId).toBe("w1");
     expect(queuedAcks.get("2000")?.pos).toBe(1);
     expect(queuedAcks.has("3000")).toBe(false);
@@ -10892,7 +10935,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     // inbound and consumes the restored ack
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("[bg: restart-wake]"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg restart-wake"),
       ),
     );
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
@@ -10909,7 +10952,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
       ),
     ).toHaveLength(1);
     expect(queuedAcks.get("2000")).toBeUndefined();
-    // the [bg: entry is still queued (no line to delete) and the
+    // the machine-wake entry is still queued (no line to delete) and the
     // delivered set now holds the committed id
     const f2 = loadRewakeQueue(rewakeDir(), "ch1");
     expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);

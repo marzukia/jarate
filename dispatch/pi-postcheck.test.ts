@@ -3,10 +3,11 @@
  *
  * Runs the real bash script against a fake HOME with stubbed curl /
  * systemctl / journalctl. C1: the webhook heartbeat is state-aware
- * ("[ok] healthy" / "[!] not healthy" - the failure path used to read
- * "[!] healthy", a lie). The heartbeat is an EMBED CARD (2026-10-19):
- * one-line content `[bg: pi-restart] [ok|!] ...` (the wake marker) +
- * one embed (postcheck · ok/fail, green/red, footer pi-postcheck).
+ * (the failure path used to read "[!] healthy", a lie). The heartbeat is
+ * an EMBED CARD (2026-10-19; 2026-10-21 de-prefix: the visible [bg:
+ * content prefix is dropped): EMPTY content, the EMBED AUTHOR is
+ * `pi-bg pi-restart · ok|fail` (the wake marker), + one embed
+ * (postcheck · ok/fail, green/red, footer pi-postcheck).
  * In-flight note lines ride the embed's in-flight field as RAW LINES:
  * no frame, no wrap, no width budget; a long token (URL) ships
  * verbatim.
@@ -32,6 +33,7 @@ interface Post {
   url: string;
   content: string;
   embeds?: Array<{
+    author?: { name: string };
     title: string;
     color: number;
     description: string;
@@ -202,12 +204,11 @@ describe("pi-postcheck C1: state-aware wording", () => {
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
       const hb = webhookPost(f);
-      // embed card: one-line content (the [bg: wake marker) + one embed
-      expect(hb.content).toBe(
-        "[bg: pi-restart] [ok] healthy 90s after restart",
-      );
-      expect(hb.content).not.toContain("\n");
+      // embed card: EMPTY content, author `pi-bg pi-restart · ok` (the
+      // 2026-10-21 wake marker) + one embed
+      expect(hb.content).toBe("");
       expect(hb.embeds).toHaveLength(1);
+      expect(hb.embeds[0].author?.name).toBe("pi-bg pi-restart \u00b7 ok");
       expect(hb.embeds[0].title).toBe("postcheck \u00b7 ok");
       expect(hb.embeds[0].color).toBe(0x57f287);
       expect(hb.embeds[0].footer?.text).toBe("pi-postcheck");
@@ -231,10 +232,8 @@ describe("pi-postcheck C1: state-aware wording", () => {
         "`[!] pi.service not active after restart`",
       );
       const hb = webhookPost(f);
-      expect(hb.content).toBe(
-        "[bg: pi-restart] [!] not healthy 90s after restart",
-      );
-      expect(hb.content).not.toContain("[!] healthy");
+      expect(hb.content).toBe("");
+      expect(hb.embeds?.[0].author?.name).toBe("pi-bg pi-restart \u00b7 fail");
       expect(hb.embeds?.[0].title).toBe("postcheck \u00b7 fail");
       expect(hb.embeds?.[0].color).toBe(0xed4245);
     } finally {
@@ -259,8 +258,9 @@ describe("pi-postcheck C1: state-aware wording", () => {
       expect(ch).toContain("`[!] pi restarted, systemd error:`");
       expect(ch).toContain("Main process exited, code=killed, status=1/SEGV");
       expect(ch).not.toContain("second failed line"); // head -1 only
-      expect(webhookPost(f).content).toBe(
-        "[bg: pi-restart] [!] not healthy 90s after restart",
+      expect(webhookPost(f).content).toBe("");
+      expect(webhookPost(f).embeds?.[0].author?.name).toBe(
+        "pi-bg pi-restart \u00b7 fail",
       );
     } finally {
       f.setInflight(null);
@@ -297,8 +297,9 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
       expect(channelPost(f).content).toBe(
         "`[ok] pi post-check: service healthy 90s after restart`",
       );
-      expect(webhookPost(f).content).toBe(
-        "[bg: pi-restart] [ok] healthy 90s after restart",
+      expect(webhookPost(f).content).toBe("");
+      expect(webhookPost(f).embeds?.[0].author?.name).toBe(
+        "pi-bg pi-restart \u00b7 ok",
       );
       expect(webhookPost(f).content).not.toContain("systemd error");
     } finally {
@@ -321,8 +322,9 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
       expect(ch).toContain("`[!] pi restarted, systemd error:`");
       expect(ch).toContain(REAL);
       expect(ch).not.toContain(SUMMARY); // the 0-failed summary is filtered
-      expect(webhookPost(f).content).toBe(
-        "[bg: pi-restart] [!] not healthy 90s after restart",
+      expect(webhookPost(f).content).toBe("");
+      expect(webhookPost(f).embeds?.[0].author?.name).toBe(
+        "pi-bg pi-restart \u00b7 fail",
       );
     } finally {
       f.setInflight(null);
@@ -340,7 +342,9 @@ describe("pi-postcheck: systemd '0 failed' summary lines are not errors", () => 
  * observable side effects instead.
  */
 describe("pi-postcheck: missing settings / no bot token branches", () => {
-  const DEGRADED = "[bg: pi-restart] [!] not healthy 90s after restart";
+  // the fail-state wake marker (2026-10-21: content is empty, the state
+  // rides the embed author)
+  const FAIL_AUTHOR = "pi-bg pi-restart \u00b7 fail";
 
   test("settings.json missing: exit 0, no channel post, degraded frame, no systemd probes", async () => {
     const f = fixture();
@@ -354,7 +358,8 @@ describe("pi-postcheck: missing settings / no bot token branches", () => {
       expect(r.code).toBe(0);
       // exactly ONE post: the webhook heartbeat (no channel post)
       expect(f.posts()).toHaveLength(1);
-      expect(webhookPost(f).content).toBe(DEGRADED);
+      expect(webhookPost(f).content).toBe("");
+      expect(webhookPost(f).embeds?.[0].author?.name).toBe(FAIL_AUTHOR);
       // branch short-circuits before probing the service
       expect(f.calls()).toEqual([]);
     } finally {
@@ -381,7 +386,8 @@ describe("pi-postcheck: missing settings / no bot token branches", () => {
       expect(r.code).toBe(0);
       // exactly ONE post: the webhook heartbeat (no channel post)
       expect(f.posts()).toHaveLength(1);
-      expect(webhookPost(f).content).toBe(DEGRADED);
+      expect(webhookPost(f).content).toBe("");
+      expect(webhookPost(f).embeds?.[0].author?.name).toBe(FAIL_AUTHOR);
       // the token check fires before is-active / journalctl
       expect(f.calls()).toEqual([]);
     } finally {
@@ -405,12 +411,10 @@ describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () =
       const r = await f.run();
       expect(r.code).toBe(0);
       const hb = webhookPost(f);
-      // the content is ONE line (the [bg: wake marker) - the note no
-      // longer rides content at all
-      expect(hb.content).toBe(
-        "[bg: pi-restart] [ok] healthy 90s after restart",
-      );
-      expect(hb.content).not.toContain("\n");
+      // the content is EMPTY (2026-10-21 de-prefix) - the note rides the
+      // embed field, the state rides the embed author
+      expect(hb.content).toBe("");
+      expect(hb.embeds?.[0].author?.name).toBe("pi-bg pi-restart \u00b7 ok");
       // no fence, no frame characters anywhere in the card
       const em = hb.embeds?.[0];
       expect(em).toBeDefined();
@@ -436,9 +440,7 @@ describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () =
       const r = await f.run();
       expect(r.code).toBe(0);
       const hb = webhookPost(f);
-      expect(hb.content).toBe(
-        "[bg: pi-restart] [ok] healthy 90s after restart",
-      );
+      expect(hb.content).toBe("");
       expect(hb.embeds?.[0].fields?.[0].name).toBe("in-flight");
       expect(hb.embeds?.[0].fields?.[0].value).toBe(
         "fix the pi restart loop\nthen redeploy",
@@ -468,9 +470,7 @@ describe("pi-postcheck in-flight note: raw embed field lines (2026-10-19)", () =
       const r = await f.run();
       expect(r.code).toBe(0);
       const hb = webhookPost(f);
-      expect(hb.content).toBe(
-        "[bg: pi-restart] [ok] healthy 90s after restart",
-      );
+      expect(hb.content).toBe("");
       const fields = hb.embeds?.[0].fields ?? [];
       // Discord-shippable: no field value over the 1024 limit
       for (const x of fields) {

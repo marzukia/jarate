@@ -34,7 +34,12 @@ const CH: ChannelConfig = {
   botToken: "tok1",
 };
 
-const msg = (id: string, body = `[bg:worker:OK] ${id}`): ChannelMessage => ({
+// the 2026-10-21 de-prefix shape: content "" + one embed whose author
+// starts pi-bg (the bridge-built body is the serialized embed)
+const msg = (
+  id: string,
+  body = `<embed>\nAuthor: pi-bg worker \u00b7 ${id}\nTitle: worker \u00b7 OK\ntask ${id} done\n</embed>`,
+): ChannelMessage => ({
   channelId: "ch1",
   channelName: "Test",
   channelType: "discord",
@@ -97,11 +102,16 @@ describe("restart-queue state file (#180)", () => {
 
   test("update pending msg rewrites the file entry (F2: edit survives a restart)", () => {
     rewakeAddPending(dir, "ch1", entry("m1"));
-    const edited = { ...msg("m1"), body: "[bg:worker:OK] m1 EDITED" };
+    const edited = {
+      ...msg("m1"),
+      body: "<embed>\nAuthor: pi-bg worker \u00b7 m1\nTitle: worker \u00b7 OK\ntask m1 done EDITED\n</embed>",
+    };
     rewakeUpdatePendingMsg(dir, "ch1", "m1", edited);
     const file = loadRewakeQueue(dir, "ch1");
     expect(file.pending).toHaveLength(1);
-    expect(file.pending[0].msg.body).toBe("[bg:worker:OK] m1 EDITED");
+    expect(file.pending[0].msg.body).toBe(
+      "<embed>\nAuthor: pi-bg worker \u00b7 m1\nTitle: worker \u00b7 OK\ntask m1 done EDITED\n</embed>",
+    );
     expect(file.pending[0].queuedAt).toBe(1000); // FIFO position kept
   });
 
@@ -245,8 +255,27 @@ describe("restart-queue state file (#180)", () => {
 describe("restart-queue option 1: bounded startup history scan", () => {
   let dir = "";
 
-  // A raw [bg: webhook post: webhook_id set + [bg:-prefixed content.
+  // A raw machine-wake webhook post (the 2026-10-21 de-prefix shape):
+  // webhook_id set + empty content + one embed whose author starts
+  // pi-bg.
   const bgPost = (id: string, ts: string) => ({
+    id,
+    webhook_id: "1546769099252695103",
+    content: "",
+    embeds: [
+      {
+        author: { name: `pi-bg worker \u00b7 ${id}` },
+        title: "worker \u00b7 OK",
+        description: `task ${id} done`,
+      },
+    ],
+    timestamp: ts,
+    author: { id: "1546769099252695103", bot: true, username: "beepy" },
+  });
+  // A legacy (pre-2026-10-21) machine-wake post: webhook_id set +
+  // [bg:-prefixed content, no embed — in-flight history + dead-letter
+  // re-posts keep this shape for one release.
+  const legacyBgPost = (id: string, ts: string) => ({
     id,
     webhook_id: "1546769099252695103",
     content: `[bg:worker:OK] ${id}`,
@@ -324,15 +353,25 @@ describe("restart-queue option 1: bounded startup history scan", () => {
     expect(c2[0]).toBe(`/channels/111/messages?before=9000&limit=5`);
   });
 
-  test("undelivered [bg: webhook post in the window → re-queued (file + callback)", async () => {
+  test("undelivered machine-wake webhook post (Author: pi-bg) in the window → re-queued (file + callback)", async () => {
     const now = new Date().toISOString();
     const { r, requeued } = await runScan([bgPost("1001", now)]);
     expect(r).toEqual({ scanned: 1, requeued: 1 });
     expect(requeued[0].msg.messageId).toBe("1001");
-    expect(requeued[0].msg.body).toBe("[bg:worker:OK] 1001");
+    expect(requeued[0].msg.body).toBe(
+      "<embed>\nAuthor: pi-bg worker \u00b7 1001\nTitle: worker \u00b7 OK\ntask 1001 done\n</embed>",
+    );
     expect(rewakePending(dir, "ch1").map((p) => p.msg.messageId)).toEqual([
       "1001",
     ]);
+  });
+
+  test("migration arm: legacy [bg: content post is re-queued (one release)", async () => {
+    const now = new Date().toISOString();
+    const { r, requeued } = await runScan([legacyBgPost("4001", now)]);
+    expect(r).toEqual({ scanned: 1, requeued: 1 });
+    expect(requeued[0].msg.messageId).toBe("4001");
+    expect(requeued[0].msg.body).toBe("[bg:worker:OK] 4001"); // verbatim
   });
 
   test("embed-only pi-bg callback (content='') is a machine wake → re-queued (incident shape)", async () => {
@@ -344,7 +383,7 @@ describe("restart-queue option 1: bounded startup history scan", () => {
     expect(requeued[0].msg.body).toContain("Author: pi-bg ticket");
   });
 
-  test("delivered set dedupes: an already-committed [bg: post is NOT re-queued", async () => {
+  test("delivered set dedupes: an already-committed machine-wake post is NOT re-queued", async () => {
     const now = new Date().toISOString();
     rewakeCommitDelivered(dir, "ch1", "1001");
     const { r } = await runScan([bgPost("1001", now)]);

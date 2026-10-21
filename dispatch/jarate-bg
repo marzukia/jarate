@@ -9,7 +9,9 @@
 #   - run CWD:      /srv/fleetwork/work/<ticket>
 #   - push:         feature branches to the bare mirror /srv/fleetwork/<repo>.git
 #                   (never origin/main)
-#   - terminal:     state returns as a [bg: fleetwork] <ticket> <agent> <state> line
+#   - terminal:     state returns as a `pi-bg fleetwork` machine-wake
+#                   card (the visible [bg: prefix was dropped 2026-10-21;
+#                   the wake rides webhook_id + the Author: pi-bg marker)
 #
 # The launch path is STUBBED (retirement notice + exit 10), not deleted:
 # in-flight tickets (dispatched before retirement) keep running to
@@ -311,7 +313,9 @@ jarate-bg: bg dispatch is retired - new dispatches go to the fleet:
   run CWD:  /srv/fleetwork/work/<ticket>
   push:     feature branches to the bare mirror /srv/fleetwork/<repo>.git
             (never origin/main)
-  terminal: state returns as a [bg: fleetwork] <ticket> <agent> <state> line
+  terminal: state returns as a `pi-bg fleetwork` machine-wake card
+            (the visible [bg: prefix was dropped 2026-10-21; the wake
+            rides webhook_id + the Author: pi-bg marker)
 In-flight tickets are unaffected: already-launched runs finish under the
 old topology, and the completion side still works (jarate-bg-watchdog,
 jarate-bg-tail, jarate-bg-kill, jarate-wait; the ~/.pi-bg-art artifact

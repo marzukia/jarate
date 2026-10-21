@@ -255,30 +255,37 @@ On completion, `jarate-bg` posts to the Discord webhook:
   A second silent death (issue #57, retry1 did not recover) is reported as
   a normal `FAIL (rc=1)` with a `silent death x2` result — the orchestrator
   treats it like any other FAIL (one fix round, then a decision).
-- **Embed card family (2026-10-19):** the plain `[bg:` text cards are
-  gone. Every producer that had no framed embed (launch-fail DIED,
-  no-output DIED, the fallback below, the watchdog OOM/SILENT/AGENT-DEAD
-  posts, the pi-restart heartbeat, the restart-wake post) now ships ONE
-  content line + ONE embed: content is a single line starting with the
-  producer's existing `[bg:` tag plus a short worst-fact summary
-  (<= 120 chars) - the `[bg:` prefix on line 1 is what `isBgWebhook`
-  accepts, so the wake behavior is unchanged; the embed carries title
-  `<producer> · <STATUS>`, color (red `0xED4245` died/oom/agent-dead/
-  unplanned/fail, yellow `0xFEE75C` silent/warn/stale, green
-  `0x57F287` planned/healthy/ok), a 1-2 line description, ALL facts as
-  fields (code-fenced output snippets only in the fallback producer),
-  and a footer with the producer name only (no timestamp). Dynamic
-  operator-facing text is censored at egress (bash producers via
-  `bg_censor`; restart-wake via `egressPayload` on every string part).
-- **Plain-text fallback:** if the embed builder fails, the legacy
-  fallback posts the SAME embed card family: one content line
-  (`[bg:<profile>:<status>] ticket <rid> <status> rc=<rc>`) + one embed
-  (title `fallback · <status>`, cwd/task fields + the raw output
-  snippet code-fenced as the `output` field value - a raw text blob
-  with no fence violates STYLE.md 2.7).
-- Inbound exemption: piscord's `isBgWebhook` exempts its own callbacks
-  (webhook with `[bg:` content, or embed author name starting `pi-bg`) from
-  triggering a run — no echo loops.
+- **Embed card family (2026-10-19; 2026-10-21 de-prefix):** the visible
+  `[bg:` content prefix is gone (operator: no visible `[bg:` lines in
+  agent channels). Every producer that had no framed embed (the watchdog
+  OOM/SILENT/AGENT-DEAD posts, the pi-restart heartbeat, the restart-wake
+  post) ships EMPTY content + ONE embed: the EMBED AUTHOR is
+  `pi-bg <producer> · <STATUS>` — the machine-wake marker (the bridge
+  serializes embeds to `Author: <name>` and `isBgCallbackBody`
+  classifies it; the WAKE itself rides `webhook_id` — `isBgWebhook`
+  exempts any webhook post from the other-bot filter) — the embed
+  carries title `<producer> · <STATUS>`, color (red `0xED4245`
+  died/oom/agent-dead/unplanned/fail, yellow `0xFEE75C`
+  silent/warn/stale, green `0x57F287` planned/healthy/ok), a 1-2 line
+  description, ALL facts as fields, and a footer with the producer name
+  only (no timestamp). The `isBgCallbackBody` `startsWith("[bg:")` arm
+  stays for ONE release: in-flight channel history, dead-letter re-posts
+  (kept verbatim), and not-yet-restyled cross-repo producers
+  (hall-monitor webhooks) still classify. Dynamic operator-facing text
+  is censored at egress (bash producers via `bg_censor`; restart-wake via
+  `egressPayload` on every string part).
+- **Plain-text fallback:** the legacy fallback (retired jarate-bg launch
+  path) shipped one content line (`[bg:<profile>:<status>] ticket <rid>
+  <status> rc=<rc>`) + one embed (title `fallback · <status>`). No NEW
+  fallback posts exist (launch is retired, stub rc 10); in-flight
+  letters of that shape are re-posted verbatim and drain.
+- Inbound exemption: piscord's `isBgWebhook` exempts ANY webhook-posted
+  message from the other-bot filter (webhook_id, since #270 — the `[bg:`
+  content prefix was never the wake gate). Machine-wake SEMANTICS
+  (queue-only, silent queue, in-turn drop) classify on
+  `isBgCallbackBody`: the legacy `[bg:` content prefix (kept one release
+  for in-flight posts + dead letters) or an embed author name starting
+  `pi-bg` (the 2026-10-21 de-prefix marker). No echo loops.
 
 ### Webhook delivery audit
 
@@ -337,8 +344,10 @@ gap) leaves a dead letter and the orchestrator never wakes on a DIED it
 never sees. Each `jarate-bg-watchdog` sweep re-posts every letter whose
 JSON body is recoverable (self-contained letters: the embedded body after
 the `--- body json ---` marker; pre-#53 letters: the `body     : <path>`
-file while it still exists): a `[bg:...]` content post wakes the channel
-(queue-only, issues #177/#179). Success: the ticket's `wb-status` gets a
+file while it still exists): the re-posted body wakes the channel
+(queue-only, issues #177/#179) — a `[bg:...]` content post for letters
+of this era (kept verbatim), an `Author: pi-bg` embed marker for
+new-shape letters. Success: the ticket's `wb-status` gets a
 re-post note and the letter is deleted (exactly-once). Failure: the letter
 is kept for the next sweep. No lock: one 15-min timer per box; a double
 sweep double-posts at most.
@@ -403,10 +412,10 @@ alerts on DELTA, not level.
   rebuild) = quiet re-baseline, the dedupe stamp drops. Max 1 ALERT per
   uid per 60 min (`$PI_BG_OOM_DEDUPE_MIN`, default 60; 0 = off); a
   suppressed delta accumulates and ships with the next fired alert.
-- **Finding, not page**: the embed card family (2026-10-19) - content
-  one line `[bg: agent-watch] OOM-ALERT user-<uid>.slice oom_kill +N`
-  (wakes the operator channel via the webhook marker) + one embed
-  (title `agent-watch · OOM`, red, `oom_kill`/`oom`/`max`/`peak` fields). M1
+- **Finding, not page**: the embed card family (2026-10-19; 2026-10-21
+  de-prefix) - EMPTY content + one embed (author `pi-bg agent-watch · OOM`
+  — the machine-wake marker — title `agent-watch · OOM`, red,
+  `oom_kill`/`oom`/`max`/`peak` fields). M1
   restarts nothing and changes no MemoryMax; absent slices are skipped
   (M2's liveness markers classify dead session vs quiet agent).
   `--quiet` = detect + log, no post, no baseline advance; `--dry-run`
@@ -445,12 +454,12 @@ bridge poll loop) is alive.
     "agent never came up after reboot" case (age = uptime).
   - **SILENT** - marker stale, or gone after having been seen -> WARN
     embed card on the ok -> silent transition (yellow, one per
-    episode): content `[bg: agent-watch] SILENT user-<uid> <age>` +
-    embed title `agent-watch · SILENT` with `age`/`note` (+`session`)
-    fields.
+    episode): EMPTY content + embed author `pi-bg agent-watch · SILENT`
+    (title `agent-watch · SILENT`, `age`/`note` (+`session`) fields,
+    the uid in the description).
   - **AGENT-DEAD** - two consecutive stale sweeps -> ALERT embed card
-    (red, silent -> dead): content `[bg: agent-watch] AGENT-DEAD
-    user-<uid> <age>` + embed title `agent-watch · AGENT-DEAD`. The
+    (red, silent -> dead): EMPTY content + embed author
+    `pi-bg agent-watch · AGENT-DEAD` (title `agent-watch · AGENT-DEAD`). The
     `user@<uid>.service` cgroup (M1's `PI_BG_OOM_ROOT` seam)
     empty/gone adds a "session gone" field: the whole user session is
     down, not just the agent.
@@ -460,9 +469,11 @@ bridge poll loop) is alive.
 - **Dedupe / wake**: max 1 ALERT per uid per `$PI_BG_LIVE_DEDUPE_MIN`
   (default 60; 0 = off); the window spans episodes and the stamp advances
   ONLY after a successful operator post (dead-letter pattern: dead
-  webhook -> the same class re-posts next sweep). Content prefix
-  `[bg: agent-watch]` (webhook wake rule: the bridge drops bot/webhook
-  posts unless the content starts with `[bg:`).
+  webhook -> the same class re-posts next sweep). The wake marker is the
+  embed author `pi-bg agent-watch · <KIND>` (webhook wake: the bridge
+  drops bot posts without a `webhook_id`; machine-wake semantics
+  classify on the serialized `Author: pi-bg`, with the legacy `[bg:`
+  content arm kept one release).
 - **Test seams**: `PI_BG_LIVE_ROOT` (fake marker dir),
   `PI_BG_LIVE_BTIME_FILE` (fake btime file). `--quiet` = detect + log, no
   post, no state advance; `--dry-run` = print only. The section no-ops
