@@ -28,3 +28,10 @@ Profile seeding copies models.json from the main agent home. New machines
 inherit 16384. Make the 32K cap part of the seed (dispatch/profiles or
 setup) so the trap doesn't recur fleet-wide. Main profile (monky) still
 carries 16384 — works today, latent risk on long thinking turns.
+
+## 2026-10-18 recurrence (frank/hydrogen)
+Same signature: stopReason=length, output=reasoning=16384, thinking-only;
+trunc1 bare-resume re-sinks deterministically (tickets 20261018-000133-4135631
++ 20261018-000701-2714). Root cause = this seed default (09-18 follow-up
+never shipped); fix = this PR. Per-profile homes can carry their own value
+(monky worker/reviewer = 32768 since 09-18).

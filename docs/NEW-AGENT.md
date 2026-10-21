@@ -116,7 +116,7 @@ node is system-wide (/usr/bin/node) - no per-user step.
   },
   "models": [{ "id": "<model-id>", "name": "<Model Name>",
     "reasoning": true, "input": ["text", "image"],
-    "contextWindow": <context-class>, "maxTokens": 16384,
+    "contextWindow": <context-class>, "maxTokens": 32768,
     "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
     "compat": { "thinkingFormat": "<thinkingFormat>" } }]
 }}}

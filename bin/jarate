@@ -1100,7 +1100,7 @@ cmd_setup() {
       --arg key "${SETUP_MKEY:-local}" --argjson headers "$SETUP_MHDR" \
       --arg id "$SETUP_MID" \
       '{name:$name,baseUrl:$base,api:"openai-completions",apiKey:$key,headers:$headers,
-        models:[{id:$id,name:$id,contextWindow:262144,maxTokens:16384,
+        models:[{id:$id,name:$id,contextWindow:262144,maxTokens:32768,
                  cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]}')"
   fi
 
