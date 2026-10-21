@@ -3,6 +3,12 @@
 Owner ask (verbatim): "brainstorm and create a solution to censor all passwords
 in keys in discord, you leak everything".
 
+This doc covers **both** redaction engines: the egress **censor**
+(`censor()` in `channel/censor.ts`, every string posted to Discord) and the
+log **sanitizer** (`sanitizeSensitiveText()` in `channel/sanitize.ts`, every
+error/log line the bridge writes). The two engines share ONE secret-pattern
+table — see [Two engines, one table](#two-engines-one-table).
+
 ## The leak surface
 
 The bridge (`packages/bridge`) posts agent output to Discord **verbatim**.
@@ -72,6 +78,59 @@ Known open (residual gaps, not covered by any process today):
   chokepoint test) and structurally for jarate-bg (posts only the censored
   strings).
 
+## Two engines, one table
+
+Secret redaction runs in two places, and both consume the single shared
+table in `packages/bridge/channel/secret-patterns.ts`:
+
+| engine | module | where it runs | marker style |
+|---|---|---|---|
+| **egress** | `censor.ts` — `censor()` | every string posted to Discord (via `egressText`, see below) + the `jarate-censor` CLI for out-of-bridge egress | `[REDACTED:<class>]` |
+| **log** | `sanitize.ts` — `sanitizeSensitiveText()` / `sanitizeUnknownValue()` | log lines: poll/send error payloads, `console.error` sites in the channel code, error/stack recursion | `[REDACTED_*]` |
+
+The audit that found the split (issue #254) showed the two engines had
+kept private copies of the same leak surface and diverged: a real 36-char
+`ghp_` PAT was redacted on egress but **not** in logs, while `AKIA`,
+`glpat-`, `xox*`, `sbk_`, `github_pat_` and DSN were absent from logs
+entirely. The table makes the split explicit data instead of two drifting
+copies: every entry names exactly one engine (`scope: "log" | "egress"`),
+its application `order`, the exact pattern (source + flags — the length
+specifiers live here and only here), and the replacement. A pattern that
+applies to both engines appears as **two entries** (one per scope), each
+with its own spec where the engines differ. `secret-patterns.test.ts`
+pins every entry (id, scope, order, source, flags, sub) plus the
+divergences below, so neither engine can silently drift.
+
+### The log-vs-egress split (per-pattern)
+
+| family | log spec (sanitize) | egress spec (censor) |
+|---|---|---|
+| github | `gh[pousr]_` + 20+ alnum → `[REDACTED_GITHUB_TOKEN]` | `gh[pousr]_` + **exactly 36** alnum, or `github_pat_` + 22..255 word chars → `[REDACTED:github]` |
+| openai `sk-` | 16+ alnum → `[REDACTED_OPENAI_KEY]` | `sk-or-` + 8+ or 20+ alnum → `[REDACTED:openai]`; `sk-ant-` + 8+ → `[REDACTED:anthropic]` |
+| google `AIza` | 20+ → `[REDACTED_GOOGLE_KEY]` | **exactly 35** → `[REDACTED:google]` |
+| bearer | case-insensitive, 10+ → `Bearer [REDACTED]` | case-sensitive, 8+ → `Bearer [REDACTED:bearer]` |
+| discord bot token | `xxx.yyy.zzz` (20+ / 6 / 25+ word chars) → `[REDACTED_DISCORD_TOKEN]` | — (the live bot token is also in the registry) |
+| key-value | query string `?key=v`, quoted `key: "v"`, bare `key=v`; keys: token/api_key/key/secret/password/authorization → `…[REDACTED]` | `key=v` (any value); `key: v` only when v is quoted (4+) or an unquoted 8+ run; keys: password/passwd/secret/token/api_key → `key=[REDACTED:kv]` |
+| switchboard `sbk_` | — | 8+ (incl. markdown-escaped `sbk\_…`) → `[REDACTED:switchboard]` |
+| gitlab `glpat-` | — | 8+ → `[REDACTED:gitlab]` |
+| aws `AKIA` | — | exactly 16 → `[REDACTED:aws]` |
+| slack `xox[baprs]-` | — | 10+ → `[REDACTED:slack]` |
+| DSN `scheme://user:pass@` | — | `scheme://[REDACTED:dsn]@` (postgres/redis/mysql/mongodb/amqps) |
+| `sshpass -p` | — | `sshpass -p [REDACTED:sshpass]` |
+
+Why the specs differ: egress ships to Discord, so a false positive is a
+visible mangled line — egress patterns pin the **exact token shape**
+(36-alnum `ghp_`, exactly-35 `AIza`). Logs are read by the operator only;
+over-redacting a log line costs nothing, so log patterns use **open
+ranges** (20+, 16+) and add log-only shapes (Discord token, query-string
+secrets). The split is today's behavior, preserved verbatim — if you want
+a pattern in the other engine, add an entry for that scope (one line)
+and extend the pin test.
+
+Not a secret pattern: **path redaction** (`redactPaths: true` on
+`sanitizeSensitiveText`) stays in `sanitize.ts` — it is flag-gated and
+redacts home-directory paths, not credentials.
+
 ## Redaction strategy
 
 `censor(text)` = two passes, in order:
@@ -92,7 +151,12 @@ prefix.
 Missing file = empty registry = patterns only. Never an error: a fresh
 agent box must still run with pattern-only redaction.
 
-### (b) PATTERN — built-in classes, fixed order
+### (b) PATTERN — shared table, scope "egress", fixed order
+
+The classes come from the shared table (`secret-patterns.ts`, scope
+"egress", applied in ascending `order`; see
+[Two engines, one table](#two-engines-one-table) for the full split).
+Egress classes, in application order:
 
 | class | pattern (abridged) | tag |
 |---|---|---|
@@ -148,6 +212,15 @@ output, and it is why the censor is idempotent (see below).
 `censor.test.ts` (~20 tests): one per pattern class, registry literal +
 longest-first, registry missing-file, DSN, sshpass, code-block kv,
 plain-word pass-through, idempotence, WARN-fingerprint shape (no raw value).
+`sanitize.test.ts`: log-engine behavior (bearer/openai/discord-token/query
+kv/quoted kv/bare kv/path redaction/error recursion).
+`secret-patterns.test.ts` (issue #254): pins the shared table — every entry
+present with its scope + order + exact pattern source (length specifiers)
++ flags + replacement, no extra entries, per-entry boundary samples
+(fires at threshold, quiet below), the preserved log/egress divergences
+end to end, and source-level asserts that both engines consume the table.
+A dropped pattern, a re-scoped entry, or a shortened specifier ({36} →
+{30,}) fails this file.
 `discord.test.ts` choke-point test: source-level assert that all text-
 and filename-bearing send functions in `discord.ts` (exported or not) that
 POST/PATCH a `content` body or a `payload_json` multipart call

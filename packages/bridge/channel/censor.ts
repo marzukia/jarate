@@ -6,8 +6,10 @@
  *   (a) REGISTRY: exact literals from ~/.pi/agent/secrets.txt
  *       ($JARATE_SECRETS_FILE overrides), longest first.
  *       → [REDACTED:secret#N]
- *   (b) PATTERN: built-in classes (GitHub/Switchboard/GitLab/Anthropic/
- *       OpenAI/AWS/Google/Slack/Bearer/DSN/sshpass/key-value).
+ *   (b) PATTERN: the shared secret-pattern table (secret-patterns.ts,
+ *       scope "egress") — the same table the log sanitizer (sanitize.ts)
+ *       consumes under scope "log", so the two engines cannot silently
+ *       diverge. See docs/secret-censor.md for the log-vs-egress split.
  *       → [REDACTED:<class>]
  *
  * Guarantees:
@@ -22,6 +24,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { applyEntry, patternsForScope } from "./secret-patterns";
 
 // ─── Registry ────────────────────────────────────────────────────────────
 
@@ -89,111 +92,13 @@ function fingerprint(literal: string): string {
   return `${literal.slice(0, 4)}…${literal.slice(-4)}`;
 }
 
-// ─── Pattern classes ─────────────────────────────────────────────────────
-
-interface PatternRule {
-  cls: string;
-  re: RegExp;
-  /** Fixed replacement (no raw value, so censor is idempotent). */
-  sub: (match: string, ...groups: string[]) => string;
-}
-
-/**
- * Built-in pattern classes, applied in this fixed order. The kv rule is
- * last: it is the loosest and must not shadow the specific token classes.
- */
-const RULES: PatternRule[] = [
-  {
-    // Classic PAT: ghp_/gho_/ghu_/ghs_/ghr_ + exactly 36 alnum.
-    // Fine-grained: github_pat_ + 22..255 word chars. Short/partial runs
-    // are not token-shaped and must not trigger (issue #54).
-    cls: "github",
-    re: /\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})\b/g,
-    sub: () => "[REDACTED:github]",
-  },
-  {
-    // Switchboard house key: sbk_<name>_<16 hex> (docs/NEW-AGENT.md).
-    // The run-frame path censors BEFORE it clips (toolActionText), so the
-    // key is whole and unescaped there. The final-send censor still sees
-    // the escaped + clipped form (sbk\_agent\_…, cut at the 28-col text
-    // budget), so the pattern must accept the escaped form too. The
-    // classic/fine-grained GitHub shapes are longer than any tool-line
-    // clip and reach the final censor unescaped (or clipped mid-run, where
-    // the trailing \b lands on the ellipsis).
-    cls: "switchboard",
-    re: /\bsbk\\?_[A-Za-z0-9\\_]{8,}\b/g,
-    sub: () => "[REDACTED:switchboard]",
-  },
-  {
-    cls: "gitlab",
-    re: /\bglpat-[A-Za-z0-9_-]{8,}\b/g,
-    sub: () => "[REDACTED:gitlab]",
-  },
-  {
-    cls: "anthropic",
-    re: /\bsk-ant-[A-Za-z0-9_-]{8,}\b/g,
-    sub: () => "[REDACTED:anthropic]",
-  },
-  {
-    cls: "openai",
-    re: /\bsk-(?:or-[A-Za-z0-9_-]{8,}|[A-Za-z0-9]{20,})\b/g,
-    sub: () => "[REDACTED:openai]",
-  },
-  {
-    cls: "aws",
-    re: /\bAKIA[0-9A-Z]{16}\b/g,
-    sub: () => "[REDACTED:aws]",
-  },
-  {
-    cls: "google",
-    re: /\bAIza[0-9A-Za-z_-]{35}\b/g,
-    sub: () => "[REDACTED:google]",
-  },
-  {
-    cls: "slack",
-    re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
-    sub: () => "[REDACTED:slack]",
-  },
-  {
-    cls: "bearer",
-    re: /\bBearer\s+[A-Za-z0-9._~+-]{8,}/g,
-    sub: () => "Bearer [REDACTED:bearer]",
-  },
-  {
-    // postgresql://user:pass@host, redis://:pass@host, etc.
-    cls: "dsn",
-    re: /\b(postgres(?:ql)?|mysql|rediss?|mongodb(?:\+srv)?|amqps?):\/\/(?:(?:[^@\s/:]+)?:)?[^@\s/:]+@/gi,
-    sub: (_m, scheme) => `${scheme.toLowerCase()}://[REDACTED:dsn]@`,
-  },
-  {
-    // The unquoted value class must not match an already-redacted marker
-    // fragment: toolActionText censors BEFORE it clips, so the egress
-    // censor re-sees `sshpass -p [REDACTED:s…` — the fit can leave as few
-    // as ONE marker char (`sshpass -p […]`, the kv line's fragment is even
-    // shorter). Any value starting `[` here is a marker fragment, never a
-    // raw secret; re-expanding it ships a 38-col line (PR #64 review P2).
-    cls: "sshpass",
-    re: /\bsshpass\s+-p\s+(?!\[)\S+/g,
-    sub: () => "sshpass -p [REDACTED:sshpass]",
-  },
-  {
-    // key = value (any context) — the strongest leak signal. Same
-    // self-exclusion as sshpass: the unquoted value class skips marker
-    // fragments (`token=[…` after a 23-col fit) so the egress pass is a
-    // no-op on already-clipped frames (PR #64 review P2).
-    cls: "kv",
-    re: /(?<![\w-])\b(password|passwd|secret|token|api[_-]?key)\b\s*=\s*("[^"]*"|'[^']*'|(?!\[)\S+)/gi,
-    sub: (_m, key) => `${key.toLowerCase()}=[REDACTED:kv]`,
-  },
-  {
-    // key: value — only when the value is quoted (>=4) or an unquoted
-    // token-like run of >=8 chars, so prose like "the password: forgot it"
-    // (6 letters) is left alone while real tokens are caught.
-    cls: "kv",
-    re: /(?<![\w-])\b(password|passwd|secret|token)\b\s*:\s*("[^"]{4,}"|'[^']{4,}'|[^\s,:;'"[\]]{8,})/gi,
-    sub: (_m, key) => `${key.toLowerCase()}: [REDACTED:kv]`,
-  },
-];
+// Pattern classes: the SHARED secret-pattern table
+// (secret-patterns.ts, scope "egress", applied in ascending `order`) —
+// the same table the log sanitizer consumes under scope "log". The
+// table's comments carry the per-class rationale (token shapes, the
+// marker-fragment self-exclusion on sshpass/kv, kv-last ordering).
+// secret-patterns.test.ts pins every entry so this list cannot silently
+// diverge from the log side (issue #254).
 
 // ─── Censor ──────────────────────────────────────────────────────────────
 
@@ -253,12 +158,13 @@ export function censor(text: string, opts: CensorOptions = {}): string {
     }
   }
 
-  // (b) pattern classes, fixed order
-  for (const rule of RULES) {
+  // (b) pattern classes — shared table, scope "egress", fixed order
+  for (const rule of patternsForScope("egress")) {
     const matches = [...out.matchAll(rule.re)];
     if (matches.length === 0) continue;
-    out = out.replace(rule.re, rule.sub);
-    warn(log, `class=${rule.cls}`, rule.cls, matches.length);
+    out = applyEntry(out, rule);
+    const cls = rule.cls ?? rule.id;
+    warn(log, `class=${cls}`, cls, matches.length);
   }
 
   return out;
