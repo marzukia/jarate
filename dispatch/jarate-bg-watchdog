@@ -77,8 +77,10 @@
 #       on a DIED it never sees. Each sweep re-posts every letter whose
 #       JSON body is recoverable (embedded after the `--- body json ---`
 #       marker; pre-#53 letters fall back to the `body     : <path>`
-#       file while it exists): a [bg:...] content post wakes the channel
-#       (queue-only, #177/#179). Success: wb-status re-post note +
+#       file while it exists): the re-posted body wakes the channel
+#       (queue-only, #177/#179) - a `[bg:...]` content post for letters
+#       of this era (kept verbatim), an `Author: pi-bg` embed marker for
+#       new-shape letters. Success: wb-status re-post note +
 #       letter deleted (exactly-once). Failure: letter kept for the next
 #       sweep. No lock (one 15-min timer per box; a double sweep
 #       double-posts at most).
@@ -108,8 +110,8 @@
 #       uids (own uid + the ~/.config/jarate/fleet-agents roster) and
 #       compares oom_kill/oom against the persisted baseline ($rec_dir/
 #       oom-baseline.json, survives restarts). Positive oom_kill delta
-#       -> OOM-ALERT post ([bg: agent-watch] card wakes the
-#       channel; the card carries oom_kill + oom counters +
+#       -> OOM-ALERT post (the card's embed author `pi-bg agent-watch · OOM`
+#       wakes the channel; the card carries oom_kill + oom counters +
 #       memory.max + memory.peak as fields in ONE red embed). Baseline semantics (dead-letter pattern): first
 #       sight of a uid = quiet baseline (the historical counter never
 #       alerts by itself); the baseline advances ONLY after a successful
@@ -144,8 +146,10 @@
 #       stamp advance ONLY after a successful operator post). Wake:
 #       operator webhook + the roster's per-agent webhook (the
 #       fleet-agents column M1 parsed but did not use) so the agent sees
-#       its own near-misses on return. Content prefix [bg: agent-watch]
-#       (webhook wake rule). Max 1 ALERT per uid per PI_BG_LIVE_DEDUPE_MIN
+#       its own near-misses on return. The wake marker is the embed
+#       author `pi-bg agent-watch · <KIND>` (2026-10-21 de-prefix: content
+#       is EMPTY; the webhook post itself is what isBgWebhook exempts).
+#       Max 1 ALERT per uid per PI_BG_LIVE_DEDUPE_MIN
 #       min (default 60; the window spans episodes). FINDING only: no
 #       auto-restart of pi.service.
 #   5. AGENTS.md drift tripwire (2026-09-14, alert-only): run
@@ -1601,15 +1605,17 @@ fi
 # embeds the JSON body after the `--- body json ---` marker (pre-#53
 # letters reference a body file the launcher's tmp cleanup deletes -
 # best-effort fallback if it still exists). Each sweep re-posts every
-# letter with a recoverable, JSON-valid body: a `[bg:...]` content post
-# wakes the channel (queue-only, issues #177/#179), the embed lands in the
+# letter with a recoverable, JSON-valid body: the re-posted body wakes
+# the channel (queue-only, issues #177/#179) - a `[bg:...]` content post
+# for letters of this era (kept verbatim), an `Author: pi-bg` embed marker
+# for new-shape letters - the embed lands in the
 # /jobs history. On success: the ticket's wb-status gets a re-post note
 # and the letter is deleted (exactly-once). On failure: the letter stays
 # for the next sweep. Under --quiet the letters are kept, not re-posted
 # (the quiet contract is zero posts, review #183 F4) - they fire on the
 # next non-quiet sweep. No lock (house style: one 15-min timer per box; a
-# double sweep double-posts at most, the [bg: dedupe in the bridge keeps
-# that to one wake).
+# double sweep double-posts at most, the bridge's per-message-id dedupe
+# keeps that to one wake).
 dl_consumed=0
 if [ -n "$webhook" ]; then
   for letter in "$BG_TMP"/pi-bg-*-webhook-failed \
@@ -1784,11 +1790,13 @@ PY
 # wd_build_oom <body-file> <uid> <delta-kill> <total-kill> <base-kill>
 #   <delta-oom> <total-oom> <base-oom> <memory.max> <memory.peak>
 # OOM-ALERT finding (issue #191 M1). 2026-10-19 (Andryo): EMBED CARD
-# family (the same visual as the pi-bg completion posts): content is ONE
-# line - `[bg: agent-watch] OOM-ALERT user-<uid>.slice oom_kill +<delta>`
-# (the [bg: prefix on line 1 is the webhook wake marker, isBgWebhook) -
-# plus ONE embed (title/color/description/fields/footer, no timestamp):
-# oom_kill delta + totals, memory.max + memory.peak ride the fields.
+# family (the same visual as the pi-bg completion posts). 2026-10-21
+# (Andryo): the visible [bg: content prefix is dropped - content is
+# EMPTY and the machine-wake marker rides the EMBED AUTHOR
+# (`pi-bg agent-watch · OOM`; the serialized "Author: pi-bg" is what
+# isBgCallbackBody classifies). ONE embed (title/color/description/
+# fields/footer, no timestamp): oom_kill delta + totals, memory.max +
+# memory.peak ride the fields.
 # memory.max "max" (uncapped) passes through; byte values get a GiB
 # rendering.
 wd_build_oom() {
@@ -1805,8 +1813,8 @@ def gib(s):
         return s or "n/a"  # "max" (uncapped) or empty (no memory.peak)
     return f"{n / 2**30:.1f}G"
 uid = E("UID")
-content = f"[bg: agent-watch] OOM-ALERT user-{uid}.slice oom_kill +{E('DK')}"
-json.dump({"content": content, "embeds": [{
+json.dump({"content": "", "embeds": [{
+    "author": {"name": "pi-bg agent-watch \u00b7 OOM"},
     "title": f"agent-watch \u00b7 OOM",
     "color": 0xED4245,
     "description": (f"new OOM kills in user-{uid}.slice since the last sweep.\n"
@@ -1951,9 +1959,11 @@ fi
 # Wake: operator webhook ($webhook, the authoritative page) + the roster's
 # per-agent webhook (the fleet-agents column M1 parsed but did not use) so
 # the agent sees its own near-misses on return; the own-webhook post is
-# best-effort (the agent is probably down) - logged, never retried. Content
-# prefix [bg: agent-watch] (webhook wake rule: the bridge drops bot/webhook
-# posts unless the content starts with [bg: ).
+# best-effort (the agent is probably down) - logged, never retried. The
+# wake marker is the embed author `pi-bg agent-watch · <KIND>` (2026-10-21
+# de-prefix: content is EMPTY; the bridge drops bot posts without a
+# webhook_id and classifies machine wakes on the serialized `Author: pi-bg`
+# marker, with the legacy `[bg:` content arm kept one release).
 # --quiet = detect + log, no post, no state advance; --dry-run = print
 # only. The section no-ops when $LIVE_ROOT is absent (the marker
 # mechanism is not installed on this box).
@@ -2071,12 +2081,14 @@ PY
 # wd_build_live <body-file> <uid> <kind> <age> <note> <session>
 # kind: SILENT (near-miss, one per episode) or AGENT-DEAD (two
 # consecutive stale sweeps). 2026-10-19 (Andryo): EMBED CARD family (the
-# same visual as the pi-bg completion posts): content is ONE line -
-# `[bg: agent-watch] <KIND> user-<uid> <age>` (the [bg: prefix on line 1
-# is the webhook wake marker, isBgWebhook) - plus ONE embed
-# (title/color/description/fields/footer, no timestamp): age + note ride
-# the fields, plus a "session gone" field when the user session cgroup is
-# empty/gone (the whole session is down, not just the agent).
+# same visual as the pi-bg completion posts). 2026-10-21 (Andryo): the
+# visible [bg: content prefix is dropped - content is EMPTY and the
+# machine-wake marker rides the EMBED AUTHOR (`pi-bg agent-watch ·
+# <KIND>`; the serialized "Author: pi-bg" is what isBgCallbackBody
+# classifies). ONE embed (title/color/description/fields/footer, no
+# timestamp): age + note ride the fields, plus a "session gone" field
+# when the user session cgroup is empty/gone (the whole session is down,
+# not just the agent).
 wd_build_live() {
   local bodyfile="$1" uid="$2" kind="$3" age="$4" note="$5" sess="$6"
   WD_L_UID="$uid" WD_L_KIND="$kind" WD_L_AGE="$age" WD_L_NOTE="$note" \
@@ -2088,16 +2100,19 @@ uid = E("UID")
 kind = E("KIND") or "SILENT"
 sess = E("SESS") or "unknown"
 dead = kind == "AGENT-DEAD"
-desc = ("the agent has been missing for two consecutive sweeps - the session may be down."
-        if dead else "the agent marker went stale (near-miss, one post per episode).")
+# the uid rides the description: the operator webhook also carries FLEET
+# ROSTER peers' cards, so the card must say WHICH agent (2026-10-21
+# de-prefix: the uid used to sit in the [bg: content line)
+desc = ("user-" + uid + ": the agent has been missing for two consecutive sweeps - the session may be down."
+        if dead else "user-" + uid + ": the agent marker went stale (near-miss, one post per episode).")
 fields = [
     {"name": "age", "value": E("AGE"), "inline": True},
     {"name": "note", "value": E("NOTE")},
 ]
 if sess == "gone":
     fields.append({"name": "session", "value": "gone", "inline": True})
-content = f"[bg: agent-watch] {kind} user-{uid} {E('AGE')}"
-json.dump({"content": content, "embeds": [{
+json.dump({"content": "", "embeds": [{
+    "author": {"name": f"pi-bg agent-watch \u00b7 {kind}"},
     "title": f"agent-watch \u00b7 {kind}",
     "color": 0xED4245 if dead else 0xFEE75C,
     "description": desc,

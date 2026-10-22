@@ -7,7 +7,8 @@
  * The channel extension is the agent-interactive bg runtime — a dispatch
  * run must not connect the channel, drain/scan the re-wake queue, or
  * register channel tools. Run events flow through the fleetwork wrapper
- * ([bg: fleetwork] <ticket> lines), not this bridge. (Pilot 2026-10-20:
+ * ([bg: fleetwork] <ticket> lines -> `pi-bg fleetwork` machine-wake
+ * cards; the visible [bg: prefix was dropped 2026-10-21), not this bridge. (Pilot 2026-10-20:
  * dispatch runs 3/5/6 each posted an "unplanned restart" wake card to the
  * agent's own channel on start, re-waking the interactive agent with a
  * ticket event about a different process.)

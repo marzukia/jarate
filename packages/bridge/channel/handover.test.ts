@@ -398,8 +398,9 @@ describe("extractDeterministic", () => {
   });
   // Real channel-inbound entries carry the full prompt text in `content`
   // (channel-ctx block as the FIRST line) plus the clean body in
-  // `details.body`. Machine inbounds (Beepy webhook, [bg: heartbeats) come
-  // through the same customType; bridge-injected wakes carry no channel-ctx.
+  // `details.body`. Machine inbounds (Beepy webhook - the `Author: pi-bg`
+  // embed, or legacy `[bg:` content) come through the same customType;
+  // bridge-injected wakes carry no channel-ctx.
   // Faithful to the CustomMessageEntry shape: timestamp is a string
   // (sendToPi passes new Date().toISOString()) and details carries the
   // channelTitle() string (e.g. "discord/Test").
@@ -423,7 +424,11 @@ describe("extractDeterministic", () => {
         "Beepy",
         "<embed>\nAuthor: pi-bg ticket · OK\n```bash\n[ok] pass\n```</embed>",
       ),
-      inb(3, "Beepy", "[bg: heartbeat] 1 in-flight"),
+      inb(
+        3,
+        "Beepy",
+        "<embed>\nAuthor: pi-bg agent-watch · SILENT\nTitle: agent-watch · SILENT\nuser-123 30m\n</embed>",
+      ),
       // bridge-injected (no channel-ctx): not a human ask
       inb(
         4,
@@ -447,7 +452,11 @@ describe("extractDeterministic", () => {
     p.turnPrefixMessages = [];
     const entries = [
       inb(1, "Beepy", "<embed>x</embed>"),
-      inb(2, null, "[bg: restart-wake] session restarted"),
+      inb(
+        2,
+        null,
+        "<embed>\nAuthor: pi-bg restart-wake · planned\nTitle: restart-wake · planned\npi restarted as planned (clean stop) - back online. No in-flight pi-bg work.\nFooter: restart-wake\n</embed>",
+      ),
     ];
     const s = extractDeterministic(p, entries as any, emptyCtx);
     expect(s.lastUserAsks).toEqual([]);
@@ -628,7 +637,12 @@ describe("inboundSender / isHumanInbound (RCA F3)", () => {
   });
   test("no channel-ctx (bridge-injected wake) → null", () => {
     expect(
-      inboundSender(inb(null, "[bg: restart-wake] session restarted") as any),
+      inboundSender(
+        inb(
+          null,
+          "<embed>\nAuthor: pi-bg restart-wake · planned\n</embed>",
+        ) as any,
+      ),
     ).toBeNull();
   });
   test("human free text → true", () => {
@@ -642,7 +656,7 @@ describe("inboundSender / isHumanInbound (RCA F3)", () => {
       isHumanInbound(inb("andy", "<embed>\nAuthor: pi-bg</embed>") as any),
     ).toBe(false);
   });
-  test("[bg: heartbeat body → false", () => {
+  test("legacy [bg: content body → false (one release)", () => {
     expect(
       isHumanInbound(inb("andy", "[bg: heartbeat] 1 in-flight") as any),
     ).toBe(false);

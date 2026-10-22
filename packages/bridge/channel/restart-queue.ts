@@ -25,7 +25,7 @@
 //   option 1 (backstop): the same startup pass does ONE bounded
 //     history fetch per channel (messages?before=<cursor>&limit=N,
 //     N = $PISCORD_REWAKE_LOOKBACK, default 50) and re-queues any
-//     [bg:/pi-bg webhook post in the window that is not in the
+//     machine-wake (webhook_id) post in the window that is not in the
 //     delivered set (ids committed to pi, capped) and not already
 //     pending. Covers the micro-window where the cursor advanced but
 //     the queue-file write did not land (process died mid-ingest),
@@ -37,7 +37,7 @@
 // single-threaded bridge is the only writer of a given file). A
 // corrupt or partially-shaped file falls back to EMPTY (documented:
 // pending entries are lost from the file, but option 1 re-finds
-// undelivered [bg: posts — at-least-once over exactly-once is the
+// undelivered machine-wake posts — at-least-once over exactly-once is the
 // safe direction when the dedupe set itself is suspect).
 
 import * as fs from "node:fs";
@@ -57,16 +57,17 @@ export const REWAKE_LOOKBACK_DEFAULT = 50;
 /** Hard clamp for the lookback bound (the scan is one REST call). */
 export const REWAKE_LOOKBACK_MAX = 200;
 /** Delivered-id cap per channel. Tied to the lookback clamp (MAX + 1)
- *  so the invariant holds with margin at the edge: any [bg: post inside
- *  the scan window, if ever committed, is within the last DELIVERED_CAP
+ *  so the invariant holds with margin at the edge: any machine-wake post
+ *  inside the scan window, if ever committed, is within the last
+ *  DELIVERED_CAP
  *  commits and therefore still in the set. A test pins the tie — raising
  *  REWAKE_LOOKBACK_MAX without the cap cannot slip through silently. */
 export const REWAKE_DELIVERED_CAP = REWAKE_LOOKBACK_MAX + 1;
 /** Age guard for the scan: applied uniformly to EVERY scan (file health
  *  is not inspected) — a candidate older than this is dropped, never
  *  re-queued. It bounds the re-queue to the last 72h of history: even a
- *  corrupt file (lost delivered set) cannot resurrect a [bg: post older
- *  than this. */
+ *  corrupt file (lost delivered set) cannot resurrect a machine-wake post
+ *  older than this. */
 export const REWAKE_SCAN_MAX_AGE_MS = 72 * 3_600_000;
 export const REWAKE_LOOKBACK_ENV = "PISCORD_REWAKE_LOOKBACK";
 
@@ -353,7 +354,7 @@ export interface BgScanResult {
   requeued: number;
 }
 
-/** Re-queue undelivered [bg:/pi-bg webhook posts from the bounded
+/** Re-queue undelivered machine-wake (webhook_id) posts from the bounded
  *  pre-cursor window. One REST call per channel, fire-and-forget at
  *  the call site. Never throws. */
 export async function scanUndeliveredBgInbounds(

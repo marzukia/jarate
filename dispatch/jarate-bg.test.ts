@@ -110,7 +110,7 @@ describe("launch path retired (hall-monitor #35): stub contract", () => {
     );
     expect(r.err).toContain("/srv/fleetwork/work/<ticket>");
     expect(r.err).toContain("/srv/fleetwork/<repo>.git");
-    expect(r.err).toContain("[bg: fleetwork]");
+    expect(r.err).toContain("pi-bg fleetwork");
     // zero side effects: pi never exec'd, no run record, the artifact
     // dir the in-flight runs own is untouched
     expect(fs.existsSync(path.join(fx.tmp, "pi-ran"))).toBe(false);

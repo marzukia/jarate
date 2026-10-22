@@ -3447,9 +3447,9 @@ describe("#143: mid-run events (child-left / sess-write)", () => {
 // root is the spec's test seam - unit tests never read real cgroups),
 // compares oom_kill/oom against the persisted baseline
 // ($PI_DISPATCH_RECORD_DIR/oom-baseline.json, survives restarts), and
-// posts an OOM-ALERT (the [bg: agent-watch] EMBED CARD, 2026-10-19:
-// one-line content with the wake tag + one embed with the facts as
-// fields) on a positive oom_kill delta. Baseline semantics: first sight = quiet
+// posts an OOM-ALERT (the EMBED CARD family, 2026-10-19; 2026-10-21
+// de-prefix: content is EMPTY, the wake marker is the embed author
+// `pi-bg agent-watch · OOM`) on a positive oom_kill delta. Baseline semantics: first sight = quiet
 // baseline (the historical counter never alerts); the baseline advances
 // ONLY after a successful post (dead webhook -> same grown delta re-posts
 // next sweep); counter regression (slice recreated) = quiet re-baseline;
@@ -3551,7 +3551,7 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
     }
   });
 
-  test("positive oom_kill delta -> OOM-ALERT post ([bg: agent-watch], delta + totals + max + peak), baseline advances", async () => {
+  test("positive oom_kill delta -> OOM-ALERT post (author pi-bg agent-watch · OOM, delta + totals + max + peak), baseline advances", async () => {
     const f = oomFixture();
     try {
       f.seedBaseline({ [String(OWN)]: { oom_kill: 0, oom: 0 } });
@@ -3562,13 +3562,11 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(r.code).toBe(0);
       expect(f.posts).toHaveLength(1);
       const body = f.posts[0];
-      // the [bg: tag on line 1 of content is the webhook wake marker
-      // (isBgWebhook); embed card family: one-line content + one embed
-      // (title/color/description/fields/footer, no timestamp)
-      expect(body.content).toBe(
-        `[bg: agent-watch] OOM-ALERT user-${OWN}.slice oom_kill +2`,
-      );
+      // 2026-10-21 de-prefix: content is EMPTY; the wake marker is the
+      // embed author (serialized "Author: pi-bg", isBgCallbackBody)
+      expect(body.content).toBe("");
       expect(body.embeds).toHaveLength(1);
+      expect(body.embeds[0].author?.name).toBe("pi-bg agent-watch \u00b7 OOM");
       expect(body.embeds[0].title).toBe("agent-watch \u00b7 OOM");
       expect(body.embeds[0].color).toBe(0xed4245);
       expect(body.embeds[0].footer?.text).toBe("jarate-bg-watchdog");
@@ -3629,8 +3627,9 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(r2.code).toBe(0);
       expect(f.posts).toHaveLength(1);
       // the accumulated delta is reported (nothing was lost)
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] OOM-ALERT user-${OWN}.slice oom_kill +3`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 OOM",
       );
       const fld2 = cardFields(f.posts[0]);
       expect(fld2.oom_kill).toBe("+3 (3 total, base 0)");
@@ -3737,8 +3736,9 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       expect(r.code).toBe(0);
       expect(f.posts).toHaveLength(1); // only the peer's delta
       const body = f.posts[0];
-      expect(body.content).toBe(
-        `[bg: agent-watch] OOM-ALERT user-${PEER}.slice oom_kill +4`,
+      expect(body.content).toBe("");
+      expect(body.embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 OOM",
       );
       const fld3 = cardFields(body);
       expect(fld3.oom_kill).toBe("+4 (4 total, base 0)");
@@ -3865,8 +3865,9 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
       );
       // the post reached the fixture capture server
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] OOM-ALERT user-${OWN}.slice oom_kill +1`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 OOM",
       );
       expect(cardFields(f.posts[0]).oom_kill).toBe("+1 (1 total, base 0)");
       // and the baseline advanced AT THE PASSED rec dir
@@ -3949,8 +3950,10 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
 // state + the dedupe stamp advance ONLY after a successful operator post;
 // dead webhook -> same class re-posts next sweep). Max 1 ALERT per uid
 // per PI_BG_LIVE_DEDUPE_MIN (60, 0 = off); the window spans episodes.
-// Wake: operator webhook + the roster's per-agent webhook; content prefix
-// [bg: agent-watch]. Test seams: PI_BG_LIVE_ROOT (fake marker dir),
+// Wake: operator webhook + the roster's per-agent webhook; the wake
+// marker is the embed author `pi-bg agent-watch · <KIND>` (2026-10-21
+// de-prefix: the [bg: content prefix is gone, content is EMPTY). Test
+// seams: PI_BG_LIVE_ROOT (fake marker dir),
 // PI_BG_LIVE_BTIME_FILE (fake btime file).
 // ────────────────────────────────────────────────────────────────────────────
 describe("#191 M2: agent liveness (marker sweep)", () => {
@@ -4100,11 +4103,11 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(r.code).toBe(0);
       expect(f.posts).toHaveLength(1);
       const body = f.posts[0];
-      // the [bg: tag on line 1 of content is the webhook wake marker
-      // (isBgWebhook); embed card family: one-line content + one embed
-      // (yellow WARN class, title/color/description/fields/footer)
-      expect(body.content).toBe(
-        `[bg: agent-watch] SILENT user-${OWN} 20m stale (limit 15m)`,
+      // 2026-10-21 de-prefix: content is EMPTY; the wake marker is the
+      // embed author (yellow WARN class, title/color/description/fields/footer)
+      expect(body.content).toBe("");
+      expect(body.embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       expect(body.embeds).toHaveLength(1);
       expect(body.embeds[0].title).toBe("agent-watch \u00b7 SILENT");
@@ -4139,8 +4142,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       // a corrupt state reads as first-sight (empty entry) -> sweep 1
       // escalates exactly one level: the WARN class, never AGENT-DEAD
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] SILENT user-${OWN} 20m stale (limit 15m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       expect(cardFields(f.posts[0]).note).toBe("marker stale");
       // dead-letter discipline: the state is rewritten as valid JSON
@@ -4167,8 +4171,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       const r1 = await f.run();
       expect(r1.code).toBe(0);
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] AGENT-DEAD user-${OWN} 20m stale (limit 15m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 AGENT-DEAD",
       );
       expect(f.posts[0].embeds).toHaveLength(1);
       expect(f.posts[0].embeds[0].title).toBe("agent-watch \u00b7 AGENT-DEAD");
@@ -4275,8 +4280,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       });
       await f.run();
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] SILENT user-${OWN} predates boot (up 60m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       const fldB = cardFields(f.posts[0]);
       expect(fldB.age).toBe("predates boot (up 60m)");
@@ -4284,8 +4290,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(f.state()[String(OWN)].state).toBe("silent");
       await f.run();
       expect(f.posts).toHaveLength(2);
-      expect(f.posts[1].content).toBe(
-        `[bg: agent-watch] AGENT-DEAD user-${OWN} predates boot (up 60m)`,
+      expect(f.posts[1].content).toBe("");
+      expect(f.posts[1].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 AGENT-DEAD",
       );
       expect(cardFields(f.posts[1]).note).toBe("2 consecutive stale sweeps");
       expect(f.state()[String(OWN)].state).toBe("dead");
@@ -4302,8 +4309,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(f.state()[String(OWN)].marker_seen).toBe(false);
       const r2 = await f.run(); // the WARN fires once
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] SILENT user-${OWN} no marker (never seen)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       const fldN = cardFields(f.posts[0]);
       expect(fldN.age).toBe("no marker (never seen)");
@@ -4334,8 +4342,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       const r = await f.run();
       expect(r.code).toBe(0);
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] SILENT user-${OWN} gone (last seen 20m ago)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       const fldG = cardFields(f.posts[0]);
       expect(fldG.age).toBe("gone (last seen 20m ago)");
@@ -4381,7 +4390,8 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       });
       await f.run();
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toContain("AGENT-DEAD");
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toContain("AGENT-DEAD");
     } finally {
       f.close();
     }
@@ -4401,7 +4411,8 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(fs.existsSync(f.stateFile)).toBe(false); // no advance
       const r2 = await f.run(); // the webhook is back
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toContain("SILENT");
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toContain("SILENT");
       expect(f.state()[String(OWN)].state).toBe("silent");
       // the ALERT with a dead webhook: state stays silent (the retry case)
       const r3 = await f.run([], { PI_DISPATCH_WEBHOOK: deadHook });
@@ -4412,7 +4423,8 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(f.state()[String(OWN)].state).toBe("silent");
       await f.run();
       expect(f.posts).toHaveLength(2);
-      expect(f.posts[1].content).toContain("AGENT-DEAD");
+      expect(f.posts[1].content).toBe("");
+      expect(f.posts[1].embeds?.[0].author?.name).toContain("AGENT-DEAD");
       expect(f.state()[String(OWN)].state).toBe("dead");
       void r2;
       void r3;
@@ -4436,8 +4448,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       const r1 = await f.run();
       expect(r1.code).toBe(0);
       expect(f.posts).toHaveLength(1);
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] AGENT-DEAD user-${OWN} 20m stale (limit 15m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 AGENT-DEAD",
       );
       expect(f.posts[0].embeds).toHaveLength(1);
       expect(f.posts[0].embeds[0].title).toBe("agent-watch \u00b7 AGENT-DEAD");
@@ -4462,8 +4475,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       });
       await g.run();
       expect(g.posts).toHaveLength(1);
-      expect(g.posts[0].content).toBe(
-        `[bg: agent-watch] AGENT-DEAD user-${OWN} 20m stale (limit 15m)`,
+      expect(g.posts[0].content).toBe("");
+      expect(g.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 AGENT-DEAD",
       );
       expect(cardFields(g.posts[0]).session).toBe("gone");
     } finally {
@@ -4480,16 +4494,24 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       const r1 = await f.run();
       expect(r1.code).toBe(0);
       expect(f.posts).toHaveLength(1); // only the peer's SILENT
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] SILENT user-${PEER} 20m stale (limit 15m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 SILENT",
       );
       expect(f.peerPosts).toHaveLength(1); // the peer's own hook got a copy
-      expect(f.peerPosts[0].content).toBe(f.posts[0].content);
+      expect(f.peerPosts[0].embeds?.[0].author?.name).toBe(
+        f.posts[0].embeds?.[0].author?.name,
+      );
       await f.run();
       expect(f.posts).toHaveLength(2);
-      expect(f.posts[1].content).toContain(`AGENT-DEAD user-${PEER}`);
+      // the peer's card says WHICH agent (the uid rides the description;
+      // it used to sit in the [bg: content line)
+      expect(f.posts[1].content).toBe("");
+      expect(f.posts[1].embeds?.[0].author?.name).toContain("AGENT-DEAD");
+      expect(f.posts[1].embeds?.[0].description).toContain(`user-${PEER}`);
       expect(f.peerPosts).toHaveLength(2);
-      expect(f.peerPosts[1].content).toContain(`AGENT-DEAD user-${PEER}`);
+      expect(f.peerPosts[1].embeds?.[0].author?.name).toContain("AGENT-DEAD");
+      expect(f.peerPosts[1].embeds?.[0].description).toContain(`user-${PEER}`);
       // own uid: ok, no post of any kind
       expect(f.state()[String(OWN)].state).toBe("ok");
       expect(f.state()[String(PEER)].state).toBe("dead");
@@ -4567,7 +4589,8 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(fs.existsSync(f.stateFile)).toBe(false);
       await f.run();
       expect(f.posts).toHaveLength(1); // not advanced -> ok -> silent
-      expect(f.posts[0].content).toContain("SILENT");
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toContain("SILENT");
     } finally {
       f.close();
     }
@@ -4638,8 +4661,9 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
       expect(exitCode).toBe(0);
       expect(f.posts).toHaveLength(1);
       // session present (fixture cgroup has a member): no session field
-      expect(f.posts[0].content).toBe(
-        `[bg: agent-watch] AGENT-DEAD user-${OWN} 20m stale (limit 15m)`,
+      expect(f.posts[0].content).toBe("");
+      expect(f.posts[0].embeds?.[0].author?.name).toBe(
+        "pi-bg agent-watch \u00b7 AGENT-DEAD",
       );
       expect(f.posts[0].embeds).toHaveLength(1);
       expect(cardFields(f.posts[0]).session).toBeUndefined();
