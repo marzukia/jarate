@@ -356,6 +356,27 @@ hb_stale() {
   return 1
 }
 
+# has_delivered <ticket>: 0 when the ticket's terminal webhook delivery is
+# proven (issue #243): jarate-bg bg_post touches the marker on 2xx, and
+# the dead-letter consumer below touches it on a successful re-post.
+has_delivered() {
+  [ -f "$BG_TMP/pi-bg-${1}-delivered" ] || [ -f "$LEGACY_TMP/pi-bg-${1}-delivered" ]
+}
+
+# zomb_live <ticket>: 0 when a DELIVERED ticket still shows liveness -
+# a member in its cgroup, or a heartbeat not older than STALL_MIN.
+# (A delivered ticket with no cgroup member and a stale/absent hb is
+# dead, not a zombie: the normal DEAD/complete paths own it.)
+zomb_live() {
+  local t="$1" f
+  cg_has_members "$CG_DIR/$t" && return 0
+  for f in "$BG_TMP/pi-bg-${t}-hb" "$LEGACY_TMP/pi-bg-${t}-hb"; do
+    [ -f "$f" ] || continue
+    hb_stale "$t" || return 0
+  done
+  return 1
+}
+
 # prune_live <ticket>: liveness for the run-state prune (issue #51) - the
 # sweep's liveness scoped to the ticket: a cgroup member, or a same-user
 # process sitting in the ticket's worktree dir when one exists.
@@ -434,6 +455,12 @@ wd_cap() {
   cutoff=$(( $(date +%s) - int * 3 ))
   live=0
   while IFS= read -r hb; do
+    # ZOMBIE parity with the jarate-bg cap scan (issue #243): a fresh hb
+    # whose terminal webhook already delivered (the -delivered marker)
+    # has a free slot - it must not hold a DEAD auto-retry.
+    t="${hb##*/pi-bg-}"
+    t="${t%-hb}"
+    [ -f "$BG_TMP/pi-bg-${t}-delivered" ] && continue
     live=$((live + 1))
   done < <(find "$BG_TMP" -maxdepth 1 -type f -name 'pi-bg-*-hb' -newermt "@${cutoff}" 2>/dev/null)
   echo "$live $max_c"
@@ -754,6 +781,7 @@ PY
 found=0
 DT=(); DREPO=(); DP=(); DLAST=(); DREAS=(); DTYPE=()
 ST=(); STREPO=(); STL=()
+zombie_found=0
 for d in "$WT_DIR"/*/*/; do
   d="${d%/}"
   [ -d "$d" ] || continue
@@ -765,7 +793,19 @@ for d in "$WT_DIR"/*/*/; do
   #    process whose heartbeat is stale > STALL_MIN min is hung (DEAD needs
   #    the process gone, so without the hb this state was invisible)
   if is_live "$t" "$d"; then
-    if hb_stale "$t" && ! already_dead "$t" && ! wd_chain_live "$t"; then
+    if has_delivered "$t" && ! already_dead "$t" && ! wd_chain_live "$t"; then
+      # ZOMBIE (issue #243): the terminal webhook already delivered -
+      # the orchestrator was woken and the cap slot is freed (the
+      # -delivered marker, jarate-bg cap scan + wd_cap) - yet a process
+      # still matches this ticket (a hung wrapper outliving delivery,
+      # or, pre-env-scrub, a same-run-id sibling). Distinct from
+      # STALLED/DEAD: nothing to report, no kill, no retry; one dead-log
+      # line per ticket per day for the record. The dead-log line also
+      # suppresses a same-day STALLED re-flag of the same abnormality.
+      echo "[pi-bg-watchdog] ZOMBIE $repo/$t (webhook delivered, process still alive - cap slot freed, issue #243)"
+      zombie_found=$((zombie_found + 1))
+      printf '%s %s %s %s %s\n' "$today" "$t" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "zombie: webhook delivered, process still alive (issue #243)" >> "$DEADLOG"
+    elif hb_stale "$t" && ! already_dead "$t" && ! wd_chain_live "$t"; then
       hb_f="$BG_TMP/pi-bg-${t}-hb"
       [ -f "$hb_f" ] || hb_f="$LEGACY_TMP/pi-bg-${t}-hb"
       hbm="$(stat -c %Y "$hb_f" 2>/dev/null)" || hbm=""
@@ -880,6 +920,17 @@ if [ -d "$rec_dir" ]; then
       rrepo="$(basename "$(dirname "$rwt")" 2>/dev/null)"
       case "$rrepo" in . | "" | "/") rrepo="" ;; esac
       [ -n "$rrepo" ] && repo="$rrepo"
+    fi
+    # ZOMBIE (issue #243): delivered webhook + liveness (a cgroup member
+    # or a fresh heartbeat) = the slot is free and the process outlived
+    # delivery. One dead-log line per ticket per day; no kill, no retry,
+    # no DEAD flag (a live member / fresh hb already takes the ticket
+    # out of the DEAD path below).
+    if has_delivered "$rt" && ! already_dead "$rt" && zomb_live "$rt"; then
+      echo "[pi-bg-watchdog] ZOMBIE $repo/$rt (webhook delivered, process still alive - cap slot freed, issue #243)"
+      zombie_found=$((zombie_found + 1))
+      printf '%s %s %s %s %s\n' "$today" "$rt" "$repo" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "zombie: webhook delivered, process still alive (issue #243)" >> "$DEADLOG"
+      continue
     fi
     cg="$CG_DIR/$rt"
     if [ -d "$cg" ]; then
@@ -1659,6 +1710,9 @@ if [ -n "$webhook" ]; then
       [ -n "$dl_code" ] || dl_code=200
       printf '%s %s (watchdog re-post, issue #53)\n' \
         "$dl_code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BG_TMP/pi-bg-${dl_t}-wb-status"
+      # #243: the re-post IS the delivery - touch the delivered marker so
+      # the cap scan frees a zombie slot the original post failed for.
+      touch "$BG_TMP/pi-bg-${dl_t}-delivered" 2>/dev/null
       rm -f "$letter" "$dl_bodyf"
       dl_consumed=$((dl_consumed + 1))
       [ "$QUIET" -eq 0 ] && echo "[pi-bg-watchdog] dead letter $dl_t: re-posted (http=$dl_code)"
@@ -2430,5 +2484,5 @@ if [ "$PRUNE_DAYS" -gt 0 ]; then
   [ "$pruned_state" -gt 0 ] && echo "[pi-bg-watchdog] pruned $pruned_state run record(s)"
 fi
 
-echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed, $oom_found agent OOM finding(s), $oom_suppressed OOM alert(s) deduped, $live_silent agent SILENT(s), $live_dead AGENT-DEAD(s), $live_suppressed live alert(s) deduped, $live_gaps boot-gap(s) (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS oom_dedupe_min=$OOM_DEDUPE_MIN live_stale_min=$LIVE_STALE_MIN live_dedupe_min=$LIVE_DEDUPE_MIN)"
+echo "[pi-bg-watchdog] sweep done: $found dead ticket(s) found, $reaped cgroup dir(s) reaped, $skipped_young young cgroup dir(s) skipped, ${#ST[@]} stalled, $hung_found hung, $zombie_found zombie(s), $ev_found mid-run event(s), $pruned_state run record(s) pruned, $cwd_found cwd ticket(s) flagged, $retry_dispatched retry dispatched, $retry_held retry held, $dl_consumed dead letter(s) consumed, $oom_found agent OOM finding(s), $oom_suppressed OOM alert(s) deduped, $live_silent agent SILENT(s), $live_dead AGENT-DEAD(s), $live_suppressed live alert(s) deduped, $live_gaps boot-gap(s) (quiet=$QUIET dry=$DRY retry_on=$RETRY_ON stall_min=$STALL_MIN hung_min=$HUNG_MIN prune_days=$PRUNE_DAYS wt_prune_days=$WT_PRUNE_DAYS oom_dedupe_min=$OOM_DEDUPE_MIN live_stale_min=$LIVE_STALE_MIN live_dedupe_min=$LIVE_DEDUPE_MIN)"
 exit 0
