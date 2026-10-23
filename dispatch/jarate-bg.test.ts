@@ -150,33 +150,6 @@ describe("launch path retired (hall-monitor #35): stub contract", () => {
   });
 });
 
-// ─── pi-bg shim: retirement passthrough ──────────────────────────────────
-
-describe("pi-bg shim: retirement passthrough", () => {
-  test("pi-bg execs the stub: deprecation line + rc 10 + stdout identity", async () => {
-    const fx = fixture();
-    const p = spawn(
-      ["bash", path.join(import.meta.dir, "pi-bg"), "worker", "t"],
-      {
-        env: fx.env,
-        cwd: fx.tmp,
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-    );
-    const [out, err] = await Promise.all([
-      new Response(p.stdout).text(),
-      new Response(p.stderr).text(),
-    ]);
-    const code = await p.exited;
-    expect(code).toBe(10);
-    expect(out.trim().split("\n")[0]).toBe(RETIRE_LINE);
-    // exactly one deprecation line ahead of the stub's stderr notice
-    const firstErr = err.trim().split("\n")[0];
-    expect(firstErr).toBe("pi-bg: deprecated, use jarate-bg (jarate #151)");
-  });
-});
-
 // ─── signal subcommand (issue #143): kept for in-flight tickets ──────────
 
 describe("#143: jarate-bg signal (mid-run intervention receipt)", () => {

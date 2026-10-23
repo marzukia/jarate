@@ -602,8 +602,8 @@ function listTree(root: string): string[] {
   return out.sort();
 }
 
-// Fake jarate checkout: .git marker + stub install.sh + real unit templates
-// (so setup's sed/cp paths exercise production files).
+// Fake jarate checkout: .git marker + stub install.sh + real deploy unit
+// templates (so setup's sed/cp paths exercise production files).
 function fakeCheckout(f: Fixture): string {
   const dir = path.join(f.tmp, "fake-repo");
   fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -622,8 +622,6 @@ function fakeCheckout(f: Fixture): string {
     "deploy/pi.service",
     "deploy/jarate-deploy.service",
     "deploy/jarate-deploy.timer",
-    "dispatch/pi-bg-watchdog.service",
-    "dispatch/pi-bg-watchdog.timer",
   ]) {
     const dst = path.join(dir, rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -919,13 +917,6 @@ describe("setup", () => {
     const jd = fs.readFileSync(path.join(ud, "jarate-deploy.service"), "utf8");
     expect(jd).toContain(`WorkingDirectory=${repo}`);
     expect(jd).toContain(`ExecStart=${repo}/deploy/deploy.sh`);
-    // watchdog units copied verbatim from the repo
-    expect(fs.readFileSync(path.join(ud, "pi-bg-watchdog.timer"), "utf8")).toBe(
-      fs.readFileSync(
-        path.join(SETUP_REPO, "dispatch", "pi-bg-watchdog.timer"),
-        "utf8",
-      ),
-    );
 
     // systemctl sequence; loginctl failure is a note, not a failure
     const scLog = fs
@@ -934,9 +925,7 @@ describe("setup", () => {
       .split("\n");
     expect(scLog).toContain("--user daemon-reload");
     expect(scLog).toContain("--user enable --now pi.service");
-    expect(scLog).toContain(
-      "--user enable --now jarate-deploy.timer pi-bg-watchdog.timer",
-    );
+    expect(scLog).toContain("--user enable --now jarate-deploy.timer");
     expect(scLog).toContain("--user is-active pi.service");
     expect(r.err).toContain("enable-linger needs root");
     fs.rmSync(f.tmp, { recursive: true, force: true });

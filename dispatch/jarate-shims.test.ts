@@ -1,12 +1,15 @@
 /**
- * dispatch/pi-* shims (jarate #151): the old names stay resolvable as
- * executable deprecation shims. Contract per shim:
+ * dispatch/pi-* shims (jarate #151): the old name stays resolvable as an
+ * executable deprecation shim. Contract per shim:
  *   - exactly one stderr line: "<old>: deprecated, use <new> (jarate #151)"
  *   - stdout byte-identical to the new script for the same args
  *   - exit code passthrough
  * The shims exec the sibling jarate-* resolved via readlink -f, so they
  * must keep working from any link path (install.sh links them into
  * ~/.local/bin and ~/scripts).
+ *
+ * The pi-bg* shims were retired 2026-10-23 (operator order: "pi-bg should
+ * be gone" - the dispatch path was gutted in #272); only pi-wait remains.
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -23,21 +26,10 @@ import { join } from "node:path";
 const D = import.meta.dir;
 // [shim, real, args for the stdout-identity check]
 const PAIRS: [string, string, string[]][] = [
-  ["pi-bg", "jarate-bg", ["--help"]],
   ["pi-wait", "jarate-wait", ["--help"]],
-  ["pi-bg-kill", "jarate-bg-kill", ["--help"]],
-  ["pi-bg-tail", "jarate-bg-tail", ["--help"]],
-  ["pi-bg-watchdog", "jarate-bg-watchdog", ["--help"]],
 ];
-// rc-passthrough probes (no args unless noted): the completion-side
-// shims exit 2 (usage); pi-bg's launch path is the RETIRED stub
-// (hall-monitor #35) and exits 10 with the fleet notice.
-const RC: [string, string[], number][] = [
-  ["pi-bg", [], 10],
-  ["pi-wait", [], 2],
-  ["pi-bg-kill", [], 2],
-  ["pi-bg-tail", [], 2],
-];
+// rc-passthrough probes (no args): the completion-side shim exits 2 (usage).
+const RC: [string, string[], number][] = [["pi-wait", [], 2]];
 
 describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
   for (const [shim, real, args] of PAIRS) {
@@ -87,63 +79,13 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
         stdout: "pipe",
         stderr: "pipe",
       });
-      const [out, rc] = await Promise.all([
+      const [, rc] = await Promise.all([
         new Response(r.stdout).text(),
         r.exited,
       ]);
       expect(rc).toBe(wantRc);
-      if (shim === "pi-bg") {
-        // the stub's ticket-line slot carries the fleet endpoint
-        expect(out).toContain(
-          "POST http://100.95.144.25:8001/api/fleet/dispatch",
-        );
-      }
     });
   }
-
-  test("pi-bg-watchdog: rc 0 with --dry-run --quiet (sweep is the pass-through)", async () => {
-    const tmp = `/tmp/jarate-shim-wd-${Date.now()}`;
-    mkdirSync(join(tmp, "art"), { recursive: true });
-    try {
-      const r = Bun.spawn([join(D, "pi-bg-watchdog"), "--dry-run", "--quiet"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        env: {
-          HOME: tmp,
-          PI_BG_TMPDIR: join(tmp, "art"),
-          PI_BG_CG_ROOT: join(tmp, "cg"),
-          PI_BG_WT_DIR: join(tmp, "wt"),
-          // the OOM section (issue #191 M1) reads $PI_BG_OOM_ROOT for
-          // the in-scope slices: keep it on the fake (slice-less) root or
-          // the first-sight line lands on stdout and the one-line
-          // contract below breaks (failing control for this env)
-          PI_BG_OOM_ROOT: join(tmp, "oom"),
-          // the liveness section (issue #191 M2) reads $PI_BG_LIVE_ROOT
-          // for the agent markers: keep it on the fake (marker-less)
-          // root or the first-sight line lands on stdout and the one-line
-          // contract below breaks (failing control for this env)
-          PI_BG_LIVE_ROOT: join(tmp, "live"),
-          PATH: process.env.PATH ?? "",
-        },
-      });
-      const [out, err, rc] = await Promise.all([
-        new Response(r.stdout).text(),
-        new Response(r.stderr).text(),
-        r.exited,
-      ]);
-      expect(rc).toBe(0);
-      expect(err).toBe(
-        "pi-bg-watchdog: deprecated, use jarate-bg-watchdog (jarate #151)\n",
-      );
-      // quiet + dry-run: no posts, just the one-line sweep summary on stdout
-      const outLines = out.trim().split("\n");
-      expect(outLines).toHaveLength(1);
-      expect(outLines[0]).toContain("[pi-bg-watchdog] sweep done");
-      expect(outLines[0]).toContain("quiet=1 dry=1");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
 
   test("shim resolves the real script through a symlink (install.sh form)", async () => {
     const tmp = `/tmp/jarate-shim-link-${Date.now()}`;
@@ -154,7 +96,7 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
         symlinkSync(join(D, shim), join(tmp, "bin", shim));
         symlinkSync(join(D, real), join(tmp, "bin", real));
       }
-      const r = Bun.spawn([join(tmp, "bin", "pi-bg"), "--help"], {
+      const r = Bun.spawn([join(tmp, "bin", "pi-wait"), "--help"], {
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -165,24 +107,26 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
       ]);
       expect(rc).toBe(0);
       expect(out.length).toBeGreaterThan(0);
-      expect(out.split("\n")[0]).toContain("jarate-bg");
-      expect(err.trim()).toBe("pi-bg: deprecated, use jarate-bg (jarate #151)");
+      expect(out.split("\n")[0]).toContain("jarate-wait");
+      expect(err.trim()).toBe(
+        "pi-wait: deprecated, use jarate-wait (jarate #151)",
+      );
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
 
   test("shim does not shadow the real script when both names are linked", async () => {
-    // the shim execs the SIBLING jarate-bg in the same dir; even if the
+    // the shim execs the SIBLING jarate-wait in the same dir; even if the
     // caller's PATH prefers the shim, one exec hop lands on the real body
     const tmp = `/tmp/jarate-shim-sib-${Date.now()}`;
     mkdirSync(tmp, { recursive: true });
     try {
-      cpSync(join(D, "pi-bg"), join(tmp, "pi-bg"));
-      cpSync(join(D, "jarate-bg"), join(tmp, "jarate-bg"));
-      chmodSync(join(tmp, "pi-bg"), 0o755);
-      chmodSync(join(tmp, "jarate-bg"), 0o755);
-      const r = Bun.spawn([join(tmp, "pi-bg"), "--help"], {
+      cpSync(join(D, "pi-wait"), join(tmp, "pi-wait"));
+      cpSync(join(D, "jarate-wait"), join(tmp, "jarate-wait"));
+      chmodSync(join(tmp, "pi-wait"), 0o755);
+      chmodSync(join(tmp, "jarate-wait"), 0o755);
+      const r = Bun.spawn([join(tmp, "pi-wait"), "--help"], {
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -191,8 +135,8 @@ describe("pi-* shims (jarate #151): deprecation line + passthrough", () => {
         r.exited,
       ]);
       expect(rc).toBe(0);
-      expect(out.split("\n")[0]).toContain("jarate-bg");
-      expect(existsSync(join(tmp, "jarate-bg"))).toBe(true);
+      expect(out.split("\n")[0]).toContain("jarate-wait");
+      expect(existsSync(join(tmp, "jarate-wait"))).toBe(true);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

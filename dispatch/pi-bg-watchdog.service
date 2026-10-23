@@ -1,8 +1,0 @@
-[Unit]
-Description=jarate-bg watchdog sweep (recover dead dispatches with lost callbacks)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/scripts/jarate-bg-watchdog

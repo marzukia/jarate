@@ -18,8 +18,8 @@ import {
 } from "./jobs";
 
 const REPO = path.resolve(import.meta.dir, "../../..");
-const TAIL = path.join(REPO, "dispatch/pi-bg-tail");
-const KILL = path.join(REPO, "dispatch/pi-bg-kill");
+const TAIL = path.join(REPO, "dispatch/jarate-bg-tail");
+const KILL = path.join(REPO, "dispatch/jarate-bg-kill");
 
 // run a dispatch script; returns {code, out, err} instead of throwing
 function run(
@@ -717,9 +717,9 @@ describe("jobsView (recent excludes in-flight ids)", () => {
   });
 });
 
-// ─── pi-bg-tail (issue #16) ───────────────────────────────────────────────
+// ─── jarate-bg-tail (issue #16) ───────────────────────────────────────────
 
-describe("pi-bg-tail", () => {
+describe("jarate-bg-tail", () => {
   const tid = "20260910-120000-1";
   const env = (home: string) => ({
     HOME: home,
@@ -772,8 +772,8 @@ describe("pi-bg-tail", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(TAIL, [], env(home));
     expect(r.code).toBe(2);
-    // #151: TAIL is now the pi-bg-tail deprecation shim; the usage line
-    // comes from jarate-bg-tail (the deprecation line rides along in err).
+    // #151: TAIL is the jarate-bg-tail entrypoint directly (the pi-bg-tail
+    // shim was retired 2026-10-23); the usage line is the script's own.
     expect(r.err).toContain("usage: jarate-bg-tail");
   });
 
@@ -802,9 +802,9 @@ describe("pi-bg-tail", () => {
   });
 });
 
-// ─── pi-bg-kill (issue #15) ───────────────────────────────────────────────
+// ─── jarate-bg-kill (issue #15) ───────────────────────────────────────────
 
-describe("pi-bg-kill", () => {
+describe("jarate-bg-kill", () => {
   const tid = "20260910-120000-2";
   // fake cgroup root: the "processes" are dummies (99999999x) that do not
   // exist, so no real process is ever signalled
@@ -926,8 +926,8 @@ describe("pi-bg-kill", () => {
   test("no args -> exit 2 + usage", () => {
     const r = run(KILL, [], env());
     expect(r.code).toBe(2);
-    // #151: KILL is now the pi-bg-kill deprecation shim; the usage line
-    // comes from jarate-bg-kill (the deprecation line rides along in err).
+    // #151: KILL is the jarate-bg-kill entrypoint directly (the pi-bg-kill
+    // shim was retired 2026-10-23); the usage line is the script's own.
     expect(r.err).toContain("usage: jarate-bg-kill");
   });
 });
@@ -955,7 +955,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   const ID = "20260914-091714-3097";
 
   test("bad id -> usage line, script never spawned", async () => {
-    stub("pi-bg-kill", "#!/bin/sh\necho should-not-run\n");
+    stub("jarate-bg-kill", "#!/bin/sh\necho should-not-run\n");
     expect(await jobsKill("nope", env, scriptsDir)).toContain(
       "[!] usage: /jobs kill <id>",
     );
@@ -965,7 +965,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   });
 
   test("kill: script exit 0 -> [ok] killed <id>, fenced", async () => {
-    stub("pi-bg-kill", "#!/bin/sh\nexit 0\n");
+    stub("jarate-bg-kill", "#!/bin/sh\nexit 0\n");
     const r = await jobsKill(ID, env, scriptsDir);
     expect(r).toContain(`[ok] killed ${ID}`);
     expect(r.startsWith("```")).toBe(true);
@@ -973,23 +973,23 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
 
   test("kill: script exit 2 (unknown ticket) -> [!] with the script's reason", async () => {
     stub(
-      "pi-bg-kill",
-      "#!/bin/sh\necho \"pi-bg-kill: no cgroup for ticket 'X'\" >&2\nexit 2\n",
+      "jarate-bg-kill",
+      "#!/bin/sh\necho \"jarate-bg-kill: no cgroup for ticket 'X'\" >&2\nexit 2\n",
     );
     const r = await jobsKill("20260910-120000-999", env, scriptsDir);
-    expect(r).toContain("[!] pi-bg-kill: no cgroup");
+    expect(r).toContain("[!] jarate-bg-kill: no cgroup");
   });
 
   test("kill: missing script -> not-found line, no throw", async () => {
     const r = await jobsKill(ID, env, scriptsDir);
-    expect(r).toContain("pi-bg-kill not found at");
+    expect(r).toContain("jarate-bg-kill not found at");
     expect(r).toContain(scriptsDir);
   });
 
   test("tail: output is fenced, capped to the last 40 lines, dropped count noted", async () => {
     let body = "#!/bin/sh\n";
     for (let i = 1; i <= 100; i++) body += `echo "line ${i}"\n`;
-    stub("pi-bg-tail", body);
+    stub("jarate-bg-tail", body);
     const r = await jobsTail(ID, 100, env, scriptsDir);
     const inner = r.slice(4, -4).split("\n");
     expect(inner[0]).toBe("[..] 60 earlier lines");
@@ -1000,7 +1000,7 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
 
   test("tail: overlong lines ship raw - no 40-col hard wrap (2026-10-18)", async () => {
     const long = "x".repeat(120);
-    stub("pi-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
+    stub("jarate-bg-tail", `#!/bin/sh\necho "${long}"\necho "ok"\n`);
     const r = await jobsTail(ID, 40, env, scriptsDir);
     const lines = r.split("\n");
     // fence + the long line verbatim + "ok" + fence
@@ -1008,14 +1008,14 @@ describe("jobsKill / jobsTail wrappers (#44)", () => {
   });
 
   test("tail: --n is clamped to [1, 200] and passed to the script", async () => {
-    stub("pi-bg-tail", '#!/bin/sh\necho "n=$2"\n');
+    stub("jarate-bg-tail", '#!/bin/sh\necho "n=$2"\n');
     expect(await jobsTail(ID, 500, env, scriptsDir)).toContain("n=200");
     expect(await jobsTail(ID, 12, env, scriptsDir)).toContain("n=12");
     expect(await jobsTail(ID, 0, env, scriptsDir)).toContain("n=40");
   });
 
   test("tail: empty output -> [!] no output", async () => {
-    stub("pi-bg-tail", "#!/bin/sh\nexit 0\n");
+    stub("jarate-bg-tail", "#!/bin/sh\nexit 0\n");
     const r = await jobsTail(ID, 40, env, scriptsDir);
     expect(r).toContain(`[!] no output for ${ID}`);
   });

@@ -357,7 +357,7 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 /jobs tail <id> [--n N]      # tail a run's live output (owner)
 ```
 
-In-flight via the process table (the `pi-bg` wrapper process exists only
+In-flight via the process table (the `jarate-bg` wrapper process exists only
 while a run is live); recent history from the `~/.pi-bg-art` artifacts each
 run leaves. Markdown list layout (2026-10-18): in-flight bullets carry
 id + profile + age + the full task text; recent bullets are
