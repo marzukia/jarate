@@ -3,7 +3,7 @@
  * redaction engines (issue #254):
  *
  *   scope "log"    → channel/sanitize.ts (log redaction: TUI/error logs)
- *   scope "egress" → channel/censor.ts (Discord egress + jarate-censor CLI)
+ *   scope "egress" → channel/censor.ts (Discord egress)
  *
  * Before this table the two engines kept private copies of the same
  * leak surface and had silently diverged (ghp_ {36} vs {20,}; AKIA /

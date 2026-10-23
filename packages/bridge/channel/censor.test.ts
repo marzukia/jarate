@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -418,31 +417,5 @@ describe("behavior", () => {
     censor(GHP, opts);
     censor(GHP, opts);
     expect(lines).toHaveLength(1);
-  });
-});
-
-describe("jarate-censor CLI (bin/jarate-censor: stdin -> censor -> stdout)", () => {
-  const BIN = path.resolve(import.meta.dir, "../../../bin/jarate-censor");
-  const run = (input: string, registry: string): string =>
-    cp.execFileSync("bun", [BIN], {
-      input,
-      encoding: "utf-8",
-      env: { ...process.env, JARATE_SECRETS_FILE: registry },
-    });
-
-  test("redacts with the same registry the bridge uses", () => {
-    reg(["trailsecret"]);
-    const out = run(`here is trailsecret and ${GHP}\n`, registryFile);
-    expect(out).toBe("here is [REDACTED:secret#1] and [REDACTED:github]\n");
-  });
-
-  test("missing registry = patterns only, never fails the caller", () => {
-    const out = run(GHP, R);
-    expect(out).toBe("[REDACTED:github]");
-  });
-
-  test("pass-through text is unchanged (incl. trailing newline)", () => {
-    const out = run("the password is fine\n", R);
-    expect(out).toBe("the password is fine\n");
   });
 });

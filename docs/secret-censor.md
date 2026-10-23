@@ -50,16 +50,9 @@ and **all six** functions call it before building their body. A test asserts
 at source level that every text-bearing send function references
 `egressText`, so a new egress path that forgets it fails CI.
 
-Not in the bridge process, but censored via the **jarate-censor CLI**
-(`bin/jarate-censor`, bun): `stdin -> censor() -> stdout`, same registry
-(`~/.pi/agent/secrets.txt` / `$JARATE_SECRETS_FILE`), never fails the
-caller (any error = pass through). Wired in where the out-of-bridge
-egress lives:
+Out-of-bridge egress (outside the bridge process, not wrapped by
+`egressText`):
 
-- `dispatch/jarate-bg` — the webhook callback embed's `task` and `result`
-  fields (truncated task text + raw worker output, the primary leak
-  surface) and the legacy plain-text fallback body are all run through
-  `jarate-censor` before the POST.
 - Peer-agent messages: agent-to-agent traffic flows through hall-monitor
   fleet comms (`POST /fleet/say`), an out-of-repo egress the censor does
   not wrap.
@@ -72,7 +65,7 @@ Known open (residual gaps, not covered by any process today):
   censoring them needs a webdrop-side hook.
 - The registry protects only what the censor runs through: any NEW
   out-of-bridge process that posts raw text to Discord leaks until it is
-  wired the same one-line way (`printf '%s' "$msg" | bun <jarate>/bin/jarate-censor`).
+  routed through `censor()` with the same registry.
   The guarantee scope is: **every Discord egress in this repo routes
   through `censor()`** — asserted for the bridge at source level (the
   chokepoint test) and structurally for jarate-bg (posts only the censored
@@ -85,7 +78,7 @@ table in `packages/bridge/channel/secret-patterns.ts`:
 
 | engine | module | where it runs | marker style |
 |---|---|---|---|
-| **egress** | `censor.ts` — `censor()` | every string posted to Discord (via `egressText`, see below) + the `jarate-censor` CLI for out-of-bridge egress | `[REDACTED:<class>]` |
+| **egress** | `censor.ts` — `censor()` | every string posted to Discord (via `egressText`, see below) | `[REDACTED:<class>]` |
 | **log** | `sanitize.ts` — `sanitizeSensitiveText()` / `sanitizeUnknownValue()` | log lines: poll/send error payloads, `console.error` sites in the channel code, error/stack recursion | `[REDACTED_*]` |
 
 The audit that found the split (issue #254) showed the two engines had
@@ -225,5 +218,4 @@ A dropped pattern, a re-scoped entry, or a shortened specifier ({36} →
 and filename-bearing send functions in `discord.ts` (exported or not) that
 POST/PATCH a `content` body or a `payload_json` multipart call
 `egressText`, plus a runtime test that a registry-literal filename is
-redacted in the API-facing `payload_json`. `censor.test.ts` covers the
-`jarate-censor` CLI end-to-end (bun, same registry).
+redacted in the API-facing `payload_json`.

@@ -21,7 +21,7 @@ agent stack). Read this before touching anything.
 ```bash
 cd packages/bridge && bun install
 cd packages/bridge && bun x tsc --noEmit   # must stay clean
-cd packages/bridge && bun x bun test       # 1114 pass, 0 fail
+cd packages/bridge && bun x bun test       # 1087 pass, 0 fail
 bunx biome check .                 # from repo root; 0 diagnostics
 bunx biome check --write .         # fix formatting + safe lints
 bash install.sh --dry-run          # installer regression check
@@ -62,7 +62,7 @@ bash install.sh --dry-run          # installer regression check
 
 ## Test expectations
 
-- Any change under `packages/bridge/`: tsc clean + all 1114 tests pass, before
+- Any change under `packages/bridge/`: tsc clean + all 1087 tests pass, before
   committing.
 - Biome must be clean at the repo root before committing (pre-commit hook
   enforces it; if you bypass git, run `bunx biome check .`).

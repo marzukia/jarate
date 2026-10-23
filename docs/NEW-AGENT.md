@@ -169,8 +169,7 @@ sudo -u <name> bash -lc '
 ```
 
 install.sh (idempotent): `bun install` in the bridge, pointer symlinks -
-~/scripts/{jarate-bg, pi-postcheck.sh, jarate}, ~/bin/{jarate-diff,
-jarate}. The checkout IS
+~/scripts/{jarate-bg, pi-postcheck.sh, jarate}, ~/bin/jarate. The checkout IS
 the deployment - `git pull --ff-only` is the update procedure. Only bridge
 changes need a pi.service restart.
 
