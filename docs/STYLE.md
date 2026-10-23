@@ -52,7 +52,7 @@ Last revised: 2026-10-20 (v4: summaries = markdown lists; 40-col budget in-turn 
 4.2 Slash commands: defer to 2.4 (fence; summary bodies per 2.3).
     (docs/COMMANDS.md tag table)
 4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
-    (docs/DISPATCH.md)
+    (retired lane; last full frame spec in the pre-#281 docs/DISPATCH.md)
 4.4 Machine output posted to Discord (script errors, command output,
     logs, JSON, paths) goes in a code fence - never bare prose. One-line
     errors: inline code. Multi-line or raw logs: fenced block.

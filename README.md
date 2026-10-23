@@ -35,7 +35,7 @@ the source of truth.
 | `install.sh` | idempotent bootstrap installer (`--dry-run`, `--jarate-dir`) |
 | `docs/SETUP.md` | **end-to-end setup**: bare box → working pi Discord agent (verified) |
 | `docs/DEPLOY.md` | install.sh internals, deploy-after-pull, one-time box migration |
-| `docs/DISPATCH.md` | orchestration pattern: roles, worktrees, cgroup escape, callback protocol, fleet caps |
+| `docs/DISPATCH.md` | dispatch pointer page: retirement banner + hall-monitor fleetwork link (#281) |
 | `docs/COMMANDS.md` | every Discord command with examples |
 | `.githooks/` | pre-commit (biome gate) |
 | `.github/workflows/ci.yml` | CI: biome + bridge typecheck/tests (context `ci`) |
@@ -46,7 +46,7 @@ Bare box → working pi Discord agent in 8 verified steps:
 **[docs/SETUP.md](docs/SETUP.md)** (prerequisites → Discord app +
 gateway intents → `./install.sh` → `~/.pi/agent/settings.json` +
 `models.json` → `pi.service` user unit → first-run journal check →
-dispatch webhook → optional auto-deploy timer).
+callback webhook → optional auto-deploy timer).
 
 TL;DR (full detail in SETUP.md):
 
@@ -104,31 +104,32 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
                       v
         +---------------------------+
         |  pi (coding agent)        |  ~/.pi/agent  (settings.json, AGENTS.md)
-        |  orchestrator turn loop   |
+        |  orchestrator turn loop   |  runs as the pi.service user unit
         +-------------+-------------+
-                      |  jarate-bg worker|reviewer [--worktree <ref>] "task"
+                      |  hands context-hungry work to the fleet:
+                      |  POST /fleet/dispatch (X-Agent-Key)
                       v
         +---------------------------+
-        |  role profiles            |  ~/.pi/agent-worker, ~/.pi/agent-reviewer
-        |  cgroup escape            |  survives pi.service restart
-        |  git worktrees            |  ~/.pi-bg-wt/<repo>/<id>, branch pi-bg/<id>
-        |  run artifacts            |  ~/.pi-bg-art/ (persistent, $PI_BG_TMPDIR)
+        |  hall-monitor fleetwork   |  the fleet control plane
+        |  queued runs on executor  |  http://100.95.144.25:8001/api
+        |  hosts (FIFO per agent)   |
         +-------------+-------------+
-                      |  on exit: webhook embed (status/verdict, brief,
-                      |             webdrop prompt+output links)
+                      |  terminal callback (embed author
+                      |  pi-bg fleetwork · <state>)
                       v
-                 Discord (callback channel) -- wakes the orchestrator as a new turn
+                 Discord (agent channel) -- wakes the orchestrator as a new turn
 ```
 
 - **bridge → Discord**: polls inbound messages, injects a `<channel-ctx>`
   block, forwards agent output back (chunked, threaded, ping-suppressed).
   Bot traffic is exempt (no echo loops).
+- **Fleet dispatch (live)**: the orchestrator keeps its KV lean by handing
+  context-hungry work to hall-monitor fleetwork (`POST /fleet/dispatch`);
+  the run's terminal callback wakes it as a new turn.
 - **jarate-bg dispatch loop (RETIRED 2026-10-20; drained 2026-10-23, #279)**:
-  the orchestrator kept its KV lean by handing context-hungry work to
-  worker/reviewer profiles; the webhook callback was the wake, in-turn
-  `jarate-wait` the opt-in exception. Dispatch now goes to the fleet control
-  plane (hall-monitor `POST /fleet/dispatch`).
-  Full protocol: [docs/DISPATCH.md](docs/DISPATCH.md).
+  the old worker/reviewer role profiles + webhook-callback loop; the launch
+  path is a stub (exit 10). `dispatch/` keeps the stub, the watchdog, and
+  `pi-postcheck.sh`. Pointer page: [docs/DISPATCH.md](docs/DISPATCH.md).
 
 ## Develop
 
