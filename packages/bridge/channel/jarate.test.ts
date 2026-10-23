@@ -182,8 +182,6 @@ describe("registerJarateTool", () => {
       "journal-errors",
       "projects",
       "projects-backfill",
-      "agents-check",
-      "agents-bless",
     ]) {
       expect(tools.jarate.description).toContain(cmd);
     }
@@ -207,8 +205,6 @@ describe("registerJarateTool", () => {
       "journal-errors",
       "projects",
       "projects-backfill",
-      "agents-check",
-      "agents-bless",
     ]);
 
     const realHome = process.env.HOME;

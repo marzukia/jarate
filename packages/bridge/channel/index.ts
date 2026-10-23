@@ -4278,15 +4278,15 @@ function safeSessionFile(ctx: ExtensionContext): string | null {
 }
 
 // ─── Live marker (issue #191 M2: agent liveness) ─────────────────────────
-// Touch /var/tmp/jarate-live/<uid> (0644) once per poll cycle. The
-// watchdog's fleet liveness sweep (dispatch/jarate-bg-watchdog) pages on
-// marker staleness: a pi.service death with NO in-flight tickets produced
-// zero ticket-class events (2026-10-04 monky OOM incident, 33 min dark,
-// found by accident). /var/tmp, not /tmp: the pre-boot marker must survive
-// a reboot so the sweep classifies BOOT-GAP (marker older than kernel
-// btime) instead of alerting on a fresh boot. The dir is sticky
-// world-writable (like /tmp) so each agent user writes its own <uid> file
-// and the orchestrator's sweep (another user) can read everyone's.
+// Touch /var/tmp/jarate-live/<uid> (0644) once per poll cycle. The marker
+// is the agent-liveness input: the watchdog's fleet liveness sweep (gone
+// with #280/3a) consumed it; liveness paging is now on the hall-monitor
+// control plane (hm#59). The class it exists for: a pi.service death with
+// NO in-flight tickets produced zero ticket-class events (2026-10-04 monky
+// OOM incident, 33 min dark). /var/tmp not /tmp: the pre-boot marker must
+// survive a reboot so a reboot classifies as BOOT-GAP, not a fresh-boot
+// alert. The dir is sticky world-writable (like /tmp): each agent user
+// writes its own <uid> file, the orchestrator's sweep reads everyone's.
 // Best-effort: a marker failure must never break the bridge poll loop.
 export const LIVE_MARKER_DIR =
   process.env.JARATE_LIVE_DIR ?? "/var/tmp/jarate-live";

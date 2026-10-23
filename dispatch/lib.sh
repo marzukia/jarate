@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # lib.sh — shared logic for the dispatch/ scripts (issue #262 DRY/connascence).
 #
-# Sourced by jarate-bg, jarate-bg-watchdog, pi-postcheck.sh and install.sh
-# (the drain, #279, retired jarate-wait/-tail/-kill). Sourcing defines the
-# functions + constants below and computes/exports JRATE_LIB_DIR - no other
-# side effects, so it is safe under the scripts' `set -u` / `set -euo
-# pipefail` combos.
+# Sourced by jarate-bg, pi-postcheck.sh and install.sh (the drain, #279,
+# retired jarate-wait/-tail/-kill; the watchdog went in #280/3c). Sourcing
+# defines the functions + constants below and computes/exports JRATE_LIB_DIR
+# - no other side effects, so it is safe under the scripts' `set -u` /
+# `set -euo pipefail` combos.
 #
 # Single-sourced contracts (the #262 findings live here, in one place):
 #   - the ticket id regex (run-identity contract, documented in the
@@ -17,7 +17,8 @@
 #   - the cgroup v2 user-slice root: $PI_BG_CG_ROOT, else the system path
 #   - the live marker dir default: /var/tmp/jarate-live, shared with
 #     install.sh (which creates it 1777) and the bridge, which writes it
-#     (packages/bridge/channel/index.ts, JARATE_LIVE_DIR)
+#     (packages/bridge/channel/index.ts, JARATE_LIVE_DIR); the watchdog's
+#     fleet liveness sweep (the reader) left with #280/3a -> hall-monitor#59
 #   - the webhook POST retry shape: 3 tries, i*3*PI_BG_WB_BACKOFF backoff
 #     (PI_BG_WB_BACKOFF=0 is the no-sleep test seam; the watchdog used to
 #     hardcode i*3 and ignore the env)
@@ -112,15 +113,11 @@ jrate_cg_root() {
   printf '%s' "${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 }
 
-# The agent-liveness marker dir (issue #191 M2): per-agent <uid> files the
-# bridge touches every poll cycle; the watchdog's fleet sweep reads
-# everyone's. install.sh creates it (1777 sticky); the bridge writes it.
-# $JARATE_LIVE_DIR is the bridge's env name; $PI_BG_LIVE_ROOT is the
-# watchdog's pre-rename test hook (kept as an alias, lower priority).
+# The agent-liveness marker dir default (issue #191 M2). The watchdog's
+# fleet liveness sweep (the reader) is gone with #280/3a: install.sh creates
+# the dir and the bridge writes the per-agent <uid> files; liveness paging
+# now runs on the hall-monitor control plane (hall-monitor#59).
 JRATE_LIVE_DIR_DEFAULT=/var/tmp/jarate-live
-jrate_live_dir() {
-  printf '%s' "${JARATE_LIVE_DIR:-${PI_BG_LIVE_ROOT:-$JRATE_LIVE_DIR_DEFAULT}}"
-}
 
 # --- webhook post (shared retry shape, issue #262) ---------------------------
 # jrate_wb_post <webhook> <body-file> [resp-file]: POST the JSON body file
@@ -197,18 +194,4 @@ jrate_list_tree() {
       queue=("${next[@]+"${next[@]}"}")
     done
   done < <(cat "$cg/cgroup.procs" 2>/dev/null | sort -un)
-}
-
-# --- pi session discovery (issue #262) ---------------------------------------
-# jrate_session_file <profile> <pi-cwd> <start-ts>: the newest session
-# .jsonl for pi's cwd (the session-dir slug is the cwd with '/' -> '-',
-# wrapped in leading/trailing '--'), created or modified after <start-ts>
-# (epoch seconds). Prints the path on stdout; nothing when absent.
-jrate_session_file() {
-  local prof="$1" pi_cwd="$2" start="$3" slug sd
-  [ -n "$pi_cwd" ] || return 0
-  slug="--${pi_cwd#/}"; slug="${slug//\//-}--"
-  sd="$HOME/.pi/agent-${prof}/sessions/$slug"
-  find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$start" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | head -1 | cut -d' ' -f2-
 }

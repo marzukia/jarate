@@ -160,13 +160,13 @@ for tool in jarate-bg pi-postcheck.sh; do
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
 # Retired dispatch pointers: the jarate-bg launch-stub era kept 11 names in
-# this list; #283 dropped the four pi-bg* shims, #279 (the drain) drops
-# jarate-wait/-tail/-kill + pi-wait (deleted now) and the watchdog (splits in
-# a follow-up, audit action 3). The deleted names are gone from the repo
-# after the step-1 pull, so our symlinks into them dangle (the watchdog link
-# dangles once action 3 deletes the script). Remove only OUR links (into
-# this checkout) that are now dangling; a live dir or a foreign symlink is
-# left untouched.
+# this list; #283 dropped the four pi-bg* shims, #279 (the drain) dropped
+# jarate-wait/-tail/-kill + pi-wait, and #280/3c dropped the watchdog (the
+# script is gone; its liveness section centralised to hall-monitor#59,
+# its drift tripwire to the agents-docs cascade). The deleted names are
+# gone from the repo after the step-1 pull, so our symlinks into them
+# dangle. Remove only OUR links (into this checkout) that are now
+# dangling; a live dir or a foreign symlink is left untouched.
 for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog \
             jarate-wait jarate-bg-tail jarate-bg-kill pi-wait \
             jarate-bg-watchdog; do
@@ -248,15 +248,15 @@ fi
 
 # --- 3b. live marker dir (issue #191 M2) ------------------------------------
 # The per-agent liveness markers (<uid>, 0644) the bridge touches every
-# poll cycle; the watchdog's fleet liveness sweep (another user) reads
-# everyone's, so the dir is sticky world-writable like /tmp. /var/tmp,
-# not /tmp: the marker must survive a reboot so the sweep can classify
-# BOOT-GAP (marker older than kernel btime) instead of alerting on a
-# fresh boot. The default path is single-sourced in dispatch/lib.sh
-# (JRATE_LIVE_DIR_DEFAULT; the bridge writes ${JARATE_LIVE_DIR:-<default>},
-# the watchdog reads it - issue #262). Created only when absent: a dir
-# another agent created first is already shared (1777) and un-chmoddable
-# by us.
+# poll cycle. The watchdog's fleet liveness sweep (the reader) left with
+# #280/3a (liveness paging is on the hall-monitor control plane, hm#59);
+# the dir stays for the bridge markers: sticky world-writable like /tmp
+# (any agent's bridge writes its own file), in /var/tmp not /tmp: the
+# marker survives a reboot. The default path is single-sourced in
+# dispatch/lib.sh (JRATE_LIVE_DIR_DEFAULT; the bridge writes
+# ${JARATE_LIVE_DIR:-<default>} - issue #262). Created only when absent:
+# a dir another agent created first is already shared (1777) and
+# un-chmoddable by us.
 LIVE_MARKER_DIR=/var/tmp/jarate-live
 if [ -f "$JARATE_DIR/dispatch/lib.sh" ]; then
   # lib.sh is the single source for the default; the fallback literal

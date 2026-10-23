@@ -135,8 +135,6 @@ const JARATE_COMMANDS = [
   "journal-errors",
   "projects",
   "projects-backfill",
-  "agents-check",
-  "agents-bless",
 ];
 
 /**
@@ -153,9 +151,7 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
       "projects [--project T] [--since D] [--agent A]: per-project rollup over pi-bg run records (runs/tokens/cost; untagged -> unspecified). " +
-      "projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]: tag historical untagged run records. " +
-      "agents-check: AGENTS.md vs manifest (drift tripwire, read-only). " +
-      "agents-bless [note]: rewrite the AGENTS.md manifest (re-bless an approved change).",
+      "projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]: tag historical untagged run records.",
     promptSnippet:
       "jarate <cmd> <args>: machine ops (ctx-report, journal-errors) as JSON",
     promptGuidelines: [

@@ -1,7 +1,7 @@
 """Shared python helpers for the dispatch/ shell scripts (issue #262).
 
-Imported by the python heredocs in jarate-bg, jarate-bg-watchdog and
-pi-postcheck.sh (the drain, #279, retired jarate-wait/-tail/-kill).
+Imported by the python heredocs in jarate-bg and pi-postcheck.sh (the drain,
+#279, retired jarate-wait/-tail/-kill; the watchdog went in #280/3c).
 dispatch/lib.sh
 points $JRATE_LIB_DIR at this file's directory; each heredoc does
 ``sys.path.insert(0, os.environ["JRATE_LIB_DIR"])`` before importing.
@@ -40,13 +40,11 @@ def kv(key, val, head=False):
 
 # --- Discord embed colors (single source, issue #262) ----------------------
 # The same semantics were previously re-typed as decimal/hex literals in
-# five heredocs across four files.
+# five heredocs across four files. (The watchdog's ORANGE_DEAD/RED_STUCK/
+# YELLOW_WARN went with the script, #280/3c.)
 GREEN_ALIVE = 0x2ECC71  # green: running / informational (SIGNAL, EVENT)
-ORANGE_DEAD = 0xE67E22  # orange: DEAD / DIED / CANCELLED (same as jarate-bg)
-RED_STUCK = 0xE74C3C  # red: alive but stuck (HUNG, STALLED)
-RED_FAIL = 0xED4245  # red: failure (postcheck fail, OOM, AGENT-DEAD)
+RED_FAIL = 0xED4245  # red: failure (postcheck fail)
 GREEN_OK = 0x57F287  # green: ok (postcheck ok)
-YELLOW_WARN = 0xFEE75C  # yellow: warning (SILENT)
 
 
 # --- settings channel selection --------------------------------------------

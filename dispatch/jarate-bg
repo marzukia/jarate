@@ -16,21 +16,22 @@
 # The launch path is STUBBED (retirement notice + exit 10), not deleted:
 # the DRAIN IS DECLARED (2026-10-23, issue #279: zero state=running records
 # fleet-wide, t180-verified) and the completion side is removed with it —
-# only the watchdog sweep + pi-postcheck.sh survive in dispatch/ until the
-# fleet timer lands, and the ~/.pi-bg-art artifact convention + run records
+# pi-postcheck.sh is the only dispatch member left (the watchdog sweep
+# left with #280/3c: liveness -> hall-monitor#59, run-state/OOM -> the hm
+# control plane), and the ~/.pi-bg-art artifact convention + run records
 # stay for host history. jarate-bg-tail/-kill and jarate-wait are gone
-# (no in-flight run to tail, kill, or wait on).
-# The watchdog's DEAD-retry re-dispatch (issue #110) targets this
-# launcher: it lands on the retirement error (rc 10, no run record),
-# so the retry stays HELD and the DEAD embed carries the human decision —
-# no new run enters the retired path.
+# (no in-flight run to tail, kill, or wait on). The watchdog's DEAD-retry
+# re-dispatch (issue #110) targeted this launcher: it would land on the
+# retirement error (rc 10, no run record), so the retry stayed HELD and
+# the DEAD embed carried the human decision — no new run entered the
+# retired path.
 #
 # Retained subcommand (in-flight intervention, issue #143):
 #   jarate-bg signal <run-id> <TERM|KILL> [--dry-run]
 #     signal the run's cgroup tree (per-pid, never the process group -
 #     that is jarate-bg-kill) and emit the receipt: stdout line +
 #     dead-log line + webhook post (issue #143, same event path as the
-#     watchdog's mid-run events). rc 0 = all signaled members gone,
+#     mid-run events). rc 0 = all signaled members gone,
 #     3 = still alive after PI_BG_SIGNAL_WAIT, 2 = usage/unknown.
 #
 # RUN-IDENTITY CONTRACT (single-sourced for dispatch; issue #262).
@@ -42,7 +43,7 @@
 #   regex:     ^[0-9]{8}-[0-9]{6}-[0-9]+$  (lib.sh JRATE_TICKET_RE)
 #   record:    <rec-dir>/pi-bg-<id>.json   (lib.sh jrate_rec_dir)
 #   cgroup:    <cg-root>/pi-bg/<id>        (lib.sh jrate_cg_root)
-#   artifacts: $PI_BG_TMPDIR/pi-bg-<id>-*  (watchdog bg_artifact_glob)
+#   artifacts: $PI_BG_TMPDIR/pi-bg-<id>-*  (host-lane readers now; the sweep's glob was bg_artifact_glob)
 #   short id:  a unique 7+ digit suffix of <id> (issue #86;
 #              lib.sh jrate_resolve_ticket scans the run records)
 # The bridge side of the contract - the [bg: wake marker - is
@@ -80,12 +81,12 @@ fi
 # jsonl) to verify the run resumed - nothing reported the kill. This
 # subcommand performs the signal on the run's cgroup tree (same
 # enumeration as jarate-bg-kill) AND emits the receipt on the same event
-# path as the watchdog's mid-run events: a stdout line + a dead-log line
+# path as the mid-run events: a stdout line + a dead-log line
 # (class "signal" - already_dead ignores it, so a later real death is not
 # suppressed) + a webhook post (embed-only, author "pi-bg ticket · <t>"
 # so the bridge exemption wakes the channel; green = the run is alive).
-# The watchdog's CHILD-LEFT event (a separate class; both may fire the
-# same day) confirms the departure on the next sweep.
+# (The sweep's CHILD-LEFT event was a separate class that confirmed the
+# departure on the next sweep; it left with the watchdog, #280/3c.)
 # Per-pid signals ONLY, never the process group: the whole run shares one
 # session (setsid, issue #56) - a group signal is a whole-run kill (that
 # is jarate-bg-kill). The receipt is best-effort over the webhook: the
@@ -246,9 +247,9 @@ PY
           # #231 P1: dead letter in the EXACT bg_post shape (issue #53
           # self-contained: the JSON body is embedded after the `--- body
           # json ---` marker). Without it, a dead webhook + the
-          # marker-suppressed wrapper DIED is a SILENT kill. The
-          # watchdog's dead-letter consumer re-posts the receipt next
-          # sweep.
+          # marker-suppressed wrapper DIED is a SILENT kill. (The
+          # watchdog's dead-letter consumer re-posted the receipt next
+          # sweep; it left with the watchdog, #280/3c.)
           { printf 'ticket   : %s\n' "$sig_id"
             printf 'http     : %s (3 attempts)\n' "$sig_code"
             printf 'when     : %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -282,9 +283,8 @@ jarate-bg: bg dispatch is retired - new dispatches go to the fleet:
             (the visible [bg: prefix was dropped 2026-10-21; the wake
             rides webhook_id + the Author: pi-bg marker)
 The drain is declared (2026-10-23, issue #279): zero in-flight runs
-fleet-wide. The completion side is just the jarate-bg-watchdog sweep
-(until the fleet timer lands) + pi-postcheck.sh; the ~/.pi-bg-art artifact
-convention survives as host history. This launcher exits 10 on the launch
-path by design.
+fleet-wide. The completion side is pi-postcheck.sh only (the watchdog
+sweep left with #280/3c); the ~/.pi-bg-art artifact convention survives
+as host history. This launcher exits 10 on the launch path by design.
 EOF
 exit 10
