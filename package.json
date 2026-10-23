@@ -9,7 +9,8 @@
   "scripts": {
     "lint": "bunx biome check .",
     "size": "bun scripts/size-ratchet.ts",
-    "test": "cd packages/bridge && bun x bun test && cd ../../dispatch && bun test && cd ../bin && bun test && cd ../deploy && bun test",
+    "test": "cd packages/bridge && bun x bun test && cd ../../bin && bun test && cd ../deploy && bun test",
+    "test:all": "cd packages/bridge && bun x bun test && cd ../../dispatch && bun test && cd ../bin && bun test && cd ../deploy && bun test",
     "typecheck": "cd packages/bridge && bun x tsc --noEmit"
   },
   "devDependencies": {
