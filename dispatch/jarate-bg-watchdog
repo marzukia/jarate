@@ -6,7 +6,9 @@
 # untrapably, no callback is posted and the worktree under
 # ~/.pi-bg-wt/<repo>/<ticket>/ lingers with the cgroup escape dir behind it.
 #
-# This sweep runs every 15 min (jarate-bg-watchdog timer unit, user systemd) and does:
+# This sweep runs every 15 min (the 15-min user-systemd timer installed on
+# the box; the repo template left with the pi-bg scrub 2026-10-23 — fresh-box
+# re-add tracked in issue #284) and does:
 #   1. enumerate ~/.pi-bg-wt/*/*/ ticket dirs
 #   2. skip tickets with a LIVE process:
 #        - any pid still inside the escape cgroup
