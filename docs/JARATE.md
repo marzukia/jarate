@@ -103,8 +103,8 @@ re-joined), or a bare date. Default: one hour back, absolute UTC.
 
 ### `projects [--project TAG] [--since YYYY-MM-DD] [--agent NAME]`
 
-Per-project rollup of jarate-bg run records (the `--project` tag, see
-DISPATCH.md) across every agent home on this host. Read-only. Scans
+Per-project rollup of jarate-bg run records (the `--project` tag ran with
+the retired launch path) across every agent home on this host. Read-only. Scans
 `<home>/.pi-dispatch/runs/pi-bg-*.json` per agent (a failing read degrades
 that agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
 
@@ -234,6 +234,6 @@ unreadable/missing (nothing is written then). Manifest write is atomic
   fleet is the dispatch): no extensions — they run the same entrypoint via
   plain bash (`~/scripts/jarate`).
 - **jarate-bg-watchdog**: runs `agents-check` every sweep (15 min) as the
-  AGENTS.md drift tripwire; see DISPATCH.md.
+  AGENTS.md drift tripwire; see `dispatch/jarate-bg-watchdog`.
 - **Deploy**: `install.sh` symlinks `~/bin/jarate` and `~/scripts/jarate`
   into the checkout (idempotent, `--dry-run` clean).

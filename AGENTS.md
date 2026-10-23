@@ -12,7 +12,7 @@ agent stack). Read this before touching anything.
   (exit 10; the `signal` subcommand stays live until the fleet timer lands),
   `jarate-bg-watchdog` completion sweep, `pi-postcheck.sh` (live).
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
-- `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
+- `docs/` — DISPATCH.md (dispatch pointer), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
 - `.githooks/pre-commit` — biome gate; enabled per checkout via repo-local
   git config `core.hooksPath .githooks` (not set by install.sh).
 

@@ -113,8 +113,10 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
 7. callback webhook: reuse an existing "Jarate" webhook in the channel
    (verified by reading its token), else create one (repo icon as avatar,
    retry without avatar on rejection); writes
-   `~/.config/pi-dispatch/webhook` + `webhook_author` (600).
-   `--webhook-url` skips the API
+   `~/.config/pi-dispatch/webhook` (live: `pi-postcheck.sh`, the watchdog,
+   and the bridge's restart-wake read it) + `webhook_author` (600 — written
+   for the record, its only consumer `jarate-wait` was removed with the
+   drain, #279). `--webhook-url` skips the API
 8. units from the `deploy/` templates — `%h` specifiers, so the
    same files work for any user: `pi.service` (name substituted into
    `Description`, jarate path → checkout), `jarate-deploy.{service,timer}`
@@ -129,6 +131,24 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
 
 ## 4. What it does not do (next steps)
 
+The edge runtime IS the setup — after step 2 a standard box is done:
+
+- **pi** — the coding agent (`~/.pi/agent`: settings.json, models.json,
+  AGENTS.md)
+- **bridge** — the pi package from this repo (`packages/bridge`), loaded
+  by pi
+- **`pi.service`** — the systemd user unit that keeps pi running
+  (`Restart=always`; the agent never restarts it itself — §7)
+- **`jarate-deploy` timer** — from step 8; pulls repo changes and restarts
+  `pi.service` when the bridge changed (health-gated, auto-rollback —
+  [DEPLOY.md](DEPLOY.md))
+
+No per-box dispatch machinery to install: context-hungry work goes to the
+fleet control plane (hall-monitor fleetwork, `POST /fleet/dispatch`); the
+old per-box dispatch lane — the callback-webhook runbook and watchdog
+fleet liveness — is not part of standard setup anymore (pointer:
+[DISPATCH.md](DISPATCH.md)).
+
 Per-agent, hand-authored — see the ref box's `~/AGENTS.md` for the
 structure:
 
@@ -136,21 +156,13 @@ structure:
 - `~/memory/` conventions (one file per session,
   `## people / ## decisions / ## follow-ups`)
 
-Optional, runbooks in this repo:
+Optional:
 
-- **RAG** — removed 2026-10-17 (fleet order); the rag Postgres data is kept
-  but unused
 - **Web search (Tavily)** — `cp extensions/mcp-tools.ts
   ~/.pi/agent/extensions/` + a `tavilyApiKey` in settings.json `mcp[]`
   (key in the query string; restart after)
-- **Fleet ops** — [DISPATCH.md](DISPATCH.md): caps, worktrees, retry classes
-- **Agent liveness** (orchestrator box only) — the watchdog sweeps the
-  fleet roster: `~/.config/jarate/fleet-agents`, one `<uid> <webhook-url>`
-  per line (`#` comments ok; the webhook is the agent's own incoming hook,
-  so it gets a copy of its near-misses). No file = own uid only, zero
-  config. The bridge touches its `/var/tmp/jarate-live/<uid>` marker every
-  poll cycle; the sweep pages on staleness (SILENT near-miss, then
-  AGENT-DEAD after two sweeps). [DISPATCH.md](DISPATCH.md) §Agent liveness
+- **RAG** — removed 2026-10-17 (fleet order); the rag Postgres data is kept
+  but unused
 
 ## 5. Verification checklist
 
