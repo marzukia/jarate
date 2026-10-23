@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # lib.sh — shared logic for the dispatch/ scripts (issue #262 DRY/connascence).
 #
-# Sourced by jarate-bg, jarate-bg-watchdog, pi-postcheck.sh and install.sh
-# (the drain, #279, retired jarate-wait/-tail/-kill). Sourcing defines the
-# functions + constants below and computes/exports JRATE_LIB_DIR - no other
-# side effects, so it is safe under the scripts' `set -u` / `set -euo
-# pipefail` combos.
+# Sourced by jarate-bg, pi-postcheck.sh and install.sh (the drain, #279,
+# retired jarate-wait/-tail/-kill; the watchdog went in #280/3c). Sourcing
+# defines the functions + constants below and computes/exports JRATE_LIB_DIR
+# - no other side effects, so it is safe under the scripts' `set -u` /
+# `set -euo pipefail` combos.
 #
 # Single-sourced contracts (the #262 findings live here, in one place):
 #   - the ticket id regex (run-identity contract, documented in the
@@ -194,18 +194,4 @@ jrate_list_tree() {
       queue=("${next[@]+"${next[@]}"}")
     done
   done < <(cat "$cg/cgroup.procs" 2>/dev/null | sort -un)
-}
-
-# --- pi session discovery (issue #262) ---------------------------------------
-# jrate_session_file <profile> <pi-cwd> <start-ts>: the newest session
-# .jsonl for pi's cwd (the session-dir slug is the cwd with '/' -> '-',
-# wrapped in leading/trailing '--'), created or modified after <start-ts>
-# (epoch seconds). Prints the path on stdout; nothing when absent.
-jrate_session_file() {
-  local prof="$1" pi_cwd="$2" start="$3" slug sd
-  [ -n "$pi_cwd" ] || return 0
-  slug="--${pi_cwd#/}"; slug="${slug//\//-}--"
-  sd="$HOME/.pi/agent-${prof}/sessions/$slug"
-  find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$start" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | head -1 | cut -d' ' -f2-
 }

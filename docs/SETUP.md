@@ -113,8 +113,8 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
 7. callback webhook: reuse an existing "Jarate" webhook in the channel
    (verified by reading its token), else create one (repo icon as avatar,
    retry without avatar on rejection); writes
-   `~/.config/pi-dispatch/webhook` (live: `pi-postcheck.sh`, the watchdog,
-   and the bridge's restart-wake read it) + `webhook_author` (600 — written
+   `~/.config/pi-dispatch/webhook` (live: `pi-postcheck.sh` and the
+   bridge's restart-wake read it) + `webhook_author` (600 — written
    for the record, its only consumer `jarate-wait` was removed with the
    drain, #279). `--webhook-url` skips the API
 8. units from the `deploy/` templates — `%h` specifiers, so the

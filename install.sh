@@ -160,13 +160,13 @@ for tool in jarate-bg pi-postcheck.sh; do
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
 # Retired dispatch pointers: the jarate-bg launch-stub era kept 11 names in
-# this list; #283 dropped the four pi-bg* shims, #279 (the drain) drops
-# jarate-wait/-tail/-kill + pi-wait (deleted now) and the watchdog (splits in
-# a follow-up, audit action 3). The deleted names are gone from the repo
-# after the step-1 pull, so our symlinks into them dangle (the watchdog link
-# dangles once action 3 deletes the script). Remove only OUR links (into
-# this checkout) that are now dangling; a live dir or a foreign symlink is
-# left untouched.
+# this list; #283 dropped the four pi-bg* shims, #279 (the drain) dropped
+# jarate-wait/-tail/-kill + pi-wait, and #280/3c dropped the watchdog (the
+# script is gone; its liveness section centralised to hall-monitor#59,
+# its drift tripwire to the agents-docs cascade). The deleted names are
+# gone from the repo after the step-1 pull, so our symlinks into them
+# dangle. Remove only OUR links (into this checkout) that are now
+# dangling; a live dir or a foreign symlink is left untouched.
 for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog \
             jarate-wait jarate-bg-tail jarate-bg-kill pi-wait \
             jarate-bg-watchdog; do

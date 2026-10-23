@@ -11472,17 +11472,18 @@ describe("#84: placeholder settlement (all exit paths)", () => {
 
 // ─── Live marker (issue #191 M2: agent liveness) ─────────────────────────
 // The bridge touches <LIVE_MARKER_DIR>/<uid> (0644) in a sticky 1777 dir
-// once per poll cycle + at session start. The watchdog's fleet liveness
-// sweep (another user) pages on marker staleness: a pi.service death with
-// no in-flight tickets produced zero ticket-class events (2026-10-04
-// monky OOM incident, 33 min dark). /var/tmp (not /tmp): the pre-boot
-// marker survives a reboot so the sweep classifies BOOT-GAP instead of
-// alerting on a fresh boot. The touch is best-effort: a failure must
-// never break the poll loop.
+// once per poll cycle + at session start. The liveness paging on marker
+// staleness now runs on the hall-monitor control plane (hm#59; the
+// watchdog's fleet liveness sweep left with #280/3a). The class it
+// exists for: a pi.service death with no in-flight tickets produced
+// zero ticket-class events (2026-10-04 monky OOM incident, 33 min
+// dark). /var/tmp (not /tmp): the pre-boot marker survives a reboot
+// so a reboot classifies as BOOT-GAP instead of a fresh-boot alert.
+// The touch is best-effort: a failure must never break the poll loop.
 describe("live marker (#191 M2)", () => {
   const uid = process.getuid?.() ?? 0;
 
-  test("LIVE_MARKER_DIR defaults to /var/tmp/jarate-live (the watchdog's default root)", () => {
+  test("LIVE_MARKER_DIR defaults to /var/tmp/jarate-live (the shared default root)", () => {
     expect(LIVE_MARKER_DIR).toBe("/var/tmp/jarate-live");
   });
 

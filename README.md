@@ -14,9 +14,9 @@ What it ships:
   channels, slash commands, threading, chunking, acks, send-file, agent-to-agent
   exemption.
 - **`dispatch/`** — the drained dispatch lane (retired 2026-10-20, drain
-  declared 2026-10-23, #279): `jarate-bg` launch stub (exit 10; `signal`
-  stays live until the fleet timer lands) + `jarate-bg-watchdog` completion
-  sweep + `pi-postcheck.sh` (restart health check, live).
+  declared 2026-10-23, #279; the watchdog left with #280): `jarate-bg`
+  launch stub (exit 10; `signal` stays live until the fleet timer lands)
+  + `pi-postcheck.sh` (restart health check, live).
 - **`templates/` + `scripts/init-repo.sh`** — newrepo boilerplate (repo
   governance: AGENTS/CONTRIBUTING/CI/hooks).
 
@@ -29,7 +29,7 @@ the source of truth.
 |---|---|
 | `packages/bridge/` | `@jarate/bridge` — Discord bridge for pi (TypeScript, bun, strict tsc; 300+ tests) |
 | `packages/bridge/skills/` | pi skill (`channel`) that ships with the bridge |
-| `dispatch/` | drained dispatch lane (#279): `jarate-bg` launch stub (exit 10), `jarate-bg-watchdog` sweep, `pi-postcheck.sh` |
+| `dispatch/` | drained dispatch lane (#279, watchdog left with #280): `jarate-bg` launch stub (exit 10), `pi-postcheck.sh` |
 | `templates/` | newrepo boilerplate (repo governance) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
 | `install.sh` | idempotent bootstrap installer (`--dry-run`, `--jarate-dir`) |
@@ -128,8 +128,8 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
   the run's terminal callback wakes it as a new turn.
 - **jarate-bg dispatch loop (RETIRED 2026-10-20; drained 2026-10-23, #279)**:
   the old worker/reviewer role profiles + webhook-callback loop; the launch
-  path is a stub (exit 10). `dispatch/` keeps the stub, the watchdog, and
-  `pi-postcheck.sh`. Pointer page: [docs/DISPATCH.md](docs/DISPATCH.md).
+  path is a stub (exit 10). `dispatch/` keeps the stub and
+  `pi-postcheck.sh` (the watchdog left with #280). Pointer page: [docs/DISPATCH.md](docs/DISPATCH.md).
 
 ## Develop
 

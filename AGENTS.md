@@ -9,8 +9,8 @@ agent stack). Read this before touching anything.
   strict tsc). Source of truth for the bridge; the live boxes run from
   their checkout (symlinks only, no rsync — see `docs/DEPLOY.md`).
 - `dispatch/` — the drained dispatch lane (#279): `jarate-bg` launch stub
-  (exit 10; the `signal` subcommand stays live until the fleet timer lands),
-  `jarate-bg-watchdog` completion sweep, `pi-postcheck.sh` (live).
+  (exit 10; the `signal` subcommand stays live until the fleet timer lands)
+  and `pi-postcheck.sh` (live; the watchdog left with #280).
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
 - `docs/` — DISPATCH.md (dispatch pointer), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
 - `.githooks/pre-commit` — biome gate; enabled per checkout via repo-local
