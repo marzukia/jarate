@@ -1,173 +1,20 @@
-// /jobs: in-flight pi-bg dispatches + recent-completed history (issue #14)
+// /jobs: recent-completed pi-bg run history (history-only since the drain,
+// #279).
 //
-// In-flight: the pi-bg wrapper's command line carries the profile, and the
-// wrapper process exists only while the run is live, so `ps` is the reliable
-// in-flight marker (the prompt/out artifacts are written at run end). Since
-// issue #118 the TASK no longer rides the wrapper argv (it is piped to pi on
-// stdin and lands in the per-run prompt file first) — when the ps line has
-// no task (or only the `-` stdin marker), /jobs falls back to the first line
-// of pi-bg-<id>-prompt.md. The ticket id is NOT in the ps line; it is
-// resolved per-pid from /proc/<pid>/cgroup (the escape cgroup path ends in
-// the run_id pi-bg prints as the escape path). Unresolvable pid => id:null,
-// never a crash.
+// The dispatch lane is retired (hall-monitor #35, 2026-10-20) and the drain
+// is declared (issue #279: zero state=running records fleet-wide, t180-
+// verified). The in-flight view (ps scan of the jarate-bg wrapper) and the
+// kill/tail wrappers (spawn jarate-bg-kill/-tail) are removed with the
+// completion side — there is no in-flight run left to list, tail, or kill.
 //
 // History: assembled from the pi-bg-<ticket>-* artifacts pi-bg leaves
 // per run (in ~/.pi-bg-art, or $PI_BG_TMPDIR; legacy runs in /tmp are
 // still scanned) — raw.out (run started), out.md (run completed,
-// non-empty), webhook-failed (callback dead letter), killed (jarate-bg-kill
-// marker), wb-status (success-path webhook HTTP code, recorded at post
-// time).
-import { execSync, spawn } from "node:child_process";
+// non-empty), webhook-failed (callback dead letter), killed (kill marker),
+// wb-status (success-path webhook HTTP code, recorded at post time).
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-export interface InflightJob {
-  /** ticket id (run_id) via /proc/<pid>/cgroup, or null when unresolved */
-  id: string | null;
-  profile: string;
-  age: string;
-  task: string;
-}
-
-// Resolve the pi-bg ticket id for a pid: /proc/<pid>/cgroup carries the
-// cgroup path, which ends in .../pi-bg/<run_id>. procRoot is overridable
-// for tests. Any read/parse failure -> null (caller keeps rendering).
-export function ticketIdFromPid(
-  pid: number,
-  procRoot = "/proc",
-): string | null {
-  try {
-    const raw = fs.readFileSync(
-      path.join(procRoot, String(pid), "cgroup"),
-      "utf8",
-    );
-    for (const line of raw.split("\n")) {
-      // cgroup v2: "0::/path"; v1: "N:controllers:/path"
-      const p = line.includes("::")
-        ? (line.split("::").pop() ?? "")
-        : (line.split(":").pop() ?? "");
-      const m = p.match(/pi-bg\/([0-9]{8}-[0-9]{6}-[0-9]+)(?:\/|$)/);
-      if (m) return m[1];
-    }
-  } catch {
-    // process gone or /proc/<pid>/cgroup unreadable — id stays null
-  }
-  return null;
-}
-
-// First display line of a run's task from its per-run prompt file
-// (issue #118 fallback for /jobs: the task is no longer in the wrapper
-// argv). Prompt format: "# pi-bg <profile> task\n\n<task>\n" — the task
-// body starts at line 3. Null when unreadable or empty.
-export function promptTask(
-  id: string,
-  tmpDirs: string[] = jobTmpDirs(),
-): string | null {
-  for (const d of tmpDirs) {
-    try {
-      const body = fs
-        .readFileSync(path.join(d, `pi-bg-${id}-prompt.md`), "utf8")
-        .split("\n");
-      const first = (body[2] ?? "").trim();
-      if (first) return first.slice(0, 70);
-    } catch {
-      // not in this dir; try the next
-    }
-  }
-  return null;
-}
-
-// ps etime: "MM:SS", "H:MM:SS", or "D-H:MM:SS" (procps). Raw seconds for
-// the dedup comparison; unparseable -> 0.
-function etimeToSecs(etime: string): number {
-  const d = etime.match(/^(\d+)-(\d+):(\d{2}):(\d{2})$/);
-  if (d) return +d[1] * 86400 + +d[2] * 3600 + +d[3] * 60 + +d[4];
-  const h = etime.match(/^(\d+):(\d{2}):(\d{2})$/);
-  if (h) return +h[1] * 3600 + +h[2] * 60 + +h[3];
-  const mm = etime.match(/^(\d+):(\d{2})$/);
-  if (mm) return +mm[1] * 60 + +mm[2];
-  return 0;
-}
-
-// Match the wrapper line shape: <pid> <etime> <bash> <script-path> <profile> [<task>]
-// The task is OPTIONAL: since #118 the wrapper argv ends at the profile for
-// stdin-launched runs (legacy argv-task runs still match the old shape).
-// The script path is EITHER the installed symlink (.../scripts/pi-bg)
-// OR the per-run snapshot (.../.pi-bg-art/snap-<run_id>/pi-bg — the
-// deploy-swap guard re-execs from a hard-linked copy, 2026-09-15).
-// procRoot is overridable so the cgroup id resolution is testable with a
-// fake /proc (ticketIdFromPid pattern); tmpDirs feeds the prompt-file
-// task fallback.
-export function parseJobsFromPs(
-  psOut: string,
-  procRoot: string = "/proc",
-  tmpDirs: string[] = jobTmpDirs(),
-): InflightJob[] {
-  const out: InflightJob[] = [];
-  for (const line of psOut.split("\n")) {
-    const m = line
-      .trim()
-      .match(
-        /^(\d+)\s+(\S+)\s+\S*bash\s+\S*(?:(?:scripts|dispatch)\/(?:pi-bg|jarate-bg)|snap-\d{8}-\d{6}-\d+\/pi-bg)\s+(worker|reviewer)(?:\s+(.*))?$/,
-      );
-    if (!m) continue;
-    const id = ticketIdFromPid(Number(m[1]), procRoot);
-    // argv task (legacy form); the `-` marker means "task came on stdin".
-    const argvTask = (m[4] ?? "").trim().replace(/^"+|"+$/g, "");
-    let task =
-      argvTask !== "" && argvTask !== "-"
-        ? argvTask.split("\n")[0].slice(0, 70)
-        : "";
-    if (!task && id) task = promptTask(id, tmpDirs) ?? "";
-    out.push({
-      id,
-      age: m[2],
-      profile: m[3],
-      task,
-    });
-  }
-  // Dedup by resolved ticket id. pi-bg's heartbeat subshell is a forked
-  // child that keeps the wrapper's argv AND cgroup (pi-bg hb loop), so a
-  // live run yields TWO ps lines with the same resolved id. Keep the
-  // longest etime per id — the wrapper always lives >= its forked
-  // helpers — and drop the rest. Null ids pass through untouched (they
-  // cannot be matched; degrades to pre-dedup behavior).
-  const kept = new Map<string, number>(); // id -> index in result
-  const result: InflightJob[] = [];
-  for (const j of out) {
-    if (j.id === null) {
-      result.push(j);
-      continue;
-    }
-    const i = kept.get(j.id);
-    if (i === undefined) {
-      kept.set(j.id, result.length);
-      result.push(j);
-    } else if (etimeToSecs(j.age) > etimeToSecs(result[i].age)) {
-      result[i] = j;
-    }
-  }
-  return result;
-}
-
-export function collectInflightJobs(procRoot: string = "/proc"): InflightJob[] {
-  let raw = "";
-  try {
-    const uid = process.getuid?.();
-    // [s]/(s) tricks keep grep itself out of its own match; the second
-    // arm catches the per-run snapshot path (deploy-swap guard). Both the
-    // scripts/ and dispatch/ wrapper locations are matched — a fail-open
-    // run (pre-snapshot) lives its whole life as scripts/jarate-bg.
-    raw = execSync(
-      `ps ${uid !== undefined ? `-u ${uid}` : "-eo"} -o pid,etime,args | grep -E '(s)cripts/(pi-bg|jarate-bg)|dispatch/(pi-bg|jarate-bg)|snap-[0-9]{8}-[0-9]{6}-[0-9]+/pi-bg'`,
-      { encoding: "utf8", timeout: 5000 },
-    );
-  } catch {
-    return [];
-  }
-  return parseJobsFromPs(raw, procRoot, jobTmpDirs());
-}
 
 export type JobState = "done" | "webhook-failed" | "killed" | "lost";
 
@@ -294,225 +141,42 @@ function ageStr(sec: number): string {
 }
 
 /**
- * Render the /jobs view. format "json" = full machine-readable object
- * (inflight + last 10 history entries); "text" = channel-ready listing
- * (inflight + last 5 history entries).
+ * Render the /jobs view (history only). format "json" = full
+ * machine-readable object (last 10 history entries); "text" = channel-
+ * ready listing (last 5 history entries).
  *
  * Markdown layout (Andryo 2026-10-18: summaries are normal markdown
  * lists, no frame, no width budget - text wraps natively):
- * - in-flight: `- <id> <profile> · <age> · <task>` bullets (full task
- *   text, one line; multi-line tasks collapse to spaces).
  * - recent: `- <state> · <age> · <id>` - state first (the signal), id
  *   last (the lookup key), no webhook noise. Raw state names (no
  *   compression - the 40-col budget that motivated wb-fail is gone).
  * Exported for tests.
  */
 export function formatJobsView(
-  inflight: InflightJob[],
   history: JobHistoryEntry[],
   format: "text" | "json" = "text",
   now: number = Math.floor(Date.now() / 1000),
 ): string {
   if (format === "json") {
-    return JSON.stringify({ inflight, history: history.slice(0, 10) }, null, 2);
-  }
-  const parts: string[] = [];
-  if (inflight.length === 0) {
-    parts.push("**jobs · none in flight**");
-  } else {
-    const lines = [`**jobs · ${inflight.length} in flight**`, ""];
-    for (const j of inflight) {
-      const task = j.task
-        ? j.task
-            .split("\n")
-            .map((t) => t.trim())
-            .filter(Boolean)
-            .join(" ")
-        : "";
-      const head = j.id ? `${j.id} ${j.profile}` : j.profile;
-      lines.push(`- ${head} · ${j.age}${task ? ` · ${task}` : ""}`);
-    }
-    parts.push(lines.join("\n"));
+    return JSON.stringify({ history: history.slice(0, 10) }, null, 2);
   }
   const recent = history.slice(0, 5);
-  if (recent.length > 0) {
-    const lines = [`**recent (newest first) · ${recent.length}**`, ""];
-    for (const h of recent) {
-      lines.push(`- ${h.state} · ${ageStr(now - h.mtime)} · ${h.id}`);
-    }
-    parts.push(lines.join("\n"));
+  if (recent.length === 0) return "**jobs · none**";
+  const lines = [`**recent (newest first) · ${recent.length}**`, ""];
+  for (const h of recent) {
+    lines.push(`- ${h.state} · ${ageStr(now - h.mtime)} · ${h.id}`);
   }
-  return parts.join("\n\n");
+  return lines.join("\n");
 }
 
-/** /jobs entry point: in-flight (ps) + history (/tmp artifacts).
- *  A live run already owns its artifact dir at dispatch time (no out.md
- *  yet), so scanJobHistory sees it as "lost" and it would render in
- *  recent right next to its own in-flight row. Exclude in-flight ids
- *  (non-null only) from the history before formatJobsView slices it —
- *  text and json paths alike. opts override the ps/history sources for
- *  tests. */
+/** /jobs entry point: recent history from the ~/.pi-bg-art artifacts
+ *  (the drain is declared - there is no in-flight view to merge). opts
+ *  override the history source for tests. */
 export function jobsView(
   format: "text" | "json" = "text",
   opts: {
-    inflight?: InflightJob[];
     history?: JobHistoryEntry[];
-    procRoot?: string;
   } = {},
 ): string {
-  const inflight = opts.inflight ?? collectInflightJobs(opts.procRoot);
-  const inflightIds = new Set(
-    inflight.map((j) => j.id).filter((x): x is string => x !== null),
-  );
-  const history = (opts.history ?? scanJobHistory()).filter(
-    (h) => !inflightIds.has(h.id),
-  );
-  return formatJobsView(inflight, history, format);
-}
-
-// ─── /jobs kill | tail (#44) ─────────────────────────────────────────────
-// Thin wrappers over the dispatch scripts jarate-bg-kill / jarate-bg-tail
-// (resolved under <scriptsDir>, default $HOME/scripts — the symlinks
-// install.sh creates). Async spawn: a real kill can wait up to ~10s for
-// the SIGTERM drain, so the event loop must not block. Output is capped
-// the same way as runShellPassthrough (20k chars, hard timeout).
-
-export const JOB_TICKET_ID_RE = /^\d{8}-\d{6}-\d+$/;
-
-const JOB_SCRIPT_TIMEOUT_MS = 20_000;
-const JOB_SCRIPT_OUT_CAP = 20_000;
-
-export function piBgScriptPath(
-  name: string,
-  env: NodeJS.ProcessEnv = process.env,
-  scriptsDir?: string,
-): string {
-  const dir = scriptsDir ?? path.join(env.HOME ?? "", "scripts");
-  return path.join(dir, name);
-}
-
-export function runPiBgScript(
-  name: string,
-  args: string[],
-  env: NodeJS.ProcessEnv = process.env,
-  scriptsDir?: string,
-): Promise<{ out: string; code: number; timedOut: boolean }> {
-  const script = piBgScriptPath(name, env, scriptsDir);
-  return new Promise((resolve) => {
-    if (!fs.existsSync(script)) {
-      resolve({
-        out: `${name} not found at ${script} (install.sh link missing)`,
-        code: 127,
-        timedOut: false,
-      });
-      return;
-    }
-    let p: ReturnType<typeof spawn>;
-    try {
-      p = spawn(script, args, { env });
-    } catch (e) {
-      resolve({
-        out: `spawn failed: ${e instanceof Error ? e.message : String(e)}`,
-        code: 1,
-        timedOut: false,
-      });
-      return;
-    }
-    let out = "";
-    let timedOut = false;
-    const cap = (s: string) => {
-      if (out.length < JOB_SCRIPT_OUT_CAP)
-        out += s.slice(0, JOB_SCRIPT_OUT_CAP - out.length);
-    };
-    const t = setTimeout(() => {
-      timedOut = true;
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already dead */
-      }
-    }, JOB_SCRIPT_TIMEOUT_MS);
-    p.stdout?.on("data", (d) => cap(String(d)));
-    p.stderr?.on("data", (d) => cap(String(d)));
-    p.on("error", (e) => {
-      clearTimeout(t);
-      resolve({ out: `spawn failed: ${e.message}`, code: 1, timedOut: false });
-    });
-    p.on("close", (code) => {
-      clearTimeout(t);
-      resolve({ out, code: code ?? 1, timedOut });
-    });
-  });
-}
-
-/** Fenced code block sized to the content's backtick runs (tail output
- *  regularly contains code fences of its own). */
-function jobWrapFence(t: string): string {
-  const n = (t.match(/`+/g) || ["`"]).reduce(
-    (m, r) => Math.max(m, r.length),
-    0,
-  );
-  const f = "`".repeat(Math.max(3, n + 1));
-  return `${f}\n${t}\n${f}`;
-}
-
-const TAIL_MAX_LINES = 40;
-
-/** Cap + fence tail output. Keeps the LAST TAIL_MAX_LINES lines (a tail
- *  is about the newest output). Lines ship raw - no 40-col hard wrap
- *  (Andryo 2026-10-18: raw output wraps natively; the wrap split long
- *  lines the operator greps for). */
-export function formatTail(out: string): string {
-  const lines = out.replace(/\n$/, "").split("\n");
-  const dropped = Math.max(0, lines.length - TAIL_MAX_LINES);
-  const head = dropped > 0 ? `[..] ${dropped} earlier lines\n` : "";
-  return jobWrapFence(`${head}${lines.slice(-TAIL_MAX_LINES).join("\n")}`);
-}
-
-/** /jobs kill <id>: cancel an in-flight run via its cgroup. Channel line
- *  comes back fenced and ready to post. */
-export async function jobsKill(
-  id: string,
-  env: NodeJS.ProcessEnv = process.env,
-  scriptsDir?: string,
-): Promise<string> {
-  if (!JOB_TICKET_ID_RE.test(id))
-    return jobWrapFence(
-      `[!] usage: /jobs kill <id> (ticket id, e.g. 20260910-135501-48211)`,
-    );
-  const r = await runPiBgScript("jarate-bg-kill", [id], env, scriptsDir);
-  if (r.timedOut) return jobWrapFence(`[!] jarate-bg-kill timed out for ${id}`);
-  if (r.code === 0) return jobWrapFence(`[ok] killed ${id}`);
-  const detail =
-    r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
-  return jobWrapFence(`[!] ${detail}`);
-}
-
-/** /jobs tail <id> [--n N]: a run's live output, capped to the last
- *  TAIL_MAX_LINES lines, wrapped at TAIL_LINE_MAX, fenced. */
-export async function jobsTail(
-  id: string,
-  n: number,
-  env: NodeJS.ProcessEnv = process.env,
-  scriptsDir?: string,
-): Promise<string> {
-  if (!JOB_TICKET_ID_RE.test(id))
-    return jobWrapFence(
-      `[!] usage: /jobs tail <id> [--n N] (ticket id, e.g. 20260910-135501-48211)`,
-    );
-  const lines = Math.max(1, Math.min(200, Math.floor(n) || 40));
-  const r = await runPiBgScript(
-    "jarate-bg-tail",
-    [id, String(lines)],
-    env,
-    scriptsDir,
-  );
-  if (r.timedOut) return jobWrapFence(`[!] jarate-bg-tail timed out for ${id}`);
-  if (r.code !== 0) {
-    const detail =
-      r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
-    return jobWrapFence(`[!] ${detail}`);
-  }
-  if (r.out.trim() === "") return jobWrapFence(`[!] no output for ${id}`);
-  return formatTail(r.out);
+  return formatJobsView(opts.history ?? scanJobHistory(), format);
 }

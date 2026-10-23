@@ -13,9 +13,10 @@ What it ships:
 - **`packages/bridge`** — the Discord bridge for pi (`@jarate/bridge`):
   channels, slash commands, threading, chunking, acks, send-file, agent-to-agent
   exemption.
-- **`dispatch/`** — orchestration: `jarate-bg` (one-shot worker/reviewer runs with
-  git worktrees, cgroup escape, Discord webhook callbacks) + `jarate-wait`
-  (in-turn wait).
+- **`dispatch/`** — the drained dispatch lane (retired 2026-10-20, drain
+  declared 2026-10-23, #279): `jarate-bg` launch stub (exit 10; `signal`
+  stays live until the fleet timer lands) + `jarate-bg-watchdog` completion
+  sweep + `pi-postcheck.sh` (restart health check, live).
 - **`templates/` + `scripts/init-repo.sh`** — newrepo boilerplate (repo
   governance: AGENTS/CONTRIBUTING/CI/hooks).
 
@@ -28,7 +29,7 @@ the source of truth.
 |---|---|
 | `packages/bridge/` | `@jarate/bridge` — Discord bridge for pi (TypeScript, bun, strict tsc; 300+ tests) |
 | `packages/bridge/skills/` | pi skill (`channel`) that ships with the bridge |
-| `dispatch/` | `jarate-bg` (dispatch worker/reviewer, worktrees, cgroup escape, webhook), `jarate-wait` (in-turn wait) |
+| `dispatch/` | drained dispatch lane (#279): `jarate-bg` launch stub (exit 10), `jarate-bg-watchdog` sweep, `pi-postcheck.sh` |
 | `templates/` | newrepo boilerplate (repo governance) |
 | `scripts/` | `init-repo.sh` — instantiates `templates/newrepo` into a new repo |
 | `install.sh` | idempotent bootstrap installer (`--dry-run`, `--jarate-dir`) |
@@ -58,7 +59,7 @@ npm install -g @earendil-works/pi-coding-agent bun
 #    (SERVERS, SERVER MESSAGES, MESSAGE CONTENT, VOICE STATES —
 #     see packages/bridge/channel/discord.ts GATEWAY_INTENTS), invite bot
 
-# 3. bootstrap (symlinks jarate-bg/jarate-wait into the checkout)
+# 3. bootstrap (symlinks jarate-bg + pi-postcheck.sh into the checkout)
 git clone https://github.com/marzukia/jarate.git ~/projects/jarate
 ~/projects/jarate/install.sh
 
@@ -122,10 +123,11 @@ Full reference: [docs/COMMANDS.md](docs/COMMANDS.md).
 - **bridge → Discord**: polls inbound messages, injects a `<channel-ctx>`
   block, forwards agent output back (chunked, threaded, ping-suppressed).
   Bot traffic is exempt (no echo loops).
-- **jarate-bg dispatch loop**: the orchestrator keeps its KV lean by handing
-  context-hungry work to worker/reviewer profiles. Default flow is
-  fire-and-forget — the webhook callback is the wake. In-turn `jarate-wait`
-  is the opt-in exception (short task, human beats every wait).
+- **jarate-bg dispatch loop (RETIRED 2026-10-20; drained 2026-10-23, #279)**:
+  the orchestrator kept its KV lean by handing context-hungry work to
+  worker/reviewer profiles; the webhook callback was the wake, in-turn
+  `jarate-wait` the opt-in exception. Dispatch now goes to the fleet control
+  plane (hall-monitor `POST /fleet/dispatch`).
   Full protocol: [docs/DISPATCH.md](docs/DISPATCH.md).
 
 ## Develop

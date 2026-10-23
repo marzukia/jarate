@@ -1363,7 +1363,7 @@ export interface KickoffLiveState {
 /** Orchestrator priming: the fresh session must re-learn its role
  *  (issue #134). Pinned by test. */
 export const ORCHESTRATOR_PRIME_LINE =
-  "ORCHESTRATOR: you have pi-bg workers (~/scripts/pi-bg). Resume in-flight dispatch and hand off context-hungry work - do not do it inline.";
+  "ORCHESTRATOR: the pi-bg dispatch lane is drained (#279) - new dispatches go to the fleet control plane (hall-monitor). Hand off context-hungry work - do not do it inline.";
 
 /** Live sources for the boot seed: the SAME calls buildHandover uses for
  *  the doc's State section (safeJobsView / safeScheduledTasks / liveTodoState).

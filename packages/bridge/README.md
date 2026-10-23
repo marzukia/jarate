@@ -144,8 +144,8 @@ usage), `/context [N]` (window breakdown), `/reset` (new session),
 reapply turns), `/verbose [0|1|2|on|off]` (tool-call detail level, bare
 `/verbose` toggles), `/hold [on|off]` (buffer inbound messages), `/compact`
 (compact session context), `/handover` (compact via the handover doc),
-`/model [name]` (switch or list models), `/jobs` (+ `kill`/`tail` for pi-bg
-dispatches), `/todos`, `/sleep [list|cancel <id>]`, `/tasks [list|add|...]`,
+`/model [name]` (switch or list models), `/jobs` (recent pi-bg run
+history), `/todos`, `/sleep [list|cancel <id>]`, `/tasks [list|add|...]`,
 `/diff [range|file]` (publish a diff to a viewer URL), `/new-worktree [ref]`
 / `/merge-worktree [squash]`.
 

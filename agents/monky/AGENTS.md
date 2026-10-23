@@ -82,12 +82,12 @@ Format:
 
 You are the ORCHESTRATOR. Goal: preserve your own KV. Hand off context-hungry work to worker/reviewer agents; keep inline only what's tiny.
 
-- Tools: `~/scripts/jarate-bg {worker|reviewer} "task"` (dispatch, posts webhook callback on exit) + `~/scripts/jarate-wait --since <msgid> --timeout 240` (in-turn wait). Pattern doc: the dispatch repo's ORCHESTRATION.md (repo: <dispatch-repo>).
+- Tools: `~/scripts/jarate-bg {worker|reviewer} "task"` (RETIRED stub, hall-monitor #35 - new dispatches go to the fleet control plane, `POST /fleet/dispatch`) + in-turn `jarate-wait` (removed with the drain, #279). Pattern doc: the dispatch repo's ORCHESTRATION.md (repo: <dispatch-repo>).
 - **Worker** = self-contained tasks: bulk edits, tests, research, file gen. `--worktree <ref>` (or bare `--worktree` = HEAD) runs it in a kept git worktree `~/.pi-bg-wt/<repo>/<id>`, branch `pi-bg/<id>` — path + branch in callback; diff, merge, `git worktree remove` after. **Reviewer** = anything that needs checking: PRs, significant code, claims needing proof. Same workdir; verdict PASS/FAIL.
 - FAIL loop: ONE fix round (worker gets the findings), then you decide. No infinite loops.
 - **Merge gate (<operator> YYYY-MM-DD):** worker waves go to a PR, not main. Flow: worker → adversarial review (reviewer) → PASS → push branch + open PR → <operator> approves + merges manually.
 - **Default: fire-and-forget.** Dispatch → confirm ("dispatched, I'll report when it lands") → end turn. The webhook callback wakes you as a new turn; act on it then. Polling loops read as "stuck" to the human (<operator>'s call).
-- In-turn wait is opt-in, only when the answer must land in THIS turn (short task): `nohup jarate-bg ... &` → `jarate-wait --since <msgid> --timeout 240`. Exit 0 = callback (act), 2 = human spoke (drop wait, answer the human first), 3 = timeout (report, re-wait or drop).
+- In-turn wait was opt-in (only when the answer must land in THIS turn, short task): `nohup jarate-bg ... &` → `jarate-wait --since <msgid> --timeout 240`. RETIRED with the drain (#279): the callback wakes you as a separate turn instead.
 - **The human beats every wait.** Waits ≤ 240s and rare. Fan-out: dispatch all, confirm once, end turn — callbacks arrive as separate wakes.
 - KV hygiene: callbacks are truncated (1.8k) — read files for detail, never paste big worker output into your turn. Task prompts must be self-contained (fresh context).
 - **Cap: max N concurrent jarate-bg dispatches (workers + reviewers combined) per agent.** <operator> sets the cap per agent. Before dispatching, count live: `ps aux | grep "jarate-bg worker\|jarate-bg reviewer" | grep -v grep | wc -l`.

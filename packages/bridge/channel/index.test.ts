@@ -61,7 +61,6 @@ import extension, {
   pendingInterrupts,
   persistLivePlaceholders,
   popChannelQueuedInbound,
-  popOldestQueuedInbound,
   prunePendingBatches,
   queuedAcks,
   queueMidTurnInbound,
@@ -3644,94 +3643,6 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.session_start?.(null, ctx);
     process.env.HOME = oldHome;
     expect(sent.length).toBe(sentBefore);
-  });
-});
-
-describe("re-wake in-turn consumed marker (#231 P3)", () => {
-  let tmp = "";
-  let oldHome = "";
-  const stateDir = () => path.join(tmp, ".pi-dispatch-state");
-  const markerDir = () => path.join(tmp, ".pi-dispatch", "in-turn-consumed");
-  const writeMarker = (id: string) => {
-    fs.mkdirSync(markerDir(), { recursive: true });
-    fs.writeFileSync(path.join(markerDir(), id), "");
-  };
-  const base = {
-    channelId: "ch1",
-    channelName: "Test",
-    channelType: "discord" as const,
-    timestamp: new Date().toISOString(),
-    attachments: [],
-    isRoom: false,
-  };
-  const bgInbound = (id: string): ChannelMessage => ({
-    ...base,
-    messageId: id,
-    from: "pi-bg",
-    fromId: "wa-1",
-    // the 2026-10-21 de-prefix shape: the serialized embed (content "",
-    // author starts pi-bg)
-    body: `<embed>\nAuthor: pi-bg worker \u00b7 20261017-000000-${id}\nTitle: worker \u00b7 OK\nresult: task ${id}\n</embed>`,
-  });
-  const humanInbound = (id: string): ChannelMessage => ({
-    ...base,
-    messageId: id,
-    from: "u",
-    fromId: "uid",
-    body: `human text ${id}`,
-  });
-
-  beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "itc-test-"));
-    oldHome = process.env.HOME || "";
-    process.env.HOME = tmp; // hasInTurnConsumedMarker resolves $HOME live
-    setRuntimeStateDir(stateDir());
-    midTurnQueues.clear();
-    queuedAcks.clear();
-    heldChannels.clear();
-  });
-
-  afterEach(() => {
-    process.env.HOME = oldHome;
-    setRuntimeStateDir(null);
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
-  test("queued machine-wake entry WITH a consumed marker is dropped, next entry popped", () => {
-    queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
-    queueMidTurnInbound("ch1", bgInbound("222"), "t", "discord/Test", "t");
-    // jarate-wait consumed the OLDEST in turn; the other keeps its wake
-    writeMarker("111");
-    const popped = popOldestQueuedInbound();
-    expect(popped?.msg.messageId).toBe("222");
-    // the consumed copy is gone from memory AND the survival file…
-    expect(midTurnQueues.has("ch1")).toBe(false);
-    const file = loadRewakeQueue(stateDir(), "ch1");
-    // …the popped copy (222) stays pending — it commits via sendToPi on
-    // delivery; the dropped copy (111) is committed as delivered
-    expect(file.pending.map((p) => p.msg.messageId)).toEqual(["222"]);
-    expect(file.delivered).toContain("111");
-  });
-
-  test("queued machine-wake entry WITHOUT a marker is delivered (timeout path)", () => {
-    queueMidTurnInbound("ch1", bgInbound("111"), "t", "discord/Test", "t");
-    const popped = popOldestQueuedInbound();
-    expect(popped?.msg.messageId).toBe("111");
-    expect(midTurnQueues.has("ch1")).toBe(false);
-  });
-
-  test("human entry with a marker file for its id is still delivered", () => {
-    queueMidTurnInbound(
-      "ch1",
-      humanInbound("333"),
-      "t",
-      "discord/Test",
-      "t",
-      false,
-    );
-    writeMarker("333"); // the marker only gates machine wakes
-    const popped = popOldestQueuedInbound();
-    expect(popped?.msg.messageId).toBe("333");
   });
 });
 
@@ -10170,79 +10081,45 @@ describe("wave 2c bridge commands", () => {
     expect(last!.startsWith("```")).toBe(false);
   });
 
-  test("/jobs kill + tail: owner-only wrappers around jarate-bg-kill/-tail (#44)", async () => {
+  test("/jobs: history-only view (drain declared, #279)", async () => {
     const home = path.join(tmp, "home");
-    const scripts = path.join(home, "scripts");
-    fs.mkdirSync(scripts, { recursive: true });
+    const art = path.join(home, ".pi-bg-art");
+    fs.mkdirSync(art, { recursive: true });
+    // fresh mtime: the fixture entry is the NEWEST and renders first
     fs.writeFileSync(
-      path.join(scripts, "jarate-bg-kill"),
-      "#!/bin/sh\nexit 0\n",
+      path.join(art, "pi-bg-20260914-091714-3097-out.md"),
+      "result\n",
     );
-    fs.writeFileSync(
-      path.join(scripts, "jarate-bg-tail"),
-      "#!/bin/sh\necho 'line one'\necho 'line two'\n",
-    );
-    fs.chmodSync(path.join(scripts, "jarate-bg-kill"), 0o755);
-    fs.chmodSync(path.join(scripts, "jarate-bg-tail"), 0o755);
     const oldHome = process.env.HOME;
+    const oldTmpDir = process.env.PI_BG_TMPDIR;
     process.env.HOME = home;
+    process.env.PI_BG_TMPDIR = art; // jobTmpDir() reads the env var live
     try {
-      // non-owner: refused, never handed to pi as plain text
+      // history is informational: open to any channel member
+      await handleInbound(pi, otherInbound("/jobs", "m1"), ctx);
+      const post = posts().find((t) => t.includes("20260914-091714-3097"));
+      expect(post).toBeDefined();
+      expect(post).toContain("- done ");
+      // markdown list, unfenced (Andryo 2026-10-18)
+      expect(post!.startsWith("```")).toBe(false);
+      // json = machine output (fenced)
+      await handleInbound(pi, inbound("/jobs json", "m2"), ctx);
+      const jsonPost = posts()
+        .filter((t) => t.startsWith("```"))
+        .find((t) => t.includes('"history"'));
+      expect(jsonPost).toBeDefined();
+      // kill/tail died with the completion side: no wrapper output, the
+      // arg is just ignored and the view renders
       await handleInbound(
         pi,
-        otherInbound("/jobs kill 20260914-091714-3097", "m1"),
+        inbound("/jobs kill 20260914-091714-3097", "m3"),
         ctx,
       );
-      expect(sent).toHaveLength(0);
-      expect(posts().some((t) => t.includes("killed"))).toBe(false);
-      // owner kill
-      await handleInbound(
-        pi,
-        inbound("/jobs kill 20260914-091714-3097", "m2"),
-        ctx,
-      );
-      expect(
-        posts().some((t) => t.includes("[ok] killed 20260914-091714-3097")),
-      ).toBe(true);
-      // owner tail: fenced output
-      await handleInbound(
-        pi,
-        inbound("/jobs tail 20260914-091714-3097", "m3"),
-        ctx,
-      );
-      const tailPost = posts().find((t) => t.includes("line one"));
-      expect(tailPost).toBeDefined();
-      expect(tailPost).toContain("line two");
-      expect(tailPost!.startsWith("```")).toBe(true);
-      // missing id -> usage line
-      await handleInbound(pi, inbound("/jobs kill", "m4"), ctx);
-      expect(
-        posts().some((t) => t.includes("[!] usage: /jobs kill <id>")),
-      ).toBe(true);
-      await handleInbound(pi, inbound("/jobs tail", "m5"), ctx);
-      expect(
-        posts().some((t) => t.includes("[!] usage: /jobs tail <id> [--n N]")),
-      ).toBe(true);
-      // --n accepted; bad --n is a usage error
-      await handleInbound(
-        pi,
-        inbound("/jobs tail 20260914-091714-3097 --n 5", "m6"),
-        ctx,
-      );
-      expect(posts().filter((t) => t.includes("line one")).length).toBe(2);
-      await handleInbound(
-        pi,
-        inbound("/jobs tail 20260914-091714-3097 --n x", "m7"),
-        ctx,
-      );
-      expect(
-        posts().filter((t) => t.includes("usage: /jobs tail")).length,
-      ).toBe(2);
-      // bare /jobs: markdown list view (2026-10-18)
-      await handleInbound(pi, inbound("/jobs", "m8"), ctx);
-      expect(posts().some((t) => t.includes("**jobs"))).toBe(true);
+      expect(posts().some((t) => t.includes("[ok] killed"))).toBe(false);
     } finally {
       process.env.HOME = oldHome;
+      if (oldTmpDir === undefined) delete process.env.PI_BG_TMPDIR;
+      else process.env.PI_BG_TMPDIR = oldTmpDir;
     }
   });
 

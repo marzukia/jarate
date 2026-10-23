@@ -8,8 +8,9 @@ agent stack). Read this before touching anything.
 - `packages/bridge/` — the Discord bridge, `@jarate/bridge` (TypeScript, bun,
   strict tsc). Source of truth for the bridge; the live boxes run from
   their checkout (symlinks only, no rsync — see `docs/DEPLOY.md`).
-- `dispatch/` — `jarate-bg`, `jarate-wait` bash scripts (+ `pi-*` deprecation
-  shims; the orchestration machinery).
+- `dispatch/` — the drained dispatch lane (#279): `jarate-bg` launch stub
+  (exit 10; the `signal` subcommand stays live until the fleet timer lands),
+  `jarate-bg-watchdog` completion sweep, `pi-postcheck.sh` (live).
 - `install.sh` — idempotent installer; `--dry-run` must keep working.
 - `docs/` — DISPATCH.md (orchestration), COMMANDS.md, DEPLOY.md, NEW-AGENT.md (fleet onboarding runbook).
 - `.githooks/pre-commit` — biome gate; enabled per checkout via repo-local

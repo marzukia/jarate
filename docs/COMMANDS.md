@@ -40,8 +40,7 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/context [N]` | markdown list, unfenced (`**context · top N/M**` + bullets, est tokens char/4); error: `[!] no session file found` / `[!] session file unreadable` |
 | `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
 | `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
-| `/jobs kill <id>` | `[ok] killed <id>` / `[!] …` (fenced) |
-| `/jobs tail <id> [--n N]` | fenced tail output (`[..] N earlier lines` when capped) |
+| `/jobs` | markdown list, unfenced (`**recent (newest first) · N**` + bullets); `json` stays fenced |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |
 | `/undo` / `/redo` | `undone: …` / `nothing to undo` (bare plain words) |
@@ -49,7 +48,6 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/hold [on|off]` | `[ok] hold on - buffered until /hold off` |
 | `/compact` | `[queued] …` (verbose 1+) / `[..] …` / `compacted: …` / `compact failed: …` (bare) |
 | `/model [name]` | `[model] …` (switch: `[ok] …` / `[!] …`) |
-| `/jobs` | markdown list, unfenced (`**jobs · N in flight**` + bullets); `json` stays fenced |
 | `/diff [git-range \| file]` | `[ok] …` (errors: `[!] …`) |
 | `/todos` | markdown board, unfenced (`**todos · N open**` + `- ` bullets); empty: `[todos] no open todos` |
 | `/sleep list` | markdown list, unfenced (`**[wake] N pending wakes (of M total)**` + bullets) |
@@ -78,15 +76,13 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | *delete a queued message* | owner | the queued entry (and its interrupt) is dropped |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
-| `/jobs` | anyone | list `jarate-bg` dispatches: in-flight + recent history (`json` for JSON) |
+| `/jobs` | anyone | recent pi-bg run history from the `~/.pi-bg-art` artifacts (`json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session\|last]` | anyone | token usage: current session (default), lifetime across all session files, or the last completed run |
 | `/context [N]` | anyone | what is eating the window: top-N items by token ESTIMATE (char/4, no model, no pricing) + category totals (user/assistant/tool) + biggest eater; N default 10, max 40 |
 | `/new-worktree [ref]` | owner | create a git worktree for this session's repo at `$PI_BG_WT_DIR/<repo>/<ticket>` (branch `pi-bg/<ticket>`), one at a time |
 | `/merge-worktree [squash]` | owner | merge the active worktree's branch into the live checkout's current branch, then remove worktree + branch; `squash` = one commit |
-| `/jobs kill <id>` | owner | kill an in-flight `jarate-bg` run (wraps `jarate-bg-kill`) |
-| `/jobs tail <id> [--n N]` | owner | tail a run's live output (wraps `jarate-bg-tail`; N capped at 200, shown lines at 40) |
 | `/reset` | owner | abort the run and restart the pi session |
 | `/hold [on\|off]` | owner | buffer plain messages in the re-wake queue until released (bare toggles) |
 | `/verbose on\|off` | owner | toggle tool-call forwarding until restart (bare `/verbose` toggles) |
@@ -197,7 +193,7 @@ the tool for "do this next, but don't interrupt what you're doing".
 ### /btw
 
 ```
-/btw what's the exit code convention in jarate-wait?
+/btw what's the exit code convention in jarate-bg?
 ```
 
 Side question answered briefly while the main run continues. A trailing
@@ -351,43 +347,30 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 ### /jobs
 
 ```
-/jobs                        # text: in-flight + last 5 completed
-/jobs json                   # machine-readable: {inflight, history(10)}
-/jobs kill <id>              # kill an in-flight run (owner)
-/jobs tail <id> [--n N]      # tail a run's live output (owner)
+/jobs                        # text: last 5 completed runs
+/jobs json                   # machine-readable: {history(10)}
 ```
 
-In-flight via the process table (the `jarate-bg` wrapper process exists only
-while a run is live); recent history from the `~/.pi-bg-art` artifacts each
-run leaves. Markdown list layout (2026-10-18): in-flight bullets carry
-id + profile + age + the full task text; recent bullets are
+History-only since the drain (#279): the dispatch lane is retired (zero
+in-flight runs fleet-wide), so the in-flight ps view and the `kill`/`tail`
+wrappers (which spawned the removed `jarate-bg-kill`/`jarate-bg-tail`
+scripts) are gone. Recent history comes from the `~/.pi-bg-art` artifacts
+each run leaves. Markdown list layout (2026-10-18): recent bullets are
 state-first (raw states `done` / `webhook-failed` / `killed` / `lost`),
 age, then id - no fence, no width budget:
 
 ```
-**jobs · 1 in flight**
-
-- 20260910-135501-48211 worker · 04:12 · bulk refactor of channel/
-
 **recent (newest first) · 2**
 
 - done · 12m · 20260910-135501-48211
 - webhook-failed · 54m · 20260910-131200-77319
 ```
 
+Empty when `~/.pi-bg-art` holds no `pi-bg-<ticket>-*` artifacts (after the
+host cleanup, piboy's lane): `**jobs · none**`.
+
 The `json` format keeps the raw machine-readable object (states un-compressed,
 plus the success-path webhook HTTP code when recorded).
-
-`kill` and `tail` wrap the dispatch scripts (`jarate-bg-kill <id>`,
-`jarate-bg-tail <id> [lines]`) and are owner-only: kill is a state change,
-and the tail file is owned by the dispatch user. Output is fenced; tail
-shows the last N lines (default 40, cap 200), notes dropped lines
-(`[..] 60 earlier lines`); lines ship raw - no 40-col hard wrap
-(2026-10-18).
-
-Companion bins (installed like `jarate-bg`): `jarate-bg-tail <id> [lines] [-f]`
-reads a run's live output; `jarate-bg-kill <id> [--dry-run]` cancels a run via
-its cgroup and posts a `CANCELLED` webhook event.
 
 ### /new-worktree + /merge-worktree
 

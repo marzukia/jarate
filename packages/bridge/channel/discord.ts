@@ -1913,12 +1913,13 @@ export const SLASH_COMMANDS = [
   },
   {
     name: "jobs",
-    description: "List in-flight pi-bg dispatches (kill/tail are owner)",
+    description:
+      "Recent pi-bg run history (history-only since the drain, #279)",
     options: [
       {
         type: 3,
         name: "action",
-        description: "kill <id>, tail <id> [--n N], or json (omit: list)",
+        description: "json (omit: text view)",
         required: false,
       },
     ],

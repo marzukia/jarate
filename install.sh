@@ -7,14 +7,12 @@
 #   3. bun install in packages/bridge (deps only; node_modules is gitignored,
 #      machine-local)
 #   4. makes machine paths POINTERS (symlinks) into the checkout:
-#        dispatch family (issue #151) — 5 jarate-* entrypoints + the pi-wait
-#        deprecation shim, each linked into BOTH ~/.local/bin and ~/scripts:
-#        {~/.local/bin,~/scripts}/jarate-bg      -> <jarate>/dispatch/jarate-bg
-#        {~/.local/bin,~/scripts}/jarate-wait    -> <jarate>/dispatch/jarate-wait
-#        {~/.local/bin,~/scripts}/jarate-bg-tail -> <jarate>/dispatch/jarate-bg-tail
-#        {~/.local/bin,~/scripts}/jarate-bg-kill -> <jarate>/dispatch/jarate-bg-kill
-#        {~/.local/bin,~/scripts}/jarate-bg-watchdog -> <jarate>/dispatch/jarate-bg-watchdog
-#        {~/.local/bin,~/scripts}/pi-wait        -> <jarate>/dispatch/pi-wait (shim)
+#        dispatch family — the drain is declared (#279): only the
+#        jarate-bg launch stub (exit 10; `signal` subcommand stays live)
+#        and pi-postcheck.sh are owned by install.sh, each linked into
+#        BOTH ~/.local/bin and ~/scripts:
+#        {~/.local/bin,~/scripts}/jarate-bg -> <jarate>/dispatch/jarate-bg
+#        {~/.local/bin,~/scripts}/pi-postcheck.sh -> <jarate>/dispatch/pi-postcheck.sh
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
 #        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
@@ -52,7 +50,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1 ;;
     --jarate-dir) JARATE_DIR="${2:?--jarate-dir needs a path}"; shift ;;
     --clone-url) CLONE_URL="${2:?--clone-url needs a url}"; shift ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,26p'; exit 0 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | sed -n '2,23p'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
@@ -150,21 +148,29 @@ else
 fi
 
 # --- 3. pointer links --------------------------------------------------------
-# Dispatch family (issue #150 + #151): 5 jarate-* entrypoints + the pi-wait
-# deprecation shim + pi-postcheck.sh (polish sweep C1), linked into BOTH
-# ~/.local/bin and ~/scripts. install.sh OWNS these names: stale entries
-# (pi-dispatch-era files, symlinks to old checkouts) are re-pointed, one
-# auditable line per change.
-for tool in jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog \
-            pi-wait pi-postcheck.sh; do
+# Dispatch family: the drain is declared (#279, t180-verified: zero
+# state=running records fleet-wide) — install.sh owns only the two live
+# members: the jarate-bg launch stub (exit 10 retirement notice; the
+# `signal` subcommand stays live until the fleet timer lands) and
+# pi-postcheck.sh (live: pi-restart schedules it 90s after every restart).
+# Linked into BOTH ~/.local/bin and ~/scripts. install.sh OWNS these names:
+# stale entries (pi-dispatch-era files, symlinks to old checkouts) are
+# re-pointed, one auditable line per change.
+for tool in jarate-bg pi-postcheck.sh; do
   link_owned "$HOME/.local/bin/$tool" "$JARATE_DIR/dispatch/$tool"
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
-# Retired pi-bg shims (operator order 2026-10-23: "pi-bg should be gone"): the
-# four dispatch/pi-bg* files left the repo, so our symlinks into them dangle
-# after the step-1 pull. Remove only OUR links (into this checkout) that are
-# now dangling; a live dir or a foreign symlink is left untouched.
-for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog; do
+# Retired dispatch pointers: the jarate-bg launch-stub era kept 11 names in
+# this list; #283 dropped the four pi-bg* shims, #279 (the drain) drops
+# jarate-wait/-tail/-kill + pi-wait (deleted now) and the watchdog (splits in
+# a follow-up, audit action 3). The deleted names are gone from the repo
+# after the step-1 pull, so our symlinks into them dangle (the watchdog link
+# dangles once action 3 deletes the script). Remove only OUR links (into
+# this checkout) that are now dangling; a live dir or a foreign symlink is
+# left untouched.
+for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog \
+            jarate-wait jarate-bg-tail jarate-bg-kill pi-wait \
+            jarate-bg-watchdog; do
   for dest in "$HOME/.local/bin/$tool" "$HOME/scripts/$tool"; do
     if [ -L "$dest" ] && [ ! -e "$dest" ]; then
       case "$(readlink "$dest")" in
@@ -189,7 +195,7 @@ link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 # never dispatch a job. Hard fail outside dry-run.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-FAMILY_TOOLS="jarate-bg jarate-wait jarate-bg-tail jarate-bg-kill jarate-bg-watchdog pi-wait pi-postcheck.sh"
+FAMILY_TOOLS="jarate-bg pi-postcheck.sh"
 for tool in $FAMILY_TOOLS jarate jarate-diff; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
@@ -207,8 +213,7 @@ for tool in $FAMILY_TOOLS jarate jarate-diff; do
     # checkout, so a shadow that survived the re-point fails install
     # loudly instead of at dispatch time.
     case "$tool" in
-      jarate-bg|jarate-wait|jarate-bg-tail|jarate-bg-kill|jarate-bg-watchdog|\
-      pi-wait|pi-postcheck.sh) ;;
+      jarate-bg|pi-postcheck.sh) ;;
       *) continue ;;
     esac
     sum_installed="$(sha256sum "$resolved" 2>/dev/null | cut -d' ' -f1 || true)"

@@ -102,7 +102,7 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
 2. `GET /users/@me` — validates the token, records the bot id
 3. `GET /channels/<id>` — validates the channel; rejects DMs with a hint
 4. clone/checkout `~/projects/jarate` + `./install.sh` (idempotent; symlinks
-   `jarate-bg`/`jarate-wait`, `bun install` in the
+   `jarate-bg` + `pi-postcheck.sh`, `bun install` in the
    bridge, creates `/var/tmp/jarate-live` (1777) for the agent liveness
    markers — issue #191 M2)
 5. merge `~/.pi/agent/settings.json`: bridge `packages` entry, the channel
@@ -143,7 +143,7 @@ Optional, runbooks in this repo:
 - **Web search (Tavily)** — `cp extensions/mcp-tools.ts
   ~/.pi/agent/extensions/` + a `tavilyApiKey` in settings.json `mcp[]`
   (key in the query string; restart after)
-- **Fleet ops** — [DISPATCH.md](DISPATCH.md): caps, worktrees, `jarate-wait`
+- **Fleet ops** — [DISPATCH.md](DISPATCH.md): caps, worktrees, retry classes
 - **Agent liveness** (orchestrator box only) — the watchdog sweeps the
   fleet roster: `~/.config/jarate/fleet-agents`, one `<uid> <webhook-url>`
   per line (`#` comments ok; the webhook is the agent's own incoming hook,
