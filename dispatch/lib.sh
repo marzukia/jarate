@@ -17,7 +17,8 @@
 #   - the cgroup v2 user-slice root: $PI_BG_CG_ROOT, else the system path
 #   - the live marker dir default: /var/tmp/jarate-live, shared with
 #     install.sh (which creates it 1777) and the bridge, which writes it
-#     (packages/bridge/channel/index.ts, JARATE_LIVE_DIR)
+#     (packages/bridge/channel/index.ts, JARATE_LIVE_DIR); the watchdog's
+#     fleet liveness sweep (the reader) left with #280/3a -> hall-monitor#59
 #   - the webhook POST retry shape: 3 tries, i*3*PI_BG_WB_BACKOFF backoff
 #     (PI_BG_WB_BACKOFF=0 is the no-sleep test seam; the watchdog used to
 #     hardcode i*3 and ignore the env)
@@ -112,15 +113,11 @@ jrate_cg_root() {
   printf '%s' "${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
 }
 
-# The agent-liveness marker dir (issue #191 M2): per-agent <uid> files the
-# bridge touches every poll cycle; the watchdog's fleet sweep reads
-# everyone's. install.sh creates it (1777 sticky); the bridge writes it.
-# $JARATE_LIVE_DIR is the bridge's env name; $PI_BG_LIVE_ROOT is the
-# watchdog's pre-rename test hook (kept as an alias, lower priority).
+# The agent-liveness marker dir default (issue #191 M2). The watchdog's
+# fleet liveness sweep (the reader) is gone with #280/3a: install.sh creates
+# the dir and the bridge writes the per-agent <uid> files; liveness paging
+# now runs on the hall-monitor control plane (hall-monitor#59).
 JRATE_LIVE_DIR_DEFAULT=/var/tmp/jarate-live
-jrate_live_dir() {
-  printf '%s' "${JARATE_LIVE_DIR:-${PI_BG_LIVE_ROOT:-$JRATE_LIVE_DIR_DEFAULT}}"
-}
 
 # --- webhook post (shared retry shape, issue #262) ---------------------------
 # jrate_wb_post <webhook> <body-file> [resp-file]: POST the JSON body file
