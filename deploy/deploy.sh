@@ -243,6 +243,10 @@ main() {
   # Pre-deploy verification. Fails abort BEFORE any restart.
   # typecheck is jarate's check (biome lint runs in CI; typecheck+test is the
   # gate here). No build step exists for jarate — checkout IS the deployment.
+  # #278: the gate runs bridge tsc + the bridge/bin/deploy suites only. The
+  # dispatch suite (retired watchdog tests, ~600s wall, 30s/90s per-test
+  # timeouts) is CI-only: under host load it timed out INSIDE this gate and
+  # wedged the 30s tick (3 consecutive fails -> backoff) on 3 of 4 agents.
   bun run typecheck || die "pre-deploy typecheck failed"
   bun run test || die "pre-deploy tests failed"
 
