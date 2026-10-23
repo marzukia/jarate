@@ -1,11 +1,12 @@
 # Dispatch (orchestration pattern)
 
-> **Retirement note (hall-monitor #35, 2026-10-20):** `jarate-bg`'s launch
-> path is RETIRED (stub, rc 10). New dispatches go to hall-monitor
-> fleetwork (`POST http://100.95.144.25:8001/api/fleet/dispatch`); in-flight
-> tickets dispatched before retirement keep running under the old topology,
-> and the watchdog/tail/kill completion side stays alive until they drain.
-> See `dispatch/jarate-bg` for the full notice.
+> **Retirement note (hall-monitor #35, 2026-10-20; drain declared
+> 2026-10-23, #279):** `jarate-bg`'s launch path is RETIRED (stub, rc 10).
+> New dispatches go to hall-monitor fleetwork (`POST
+> http://100.95.144.25:8001/api/fleet/dispatch`); the drain covered the
+> in-flight tickets and the completion side went with it (tail/kill
+> removed #279, the watchdog split #280). See `dispatch/jarate-bg` for
+> the full notice.
 
 Dispatch lives in the fleet control plane: **hall-monitor fleetwork** —
 `POST` [http://100.95.144.25:8001/api/fleet/dispatch](http://100.95.144.25:8001/api/fleet/dispatch)
