@@ -84,7 +84,7 @@ import {
   shouldHandoff,
 } from "./handover";
 import { registerJarateTool } from "./jarate";
-import { jobsKill, jobsTail, jobsView } from "./jobs";
+import { jobsView } from "./jobs";
 import { extractQueueSuffix } from "./queue";
 import {
   loadRewakeQueue,
@@ -441,42 +441,12 @@ export function queueMidTurnInbound(
   return q.length;
 }
 
-// ─── In-turn consumed marker (#231 P3) ──────────────────────────────────
-// jarate-wait writes one marker file per DISCORD MESSAGE id on rc 0
-// (~/.pi-dispatch/in-turn-consumed/<id>, dir 0700, >1h pruned on its
-// start). A machine-wake callback the agent consumed IN TURN therefore has a
-// marker before any re-wake drain can pop its queued copy: the bridge
-// queued the message at arrival T0, jarate-wait saw the same message at
-// T1 >= T0 and wrote the marker, the drain consults at T2 > T1. A wait
-// timeout (rc 3) writes no marker -> the re-wake delivers as today (the
-// fix's failure mode IS today's behavior). Keyed on the message id, never
-// the ticket: the ticket's other messages keep their wakes.
-export function inTurnConsumedDir(home = defaultHome()): string {
-  return path.join(home, ".pi-dispatch", "in-turn-consumed");
-}
-
-/** #231 P3: does the Discord message id carry an in-turn consumed
- *  marker? Never throws (missing dir/file = false; a non-numeric id is
- *  no snowflake, so no file). */
-export function hasInTurnConsumedMarker(
-  messageId: string,
-  home = defaultHome(),
-): boolean {
-  if (!/^\d+$/.test(messageId)) return false;
-  try {
-    return fs.statSync(path.join(inTurnConsumedDir(home), messageId)).isFile();
-  } catch {
-    return false;
-  }
-}
+// ─── Re-wake FIFO ────────────────────────────────────────────────────────
 
 /** Pop the globally oldest queued inbound across all channels (FIFO).
  *  Held channels (#39) are skipped: their buffer drains on /hold off,
- *  not at agent_end. #231 P3: a queued machine-wake entry whose message id
- *  has an in-turn consumed marker is DROPPED (logged) and the next entry
- *  popped — the agent already consumed that callback in turn, so the
- *  re-wake is the double-delivery copy. Human entries never drop (the
- *  marker only gates machine-wake entries). */
+ *  not at agent_end. (The #231 P3 in-turn-consumed marker drop is gone
+ *  with jarate-wait, the only marker producer — #279 drain.) */
 export function popOldestQueuedInbound(): {
   channelId: string;
   msg: ChannelMessage;
@@ -501,24 +471,9 @@ export function popOldestQueuedInbound(): {
     // cancel splices it): recompute on a stale snapshot instead of
     // shifting the wrong entry.
     if (q[0]?.queuedAt !== oldest.queuedAt) continue;
-    const drop =
-      isBgInbound(oldest.msg) && hasInTurnConsumedMarker(oldest.msg.messageId);
     q.shift();
     if (q.length === 0) midTurnQueues.delete(oldest.channelId);
     consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
-    if (drop) {
-      // Consumed in turn = delivered: record the id (dedupes the
-      // startup history scan) and clear it from the survival file.
-      rewakeCommitDelivered(
-        runtimeStateDir,
-        oldest.channelId,
-        oldest.msg.messageId,
-      );
-      console.log(
-        `[channel] dropped in-turn-consumed machine-wake re-wake ${oldest.msg.messageId} (${oldest.channelId})`,
-      );
-      continue;
-    }
     return { channelId: oldest.channelId, msg: oldest.msg };
   }
 }
@@ -2177,9 +2132,10 @@ export function hasOwnerConfigured(
   return !!(ch?.ownerUserId || ch?.ownerUserIds?.length);
 }
 
-// ─── /jobs: in-flight pi-bg dispatches + recent history ─────────────────
-// In-flight via `ps`, history via /tmp/pi-bg-<ticket>-* artifacts.
-// Assembly lives in ./jobs (parseJobsFromPs / scanJobHistory / formatJobsView).
+// ─── /jobs: recent pi-bg run history ────────────────────────────────────
+// History-only since the drain (#279): the dispatch lane is retired, the
+// in-flight ps view and the kill/tail wrappers died with the removed
+// completion side. Assembly lives in ./jobs (scanJobHistory / formatJobsView).
 
 /** ! shell passthrough: run bash -c in the working directory, 60s cap.
  *  Keeps the first 20k chars of combined stdout+stderr. Exported for tests. */
@@ -4125,9 +4081,7 @@ const HELP_TEXT = [
   "/compact [instructions] - compact session context (owner)",
   "/handover [instructions] - compact via the handover doc (owner; needs handoff.enabled)",
   "/model [name] - switch or list models (owner)",
-  "/jobs - list pi-bg dispatches: in-flight + recent history (json for JSON)",
-  "/jobs kill <id> - kill an in-flight pi-bg run (owner)",
-  "/jobs tail <id> [--n N] - tail a run's live output (owner)",
+  "/jobs - recent pi-bg run history (json for JSON)",
   "/new-worktree [ref] - worktree for this session's repo (owner)",
   "/merge-worktree [squash] - merge worktree back, keep or squash (owner)",
   "/diff [git-range | file] - publish a diff (default: working tree) to a shareable viewer URL",
@@ -5683,35 +5637,14 @@ async function runChannelCommand(
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
     case "jobs": {
-      // #44: /jobs kill <id> + /jobs tail <id> [--n N] wrap the dispatch
-      // scripts (owner-only — kill is a state change, tail reads a file
-      // only the dispatch user owns). /jobs [json] stays open to all.
-      const argText = (arg || "").trim();
-      const parts = argText ? argText.split(/\s+/) : [];
-      const sub = (parts[0] ?? "").toLowerCase();
-      if (sub === "kill" || sub === "tail") {
-        if (!isOwner) return ownerOnly;
-        const id = (parts[1] ?? "").trim();
-        if (!id || id.startsWith("-"))
-          return {
-            immediate: fence(
-              `[!] usage: /jobs ${sub} <id>${sub === "tail" ? " [--n N]" : ""}`,
-            ),
-          };
-        if (sub === "kill") return { immediate: await jobsKill(id) };
-        let n = 40;
-        const ni = parts.indexOf("--n");
-        if (ni !== -1) {
-          const v = Number.parseInt(parts[ni + 1] ?? "", 10);
-          if (!Number.isFinite(v) || v < 1)
-            return { immediate: fence("[!] usage: /jobs tail <id> [--n N]") };
-          n = Math.min(v, 200);
-        }
-        return { immediate: await jobsTail(id, n) };
-      }
-      // Informational, open to all channel members (private channel).
-      // json = machine output (fenced); text = the markdown summary list
-      // (unfenced - Andryo 2026-10-18: no fence, no width budget).
+      // History-only since the drain (#279): the dispatch lane is retired
+      // (zero in-flight runs fleet-wide), so the kill/tail subcommands and
+      // their dispatch scripts are gone with the completion side. The
+      // history view is informational, open to all channel members
+      // (private channel). json = machine output (fenced); text = the
+      // markdown summary list (unfenced - Andryo 2026-10-18: no fence,
+      // no width budget).
+      const sub = ((arg || "").trim().split(/\s+/)[0] ?? "").toLowerCase();
       return {
         immediate: sub === "json" ? fence(jobsView("json")) : jobsView("text"),
       };

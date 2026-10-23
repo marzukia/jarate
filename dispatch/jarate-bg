@@ -14,16 +14,14 @@
 #                   the wake rides webhook_id + the Author: pi-bg marker)
 #
 # The launch path is STUBBED (retirement notice + exit 10), not deleted:
-# in-flight tickets (dispatched before retirement) keep running to
-# completion under the old topology, and the ~/.pi-bg-art artifact
-# convention + run records survive for the completion side, which stays
-# alive until the last in-flight ticket drains:
-#   jarate-bg-watchdog  completion checks + DEAD/SILENT sweep + dead letters
-#   jarate-bg-tail      live output of an in-flight run
-#   jarate-bg-kill      cancel an in-flight run via its cgroup
-#   jarate-wait         in-turn wait for the callback
+# the DRAIN IS DECLARED (2026-10-23, issue #279: zero state=running records
+# fleet-wide, t180-verified) and the completion side is removed with it —
+# only the watchdog sweep + pi-postcheck.sh survive in dispatch/ until the
+# fleet timer lands, and the ~/.pi-bg-art artifact convention + run records
+# stay for host history. jarate-bg-tail/-kill and jarate-wait are gone
+# (no in-flight run to tail, kill, or wait on).
 # The watchdog's DEAD-retry re-dispatch (issue #110) targets this
-# launcher: it now lands on the retirement error (rc 10, no run record),
+# launcher: it lands on the retirement error (rc 10, no run record),
 # so the retry stays HELD and the DEAD embed carries the human decision —
 # no new run enters the retired path.
 #
@@ -316,9 +314,10 @@ jarate-bg: bg dispatch is retired - new dispatches go to the fleet:
   terminal: state returns as a `pi-bg fleetwork` machine-wake card
             (the visible [bg: prefix was dropped 2026-10-21; the wake
             rides webhook_id + the Author: pi-bg marker)
-In-flight tickets are unaffected: already-launched runs finish under the
-old topology, and the completion side still works (jarate-bg-watchdog,
-jarate-bg-tail, jarate-bg-kill, jarate-wait; the ~/.pi-bg-art artifact
-convention survives). This launcher exits 10 on the launch path by design.
+The drain is declared (2026-10-23, issue #279): zero in-flight runs
+fleet-wide. The completion side is just the jarate-bg-watchdog sweep
+(until the fleet timer lands) + pi-postcheck.sh; the ~/.pi-bg-art artifact
+convention survives as host history. This launcher exits 10 on the launch
+path by design.
 EOF
 exit 10

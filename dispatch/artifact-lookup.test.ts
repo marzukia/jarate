@@ -3,11 +3,12 @@
  * survives the launcher retirement (hall-monitor #35, 2026-10-20).
  *
  * Moved here from jarate-bg.test.ts with the gut: these pin the
- * COMPLETION-SIDE readers of the artifact dir, which stay alive until
- * the last in-flight ticket drains —
+ * COMPLETION-SIDE readers of the artifact dir. The drain is declared
+ * (#279): the completion side is now the watchdog sweep (until the fleet
+ * timer lands) + pi-postcheck.sh —
  *   - jarate-bg-watchdog rule 3 (dual lookup: persistent dir + legacy /tmp)
  *   - jarate-bg-watchdog STALLED classification (issue #52)
- *   - jarate-bg-tail (artifact lookup)
+ * jarate-bg-tail (the third reader) left the repo with the drain.
  * The launcher's own artifact tests (bg_post shape, run records, hb)
  * went with the launch path; the artifacts the in-flight runs leave
  * behind are what these pin.
@@ -52,7 +53,6 @@ function runScript(
 }
 
 const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
-const TAIL = path.join(import.meta.dir, "jarate-bg-tail");
 
 // Fake ids in year 2099: never collide with real tickets (real run ids
 // carry the real date - jarate-bg run_id). The id encodes user+process,
@@ -73,9 +73,7 @@ const TAIL = path.join(import.meta.dir, "jarate-bg-tail");
 // Length budget: "jarate/<t>" must fit the STALLED embed row clip
 // (LINE_W=30, watchdog) -> TID <= 23 chars; met with a <=9999 uid
 // (guarded) and the unbounded pid group. n is capped at 99 (2 digits);
-// the jarate-bg-tail fixture family takes n 31-33, the watchdog
-// fixtures n 1-24 - the same family separation the old minute tag
-// (235958 vs 235959) gave.
+// the watchdog fixtures take n 1-24.
 const TID_UID = os.userInfo().uid;
 if (TID_UID > 9999)
   throw new Error(`TID encoding needs a <=9999 uid, got ${TID_UID}`);
@@ -238,54 +236,6 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("0 dead ticket(s) found");
   }, 60_000);
-});
-
-describe("jarate-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
-  test("raw.out in PI_BG_TMPDIR -> shown", async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
-    tmpDirs.push(tmp);
-    const art = path.join(tmp, "art");
-    fs.mkdirSync(art, { recursive: true });
-    const id = TID(31);
-    fs.writeFileSync(path.join(art, `pi-bg-${id}-raw.out`), "fresh line\n");
-    const env = { ...process.env } as Record<string, string>;
-    env.HOME = tmp;
-    env.PI_BG_TMPDIR = art;
-    const r = await runScript(TAIL, [id], env, tmp);
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("fresh line");
-  });
-
-  test("raw.out in legacy /tmp only -> fallback finds it", async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
-    tmpDirs.push(tmp);
-    const art = path.join(tmp, "art");
-    fs.mkdirSync(art, { recursive: true });
-    const id = TID(32);
-    const legacy = `/tmp/pi-bg-${id}-raw.out`;
-    fs.writeFileSync(legacy, "legacy line\n");
-    try {
-      const env = { ...process.env } as Record<string, string>;
-      env.HOME = tmp;
-      env.PI_BG_TMPDIR = art;
-      const r = await runScript(TAIL, [id], env, tmp);
-      expect(r.code).toBe(0);
-      expect(r.out).toContain("legacy line");
-    } finally {
-      fs.rmSync(legacy, { force: true });
-    }
-  });
-
-  test("no raw.out anywhere -> exit 2", async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
-    tmpDirs.push(tmp);
-    const env = { ...process.env } as Record<string, string>;
-    env.HOME = tmp;
-    env.PI_BG_TMPDIR = path.join(tmp, "art");
-    const r = await runScript(TAIL, [TID(33)], env, tmp);
-    expect(r.code).toBe(2);
-    expect(r.err).toContain("no live output");
-  });
 });
 
 describe("#52: watchdog STALLED classification (live + stale heartbeat)", () => {

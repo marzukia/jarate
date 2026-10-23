@@ -32,12 +32,14 @@ Idempotent. Flags: `--jarate-dir DIR`, `--clone-url URL`, `--dry-run`, `-h`.
 2. **bridge deps** — `bun install` in `packages/bridge` (node_modules is
    gitignored, machine-local).
 3. **pointer links** — symlinks, never copies:
-   - dispatch family (issue #151): each of `jarate-bg`, `jarate-wait`,
-     `jarate-bg-tail`, `jarate-bg-kill`, `jarate-bg-watchdog`, the
-     `pi-wait` deprecation shim, and `pi-postcheck.sh` is linked into BOTH
-     `~/.local/bin` and `~/scripts` -> `<jarate>/dispatch/<name>`. Post-install verify fails
-     the run (non-dry) if any of the 7 is missing or shadowed by a stale
-     non-symlink in the unit PATH.
+   - dispatch family (drain declared, #279): the two live members,
+     `jarate-bg` (launch stub, exit 10; `signal` stays live) and
+     `pi-postcheck.sh`, are linked into BOTH `~/.local/bin` and
+     `~/scripts` -> `<jarate>/dispatch/<name>`. Post-install verify fails
+     the run (non-dry) if either is missing or shadowed by a stale
+     non-symlink in the unit PATH. The retired names (pi-bg*, jarate-wait,
+     jarate-bg-tail/-kill, pi-wait, jarate-bg-watchdog) are not linked;
+     our dangling symlinks into the checkout are cleaned up on install.
    - `~/scripts/jarate` -> `<jarate>/bin/jarate`
    - stale `~/projects/recall` symlink cleanup: a dangling link pointing at
      the removed `packages/recall` is removed (RAG/recall removed 2026-10-17
@@ -56,7 +58,7 @@ Guarantees:
 
 ```bash
 cd <jarate> && git pull --ff-only
-# done. jarate-bg/jarate-wait are symlinks - they update instantly.
+# done. jarate-bg + pi-postcheck.sh are symlinks - they update instantly.
 # Only bridge (channel/) changes need a pi.service restart.
 ```
 

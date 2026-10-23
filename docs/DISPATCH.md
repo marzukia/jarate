@@ -13,10 +13,14 @@ lean by handing self-contained work to `worker` agents and verification to
 
 Components (all in this repo):
 
-- `dispatch/jarate-bg` — dispatch a one-shot pi run on a role profile (**RETIRED 2026-10-20, hall-monitor #35 — stub, see banner**)
-- `dispatch/jarate-wait` — in-turn wait for the callback / a human message
-- `dispatch/jarate-bg-tail` — read a run's live output (`jarate-bg-tail <id> [lines] [-f]`)
-- `dispatch/jarate-bg-kill` — cancel a run via its cgroup (`jarate-bg-kill <id> [--dry-run]`)
+- `dispatch/jarate-bg` — dispatch a one-shot pi run on a role profile (**RETIRED 2026-10-20, hall-monitor #35 — stub, see banner**; the `signal` subcommand stays live until the fleet timer lands)
+- `dispatch/jarate-bg-watchdog` — completion sweep (run-state/DEAD/SILENT, dead letters, agent liveness, AGENTS.md drift) — live timer, splits to hall-monitor (audit action 3)
+- `dispatch/pi-postcheck.sh` — restart health check + heartbeat (live: pi-restart schedules it 90s after every restart)
+
+The completion side was removed with the drain (issue #279, 2026-10-23):
+`jarate-wait`, `jarate-bg-tail`, `jarate-bg-kill`, and the pi-* shims are
+no longer in this repo; the `~/.pi-bg-art` artifact convention + run records
+survive as host history for `/jobs`.
 
 ## Roles
 
