@@ -90,7 +90,7 @@ You are the ORCHESTRATOR. Goal: preserve your own KV. Hand off context-hungry wo
 - In-turn wait is opt-in, only when the answer must land in THIS turn (short task): `nohup jarate-bg ... &` → `jarate-wait --since <msgid> --timeout 240`. Exit 0 = callback (act), 2 = human spoke (drop wait, answer the human first), 3 = timeout (report, re-wait or drop).
 - **The human beats every wait.** Waits ≤ 240s and rare. Fan-out: dispatch all, confirm once, end turn — callbacks arrive as separate wakes.
 - KV hygiene: callbacks are truncated (1.8k) — read files for detail, never paste big worker output into your turn. Task prompts must be self-contained (fresh context).
-- **Cap: max N concurrent jarate-bg dispatches (workers + reviewers combined) per agent.** <operator> sets the cap per agent. Before dispatching, count live: `ps aux | grep "pi-bg worker\|pi-bg reviewer" | grep -v grep | wc -l`.
+- **Cap: max N concurrent jarate-bg dispatches (workers + reviewers combined) per agent.** <operator> sets the cap per agent. Before dispatching, count live: `ps aux | grep "jarate-bg worker\|jarate-bg reviewer" | grep -v grep | wc -l`.
 - Callbacks double-deliver (in-turn consume + channel wake). The wake copy gets a one-liner ack, no re-work.
 
 # Rules

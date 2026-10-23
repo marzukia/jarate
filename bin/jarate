@@ -837,7 +837,7 @@ PY
 # ─── agents-check / agents-bless ───────────────────────────────────────────
 # AGENTS.md is prompt-level law: changes require the operator's explicit approval
 # (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
-# check never reverts, never blocks; the watchdog (pi-bg-watchdog) posts one
+# check never reverts, never blocks; the watchdog (jarate-bg-watchdog) posts one
 # warning per drifted hash. Manifest: <sha256>  <UTC timestamp>  <note>.
 
 agents_md_path() {
@@ -1229,8 +1229,8 @@ cmd_setup() {
   local unit_dir="$HOME/.config/systemd/user"
   if [ "$SETUP_UNITS" = 1 ]; then
     if [ "$SETUP_DRY" = 1 ]; then
-      sdry "write $unit_dir/{pi.service,jarate-deploy.service,jarate-deploy.timer,pi-bg-watchdog.service,pi-bg-watchdog.timer} from repo templates (%h specifiers)"
-      sdry "systemctl --user daemon-reload; loginctl enable-linger $(id -un); systemctl --user enable --now pi.service jarate-deploy.timer pi-bg-watchdog.timer"
+      sdry "write $unit_dir/{pi.service,jarate-deploy.service,jarate-deploy.timer} from repo templates (%h specifiers)"
+      sdry "systemctl --user daemon-reload; loginctl enable-linger $(id -un); systemctl --user enable --now pi.service jarate-deploy.timer"
     else
       command -v systemctl >/dev/null 2>&1 \
         || die "setup: systemctl not found (need a systemd user session)"
@@ -1244,17 +1244,13 @@ cmd_setup() {
         > "$unit_dir/jarate-deploy.service" || die "setup: jarate-deploy.service write failed"
       cp "$SETUP_DIR/deploy/jarate-deploy.timer" "$unit_dir/" \
         || die "setup: jarate-deploy.timer copy failed"
-      cp "$SETUP_DIR/dispatch/pi-bg-watchdog.service" "$unit_dir/" \
-        || die "setup: pi-bg-watchdog.service copy failed"
-      cp "$SETUP_DIR/dispatch/pi-bg-watchdog.timer" "$unit_dir/" \
-        || die "setup: pi-bg-watchdog.timer copy failed"
       systemctl --user daemon-reload || die "setup: daemon-reload failed"
       loginctl enable-linger "$(id -un)" 2>/dev/null \
         || slog "note: enable-linger needs root (loginctl enable-linger $(id -un))"
       systemctl --user enable --now pi.service || die "setup: enable pi.service failed"
-      systemctl --user enable --now jarate-deploy.timer pi-bg-watchdog.timer \
+      systemctl --user enable --now jarate-deploy.timer \
         || die "setup: enable timers failed"
-      slog "units installed + enabled (pi.service, jarate-deploy.timer, pi-bg-watchdog.timer)"
+      slog "units installed + enabled (pi.service, jarate-deploy.timer)"
     fi
   fi
 

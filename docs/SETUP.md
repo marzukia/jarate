@@ -115,10 +115,10 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
    retry without avatar on rejection); writes
    `~/.config/pi-dispatch/webhook` + `webhook_author` (600).
    `--webhook-url` skips the API
-8. units from `deploy/` + `dispatch/` templates — `%h` specifiers, so the
+8. units from the `deploy/` templates — `%h` specifiers, so the
    same files work for any user: `pi.service` (name substituted into
-   `Description`, jarate path → checkout), `jarate-deploy.{service,timer}`,
-   `pi-bg-watchdog.{service,timer}` → `~/.config/systemd/user/`;
+   `Description`, jarate path → checkout), `jarate-deploy.{service,timer}`
+   → `~/.config/systemd/user/`;
    `daemon-reload`, `enable-linger` (note on failure), `enable --now`
 9. boot gate (≤90s): `pi.service` active **and** the journal shows
    `[interactions] registered` — the same signal `deploy.sh` trusts. On
@@ -208,11 +208,10 @@ cd ~/projects/jarate
    mkdir -p "$U"
    sed "s#__AGENT_NAME__#$(id -un)#g" deploy/pi.service > "$U/pi.service"
    sed "s#%h/projects/jarate#$PWD#g" deploy/jarate-deploy.service > "$U/jarate-deploy.service"
-   cp deploy/jarate-deploy.timer dispatch/pi-bg-watchdog.service \
-      dispatch/pi-bg-watchdog.timer "$U"/
+   cp deploy/jarate-deploy.timer "$U"/
    systemctl --user daemon-reload
    loginctl enable-linger "$(id -un)"     # needs root
-   systemctl --user enable --now pi.service jarate-deploy.timer pi-bg-watchdog.timer
+   systemctl --user enable --now pi.service jarate-deploy.timer
    ```
 
    Note the sed for `jarate-deploy.service`: the template carries

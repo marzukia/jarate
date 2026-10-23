@@ -73,7 +73,7 @@ const TAIL = path.join(import.meta.dir, "jarate-bg-tail");
 // Length budget: "jarate/<t>" must fit the STALLED embed row clip
 // (LINE_W=30, watchdog) -> TID <= 23 chars; met with a <=9999 uid
 // (guarded) and the unbounded pid group. n is capped at 99 (2 digits);
-// the pi-bg-tail fixture family takes n 31-33, the watchdog
+// the jarate-bg-tail fixture family takes n 31-33, the watchdog
 // fixtures n 1-24 - the same family separation the old minute tag
 // (235958 vs 235959) gave.
 const TID_UID = os.userInfo().uid;
@@ -240,7 +240,7 @@ describe("watchdog rule 3: dual lookup (persistent dir + legacy /tmp)", () => {
   }, 60_000);
 });
 
-describe("pi-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
+describe("jarate-bg-tail: artifact lookup (persistent dir + legacy /tmp)", () => {
   test("raw.out in PI_BG_TMPDIR -> shown", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pibg-tail-"));
     tmpDirs.push(tmp);

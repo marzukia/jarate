@@ -14,7 +14,7 @@
 // History: assembled from the pi-bg-<ticket>-* artifacts pi-bg leaves
 // per run (in ~/.pi-bg-art, or $PI_BG_TMPDIR; legacy runs in /tmp are
 // still scanned) — raw.out (run started), out.md (run completed,
-// non-empty), webhook-failed (callback dead letter), killed (pi-bg-kill
+// non-empty), webhook-failed (callback dead letter), killed (jarate-bg-kill
 // marker), wb-status (success-path webhook HTTP code, recorded at post
 // time).
 import { execSync, spawn } from "node:child_process";
@@ -371,7 +371,7 @@ export function jobsView(
 }
 
 // ─── /jobs kill | tail (#44) ─────────────────────────────────────────────
-// Thin wrappers over the dispatch scripts pi-bg-kill / pi-bg-tail
+// Thin wrappers over the dispatch scripts jarate-bg-kill / jarate-bg-tail
 // (resolved under <scriptsDir>, default $HOME/scripts — the symlinks
 // install.sh creates). Async spawn: a real kill can wait up to ~10s for
 // the SIGTERM drain, so the event loop must not block. Output is capped
@@ -480,8 +480,8 @@ export async function jobsKill(
     return jobWrapFence(
       `[!] usage: /jobs kill <id> (ticket id, e.g. 20260910-135501-48211)`,
     );
-  const r = await runPiBgScript("pi-bg-kill", [id], env, scriptsDir);
-  if (r.timedOut) return jobWrapFence(`[!] pi-bg-kill timed out for ${id}`);
+  const r = await runPiBgScript("jarate-bg-kill", [id], env, scriptsDir);
+  if (r.timedOut) return jobWrapFence(`[!] jarate-bg-kill timed out for ${id}`);
   if (r.code === 0) return jobWrapFence(`[ok] killed ${id}`);
   const detail =
     r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
@@ -502,12 +502,12 @@ export async function jobsTail(
     );
   const lines = Math.max(1, Math.min(200, Math.floor(n) || 40));
   const r = await runPiBgScript(
-    "pi-bg-tail",
+    "jarate-bg-tail",
     [id, String(lines)],
     env,
     scriptsDir,
   );
-  if (r.timedOut) return jobWrapFence(`[!] pi-bg-tail timed out for ${id}`);
+  if (r.timedOut) return jobWrapFence(`[!] jarate-bg-tail timed out for ${id}`);
   if (r.code !== 0) {
     const detail =
       r.out.split("\n").find((l) => l.trim() !== "") ?? `exit ${r.code}`;
