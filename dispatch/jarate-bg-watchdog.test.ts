@@ -1266,7 +1266,9 @@ describe("watchdog #52: STALLED classification (live process, stale hb)", () => 
       expect(em.description).toContain(t);
       expect(em.description).toContain("  hb last ");
       expect(em.description).toContain("process alive; hb stale >10m");
-      expect(em.description).toContain("jarate-bg-kill");
+      // N1a (#280 banked): jarate-bg-kill left in #283/#286; the live cancel
+      // path is the retained signal subcommand (dispatch/jarate-bg stub)
+      expect(em.description).toContain("jarate-bg signal KILL");
       for (const line of codeLines(em)) {
         expect(line.length).toBeLessThanOrEqual(40);
       }

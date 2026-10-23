@@ -1459,7 +1459,7 @@ for r in os.environ.get("WD_LIST", "").splitlines():
 if count > 10:
     lines.append(f"... {count - 10} more: ~/.pi-bg-deadlog")
 lines.append(f"process alive; hb stale >{mins}m")
-lines.append("jarate-bg-kill <t> to cancel")
+lines.append("jarate-bg signal KILL <t> to cancel")
 embed = {"author": {"name": "pi-bg watchdog"},
          "color": RED_STUCK,  # red: alive but stuck (DEAD is orange)
          "title": f"{count} stalled \u00b7 watchdog sweep",
