@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "projects", "projects-backfill", "agents-check", "agents-bless"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "projects", "projects-backfill"]}
 ```
 
 ## Commands
@@ -174,45 +174,6 @@ and never overwritten (even by `--set`). `--dry-run` plans without writing.
   counts the agents that answered. Still `ok:true`.
 - `--agent` narrows; no match -> `ok:false` rc 1.
 
-### `agents-check`
-
-Drift check for the agent's AGENTS.md — the main profile's law file. Target
-resolution: `~/.pi/agent/AGENTS.md` if present, else `~/AGENTS.md` (live
-boxes keep the law in `~/AGENTS.md`), else `JARATE_AGENTS_MD` wins over both.
-Changes require the operator's explicit approval (2026-09-14). Compares the live
-file's sha256 against the manifest `~/.pi/agent/.agents-md-hash` (one line:
-`<sha256>  <UTC ts>  <note>` — fixed path; only `JARATE_AGENTS_MD` moves it,
-to the checked file's directory). ALERT-ONLY: the check never reverts and
-never blocks — `ok:true` even on drift; `ok:false` only when AGENTS.md
-itself is unreadable/missing (rc 1).
-
-```json
-{"ok": true, "ts": "...", "error": null,
- "hash": "<sha256 of the live file>",
- "expected": "<manifest hash, null if manifest missing>",
- "drift": true}
-```
-
-- `drift:true` = manifest missing OR hash mismatch.
-- The jarate-bg-watchdog sweep (15 min) is the consumer: one channel warning per
-  drifted hash, deduped via `~/.pi/agent/.agents-md-drift-warned`.
-
-### `agents-bless [note]`
-
-Re-bless: rewrite the manifest with the CURRENT AGENTS.md hash + UTC
-timestamp + note. This is how an approved change stops the drift alarm.
-Note optional (empty -> `-`). `ok:false` rc 1 when AGENTS.md is
-unreadable/missing (nothing is written then). Manifest write is atomic
-(tmp + mv).
-
-```json
-{"ok": true, "ts": "...", "error": null, "hash": "<new sha256>", "note": "operator approved"}
-```
-
-- Both commands honor `JARATE_AGENTS_MD` (default resolution: `~/.pi/agent/AGENTS.md`,
-  fallback `~/AGENTS.md`); the manifest stays at `~/.pi/agent/.agents-md-hash`
-  unless the override moves it next to the checked file.
-
 ## Env overrides (tests + machines)
 
 | Var | Meaning |
@@ -221,7 +182,6 @@ unreadable/missing (nothing is written then). Manifest write is atomic
 | `JARATE_TOKEN_COST` | explicit path to pi-token-cost.py |
 | `JARATE_CTX_LIMIT` | fallback context limit when models.json has none |
 | `JARATE_AGENT_HOMES` | colon-separated agent home list (skips auto-discovery) |
-| `JARATE_AGENTS_MD` | explicit AGENTS.md path (else `~/.pi/agent/AGENTS.md`, fallback `~/AGENTS.md`) |
 | `JARATE_ROOT` | repo root (auto-detected otherwise) |
 
 ## Consumers
@@ -233,7 +193,5 @@ unreadable/missing (nothing is written then). Manifest write is atomic
 - **jarate-bg workers** (launch path RETIRED 2026-10-20, hall-monitor #35 -
   fleet is the dispatch): no extensions — they run the same entrypoint via
   plain bash (`~/scripts/jarate`).
-- **jarate-bg-watchdog**: runs `agents-check` every sweep (15 min) as the
-  AGENTS.md drift tripwire; see `dispatch/jarate-bg-watchdog`.
 - **Deploy**: `install.sh` symlinks `~/bin/jarate` and `~/scripts/jarate`
   into the checkout (idempotent, `--dry-run` clean).

@@ -23,8 +23,6 @@
 #   projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]...
 #                               tag historical untagged run records (worktree
 #                               path, ~/projects cwd, per-agent default)
-#   agents-check                  AGENTS.md vs manifest (drift tripwire, read-only)
-#   agents-bless [note]           rewrite the AGENTS.md manifest (re-bless an approved change)
 #
 # Local-only (2026-10-17): hall-monitor owns credentials + privileged exec.
 #   journal-errors / projects / projects-backfill read $HOME only; any
@@ -39,9 +37,6 @@
 #   JARATE_TOKEN_COST   path to pi-token-cost.py (default: ~/scripts, then repo)
 #   JARATE_CTX_LIMIT    context limit fallback when models.json has none
 #   JARATE_AGENT_HOMES  colon-separated agent homes (default: $HOME + /home/* agents)
-#   JARATE_AGENTS_MD    path to the agent AGENTS.md (default: ~/.pi/agent/AGENTS.md,
-#                       falling back to ~/AGENTS.md when that is absent — the
-#                       live boxes keep the main profile's law in ~/AGENTS.md)
 #   JARATE_TIMEOUT_S    per-external-call timeout in seconds (default 25)
 #   JARATE_SETUP_GATE_S setup boot-gate window in seconds (default 90)
 #   JARATE_SETUP_POLL_S setup boot-gate poll interval in seconds (default 3)
@@ -52,7 +47,7 @@ JARATE_ROOT="${JARATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null
 TMO="${JARATE_TIMEOUT_S:-25}"
 WARN_CAP=100   # max warning lines per agent
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "projects" "projects-backfill" "agents-check" "agents-bless")
+COMMANDS=("setup" "ctx-report" "journal-errors" "projects" "projects-backfill")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -834,93 +829,6 @@ PY
   printf '%s\n' "$doc"
 }
 
-# ─── agents-check / agents-bless ───────────────────────────────────────────
-# AGENTS.md is prompt-level law: changes require the operator's explicit approval
-# (2026-09-14). A hash manifest makes the rule mechanical. ALERT-ONLY: the
-# check never reverts, never blocks; the watchdog (jarate-bg-watchdog) posts one
-# warning per drifted hash. Manifest: <sha256>  <UTC timestamp>  <note>.
-
-agents_md_path() {
-  if [ -n "${JARATE_AGENTS_MD:-}" ]; then
-    printf '%s' "$JARATE_AGENTS_MD"
-    return
-  fi
-  # live boxes keep the main profile's law in ~/AGENTS.md; prefer the
-  # canonical ~/.pi/agent/AGENTS.md when it exists
-  if [ -f "$HOME/.pi/agent/AGENTS.md" ]; then
-    printf '%s' "$HOME/.pi/agent/AGENTS.md"
-  else
-    printf '%s' "$HOME/AGENTS.md"
-  fi
-}
-
-agents_manifest_path() {
-  # fixed design path; only an explicit JARATE_AGENTS_MD moves it (next to
-  # the checked file)
-  if [ -n "${JARATE_AGENTS_MD:-}" ]; then
-    printf '%s' "$(dirname "$JARATE_AGENTS_MD")/.agents-md-hash"
-  else
-    printf '%s' "$HOME/.pi/agent/.agents-md-hash"
-  fi
-}
-
-agents_hash() { # $1=md path -> sha256 on stdout, rc!=0 on failure
-  sha256sum "$1" 2>/dev/null | awk '{print $1}'
-}
-
-cmd_agents_check() {
-  local md man hash expected="" drift
-  md="$(agents_md_path)"
-  man="$(agents_manifest_path)"
-  [ -r "$md" ] || die "agents-check: AGENTS.md unreadable or missing: $md"
-  hash="$(agents_hash "$md")" || die "agents-check: sha256 failed: $md"
-  [ -n "$hash" ] || die "agents-check: sha256 failed: $md"
-  if [ -r "$man" ]; then
-    expected="$(awk 'NR==1 {print $1; exit}' "$man" 2>/dev/null)"
-  fi
-  if [ -z "$expected" ]; then
-    drift="true" # manifest missing (or unparseable)
-  elif [ "$expected" = "$hash" ]; then
-    drift="false"
-  else
-    drift="true" # hash mismatch
-  fi
-  jq -cn \
-    --arg ts "$(ts_now)" \
-    --arg hash "$hash" \
-    --arg expected "$expected" \
-    --argjson drift "$drift" \
-    '{ok: true, ts: $ts, error: null, hash: $hash,
-      expected: (if $expected == "" then null else $expected end),
-      drift: $drift}' \
-    || die "agents-check: json assembly failed"
-}
-
-cmd_agents_bless() {
-  local md man hash ts note tmpf
-  md="$(agents_md_path)"
-  man="$(agents_manifest_path)"
-  [ -r "$md" ] || die "agents-bless: AGENTS.md unreadable or missing: $md"
-  hash="$(agents_hash "$md")" || die "agents-bless: sha256 failed: $md"
-  [ -n "$hash" ] || die "agents-bless: sha256 failed: $md"
-  ts="$(ts_now)"
-  note="$*"
-  [ -n "$note" ] || note="-"
-  mkdir -p "$(dirname "$man")" 2>/dev/null \
-    || die "agents-bless: cannot create $(dirname "$man")"
-  tmpf="$(mktemp "$(dirname "$man")"/.agents-md-hash.XXXXXX)" \
-    || die "agents-bless: mktemp failed"
-  printf '%s  %s  %s\n' "$hash" "$ts" "$note" > "$tmpf" \
-    && mv "$tmpf" "$man" \
-    || { rm -f "$tmpf"; die "agents-bless: manifest write failed: $man"; }
-  jq -cn \
-    --arg ts "$ts" \
-    --arg hash "$hash" \
-    --arg note "$note" \
-    '{ok: true, ts: $ts, error: null, hash: $hash, note: $note}' \
-    || die "agents-bless: json assembly failed"
-}
-
 # ─── setup ────────────────────────────────────────────────────────────────────
 # Fresh-node FTUE: token + channel -> running, verified agent (design:
 # audit-ftue.md section 2, 2026-09-15). Default = DRY-RUN: prints the plan,
@@ -1342,23 +1250,19 @@ main() {
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors",
-                     "projects", "projects-backfill",
-                     "agents-check", "agents-bless"]}'
+                     "projects", "projects-backfill"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
     journal-errors) cmd_journal_errors "$@" ;;
     projects) cmd_projects "$@" ;;
     projects-backfill) cmd_projects_backfill "$@" ;;
-    agents-check) cmd_agents_check "$@" ;;
-    agents-bless) cmd_agents_bless "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
           commands: ["setup", "ctx-report", "journal-errors",
-                     "projects", "projects-backfill",
-                     "agents-check", "agents-bless"]}'
+                     "projects", "projects-backfill"]}'
       exit 2
       ;;
   esac

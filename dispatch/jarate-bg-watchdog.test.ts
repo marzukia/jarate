@@ -1,11 +1,12 @@
 /**
- * dispatch/jarate-bg-watchdog — AGENTS.md drift tripwire (2026-09-14).
+ * dispatch/jarate-bg-watchdog — sweep tests (worktree/cgroup reaper, run
+ * state, liveness). The AGENTS.md drift tripwire moved to the hall-monitor
+ * agents-docs cascade (#280/3b, 2026-10-24: cascade live + verified).
  *
- * Runs the real bash watchdog against a fake HOME with the REAL bin/jarate
- * symlinked in ($HOME/bin/jarate is what the watchdog calls). Asserts the
- * alert-only contract: one warning per drifted hash, state file gates
- * re-posting, re-bless clears drift, jarate missing -> silent skip, and the
- * sweep always exits 0.
+ * Runs the real bash watchdog against a fake HOME with the real
+ * dispatch/lib.sh + jrate_common.py sourced (JARATE_JQ stubbed to the system
+ * jq). No real cgroup fs, no real worktrees: every sweep root is pinned to
+ * the fixture tmp dir.
  */
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
@@ -17,7 +18,6 @@ import { spawn } from "bun";
 
 const WD = path.join(import.meta.dir, "jarate-bg-watchdog");
 const JB = path.join(import.meta.dir, "jarate-bg");
-const JARATE = path.join(import.meta.dir, "..", "bin", "jarate");
 
 type Post = {
   content?: string;
@@ -54,9 +54,6 @@ function fixture() {
   fs.mkdirSync(bin, { recursive: true });
   fs.mkdirSync(path.join(tmp, "wt"), { recursive: true });
   fs.mkdirSync(path.join(tmp, "art"), { recursive: true });
-  fs.writeFileSync(path.join(agentDir, "AGENTS.md"), "# law v1\n");
-  // the watchdog calls $HOME/bin/jarate: use the real entrypoint
-  fs.symlinkSync(JARATE, path.join(bin, "jarate"));
 
   const posts: Post[] = [];
   const server = Bun.serve({
@@ -88,7 +85,6 @@ function fixture() {
   env.PI_DISPATCH_RECORD_DIR = path.join(home, ".pi-dispatch", "runs");
   env.PI_DISPATCH_WEBHOOK = `http://127.0.0.1:${server.port}/hook`;
   delete env.PI_SERVICE;
-  delete env.JARATE_AGENTS_MD;
   // audit dispatch-watchdog F6: the bun test process inherits the operator
   // shell; ambient watchdog-override vars (e.g. PI_BG_HUNG_MIN=999) used to
   // silently retune the timing-sensitive sweeps. A test that needs an
@@ -134,13 +130,10 @@ function fixture() {
   return {
     tmp,
     home,
-    agentDir,
     wtDir: path.join(tmp, "wt"),
     art: path.join(tmp, "art"),
     env,
-    agentsMd: () => path.join(agentDir, "AGENTS.md"),
     manifest: () => path.join(agentDir, ".agents-md-hash"),
-    state: () => path.join(agentDir, ".agents-md-drift-warned"),
     posts,
     sha: (s: string) => createHash("sha256").update(s).digest("hex"),
     run,
@@ -150,208 +143,6 @@ function fixture() {
     },
   };
 }
-
-/** Write a manifest blessed for a DIFFERENT file content -> drift. */
-const blessFor = (f: { manifest: () => string }) =>
-  fs.writeFileSync(f.manifest(), `b0 2026-09-14T00:00:00Z  old-bless\n`);
-
-describe("watchdog AGENTS.md drift tripwire (alert-only, one warn per hash)", () => {
-  test("drift -> one warning with the spec message; state file written", async () => {
-    const f = fixture();
-    blessFor(f); // manifest hash b0 != current file hash
-    try {
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      const h8 = f.sha("# law v1\n").slice(0, 8);
-      expect(r.out).toContain(
-        `AGENTS.md drift: ${h8} since 2026-09-14T00:00:00Z`,
-      );
-      expect(f.posts).toHaveLength(1);
-      const em = f.posts[0].embeds[0];
-      expect(em.title).toBe("AGENTS.md drift");
-      // C9 (polish sweep): the raw drift line is fenced (not clipped to
-      // the 160 cap) and word-wrapped to the 40-col budget; the em-dash
-      // is an ASCII " - " (B3).
-      expect(em.description).toBe(
-        [
-          "```",
-          `AGENTS.md drift: ${h8} since`,
-          `2026-09-14T00:00:00Z - review +`,
-          're-bless: jarate agents-bless "note"',
-          "```",
-        ].join("\n"),
-      );
-      // state = full drifted hash (dedupe key)
-      expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
-        f.sha("# law v1\n"),
-      );
-    } finally {
-      f.close();
-    }
-  });
-
-  test("second sweep with the same drifted hash -> no re-post", async () => {
-    const f = fixture();
-    blessFor(f);
-    try {
-      await f.run();
-      expect(f.posts).toHaveLength(1);
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(1); // still one
-      expect(r.out).not.toContain("AGENTS.md drift:");
-    } finally {
-      f.close();
-    }
-  });
-
-  test("re-bless clears drift: sweep posts nothing", async () => {
-    const f = fixture();
-    blessFor(f);
-    try {
-      await f.run();
-      expect(f.posts).toHaveLength(1);
-      // approved change: re-bless the manifest to the current hash
-      const p = spawn(["bash", JARATE, "agents-bless", "operator approved"], {
-        env: { ...process.env, HOME: f.home },
-        cwd: f.tmp,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const out = await new Response(p.stdout).text();
-      await p.exited;
-      const d = JSON.parse(out);
-      expect(d.ok).toBe(true);
-      expect(d.hash).toBe(f.sha("# law v1\n"));
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(1); // no new warning
-      expect(r.out).not.toContain("AGENTS.md drift:");
-    } finally {
-      f.close();
-    }
-  });
-
-  test("a NEW drifted hash (file changed again) -> one more warning", async () => {
-    const f = fixture();
-    blessFor(f);
-    try {
-      await f.run();
-      expect(f.posts).toHaveLength(1);
-      fs.appendFileSync(f.agentsMd(), "amendment\n");
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(2);
-      const h8 = f.sha("# law v1\namendment\n").slice(0, 8);
-      expect(f.posts[1].embeds[0].description).toContain(h8);
-      expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
-        f.sha("# law v1\namendment\n"),
-      );
-      expect(r.out).toContain(`AGENTS.md drift: ${h8}`);
-    } finally {
-      f.close();
-    }
-  });
-
-  test("never blessed (no manifest) -> ts falls back to AGENTS.md mtime", async () => {
-    const f = fixture();
-    try {
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(1);
-      const mtime = Math.floor(fs.statSync(f.agentsMd()).mtimeMs / 1000) * 1000;
-      const ts = new Date(mtime).toISOString().replace(".000Z", "Z");
-      // wrapped fence: the ts leads its own line (C9)
-      expect(f.posts[0].embeds[0].description).toContain(`${ts} - review +`);
-      expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
-        f.sha("# law v1\n"),
-      );
-    } finally {
-      f.close();
-    }
-  });
-
-  test("fallback layout: law file in ~/AGENTS.md, watchdog still warns once", async () => {
-    const f = fixture();
-    try {
-      fs.rmSync(f.agentsMd());
-      fs.writeFileSync(path.join(f.home, "AGENTS.md"), "# home law\n");
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(1);
-      const h8 = f.sha("# home law\n").slice(0, 8);
-      expect(f.posts[0].embeds[0].description).toContain(h8);
-      expect(fs.readFileSync(f.state(), "utf8").trim()).toBe(
-        f.sha("# home law\n"),
-      );
-      await f.run();
-      expect(f.posts).toHaveLength(1);
-    } finally {
-      f.close();
-    }
-  });
-
-  test("jarate missing -> sweep exits 0, silent, no state file", async () => {
-    const f = fixture();
-    blessFor(f);
-    fs.rmSync(path.join(f.home, "bin", "jarate"));
-    try {
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(0);
-      expect(fs.existsSync(f.state())).toBe(false);
-      expect(r.out).not.toContain("AGENTS.md drift:");
-    } finally {
-      f.close();
-    }
-  });
-
-  test("no webhook -> drift detected, no post, no state (retry next sweep)", async () => {
-    const f = fixture();
-    blessFor(f);
-    try {
-      const r = await f.run([], { PI_DISPATCH_WEBHOOK: "" });
-      expect(r.code).toBe(0);
-      expect(r.out).toContain("AGENTS.md drift:");
-      expect(f.posts).toHaveLength(0);
-      expect(fs.existsSync(f.state())).toBe(false);
-    } finally {
-      f.close();
-    }
-  });
-
-  test("--quiet -> no post, no state; --dry-run -> would-post line, no state", async () => {
-    const f = fixture();
-    blessFor(f);
-    try {
-      const rq = await f.run(["--quiet"]);
-      expect(rq.code).toBe(0);
-      expect(f.posts).toHaveLength(0);
-      expect(fs.existsSync(f.state())).toBe(false);
-      const rd = await f.run(["--dry-run"]);
-      expect(rd.code).toBe(0);
-      expect(f.posts).toHaveLength(0);
-      expect(fs.existsSync(f.state())).toBe(false);
-      expect(rd.out).toContain("dry-run: would post AGENTS.md drift warning");
-    } finally {
-      f.close();
-    }
-  });
-
-  test("check fails (AGENTS.md deleted) -> sweep exits 0, silent", async () => {
-    const f = fixture();
-    blessFor(f);
-    fs.rmSync(f.agentsMd());
-    try {
-      const r = await f.run();
-      expect(r.code).toBe(0);
-      expect(f.posts).toHaveLength(0);
-      expect(fs.existsSync(f.state())).toBe(false);
-    } finally {
-      f.close();
-    }
-  });
-});
 
 /**
  * Empty-cgroup reaper (2026-09-14, pi-bg cgroup-dir leak): the sweep rmdirs
@@ -1006,8 +797,8 @@ describe("watchdog #51: sticky terminal lifecycle", () => {
   test("held record: re-flagged daily; launch lands on the retired stub, stays running (#35 gut)", async () => {
     const f = fixture();
     // Scrub the ambient PI_BG_* leak vars (mirrors retryFixture's list,
-    // plus PI_BG_HB_PID): the bare fixture only scrubs PI_SERVICE/
-    // JARATE_AGENTS_MD, and inside a jarate-bg wrapper the launched
+    // plus PI_BG_HB_PID): the bare fixture only scrubs PI_SERVICE, and
+    // inside a jarate-bg wrapper the launched
     // retry run inherits the wrapper's env. That made this test green
     // by accident in wrapper envs and deterministically red in a clean
     // env (review #183 F1). Without the scrub the launched run takes
@@ -3469,13 +3260,6 @@ describe("#191 M1: agent OOM signature (slice memory.events delta)", () => {
     const f = fixture();
     const oomRoot = f.env.PI_BG_OOM_ROOT as string;
     const recDir = f.env.PI_DISPATCH_RECORD_DIR as string;
-    // no drift post under the OOM tests: bless the fixture AGENTS.md
-    // (the sweep runs `jarate agents-check` on every run when bun is on
-    // PATH - CI and this box both are)
-    fs.writeFileSync(
-      f.manifest(),
-      `${f.sha("# law v1\n")} 2026-10-06T00:00:00Z  #191 M1 oom test\n`,
-    );
     const slice = (uid: number) => {
       const d = path.join(oomRoot, `user-${uid}.slice`);
       fs.mkdirSync(d, { recursive: true });
@@ -3984,12 +3768,6 @@ describe("#191 M2: agent liveness (marker sweep)", () => {
     );
     f.env.PI_BG_LIVE_ROOT = liveRoot;
     f.env.PI_BG_LIVE_BTIME_FILE = btimeFile;
-    // no drift post under the liveness tests (same as M1): bless the
-    // fixture AGENTS.md
-    fs.writeFileSync(
-      f.manifest(),
-      `${f.sha("# law v1\n")} 2026-10-07T00:00:00Z  #191 M2 live test\n`,
-    );
     // the roster's per-agent own hook: a second capture server
     const peerPosts: Post[] = [];
     const peerServer = Bun.serve({
