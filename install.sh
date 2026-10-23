@@ -14,7 +14,6 @@
 #        {~/.local/bin,~/scripts}/jarate-bg -> <jarate>/dispatch/jarate-bg
 #        {~/.local/bin,~/scripts}/pi-postcheck.sh -> <jarate>/dispatch/pi-postcheck.sh
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
-#        ~/bin/jarate-diff   -> <jarate>/bin/jarate-diff
 #        ~/bin/jarate        -> <jarate>/bin/jarate
 #   5. cleans up a stale ~/projects/recall symlink left by pre-2026-10-17
 #      installs (the repo no longer ships packages/recall)
@@ -183,7 +182,6 @@ for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog \
   done
 done
 link_into "$HOME/scripts/jarate"     "$JARATE_DIR/bin/jarate"
-link_into "$HOME/bin/jarate-diff"    "$JARATE_DIR/bin/jarate-diff"
 link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 
 # --- 3a. PATH verify (issue #71, #151) -------------------------------------
@@ -196,7 +194,7 @@ link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
 FAMILY_TOOLS="jarate-bg pi-postcheck.sh"
-for tool in $FAMILY_TOOLS jarate jarate-diff; do
+for tool in $FAMILY_TOOLS jarate; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
     echo "  [!] PATH: $tool not found in unit PATH ($UNIT_PATH)" >&2

@@ -422,9 +422,6 @@ fetchable until it is deleted. No third-party service sees the code
 https://drop.example.com/<id>.html
 ```
 
-Agent-side CLI (same pipeline): `bun bin/jarate-diff [file|range|-]` from
-the repo root — stdin `-` for a diff piped in.
-
 `/diff` needs webdrop credentials: `WEBDROP_SERVER` + `WEBDROP_TOKEN` env,
 or `~/.config/webdrop/config.toml` (the same file the `webdrop` CLI reads).
 Missing config answers `[!] webdrop not configured (…)`.
