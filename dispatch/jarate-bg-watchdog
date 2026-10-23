@@ -203,6 +203,12 @@
 #   --age-min N  override the 20-minute age threshold
 set -uo pipefail
 
+# Shared contracts (issue #262 DRY): the ticket id regex, the webhook
+# resolver, the record/cgroup/live roots, the webhook POST retry, the
+# run-record state updater, the cgroup tree walk and the pi session
+# lookup live in dispatch/lib.sh (python side: dispatch/jrate_common.py).
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
 WT_DIR="${PI_BG_WT_DIR:-${HOME}/.pi-bg-wt}"
 # persistent artifact dir (same default as jarate-bg); /tmp is a tmpfs on the
 # reference agent host and a reboot wipes it (2026-09-13 DEAD-flood). LEGACY_TMP is
@@ -244,14 +250,12 @@ esac
 
 # PI_BG_CG_ROOT overrides the cgroup base (same hook as jarate-bg + jarate-bg-kill);
 # tests point the sweep at a per-run fake root instead of the real user slice.
-CG_DIR="${PI_BG_CG_ROOT:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}/pi-bg"
+CG_DIR="$(jrate_cg_root)/pi-bg"
 today="$(date -u +%Y-%m-%d)"
-rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
-
-webhook="${PI_DISPATCH_WEBHOOK:-}"
-if [ -z "$webhook" ] && [ -f "${HOME}/.config/pi-dispatch/webhook" ]; then
-  webhook="$(head -1 "${HOME}/.config/pi-dispatch/webhook")"
-fi
+rec_dir="$(jrate_rec_dir)"
+# same URL source as jarate-bg: $PI_DISPATCH_WEBHOOK, else the first line
+# of ~/.config/pi-dispatch/webhook (lib.sh jrate_webhook)
+webhook="$(jrate_webhook)"
 
 # cg_has_members <cgroup-dir>: 0 while the cgroup still holds a process.
 # cgroupfs files ALWAYS report size 0 to stat, so test -s is useless on
@@ -336,7 +340,7 @@ has_started() {
 # process. The sweep must not re-flag it DEAD.
 record_done() {
   local t="$1" rf
-  rf="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}/pi-bg-$t.json"
+  rf="$rec_dir/pi-bg-$t.json"
   [ -f "$rf" ] || return 1
   grep -q '"state": *"done"\|"state": *"killed"\|"state": *"cancelled"' "$rf" 2>/dev/null
 }
@@ -648,23 +652,19 @@ wd_dead_retry_decide() {
   return 0
 }
 
-# wd_post <body-file>: same retry shape as jarate-bg bg_post (3 attempts)
+# wd_post <body-file>: the shared retry shape (lib.sh jrate_wb_post, same
+# as jarate-bg bg_post: 3 attempts, i*3*PI_BG_WB_BACKOFF backoff)
 wd_post() {
-  local body="$1" code i
+  local body="$1" code
   [ -n "$webhook" ] || return 1
-  for i in 1 2 3; do
-    code="$(curl -s -o "$BG_TMP/pi-bg-watchdog-wb-resp.txt" -w '%{http_code}' -X POST "$webhook" \
-      -H 'Content-Type: application/json' --max-time 15 --data @"$body" 2>/dev/null)" || code="000"
-    case "$code" in
-      2*) # the dead-letter consumer (issue #53) records this code in the
-          # ticket's wb-status; the resp file holds the body, not the code
-          printf '%s\n' "$code" > "$BG_TMP/pi-bg-watchdog-wb-code" 2>/dev/null
-          return 0 ;;
-    esac
-    [ "$i" -lt 3 ] && sleep $((i * 3))
-  done
-  echo "[pi-bg-watchdog] webhook FAILED (http=$code) for body: $body" >&2
-  return 1
+  code="$(jrate_wb_post "$webhook" "$body" "$BG_TMP/pi-bg-watchdog-wb-resp.txt")" || {
+    echo "[pi-bg-watchdog] webhook FAILED (http=$code) for body: $body" >&2
+    return 1
+  }
+  # the dead-letter consumer (issue #53) records this code in the ticket's
+  # wb-status; the resp file holds the body, not the code
+  printf '%s\n' "$code" > "$BG_TMP/pi-bg-watchdog-wb-code" 2>/dev/null
+  return 0
 }
 
 # wd_build <body-file> <ticket> <repo> <wt-path> <last-activity> <reason> <kind>
@@ -681,18 +681,9 @@ wd_build() {
   WD_T="$t" WD_REPO="$repo" WD_PATH="$path" WD_LAST="$last" WD_REASON="$reason" WD_KIND="$kind" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import kv, ORANGE_DEAD
 E = lambda k: os.environ.get("WD_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15): every frame line <= 40
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def clip_start(s, max):
-    s = str(s)
-    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
-def kv(key, val, head=False):
-    # 2-col bar prefix + 6-col label + " : " + 29-col value = FRAME_W
-    cut = clip_start if head else clip_end
-    return "\u251c " + key.ljust(6) + " : " + cut(val, FRAME_W - 11)
 kind = E('KIND') or 'DEAD'
 note = ("silent death (issue #57): rc=1, no output, retry1 did not recover"
         if kind == 'SILENT' else
@@ -709,7 +700,7 @@ lines = ["\u250c " + kind.lower() + " \u00b7 " + E('T'),
          kv("note", note),
          "\u2514"]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {E('T')}"},
-         "color": 15105570,  # orange, same as jarate-bg DIED
+         "color": ORANGE_DEAD,  # orange, same as jarate-bg DIED
          "title": f"{kind} \u00b7 watchdog sweep",
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg watchdog"},
@@ -726,9 +717,10 @@ wd_build_drift() {
   local bodyfile="$1" h8="$2" ts="$3"
   WD_H8="$h8" WD_TS="$ts" python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import FRAME_W, ORANGE_DEAD
 h8 = os.environ.get("WD_H8", "")
 ts = os.environ.get("WD_TS", "unknown")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15)
 # C9 (polish sweep): raw machine lines are fenced, not clipped to the
 # 160-char cap. Wrap at FRAME_W so the fence body obeys the 40-col law.
 msg = f'AGENTS.md drift: {h8} since {ts} - review + re-bless: jarate agents-bless "note"'
@@ -742,7 +734,7 @@ for w in words:
         wrapped.append(w)
 desc = "```\n" + "\n".join(wrapped) + "\n```"
 embed = {"author": {"name": "pi-bg watchdog"},
-         "color": 15105570,  # orange, same as the DEAD sweep
+         "color": ORANGE_DEAD,  # orange, same as the DEAD sweep
          "title": "AGENTS.md drift",
          "description": desc,
          "footer": {"text": "pi-bg watchdog"},
@@ -760,7 +752,7 @@ for d in "$WT_DIR"/*/*/; do
   t="$(basename "$d")"
   repo="$(basename "$(dirname "$d")")"
   # sanity: ticket ids are YYYYMMDD-HHMMSS-NNNNN
-  [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+  [[ "$t" =~ $JRATE_TICKET_RE ]] || continue
   # 1) live dispatch -> leave alone; STALLED check (issue #52): a live
   #    process whose heartbeat is stale > STALL_MIN min is hung (DEAD needs
   #    the process gone, so without the hb this state was invisible)
@@ -825,17 +817,7 @@ for d in "$WT_DIR"/*/*/; do
   if [ "$DRY" -eq 0 ]; then
     IFS=$'\x1f' read -r rst _ drS _ _ _ _ _ < <(wd_rec_fields "$t")
     if [ "$rst" = "running" ] && [ "$drS" != "held" ]; then
-      PI_BG_REC_STATE="killed" python3 - "$rec_dir/pi-bg-${t}.json" <<'PY' 2>/dev/null || true
-import datetime, json, os, sys
-p = sys.argv[1]
-try:
-    rec = json.load(open(p))
-except Exception:
-    sys.exit(0)
-rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
-rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-json.dump(rec, open(p, "w"), indent=2)
-PY
+      jrate_rec_set_state "$rec_dir/pi-bg-${t}.json" killed
     fi
   fi
 
@@ -871,7 +853,7 @@ cwd_found=0
 if [ -d "$rec_dir" ]; then
   while IFS=$'\t' read -r rt rcwd rwt; do
     [ -n "$rt" ] || continue
-    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [[ "$rt" =~ $JRATE_TICKET_RE ]] || continue
     # wt-chain run (a retry re-dispatched with --wt-reuse carries the
     # original's wt on its record): its death shows the repo name, not
     # "cwd" (issue #110, review F4)
@@ -937,17 +919,7 @@ if [ -d "$rec_dir" ]; then
     # mark the record killed (issue #51 audit path, same as jarate-bg-kill):
     # audit-only, never breaks the sweep; skipped for a held record (above)
     if [ "$drS" != "held" ]; then
-      PI_BG_REC_STATE="killed" python3 - "$rec_dir/pi-bg-${rt}.json" <<'PY' 2>/dev/null || true
-import datetime, json, os, sys
-p = sys.argv[1]
-try:
-    rec = json.load(open(p))
-except Exception:
-    sys.exit(0)
-rec["state"] = os.environ.get("PI_BG_REC_STATE", "killed")
-rec["finished"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-json.dump(rec, open(p, "w"), indent=2)
-PY
+      jrate_rec_set_state "$rec_dir/pi-bg-${rt}.json" killed
     fi
     cwd_found=$((cwd_found + 1))
     found=$((found + 1))
@@ -1002,7 +974,7 @@ PY
 )"
   while IFS=$'\t' read -r hrt hstate; do
     [ -n "$hrt" ] || continue
-    [[ "$hrt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [[ "$hrt" =~ $JRATE_TICKET_RE ]] || continue
     if [ "$hstate" = "dispatched" ]; then
       IFS=$'\x1f' read -r _ _ _ hdt _ _ _ _ < <(wd_rec_fields "$hrt")
       if [ -n "$hdt" ] && [ -f "${rec_dir}/pi-bg-${hdt}.json" ]; then
@@ -1124,14 +1096,9 @@ wd_build_hung() {
   WD_H_HB="$hblast" WD_H_CHILD="$child" WD_H_CMD="$ccmd" WD_H_TREE="$tree" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import VAL_W, clip_end, kv, RED_STUCK
 E = lambda k: os.environ.get("WD_H_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
-VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def kv(key, val):
-    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
 def wrap(s, width):
     out = []
     for line in str(s).splitlines():
@@ -1156,7 +1123,7 @@ if tree:
         lines.append("\u2502 " + clip_end(cont, VAL_W - 1))
 lines.append("\u2514")
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
-         "color": 15158332,  # red: alive but stuck (as STALLED; DEAD is orange)
+         "color": RED_STUCK,  # red: alive but stuck (as STALLED; DEAD is orange)
          "title": f"HUNG \u00b7 {t}",
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg watchdog (hung)"},
@@ -1169,7 +1136,7 @@ hung_found=0
 if [ -d "$rec_dir" ]; then
   while IFS=$'\t' read -r rt rprof rcwd rstart; do
     [ -n "$rt" ] || continue
-    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [[ "$rt" =~ $JRATE_TICKET_RE ]] || continue
     [ -n "$rstart" ] || continue    # no started ts -> session not discoverable
     # worktree run? the ticket dir under $WT_DIR (same layout as the main
     # sweep) - liveness + the pi cwd (pi runs in the worktree, not the
@@ -1181,9 +1148,7 @@ if [ -d "$rec_dir" ]; then
     is_live "$rt" "$wt" || continue  # dead run -> DIED paths own it
     piscwd="$wt"; [ -n "$piscwd" ] || piscwd="$rcwd"
     [ -n "$piscwd" ] || continue
-    slug="--${piscwd#/}"; slug="${slug//\//-}--"
-    sd="$HOME/.pi/agent-${rprof}/sessions/$slug"
-    jf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$rstart" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    jf="$(jrate_session_file "$rprof" "$piscwd" "$rstart")"
     [ -n "$jf" ] || continue         # no session file -> not judgeable
     jmt="$(stat -c %Y "$jf" 2>/dev/null)" || continue
     now_h="$(date +%s)"
@@ -1334,14 +1299,9 @@ wd_build_event() {
   WD_E_T="$t" WD_E_REPO="$repo" WD_E_CLS="$cls" WD_E_WHAT="$what" \
   WD_E_DETAIL="$detail" WD_E_AT="$at" python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys, datetime
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import kv, GREEN_ALIVE
 E = lambda k: os.environ.get("WD_E_" + k, "")
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3)
-VAL_W = FRAME_W - 11  # 29-col value budget (kv layout, same as wd_build)
-def clip_end(s, max):
-    s = str(s)
-    return s if len(s) <= max else (s[:max - 1] + "\u2026" if max > 1 else "\u2026")
-def kv(key, val):
-    return "\u251c " + key.ljust(6) + " : " + clip_end(val, VAL_W)
 t = E('T')
 lines = ["\u250c " + E('CLS') + " \u00b7 " + t,
          "\u251c $ jarate-bg-watchdog sweep",
@@ -1351,7 +1311,7 @@ lines = ["\u250c " + E('CLS') + " \u00b7 " + t,
          kv("at", E('AT')),
          "\u2514"]
 embed = {"author": {"name": f"pi-bg ticket \u00b7 {t}"},
-         "color": 3066993,
+         "color": GREEN_ALIVE,
          "title": E('CLS').upper() + " \u00b7 " + t,
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg watchdog (event)"},
@@ -1364,7 +1324,7 @@ ev_found=0
 if [ -d "$rec_dir" ]; then
   while IFS=$'\t' read -r rt rprof rcwd rstart; do
     [ -n "$rt" ] || continue
-    [[ "$rt" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [[ "$rt" =~ $JRATE_TICKET_RE ]] || continue
     # worktree run? (same lookup as the HUNG sweep: liveness + pi cwd +
     # repo name); a dead run is skipped - the DIED paths own it
     wt=""; repo="cwd"
@@ -1379,9 +1339,7 @@ if [ -d "$rec_dir" ]; then
     cur_mt=""
     piscwd="$wt"; [ -n "$piscwd" ] || piscwd="$rcwd"
     if [ -n "$piscwd" ] && [ -n "$rstart" ]; then
-      slug="--${piscwd#/}"; slug="${slug//\//-}--"
-      sd="$HOME/.pi/agent-${rprof}/sessions/$slug"
-      jf="$(find "$sd" -maxdepth 1 -name '*.jsonl' -newermt "$rstart" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+      jf="$(jrate_session_file "$rprof" "$piscwd" "$rstart")"
       [ -n "$jf" ] && cur_mt="$(stat -c %Y "$jf" 2>/dev/null)"
     fi
     # last-seen baseline (first sight = empty -> baseline only, no event)
@@ -1524,11 +1482,9 @@ if [ "$found" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" -eq
       printf '%s/%s | %s | last %s\n' "${DREPO[$i]}" "${DT[$i]}" "${DTYPE[$i]}" "${DLAST[$i]}"
     done)" WD_EXTRA=$((found - 10)) python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15)
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import clip_start, ORANGE_DEAD
 LINE_W = 30   # digest list rows stay compact (~30 cols) in the 40-col frame
-def clip_start(s, max):
-    s = str(s)
-    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
 count = int(os.environ.get("WD_N", "0"))
 extra = int(os.environ.get("WD_EXTRA", "0"))
 lines = []
@@ -1544,7 +1500,7 @@ if extra > 0:
     lines.append(f"... {extra} more: ~/.pi-bg-deadlog")
 lines.append("wt kept: ~/.pi-bg-wt (prune 7d)")
 embed = {"author": {"name": "pi-bg watchdog"},
-         "color": 15105570,
+         "color": ORANGE_DEAD,
          "title": f"pi-bg \u00b7 {count} dead tickets swept",
          "description": "```bash\n" + "\n".join(lines) + "\n```",  # fence on its own line (jarate-bg pattern)
          "footer": {"text": "pi-bg watchdog (digest)"},
@@ -1567,11 +1523,9 @@ if [ "${#ST[@]}" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ -n "$webhook" ] && [ "$DRY" 
     printf '%s/%s | hb last %s\n' "${STREPO[$i]}" "${ST[$i]}" "${STL[$i]}"
   done)" python3 - > "$bodyf" 2>/dev/null <<'PY'
 import json, os, sys, datetime
-FRAME_W = 40  # mobile budget (docs/STYLE.md 2.3, measured 2026-09-15)
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import clip_start, RED_STUCK
 LINE_W = 30   # stalled list rows stay compact (~30 cols) in the 40-col frame
-def clip_start(s, max):
-    s = str(s)
-    return s if len(s) <= max else ("\u2026" + s[len(s) - (max - 1):] if max > 1 else "\u2026")
 count = int(os.environ.get("WD_N", "0"))
 mins = os.environ.get("WD_MIN", "10")
 lines = []
@@ -1586,7 +1540,7 @@ if count > 10:
 lines.append(f"process alive; hb stale >{mins}m")
 lines.append("jarate-bg-kill <t> to cancel")
 embed = {"author": {"name": "pi-bg watchdog"},
-         "color": 15158332,  # red: alive but stuck (DEAD is orange)
+         "color": RED_STUCK,  # red: alive but stuck (DEAD is orange)
          "title": f"{count} stalled \u00b7 watchdog sweep",
          "description": "```bash\n" + "\n".join(lines) + "\n```",
          "footer": {"text": "pi-bg watchdog (stalled)"},
@@ -1807,6 +1761,8 @@ wd_build_oom() {
   WD_O_TO="$to" WD_O_BO="$bo" WD_O_MAX="$mx" WD_O_PEAK="$pk" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import RED_FAIL
 E = lambda k: os.environ.get("WD_O_" + k, "")
 def gib(s):
     try:
@@ -1818,7 +1774,7 @@ uid = E("UID")
 json.dump({"content": "", "embeds": [{
     "author": {"name": "pi-bg agent-watch \u00b7 OOM"},
     "title": f"agent-watch \u00b7 OOM",
-    "color": 0xED4245,
+    "color": RED_FAIL,
     "description": (f"new OOM kills in user-{uid}.slice since the last sweep.\n"
                     "kernel OOM lines are not journaled on this box - the cgroup counters are the record."),
     "fields": [
@@ -1969,7 +1925,7 @@ fi
 # --quiet = detect + log, no post, no state advance; --dry-run = print
 # only. The section no-ops when $LIVE_ROOT is absent (the marker
 # mechanism is not installed on this box).
-LIVE_ROOT="${PI_BG_LIVE_ROOT:-/var/tmp/jarate-live}"
+LIVE_ROOT="$(jrate_live_dir)"
 LIVE_STALE_MIN="${PI_BG_LIVE_STALE_MIN:-15}"
 case "$LIVE_STALE_MIN" in '' | *[!0-9]*) LIVE_STALE_MIN=15 ;; esac
 LIVE_DEDUPE_MIN="${PI_BG_LIVE_DEDUPE_MIN:-60}"
@@ -2097,6 +2053,8 @@ wd_build_live() {
   WD_L_SESS="$sess" \
   python3 - > "$bodyfile" 2>/dev/null <<'PY'
 import json, os, sys
+sys.path.insert(0, os.environ["JRATE_LIB_DIR"])
+from jrate_common import RED_FAIL, YELLOW_WARN
 E = lambda k: os.environ.get("WD_L_" + k, "")
 uid = E("UID")
 kind = E("KIND") or "SILENT"
@@ -2116,7 +2074,7 @@ if sess == "gone":
 json.dump({"content": "", "embeds": [{
     "author": {"name": f"pi-bg agent-watch \u00b7 {kind}"},
     "title": f"agent-watch \u00b7 {kind}",
-    "color": 0xED4245 if dead else 0xFEE75C,
+    "color": RED_FAIL if dead else YELLOW_WARN,
     "description": desc,
     "fields": fields,
     "footer": {"text": "jarate-bg-watchdog"},
@@ -2397,12 +2355,11 @@ fi
 #     embed every UTC day while the dir exists (review #183 F3).
 pruned_state=0
 if [ "$PRUNE_DAYS" -gt 0 ]; then
-  rec_dir="${PI_DISPATCH_RECORD_DIR:-${HOME}/.pi-dispatch/runs}"
   for rf in "$rec_dir"/pi-bg-*.json; do
     [ -f "$rf" ] || continue
     t="${rf##*/pi-bg-}"
     t="${t%.json}"
-    [[ "$t" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || continue
+    [[ "$t" =~ $JRATE_TICKET_RE ]] || continue
     mtime="$(stat -c %Y "$rf" 2>/dev/null)" || continue
     [ $(( $(date +%s) - mtime )) -gt $((PRUNE_DAYS * 86400)) ] || continue
     prune_live "$t" && continue
