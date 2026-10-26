@@ -1,76 +1,27 @@
 /**
  * Sensitive data redaction for logs.
  *
- * Ported from kimaki's privacy-sanitizer. Redacts common secrets
- * (bearer tokens, provider API keys, query-string secrets) plus Discord bot
- * tokens, so poll/send errors never leak credentials into the TUI log.
+ * Patterns come from the shared secret table (./secret-patterns.ts, log
+ * scope) — the same table the egress censor (./censor.ts) consumes, so
+ * the two engines cannot silently diverge (issue #254). Redacts common
+ * secrets (bearer tokens, provider API keys, GitHub and Discord tokens,
+ * query-string secrets) so poll/send errors never leak credentials into
+ * the TUI log. See docs/secret-censor.md for the design and the
+ * log-vs-egress split.
  */
 
-const CORE_SENSITIVE_REPLACEMENTS: Array<{
-  pattern: RegExp;
-  replacement: string;
-}> = [
-  {
-    pattern: /\bBearer\s+[A-Za-z0-9._-]{10,}\b/gi,
-    replacement: "Bearer [REDACTED]",
-  },
-  {
-    pattern: /\bsk-[A-Za-z0-9]{16,}\b/g,
-    replacement: "[REDACTED_OPENAI_KEY]",
-  },
-  {
-    pattern: /\bAIza[0-9A-Za-z_-]{20,}\b/g,
-    replacement: "[REDACTED_GOOGLE_KEY]",
-  },
-  {
-    pattern: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
-    replacement: "[REDACTED_GITHUB_TOKEN]",
-  },
-  {
-    pattern: /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}\b/g,
-    replacement: "[REDACTED_DISCORD_TOKEN]",
-  },
-  {
-    pattern:
-      /([?&](?:token|api[_-]?key|key|secret|password|authorization)=)[^&\s]+/gi,
-    replacement: "$1[REDACTED]",
-  },
-  {
-    pattern:
-      /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*")([^"]+)(")/gi,
-    replacement: "$1[REDACTED]$3",
-  },
-  {
-    pattern:
-      /(\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[:=]\s*)([^\s,;]+)/gi,
-    replacement: "$1[REDACTED]",
-  },
-];
-
-const PATH_REPLACEMENTS: Array<{
-  pattern: RegExp;
-  replacement: string;
-}> = [
-  {
-    pattern: /\/(?:Users|home)\/[^/\s]+\/[^\s'"`)]*/g,
-    replacement: "[REDACTED_PATH]",
-  },
-  {
-    pattern: /[A-Za-z]:\\[^\s'"`)]*/g,
-    replacement: "[REDACTED_PATH]",
-  },
-];
+import { applyRule, LOG_SECRET_RULES } from "./secret-patterns";
 
 /** Redact sensitive values from a log line. */
 export function sanitizeSensitiveText(
   value: string,
   { redactPaths = false }: { redactPaths?: boolean } = {},
 ): string {
-  const replacements = redactPaths
-    ? [...CORE_SENSITIVE_REPLACEMENTS, ...PATH_REPLACEMENTS]
-    : CORE_SENSITIVE_REPLACEMENTS;
-  return replacements.reduce((current, entry) => {
-    return current.replace(entry.pattern, entry.replacement);
+  const rules = redactPaths
+    ? LOG_SECRET_RULES
+    : LOG_SECRET_RULES.filter((r) => !r.paths);
+  return rules.reduce((current, { re, sub }) => {
+    return applyRule(current, re, sub);
   }, value);
 }
 

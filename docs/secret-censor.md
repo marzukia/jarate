@@ -1,7 +1,21 @@
-# Secret egress censor
+# Secret censor (log + egress)
 
 Owner ask (verbatim): "brainstorm and create a solution to censor all passwords
 in keys in discord, you leak everything".
+
+Two redaction engines, one shared pattern table (issue #254):
+
+- **egress** — `censor()` (`packages/bridge/channel/censor.ts`) redacts every
+  string the bridge posts to Discord.
+- **log** — `sanitizeSensitiveText()` / `sanitizeUnknownValue()`
+  (`packages/bridge/channel/sanitize.ts`) redact what the bridge writes to
+  its own logs (TUI / journal): error payloads, capped tool output, status
+  lines.
+
+Both engines consume the same table —
+`packages/bridge/channel/secret-patterns.ts` — filtered by a per-pattern
+scope (`both` / `log` / `egress`), so the two cannot silently diverge.
+See "Shared pattern table" below.
 
 ## The leak surface
 
@@ -19,6 +33,11 @@ remote URLs under `~/projects`), the sudo/sshpass password (embedded in
 provider API keys (Tavily, in the MCP URL in `~/.pi/agent/settings.json`),
 the Discord bot token, and database DSNs. Anything that lands in context can
 land in a reply.
+
+The same content also lands in the bridge's own logs: poll/send errors,
+stack traces, and capped tool output are written to the TUI and the journal.
+A log leak is less visible (local file) but puts the same credential in a
+place humans grep — which is why the log engine exists at all.
 
 ## The choke point
 
@@ -43,6 +62,13 @@ Design rule: one private helper, `egressText(text)`, wraps `censor(text)`
 and **all six** functions call it before building their body. A test asserts
 at source level that every text-bearing send function references
 `egressText`, so a new egress path that forgets it fails CI.
+
+Log side: there is no single funnel — every log site wraps its own value.
+Two entry points cover it: `sanitizeSensitiveText(line)` for strings (error
+messages, and the capped-tool-output path in `index.ts`, which also passes
+`redactPaths: true`) and `sanitizeUnknownValue(e)` for errors/objects/
+arrays (recursive, depth-limited, cycle-safe). Both take the shared table's
+log scope; a new log site that forgets them leaks into the journal.
 
 Not in the bridge process, but censored via the **jarate-censor CLI**
 (`bin/jarate-censor`, bun): `stdin -> censor() -> stdout`, same registry
@@ -92,7 +118,12 @@ prefix.
 Missing file = empty registry = patterns only. Never an error: a fresh
 agent box must still run with pattern-only redaction.
 
-### (b) PATTERN — built-in classes, fixed order
+### (b) PATTERN — egress scope of the shared table
+
+The 13 egress rules come from `secret-patterns.ts` (scope `both` +
+`egress`); the table owns the regexes, replacements, and application
+order. The list below is the egress projection of that table (the log
+engine's projection is in "Shared pattern table"):
 
 | class | pattern (abridged) | tag |
 |---|---|---|
@@ -112,6 +143,65 @@ agent box must still run with pattern-only redaction.
 Replacements are **fixed strings** — the raw value never appears in the
 output, and it is why the censor is idempotent (see below).
 
+## Shared pattern table (issue #254)
+
+`packages/bridge/channel/secret-patterns.ts` is the single source of truth
+for both engines. Before #254, the log engine and the egress censor each
+carried their own pattern list and had drifted silently (different ghp_
+lengths, different token classes, different orders).
+
+Every entry declares:
+
+- `name` — stable name; for egress rules it doubles as the WARN class tag
+  (`[censor] class=<name>`). The two key-value rules share the name `kv`
+  (one class, two shapes: the `=` form and the `:` form).
+- `scope` — `both` (each engine applies its own side), `log`, or `egress`.
+- `log` / `egress` sides — each side carries its own `re`, `sub`, and
+  `order` (lower runs first), so per-engine shape overrides are data, not
+  code.
+- `paths` — log-only: applied only when the caller passes
+  `redactPaths: true` (paths are not secrets; they leak usernames +
+  layout).
+
+Why the shapes differ per engine: egress text is user-visible, so egress
+shapes are strict — a `ghp_` run redacts at exactly 36 chars on egress (a
+real PAT shape; a 35-char run is user content, issue #54). Log text is not
+user-visible, so the log side is looser (`{20,}` catches partials too: a
+partial redaction in a log beats a live secret).
+
+Application order is per-side data. Log: Bearer runs before the `sk-` class
+(a Bearer value can carry an sk- key — `Bearer sk-…` must redact as one
+Bearer match, not be split by the sk- rule). Egress: the kv rules run last
+(loosest first would shadow the specific token classes).
+
+The full split:
+
+| name | scope | log shape → replacement | egress shape → replacement |
+|---|---|---|---|
+| github | both | `gh[pousr]_` + `{20,}` alnum → `[REDACTED_GITHUB_TOKEN]` | `gh[pousr]_` + exactly 36 alnum, or `github_pat_` + 22..255 word chars → `[REDACTED:github]` |
+| switchboard | egress | — | `sbk_` + 8+ word chars (escaped form tolerated) → `[REDACTED:switchboard]` |
+| gitlab | egress | — | `glpat-` → `[REDACTED:gitlab]` |
+| anthropic | egress | — | `sk-ant-` → `[REDACTED:anthropic]` |
+| openai | both | `sk-` + `{16,}` alnum → `[REDACTED_OPENAI_KEY]` | `sk-or-`, or `sk-` + `{20,}` alnum → `[REDACTED:openai]` |
+| aws | egress | — | `AKIA[0-9A-Z]{16}` → `[REDACTED:aws]` |
+| google | both | `AIza` + `{20,}` → `[REDACTED_GOOGLE_KEY]` | `AIza` + exactly 35 → `[REDACTED:google]` |
+| slack | egress | — | `xox[baprs]-` → `[REDACTED:slack]` |
+| bearer | both | `Bearer ` + 10+ char run (case-insensitive) → `Bearer [REDACTED]` | `Bearer ` + 8+ char run → `Bearer [REDACTED:bearer]` |
+| discord | log | `<20+>.<6>.<25+>` dot parts → `[REDACTED_DISCORD_TOKEN]` | — |
+| dsn | egress | — | `scheme://user:pass@` (also `://:pass@`) → `scheme://[REDACTED:dsn]@` |
+| sshpass | egress | — | `sshpass -p <arg>` (skips marker fragments) → `sshpass -p [REDACTED:sshpass]` |
+| kv-query | log | `?token=` / `&api_key=` + run → `$1[REDACTED]` | — |
+| kv-quoted | log | `token: "v"` / `secret="v"` → `$1[REDACTED]$3` | — |
+| kv-bare | log | `token=v` / `secret: v` (value stops at whitespace/comma/semicolon) → `$1[REDACTED]` | — |
+| kv (eq) | egress | — | `password/passwd/secret/token/api_key = v` anywhere (quoted, or unquoted not starting `[`) → `key=[REDACTED:kv]` |
+| kv (colon) | egress | — | `key: v` when v is quoted (>=4) or an unquoted run of >=8 chars → `key: [REDACTED:kv]` |
+| path-unix | log (paths) | `/Users/<n>/…`, `/home/<n>/…` → `[REDACTED_PATH]` | — |
+| path-win | log (paths) | `C:\…` → `[REDACTED_PATH]` | — |
+
+Pinned by `secret-patterns.test.ts`: dropping a pattern, reordering an
+entry, shortening a length specifier (`{36}` → `{35}`), or flipping a
+scope all fail CI.
+
 ## Behavior
 
 - **Never the raw value.** Only the class tag is emitted.
@@ -127,6 +217,10 @@ output, and it is why the censor is idempotent (see below).
 - **Pass-through.** Prose containing the *word* "password" (no
   `=`/`:`-separated value) is untouched, as are tick frames like
   `┌ working · 3 calls · 10s`.
+- **Log side has no registry pass.** The registry protects egress (the
+  user-visible surface); `sanitizeSensitiveText` / `sanitizeUnknownValue`
+  apply the log-scope patterns only, and there is no WARN on the log side
+  — a redacted log line is a local file, not a message.
 
 ## Rollout
 
@@ -148,6 +242,16 @@ output, and it is why the censor is idempotent (see below).
 `censor.test.ts` (~20 tests): one per pattern class, registry literal +
 longest-first, registry missing-file, DSN, sshpass, code-block kv,
 plain-word pass-through, idempotence, WARN-fingerprint shape (no raw value).
+`secret-patterns.test.ts` (pin tests, issue #254): the shared table equals a
+pinned copy exactly (names, order, scopes, regex source + flags,
+replacements), each engine's derived rule list IS the table (no private
+copies, checked by RegExp identity), function replacements are probed, and
+the log-vs-egress split behaves as documented (a 36-char `ghp_` run is
+redacted by both engines; a 35-char one is log-only; `github_pat_` is
+egress-only; the Discord token shape is log-only).
+`sanitize.test.ts`: one per log class, the three kv shapes, the path
+opt-in, and `sanitizeUnknownValue` recursion (errors, arrays, objects,
+cycles, depth limit).
 `discord.test.ts` choke-point test: source-level assert that all text-
 and filename-bearing send functions in `discord.ts` (exported or not) that
 POST/PATCH a `content` body or a `payload_json` multipart call
