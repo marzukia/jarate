@@ -39,6 +39,16 @@ export const WORKTREE_STATE_REL = path.join(".tmp", "worktree.json");
 
 const GIT_TIMEOUT_MS = 30_000;
 
+/** Backoff before the single automatic retry of a failed `git worktree add` (a
+ *  transient git hiccup — lock contention in a CI window — should not fail the
+ *  /new-worktree command). */
+const RETRY_BACKOFF_MS = 250;
+
+/** Synchronous sleep (the bridge's git calls are synchronous). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 function stateFile(cwd: string): string {
   return path.join(cwd, WORKTREE_STATE_REL);
 }
@@ -78,7 +88,14 @@ export function clearWorktreeState(cwd: string): void {
   }
 }
 
-function git(cwd: string, args: string[]): { code: number; out: string } {
+function git(
+  cwd: string,
+  args: string[],
+): {
+  code: number;
+  out: string;
+  stderr: string;
+} {
   try {
     const out = execFileSync("git", args, {
       cwd,
@@ -86,7 +103,7 @@ function git(cwd: string, args: string[]): { code: number; out: string } {
       timeout: GIT_TIMEOUT_MS,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    return { code: 0, out: String(out).trimEnd() };
+    return { code: 0, out: String(out).trimEnd(), stderr: "" };
   } catch (e) {
     const err = e as { status?: number; stdout?: string; stderr?: string };
     return {
@@ -94,12 +111,22 @@ function git(cwd: string, args: string[]): { code: number; out: string } {
       out: `${String(err.stdout ?? "").trimEnd()}\n${String(
         err.stderr ?? "",
       ).trimEnd()}`.trim(),
+      stderr: String(err.stderr ?? "").trimEnd(),
     };
   }
 }
 
 function firstLine(s: string): string {
   return s.split("\n").find((l) => l.trim() !== "") ?? "";
+}
+
+/** Last non-blank line — where git puts the `fatal:`. */
+function lastLine(s: string): string {
+  const lines = s
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+  return lines[lines.length - 1] ?? "";
 }
 
 /** Ticket id, same shape as pi-bg run ids: YYYYMMDD-HHMMSS-NNNN (UTC). */
@@ -138,9 +165,15 @@ export function newWorktree(
   const id = worktreeId();
   const wtPath = path.join(wtBaseDir(env), path.basename(repo), id);
   const branch = `pi-bg/${id}`;
-  const add = git(repo, ["worktree", "add", "-b", branch, wtPath, from]);
-  if (add.code !== 0)
-    return `[!] worktree add failed: ${firstLine(add.out) || `ref ${from}`}`;
+  let add = git(repo, ["worktree", "add", "-b", branch, wtPath, from]);
+  if (add.code !== 0) {
+    // One automatic retry with a small backoff: a transient git hiccup
+    // (lock contention in a CI window) should not fail /new-worktree.
+    sleepSync(RETRY_BACKOFF_MS);
+    add = git(repo, ["worktree", "add", "-b", branch, wtPath, from]);
+    if (add.code !== 0)
+      return `[!] worktree add failed: ${lastLine(add.stderr) || firstLine(add.out) || `ref ${from}`}`;
+  }
   saveWorktreeState(cwd, {
     id,
     repo,
