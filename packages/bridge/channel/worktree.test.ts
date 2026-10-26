@@ -176,6 +176,54 @@ describe("newWorktree (#12)", () => {
     const line = newWorktree(repo, undefined, env);
     expect(line).toMatch(/^\[ok\] worktree /);
   });
+
+  test("transient git worktree add failure: one retry, then [ok] (#295)", () => {
+    // PATH shim: a fake `git` that fails the FIRST `worktree add` (exit 1,
+    // stderr with a fatal: line, like the CI flake) and exec's the real git
+    // for everything else. Call count is tracked in a file.
+    const realGit = execFileSync("which", ["git"], {
+      encoding: "utf8",
+    }).trim();
+    const shimDir = path.join(tmp, "shim");
+    fs.mkdirSync(shimDir);
+    const countFile = path.join(shimDir, "count");
+    fs.writeFileSync(
+      path.join(shimDir, "git"),
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then',
+        '  n=$(cat "$SHIM_COUNT_FILE" 2>/dev/null || echo 0)',
+        "  n=$((n + 1))",
+        '  echo "$n" > "$SHIM_COUNT_FILE"',
+        '  if [ "$n" = "1" ]; then',
+        "    echo \"Preparing worktree (new branch 'pi-bg/shim')\" >&2",
+        '    echo "fatal: could not lock the worktree (transient)" >&2',
+        "    exit 1",
+        "  fi",
+        "fi",
+        'exec "$REAL_GIT" "$@"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(path.join(shimDir, "git"), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.env.REAL_GIT = realGit;
+    process.env.SHIM_COUNT_FILE = countFile;
+    try {
+      const line = newWorktree(repo, undefined, env);
+      expect(line).toMatch(/^\[ok\] worktree /);
+      // the first attempt failed, the retry succeeded (exactly 2 attempts)
+      expect(fs.readFileSync(countFile, "utf8").trim()).toBe("2");
+      const st = loadWorktreeState(repo);
+      expect(st).not.toBeNull();
+      expect(fs.existsSync(path.join(st!.path, "base.txt"))).toBe(true);
+    } finally {
+      process.env.PATH = savedPath;
+      delete process.env.REAL_GIT;
+      delete process.env.SHIM_COUNT_FILE;
+    }
+  });
 });
 
 // ─── /merge-worktree ──────────────────────────────────────────────────────
