@@ -50,6 +50,13 @@ import {
   resolveSystemdUnit,
 } from "./types";
 
+// Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
+// suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;
+// the gate treats that as a fleet run and would skip all channel startup
+// in every test. Clear it here (#273 review (C): replicate the
+// index.test.ts guard in the split-off files).
+delete process.env.PI_SESSION_ID;
+
 describe("parseUndoCount (#46 /undo N)", () => {
   test("bare / whitespace = 1; positive integers pass through", () => {
     expect(parseUndoCount(undefined)).toBe(1);

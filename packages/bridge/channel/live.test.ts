@@ -33,6 +33,13 @@ import {
 import { midTurnQueues, queuedAcks, queueMidTurnInbound } from "./queue";
 import type { ChannelMessage } from "./types";
 
+// Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
+// suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;
+// the gate treats that as a fleet run and would skip all channel startup
+// in every test. Clear it here (#273 review (C): replicate the
+// index.test.ts guard in the split-off files).
+delete process.env.PI_SESSION_ID;
+
 /** F2 (test-fidelity audit): the interaction network contract — the ONLY
  *  (method, URL) pairs the bridge may send for one interaction:
  *   - callback (defer / plain reply): POST  /interactions/{id}/{token}/callback
@@ -219,6 +226,7 @@ describe("live intermediate text (SPEC B)", () => {
 
   beforeEach(() => {
     jest.useFakeTimers();
+    clearDiscordStatesForTest(); // #273 review (B): start each harness test with a clean shared idCache (post-split, bun schedules test files concurrently in one process)
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-livetext-"));
     fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
     fs.writeFileSync(

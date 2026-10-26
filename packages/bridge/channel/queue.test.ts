@@ -39,6 +39,13 @@ import { setSystemdRestartHookForTest } from "./restart-ops";
 import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
 import type { ChannelMessage } from "./types";
 
+// Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
+// suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;
+// the gate treats that as a fleet run and would skip all channel startup
+// in every test. Clear it here (#273 review (C): replicate the
+// index.test.ts guard in the split-off files).
+delete process.env.PI_SESSION_ID;
+
 describe("extractQueueSuffix", () => {
   test("dot + space + queue at end", () => {
     expect(extractQueueSuffix("fix the bug. queue")).toEqual({
@@ -178,6 +185,7 @@ describe("queue control (harness shared with extension handlers A1/A2/A4)", () =
   });
 
   beforeEach(() => {
+    clearDiscordStatesForTest(); // #273 review (B): start each harness test with a clean shared idCache (post-split, bun schedules test files concurrently in one process)
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-test-"));
     fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
     fs.writeFileSync(

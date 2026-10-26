@@ -478,6 +478,9 @@ export function clearDiscordStatesForTest(): void {
   }
   states.clear();
   autoReactSuppressed.clear();
+  // #273 review (B): resolve cache is module-level, shared across test
+  // files in one bun process (fleet-gate harness contaminates queue/live).
+  idCache.clear();
 }
 
 /** Poll interval for a channel: backfill (60s) while its token's gateway
