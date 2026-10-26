@@ -3,15 +3,37 @@
 The 555 fixture asserts the case-study facts (2026-10-26, turn 161):
 stopReason=length, 58,946-char thinking-only block, usage
 input=107,538 / output=16,384 / total=123,922, g6_reason=empty-final.
+
+The generator's canonical home is hall-monitor
+deploy/fleetwork/detpipe/ (placement ruling; hall-monitor PR #131,
+merged 1005ee06). This directory keeps only the schema of record,
+the real ticket-555 fixture, and the in-session handover (handover.ts).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Canonical generator home (hall-monitor #131); DETPIPE_HOME overrides.
+_CANDIDATES = [
+    os.environ.get("DETPIPE_HOME", ""),
+    str(
+        Path.home() / "projects" / "hall-monitor" / "deploy" / "fleetwork" / "detpipe"
+    ),
+    "/tmp/hm-dedup-ref/deploy/fleetwork/detpipe",
+]
+_HOME = next(
+    (c for c in _CANDIDATES if c and (Path(c) / "detpipe.py").is_file()), ""
+)
+if not _HOME:
+    raise SystemExit(
+        "detpipe generator not found; set DETPIPE_HOME to hall-monitor "
+        "deploy/fleetwork/detpipe (canonical home, hall-monitor #131)"
+    )
+sys.path.insert(0, _HOME)
 
 import detpipe  # noqa: E402
 
