@@ -17,18 +17,17 @@
 #   setup <bot-token> <channel>   fresh-node FTUE (default dry-run; --yes executes)
 #   ctx-report                    context % + token cost (reuses pi-token-cost.py --json)
 #   journal-errors [--since S]    per-agent pi.service warnings (journalctl -p warning)
-#   projects [--project T] [--since D] [--agent A]
-#                               per-project rollup over pi-bg run records
-#                               (runs/tokens/cost; untagged -> "unspecified")
-#   projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]...
-#                               tag historical untagged run records (worktree
-#                               path, ~/projects cwd, per-agent default)
+#
+# Per-project rollup (removed 2026-10-26, operator order 'wave 1',
+# jarate-hm relocation map wave 1): hall-monitor GET
+# /api/fleet/spend?project=<repo> (five-dimension tokens) + GET
+# /api/fleet/runs.
 #
 # Local-only (2026-10-17): hall-monitor owns credentials + privileged exec.
-#   journal-errors / projects / projects-backfill read $HOME only; any
-#   requested agent home that is not $HOME (JARATE_AGENT_HOMES) yields a
-#   per-agent entry with ok:false + error "cross-user read removed: use a
-#   hall-monitor plan (SUDO_PW)". The run itself does not fail.
+#   journal-errors reads $HOME only; any requested agent home that is not
+#   $HOME (JARATE_AGENT_HOMES) yields a per-agent entry with ok:false +
+#   error "cross-user read removed: use a hall-monitor plan (SUDO_PW)".
+#   The run itself does not fail.
 #
 # Deployed by install.sh: $HOME/bin/jarate + $HOME/scripts/jarate.
 # Callers use $HOME/bin/jarate — do not rely on PATH.
@@ -47,7 +46,7 @@ JARATE_ROOT="${JARATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null
 TMO="${JARATE_TIMEOUT_S:-25}"
 WARN_CAP=100   # max warning lines per agent
 
-COMMANDS=("setup" "ctx-report" "journal-errors" "projects" "projects-backfill")
+COMMANDS=("setup" "ctx-report" "journal-errors")
 
 ts_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -244,8 +243,7 @@ cmd_ctx_report() {
 
 # agent_homes — populate the global AGENT_HOMES: JARATE_AGENT_HOMES
 # (colon-separated) or $HOME + the other /home/<u> agent accounts
-# (uid > 900, not self). Shared by journal-errors, projects and
-# projects-backfill.
+# (uid > 900, not self). Used by journal-errors.
 AGENT_HOMES=()
 agent_homes() {
   AGENT_HOMES=()
@@ -370,463 +368,6 @@ cmd_journal_errors() {
       since: $since, agents: $agents}' \
     || die "journal-errors: json assembly failed"
   [ "$ok_all" = "true" ] || exit 1
-}
-
-# ─── projects ─────────────────────────────────────────────────────────────────
-# Per-project rollup over pi-bg run records (2026-09-18, invoice
-# itemisation): runs/workers/reviewers/tokens/cost_usd per project tag.
-# Untagged records roll up into "unspecified". Local-only (2026-10-17):
-# only $HOME is scanned; any other requested agent home yields a per-agent
-# ok:false entry (records null + error) with a "warn" in the doc, overall
-# ok:true.
-
-# PROJ_SCAN — read-only per-agent record projection, executed against
-# PI_HOME. Env: PI_HOME, SINCE (optional date).
-# Prints a JSON array of {run, profile, project, started, tokens, cost_usd}.
-# Single-quote free (legacy of the ssh-hop era; run locally now).
-PROJ_SCAN='import json, os
-
-home = os.environ["PI_HOME"].rstrip("/")
-since = os.environ.get("SINCE", "")
-d = os.path.join(home, ".pi-dispatch", "runs")
-rows = []
-try:
-    names = sorted(os.listdir(d))
-except Exception:
-    names = []
-for n in names:
-    if not (n.startswith("pi-bg-") and n.endswith(".json")):
-        continue
-    try:
-        with open(os.path.join(d, n), "r") as fh:
-            rec = json.load(fh)
-    except Exception:
-        continue
-    if not isinstance(rec, dict):
-        continue
-    st = rec.get("started")
-    if isinstance(st, str) and since and st < since:
-        continue
-    rows.append({
-        "run": rec.get("run") or n[:-5],
-        "profile": rec.get("profile"),
-        "project": rec.get("project"),
-        "started": st,
-        "tokens": rec.get("tokens"),
-        "cost_usd": rec.get("cost_usd"),
-    })
-print(json.dumps(rows))
-'
-
-# BACKFILL_SCAN — tag records lacking a project (2026-09-18). First match
-# wins: --set override (SETS_B64) > worktree path (~/.pi-bg-wt/<repo>/<id>)
-# > cwd under ~/projects/<name> > per-agent default (frank -> nestfinder,
-# all other agents -> unspecified). Writes project + backfilled +
-# backfilled_at (skipped under DRY=1); idempotent: a record that gains a
-# tag is never touched again. Env: PI_HOME, DRY, SETS_B64.
-# Prints {scanned, tagged, skipped, error, map:[{run, project, source}]}.
-# Single-quote free (legacy of the ssh-hop era; run locally now).
-BACKFILL_SCAN='import base64, datetime, json, os, re
-
-home = os.environ["PI_HOME"].rstrip("/")
-dry = os.environ.get("DRY", "0") == "1"
-sets = {}
-sb = os.environ.get("SETS_B64", "")
-if sb:
-    for p in json.loads(base64.b64decode(sb).decode()):
-        sets[p["run"]] = p["tag"]
-TAG = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
-owner = os.path.basename(home)
-d = os.path.join(home, ".pi-dispatch", "runs")
-scanned = tagged = skipped = 0
-err = None
-changes = []
-try:
-    names = sorted(os.listdir(d))
-except FileNotFoundError:
-    names = []
-except Exception as e:
-    err = "runs dir unreadable: " + str(e)
-    names = []
-for n in names:
-    if not (n.startswith("pi-bg-") and n.endswith(".json")):
-        continue
-    p = os.path.join(d, n)
-    try:
-        with open(p, "r") as fh:
-            rec = json.load(fh)
-    except Exception:
-        continue
-    if not isinstance(rec, dict):
-        continue
-    scanned += 1
-    if rec.get("project") is not None:
-        skipped += 1
-        continue
-    run = rec.get("run") or n[:-5]
-    cwd = rec.get("cwd") or ""
-    tag = None
-    src = None
-    if run in sets:
-        tag, src = sets[run], "set"
-    else:
-        wt = home + "/.pi-bg-wt/"
-        if cwd.startswith(wt):
-            cand = cwd[len(wt):].split("/", 1)[0]
-            if TAG.match(cand):
-                tag, src = cand, "worktree"
-        if tag is None:
-            pj = home + "/projects/"
-            if cwd.startswith(pj):
-                cand = cwd[len(pj):].split("/", 1)[0]
-                if TAG.match(cand):
-                    tag, src = cand, "cwd"
-    if tag is None:
-        tag = "nestfinder" if owner == "frank" else "unspecified"
-        src = "default"
-    tagged += 1
-    changes.append({"run": run, "project": tag, "source": src})
-    if not dry:
-        rec["project"] = tag
-        rec["backfilled"] = True
-        rec["backfilled_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        tmp = p + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(rec, fh, indent=2)
-            fh.write("\n")
-        os.replace(tmp, p)
-print(json.dumps({"scanned": scanned, "tagged": tagged, "skipped": skipped, "error": err, "map": changes}))
-'
-
-# jarate_scan <home> <b64-script> [KEY=VAL ...] — run a scanner (base64 of
-# a python script) against <home> as the current user. Local-only
-# (2026-10-17): callers pass $HOME; other homes are not scanned here.
-# KEY=VAL pairs land as env on the python (safe tokens only). Returns
-# non-zero on scan failure.
-jarate_scan() {
-  local home="$1" b64="$2"; shift 2
-  local envs="" kv
-  for kv in "$@"; do
-    # safe tokens only (a token with spaces/globs would break the
-    # env word-splitting)
-    [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_+./:=:-]*$ ]] || { echo "jarate_scan: bad KEY=VAL token: $kv" >&2; return 1; }
-    envs="${envs:+$envs }$kv"
-  done
-  timeout "$TMO" env PI_HOME="$home" $envs python3 -c \
-    'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' "$b64"
-}
-
-cmd_projects() {
-  local project="" since="" agent_filter="" h name src out recs err row
-  while [ $# -gt 0 ]; do
-    # --flag=value -> --flag value (one flag grammar, #148)
-    case "$1" in
-      --project=*|--since=*|--agent=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
-    esac
-    case "$1" in
-      --project)
-        [ $# -ge 2 ] || die_usage "projects: --project needs a value"
-        project="$2"
-        [[ "$project" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die_usage "projects: invalid --project tag: $project (want [a-z0-9][a-z0-9-]{0,31})"
-        shift 2 ;;
-      --since)
-        [ $# -ge 2 ] || die_usage "projects: --since needs a value (YYYY-MM-DD)"
-        since="$2"
-        [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die_usage "projects: bad --since (want YYYY-MM-DD): $since"
-        shift 2 ;;
-      --agent)
-        [ $# -ge 2 ] || die_usage "projects: --agent needs a value"
-        agent_filter="$2"; shift 2 ;;
-      *) die_usage "projects: unknown arg: $1 (want: --project <tag> | --since YYYY-MM-DD | --agent <name>)" ;;
-    esac
-  done
-
-  agent_homes
-  local -a homes=()
-  if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
-  [ "${#homes[@]}" -gt 0 ] || die "projects: no agent homes found"
-
-  local b64
-  b64="$(printf '%s' "$PROJ_SCAN" | base64 -w0)"
-  local included=0 rows="[]"
-  for h in "${homes[@]}"; do
-    name="${h##*/}"
-    if [ -n "$agent_filter" ] && [ "$name" != "$agent_filter" ]; then
-      continue
-    fi
-    included=$((included + 1))
-    recs="null"
-    err=""
-    if [ "$h" = "$HOME" ]; then
-      src="local"
-      if out="$(jarate_scan "$h" "$b64" SINCE="$since" 2>/dev/null)"; then
-        if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, list) else 1)' 2>/dev/null; then
-          recs="$out"
-        else
-          err="scan failed (bad scanner output)"
-        fi
-      else
-        err="scan failed (local)"
-      fi
-    else
-      # cross-user read removed (2026-10-17): hall-monitor owns the
-      # privileged read (SUDO_PW plan); the entry carries ok:false, the
-      # run itself does not fail.
-      src="cross-user"
-      err="cross-user read removed: use a hall-monitor plan (SUDO_PW)"
-    fi
-    row="$(jq -cn \
-      --arg agent "$name" \
-      --arg source "$src" \
-      --argjson records "$recs" \
-      --arg error "$err" \
-      '{ok: (if $error == "" then true else false end),
-        agent: $agent, source: $source, records: $records,
-        error: (if $error == "" then null else $error end)}')" || die "projects: json assembly failed"
-    rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
-  done
-  [ "$included" -gt 0 ] || die "projects: no agents matched --agent $agent_filter"
-
-  local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/jarate-projects.XXXXXXXX")" || die "projects: mktemp failed"
-  jq -cn --arg ts "$(ts_now)" --arg since "$since" --arg project "$project" \
-    --argjson agents "$rows" \
-    '{ts: $ts, since: $since, project: $project, agents: $agents}' > "$tmp"
-  local doc
-  if ! doc="$(python3 - "$tmp" <<'PY'
-import json, sys
-
-data = json.load(open(sys.argv[1]))
-since = data.get("since") or ""
-pfilter = data.get("project") or None
-agents = data.get("agents", [])
-buckets = {}
-agent_rows = []
-warn = None
-for a in agents:
-    recs = a.get("records")
-    row = {"ok": a.get("ok"), "agent": a["agent"], "source": a["source"], "scanned": None, "error": None}
-    if recs is None:
-        row["error"] = a.get("error") or "cross-user read removed: use a hall-monitor plan (SUDO_PW)"
-        if warn is None:
-            warn = "cross-user read removed: " + a["agent"]
-        agent_rows.append(row)
-        continue
-    row["scanned"] = len(recs)
-    agent_rows.append(row)
-    for r in recs:
-        proj = r.get("project")
-        if not proj:
-            proj = "unspecified"
-        if pfilter and proj != pfilter:
-            continue
-        b = buckets.setdefault(proj, {
-            "runs": 0, "workers": 0, "reviewers": 0,
-            # C6 (polish sweep): OUTPUT keys are snake_case (the JSON
-            # discipline above). Run RECORDS stay camelCase - no
-            # historical migration; the sum loop maps the names.
-            "tokens": {"input": 0, "output": 0, "cache_read": 0,
-                       "cache_write": 0, "total": 0},
-            "costs": [], "first": None, "last": None,
-        })
-        b["runs"] += 1
-        pr = r.get("profile")
-        if pr == "worker":
-            b["workers"] += 1
-        elif pr == "reviewer":
-            b["reviewers"] += 1
-        t = r.get("tokens")
-        if isinstance(t, dict):
-            for k in b["tokens"]:
-                # records carry camelCase; the output keys are snake_case
-                src = ("cacheRead" if k == "cache_read"
-                       else "cacheWrite" if k == "cache_write" else k)
-                v = t.get(src)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    b["tokens"][k] += v
-        c = r.get("cost_usd")
-        # bool is an int subclass: a hand-edited "cost_usd": true must not
-        # count as priced (same guard the token sums use)
-        b["costs"].append(
-            c if isinstance(c, (int, float)) and not isinstance(c, bool)
-            else None
-        )
-        st = r.get("started")
-        if isinstance(st, str):
-            if b["first"] is None or st < b["first"]:
-                b["first"] = st
-            if b["last"] is None or st > b["last"]:
-                b["last"] = st
-if pfilter and pfilter not in buckets:
-    buckets[pfilter] = {
-        "runs": 0, "workers": 0, "reviewers": 0,
-        "tokens": {"input": 0, "output": 0, "cache_read": 0,
-                   "cache_write": 0, "total": 0},
-        "costs": [], "first": None, "last": None,
-    }
-rows = []
-for proj, b in buckets.items():
-    costs = b["costs"]
-    allpriced = bool(costs) and all(c is not None for c in costs)
-    rows.append({
-        "project": proj,
-        "runs": b["runs"],
-        "workers": b["workers"],
-        "reviewers": b["reviewers"],
-        "tokens": b["tokens"],
-        # null if ANY contributing record lacks cost_usd; cost_covered
-        # says how many were priced. Never a partial sum.
-        "cost_usd": round(sum(costs), 5) if allpriced else None,
-        "cost_covered": sum(1 for c in costs if c is not None),
-        "first": b["first"],
-        "last": b["last"],
-    })
-rows.sort(key=lambda r: (-r["runs"], r["project"]))
-print(json.dumps({
-    "ok": True,
-    "ts": data["ts"],
-    "error": None,
-    "since": since or None,
-    "project": pfilter,
-    "warn": warn,
-    "projects": rows,
-    "agents": agent_rows,
-}))
-PY
-)"; then rm -f "$tmp"; die "projects: rollup failed"; fi
-  rm -f "$tmp"
-  printf '%s\n' "$doc"
-}
-
-cmd_projects_backfill() {
-  local agent_filter="" dry=0 runid tag h name src out scan err row
-  local -a sets=()
-  while [ $# -gt 0 ]; do
-    # --flag=value -> --flag value (one flag grammar, #148): the value may
-    # itself contain '=' (e.g. --set=run-2=tag) — split at the FIRST =.
-    case "$1" in
-      --agent=*|--set=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;
-    esac
-    case "$1" in
-      --agent)
-        [ $# -ge 2 ] || die_usage "projects-backfill: --agent needs a value"
-        agent_filter="$2"; shift 2 ;;
-      --dry-run) dry=1; shift ;;
-      --set)
-        [ $# -ge 2 ] || die_usage "projects-backfill: --set needs a value (<run>=<tag>)"
-        case "$2" in
-          *=*) : ;;
-          *) die_usage "projects-backfill: --set wants <run>=<tag>, got: $2" ;;
-        esac
-        runid="${2%%=*}"
-        tag="${2#*=}"
-        [ -n "$runid" ] || die_usage "projects-backfill: --set wants <run>=<tag>, got: $2"
-        [[ "$tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die_usage "projects-backfill: invalid tag: $tag (want [a-z0-9][a-z0-9-]{0,31})"
-        sets+=("$2"); shift 2 ;;
-      *) die_usage "projects-backfill: unknown arg: $1 (want: --agent <name> | --dry-run | --set <run>=<tag>)" ;;
-    esac
-  done
-
-  agent_homes
-  local -a homes=()
-  if [ "${#AGENT_HOMES[@]}" -gt 0 ]; then homes=("${AGENT_HOMES[@]}"); fi
-  [ "${#homes[@]}" -gt 0 ] || die "projects-backfill: no agent homes found"
-
-  local b64 sets_b64=""
-  local -a setjson=()
-  local kv2
-  b64="$(printf '%s' "$BACKFILL_SCAN" | base64 -w0)"
-  if [ "${#sets[@]}" -gt 0 ]; then
-    for kv2 in "${sets[@]}"; do
-      setjson+=("$(jq -cn --arg run "${kv2%%=*}" --arg tag "${kv2#*=}" '{run: $run, tag: $tag}')")
-    done
-    sets_b64="$(printf '%s\n' "${setjson[@]}" | jq -c -s '.' | base64 -w0)"
-  fi
-
-  local included=0 rows="[]"
-  for h in "${homes[@]}"; do
-    name="${h##*/}"
-    if [ -n "$agent_filter" ] && [ "$name" != "$agent_filter" ]; then
-      continue
-    fi
-    included=$((included + 1))
-    scan="null"
-    err=""
-    if [ "$h" = "$HOME" ]; then
-      src="local"
-      if out="$(jarate_scan "$h" "$b64" DRY="$dry" SETS_B64="$sets_b64" 2>/dev/null)"; then
-        if printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
-          scan="$out"
-        else
-          err="scan failed (bad scanner output)"
-        fi
-      else
-        err="scan failed (local)"
-      fi
-    else
-      # cross-user read removed (2026-10-17): hall-monitor owns the
-      # privileged read (SUDO_PW plan); the entry carries ok:false, the
-      # run itself does not fail.
-      src="cross-user"
-      err="cross-user read removed: use a hall-monitor plan (SUDO_PW)"
-    fi
-    row="$(jq -cn \
-      --arg agent "$name" \
-      --arg source "$src" \
-      --argjson scan "$scan" \
-      --arg error "$err" \
-      '{ok: (if $error == "" then true else false end),
-        agent: $agent, source: $source, scan: $scan,
-        error: (if $error == "" then null else $error end)}')" || die "projects-backfill: json assembly failed"
-    rows="$(jq -c --argjson r "$row" '. + [$r]' <<<"$rows")"
-  done
-  [ "$included" -gt 0 ] || die "projects-backfill: no agents matched --agent $agent_filter"
-
-  local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/jarate-backfill.XXXXXXXX")" || die "projects-backfill: mktemp failed"
-  jq -cn --arg ts "$(ts_now)" --argjson dry "$dry" --argjson agents "$rows" \
-    '{ts: $ts, dry_run: $dry, agents: $agents}' > "$tmp"
-  local doc
-  if ! doc="$(python3 - "$tmp" <<'PY'
-import json, sys
-
-data = json.load(open(sys.argv[1]))
-rows = []
-tot = {"scanned": 0, "tagged": 0, "skipped": 0}
-for a in data.get("agents", []):
-    row = {
-        "ok": a.get("ok"),
-        "agent": a["agent"],
-        "source": a["source"],
-        "scanned": None, "tagged": None, "skipped": None,
-        "map": None, "error": None,
-    }
-    s = a.get("scan")
-    if s is None:
-        row["error"] = a.get("error") or "cross-user read removed: use a hall-monitor plan (SUDO_PW)"
-    else:
-        row["scanned"] = s.get("scanned")
-        row["tagged"] = s.get("tagged")
-        row["skipped"] = s.get("skipped")
-        row["map"] = s.get("map")
-        if s.get("error"):
-            row["error"] = s["error"]
-        for k in tot:
-            if isinstance(s.get(k), (int, float)):
-                tot[k] += s[k]
-    rows.append(row)
-print(json.dumps({
-    "ok": True,
-    "ts": data["ts"],
-    "error": None,
-    "dry_run": bool(data.get("dry_run")),
-    "agents": rows,
-    "total": tot,
-}))
-PY
-)"; then rm -f "$tmp"; die "projects-backfill: rollup failed"; fi
-  rm -f "$tmp"
-  printf '%s\n' "$doc"
 }
 
 # ─── setup ────────────────────────────────────────────────────────────────────
@@ -1249,20 +790,16 @@ main() {
     "" | help | -h | --help)
       jq -cn --arg ts "$(ts_now)" \
         '{ok: true, ts: $ts, error: null, usage: "jarate <cmd> [args]",
-          commands: ["setup", "ctx-report", "journal-errors",
-                     "projects", "projects-backfill"]}'
+          commands: ["setup", "ctx-report", "journal-errors"]}'
       ;;
     setup) cmd_setup "$@" ;;
     ctx-report) cmd_ctx_report "$@" ;;
     journal-errors) cmd_journal_errors "$@" ;;
-    projects) cmd_projects "$@" ;;
-    projects-backfill) cmd_projects_backfill "$@" ;;
     *)
       jq -cn --arg ts "$(ts_now)" --arg c "$cmd" \
         '{ok: false, ts: $ts, error: ("unknown command: " + $c),
           usage: "jarate <cmd> [args]",
-          commands: ["setup", "ctx-report", "journal-errors",
-                     "projects", "projects-backfill"]}'
+          commands: ["setup", "ctx-report", "journal-errors"]}'
       exit 2
       ;;
   esac
