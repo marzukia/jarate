@@ -129,13 +129,7 @@ export function jarateText(r: JarateResult, timeoutMs?: number): string {
   });
 }
 
-const JARATE_COMMANDS = [
-  "setup",
-  "ctx-report",
-  "journal-errors",
-  "projects",
-  "projects-backfill",
-];
+const JARATE_COMMANDS = ["setup", "ctx-report", "journal-errors"];
 
 /**
  * Register the single `jarate` tool (cmd + args string). Subcommands are
@@ -150,8 +144,7 @@ export function registerJarateTool(pi: ExtensionAPI): void {
       "setup <bot-token> <channel> [--yes]: fresh-node FTUE (default dry-run; --yes executes). " +
       "ctx-report: this agent's context % + lifetime token cost (pi-token-cost). " +
       "journal-errors [--since S] [--agent N]: pi.service warnings, all agents (since = absolute datetime, default 1h back). " +
-      "projects [--project T] [--since D] [--agent A]: per-project rollup over pi-bg run records (runs/tokens/cost; untagged -> unspecified). " +
-      "projects-backfill [--agent A] [--dry-run] [--set RUN=TAG]: tag historical untagged run records.",
+      "Per-project rollup (removed 2026-10-26, operator order 'wave 1'): hall-monitor GET /api/fleet/spend?project=<repo> (five-dimension tokens) + GET /api/fleet/runs.",
     promptSnippet:
       "jarate <cmd> <args>: machine ops (ctx-report, journal-errors) as JSON",
     promptGuidelines: [

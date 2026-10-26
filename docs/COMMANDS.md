@@ -76,7 +76,7 @@ New commands follow the same scheme: one tag, bracketed, lowercase, no emoji.
 | *delete a queued message* | owner | the queued entry (and its interrupt) is dropped |
 | `/help` | anyone | list the commands |
 | `/btw <question>` | anyone | quick side question, answered briefly without disturbing the main run |
-| `/jobs` | anyone | recent pi-bg run history from the `~/.pi-bg-art` artifacts (`json` for JSON) |
+| `/jobs` | anyone | history-only scan of the `~/.pi-bg-art` artifacts (post-#279 drain: the `jarate-bg` launcher is a stub, rc 10; new work goes to hall-monitor dispatch; `json` for JSON) |
 | `/diff [git-range \| file]` | anyone | publish a diff to a shareable self-hosted viewer URL (default: working tree) |
 | `/status` | owner | context, model, uptime, run state, verbose level, hold, queue depth, interrupt |
 | `/usage [all\|session\|last]` | anyone | token usage: current session (default), lifetime across all session files, or the last completed run |
@@ -354,8 +354,9 @@ Owner only. `/model` is async — the reply confirms after the switch completes.
 History-only since the drain (#279): the dispatch lane is retired (zero
 in-flight runs fleet-wide), so the in-flight ps view and the `kill`/`tail`
 wrappers (which spawned the removed `jarate-bg-kill`/`jarate-bg-tail`
-scripts) are gone. Recent history comes from the `~/.pi-bg-art` artifacts
-each run leaves. Markdown list layout (2026-10-18): recent bullets are
+scripts) are gone. The `jarate-bg` launcher is a stub (rc 10 retirement
+notice); new work goes to hall-monitor dispatch (`POST /fleet/dispatch`).
+Recent history comes from the `~/.pi-bg-art` artifacts each run leaves. Markdown list layout (2026-10-18): recent bullets are
 state-first (raw states `done` / `webhook-failed` / `killed` / `lost`),
 age, then id - no fence, no width budget:
 

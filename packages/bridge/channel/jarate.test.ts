@@ -106,13 +106,13 @@ describe("runJarate", () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  test("projects --project= is reachable (value flag, not swallowed)", async () => {
+  test("journal-errors --agent= is reachable (value flag, not swallowed)", async () => {
     const home = makeJarateHome(argvStub);
-    const r = await runJarate("projects", "--project=nestfinder", {
+    const r = await runJarate("journal-errors", "--agent=peer-home", {
       env: envFor(home),
     });
     const d = JSON.parse(r.out);
-    expect(d.argv).toBe("projects|--project=nestfinder");
+    expect(d.argv).toBe("journal-errors|--agent=peer-home");
     fs.rmSync(home, { recursive: true, force: true });
   });
 
@@ -176,13 +176,7 @@ describe("registerJarateTool", () => {
     registerJarateTool(pi);
     expect(Object.keys(tools)).toEqual(["jarate"]);
     // subcommands are discoverable from the description
-    for (const cmd of [
-      "setup",
-      "ctx-report",
-      "journal-errors",
-      "projects",
-      "projects-backfill",
-    ]) {
+    for (const cmd of ["setup", "ctx-report", "journal-errors"]) {
       expect(tools.jarate.description).toContain(cmd);
     }
     // gutted subcommands (hall-monitor owns credentials + privileged exec,
@@ -203,8 +197,6 @@ describe("registerJarateTool", () => {
       "setup",
       "ctx-report",
       "journal-errors",
-      "projects",
-      "projects-backfill",
     ]);
 
     const realHome = process.env.HOME;

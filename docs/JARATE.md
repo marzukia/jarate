@@ -27,7 +27,7 @@ $ jarate <cmd> [args]     # stdout = exactly one JSON document
 Usage / unknown command:
 
 ```json
-{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors", "projects", "projects-backfill"]}
+{"ok": false, "ts": "...", "error": "unknown command: bogus", "usage": "jarate <cmd> [args]", "commands": ["setup", "ctx-report", "journal-errors"]}
 ```
 
 ## Commands
@@ -101,78 +101,9 @@ re-joined), or a bare date. Default: one hour back, absolute UTC.
   fail, rc 0). `ok: false` (rc 1) only when the local journalctl call
   failed; `ok: false` (rc 1) also when no agent matched `--agent`.
 
-### `projects [--project TAG] [--since YYYY-MM-DD] [--agent NAME]`
-
-Per-project rollup of jarate-bg run records (the `--project` tag ran with
-the retired launch path) across every agent home on this host. Read-only. Scans
-`<home>/.pi-dispatch/runs/pi-bg-*.json` per agent (a failing read degrades
-that agent's row with `error` + a top-level `warn` — the doc stays `ok:true`).
-
-```json
-{
-  "ok": true, "ts": "...", "error": null,
-  "since": null, "project": null, "warn": null,
-  "projects": [
-    {"project": "nestfinder", "runs": 12, "workers": 10, "reviewers": 2,
-     "tokens": {"input": 100, "output": 50, "cache_read": 200, "cache_write": 5, "total": 350},
-     "cost_usd": 0.12345, "cost_covered": 12,
-     "first": "2026-09-01T00:00:00Z", "last": "2026-09-18T00:00:00Z"}
-  ],
-  "agents": [
-    {"agent": "monky", "source": "local", "scanned": 40, "error": null}
-  ]
-}
-```
-
-- Buckets: one row per tag; records without `project` land in `unspecified`.
-  `--project` filters to one bucket (an unknown tag yields a single
-  zeroed-out row, `ok:true` — not an error).
-- **Cost null semantics:** `cost_usd` is `null` when ANY contributing record
-  lacks a priced `cost_usd` (never a partial sum); `cost_covered` counts how
-  many were priced. `tokens` sums per field over contributing records
-  (missing -> 0).
-- Rows sort by `runs` desc, then `project` asc (deterministic).
-- `--since` (shape-validated `YYYY-MM-DD`) drops records with `started`
-  earlier than the date (string compare); `--agent` narrows the agent list
-  (no match -> `ok:false` rc 1).
-- `scanned` = records read; a degraded agent row has `scanned: null` +
-  `error` and contributes nothing.
-
-### `projects-backfill [--agent NAME] [--dry-run] [--set RUN=TAG ...]`
-
-Tag the untagged historical records (ones pre-dating `--project`). First
-match wins per record:
-
-1. `--set <run>=<tag>` — explicit override (tag validated against the same
-   `[a-z0-9][a-z0-9-]{0,31}` rule; multiple `--set` allowed);
-2. record `cwd` under `<home>/.pi-bg-wt/<repo>/` -> tag `<repo>`
-   (worktree runs — records carry no worktree field, the cwd is the
-   source of truth);
-3. record `cwd` under `<home>/projects/<name>` -> tag `<name>`;
-4. per-agent default: owner `frank` -> `nestfinder`, every other agent ->
-   `unspecified`.
-
-Writes `project`, `backfilled: true`, `backfilled_at` (ISO UTC) atomically
-(tmp + replace). **Idempotent:** a record that has a `project` is skipped
-and never overwritten (even by `--set`). `--dry-run` plans without writing.
-
-```json
-{
-  "ok": true, "ts": "...", "error": null, "dry_run": true,
-  "agents": [
-    {"agent": "monky", "source": "local", "scanned": 40, "tagged": 30, "skipped": 10,
-     "map": [{"run": "20260910-123456-1", "project": "jarate", "source": "worktree"}],
-     "error": null}
-  ],
-  "total": {"scanned": 40, "tagged": 30, "skipped": 10}
-}
-```
-
-- `map` lists only the records tagged (or would be, under `--dry-run`),
-  with the derivation `source`: `set` | `worktree` | `cwd` | `default`.
-- A degraded agent row has `scanned/tagged/skipped: null` + `error`; `total`
-  counts the agents that answered. Still `ok:true`.
-- `--agent` narrows; no match -> `ok:false` rc 1.
+Per-project rollup (removed 2026-10-26, operator order 'wave 1',
+jarate-hm relocation map): hall-monitor `GET /api/fleet/spend?project=<repo>`
+(five-dimension tokens) + `GET /api/fleet/runs`.
 
 ## Env overrides (tests + machines)
 
