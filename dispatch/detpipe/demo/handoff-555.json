@@ -1,0 +1,21 @@
+{
+  "extracted_at": "2026-10-27T00:00:00Z",
+  "schema": "detpipe/1",
+  "session": "fleetwork-555",
+  "sha256": {
+    "brief": "11d07933f4fbe96247875c674108e27b909b2460977140408b018cdf8e9402e1",
+    "decisions": "552e423045fcbd949252397b4bee754f0b8f99b1bbbe41edc9b25dbfc81b146a",
+    "files": "a00f98c303eab4cd525b9ecccb47661a4d5256fff381d8971d3135e74acd7591",
+    "git_state": "280b94e508576080c5a8951f33e9710d0d13fe7c08faca52ed8bf8b0d2d8b503",
+    "next_action": "814f7bf2a5086b6f05135e91f1e91fd5abaae6a03d1f4c1f83dc03e0e9c5478f",
+    "tool_calls": "9dbd9f8e17ac920710a75f652bc56e89bc063cfb8c99981e9997a4e950185a79",
+    "transcript_tail": "be9a4f2c1ab9377dc684e75037a67298bf8bbf46db62a4a44ecbbda5d78bbb53",
+    "trigger": "c42c5692f3c3b9cef87af8d0bbd482466e561a9977d7b04bb774fc0bde16c322",
+    "usage": "2f3e13f3af68d71af2671e26e0f9c7af58a771c13aaae6217b7c9e4612cdb27a"
+  },
+  "source": {
+    "cwd": "/srv/fleetwork/work/555"
+  },
+  "trigger": "context-threshold",
+  "triggers": ["context-threshold", "stop-length", "rumination"]
+}
