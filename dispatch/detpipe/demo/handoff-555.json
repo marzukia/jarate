@@ -17,9 +17,5 @@
     "cwd": "/srv/fleetwork/work/555"
   },
   "trigger": "context-threshold",
-  "triggers": [
-    "context-threshold",
-    "stop-length",
-    "rumination"
-  ]
+  "triggers": ["context-threshold", "stop-length", "rumination"]
 }
