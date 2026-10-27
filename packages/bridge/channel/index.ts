@@ -20,7 +20,6 @@
  * is included in the LLM message as a folder reference.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -29,37 +28,39 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
-import { renderContext } from "./context";
-import { publishDiff } from "./diff";
+import {
+  buildInteractionHandler,
+  channelError,
+  failurePostText,
+  isOwnerUser,
+  matchCommand,
+  runChannelCommand,
+  runShellPassthrough,
+  startCompact,
+  wrapFence,
+} from "./commands";
 import {
   connectDiscord,
   connectDiscordPresence,
   type DiscordCallbacks,
-  deferInteraction,
   deleteDiscordMessage,
   disconnectDiscord,
   discordFetch,
   editDiscordMessage,
-  editInteractionMessage,
-  getChannelCursor,
   getDiscordChannelId,
   getDiscordStates,
   getDiscordToken,
-  interactionUserId,
   loadChannelStateFile,
   loadDiscordAttachment,
   loadPersistedCursors,
   MAX_ATTACHMENT_BYTES,
   patchChannelState,
   registerDiscordCommands,
-  respondToInteraction,
   sendDiscordMessage,
   sendDiscordMessageWithFiles,
   sendDiscordTyping,
-  sendFilesToDiscord,
   setChannelCursor,
   setDiscordInteractionHandler,
   setDiscordPresenceActivity,
@@ -73,72 +74,98 @@ import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
-  buildSeedKickoff,
   type HandoverComplete,
   isHandoffFreshWindow,
-  type KickoffLiveState,
-  liveKickoffState,
-  loadPreviousHandover,
   parsePriorTags,
   resolveHandoffSettings,
   shouldHandoff,
 } from "./handover";
 import { registerJarateTool } from "./jarate";
-import { jobsView } from "./jobs";
-import { extractQueueSuffix } from "./queue";
+import {
+  armOpTick,
+  cleanThinking,
+  compactPlaceholders,
+  earlySendText,
+  earlySent,
+  fence,
+  finalText,
+  interruptEntryInFlight,
+  LIVE_TEXT_THROTTLE_MS,
+  type LiveFrameRec,
+  opTickLine,
+  opTicks,
+  persistLivePlaceholders,
+  readLivePlaceholders,
+  setLivePlaceholderSnapshot,
+  settleCompactTick,
+  settleOpTick,
+  stopAllOpTicks,
+  stopOpTick,
+  stopOpTickPrefix,
+  truncateLiveText,
+  unlinkLivePlaceholders,
+} from "./live";
+import {
+  clearQueuedInbound,
+  consumeQueuedAck,
+  deleteQueuedInbound,
+  drainRewakeSurvival,
+  dropQueuedInbound,
+  extractQueueSuffix,
+  midTurnQueues,
+  popOldestQueuedInbound,
+  queuedAcks,
+  queueMidTurnInbound,
+  resolveChannel,
+  updateQueuedInbound,
+} from "./queue";
+import {
+  consumeOpMarker,
+  handoffRestartForSize,
+  safeSessionFile,
+} from "./restart-ops";
 import {
   loadRewakeQueue,
   rewakeAddPending,
   rewakeClearPending,
   rewakeCommitDelivered,
-  rewakePending,
   rewakeRemovePending,
   rewakeSetPendingAck,
-  rewakeUpdatePendingMsg,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
-  cancelWake,
   collectOrphanTmpFiles,
   completeWake,
   dueWakes,
-  formatDurationMs,
   formatWakePrompt,
-  loadWakes,
   markClaimed,
-  parseWakeAt,
-  scheduleWake,
 } from "./sleep";
 import {
-  cancelTask,
   collectOrphanTaskTmpFiles,
   completeTask,
   dueTasks,
-  formatTaskLine,
   formatTaskPrompt,
-  loadTasks,
   markTaskClaimed,
-  parseTaskSpec,
-  rescheduleTask,
-  scheduleTask,
 } from "./tasks";
 import {
-  defaultHome,
   extractTodoLines,
   fit,
   isBgCallbackBody,
-  listBoards,
   loadBoard,
   mergeTodoLines,
-  renderBoard,
-  sanitizeTodos,
   saveBoard,
-  type TodoBoard,
   todoBoardContextBlock,
 } from "./todos";
+import {
+  registerSendFileTool,
+  registerSleepTool,
+  registerTaskTool,
+  registerTodoTool,
+  syncTodoBoard,
+} from "./tools";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
 import {
   type AttachmentRef,
@@ -147,32 +174,21 @@ import {
   getChannel,
   getDefaultChannel,
   loadChannelConfig,
-  resolveSystemdUnit,
 } from "./types";
 import {
   consumeRerun,
   findSessionFile,
   finishRun,
-  performRedo,
-  performUndo,
   stageFileTouch,
   startRun,
   type UndoRun,
 } from "./undo";
-import {
-  estimateCost,
-  hasUsage,
-  renderUsage,
-  sumRunUsage,
-  type UsageStats,
-  usageSummary,
-} from "./usage";
+import { estimateCost, hasUsage, sumRunUsage, type UsageStats } from "./usage";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
-import { mergeWorktree, newWorktree } from "./worktree";
 
-let lastActiveChannel: ChannelConfig | null = null;
-let sessionStartTs = 0;
-let agentBusy = false;
+export let lastActiveChannel: ChannelConfig | null = null;
+export let sessionStartTs = 0;
+export let agentBusy = false;
 // /undo run store: the in-flight run's snapshot handle (pre-state captured
 // at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
@@ -190,7 +206,21 @@ let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
 // replaces the earlier. Flushed at agent_end, or when the blocking
 // compaction settles (session_compact / session_compact_failed — an
 // in-flight compaction never triggers agent_end on its own).
-let pendingCompact: { ch: ChannelConfig; instructions?: string } | null = null;
+export let pendingCompact: {
+  ch: ChannelConfig;
+  instructions?: string;
+} | null = null;
+export function getPendingCompact(): {
+  ch: ChannelConfig;
+  instructions?: string;
+} | null {
+  return pendingCompact;
+}
+export function setPendingCompact(
+  v: { ch: ChannelConfig; instructions?: string } | null,
+): void {
+  pendingCompact = v;
+}
 // /verbose per-channel override (until restart). Exported for tests and
 // for #10 (3-level display + persistence builds on this).
 // /verbose per-channel override (#10): 3-level tool-call display,
@@ -246,7 +276,7 @@ export const heldChannels = new Set<string>();
 // is set at session_start; ensureRuntimeStateLoaded re-reads the file at
 // most once per dir (a fresh process starts with a null guard, so boot
 // always loads; in-process re-starts reload via setRuntimeStateDir).
-let runtimeStateDir: string | null = null;
+export let runtimeStateDir: string | null = null;
 let runtimeStateLoadedFor: string | null = null;
 /** Set the runtime-state dir + reset the load guard. Exported for tests. */
 export function setRuntimeStateDir(dir: string | null): void {
@@ -265,7 +295,7 @@ export function resetRuntimeStateForTest(): void {
   compactPlaceholders.clear();
   setLivePlaceholderSnapshot(null);
 }
-function ensureRuntimeStateLoaded(): void {
+export function ensureRuntimeStateLoaded(): void {
   const dir = runtimeStateDir ?? "";
   if (runtimeStateLoadedFor === dir) return;
   runtimeStateLoadedFor = dir;
@@ -305,285 +335,11 @@ export function persistChannelRuntimeState(
 // Display gate (#38): the extension closure owns the live status-block
 // state; the module-level command paths reach it through this hook (one
 // extension instance per process, registered in the extension body).
-let onDeleteStatusBlock: ((ch: ChannelConfig) => Promise<void>) | null = null;
-// ─── Mid-turn re-wake queue ─────────────────────────────────────────────
-// An inbound that arrives while a run is in flight is NOT steered into the
-// in-flight run (pi's deliverAs:"steer" folds it in, and if the run ends
-// before a model step consumes it the message is swallowed with no new
-// turn). Instead we queue the FULL ChannelMessage here — per channel, in
-// arrival order — and re-run it as a fresh inbound at agent_end, which
-// guarantees a dedicated new run. One entry = one message = one re-wake run.
-interface QueuedInbound {
-  msg: ChannelMessage;
-  queuedAt: number;
-  /** Pre-rendered LLM text (channel ctx + body/attachments), captured at
-   *  queue time so the mid-run interrupt can force-deliver it without async
-   *  re-rendering (re-rendering is async and would widen the send/abort
-   *  race window). The re-wake path still re-renders via handleInbound. */
-  text?: string;
-  title?: string;
-  display?: string;
-}
-export const midTurnQueues = new Map<string, QueuedInbound[]>();
-
-// ─── Queue acks ([queued] N in line) ─────────────────────────────────────
-// One ack message per queued inbound, keyed by the inbound's Discord
-// message id. Deleted when the entry is consumed/dropped; renumbered when
-// an entry ahead of it leaves the line (delete or consume).
-export const queuedAcks = new Map<
-  string,
-  { ackId: string; fromId?: string; pos: number }
->();
+export let onDeleteStatusBlock: ((ch: ChannelConfig) => Promise<void>) | null =
+  null;
 // Workspace root captured at session_start — lets module-level queue
 // helpers resolve ChannelConfig without a ctx.
-let configRoot: string | null = null;
-
-function resolveChannel(channelId: string): ChannelConfig | undefined {
-  return configRoot
-    ? getChannel(loadChannelConfig(configRoot), channelId)
-    : undefined;
-}
-
-/** Drop the stored ack for a consumed/dropped message, then renumber the
- *  acks of the entries still in line. The REST delete is fire-and-forget
- *  unless `deletes` is given — the shutdown drain passes one and awaits
- *  it, because the process may exit before an unawaited delete lands. */
-function consumeQueuedAck(
-  channelId: string,
-  messageId: string,
-  deletes?: Promise<unknown>[],
-): void {
-  const ack = queuedAcks.get(messageId);
-  if (ack) {
-    queuedAcks.delete(messageId);
-    const ch = resolveChannel(channelId);
-    if (ch) {
-      const del = deleteDiscordMessage(ch, ack.ackId).catch(() => {});
-      if (deletes) deletes.push(del);
-    }
-  }
-  renumberQueuedAcks(channelId);
-  persistLivePlaceholders(); // #84: the ack line left (or was renumbered)
-}
-
-/** Re-edit the channel's remaining queued acks so positions stay true
- *  after an entry ahead of them left the line. No-op when already correct.
- *  The ack is one-line op status — prose, unfenced (STYLE.md v4 §2.3). */
-function renumberQueuedAcks(channelId: string): void {
-  const ch = resolveChannel(channelId);
-  if (!ch) return;
-  const q = midTurnQueues.get(channelId) ?? [];
-  q.forEach((e, i) => {
-    const ack = queuedAcks.get(e.msg.messageId);
-    if (!ack || ack.pos === i + 1) return;
-    ack.pos = i + 1;
-    editDiscordMessage(ch, ack.ackId, `[queued] ${i + 1} in line`).catch(
-      () => {},
-    );
-  });
-}
-
-/** Queue a mid-turn inbound for a re-wake. Returns the new queue depth
- *  (the message's 1-based position in its channel's line). `armInterrupt`
- *  defaults to true; ". queue"-suffixed messages pass false so they wait
- *  their turn instead of jumping it. */
-export function queueMidTurnInbound(
-  channelId: string,
-  msg: ChannelMessage,
-  text?: string,
-  title?: string,
-  display?: string,
-  armInterrupt = true,
-): number {
-  let q = midTurnQueues.get(channelId);
-  if (!q) {
-    q = [];
-    midTurnQueues.set(channelId, q);
-  }
-  const entry: QueuedInbound = {
-    msg,
-    queuedAt: Date.now(),
-    text,
-    title,
-    display,
-  };
-  q.push(entry);
-  // #180 (survival path): mirror the entry into the per-channel state
-  // file. session_shutdown clears MEMORY only; the file is what a
-  // respawn drains. Synchronous tmp+rename right after the push — the
-  // in-memory → file window is the same tick, no await in between.
-  rewakeAddPending(runtimeStateDir, channelId, {
-    msg,
-    queuedAt: entry.queuedAt,
-  });
-  console.log(
-    `[channel] queued mid-turn inbound, will re-wake (${q.length} queued)`,
-  );
-  // #177: machine wakes are queue-only. The re-wake queue already
-  // guarantees agent_end delivery; the interrupt only jumps the line, and
-  // a machine alert is never more urgent than the in-flight turn — so it
-  // never arms one. (2026-10-06 incident: a reviewer callback posted
-  // mid-turn armed the 3s interrupt, was never consumed, and was lost at
-  // compact.)
-  if (armInterrupt && !isBgInbound(msg)) {
-    // 4x (12s) case: an interrupt is already in flight (re-wake run in
-    // progress). Without this, rapid-fire messages cascade — each new
-    // message arms a 3s interrupt that kills the re-wake run mid-LLM-call,
-    // forcing a full 120K-token prefill restart. The message is queued
-    // with a guaranteed re-wake either way, so the longer window only
-    // changes WHEN the interrupt cuts in. All other senders keep the 3s
-    // default (quick cut-in).
-    const delay = interruptingChannels.has(channelId)
-      ? interruptStepTimeoutMs() * 4 // 12s: give the in-flight run room
-      : undefined; // default 3s
-    armInterruptTimer(channelId, msg.messageId, delay);
-  }
-  return q.length;
-}
-
-// ─── Re-wake FIFO ────────────────────────────────────────────────────────
-
-/** Pop the globally oldest queued inbound across all channels (FIFO).
- *  Held channels (#39) are skipped: their buffer drains on /hold off,
- *  not at agent_end. (The #231 P3 in-turn-consumed marker drop is gone
- *  with jarate-wait, the only marker producer — #279 drain.) */
-export function popOldestQueuedInbound(): {
-  channelId: string;
-  msg: ChannelMessage;
-} | null {
-  ensureRuntimeStateLoaded();
-  for (;;) {
-    let oldest: {
-      channelId: string;
-      msg: ChannelMessage;
-      queuedAt: number;
-    } | null = null;
-    for (const [channelId, q] of midTurnQueues) {
-      if (heldChannels.has(channelId)) continue;
-      const head = q[0];
-      if (!head) continue;
-      if (!oldest || head.queuedAt < oldest.queuedAt)
-        oldest = { channelId, msg: head.msg, queuedAt: head.queuedAt };
-    }
-    if (!oldest) return null;
-    const q = midTurnQueues.get(oldest.channelId)!;
-    // The head can move between scan and shift (a delete or interrupt
-    // cancel splices it): recompute on a stale snapshot instead of
-    // shifting the wrong entry.
-    if (q[0]?.queuedAt !== oldest.queuedAt) continue;
-    q.shift();
-    if (q.length === 0) midTurnQueues.delete(oldest.channelId);
-    consumeQueuedAck(oldest.channelId, oldest.msg.messageId);
-    return { channelId: oldest.channelId, msg: oldest.msg };
-  }
-}
-
-/** Drop all queued inbounds for a channel (/stop, shutdown drain).
- *  `deletes` collects the ack-delete promises so the caller can await
- *  them (session_shutdown must — the process dies right after). Returns
- *  the count dropped. `keepFile` (session_shutdown only): the in-memory
- *  drain is the fast path (ack cleanup); the #180 state file is the
- *  SURVIVAL path and must outlive the process. */
-export function clearQueuedInbound(
-  channelId: string,
-  deletes?: Promise<unknown>[],
-  opts?: { keepFile?: boolean },
-): number {
-  const q = midTurnQueues.get(channelId);
-  if (!q) return 0;
-  for (const e of q) {
-    consumeQueuedAck(channelId, e.msg.messageId, deletes);
-    if (!opts?.keepFile)
-      rewakeRemovePending(runtimeStateDir, channelId, e.msg.messageId);
-  }
-  const n = q.length;
-  midTurnQueues.delete(channelId);
-  return n;
-}
-
-/** #180 (survival drain): re-queue persisted pending entries into the
- *  in-memory re-wake queue at a real process start. The file is left in
- *  place — entries are pruned from it exactly when committed to pi
- *  (sendToPi) or dropped, so a second death before delivery re-drains
- *  the same file and the message is still delivered exactly once.
- *  Returns the count re-queued. Exported for tests. */
-export function drainRewakeSurvival(
-  stateDir: string,
-  channels: ChannelConfig[],
-): number {
-  let n = 0;
-  for (const ch of channels) {
-    if (ch.type !== "discord") continue;
-    const pending = rewakePending(stateDir, ch.id);
-    if (pending.length === 0) continue;
-    const q = midTurnQueues.get(ch.id) ?? [];
-    for (const e of pending) {
-      // Fresh process: midTurnQueues is empty; the guard is for
-      // in-process reuse and is idempotent either way.
-      if (q.some((x) => x.msg.messageId === e.msg.messageId)) continue;
-      q.push({ msg: e.msg, queuedAt: e.queuedAt });
-      // #194 interaction: the fresh process has an EMPTY queuedAcks
-      // map, but the `[queued] N in line` line survived the restart
-      // (the crash-settle keeps it alive when a rewake entry is
-      // restored) — restore its id at its line position so the
-      // re-wake drain's consumeQueuedAck deletes it exactly once.
-      if (e.ackId)
-        queuedAcks.set(e.msg.messageId, {
-          ackId: e.ackId,
-          pos: q.length,
-        });
-      n += 1;
-    }
-    midTurnQueues.set(ch.id, q);
-  }
-  if (n > 0)
-    console.log(
-      `[channel] rewake survival: re-queued ${n} queued inbound(s) from state files`,
-    );
-  return n;
-}
-
-/** Pop the oldest queued inbound for ONE channel (#39 /hold off drain).
- *  Returns null when the channel's line is empty. */
-export function popChannelQueuedInbound(
-  channelId: string,
-): QueuedInbound | null {
-  const q = midTurnQueues.get(channelId);
-  if (!q || q.length === 0) return null;
-  const e = q.shift()!;
-  if (q.length === 0) midTurnQueues.delete(channelId);
-  consumeQueuedAck(channelId, e.msg.messageId);
-  return e;
-}
-
-/** Drop one queued entry by id WITHOUT delivering it (#186 F1): the
- *  delivery already happened through another path (the cursor-replay
- *  direct send) and its commit must not leave the drained copy behind
- *  for the agent_end re-wake to pop — that second pop is exactly the
- *  double delivery. Consume the ack like a pop would. No-op when the
- *  id is not queued (the normal pop-then-send order reaches here with
- *  the entry already out of the line). */
-function dropQueuedInbound(channelId: string, messageId: string): void {
-  const q = midTurnQueues.get(channelId);
-  if (!q) return;
-  const idx = q.findIndex((e) => e.msg.messageId === messageId);
-  if (idx === -1) return;
-  q.splice(idx, 1);
-  if (q.length === 0) midTurnQueues.delete(channelId);
-  consumeQueuedAck(channelId, messageId);
-}
-
-/** Remove one armed interrupt timer (the queue entry for it is gone).
- *  No-op when the message never armed one. */
-export function disarmInterrupt(channelId: string, messageId: string): void {
-  const list = pendingInterrupts.get(channelId);
-  if (!list) return;
-  const i = list.findIndex((p) => p.messageId === messageId);
-  if (i === -1) return;
-  clearTimeout(list[i].timer);
-  list.splice(i, 1);
-  if (list.length === 0) pendingInterrupts.delete(channelId);
-}
+export let configRoot: string | null = null;
 
 // ─── Mid-run interrupt ─────────────────────────────────────────────────
 // A PLAIN message that arrives while a run is active is queued for a
@@ -631,16 +387,16 @@ interface PendingInterrupt {
   timer: ReturnType<typeof setTimeout>;
 }
 export const pendingInterrupts = new Map<string, PendingInterrupt[]>();
-const interruptingChannels = new Set<string>();
+export const interruptingChannels = new Set<string>();
 // Channels whose in-flight interrupt was cancelled by /stop, /reset or
 // /restart while the settle wait was running — the pending send is dropped
 // (consistent with those commands dropping queued mid-turn inbounds).
-const interruptCancelled = new Set<string>();
+export const interruptCancelled = new Set<string>();
 // #84: the in-flight interrupt's entry is spliced OUT of midTurnQueues,
 // so this registry (channelId -> queued messageId) is the only way
 // session_shutdown can find its "[..] interrupting… Ns" ack line to
 // clear. Cleared in the same finally as interruptingChannels.
-const interruptInFlight = new Map<string, string>();
+export const interruptInFlight = new Map<string, string>();
 let interruptHandler: ((channelId: string, messageId: string) => void) | null =
   null;
 let interruptCtx: ExtensionContext | null = null;
@@ -717,232 +473,6 @@ export function clearAllInterrupts(): void {
   persistLivePlaceholders();
 }
 
-// ─── Live placeholder persistence (#84: crash settle) ───────────────────
-// A process death (OOM, SIGKILL, power loss) runs neither agent_end nor
-// session_shutdown — the working frame, SPEC B live text, in-flight
-// interrupt ack, open compact line, and queued-inbound acks freeze in the
-// channel. #173 settled the PLANNED death; this covers the unplanned one.
-// Every live placeholder is recorded here on post, cleared on settle (the
-// file exists iff a placeholder is live); the next real process start
-// (session_start reason "startup") reads the file and drives whatever
-// survived to a terminal state. Queued-inbound entry REDISPATCH is issue
-// #180's scope — here only the placeholder LINES are settled, plus the
-// spliced in-flight interrupt entry (the queue no longer holds it, so
-// nobody else redelivers it).
-interface LiveFrameRec {
-  channelId: string;
-  msgId: string;
-  /** Shown call count at snapshot time (0 -> startup deletes, not morphs). */
-  calls: number;
-  /** Last rendered UNFENCED working frame body (null when unrenderable). */
-  body: string | null;
-}
-interface LiveMsgRec {
-  channelId: string;
-  msgId: string;
-}
-interface LiveInterruptRec extends LiveMsgRec {
-  ackId: string | null;
-  text: string;
-  title: string;
-  display: string;
-}
-interface LiveQueueAckRec {
-  channelId: string;
-  /** The queued inbound message id the ack belongs to. */
-  inboundId: string;
-  ackId: string;
-  pos: number;
-}
-interface LivePlaceholderState {
-  v: 1;
-  frame: LiveFrameRec | null;
-  liveText: LiveMsgRec | null;
-  interrupts: LiveInterruptRec[];
-  compacts: LiveMsgRec[];
-  queueAcks: LiveQueueAckRec[];
-}
-
-/** Pre-rendered entry of an in-flight interrupt, kept alongside
- *  interruptInFlight so a crash can redeliver it (#84). */
-const interruptEntryInFlight = new Map<
-  string,
-  { text: string; title: string; display: string }
->();
-
-/** Pure-compact placeholder lines (armCompactTick only; restart-class op
- *  windows are covered by the op marker, and #173's shutdown settles both). */
-const compactPlaceholders = new Map<string, string>(); // channelId -> msgId
-
-const LIVE_PLACEHOLDERS_FILE = "live-placeholders.json";
-
-/** Closure-scoped frame/live-text state, registered by the extension.
- *  Null outside an extension instance (e.g. in unit scope). */
-let livePlaceholderSnapshot:
-  | (() => { frame: LiveFrameRec | null; liveText: LiveMsgRec | null })
-  | null = null;
-
-export function setLivePlaceholderSnapshot(
-  fn:
-    | (() => { frame: LiveFrameRec | null; liveText: LiveMsgRec | null })
-    | null,
-): void {
-  livePlaceholderSnapshot = fn;
-}
-
-function livePlaceholdersPath(): string | null {
-  return runtimeStateDir
-    ? path.join(runtimeStateDir, LIVE_PLACEHOLDERS_FILE)
-    : null;
-}
-
-/** Snapshot the queued-ack lines: acks whose entries are still in the
- *  queue (an in-flight interrupt's ack rides its interrupt record instead). */
-function snapshotQueueAcks(): LiveQueueAckRec[] {
-  const out: LiveQueueAckRec[] = [];
-  for (const [messageId, ack] of queuedAcks) {
-    for (const [channelId, q] of midTurnQueues) {
-      if (!q.some((e) => e.msg.messageId === messageId)) continue;
-      out.push({
-        channelId,
-        inboundId: messageId,
-        ackId: ack.ackId,
-        pos: ack.pos,
-      });
-      break;
-    }
-  }
-  return out;
-}
-
-/** Rewrite <cwd>/.tmp/live-placeholders.json atomically (or unlink it when
- *  no placeholder is live). Never throws — a persist failure must not break
- *  the message path; the crash settle is best-effort on top. */
-export function persistLivePlaceholders(): void {
-  const p = livePlaceholdersPath();
-  if (!p) return;
-  try {
-    const snap = livePlaceholderSnapshot?.() ?? { frame: null, liveText: null };
-    const interrupts: LiveInterruptRec[] = [];
-    for (const [channelId, msgId] of interruptInFlight) {
-      const entry = interruptEntryInFlight.get(channelId);
-      if (!entry) continue;
-      interrupts.push({
-        channelId,
-        msgId,
-        ackId: queuedAcks.get(msgId)?.ackId ?? null,
-        ...entry,
-      });
-    }
-    const state: LivePlaceholderState = {
-      v: 1,
-      frame: snap.frame,
-      liveText: snap.liveText,
-      interrupts,
-      compacts: [...compactPlaceholders].map(([channelId, msgId]) => ({
-        channelId,
-        msgId,
-      })),
-      queueAcks: snapshotQueueAcks(),
-    };
-    const empty =
-      !state.frame &&
-      !state.liveText &&
-      state.interrupts.length === 0 &&
-      state.compacts.length === 0 &&
-      state.queueAcks.length === 0;
-    if (empty) {
-      unlinkLivePlaceholders();
-      return;
-    }
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    const tmp = `${p}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state));
-    fs.renameSync(tmp, p);
-  } catch (e) {
-    console.error(
-      "[channel] live-placeholder persist failed:",
-      sanitizeUnknownValue(e),
-    );
-  }
-}
-
-/** Read + validate the persisted record. `null` = no file or corrupt. */
-export function readLivePlaceholders(): LivePlaceholderState | null {
-  const p = livePlaceholdersPath();
-  if (!p) return null;
-  try {
-    const s = JSON.parse(fs.readFileSync(p, "utf8")) as any;
-    if (typeof s !== "object" || s?.v !== 1) return null;
-    const isMsgRec = (r: any): r is LiveMsgRec =>
-      !!r && typeof r.channelId === "string" && typeof r.msgId === "string";
-    return {
-      v: 1,
-      frame:
-        s.frame &&
-        typeof s.frame.channelId === "string" &&
-        typeof s.frame.msgId === "string"
-          ? {
-              channelId: s.frame.channelId,
-              msgId: s.frame.msgId,
-              calls: typeof s.frame.calls === "number" ? s.frame.calls : 0,
-              body: typeof s.frame.body === "string" ? s.frame.body : null,
-            }
-          : null,
-      liveText: isMsgRec(s.liveText) ? s.liveText : null,
-      interrupts: Array.isArray(s.interrupts)
-        ? (s.interrupts.filter(
-            (r: any) =>
-              !!r &&
-              typeof r.channelId === "string" &&
-              typeof r.msgId === "string" &&
-              typeof r.text === "string" &&
-              (r.ackId === null || typeof r.ackId === "string"),
-          ) as LiveInterruptRec[])
-        : [],
-      compacts: Array.isArray(s.compacts) ? s.compacts.filter(isMsgRec) : [],
-      queueAcks: Array.isArray(s.queueAcks)
-        ? s.queueAcks.filter(
-            (r: any) =>
-              !!r &&
-              typeof r.channelId === "string" &&
-              typeof r.inboundId === "string" &&
-              typeof r.ackId === "string",
-          )
-        : [],
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Remove the record (best-effort; a missing file is the normal state). */
-export function unlinkLivePlaceholders(): void {
-  const p = livePlaceholdersPath();
-  if (!p) return;
-  try {
-    fs.unlinkSync(p);
-  } catch {
-    /* already gone */
-  }
-}
-
-/**
- * Simulate a process death for tests: drop the in-memory live state
- * WITHOUT rewriting the persisted record — a crash runs no code, so the
- * file must survive exactly as the live process last wrote it.
- */
-export function simulateProcessDeathForTest(): void {
-  pendingInterrupts.clear();
-  interruptingChannels.clear();
-  interruptCancelled.clear();
-  interruptInFlight.clear();
-  interruptEntryInFlight.clear();
-  compactPlaceholders.clear();
-  midTurnQueues.clear();
-  queuedAcks.clear();
-}
-
 // ─── Compaction window (per channel) ─────────────────────────────────────
 // Set when /compact is dispatched for a channel (startCompact), cleared
 // when pi settles the compaction (session_compact / session_compact_failed
@@ -960,7 +490,7 @@ export type OpLabel =
   | "redoing"
   | "handing-off";
 
-interface CompactingEntry {
+export interface CompactingEntry {
   since: number;
   timer: ReturnType<typeof setTimeout>;
   /** Which op owns the window (status display + tick text). */
@@ -974,7 +504,10 @@ interface CompactingEntry {
 export const compactingChannels = new Map<string, CompactingEntry>();
 /** Pending op-shutdown timers by channel (F1). The window is cleared on
  *  /stop, which clears this timer, so the shutdown chain never runs. */
-const opShutdownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+export const opShutdownTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
 
 // ─── Handover compaction state (mechanism A, design v2) ────────────────────
 // F10: set SYNCHRONOUSLY at session_before_compact handler entry, before
@@ -997,7 +530,7 @@ export function setHandoffInFlight(v: boolean): void {
  *  session, /usage turns reset to 0). A restart is a new process, so the arm
  *  is naturally absent in the seeded session; its first settle IS loop-gated
  *  by the fresh window. */
-let handoffRestartArmed = false;
+export let handoffRestartArmed = false;
 export function isHandoffRestartArmed(): boolean {
   return handoffRestartArmed;
 }
@@ -1029,7 +562,7 @@ export function opWindowLabel(channelId: string): OpLabel | null {
  *  a compaction window says "already compacting", a restart-class op
  *  window says "already restarting". One-line op status = prose, ships
  *  unfenced (STYLE.md v4 §2.3). */
-function opBusyRefusal(channelId: string): string {
+export function opBusyRefusal(channelId: string): string {
   // Bare chat one-liner - plain words, no tag (machine output only, Andryo
   // 2026-10-20).
   return opWindowLabel(channelId) === "compacting"
@@ -1069,7 +602,7 @@ export function clearAllCompacting(): void {
 /** Open the window: set the flag + arm the 10-min fallback. The fallback
  *  clears with a console.warn and drains whatever was queued behind the
  *  op, in case the completion event never arrives. */
-function beginCompacting(
+export function beginCompacting(
   pi: ExtensionAPI,
   ch: ChannelConfig,
   ctx: ExtensionContext,
@@ -1095,138 +628,6 @@ function beginCompacting(
     rewindTo,
   });
   console.log(`[op:${label}] window open for ${ch.id}`);
-}
-
-// ─── Shared long-op live tick (issue #22, generalized 2026-09-11) ────
-// One 5s edit-in-place ticker for EVERY long-op placeholder: compaction,
-// restart-class ops (/reset /restart /undo /redo), the working block
-// (statusTick), and mid-run interrupts. `render` returns the next line
-// or null to pause (window closed — the entry is KEPT so a settle can
-// still replace the message in place). Same ASCII style as before:
-// `[..] compacting… 5s` / the live working frame (each tick re-renders
-// the full frame, header `┌ working · N calls · 10s`).
-interface OpTickEntry {
-  ch: ChannelConfig;
-  msgId: string;
-  since: number;
-  timer: ReturnType<typeof setInterval>;
-  render: (secs: number) => string | null;
-  fenced: boolean;
-}
-const opTicks = new Map<string, OpTickEntry>();
-
-/** `[..] <label>… <inc>s` — 5s-increment elapsed, shared tick style. */
-export function opTickLine(label: string, secs: number): string {
-  const inc = Math.floor(secs / 5) * 5;
-  return `[..] ${label}… ${inc}s`;
-}
-
-/** Fenced block (STYLE.md v4): fences are for /command replies (§2.4),
- * in-turn working frames (§2.1), and machine output (§4.4). One-line
- * op status ([..]) is PROSE and ships unfenced (§2.3); [ok]/[!] tags are
- * machine output ONLY (Andryo 2026-10-20). The v3 box-drawing alignment
- * rationale applies only to multi-line frames, not single status lines. */
-export const fence = (s: string): string => `\`\`\`
-${s}
-\`\`\``;
-
-/** Arm (or re-arm, same key) a live tick on a placeholder message.
- *  `fenced` (default false): multi-line working frames post inside a
- *  code fence (§2.1); one-line op status ticks post bare (§2.3). */
-export function armOpTick(
-  key: string,
-  ch: ChannelConfig,
-  msgId: string,
-  render: (secs: number) => string | null,
-  fenced = false,
-): void {
-  const prev = opTicks.get(key);
-  if (prev) clearInterval(prev.timer);
-  const since = Date.now();
-  const timer = setInterval(() => {
-    const entry = opTicks.get(key);
-    if (!entry) return;
-    const text = entry.render(Math.floor((Date.now() - since) / 1000));
-    if (text === null) {
-      clearInterval(entry.timer); // paused; entry kept for the settle
-      return;
-    }
-    editDiscordMessage(
-      entry.ch,
-      entry.msgId,
-      entry.fenced ? fence(text) : text,
-    ).catch(() => {});
-  }, 5000);
-  (timer as any).unref?.();
-  opTicks.set(key, { ch, msgId, since, timer, render, fenced });
-}
-
-/** Replace the ticking placeholder in place with the final line. Returns
- *  false when no tick was armed (native slash path / settle raced the
- *  post) — the caller then falls back to a fresh post. `fenced` matches
- *  the tick that armed (default false: one-line op status is prose, §2.3
- *  — the same settle must produce the SAME bare form as the fresh-post
- *  fallback). */
-export function settleOpTick(
-  key: string,
-  text: string,
-  fenced = false,
-): boolean {
-  const entry = opTicks.get(key);
-  if (!entry) return false;
-  clearInterval(entry.timer);
-  opTicks.delete(key);
-  editDiscordMessage(entry.ch, entry.msgId, fenced ? fence(text) : text).catch(
-    () => {},
-  );
-  return true;
-}
-
-/** Stop + drop the tick without a final replace (session_shutdown). */
-export function stopOpTick(key: string): void {
-  const entry = opTicks.get(key);
-  if (!entry) return;
-  clearInterval(entry.timer);
-  opTicks.delete(key);
-}
-
-/** Stop every tick whose key has the prefix (e.g. "working:"). */
-export function stopOpTickPrefix(prefix: string): void {
-  for (const key of [...opTicks.keys()])
-    if (key.startsWith(prefix)) stopOpTick(key);
-}
-
-export function stopAllOpTicks(): void {
-  for (const key of [...opTicks.keys()]) stopOpTick(key);
-}
-
-// ─── Compact placeholder (built on the shared op-tick) ──────────────
-// One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
-export const COMPACT_PLACEHOLDER = "[..] compacting...";
-
-export function armCompactTick(ch: ChannelConfig, msgId: string): void {
-  armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>
-    isCompacting(ch.id) ? opTickLine("compacting", secs) : null,
-  );
-  compactPlaceholders.set(ch.id, msgId); // #84: crash settle for this line
-  persistLivePlaceholders();
-}
-
-export function settleCompactTick(channelId: string, text: string): boolean {
-  const ok = settleOpTick(`compact:${channelId}`, text);
-  compactPlaceholders.delete(channelId); // #84: settled = no longer live
-  persistLivePlaceholders();
-  return ok;
-}
-
-export function stopCompactTick(channelId: string): void {
-  stopOpTick(`compact:${channelId}`);
-  compactPlaceholders.delete(channelId);
-  persistLivePlaceholders();
-}
-
-export function stopAllCompactTicks(): void {
-  stopOpTickPrefix("compact:");
 }
 
 /** Deliver ONE queued inbound that was waiting out a compaction (same
@@ -1448,90 +849,6 @@ export async function runMidRunInterrupt(
     stopOpTick(`interrupt:${channelId}`);
   }
 }
-// ─── Queue control: edit + delete of queued inbounds ─────────────────────
-// The re-wake queue keeps the FULL ChannelMessage per entry, so the
-// Discord MESSAGE_UPDATE / MESSAGE_DELETE gateway events (routed per
-// channel in discord.ts) can target an entry by message id. Owner-only,
-// same isOwner rule as the channel commands.
-
-/** Re-render a queued entry after its Discord message was edited.
- *  Updates the stored ChannelMessage (the re-wake path re-processes it
- *  through the full inbound pipeline) and the pre-rendered interrupt text
- *  (the plain-path ctx pipeline: channel-ctx + replied-message +
- *  suffix-stripped body). FIFO position is kept. Returns false when
- *  the message is not queued or the editor is not the owner. */
-export async function updateQueuedInbound(
-  ctx: ExtensionContext,
-  channelId: string,
-  messageId: string,
-  content: string,
-  attachments: AttachmentRef[],
-  authorId: string | undefined,
-): Promise<boolean> {
-  const q = midTurnQueues.get(channelId);
-  const entry = q?.find((e) => e.msg.messageId === messageId);
-  if (!entry) return false;
-  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
-  if (hasOwnerConfigured(ch) && !isOwnerUser(ch, authorId)) return false;
-  entry.msg.body = content;
-  entry.msg.attachments = attachments;
-  // #186 (F2): rewrite the FILE copy too — the file is the survival
-  // path; a restart before delivery must drain the edited
-  // body/attachments, not the pre-edit msg.
-  rewakeUpdatePendingMsg(runtimeStateDir, channelId, messageId, entry.msg);
-
-  // Plain-path re-render (same pipeline as handleInbound's no-attachment
-  // branch). Entries queued WITH attachments keep their stored file-folder
-  // text stale for the interrupt path; the re-wake path (the common one)
-  // re-downloads and re-renders them fully from entry.msg.
-  const { prompt: body, forceBtw } = extractBtwSuffix(content.trim());
-  const channelCtx = buildChannelContext(ch, entry.msg, { btw: forceBtw });
-  const repliedBlock = buildRepliedMessageBlock(entry.msg.repliedMessage);
-  const ctxBlock = [channelCtx, repliedBlock].filter(Boolean).join("\n\n");
-  entry.text = `${ctxBlock}\n\n${body || "(empty)"}`;
-  entry.title = channelTitle(ch, entry.msg);
-  entry.display = body || "(empty)";
-  console.log(
-    `[channel] queued inbound ${messageId} re-rendered from message edit`,
-  );
-  return true;
-}
-
-/** Drop a queued entry after its Discord message was deleted. Removes the
- *  entry, disarms its interrupt timer, deletes the "[queued] N in line"
- *  ack, and renumbers the remaining line. Owner-only. */
-export async function deleteQueuedInbound(
-  ctx: ExtensionContext,
-  channelId: string,
-  messageId: string,
-): Promise<void> {
-  const ch = getChannel(loadChannelConfig(ctx.cwd), channelId);
-  const q = midTurnQueues.get(channelId);
-  const idx = q ? q.findIndex((e) => e.msg.messageId === messageId) : -1;
-  const ack = queuedAcks.get(messageId);
-  if (idx === -1 && !ack) return; // never queued, no ack: not ours
-  if (hasOwnerConfigured(ch)) {
-    const fromId = idx !== -1 && q ? q[idx].msg.fromId : ack?.fromId;
-    if (!isOwnerUser(ch, fromId)) return; // owner only
-  }
-  if (idx !== -1 && q) {
-    q.splice(idx, 1);
-    if (q.length === 0) midTurnQueues.delete(channelId);
-    disarmInterrupt(channelId, messageId);
-    // #180: the operator deleted the message — the survived copy must
-    // not resurrect it on the next restart.
-    rewakeRemovePending(runtimeStateDir, channelId, messageId);
-    console.log(
-      `[channel] queued inbound ${messageId} dropped (message deleted)`,
-    );
-  }
-  if (ack) {
-    queuedAcks.delete(messageId);
-    if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
-  }
-  renumberQueuedAcks(channelId);
-}
-
 // Last inbound Discord message id per channel — the 👀 ack target. The
 // message_end early-send path unreacts it (A1: step-finals carry no
 // replyTo, so the agent_end unreact branch never sees them).
@@ -1542,7 +859,10 @@ const lastInboundIds = new Map<string, string>();
 const runInboundIds = new Map<string, string[]>();
 // Set when /stop or a mid-run interrupt aborts a run, so agent_end does not
 // post the abort's errorMessage as if it were a model/API failure (A2).
-let userStoppedRun = false;
+export let userStoppedRun = false;
+export function setUserStoppedRun(v: boolean): void {
+  userStoppedRun = v;
+}
 
 // ─── Repetition guard ────────────────────────────────────────────────────
 // 3 consecutive byte-identical finals (after trim) in one channel = a
@@ -1979,36 +1299,6 @@ export function chunkText(text: string, max: number): string[] {
   return out;
 }
 
-/** Strip leaked Qwen thinking tags (
- /
-) from assistant text. */
-function cleanThinking(text: string): string {
-  const O = "<think>";
-  const C = "</think>";
-  const strip = (t: string) =>
-    t
-      .split(O)
-      .join("")
-      .split(C)
-      .join("")
-      .replace(/\n{3,}/g, "\n\n");
-  const firstO = text.indexOf(O);
-  if (firstO >= 0) {
-    const lastC = text.lastIndexOf(C);
-    if (lastC > firstO) {
-      const before = strip(text.slice(0, firstO)).trim();
-      const after = strip(text.slice(lastC + C.length)).trim();
-      const both = [before, after].filter(Boolean).join("\n\n");
-      if (both) return both;
-    }
-    const before = strip(text.slice(0, firstO)).trim();
-    if (before) return before;
-    const after = strip(text.slice(firstO + O.length)).trim();
-    if (after) return after;
-  }
-  return strip(text).trim();
-}
-
 /**
  * Parse `<reply-to:MSGID>` tags from assistant text. The tag lets the LLM
  * thread its reply to a specific person's message in a multi-person burst.
@@ -2088,239 +1378,6 @@ export function collectFinals(
   }
   return finals;
 }
-
-/**
- * Command matcher: every command requires a leading '/'. Exception:
- * bare "stop" (exact match, no args) is also a command — the no-slash
- * form absorbs nothing, so "stop that" is chat, not /stop.
- * Exported for tests.
- */
-export function matchCommand(
-  body: string,
-): { name: string; arg?: string } | null {
-  const m = body.match(
-    /^(?:\/(stop|help|btw|status|usage|context|reset|restart|undo|redo|sleep|verbose|hold|compact|handover|model|jobs|todos|tasks|diff|new-worktree|merge-worktree)(?:\s+([\s\S]+))?|stop)$/i,
-  );
-  if (!m) return null;
-  return { name: m[1] ?? "stop", arg: m[2] };
-}
-
-/**
- * Owner check. `ownerUserIds` (list) is preferred; the legacy single
- * `ownerUserId` still works, so existing configs are unaffected. A channel
- * with no owner configured admits nobody.
- *
- * 2026-09-23: an unset owner used to be invisible — owner-only commands
- * silently fell through to the agent as plain text ("why isn't /status
- * working" was the agent answering the command as a prompt). Refusals are
- * now explicit for both transports; see the `ownerOnly` note in
- * runChannelCommand. Exported for tests.
- */
-export function isOwnerUser(
-  ch: { ownerUserId?: string; ownerUserIds?: string[] } | undefined | null,
-  userId: string | undefined,
-): boolean {
-  if (!ch || !userId) return false;
-  if (ch.ownerUserIds?.includes(userId)) return true;
-  return !!ch.ownerUserId && ch.ownerUserId === userId;
-}
-
-/** Does this channel have any owner configured at all? */
-export function hasOwnerConfigured(
-  ch: { ownerUserId?: string; ownerUserIds?: string[] } | undefined | null,
-): boolean {
-  return !!(ch?.ownerUserId || ch?.ownerUserIds?.length);
-}
-
-// ─── /jobs: recent pi-bg run history ────────────────────────────────────
-// History-only since the drain (#279): the dispatch lane is retired, the
-// in-flight ps view and the kill/tail wrappers died with the removed
-// completion side. Assembly lives in ./jobs (scanJobHistory / formatJobsView).
-
-/** ! shell passthrough: run bash -c in the working directory, 60s cap.
- *  Keeps the first 20k chars of combined stdout+stderr. Exported for tests. */
-export function runShellPassthrough(
-  cmd: string,
-  cwd: string,
-): Promise<{ out: string; code: number; timedOut: boolean }> {
-  return new Promise((resolve) => {
-    const p = spawn("bash", ["-c", cmd], { cwd, env: process.env });
-    let out = "";
-    let timedOut = false;
-    const cap = (s: string) => {
-      if (out.length < 20_000) out += s.slice(0, 20_000 - out.length);
-    };
-    const t = setTimeout(() => {
-      timedOut = true;
-      try {
-        p.kill("SIGKILL");
-      } catch {}
-    }, 60_000);
-    p.stdout?.on("data", (d) => cap(String(d)));
-    p.stderr?.on("data", (d) => cap(String(d)));
-    p.on("error", (e) => {
-      clearTimeout(t);
-      resolve({ out: `spawn failed: ${e.message}`, code: 1, timedOut: false });
-    });
-    p.on("close", (code) => {
-      clearTimeout(t);
-      resolve({ out, code: code ?? 1, timedOut });
-    });
-  });
-}
-
-/** Fenced code block sized to the content's backtick runs. */
-function wrapFence(t: string): string {
-  const n = (t.match(/`+/g) || ["`"]).reduce(
-    (m, r) => Math.max(m, r.length),
-    0,
-  );
-  const f = "`".repeat(Math.max(3, n + 1));
-  return `${f}\n${t}\n${f}`;
-}
-
-/**
- * Error -> short channel-safe text. The single funnel for error text
- * posted to Discord (run failures, command catches): known error classes
- * map to consistent markers (timeout -> "timed out", rate limit ->
- * "rate limited, retrying", ENOSPC -> "disk full"); aborts return null —
- * suppressed, because an abort is self-evident (the human message landed
- * and the turn continued); everything else is trimmed to its first line,
- * capped at 200 chars, sensitive-text redacted. No raw DOMException/JS
- * message string reaches the send layer. Exported for tests.
- */
-export function channelError(e: unknown): string | null {
-  if (e === null || e === undefined) return null;
-  const obj = (typeof e === "object" ? e : {}) as Record<string, unknown>;
-  const name = typeof obj.name === "string" ? obj.name : "";
-  const code = String(obj.code ?? obj.status ?? obj.statusCode ?? "");
-  const msg =
-    typeof e === "string"
-      ? e
-      : typeof (e as Error).message === "string" && (e as Error).message !== ""
-        ? (e as Error).message
-        : String(e);
-  const hay = `${name}\n${code}\n${msg}`;
-  // Aborted: DOMException "AbortError", the pi stream layer's "This
-  // operation was aborted", the bash tool's "Command aborted".
-  if (name === "AbortError" || /abort/i.test(hay)) return null;
-  if (
-    name === "TimeoutError" ||
-    code === "ETIMEDOUT" ||
-    code === "ESOCKETTIMEDOUT" ||
-    /timed? ?out/i.test(hay)
-  )
-    return "timed out";
-  if (code === "429" || /rate.?limit|too many requests|overloaded/i.test(hay))
-    return "rate limited, retrying";
-  if (code === "ENOSPC" || /no space left on device/i.test(hay))
-    return "disk full";
-  const line = msg.split(/\r?\n/, 1)[0].trim();
-  if (line.length === 0) return "";
-  const capped = line.length > 200 ? `${line.slice(0, 197)}...` : line;
-  return sanitizeSensitiveText(capped, { redactPaths: true });
-}
-
-/**
- * Silent-run-failure check (A2): pi's handleRunFailure emits agent_end
- * with a fresh empty-text failure message that yields no finals and no
- * tool block. If the last message has stopReason "error" — or "aborted"
- * with an errorMessage — return the post text (via channelError); null
- * otherwise. Aborts are suppressed unconditionally: a mid-run interrupt
- * is self-evident, and the user-stopped flag can race a re-wake's
- * turn_start reset (the aborted run's agent_end then runs with the flag
- * already cleared). Exported for tests.
- */
-export function failurePostText(
-  messages: unknown[],
-  userStopped: boolean,
-): string | null {
-  const last = messages.at(-1) as any;
-  if (last?.role !== "assistant") return null;
-  const err = typeof last.errorMessage === "string" ? last.errorMessage : "";
-  // An abort surfaces as stopReason "error" + errorMessage "This operation
-  // was aborted" (pi stream layer), or stopReason "aborted". /stop,
-  // /reset and the mid-run interrupt set the user-stopped flag;
-  // channelError suppresses the abort markers even when the flag raced.
-  const isAbort =
-    last.stopReason === "aborted" ||
-    (last.stopReason === "error" && /abort/i.test(err));
-  if (userStopped && isAbort) return null;
-  if (last.stopReason === "error" || (last.stopReason === "aborted" && err)) {
-    const t = channelError(err);
-    if (t === null) return null;
-    // Bare chat one-liner - plain words, no tag (machine output only,
-    // Andryo 2026-10-20).
-    return `${t || "run failed"}`;
-  }
-  return null;
-}
-
-/**
- * Early-send gate: if `message` is a finalized intermediate assistant
- * message (>=1 text block AND >=1 toolCall block), return its cleaned text;
- * null otherwise. Finals (text only, no toolCall) return null, so the
- * agent_end path can never double-send them. Exported for tests.
- */
-export function earlySendText(message: unknown): string | null {
-  const m = message as any;
-  if (m?.role !== "assistant") return null;
-  const blocks = Array.isArray(m.content) ? m.content : [];
-  const hasText = blocks.some((b: any) => b.type === "text");
-  const hasToolCall = blocks.some((b: any) => b.type === "toolCall");
-  if (!hasText || !hasToolCall) return null;
-  const text = blocks
-    .filter((b: any) => b.type === "text")
-    .map((b: any) => b.text)
-    .join("");
-  return cleanThinking(text.trim()) || null;
-}
-
-/**
- * Final-text gate: an assistant message with >=1 text block and NO toolCall
- * block is a step-final. Forwarded at message_end (not agent_end) so a final
- * from a step interrupted by a steering message is never dropped — agent_end
- * only fires for the LAST step of the run and only carries that step's
- * messages. Exported for tests.
- */
-export function finalText(message: unknown): string | null {
-  const m = message as any;
-  if (m?.role !== "assistant") return null;
-  const blocks = Array.isArray(m.content) ? m.content : [];
-  const hasText = blocks.some((b: any) => b.type === "text");
-  const hasToolCall = blocks.some((b: any) => b.type === "toolCall");
-  if (!hasText || hasToolCall) return null;
-  const text = blocks
-    .filter((b: any) => b.type === "text")
-    .map((b: any) => b.text)
-    .join("");
-  return cleanThinking(text.trim()) || null;
-}
-
-// ─── Live intermediate text (SPEC B) ────────────────────────────────────
-// The operator watches the agent think: intermediate (non-final) text
-// appears as ONE ephemeral message below the tool-call block, edited in
-// place as new segments arrive, deleted when the final is sent or the
-// run ends. Level-independent: live text posts at every verbose level;
-// the level gates tool-call frames only (Andryo 2026-10-19).
-/** Tail budget for the live-text message: keep the last N chars, prepend
- *  an ellipsis when cut (900 + ellipsis stays well under Discord's 2000
- *  char limit after markdown conversion). */
-export const LIVE_TEXT_TAIL = 900;
-/** Minimum gap between live-text edits (Discord edit-rate headroom). */
-export const LIVE_TEXT_THROTTLE_MS = 1500;
-/** Shown once a tool call has fired but no intermediate text yet. */
-export const LIVE_TEXT_PLACEHOLDER = "[..]";
-
-/** Keep the TAIL of the text; prepend an ellipsis when cut.
- *  Exported for tests. */
-export function truncateLiveText(text: string, tail = LIVE_TEXT_TAIL): string {
-  if (text.length <= tail) return text;
-  return `…${text.slice(-tail)}`;
-}
-
-/** Messages already forwarded by the message_end path — agent_end skips them. */
-const earlySent = new WeakSet<object>();
 
 // ─── Inbound message custom type ─────────────────────────────────────────
 // Sent via pi.sendMessage(); the LLM sees the full content (with <channel-ctx>),
@@ -4062,36 +3119,7 @@ const CHANNEL_FORMAT_HINTS: Record<ChannelConfig["type"], string> = {
     "Discord message: markdown supported (bold, bullets, code blocks); keep it compact for chat reading.",
 };
 
-// Fenced at egress (every command reply ships in a code block) - so no
-// markdown markup inside: backticks/asterisks would render literally.
-const HELP_TEXT = [
-  "Commands",
-  "/stop - stop the current run",
-  "plain message during a run - interrupts the step after ~3s, then takes over",
-  "/btw <question> - quick side question, answered briefly",
-  "/status - session stats (owner)",
-  "/usage [all|session|last] - token usage: current session, all, or last run",
-  "/context [N] - what's eating the window: top-N + category totals (est)",
-  "/reset - start a NEW session, clearing context (owner)",
-  "/restart - restart pi, resuming THIS session (owner)",
-  "/undo [N] - revert last N assistant turns (default 1): files + conversation (owner)",
-  "/redo - reapply an /undo (one level deep, owner)",
-  "/verbose [0|1|2|on|off] - tool detail: 0 text, 1 essential, 2 all (owner)",
-  "/hold [on|off] - buffer messages until released (owner)",
-  "/compact [instructions] - compact session context (owner)",
-  "/handover [instructions] - compact via the handover doc (owner; needs handoff.enabled)",
-  "/model [name] - switch or list models (owner)",
-  "/jobs - recent pi-bg run history (json for JSON)",
-  "/new-worktree [ref] - worktree for this session's repo (owner)",
-  "/merge-worktree [squash] - merge worktree back, keep or squash (owner)",
-  "/diff [git-range | file] - publish a diff (default: working tree) to a shareable viewer URL",
-  "/todos - show the channel todo board (arg all for every channel)",
-  "/sleep [list | cancel <id>] - list or cancel pending session wakes (owner)",
-  "/tasks [list | add | reschedule | cancel] - schedule, change or cancel prompt tasks (owner)",
-  "/help - this message",
-].join("\n");
-
-function channelTitle(
+export function channelTitle(
   ch: ChannelConfig | undefined,
   msg: ChannelMessage,
 ): string {
@@ -4139,7 +3167,7 @@ export function isBgInbound(msg: ChannelMessage): boolean {
   return isBgCallbackBody(msg.body.trimStart());
 }
 
-function buildChannelContext(
+export function buildChannelContext(
   ch: ChannelConfig | undefined,
   msg: ChannelMessage,
   opts?: { btw?: boolean },
@@ -4183,100 +3211,6 @@ function buildChannelContext(
   return todoBlock ? `${block}\n\n${todoBlock}` : block;
 }
 
-// ─── Native slash-command handler (INTERACTIONS_CREATE) ───────────────────
-// Defer-first: the type-5 ack lands BEFORE any command work, so a slow
-// handler or a throwing command can never produce "did not respond in
-// time" (Discord's 3s window). Immediate results EDIT the deferred
-// message; /btw leaves the defer alone (answer arrives as a normal
-// channel message). Exported for tests.
-export function buildInteractionHandler(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  botToken: string,
-): (d: any) => Promise<void> {
-  return async (d: any) => {
-    // MESSAGE_COMPONENT (button/select) events: type 3 per the current
-    // Discord spec (it was 4 in the old numbering). The PAT vault
-    // (gutted 2026-10-17) was the only component producer — drop them
-    // before the command path (the
-    // gateway branch calls this handler un-awaited inside a sync-only
-    // try/catch; a reply here would need an ack the tap never gets).
-    if (d?.type === 3) return;
-    // Config fallback covers the pre-resolution window where no gateway
-    // state exists yet (and keeps tests simple).
-    const cid = getDiscordChannelId(ch.id) || ch.channel;
-    if (!cid || String(d.channel_id) !== String(cid)) {
-      // No async work before this ack — a plain type-4 reply is safe.
-      respondToInteraction(botToken, d, `use me in #${ch.name}`).catch(
-        () => {},
-      );
-      return;
-    }
-    await deferInteraction(botToken, d);
-    // Single-string options only: every registered command carries at most
-    // one type-3 option; its name must be in this allowlist or the value
-    // never reaches runChannelCommand. Keep in lockstep with SLASH_COMMANDS
-    // (discord.ts) — the option names in use: question (btw), mode
-    // (verbose/hold/merge-worktree), instructions (compact/handover), name
-    // (model), scope (usage/todos/sleep), count (context/undo), action
-    // (jobs/tasks), ref (new-worktree), source (diff).
-    const opt = Array.isArray(d.data?.options)
-      ? d.data.options.find((o: any) =>
-          [
-            "question",
-            "mode",
-            "instructions",
-            "name",
-            "scope",
-            "count",
-            "action",
-            "ref",
-            "source",
-          ].includes(o?.name),
-        )
-      : undefined;
-    let text: string | undefined;
-    try {
-      const r = await runChannelCommand(
-        pi,
-        ctx,
-        ch,
-        d.data?.name,
-        opt?.value ?? undefined,
-        interactionUserId(d),
-        true,
-      );
-      text = r.btw
-        ? undefined
-        : (r.immediate ?? (r.consumed ? undefined : fence("ok")));
-    } catch (e) {
-      const t = channelError(e);
-      if (t !== null) text = `command failed: ${t}`;
-    }
-    // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
-    // machine-state lines; already-fenced immediates pass through unchanged.
-    if (text !== undefined)
-      await editInteractionMessage(botToken, d, styleGuard(text));
-  };
-}
-
-// ─── /undo + /redo: session + file revert ──────────────────────────────
-// See channel/undo.ts. The conversation revert works like /reset: pi resumes
-// with the LAST line of the session file as leaf, so truncating the file and
-// restarting pi takes the revert into effect.
-
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-function safeSessionFile(ctx: ExtensionContext): string | null {
-  try {
-    return ctx.sessionManager?.getSessionFile?.() ?? null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── Live marker (issue #191 M2: agent liveness) ─────────────────────────
 // Touch /var/tmp/jarate-live/<uid> (0644) once per poll cycle. The marker
 // is the agent-liveness input: the watchdog's fleet liveness sweep (gone
@@ -4318,557 +3252,6 @@ export function touchLiveMarker(dir: string = LIVE_MARKER_DIR): string | null {
   } catch {
     return null;
   }
-}
-
-// ─── Restart-class ops: /reset /restart /undo /redo ────────────────────
-// These restart the pi process (systemd respawns `pi -c`). The channel is
-// blocked across the restart the same way compaction blocks it:
-//   1. op window opens (inbound queued with [queued] ack, no interrupts)
-//   2. placeholder posted + live-ticked (shared op-tick helper)
-//   3. op marker written to .tmp/op-marker.json — the RESPAWNED process
-//      settles the placeholder with finalText at its session_start
-//   4. Discord cursor rewound to the pre-op value before shutdown —
-//      inbounds delivered during the op replay after the restart
-//      (persisted cursor + immediate first poll; nothing is lost)
-//   5. bounded shutdown: wait for the aborted run to settle (2s cap), let
-//      the placeholder land (1.5s cap), rewind, op-specific file work,
-//      ask systemd to restart the unit early (skips the 5s RestartSec),
-//      then ctx.shutdown()
-const OP_SHUTDOWN_DELAY_MS = 300;
-const OP_MARKER_TTL_MS = 10 * 60 * 1000;
-interface OpMarker {
-  op: string;
-  channelId: string;
-  at: number;
-  /** Placeholder message id (null = post failed; respawn posts fresh). */
-  msgId: string | null;
-  /** Final line the respawn posts into the channel. */
-  finalText: string;
-  /** Handoff op only (mechanism B, F4): false until the respawn seeds
-   *  the fresh session from the doc. The op marker is the ONLY seed
-   *  gate — reset/restart/undo/redo markers never carry seeded:false,
-   *  so ordinary boots (incl. OOM respawns without a handoff) never
-   *  seed. */
-  seeded?: boolean;
-}
-const opMarkerPath = (cwd: string) => path.join(cwd, ".tmp", "op-marker.json");
-
-function writeOpMarker(
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  op: string,
-  finalText: string,
-  marker?: { seeded?: boolean },
-): void {
-  try {
-    const p = opMarkerPath(ctx.cwd);
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    const m: OpMarker = {
-      op,
-      channelId: ch.id,
-      at: Date.now(),
-      msgId: null,
-      finalText,
-    };
-    if (marker?.seeded !== undefined) m.seeded = marker.seeded;
-    const tmp = `${p}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(m));
-    fs.renameSync(tmp, p);
-  } catch (e) {
-    console.error("[op] marker write failed:", sanitizeUnknownValue(e));
-  }
-}
-
-function updateOpMarkerMsgId(
-  ctx: ExtensionContext,
-  channelId: string,
-  msgId: string,
-): void {
-  try {
-    const p = opMarkerPath(ctx.cwd);
-    const m = JSON.parse(fs.readFileSync(p, "utf-8")) as OpMarker;
-    if (!m || m.channelId !== channelId) return;
-    m.msgId = msgId;
-    const tmp = `${p}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(m));
-    fs.renameSync(tmp, p);
-  } catch {
-    /* placeholder post failed or marker gone — fresh-post fallback */
-  }
-}
-
-/** Respawn-side settle: replace the dead process's op placeholder with
- *  the final line. Called from session_start. Stale markers (>10m —
- *  e.g. pi crashed and the channel sat dark) are dropped, not shown.
- *
- *  Mechanism B seed (F4): ONLY a handoff marker with seeded!=true seeds
- *  the fresh session (sendUserMessage with the doc digest + forced
- *  read of latest.md), then the marker is flipped seeded=true and
- *  unlinked. The flip happens AFTER the send: a crash between them
- *  re-seeds the next boot (harmless duplicate), while a flip-before-
- *  send crash would lose the seed entirely. */
-export function consumeOpMarker(pi: ExtensionAPI, ctx: ExtensionContext): void {
-  const p = opMarkerPath(ctx.cwd);
-  let m: OpMarker | null = null;
-  try {
-    m = JSON.parse(fs.readFileSync(p, "utf-8")) as OpMarker;
-  } catch {
-    return; // no marker — normal boot
-  }
-  const valid =
-    typeof m?.channelId === "string" &&
-    typeof m?.finalText === "string" &&
-    m.finalText.length > 0;
-  if (valid && m.op === "handoff" && m.seeded !== true) {
-    try {
-      seedFromHandoffDoc(pi, ctx);
-      markHandoffSeeded(ctx);
-    } catch (e) {
-      console.error("[handoff] boot seed failed:", sanitizeUnknownValue(e));
-    }
-  }
-  try {
-    fs.unlinkSync(p);
-  } catch {}
-  if (!valid) return;
-  if (typeof m.at !== "number" || Date.now() - m.at > OP_MARKER_TTL_MS) {
-    console.log(`[op] ${m.op ?? "?"} marker stale (>10m) — dropped`);
-    return;
-  }
-  const ch = getChannel(loadChannelConfig(ctx.cwd), m.channelId);
-  if (ch?.type !== "discord") return;
-  console.log(
-    `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
-  );
-  if (m.msgId)
-    editDiscordMessage(ch, m.msgId, m.finalText).catch(() =>
-      sendDiscordMessage(ch, m.finalText).catch(() => {}),
-    );
-  else sendDiscordMessage(ch, m.finalText).catch(() => {});
-}
-
-/** Flip seeded=true on the handoff op marker (F4 crash-safety flip). */
-function markHandoffSeeded(ctx: ExtensionContext): void {
-  try {
-    const p = opMarkerPath(ctx.cwd);
-    const m = JSON.parse(fs.readFileSync(p, "utf8")) as OpMarker;
-    if (m?.op !== "handoff") return;
-    m.seeded = true;
-    const tmp = `${p}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(m));
-    fs.renameSync(tmp, p);
-  } catch (e) {
-    console.error("[handoff] seeded flip failed:", sanitizeUnknownValue(e));
-  }
-}
-
-/** Mechanism B: seed the fresh session from the handover doc (F4/F8).
- *  A plain user message (pi.sendUserMessage — always triggers a turn),
- *  NOT a channel-inbound entry: it must not echo to Discord, and the
- *  next handover's "last 3 user asks" keys on channel-inbound entries.
- *  The seed itself cannot re-trigger a handoff: the fresh session is far
- *  under the threshold, and the fresh-window guard (latest.md < 5m)
- *  blocks handoffs for this session either way. */
-function seedFromHandoffDoc(pi: ExtensionAPI, ctx: ExtensionContext): void {
-  const settings = resolveHandoffSettings(ctx.cwd);
-  const doc = loadPreviousHandover({ storeDir: settings.storeDir });
-  if (!doc) {
-    console.log("[handoff] no handover doc at boot - seed skipped");
-    return;
-  }
-  // Live dispatch + board state (issue #134): the deterministic doc has no
-  // Mission/In-flight sections, so the seed reads the SAME sources the doc's
-  // State box renders - fresh at restart, not scraped from the doc.
-  const live = liveKickoffStateHook
-    ? liveKickoffStateHook(ctx.cwd)
-    : liveKickoffState(ctx.cwd);
-  pi.sendUserMessage(
-    buildSeedKickoff(doc, settings.storeDir, defaultHome(), live),
-  );
-  console.log("[handoff] seeded fresh session from the handover doc");
-}
-
-/** Drop the op marker (F1: /stop cancels the op — no respawn comes from
- *  this process, so a stale marker must not settle the old placeholder
- *  on the next unrelated boot). */
-function clearOpMarker(ctx: ExtensionContext): void {
-  try {
-    fs.unlinkSync(opMarkerPath(ctx.cwd));
-  } catch {}
-}
-
-let systemdRestartHook: ((unit: string) => void) | null = null;
-/** Override the early-restart trigger (tests: no real systemctl around). */
-export function setSystemdRestartHookForTest(
-  fn: ((unit: string) => void) | null,
-): void {
-  systemdRestartHook = fn;
-}
-
-let liveKickoffStateHook: ((cwd: string) => KickoffLiveState) | null = null;
-/** Override the live seed-state source (tests: no real ps / board around).
- *  The boot-seed wiring calls liveKickoffState (ps + todo board), which is
- *  environment-dependent — tests pin it with this hook. */
-export function setLiveKickoffStateHookForTest(
-  fn: ((cwd: string) => KickoffLiveState) | null,
-): void {
-  liveKickoffStateHook = fn;
-}
-
-let processExitHook: ((code: number) => void) | null = null;
-/** Override process.exit (tests: the watchdog F7 death must not kill the
- *  runner). */
-export function setProcessExitHookForTest(
-  fn: ((code: number) => void) | null,
-): void {
-  processExitHook = fn;
-}
-
-/** The restart command for a resolved unit name (issue #28: the unit is
- *  NOT hardcoded — see resolveSystemdUnit). */
-export function buildRestartCommand(unit: string): string {
-  return `sleep 3; systemctl --user restart ${unit}`;
-}
-
-/** Shortcut the 5s systemd RestartSec wait: ask systemd to restart the
- *  unit ~3s from now — by then our own shutdown has run, so the stop is
- *  a no-op and the start is immediate. If this never lands (systemd not
- *  there, hook eaten) the unit's Restart=always still covers us. */
-function requestSystemdRestart(unit: string): void {
-  if (systemdRestartHook) {
-    systemdRestartHook(unit);
-    return;
-  }
-  if (!process.env.XDG_RUNTIME_DIR) {
-    // #28: this early return used to be silent — an operator reading the
-    // channel would never know the restart shortcut was skipped.
-    console.error(
-      `[op] no XDG_RUNTIME_DIR - not under a systemd user unit; cannot ask systemd to restart ${unit} (relying on unit auto-restart)`,
-    );
-    return;
-  }
-  try {
-    const p = spawn("sh", ["-c", buildRestartCommand(unit)], {
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
-    });
-    p.on("error", () => {});
-    p.unref();
-  } catch {
-    /* auto-restart covers it */
-  }
-}
-
-/** Open the op window + post/ARM the ticking placeholder + write the op
- *  marker the respawn settles. Returns the placeholder post promise
- *  (scheduleOpShutdown awaits it, bounded). */
-function beginRestartOp(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  op: string,
-  label: OpLabel,
-  finalText: string,
-  marker?: { seeded?: boolean },
-): Promise<string | null> {
-  beginCompacting(pi, ch, ctx, {
-    label,
-    rewindTo: getChannelCursor(ch.id),
-  });
-  writeOpMarker(ctx, ch, op, finalText, marker);
-  if (ch.type !== "discord") return Promise.resolve(null);
-  // One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
-  return sendDiscordMessage(ch, `[..] ${label}...`)
-    .then((r) => {
-      if (r.success && r.messageId) {
-        updateOpMarkerMsgId(ctx, ch.id, r.messageId);
-        armOpTick(`op:${ch.id}`, ch, r.messageId, (secs) => {
-          const entry = compactingChannels.get(ch.id);
-          return entry ? opTickLine(entry.label, secs) : null;
-        });
-      }
-      return r.success ? (r.messageId ?? null) : null;
-    })
-    .catch(() => null);
-}
-
-/** Rewind the Discord cursor to the pre-op value (persisted) so the
- *  respawn's immediate first poll replays op-window inbounds. */
-function rewindOpCursor(ch: ChannelConfig): void {
-  const entry = compactingChannels.get(ch.id);
-  if (entry?.rewindTo) setChannelCursor(ch.id, entry.rewindTo);
-}
-
-/** #28 (partial): a restart that never lands (no systemd, unit dead,
- *  hook eaten) leaves the op window open forever. Arm a ~15s watchdog
- *  after the restart request: a successful respawn kills this process
- *  (ctx.shutdown below), so if the timer still fires with the SAME
- *  window entry open, the restart failed. Close the window, drain the
- *  queue, and tell the owner which unit to check. */
-const RESTART_WATCHDOG_MS = 15_000;
-function armRestartWatchdog(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  unit: string,
-  entry: CompactingEntry,
-): void {
-  const t = setTimeout(() => {
-    // Entry mismatch = window already closed (settle, /stop cancel) or
-    // replaced by a newer op — not a failure. Unref'd: a healthy process
-    // exit removes the timer with it.
-    if (compactingChannels.get(ch.id) !== entry) return;
-    console.error(
-      `[op] ${ch.id} restart failed - process still alive ${RESTART_WATCHDOG_MS / 1000}s after the request (unit: ${unit})`,
-    );
-    clearOpMarker(ctx); // the respawn that would settle it never came
-    clearCompacting(ch.id); // also drops the pending op-shutdown timer
-    drainQueuedAfterCompact(pi, ctx);
-    const line = `restart failed - check unit ${unit}`;
-    if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
-    // F7 (design v2, PR2): a swallowed restart leaves THIS process alive
-    // and the unit "active" — systemd will never auto-respawn it. Die on
-    // purpose (after the post lands): Restart=always respawns 'pi -c',
-    // which loads the small session file and settles the op marker.
-    const exitTimer = setTimeout(
-      () => (processExitHook ?? process.exit.bind(process))(1),
-      500,
-    );
-    exitTimer.unref?.();
-  }, RESTART_WATCHDOG_MS);
-  t.unref?.();
-}
-
-function scheduleOpShutdown(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  placeholderP: Promise<string | null>,
-  preShutdown?: () => void,
-): void {
-  const entry = compactingChannels.get(ch.id);
-  const timer = setTimeout(() => {
-    opShutdownTimers.delete(ch.id);
-    void (async () => {
-      // F1 (owner: cancel): the window was cleared before this fired
-      // (/stop) — the op is off. Skip the whole chain: no preShutdown
-      // (session-file move), no systemd restart request, no ctx.shutdown.
-      // clearCompacting drops the timer; this check covers a stop that
-      // landed after the callback was already queued.
-      if (!entry || compactingChannels.get(ch.id) !== entry) {
-        console.log(
-          `[op] ${ch.id} window closed before shutdown — op cancelled`,
-        );
-        return;
-      }
-      // Bounded settle: the aborted run is usually done in ms; a stuck
-      // session must not hold the respawn hostage (2s cap, then go).
-      const t0 = Date.now();
-      while (!ctx.isIdle() && Date.now() - t0 < 2000) await sleep(50);
-      // Let the placeholder post land (bounded) so the respawn can edit
-      // it in place; a failed post gets the fresh-line fallback there.
-      try {
-        await Promise.race([placeholderP, sleep(1500)]);
-      } catch {}
-      rewindOpCursor(ch);
-      try {
-        preShutdown?.();
-      } catch (e) {
-        console.error(`[op] ${ch.id} pre-shutdown failed, forcing respawn:`, e);
-        process.exit(1); // F3 parity: never leave a zombie half-state
-      }
-      const unit = resolveSystemdUnit(ctx.cwd);
-      requestSystemdRestart(unit);
-      armRestartWatchdog(pi, ctx, ch, unit, entry);
-      try {
-        ctx.shutdown();
-      } catch {
-        process.exit(1);
-      }
-    })();
-  }, OP_SHUTDOWN_DELAY_MS);
-  opShutdownTimers.set(ch.id, timer);
-}
-
-/** /reset = NEW session: move the current session file aside so the
- *  systemd respawn's 'pi -c' starts fresh. (ctx.newSession does NOT exist
- *  on event ctx — only on registerCommand ctx — reviewer F1, 2026-09-10.)
- *  F5 (2026-09-23 handoff review): move the EXPLICIT live file
- *  (ctx.sessionManager.getSessionFile(), passed by the caller); the
- *  newest-by-mtime scan is a fallback ONLY when that file is gone. The
- *  old mtime-only path picked the wrong file whenever two session files
- *  were live at once (encDir string mismatch + multi-channel ops). */
-export function moveSessionFileAside(
-  ctx: ExtensionContext,
-  targetFile?: string | null,
-): void {
-  let explicit: string | null = null;
-  try {
-    explicit = targetFile ?? ctx.sessionManager?.getSessionFile?.() ?? null;
-  } catch {
-    explicit = targetFile ?? null;
-  }
-  if (explicit) {
-    try {
-      if (fs.existsSync(explicit)) {
-        fs.renameSync(explicit, `${explicit}.reset-${Date.now()}`);
-        return;
-      }
-      console.warn(
-        `[reset] explicit session file missing, falling back to mtime scan: ${explicit}`,
-      );
-    } catch (e) {
-      console.warn(
-        `[reset] explicit move failed, falling back to mtime scan: ${sanitizeUnknownValue(e)}`,
-      );
-    }
-  }
-  const home = process.env.HOME || "/root";
-  const sessionsBase = path.join(home, ".pi", "agent", "sessions");
-  const encDir = path.join(
-    sessionsBase,
-    `-${String(ctx.cwd).replace(/\//g, "-")}-`,
-  );
-  let target: string | null = null;
-  const candidates: Array<[string, number]> = [];
-  const scan = (dir: string) => {
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-*
-      const p = path.join(dir, f);
-      try {
-        candidates.push([p, fs.statSync(p).mtimeMs]);
-      } catch {}
-    }
-  };
-  if (fs.existsSync(encDir)) scan(encDir);
-  else if (fs.existsSync(sessionsBase)) {
-    for (const d of fs.readdirSync(sessionsBase)) {
-      const sub = path.join(sessionsBase, d);
-      try {
-        if (fs.statSync(sub).isDirectory()) scan(sub);
-      } catch {}
-    }
-  }
-  candidates.sort((a, b) => b[1] - a[1]);
-  target = candidates[0]?.[0] ?? null;
-  if (target) fs.renameSync(target, `${target}.reset-${Date.now()}`);
-}
-
-/** F2 (mechanism B, PR2): after the live session file is moved aside by
- *  preShutdown, archive EVERY OTHER .jsonl in the same session dir to
- *  .jsonl.stale-<ts>. The respawn runs 'pi -c' (continueRecent = newest
- *  .jsonl by mtime) — the 2nd-newest is exactly what it would pick, so
- *  without this the "fresh" boot can resume a huge superseded session.
- *  Superseded files stay on disk for PR3's GC sweep. Best-effort: an
- *  archive failure must not abort the restart. */
-export function archiveStaleSessions(liveFile: string): void {
-  const dir = path.dirname(liveFile);
-  const ts = Date.now();
-  let n = 0;
-  try {
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.stale-*
-      const p = path.join(dir, f);
-      if (p === liveFile) continue; // preShutdown step 1 already moved it
-      fs.renameSync(p, `${p}.stale-${ts}`);
-      n++;
-    }
-  } catch (e) {
-    console.warn(
-      `[handoff] stale session archive failed: ${sanitizeUnknownValue(e)}`,
-    );
-  }
-  if (n > 0)
-    console.log(`[handoff] archived ${n} stale session file(s) in ${dir}`);
-}
-
-// ─── Handoff mechanism B: restart-into-fresh-session (design v2) ────────
-// Registered on session_compact AFTER the settle ran (F1: the
-// compaction window is already closed when the gate decides, so the
-// restart op it opens cannot be swept by the settle it reacts to).
-// Issue #85 follow-up: EVERY handoff-qualifying compact restarts into a
-// fresh seeded session (the file-size cap is gone). The fresh-window
-// guard (isHandoffFreshWindow, 5 min) keeps the seeded session from
-// immediately re-handoffing and restarting again. Reuses the SAME
-// /reset restart chain (op window + marker + cursor rewind + bounded
-// shutdown + systemd restart + watchdog). Deferred one macrotask:
-// on the MANUAL compact path pi's ctx.compact wrapper calls its
-// onComplete belt (clearCompacting) AFTER the session_compact emit —
-// a synchronous window open would be wiped by that belt. A 0ms timer
-// runs after all pending microtasks (emit + compaction_end + belt).
-export function handoffRestartForSize(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-): void {
-  setTimeout(() => {
-    try {
-      void maybeHandoffRestart(pi, ctx);
-    } catch (e) {
-      console.error("[handoff] restart gate failed:", sanitizeUnknownValue(e));
-    }
-  }, 0);
-}
-
-/** The restart chain (exported for direct tests). Issue #85 follow-up:
- *  every handoff-qualifying compact (manual /compact, threshold ≥80% auto)
- *  restarts into a fresh seeded session — the file-size cap is gone.
- *  The fresh-window guard (isHandoffFreshWindow) keeps the just-seeded
- *  session from immediately re-handoffing and restarting again. */
-export async function maybeHandoffRestart(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-): Promise<void> {
-  const settings = resolveHandoffSettings(ctx.cwd);
-  if (!settings.enabled) return;
-  const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
-  if (ch?.type !== "discord") return;
-  // A settle-flushed /compact re-opened the window (label "compacting"):
-  // let it finish — its own settle re-runs this gate. Opening the op here
-  // would orphan the in-flight compaction's window + belt.
-  if (compactingChannels.get(ch.id)?.label === "compacting") return;
-  // Fresh window: a handover doc was written <5 min ago (possibly with a
-  // restart + seed still pending). Don't re-restart on the seeded
-  // session's first settle — it would loop. The compact that just WROTE the
-  // doc is exempt: its own write set the window, and THAT compact is the
-  // restart the doc triggers (issue #85: compact -> NEW session, /usage
-  // turns -> 0). Consume the arm at this decision either way.
-  const armed = handoffRestartArmed;
-  handoffRestartArmed = false;
-  if (!armed && isHandoffFreshWindow(settings.storeDir)) return;
-  let live: string | null = null;
-  try {
-    live = ctx.sessionManager?.getSessionFile?.() ?? null;
-  } catch {
-    live = null;
-  }
-  if (!live) return;
-  let size: number;
-  try {
-    size = fs.statSync(live).size;
-  } catch {
-    return; // file gone — nothing to gate on
-  }
-  const mb = (size / (1024 * 1024)).toFixed(1);
-  console.log(`[handoff] compact settled - restart op (session file ${mb}MB)`);
-  // F4: the op marker carries seeded:false — the respawn's session_start
-  // seeds the fresh session from the doc (the ONLY seed gate). F5: move
-  // the EXPLICIT live file at shutdown; F2: archive the other stale
-  // .jsonl so the respawn's 'pi -c' resume target is provably small.
-  const finalText = `context handoff -> new session (file was ${mb} MB)`;
-  const placeholderP = beginRestartOp(
-    pi,
-    ctx,
-    ch,
-    "handoff",
-    "handing-off",
-    finalText,
-    { seeded: false },
-  );
-  scheduleOpShutdown(pi, ctx, ch, placeholderP, () => {
-    moveSessionFileAside(ctx, live);
-    archiveStaleSessions(live);
-  });
 }
 
 // ─── Handoff proactive gate: token-% auto-compact (design v2, PR3) ────────
@@ -4968,1194 +3351,6 @@ export async function maybeAutoCompactByToken(
   if (err !== null) console.error(`[handoff] auto-compact failed: ${err}`);
 }
 
-// /undo + /redo share the idle guard: abort the in-flight run, drop the
-// mid-turn re-wake queue (F11: otherwise agent_end starts a fresh run
-// that /undo then truncates or kills mid-flight), then wait for idle.
-// Bounded — a stuck agent should not block the command forever.
-async function waitIdle(ctx: ExtensionContext, label: string): Promise<void> {
-  if (ctx.isIdle()) return;
-  userStoppedRun = true;
-  try {
-    ctx.abort();
-  } catch {}
-  let dropped = 0;
-  for (const chId of [...midTurnQueues.keys()])
-    dropped += clearQueuedInbound(chId);
-  if (dropped > 0)
-    console.log(`[undo] ${label} dropped ${dropped} queued re-wake inbound(s)`);
-  const t0 = Date.now();
-  while (!ctx.isIdle() && Date.now() - t0 < 3000) await sleep(100);
-}
-
-/**
- * /undo arg (issue #46): N = how many assistant turns to revert, 1 or
- * more. Bare /undo = 1 (legacy behavior). 0 / negative / non-numeric ->
- * null: the command case answers one [!] usage line, no action.
- * Exported for tests.
- */
-export function parseUndoCount(arg: string | undefined): number | null {
-  const s = (arg ?? "").trim();
-  if (s === "") return 1;
-  if (!/^\d+$/.test(s)) return null;
-  const n = Number(s);
-  return n >= 1 && Number.isSafeInteger(n) ? n : null;
-}
-
-async function runUndo(
-  ctx: ExtensionContext,
-  n = 1,
-): Promise<{ text: string; restarted: boolean }> {
-  await waitIdle(ctx, "undo");
-  const sessionFile = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd);
-  // The /undo command case owns the block + tick + op shutdown when the
-  // restart actually happens (see beginRestartOp / scheduleOpShutdown).
-  // #46: N>1 reverts several turns in this ONE restart-class op.
-  return performUndo(sessionFile, n);
-}
-
-async function runRedo(
-  ctx: ExtensionContext,
-): Promise<{ text: string; restarted: boolean }> {
-  await waitIdle(ctx, "redo"); // F6: busy /redo raced the re-wake + restart
-  return performRedo();
-}
-
-// ─── /compact: execute + report ─────────────────────────────────────────
-// pi's ctx.compact() is fire-and-forget and swallows failures silently
-// (the dist IIFE only calls onError when one is passed). Always report:
-// onComplete → token delta, onError → one line (plain words, no tag -
-// op status is prose, Andryo 2026-10-20). A sync throw returns the
-// sanitized error message (null on success) so the caller reports it on
-// its own path (command reply vs channel post).
-function startCompact(
-  pi: ExtensionAPI,
-  pending: { ch: ChannelConfig; instructions?: string },
-  ctx: ExtensionContext,
-  postPlaceholder = false,
-): string | null {
-  const { ch, instructions } = pending;
-  const report = (text: string) => {
-    // Replace the ticking placeholder in place when one is armed; the
-    // fresh-post fallback covers the native slash path and the (impossible
-    // in practice) settle-before-post race. Both settle paths post the
-    // SAME bare line: status is prose (STYLE.md v4 §2.3), and styleGuard
-    // is a no-op on the plain one-liner that reaches the fresh-post path.
-    const guarded = styleGuard(text);
-    if (!settleCompactTick(ch.id, text))
-      sendDiscordMessage(ch, guarded).catch(() => {});
-  };
-  try {
-    ctx.compact({
-      customInstructions: instructions,
-      onComplete: (result) => {
-        // The session_compact event also settles the window; this is the
-        // belt: if the event is ever missing, the fallback timer is the
-        // only clear. (No-op once the event has cleared the flag.)
-        clearCompacting(pending.ch.id);
-        const before =
-          typeof result?.tokensBefore === "number" ? result.tokensBefore : null;
-        const after =
-          typeof result?.estimatedTokensAfter === "number"
-            ? result.estimatedTokensAfter
-            : null;
-        report(
-          before != null && after != null
-            ? `compacted: ${fmtTokensLC(before)} -> ${fmtTokensLC(after)}`
-            : "compacted",
-        );
-      },
-      onError: (err) => {
-        const t = channelError(err);
-        if (t !== null) report(`compact failed: ${t}`);
-        clearCompacting(pending.ch.id);
-      },
-    });
-    beginCompacting(pi, pending.ch, ctx);
-    if (postPlaceholder && ch.type === "discord") {
-      // Fire-and-forget: the placeholder gets its live tick; a settle
-      // faster than the post simply gets the fresh-post fallback via report().
-      sendDiscordMessage(ch, COMPACT_PLACEHOLDER)
-        .then((r) => {
-          if (r.success && r.messageId) armCompactTick(ch, r.messageId);
-        })
-        .catch(() => {});
-    }
-    return null;
-  } catch (e) {
-    return sanitizeSensitiveText(e instanceof Error ? e.message : String(e));
-  }
-}
-
-// ─── /tasks spec-string adapter ────────────────────────────────────────────
-// Turns the raw schedule text of /tasks add|reschedule into parseTaskSpec
-// params (the SAME validator the task LLM tool uses — no second parser):
-//   1 token: digits = minutes (optional m suffix, e.g. 30m), otherwise an ISO
-//   5 tokens: 5-field cron
-//   6 tokens: 5-field cron + IANA timezone
-// Surrounding double quotes on the spec are decoration (the issue examples
-// show /tasks add "..." "0 6 * * *"); no valid spec value (minutes, ISO,
-// cron field, IANA tz) contains a quote, so all of them are stripped.
-// Anything else is a form error (the command prints its usage line).
-function specStringParams(
-  raw: string,
-): { at?: string; minutes?: number; cron?: string; tz?: string } | undefined {
-  const s = raw.trim().replace(/"/g, "");
-  if (!s) return undefined;
-  const tokens = s.split(/\s+/);
-  if (tokens.length === 1) {
-    const t0 = tokens[0]!;
-    const mins = t0.match(/^(\d+)m?$/);
-    if (mins) return { minutes: Number(mins[1]!) };
-    return { at: t0 };
-  }
-  if (tokens.length === 5) return { cron: tokens.join(" ") };
-  if (tokens.length === 6)
-    return { cron: tokens.slice(0, 5).join(" "), tz: tokens[5] };
-  return undefined;
-}
-
-/** Schedule label for [ok] lines (same wording as the task tool ack). */
-function taskWhenLabel(task: {
-  kind: string;
-  cron?: string;
-  tz?: string;
-  atMs?: number;
-}): string {
-  return task.kind === "cron"
-    ? `cron "${task.cron}"${task.tz ? ` (${task.tz})` : " (system tz)"}`
-    : `at ${new Date(task.atMs!).toISOString()}`;
-}
-
-// ─── Shared command execution ─────────────────────────────────────────────
-// Used by both text messages and native slash commands (INTERACTIONS_CREATE).
-// `native` = came from a Discord interaction: non-owners get a reply instead
-// of the message falling through as normal chat. Async: /model awaits
-// pi.setModel().
-
-async function runChannelCommand(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  ch: ChannelConfig,
-  name: string,
-  arg: string | undefined,
-  fromId: string | undefined,
-  native: boolean,
-): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
-  const isOwner = isOwnerUser(ch, fromId);
-  // A recognised command is NEVER handed to the agent as plain text when the
-  // sender is not permitted. It used to be (`immediate` was only set on the
-  // native/slash path), so an owner-only command from a non-owner quietly
-  // became a prompt and the agent answered it as chat — indistinguishable
-  // from the bridge ignoring commands. Refuse explicitly on both transports,
-  // and name the misconfiguration when no owner is set at all.
-  const ownerOnly = isOwner
-    ? {}
-    : {
-        immediate: fence(
-          hasOwnerConfigured(ch)
-            ? "[!] owner only"
-            : "[!] owner only (no owner configured: set channels[].ownerUserId or ownerUserIds)",
-        ),
-      };
-  // Robustness: a misrouted event (no d.data.name) must fail with a
-  // readable line, not a TypeError (2026-10-01: a button tap crashed here
-  // before the type gate was fixed).
-  if (typeof name !== "string" || name.length === 0)
-    return { immediate: fence("[!] unknown command") };
-  switch (name.toLowerCase()) {
-    case "stop": {
-      // /stop while compacting is owner-only (isOwner pattern): it aborts
-      // the in-flight compaction, a state change, not a read. Answer
-      // immediately for non-owners (even plain text): a queued /stop would
-      // re-run ungated after the window closes and drop the channel's
-      // re-wake queue (including owner messages) + abort the next run.
-      if (isCompacting(ch.id) && !isOwner)
-        return { immediate: fence("[!] owner only") };
-      // A restart-class op captured its Discord cursor at window open;
-      // /stop clears the window AND restores that cursor so inbounds
-      // delivered during the op replay on the next boot instead of being
-      // lost with the window (they are dropped from the re-wake queue
-      // below).
-      const stoppedEntry = compactingChannels.get(ch.id);
-      // F1 (owner: cancel): a restart-class op (rewindTo set) was in
-      // flight — /stop CANCELS it. clearCompacting drops the pending
-      // shutdown timer, the marker goes with the op, and the ack says
-      // so. A compaction-only stop keeps the plain "[-] stopped".
-      const restartCancelled = stoppedEntry?.rewindTo != null;
-      clearCompacting(ch.id); // the abort's settle (session_compact_failed)
-      // re-clears + drains; the queue drop below wins for THIS /stop
-      if (restartCancelled) clearOpMarker(ctx);
-      if (stoppedEntry?.rewindTo)
-        setChannelCursor(ch.id, stoppedEntry.rewindTo);
-      // A4: drain the mid-turn re-wake queue so /stop does not immediately
-      // re-wake a message that was waiting for this run to end. (Steer
-      // messages already queued in pi are a known upstream gap — the
-      // extension context exposes hasPendingMessages() but no clearQueue(),
-      // so they land at the next run's first turn boundary.) Armed mid-run
-      // interrupts are cleared too: a stopped run is not interrupted by a
-      // stale message.
-      // #39: a HELD channel's queue is the operator's buffer — /stop clears
-      // the run but NOT the buffer. The held queue persists: it drains on
-      // /hold off, or entries are deleted one by one. (Documented choice:
-      // persist, not clear.)
-      const held = isHeld(ch);
-      const dropped = held ? 0 : clearQueuedInbound(ch.id);
-      clearInterrupts(ch.id);
-      // Cancel an in-flight interrupt's pending send — but only when one is
-      // actually in flight for this channel, so the flag never goes stale
-      // and drops a later legitimate interrupt (F7).
-      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /stop dropped ${dropped} queued mid-turn inbound(s)`,
-        );
-      if (!ctx.isIdle()) {
-        userStoppedRun = true;
-        ctx.abort();
-      }
-      const heldDepth = held ? (midTurnQueues.get(ch.id)?.length ?? 0) : 0;
-      return {
-        immediate: restartCancelled
-          ? fence("[-] stopped (restart cancelled)")
-          : heldDepth > 0
-            ? fence(`[-] stopped - ${heldDepth} held in line`)
-            : fence("[-] stopped"),
-      };
-    }
-    case "hold": {
-      if (!isOwner) return ownerOnly;
-      const a = (arg ?? "").trim().toLowerCase();
-      const on =
-        a === "" ? !isHeld(ch) : a === "on" || a === "1" || a === "yes";
-      if (a !== "" && !on && a !== "off" && a !== "0" && a !== "no")
-        return { immediate: fence("[!] usage: /hold on|off") };
-      const depth = midTurnQueues.get(ch.id)?.length ?? 0;
-      if (on === isHeld(ch))
-        return {
-          immediate: on
-            ? fence(`[ok] hold on - ${depth} in line`)
-            : fence("[ok] hold off"),
-        };
-      setHeld(ch.id, on);
-      if (on) {
-        // Held messages wait their turn: disarm interrupts armed before
-        // the hold. (An in-flight interrupt runs to completion — its
-        // message was queued before the hold. agent_end skips held
-        // channels, so the buffer does not drain on its own.)
-        clearInterrupts(ch.id);
-        return {
-          immediate:
-            depth > 0
-              ? fence(`[ok] hold on - ${depth} in line`)
-              : fence("[ok] hold on - buffered until /hold off"),
-        };
-      }
-      // off: drain — send the oldest now when idle; the existing re-wake
-      // loop (agent_end) chains the rest, one run each, in order.
-      if (depth === 0) return { immediate: fence("[ok] hold off") };
-      if (ctx.isIdle() && !isCompacting(ch.id)) {
-        const entry = popChannelQueuedInbound(ch.id);
-        // Awaits the drained inbound: its send must finish before this
-        // command's reply lands, or the in-flight drain can leak into the
-        // next message's turn (and the next test, in the suite).
-        if (entry)
-          await handleInbound(pi, entry.msg, ctx, true).catch((e) => {
-            console.error(
-              "[channel] hold drain failed:",
-              sanitizeUnknownValue(e),
-            );
-          });
-        return {
-          immediate: fence(`[ok] hold off - ${depth} in line, running`),
-        };
-      }
-      return { immediate: fence(`[ok] hold off - ${depth} in line, will run`) };
-    }
-    case "help":
-      return { immediate: fence(HELP_TEXT) };
-    case "btw": {
-      const question = (arg || "").trim();
-      if (!question) return { immediate: fence("[!] usage: /btw <question>") };
-      const msg: ChannelMessage = {
-        channelId: ch.id,
-        channelName: ch.name,
-        channelType: "discord",
-        messageId: "",
-        from: fromId || "unknown",
-        fromId,
-        body: question,
-        timestamp: new Date().toISOString(),
-        attachments: [],
-        isRoom: false,
-      };
-      const channelCtx = buildChannelContext(ch, msg);
-      sendToPi(
-        pi,
-        ch.id,
-        `${channelCtx}\n\n${BTW_HINT}\n\n${question}`,
-        `${ch.type}/${ch.name}`,
-        question,
-      );
-      return { btw: true };
-    }
-    case "status": {
-      if (!isOwner) return ownerOnly;
-      let text: string;
-      try {
-        const u = ctx.getContextUsage?.();
-        const model = (ctx.model as any)?.id ?? (ctx.model as any)?.name ?? "?";
-        const elapsed = Date.now() - sessionStartTs;
-        const up = `${Math.floor(elapsed / 3600000)}h${Math.floor((elapsed % 3600000) / 60000)}m`;
-        const parts = [
-          `ctx ${typeof u?.percent === "number" ? `${Math.round(u.percent)}%` : "?"}`,
-          `model ${model}`,
-          `up ${up}`,
-          // Open op window (compaction OR a restart-class op) shows its
-          // label; otherwise the honest idle/running state.
-          opWindowLabel(ch.id) ?? (ctx.isIdle() ? "idle" : "running"),
-          // Tool-call display level (#10): quiet = 0 (text only),
-          // verbose 1 = essential tools, verbose 2 = all.
-          verboseLevel(ch) === 0 ? "quiet" : `verbose ${verboseLevel(ch)}`,
-          // Channel hold (#39): plain messages buffer, runs don't start.
-          isHeld(ch) ? "hold on" : null,
-          // Queue depth (#47): mid-turn inbounds waiting for the run.
-          midTurnQueues.get(ch.id)?.length
-            ? `queue ${midTurnQueues.get(ch.id)!.length}`
-            : null,
-        ].filter(Boolean);
-        // Interrupt state, honestly: in flight, or armed with time to fire.
-        if (interruptingChannels.has(ch.id)) {
-          parts.push("interrupting");
-        } else {
-          const pend = pendingInterrupts.get(ch.id);
-          if (pend && pend.length > 0) {
-            const msLeft = Math.max(
-              0,
-              Math.min(...pend.map((p) => p.at)) - Date.now(),
-            );
-            parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
-          }
-        }
-        text = fence(`[status] ${parts.join(" · ")}`);
-      } catch {
-        text = fence("[!] status unavailable");
-      }
-      return { immediate: text };
-    }
-    case "usage": {
-      // #40: /usage last — the last completed run's tokens + est. cost
-      // (in-memory; reset on bridge restart, like the rest of run state).
-      const scope = (arg ?? "").trim().toLowerCase();
-      if (scope === "last") {
-        const lu = lastRunUsage.value;
-        if (!lu) return { immediate: "no completed run yet (run one first)" };
-        const at = lu.at.toISOString().slice(11, 19);
-        return { immediate: usageSummary("last run", at, lu.stats) };
-      }
-      // Read-only token stats from the session store. Session discovery
-      // reuses the /undo path: active ctx session file, else newest .jsonl
-      // under cwd's session dir (findSessionFile fallback). The error
-      // paths stay bare (one-liners, no tag); the stats list ships as
-      // normal markdown - unfenced, no width budget (Andryo 2026-10-18).
-      try {
-        const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
-        return { immediate: text };
-      } catch {
-        return { immediate: fence("[!] usage stats unavailable") };
-      }
-    }
-    case "context": {
-      // #48: what is eating the window: top-N items by token ESTIMATE
-      // (char/4, no model, no pricing) + category totals. Read-only, open
-      // to all like /usage. Session discovery is the same /undo path;
-      // the markdown list is built by renderContext, errors are one
-      // [!] line (fenced machine one-liners stay fenced), no stack.
-      try {
-        const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
-        // Success = the markdown summary list (unfenced - Andryo
-        // 2026-10-18); [!] errors stay fenced one-liners.
-        return { immediate: text.startsWith("[!]") ? fence(text) : text };
-      } catch {
-        // fenced, mirroring the /usage catch (PR #242 review F4)
-        return { immediate: fence("[!] context stats unavailable") };
-      }
-    }
-    case "diff": {
-      // Read-only: git + upload to our own webdrop (issue #7). Open to all
-      // channel members, like /jobs.
-      try {
-        const text = await publishDiff(ctx.cwd, arg);
-        // #87: the viewer URL is the one link the user asked for - a
-        // fenced URL is monospace, not clickable. Fence the status line,
-        // leave the URL bare (publishDiff keeps the URL on its own last
-        // line for exactly this split).
-        const nl = text.lastIndexOf("\n");
-        const last = nl > 0 ? text.slice(nl + 1) : "";
-        if (/^https?:\/\/\S+$/i.test(last))
-          return { immediate: `${fence(text.slice(0, nl))}\n${last}` };
-        return { immediate: fence(text) };
-      } catch {
-        return { immediate: fence("[!] diff publish failed") };
-      }
-    }
-    case "reset": {
-      if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      userStoppedRun = true;
-      clearInterrupts(ch.id);
-      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
-      // #84 L2: drain queued inbounds while the process is still alive — a
-      // restart wipes the in-memory maps at shutdown (no Discord delete), so
-      // a queued ack posted now would be orphaned in the channel forever.
-      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
-      const held = isHeld(ch);
-      const dropped = held ? 0 : clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /reset dropped ${dropped} queued mid-turn inbound(s)`,
-        );
-      try {
-        ctx.abort();
-      } catch {}
-      // BLOCK the channel across the respawn (like /compact): placeholder
-      // + live tick now, the respawn settles it (op marker), the cursor
-      // rewind replays op-window inbounds after boot. /reset = NEW session:
-      // move the session file aside at shutdown.
-      const placeholderP = beginRestartOp(
-        pi,
-        ctx,
-        ch,
-        "reset",
-        "resetting",
-        "[new] new session (context cleared)",
-      );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP, () => {
-        const live = ctx.sessionManager?.getSessionFile?.();
-        moveSessionFileAside(ctx, live);
-        // Archive the OTHER stale .jsonl too: 'pi -c' (continueRecent) resumes
-        // the newest .jsonl, so without this a /reset can resume a superseded
-        // session (turns != 0) instead of a truly fresh one (issue #85).
-        if (live) archiveStaleSessions(live);
-      });
-      return native
-        ? { immediate: fence("[..] resetting...") }
-        : { consumed: true };
-    }
-    case "restart": {
-      if (!isOwner) return ownerOnly;
-      // /restart = process restart that RESUMES this session: systemd respawns
-      // 'pi -c' which continues the last session file (the opposite of
-      // /reset, which moves that file aside first). Same block + tick +
-      // cursor-replay dance as /reset, minus the session-file move.
-      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      userStoppedRun = true;
-      clearInterrupts(ch.id);
-      if (interruptingChannels.has(ch.id)) interruptCancelled.add(ch.id); // F7 guard
-      // #84 L2: drain queued inbounds while the process is still alive — a
-      // restart wipes the in-memory maps at shutdown (no Discord delete), so
-      // a queued ack posted now would be orphaned in the channel forever.
-      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
-      const held = isHeld(ch);
-      const dropped = held ? 0 : clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /restart dropped ${dropped} queued mid-turn inbound(s)`,
-        );
-      try {
-        ctx.abort();
-      } catch {}
-      const placeholderP = beginRestartOp(
-        pi,
-        ctx,
-        ch,
-        "restart",
-        "restarting",
-        "restarted - session resumed",
-      );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: fence("[..] restarting...") }
-        : { consumed: true };
-    }
-    case "undo": {
-      if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      const n = parseUndoCount(arg);
-      if (n === null)
-        return { immediate: fence("[!] usage: /undo [N] (N is 1 or more)") };
-      const r = await runUndo(ctx, n);
-      if (!r.restarted) return { immediate: fence(r.text) };
-      // #84 L2: drain queued inbounds while the process is still alive — a
-      // restart wipes the in-memory maps at shutdown (no Discord delete), so
-      // a queued ack posted now would be orphaned in the channel forever.
-      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
-      const held = isHeld(ch);
-      const dropped = held ? 0 : clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /undo dropped ${dropped} queued mid-turn inbound(s)`,
-        );
-      // performUndo already truncated the session file + parked the re-run
-      // trigger (F1); the respawn resumes the pre-turn state. #46: N>1
-      // removed every turn back to the Nth trigger in this ONE restart.
-      // Block + tick + cursor replay across the respawn, like /reset.
-      const placeholderP = beginRestartOp(
-        pi,
-        ctx,
-        ch,
-        "undo",
-        "undoing",
-        r.text,
-      );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: fence("[..] undoing...") }
-        : { consumed: true };
-    }
-    case "redo": {
-      if (!isOwner) return ownerOnly;
-      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      const r = await runRedo(ctx);
-      if (!r.restarted) return { immediate: fence(r.text) };
-      // #84 L2: drain queued inbounds while the process is still alive — a
-      // restart wipes the in-memory maps at shutdown (no Discord delete), so
-      // a queued ack posted now would be orphaned in the channel forever.
-      // A HELD channel's queue is the operator's buffer: keep it (/stop A4).
-      const held = isHeld(ch);
-      const dropped = held ? 0 : clearQueuedInbound(ch.id);
-      if (dropped > 0)
-        console.log(
-          `[channel] /redo dropped ${dropped} queued mid-turn inbound(s)`,
-        );
-      const placeholderP = beginRestartOp(
-        pi,
-        ctx,
-        ch,
-        "redo",
-        "redoing",
-        r.text,
-      );
-      scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: fence("[..] redoing...") }
-        : { consumed: true };
-    }
-    case "verbose": {
-      if (!isOwner) return ownerOnly;
-      const a = (arg ?? "").trim().toLowerCase();
-      const prev = verboseLevel(ch);
-      // Bare command: show the current level (read-only, no change).
-      if (a === "")
-        return {
-          immediate: fence(
-            `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
-          ),
-        };
-      const next = parseVerboseLevel(a);
-      if (next === null)
-        return { immediate: fence("[!] usage: /verbose 0|1|2") };
-      verboseOverride.set(ch.id, next);
-      persistChannelRuntimeState(ch.id, { verbose: next });
-      // Live >0 -> 0 transition: delete the in-flight block so it does
-      // not sit in history as a stale "working…" line. The closure-owned
-      // hook is registered by the extension instance (module-level
-      // command path, see onDeleteStatusBlock above).
-      if (prev > 0 && next === 0) await onDeleteStatusBlock?.(ch);
-      return {
-        immediate: fence(
-          `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
-        ),
-      };
-    }
-    case "compact": {
-      if (!isOwner) return ownerOnly;
-      const instructions = (arg || "").trim() || undefined;
-      if (isCompacting(ch.id)) {
-        // The channel's own op window is open: one op at a time, reject
-        // the second instead of queueing it (F5: name the active op).
-        return { immediate: opBusyRefusal(ch.id) };
-      }
-      if (!ctx.isIdle()) {
-        // Run in progress (compact would abort it) or a compaction already
-        // in flight: queue it. One slot — a later /compact replaces the
-        // earlier. Flushed at agent_end or when the current compaction
-        // settles (see pendingCompact + the flush handlers).
-        const replacing = pendingCompact !== null;
-        pendingCompact = { ch, instructions };
-        const why = agentBusy
-          ? "run in progress"
-          : "compact already in progress";
-        return {
-          immediate: fence(
-            `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
-          ),
-        };
-      }
-      // Text path: startCompact posts the placeholder (armed with its live
-      // tick) and reports settle-in-place. Native: the deferred interaction
-      // shows the placeholder instead; the report posts fresh.
-      const err = startCompact(pi, { ch, instructions }, ctx, !native);
-      if (err !== null) {
-        const t = channelError(err);
-        if (t !== null) return { immediate: fence(`[!] compact failed: ${t}`) };
-      }
-      return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
-    }
-    case "handover": {
-      // Manual mechanism A: same path as /compact (reason=manual), the
-      // handoff module builds the doc in session_before_compact when
-      // handoff.enabled. Disabled → standard compact (same as /compact).
-      if (!isOwner) return ownerOnly;
-      const instructions = (arg || "").trim() || undefined;
-      if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      if (!ctx.isIdle()) {
-        const replacing = pendingCompact !== null;
-        pendingCompact = { ch, instructions };
-        const why = agentBusy
-          ? "run in progress"
-          : "compact already in progress";
-        return {
-          immediate: fence(
-            `[queued] handover (${why})${replacing ? ", replaces earlier" : ""}`,
-          ),
-        };
-      }
-      const settings = resolveHandoffSettings(ctx.cwd);
-      const err = startCompact(pi, { ch, instructions }, ctx, !native);
-      if (err !== null) {
-        const t = channelError(err);
-        if (t !== null)
-          return { immediate: fence(`[!] handover failed: ${t}`) };
-      }
-      if (!settings.enabled)
-        sendDiscordMessage(
-          ch,
-          styleGuard(
-            "handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
-          ),
-        ).catch(() => {});
-      return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
-    }
-    case "jobs": {
-      // History-only since the drain (#279): the dispatch lane is retired
-      // (zero in-flight runs fleet-wide), so the kill/tail subcommands and
-      // their dispatch scripts are gone with the completion side. The
-      // history view is informational, open to all channel members
-      // (private channel). json = machine output (fenced); text = the
-      // markdown summary list (unfenced - Andryo 2026-10-18: no fence,
-      // no width budget).
-      const sub = ((arg || "").trim().split(/\s+/)[0] ?? "").toLowerCase();
-      return {
-        immediate: sub === "json" ? fence(jobsView("json")) : jobsView("text"),
-      };
-    }
-    case "new-worktree": {
-      // #12: create the interactive session's worktree (owner-only).
-      if (!isOwner) return ownerOnly;
-      const ref = (arg ?? "").trim() || undefined;
-      try {
-        return { immediate: fence(newWorktree(ctx.cwd, ref)) };
-      } catch (e) {
-        return {
-          immediate: fence(
-            `[!] worktree failed: ${channelError(e) ?? "error"}`,
-          ),
-        };
-      }
-    }
-    case "merge-worktree": {
-      // #12: merge the worktree branch back into the live checkout
-      // (owner-only; optional arg `squash` = squash merge).
-      if (!isOwner) return ownerOnly;
-      const mode =
-        (arg ?? "").trim().toLowerCase() === "squash" ? "squash" : "keep";
-      try {
-        return { immediate: fence(mergeWorktree(ctx.cwd, mode)) };
-      } catch (e) {
-        return {
-          immediate: fence(`[!] merge failed: ${channelError(e) ?? "error"}`),
-        };
-      }
-    }
-    case "sleep": {
-      if (!isOwner) return ownerOnly;
-      const argText = (arg || "").trim();
-      const sub = argText ? argText.split(/\s+/)[0]!.toLowerCase() : "list";
-      if (sub === "list") {
-        const names = new Map(
-          loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
-        );
-        const wakes = loadWakes();
-        if (wakes.length === 0)
-          return { immediate: fence("[wake] no pending wakes") };
-        const pending = wakes.filter((w) => w.status === "pending").length;
-        const lines = wakes.map((w) => {
-          const chName = names.get(w.channelId) || w.channelName || w.channelId;
-          const at = new Date(w.wakeAt).toISOString();
-          const m = Math.round((w.wakeAt - Date.now()) / 60000);
-          const state =
-            w.status === "claimed"
-              ? "claimed"
-              : m > 0
-                ? `in ${formatDurationMs(m * 60000)}`
-                : "due";
-          const note = w.note ? ` \u00b7 note: ${w.note}` : "";
-          return `- ${w.id} \u00b7 ${chName} \u00b7 ${at} (${state})${note}`;
-        });
-        return {
-          immediate: `**[wake] ${pending} pending wake${
-            pending > 1 ? "s" : ""
-          } (of ${wakes.length} total)**\n\n${lines.join("\n")}`,
-        };
-      }
-      if (sub === "cancel") {
-        const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: fence("[!] usage: /sleep cancel <id>") };
-        const ok = cancelWake(id);
-        return {
-          immediate: fence(
-            ok ? `[ok] cancelled wake ${id}` : `[!] no wake with id ${id}`,
-          ),
-        };
-      }
-      return { immediate: fence("[!] usage: /sleep [list | cancel <id>]") };
-    }
-    case "tasks": {
-      if (!isOwner) return ownerOnly;
-      const argText = (arg || "").trim();
-      const sub = argText ? argText.split(/\s+/)[0]!.toLowerCase() : "list";
-      if (sub === "list") {
-        const names = new Map(
-          loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
-        );
-        const tasks = loadTasks();
-        if (tasks.length === 0)
-          return { immediate: fence("[tasks] no scheduled tasks") };
-        const pending = tasks.filter((t) => t.status === "pending").length;
-        const lines = tasks.map((t) =>
-          formatTaskLine(t, names.get(t.channelId) || t.channelName),
-        );
-        return {
-          immediate: `**[tasks] ${pending} pending task${
-            pending > 1 ? "s" : ""
-          } (of ${tasks.length} total)**\n\n${lines.join("\n")}`,
-        };
-      }
-      if (sub === "cancel") {
-        const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: fence("[!] usage: /tasks cancel <id>") };
-        const ok = cancelTask(id);
-        return {
-          immediate: fence(
-            ok ? `[ok] cancelled task ${id}` : `[!] no task with id ${id}`,
-          ),
-        };
-      }
-      if (sub === "add") {
-        const rest = argText.slice("add".length).trim();
-        const m = rest.match(/^"([^"]*)"\s*([\s\S]*)$/);
-        if (!m)
-          return {
-            immediate: fence(
-              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
-            ),
-          };
-        const prompt = m[1]!.trim();
-        const spec = specStringParams(m[2] ?? "");
-        if (!spec)
-          return {
-            immediate: fence(
-              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
-            ),
-          };
-        const res = parseTaskSpec({ prompt, ...spec });
-        if (!res.spec || res.error)
-          return {
-            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
-          };
-        const task = scheduleTask({
-          channelId: ch.id,
-          channelName: ch.name,
-          prompt,
-          spec: res.spec,
-        });
-        return {
-          immediate: fence(
-            `[ok] task ${task.id} scheduled: ${taskWhenLabel(task)}, next fire ` +
-              `${new Date(task.nextFireAt).toISOString()}, ` +
-              `cancel with /tasks cancel ${task.id}`,
-          ),
-        };
-      }
-      if (sub === "reschedule") {
-        const rest = argText.slice("reschedule".length).trim();
-        const parts = rest.split(/\s+/).filter(Boolean);
-        const id = parts[0] ?? "";
-        if (!id)
-          return {
-            immediate: fence(
-              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
-            ),
-          };
-        // validate the id against THIS session's tasks before touching the spec
-        const t = loadTasks().find((x) => x.id === id && x.channelId === ch.id);
-        if (!t) return { immediate: fence(`[!] no task with id ${id}`) };
-        const spec = specStringParams(parts.slice(1).join(" "));
-        if (!spec)
-          return {
-            immediate: fence(
-              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
-            ),
-          };
-        const res = parseTaskSpec({ prompt: t.prompt, ...spec });
-        if (!res.spec || res.error)
-          return {
-            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
-          };
-        const r = rescheduleTask(id, res.spec, ch.id);
-        if (!r.task || r.error)
-          return { immediate: fence(`[!] ${r.error ?? "reschedule failed"}`) };
-        return {
-          immediate: fence(
-            `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(t)} -> ` +
-              `${taskWhenLabel(r.task)}, ` +
-              `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
-          ),
-        };
-      }
-      return {
-        immediate: fence(
-          "[!] usage: /tasks [list | add | reschedule | cancel]",
-        ),
-      };
-    }
-    case "todos": {
-      // Informational, open to all channel members (private channel).
-      // The board is a normal markdown list: bold header + bullets, full
-      // text, no fence, no width budget (Andryo 2026-10-18).
-      if ((arg || "").trim().toLowerCase() === "all") {
-        const names = new Map(
-          loadChannelConfig(ctx.cwd).map((c) => [c.id, c.name]),
-        );
-        const parts = listBoards()
-          .filter((b) => b.todos.length > 0)
-          .map((b) =>
-            renderBoard(b.todos, names.get(b.channelId) ?? b.channelId),
-          );
-        return {
-          immediate:
-            parts.length > 0
-              ? parts.join("\n\n")
-              : fence("[todos] no open todos"),
-        };
-      }
-      const board = loadBoard(ch.id);
-      if (!board || board.todos.length === 0)
-        return { immediate: fence("[todos] no open todos") };
-      return { immediate: renderBoard(board.todos) };
-    }
-    case "model": {
-      if (!isOwner) return ownerOnly;
-      const req = (arg || "").trim();
-      let models: any[] = [];
-      try {
-        models = ctx.modelRegistry?.getAvailable?.() ?? [];
-      } catch {}
-      if (!req) {
-        if (models.length === 0)
-          return { immediate: fence("[model] no models available") };
-        const names = models
-          .slice(0, 20)
-          .map((m: any) => `${m.provider}/${m.id}`);
-        return {
-          immediate: fence(
-            `[model] ${models.length} available:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
-          ),
-        };
-      }
-      const lower = req.toLowerCase();
-      let found: any | undefined = models.find(
-        (m: any) =>
-          String(m.id).toLowerCase() === lower ||
-          `${m.provider}/${m.id}`.toLowerCase() === lower,
-      );
-      if (!found) {
-        const partial = models.filter(
-          (m: any) =>
-            String(m.id).toLowerCase().includes(lower) ||
-            String(m.name ?? "")
-              .toLowerCase()
-              .includes(lower),
-        );
-        if (partial.length === 1) found = partial[0];
-        else if (partial.length > 1) {
-          const cands = partial
-            .slice(0, 5)
-            .map((m: any) => `${m.provider}/${m.id}`)
-            .join(", ");
-          return {
-            immediate: fence(
-              `[!] ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
-            ),
-          };
-        }
-      }
-      if (!found) return { immediate: fence(`[!] model not found: ${req}`) };
-      const ok = await pi.setModel(found);
-      return {
-        immediate: fence(
-          ok
-            ? `[ok] model ${found.provider}/${found.id}`
-            : `[!] no auth configured for ${found.provider}/${found.id}`,
-        ),
-      };
-    }
-    default:
-      return {};
-  }
-}
-
-// ─── send-file tool ────────────────────────────────────────────────
-// Uploads local file(s) to the active Discord channel in one message
-// (multipart upload, 25 MB per-file cap). Replaces the webdrop round-trip
-// for anything small.
-
-function registerSendFileTool(
-  pi: ExtensionAPI,
-  channels: ChannelConfig[],
-): void {
-  pi.registerTool({
-    name: "send-file",
-    label: "Send file",
-    description:
-      "Send file(s) from this machine to the active Discord channel. Use it when the user should receive an image, report, log, or any file. Files up to 25 MB each; all files are sent in one message (images shown in a grid).",
-    promptSnippet: "Send local file(s) to the active Discord channel",
-    promptGuidelines: [
-      "Use send-file to deliver files to the user instead of pasting long paths or webdrop links.",
-    ],
-    parameters: Type.Object({
-      files: Type.Array(Type.String(), {
-        minItems: 1,
-        description:
-          "File paths (absolute, or relative to the working directory)",
-      }),
-    }),
-    async execute(
-      _toolCallId,
-      params: { files: string[] },
-      _signal,
-      _onUpdate,
-      ctx: ExtensionContext,
-    ) {
-      const active =
-        lastActiveChannel && lastActiveChannel.type === "discord"
-          ? lastActiveChannel
-          : null;
-      const ch = active || getDefaultChannel(channels);
-      if (ch?.type !== "discord") {
-        return {
-          content: [{ type: "text", text: "No Discord channel available" }],
-          details: {},
-        };
-      }
-      const token = getDiscordToken(ch.id) || ch.botToken;
-      const channelId = getDiscordChannelId(ch.id);
-      if (!token || !channelId) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Channel ${ch.name}: no bot token/channel id`,
-            },
-          ],
-          details: {},
-        };
-      }
-      // Some models prefix paths with @ — normalize it.
-      const files = params.files.map((f) =>
-        path.resolve(ctx.cwd, f.replace(/^@/, "")),
-      );
-      const r = await sendFilesToDiscord(channelId, files, token);
-      if (r.success) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Sent ${files.length} file(s) to ${ch.name}`,
-            },
-          ],
-          details: {},
-        };
-      }
-      return {
-        content: [{ type: "text", text: r.error || "send failed" }],
-        details: {},
-      };
-    },
-  });
-}
-
-// ─── todo tool ─────────────────────────────────────────────────────────
-// Maintains the per-channel todo board. FULL-LIST semantics: the model
-// always sends the complete updated list; an empty array clears the
-// board. State: ~/.pi/agent/todos/<channelId>.json. The Discord board
-// message is posted once, then edited in place; board send/edit failures
-// never fail the tool call (state is the source of truth).
-// Description text is opencode's proven todo prompt.
-export const TODO_TOOL_DESCRIPTION = `Create and maintain a structured task list for the current coding session. Tracks progress, organizes multi-step work, and surfaces status to the user.
-## When to use
-Use proactively when:
-- The task requires 3+ distinct steps or actions (not just 3 tool calls for a single conceptual step)
-- The work is non-trivial and benefits from planning
-- The user provides multiple tasks (numbered or comma-separated) or explicitly asks for a todo list
-- New instructions arrive - capture them as todos
-- You start a task - mark it in_progress (only one at a time) before working
-- You finish a task - mark it completed and add any follow-ups discovered during the work
-## When NOT to use
-Skip when:
-- The work is a single, straightforward task (or <3 trivial steps)
-- The request is purely informational or conversational
-- Tracking adds no organizational value
-## States
-- pending - not started
-- in_progress - actively working (exactly ONE at a time)
-- completed - finished successfully
-- cancelled - no longer needed
-## Rules
-- Update status in real time; do not batch completions
-- Mark completed only after the required work is actually done, including any required verification. Never based on intent
-- Keep exactly one in_progress while work remains
-- If blocked or partial, keep it in_progress and add a follow-up todo describing the blocker
-- Preserve user-provided commands verbatim (flags, args, order)
-- Items should be specific and actionable; break large work into smaller steps
-When in doubt, use it.`;
-
-/**
- * Post or edit the channel's Discord todo board message. Never throws:
- * a failed post/edit is logged, and the state file remains authoritative
- * (the next sync retries, or re-posts when the message id was lost).
- * Exported for tests.
- */
-export async function syncTodoBoard(
-  ch: ChannelConfig,
-  board: TodoBoard,
-): Promise<void> {
-  try {
-    if (board.todos.length === 0) {
-      if (board.boardMessageId) {
-        await deleteDiscordMessage(ch, board.boardMessageId);
-        board.boardMessageId = undefined;
-        saveBoard(board);
-      }
-      return;
-    }
-    const text = renderBoard(board.todos);
-    if (board.boardMessageId) {
-      const r = await editDiscordMessage(ch, board.boardMessageId, text);
-      if (!r.success)
-        console.error(
-          `[todos] board edit failed: ${sanitizeSensitiveText(r.error || "")}`,
-        );
-      return;
-    }
-    const r = await sendDiscordMessage(ch, text);
-    if (r.success && r.messageId) {
-      board.boardMessageId = r.messageId;
-      saveBoard(board);
-    } else {
-      // Webhook-only channels return no message id — the next sync re-posts.
-      console.error(
-        `[todos] board post failed: ${sanitizeSensitiveText(r.error || "")}`,
-      );
-    }
-  } catch (e) {
-    console.error(`[todos] board sync failed: ${sanitizeUnknownValue(e)}`);
-  }
-}
-
-export function registerTodoTool(
-  pi: ExtensionAPI,
-  channels: ChannelConfig[],
-): void {
-  pi.registerTool({
-    name: "todo",
-    label: "Todo",
-    description: TODO_TOOL_DESCRIPTION,
-    promptSnippet:
-      "Maintain the channel todo board (send the FULL updated list every time)",
-    promptGuidelines: [
-      "Call todo with the complete updated list whenever a task's status changes; empty list clears the board.",
-    ],
-    parameters: Type.Object({
-      todos: Type.Array(
-        Type.Object({
-          content: Type.String({
-            description: "What to do (specific and actionable)",
-          }),
-          status: Type.Union(
-            [
-              Type.Literal("pending"),
-              Type.Literal("in_progress"),
-              Type.Literal("completed"),
-              Type.Literal("cancelled"),
-            ],
-            { description: "Item status" },
-          ),
-        }),
-        {
-          maxItems: 50,
-          description:
-            "The COMPLETE updated list (empty array clears the board)",
-        },
-      ),
-    }),
-    async execute(
-      _toolCallId,
-      params: { todos: any[] },
-      _signal,
-      _onUpdate,
-      _ctx: ExtensionContext,
-    ) {
-      const active =
-        lastActiveChannel && lastActiveChannel.type === "discord"
-          ? lastActiveChannel
-          : null;
-      const ch = active || getDefaultChannel(channels);
-      if (ch?.type !== "discord") {
-        return {
-          content: [{ type: "text", text: "No Discord channel available" }],
-          details: {},
-        };
-      }
-      const todos = sanitizeTodos(params.todos);
-      const prev = loadBoard(ch.id);
-      const board: TodoBoard = {
-        channelId: ch.id,
-        todos,
-        updatedAt: new Date().toISOString(),
-        ...(prev?.boardMessageId
-          ? { boardMessageId: prev.boardMessageId }
-          : {}),
-      };
-      let stateNote = "";
-      try {
-        saveBoard(board);
-      } catch (e) {
-        // State write failed — report it but still echo the list so the
-        // model keeps its copy.
-        stateNote = `\n\n[!] board save failed: ${channelError(e) ?? "error"}`;
-      }
-      await syncTodoBoard(ch, board);
-      const text =
-        todos.length === 0 ? "todo board cleared" : renderBoard(todos);
-      return {
-        content: [{ type: "text", text: text + stateNote }],
-        details: {},
-      };
-    },
-  });
-}
-
 // ─── Inbound handler ──────────────────────────────────────────────────────
 // ─── Sleep wake delivery ────────────────────────────────────────────────
 // Claim (markClaimed) BEFORE injection so a crash between claim and
@@ -6190,83 +3385,6 @@ export function deliverDueWakes(
   return due.length;
 }
 
-// ─── sleep tool ───────────────────────────────────────────────────────────
-// Durable "wake me at X": records the wake on disk, tells the model to end
-// the run. Delivery is external (session_start catch-up + 30s poller) so it
-// survives pi.service restarts and machine reboots. The wake lands as a
-// fresh channel-inbound turn in the same session.
-export const SLEEP_TOOL_DESCRIPTION = `Pause this session and wake it at a later time. Schedule a wake (minutes from now, or an ISO time), optionally with a note for your waking self, then END YOUR REPLY IMMEDIATELY — the run ends now and a "Woke after sleeping until ..." message starts the next turn in this same session. Use it to sleep until a known time (deploy window closes, meeting ends, CI should be done) instead of polling. The wake survives process restarts.`;
-
-export function registerSleepTool(
-  pi: ExtensionAPI,
-  channels: ChannelConfig[],
-): void {
-  pi.registerTool({
-    name: "sleep",
-    label: "Sleep",
-    description: SLEEP_TOOL_DESCRIPTION,
-    promptSnippet:
-      "Pause the session and wake it at a later time (minutes or ISO until, optional note)",
-    promptGuidelines: [
-      "After calling sleep, end the reply immediately — do not keep working or poll; the wake arrives as a new message in this session.",
-    ],
-    parameters: Type.Object({
-      minutes: Type.Optional(
-        Type.Union([Type.Number(), Type.String()], {
-          description: "Sleep length in minutes (e.g. 30)",
-        }),
-      ),
-      until: Type.Optional(
-        Type.String({
-          description:
-            "Wake time as ISO timestamp, e.g. 2026-09-10T15:00:00Z (exactly one of minutes/until)",
-        }),
-      ),
-      note: Type.Optional(
-        Type.String({
-          description: "Optional note stored and shown back at wake time",
-        }),
-      ),
-    }),
-    async execute(
-      _toolCallId,
-      params: { minutes?: number | string; until?: string; note?: string },
-      _signal,
-      _onUpdate,
-      _ctx: ExtensionContext,
-    ) {
-      const active =
-        lastActiveChannel && lastActiveChannel.type === "discord"
-          ? lastActiveChannel
-          : null;
-      const ch = active || getDefaultChannel(channels);
-      if (ch?.type !== "discord") {
-        return {
-          content: [{ type: "text", text: "No Discord channel available" }],
-          details: {},
-        };
-      }
-      const res = parseWakeAt(params);
-      if (res.error !== undefined || res.wakeAt === undefined) {
-        return {
-          content: [
-            { type: "text", text: `[!] ${res.error ?? "invalid wake time"}` },
-          ],
-          details: {},
-        };
-      }
-      const wake = scheduleWake({
-        channelId: ch.id,
-        channelName: ch.name,
-        wakeAt: res.wakeAt,
-        note: params.note,
-      });
-      const text = `[ok] sleeping until ${new Date(wake.wakeAt).toISOString()} (id ${wake.id}). End your reply now; this session wakes at that time.`;
-      return { content: [{ type: "text", text }], details: { wake } };
-    },
-  });
-}
-
 // ─── Scheduled task delivery ──────────────────────────────────────────────
 // Same at-least-once discipline as sleep wakes: claim before injection,
 // complete AFTER injection succeeds (one-shot: removed; cron: advance to
@@ -6297,109 +3415,6 @@ export function deliverDueTasks(
       );
   }
   return due.length;
-}
-
-// ─── task tool ───────────────────────────────────────────────────────────
-// Durable "fire this prompt into this session at a later time": one-shot
-// (minutes from now, or an ISO time) or recurring (5-field cron, optional
-// IANA tz). Delivery is external (session_start catch-up + 30s poller) so
-// it survives pi.service restarts and machine reboots. The fire lands as a
-// fresh channel-inbound turn in the same session.
-export const TASK_TOOL_DESCRIPTION = `Schedule a prompt that fires into THIS session as a new message at a later time. One-shot: minutes from now or an ISO time (e.g. "remind me in 2h to check the build"). Recurring: a 5-field cron expression (e.g. "daily 06:00 run the fleet check" = "0 6 * * *"), optional IANA timezone. The fire arrives as a normal channel message in this same session — a fresh turn for your future self. It survives process restarts and reboots. After scheduling, do not wait or poll; the fire is its own message.`;
-
-export function registerTaskTool(
-  pi: ExtensionAPI,
-  channels: ChannelConfig[],
-): void {
-  pi.registerTool({
-    name: "task",
-    label: "Task",
-    description: TASK_TOOL_DESCRIPTION,
-    promptSnippet:
-      "Schedule a prompt to fire into this session later (one-shot minutes/ISO, or recurring cron)",
-    promptGuidelines: [
-      "Write the prompt for your future self: self-contained, no 'this' or 'it'.",
-      "After calling task, keep working or end the reply — the fire arrives as its own message later.",
-    ],
-    parameters: Type.Object({
-      prompt: Type.String({
-        description:
-          "The message to deliver when the task fires (self-contained instruction)",
-      }),
-      minutes: Type.Optional(
-        Type.Union([Type.Number(), Type.String()], {
-          description:
-            "One-shot: fire N minutes from now (e.g. 120) — exactly one of minutes/at/cron",
-        }),
-      ),
-      at: Type.Optional(
-        Type.String({
-          description:
-            "One-shot: fire time as ISO timestamp, e.g. 2026-09-10T15:00:00Z (exactly one of minutes/at/cron)",
-        }),
-      ),
-      cron: Type.Optional(
-        Type.String({
-          description:
-            "Recurring: 5-field cron (minute hour dom month dow), e.g. '0 6 * * *' = daily 06:00 — exactly one of minutes/at/cron",
-        }),
-      ),
-      tz: Type.Optional(
-        Type.String({
-          description:
-            "IANA timezone for the cron expression (e.g. Australia/Melbourne); default system tz",
-        }),
-      ),
-    }),
-    async execute(
-      _toolCallId,
-      params: {
-        prompt?: string;
-        minutes?: number | string;
-        at?: string;
-        cron?: string;
-        tz?: string;
-      },
-      _signal,
-      _onUpdate,
-      _ctx: ExtensionContext,
-    ) {
-      const active =
-        lastActiveChannel && lastActiveChannel.type === "discord"
-          ? lastActiveChannel
-          : null;
-      const ch = active || getDefaultChannel(channels);
-      if (ch?.type !== "discord") {
-        return {
-          content: [{ type: "text", text: "No Discord channel available" }],
-          details: {},
-        };
-      }
-      const res = parseTaskSpec(params);
-      if (res.error !== undefined || res.spec === undefined) {
-        return {
-          content: [
-            { type: "text", text: `[!] ${res.error ?? "invalid task spec"}` },
-          ],
-          details: {},
-        };
-      }
-      const task = scheduleTask({
-        channelId: ch.id,
-        channelName: ch.name,
-        prompt: params.prompt!.trim(),
-        spec: res.spec,
-      });
-      const when =
-        task.kind === "cron"
-          ? `cron "${task.cron}"${task.tz ? ` (${task.tz})` : " (system tz)"}`
-          : `at ${new Date(task.atMs!).toISOString()}`;
-      const text =
-        `[ok] task ${task.id} scheduled: ${when}, next fire ${new Date(task.nextFireAt).toISOString()} — ` +
-        `it arrives as a message in this channel. Cancel with /tasks cancel ${task.id}.`;
-      return { content: [{ type: "text", text }], details: { task } };
-    },
-  });
 }
 
 // (named export for test harness; pi itself only uses the default factory)
@@ -6851,7 +3866,7 @@ export async function handleInbound(
 
 // ─── Send to pi session ──────────────────────────────────────────────────
 
-function sendToPi(
+export function sendToPi(
   pi: ExtensionAPI,
   channelId: string,
   text: string,

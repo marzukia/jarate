@@ -52,14 +52,13 @@ import extension, {
   isCompacting,
   isHandoffInFlight,
   isHandoffRestartArmed,
-  moveSessionFileAside,
   opWindowLabel,
   setHandoffInFlight,
   setHandoffRestartArmed,
   setHandoverCompleteForTest,
-  setSystemdRestartHookForTest,
-  stopAllOpTicks,
 } from "./index";
+import { stopAllOpTicks } from "./live";
+import { setSystemdRestartHookForTest } from "./restart-ops";
 import { renderBoard, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
 
@@ -2144,65 +2143,6 @@ describe("liveKickoffState scheduled pipe (issue #140)", () => {
     const live = liveKickoffState(tmp);
     expect(live.todoBoard).toBeNull();
     expect(live.openTodos).toBeNull();
-  });
-});
-
-// ─── moveSessionFileAside (F5) ──────────────────────────────────────────────
-
-describe("moveSessionFileAside (F5)", () => {
-  let tmp = "";
-  let oldHome = "";
-  beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-move-"));
-    oldHome = process.env.HOME || "";
-    process.env.HOME = tmp;
-  });
-  afterEach(() => {
-    process.env.HOME = oldHome;
-    fs.rmSync(tmp, { recursive: true, force: true });
-  });
-
-  const mkSession = (name: string, ageMs: number): string => {
-    const dir = path.join(tmp, ".pi", "agent", "sessions", "profile");
-    fs.mkdirSync(dir, { recursive: true });
-    const f = path.join(dir, name);
-    fs.writeFileSync(f, "{}");
-    const t = Date.now() - ageMs;
-    fs.utimesSync(f, t / 1000, t / 1000);
-    return f;
-  };
-
-  test("explicit target is moved even when another file is newer", () => {
-    const live = mkSession("live.jsonl", 60_000); // older
-    const other = mkSession("newer.jsonl", 1_000); // newer mtime
-    const ctx: any = {
-      cwd: tmp,
-      sessionManager: { getSessionFile: () => live },
-    };
-    moveSessionFileAside(ctx, live);
-    expect(fs.existsSync(live)).toBe(false);
-    expect(
-      fs
-        .readdirSync(path.dirname(live))
-        .some((f) => f.startsWith("live.jsonl.reset-")),
-    ).toBe(true);
-    expect(fs.existsSync(other)).toBe(true); // the mtime trap is avoided
-  });
-  test("explicit target missing → mtime fallback picks the newest", () => {
-    const old = mkSession("old.jsonl", 60_000);
-    const newer = mkSession("newer.jsonl", 1_000);
-    const ctx: any = {
-      cwd: tmp,
-      sessionManager: { getSessionFile: () => path.join(tmp, "gone.jsonl") },
-    };
-    moveSessionFileAside(ctx);
-    expect(fs.existsSync(newer)).toBe(false);
-    expect(fs.existsSync(old)).toBe(true);
-  });
-  test("no sessionManager at all → mtime fallback still works", () => {
-    const newer = mkSession("newer.jsonl", 1_000);
-    moveSessionFileAside({ cwd: tmp } as any);
-    expect(fs.existsSync(newer)).toBe(false);
   });
 });
 
