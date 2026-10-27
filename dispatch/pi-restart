@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# pi-restart: restart pi.service with a guaranteed delayed self-check.
+# Usage: pi-restart [delay_s=90] [in-flight note]
+# - saves the note to ~/.config/pi-inflight.md (the post-check heartbeat
+#   includes it, so the woken agent knows what was in flight)
+# - schedules a one-shot systemd timer (transient unit, auto-cleans) that
+#   runs pi-postcheck.sh N seconds later
+# - pi-postcheck posts a visible status line AND a heartbeat through the
+#   pi-dispatch Discord webhook (the agent never sees its own bot messages;
+#   the webhook post is polled back as a turn and wakes the agent)
+# - THEN restarts pi.service detached
+# Always use this instead of raw `systemctl --user restart pi.service`.
+set -u
+DELAY="${1:-90}"
+NOTE="${2:-}"
+if [ -n "$NOTE" ]; then
+  printf '%s\n' "$NOTE" > "$HOME/.config/pi-inflight.md"
+  chmod 600 "$HOME/.config/pi-inflight.md"
+else
+  rm -f "$HOME/.config/pi-inflight.md"
+fi
+UNIT="pi-postcheck-$(date +%s)"
+XDG_RUNTIME_DIR=/run/user/$(id -u) systemd-run --user --on-active="${DELAY}s" --unit="$UNIT" \
+  "$HOME/scripts/pi-postcheck.sh" > /dev/null 2>&1 || echo "pi-restart: [!] postcheck timer FAILED to schedule"
+( sleep 5; XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart pi.service ) &
+disown
+echo "pi-restart: postcheck at +${DELAY}s ($UNIT), restart in 5s"

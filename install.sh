@@ -8,11 +8,12 @@
 #      machine-local)
 #   4. makes machine paths POINTERS (symlinks) into the checkout:
 #        dispatch family — the drain is declared (#279): only the
-#        jarate-bg launch stub (exit 10; `signal` subcommand stays live)
-#        and pi-postcheck.sh are owned by install.sh, each linked into
-#        BOTH ~/.local/bin and ~/scripts:
+#        jarate-bg launch stub (exit 10; `signal` subcommand stays live),
+#        pi-postcheck.sh and pi-restart are owned by install.sh, each
+#        linked into BOTH ~/.local/bin and ~/scripts:
 #        {~/.local/bin,~/scripts}/jarate-bg -> <jarate>/dispatch/jarate-bg
 #        {~/.local/bin,~/scripts}/pi-postcheck.sh -> <jarate>/dispatch/pi-postcheck.sh
+#        {~/.local/bin,~/scripts}/pi-restart     -> <jarate>/dispatch/pi-restart
 #        ~/scripts/jarate    -> <jarate>/bin/jarate
 #        ~/bin/jarate        -> <jarate>/bin/jarate
 #   5. cleans up a stale ~/projects/recall symlink left by pre-2026-10-17
@@ -148,14 +149,15 @@ fi
 
 # --- 3. pointer links --------------------------------------------------------
 # Dispatch family: the drain is declared (#279, t180-verified: zero
-# state=running records fleet-wide) — install.sh owns only the two live
+# state=running records fleet-wide) — install.sh owns only the three live
 # members: the jarate-bg launch stub (exit 10 retirement notice; the
-# `signal` subcommand stays live until the fleet timer lands) and
-# pi-postcheck.sh (live: pi-restart schedules it 90s after every restart).
+# `signal` subcommand stays live until the fleet timer lands),
+# pi-postcheck.sh (live: pi-restart schedules it 90s after every restart),
+# and pi-restart (issue #260: the sanctioned pi.service restart).
 # Linked into BOTH ~/.local/bin and ~/scripts. install.sh OWNS these names:
 # stale entries (pi-dispatch-era files, symlinks to old checkouts) are
 # re-pointed, one auditable line per change.
-for tool in jarate-bg pi-postcheck.sh; do
+for tool in jarate-bg pi-postcheck.sh pi-restart; do
   link_owned "$HOME/.local/bin/$tool" "$JARATE_DIR/dispatch/$tool"
   link_owned "$HOME/scripts/$tool"    "$JARATE_DIR/dispatch/$tool"
 done
@@ -193,7 +195,7 @@ link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
 # never dispatch a job. Hard fail outside dry-run.
 UNIT_PATH="$HOME/.local/bin:$HOME/bin:$HOME/scripts:/usr/local/bin:/usr/bin:/bin"
 PATH_FAIL=0
-FAMILY_TOOLS="jarate-bg pi-postcheck.sh"
+FAMILY_TOOLS="jarate-bg pi-postcheck.sh pi-restart"
 for tool in $FAMILY_TOOLS jarate; do
   resolved="$(env -i PATH="$UNIT_PATH" command -v "$tool" 2>/dev/null || true)"
   if [ -z "$resolved" ]; then
@@ -211,7 +213,7 @@ for tool in $FAMILY_TOOLS jarate; do
     # checkout, so a shadow that survived the re-point fails install
     # loudly instead of at dispatch time.
     case "$tool" in
-      jarate-bg|pi-postcheck.sh) ;;
+      jarate-bg|pi-postcheck.sh|pi-restart) ;;
       *) continue ;;
     esac
     sum_installed="$(sha256sum "$resolved" 2>/dev/null | cut -d' ' -f1 || true)"
