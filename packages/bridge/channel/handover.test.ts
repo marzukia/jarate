@@ -470,6 +470,70 @@ describe("extractDeterministic", () => {
       "push branch pi-bg/",
     );
   });
+  test("#291: stale last-ask - answered inbounds are not pending (no stale pointer)", () => {
+    // both inbounds have an assistant answer after them in the snapshot -
+    // the old list pointed at the handled relay; the pointer must not.
+    // empty span: no fallback candidates, so the section is (none).
+    const p = basePrep();
+    p.messagesToSummarize = [];
+    p.turnPrefixMessages = [];
+    const entries = [
+      inb(1, "warden", "relay: push the main-sync patch"),
+      {
+        id: "a1",
+        type: "message",
+        message: { role: "assistant", content: "pushed the patch" },
+      },
+      inb(2, "warden", "relay: file the issue for it"),
+      {
+        id: "a2",
+        type: "message",
+        message: { role: "assistant", content: "filed the issue" },
+      },
+    ];
+    const s = extractDeterministic(p, entries as any, emptyCtx);
+    expect(s.lastUserAsks).toEqual([]);
+  });
+  test("#291: pointer moves to the truly open ask (the last unanswered one)", () => {
+    // the relay was processed (an assistant answer landed after it); the
+    // open ask is the newest inbound with no answer after it.
+    const entries = [
+      inb(1, "warden", "relay: push the main-sync patch"),
+      {
+        id: "a1",
+        type: "message",
+        message: { role: "assistant", content: "pushed the patch" },
+      },
+      inb(2, "warden", "now file the issue for it"),
+    ];
+    const s = extractDeterministic(basePrep(), entries as any, emptyCtx);
+    // the handled relay is filtered out; the pointer lands on the open ask.
+    expect(s.lastUserAsks).toEqual(["now file the issue for it"]);
+  });
+  test("#291: fallback - an answered span ask is not pending", () => {
+    // no channel inbounds: the fallback reads user-role span messages.
+    // "fix the bug" has an assistant answer after it in the span, so only
+    // the un-answered "push branch" ask is pending.
+    const s = extractDeterministic(basePrep(), [], emptyCtx);
+    expect(s.lastUserAsks).toEqual([
+      "push branch pi-bg/20260923-021858-3964667",
+    ]);
+  });
+  test("#291: fallback - an assistant in the kept tail answers every span ask", () => {
+    const p = basePrep();
+    p.messagesToSummarize = [{ role: "user", content: "old ask" }];
+    p.turnPrefixMessages = [];
+    p.firstKeptEntryId = "keep-0";
+    const entries = [
+      {
+        id: "keep-0",
+        type: "message",
+        message: { role: "assistant", content: "working on it" },
+      },
+    ];
+    const s = extractDeterministic(p, entries as any, emptyCtx);
+    expect(s.lastUserAsks).toEqual([]);
+  });
   test("context line: from usage when available, else tokensBefore", () => {
     const withUsage = formatContextLine(
       { tokens: 210_000, contextWindow: 262_144, percent: 80.1 },
@@ -606,6 +670,150 @@ describe("serializeTranscript", () => {
     expect(t).toMatch(
       /…\[kept tail truncated: \d+ oldest kept entries dropped\]/,
     );
+  });
+});
+
+// ─── #291: handover amnesia (last completed turn + last-ask) ─────────────
+
+describe("#291: capture through the last completed turn", () => {
+  test("last turn completed before compact: Q+R survive a huge kept tail (no re-do)", () => {
+    const p = basePrep();
+    p.isSplitTurn = true;
+    // the last completed turn: the user turn + the start of the answer in
+    // the turn prefix (span); the rest of the turn (tool-heavy, over 60k)
+    // in the kept tail from the cut point on.
+    p.messagesToSummarize = [
+      { role: "user", content: "old ask" },
+      { role: "assistant", content: "old answer" },
+    ];
+    p.turnPrefixMessages = [
+      { role: "user", content: "push the main-sync patch as a PR" },
+      { role: "assistant", content: "dispatching the patch" },
+    ];
+    p.firstKeptEntryId = "keep-0";
+    const entries = [
+      {
+        id: "keep-0",
+        type: "message",
+        message: { role: "assistant", content: "tool call one" },
+      },
+      ...Array.from({ length: 100 }, (_, i) => ({
+        id: `t${i}`,
+        type: "message",
+        message: {
+          role: "toolResult",
+          content: `tool output ${i} ${"x".repeat(700)}`,
+        },
+      })),
+      {
+        id: "final",
+        type: "message",
+        message: {
+          role: "assistant",
+          content: "done: the patch is pushed as PR #99",
+        },
+      },
+    ];
+    const tail = keptTailMessages(p, entries as any);
+    const t = serializeTranscript(p, tail);
+    // the turn's user turn + the answer's end survive even though the tail
+    // alone is over the cap (the old code gave the span zero budget and
+    // dropped the question).
+    expect(t).toContain("[user] push the main-sync patch as a PR");
+    expect(t).toContain("done: the patch is pushed as PR #99");
+    // the turn's MIDDLE is dropped, marked - never the turn's start or end.
+    expect(t).toMatch(
+      /…\[mid-turn truncated: \d+ entries dropped from the middle of the last turn\]/,
+    );
+    // the doc stays under the cap
+    expect(t.length).toBeLessThanOrEqual(60_000 + 256);
+  });
+  test("last turn wholly in the kept tail: its user turn survives the tail cap", () => {
+    const p = basePrep();
+    p.messagesToSummarize = [];
+    p.turnPrefixMessages = [];
+    p.firstKeptEntryId = "k0";
+    // the last completed turn sits wholly in the tail: user turn + a
+    // tool-heavy answer, over 60k in total.
+    const entries = [
+      {
+        id: "k0",
+        type: "message",
+        message: { role: "user", content: "ship it" },
+      },
+      ...Array.from({ length: 100 }, (_, i) => ({
+        id: `t${i}`,
+        type: "message",
+        message: {
+          role: "toolResult",
+          content: `output ${i} ${"y".repeat(700)}`,
+        },
+      })),
+      {
+        id: "final",
+        type: "message",
+        message: { role: "assistant", content: "shipped" },
+      },
+    ];
+    const tail = keptTailMessages(p, entries as any);
+    const t = serializeTranscript(p, tail);
+    // the turn's anchor ("ship it") + the newest state survive; the middle
+    // is dropped with a marker (the old code dropped the anchor itself).
+    expect(t).toContain("[user] ship it");
+    expect(t).toContain("[assistant] shipped");
+    expect(t).toMatch(
+      /…\[mid-turn truncated: \d+ entries dropped from the middle of the last turn\]/,
+    );
+    expect(t.length).toBeLessThanOrEqual(60_000 + 256);
+  });
+  test("mid-turn marker present when the boundary is ambiguous (isSplitTurn)", () => {
+    const p = basePrep();
+    p.isSplitTurn = true;
+    p.turnPrefixMessages = [
+      { role: "user", content: "push the main-sync patch" },
+      { role: "assistant", content: "dispatching" },
+    ];
+    p.firstKeptEntryId = "keep-0";
+    const entries = [
+      {
+        id: "keep-0",
+        type: "message",
+        message: { role: "assistant", content: "tool call" },
+      },
+      {
+        id: "t1",
+        type: "message",
+        message: { role: "toolResult", content: "tool output" },
+      },
+    ];
+    const t = serializeTranscript(p, keptTailMessages(p, entries as any));
+    expect(t).toContain("…[mid-turn at compact:");
+    // the marker sits at the tail→span boundary (the split turn's
+    // continuation meets its user turn).
+    const iMarker = t.indexOf("…[mid-turn at compact:");
+    const iTail = t.indexOf("[tool] tool output");
+    const iSpan = t.indexOf("[user] push the main-sync patch");
+    expect(iMarker).toBeGreaterThan(iTail);
+    expect(iMarker).toBeLessThan(iSpan);
+  });
+  test("no mid-turn marker when the boundary is a turn start", () => {
+    const p = basePrep();
+    p.isSplitTurn = false;
+    p.firstKeptEntryId = "keep-0";
+    const entries = [
+      {
+        id: "keep-0",
+        type: "message",
+        message: { role: "user", content: "new turn question" },
+      },
+      {
+        id: "t1",
+        type: "message",
+        message: { role: "assistant", content: "new turn answer" },
+      },
+    ];
+    const t = serializeTranscript(p, keptTailMessages(p, entries as any));
+    expect(t).not.toContain("…[mid-turn at compact:");
   });
 });
 
@@ -848,11 +1056,13 @@ describe("renderTemplate", () => {
   });
   test("deterministic sections carry the extracted facts", () => {
     expect(doc).toContain("- PR/issues/tickets:");
-    expect(doc).toContain("#42");
-    expect(doc).toContain("https://example.com/a");
     expect(doc).toContain("- model: vllm/qwen3.8-27b");
     expect(doc).toContain("183k tokens before compaction");
-    expect(doc).toContain("1. fix the bug in PR #42");
+    // #291: an answered ask is not pending - "fix the bug in PR #42" has an
+    // assistant answer after it in the span, so the section carries only the
+    // truly open ask (the pointer must not land on a handled item).
+    expect(doc).toContain("1. push branch pi-bg/20260923-021858-3964667");
+    expect(doc).not.toContain("fix the bug in PR #42");
   });
   test("file tags cumulative + machine-parseable", () => {
     const t = parsePriorTags(doc);
