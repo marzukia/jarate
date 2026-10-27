@@ -65,3 +65,12 @@ Tests: last-turn-completed-before-compact (Q+R in transcript, no stale pointer),
 stale last-ask (pointer moves to the truly open ask), mid-turn marker present
 when the boundary is ambiguous, plus cap-overflow cases (turn over 60k keeps
 anchor + newest; existing truncation behavior preserved).
+
+## Implementation note (size gate)
+
+`serializeTranscript` + `formatTranscriptLine` + `keptTailMessages` + `msgText`
+moved to the sibling module `packages/bridge/channel/transcript.ts` (size gate:
+ratcheted files may only shrink; handover.ts budget 1409 non-blank lines).
+handover.ts re-exports them (`keptTailMessages`, `msgText`,
+`serializeTranscript`) so existing importers (tests, buildHandover) are
+untouched. No behavior change from the split — the move is verbatim.

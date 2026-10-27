@@ -29,18 +29,25 @@ import type {
   UserMessage,
 } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import {
-  type ContextUsage,
-  type ExtensionAPI,
-  type ExtensionContext,
-  type SessionEntry,
-  sessionEntryToContextMessages,
+import type {
+  ContextUsage,
+  ExtensionAPI,
+  ExtensionContext,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { fmtTokensLC } from "./format";
 import { jobsView } from "./jobs";
 import { formatTaskLine, loadTasks } from "./tasks";
 import { defaultHome, loadBoard, renderBoard } from "./todos";
+import { keptTailMessages, msgText, serializeTranscript } from "./transcript";
 import { getDefaultChannel, loadChannelConfig } from "./types";
+
+// re-exported for the tests + existing importers
+export {
+  keptTailMessages,
+  msgText,
+  serializeTranscript,
+} from "./transcript";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -234,28 +241,6 @@ export function shouldHandoff(
   return false;
 }
 
-// ─── Message text ───────────────────────────────────────────────────────────
-
-/** Text of one pi message (string or content blocks); custom messages
- *  contribute their serialized content. */
-export function msgText(m: HandoverMessage | null | undefined): string {
-  if (!m) return "";
-  const c = m.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    return c
-      .map((b) => {
-        if (typeof b === "string") return b;
-        if (b && typeof b === "object" && "text" in b)
-          return String((b as { text: unknown }).text ?? "");
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
-}
-
 /** Strip LLM-only framing (channel-ctx, todo-board) from an inbound body
  *  so user asks read as the user wrote them. */
 export function stripPromptFraming(s: string): string {
@@ -382,21 +367,53 @@ export function extractDeterministic(
 
   // Last user asks (RCA F3): HUMAN channel inbounds only, last 2 — the old
   // list read like a pi-bg server log (Beepy <embed> webhooks, machine-wake
-  // cards, bridge-injected wakes). Fallback: user-role span messages.
-  const asks: string[] = [];
-  for (const e of branchEntries) {
-    if (e.type === "custom_message" && e.customType === "channel-inbound") {
-      if (!isHumanInbound(e)) continue;
-      const body = stripPromptFraming(inboundBody(e));
-      if (body) asks.push(body);
+  // cards, bridge-injected wakes). #291: an ask is PENDING only when NO
+  // assistant answer landed after it in the captured range (the snapshot) —
+  // the old list pointed at handled items (the answer landed moments before
+  // the snapshot) and the resumed agent re-answered them. Fallback:
+  // user-role span messages (same answer check; the kept tail is entirely
+  // newer than the span, so any assistant in it answers every span ask).
+  const isAssistantEntry = (e: SessionEntry): boolean =>
+    e.type === "message" &&
+    (e as { message?: { role?: string } }).message?.role === "assistant";
+  let lastAssistantIdx = -1;
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    if (isAssistantEntry(branchEntries[i])) {
+      lastAssistantIdx = i;
+      break;
     }
   }
+  const asks: string[] = [];
+  for (let i = 0; i < branchEntries.length; i++) {
+    const e = branchEntries[i];
+    if (e.type !== "custom_message" || e.customType !== "channel-inbound")
+      continue;
+    if (!isHumanInbound(e)) continue;
+    if (lastAssistantIdx > i) continue; // an assistant answer landed after it
+    const body = stripPromptFraming(inboundBody(e));
+    if (body) asks.push(body);
+  }
   if (asks.length === 0) {
-    for (const m of [
+    const spanMsgs = [
       ...preparation.messagesToSummarize,
       ...preparation.turnPrefixMessages,
-    ]) {
+    ];
+    let spanLastAssistant = -1;
+    for (let i = spanMsgs.length - 1; i >= 0; i--) {
+      if (spanMsgs[i]?.role === "assistant") {
+        spanLastAssistant = i;
+        break;
+      }
+    }
+    const keptIdx = branchEntries.findIndex(
+      (e) => e.id === preparation.firstKeptEntryId,
+    );
+    const tailHasAssistant =
+      keptIdx >= 0 && branchEntries.slice(keptIdx).some(isAssistantEntry);
+    for (let i = 0; i < spanMsgs.length; i++) {
+      const m = spanMsgs[i];
       if (m?.role !== "user") continue;
+      if (spanLastAssistant > i || tailHasAssistant) continue;
       const body = stripPromptFraming(msgText(m));
       if (body) asks.push(body);
     }
@@ -502,124 +519,6 @@ export function formatSessionStats(
   }
   const entries = entryCount != null ? ` (${entryCount} entries)` : "";
   return `${sessionFile}${stats}${entries}`;
-}
-
-// ─── Transcript + LLM prompt ────────────────────────────────────────────────
-
-const MSG_CAP = 4_000;
-const TRANSCRIPT_CAP = 60_000;
-
-/**
- * Serialize the transcript for the doc (RCA F2 — pi-compaction-lossy-rca.md
- * §5). The old code walked the span oldest→newest and cut at
- * TRANSCRIPT_CAP, silently dropping the NEWEST work — the very state the
- * session was in at compaction. The doc must always contain the current
- * state, so:
- *
- *   1. pi-prep's KEPT TAIL (entries at/after firstKeptEntryId — see
- *      keptTailMessages) is serialized first, in full, chronological. The
- *      restart drops it from pi's context (pi boots from the LLM summary),
- *      so this doc is the only surviving copy of it.
- *   2. The older span (messagesToSummarize + turnPrefixMessages) then fills
- *      the remaining TRANSCRIPT_CAP, walking newest→oldest. The kept subset
- *      renders chronological, with a marker where the oldest messages were
- *      dropped.
- *
- * Each message is still capped at MSG_CAP.
- */
-export function serializeTranscript(
-  p: HandoverPreparation,
-  keptTail: HandoverMessage[] = [],
-): string {
-  const span = [
-    ...(p.messagesToSummarize ?? []),
-    ...(p.turnPrefixMessages ?? []),
-  ];
-
-  // 1) kept tail — full, chronological. If the tail alone overflows the cap,
-  //    drop from the OLDEST tail side (newest state survives).
-  const allTail = keptTail
-    .map(formatTranscriptLine)
-    .filter((l): l is string => l != null);
-  let tailLines = allTail;
-  let total = tailLines.reduce((n, l) => n + l.length + 1, 0);
-  while (tailLines.length > 1 && total > TRANSCRIPT_CAP) {
-    total -= tailLines[0].length + 1;
-    tailLines = tailLines.slice(1);
-  }
-  const tailDropped = allTail.length - tailLines.length;
-
-  // 2) span — newest first, filling the remainder of the cap.
-  const spanLines: string[] = [];
-  let spanTruncated = false;
-  for (let i = span.length - 1; i >= 0; i--) {
-    const line = formatTranscriptLine(span[i]);
-    if (!line) continue;
-    if (total + line.length + 1 > TRANSCRIPT_CAP) {
-      spanTruncated = true;
-      break;
-    }
-    spanLines.push(line);
-    total += line.length + 1;
-  }
-  spanLines.reverse(); // render chronological in the doc
-
-  const out: string[] = [];
-  if (tailLines.length > 0) {
-    if (tailDropped > 0)
-      out.push(
-        `…[kept tail truncated: ${tailDropped} oldest kept entries dropped]`,
-      );
-    out.push(...tailLines);
-  }
-  if (spanLines.length > 0) {
-    if (tailLines.length > 0) out.push("…[older span]");
-    if (spanTruncated) out.push("…[transcript truncated]");
-    out.push(...spanLines);
-  }
-  return out.join("\n");
-}
-
-/** One transcript line: `[role] body`, per-message capped. null = none. */
-function formatTranscriptLine(
-  m: HandoverMessage | null | undefined,
-): string | null {
-  const text = msgText(m).trim();
-  if (!text) return null;
-  const role =
-    m?.role === "assistant"
-      ? "assistant"
-      : m?.role === "toolResult"
-        ? "tool"
-        : "user";
-  let body = text;
-  if (body.length > MSG_CAP) body = `${body.slice(0, MSG_CAP)}\n…[truncated]`;
-  return `[${role}] ${body}`;
-}
-
-/**
- * pi-prep's KEPT TAIL as context messages (RCA F2): the branch entries at/
- * after preparation.firstKeptEntryId — the newest work pi keeps in context
- * across the compaction. The restart still drops it (pi boots from the LLM
- * summary, not the tail), so the handover doc carries it in full. Returns
- * [] when the id is not on the branch (safe: span-only doc).
- */
-export function keptTailMessages(
-  preparation: HandoverPreparation,
-  branchEntries: SessionEntry[],
-): HandoverMessage[] {
-  if (branchEntries.length === 0) return [];
-  const idx = branchEntries.findIndex(
-    (e) => e.id === preparation.firstKeptEntryId,
-  );
-  if (idx < 0) return [];
-  const out: HandoverMessage[] = [];
-  for (let i = idx; i < branchEntries.length; i++) {
-    for (const m of sessionEntryToContextMessages(branchEntries[i])) {
-      out.push(m as HandoverMessage);
-    }
-  }
-  return out;
 }
 
 /**
