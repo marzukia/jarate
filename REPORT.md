@@ -191,3 +191,83 @@ save, and the undo tmp-scheme rewrite.
 
 No changes to `channel/index.ts` (ja-style-v4-nits owns it), no new deps,
 no bun.lock churn.
+
+
+# REPORT — issue #284 (re-add the fresh-onboard 15-min watchdog timer template)
+
+## Outcome
+
+PR open: https://github.com/marzukia/jarate/pull/302 (branch
+`pi-bg/284-watchdog-template`, commit `548d9192` + report commit, base
+`main` e517c322). Issue #282 closed via gh with the ordered comment
+("Removed in #287 (374130af); residual doc refs in NEW-AGENT.md are the
+live pi/webdrop CLI, not the orphans.").
+
+## Change summary
+
+1. **Templates** — `deploy/jarate-bg-watchdog.{service,timer}` (new).
+   Mirrors the `deploy/jarate-deploy.{service,timer}` conventions
+   (`%h` specifiers, `[Install] WantedBy=timers.target`).
+   `ExecStart=%h/scripts/jarate-bg-watchdog` — the script live boxes
+   retain (symlink into the pre-#280 checkout; verified: the repo copy
+   `dispatch/jarate-bg-watchdog` is GONE since #280/3c, 274801fc, and
+   install.sh links neither it nor the template — it only cleans up
+   dangling symlinks for it). Cadence verbatim from the pre-scrub
+   template (git show 94d99e65^:dispatch/pi-bg-watchdog.timer):
+   `OnBootSec=5min`, `OnUnitActiveSec=15min`, `Persistent=true`,
+   `AccuracySec=1min`.
+2. **`bin/jarate` setup (step 9)** — copies the two `%h`-only templates
+   (plain `cp`, no sed; no checkout path in them), adds the
+   template-missing guard, `enable --now jarate-bg-watchdog.timer`,
+   per-unit die messages, dry-run plan line updated.
+3. **`docs/SETUP.md`** — step 8 unit list; what-it-does-not-do bullet
+   (fresh box: timer armed, sweep unit fails until the script is
+   restored — documented consequence of #280/3c); manual procedure
+   (cp + enable lines + note).
+4. **`install.sh`** — comments-only. The retired-name cleanup list
+   (line ~172) verified to already match post-#280/#283 reality: all 9
+   names are gone from the repo and none are linked, so
+   `jarate-bg-watchdog` correctly stays in the cleanup list (the
+   re-added template is installed by `jarate setup`, not linked by
+   install.sh). Comment now says so explicitly.
+5. **Tests** — `bin/jarate.test.ts`: setup fixture copies the two new
+   templates from the repo; `--yes` asserts the unit files land in
+   `~/.config/systemd/user/` with the right content
+   (`ExecStart=%h/scripts/jarate-bg-watchdog`, `OnUnitActiveSec=15min`,
+   `WantedBy=timers.target`) + `--user enable --now
+   jarate-bg-watchdog.timer` in the systemctl log.
+
+Existing boxes keep their installed `pi-bg-watchdog` units (ExecStart
+points at the retained script); not migrated by this change (per issue).
+
+## Gate outputs (repo root, commit 548d9192)
+
+- `bun test`: **1158 pass, 0 fail** (bridge 1087 + bin 30 + dispatch +
+  deploy 6) — first run had 17 fails from missing node_modules (fresh
+  worktree); `bun install` → all green.
+- `cd packages/bridge && bun x tsc --noEmit`: **clean**
+- `bunx biome check .`: **Checked 80 files. No fixes applied.** (0
+  diagnostics)
+- `bun scripts/size-ratchet.ts --base origin/main`: **SIZE GATE: OK
+  (9 ratcheted)**
+- `HOME=/tmp/fake-home-284 bash install.sh --dry-run`: **rc=0**, output
+  unchanged vs baseline (same link lines, same PATH [!] notes on the
+  empty fake HOME, settings.json untouched)
+- `bin/jarate` non-blank lines 760 → 769 (budget 800, not ratcheted);
+  `bin/jarate.test.ts` 1042 → 1051 (test x3 budget)
+
+## Hygiene
+
+- `gh issue close 282 --comment "Removed in #287 (374130af); residual
+  doc refs in NEW-AGENT.md are the live pi/webdrop CLI, not the
+  orphans."` — done (✓ Closed issue marzukia/jarate#282). Verified
+  374130af is an ancestor of main.
+
+## Push + PR
+
+- `git push origin pi-bg/284-watchdog-template` → bare mirror
+  /srv/fleetwork/jarate.git (branch at 548d9192, verified via
+  `git ls-remote origin`)
+- `git push github pi-bg/284-watchdog-template` → new branch on GitHub
+- `gh pr create --base main --head pi-bg/284-watchdog-template` →
+  **https://github.com/marzukia/jarate/pull/302**

@@ -119,8 +119,10 @@ stderr. Exit codes: 0 ok, 1 setup failed, 2 usage.
    drain, #279). `--webhook-url` skips the API
 8. units from the `deploy/` templates — `%h` specifiers, so the
    same files work for any user: `pi.service` (name substituted into
-   `Description`, jarate path → checkout), `jarate-deploy.{service,timer}`
-   → `~/.config/systemd/user/`;
+   `Description`, jarate path → checkout),
+   `jarate-deploy.{service,timer}`, `jarate-bg-watchdog.{service,timer}`
+   (15-min sweep schedule; `%h`-only, plain copy) →
+   `~/.config/systemd/user/`;
    `daemon-reload`, `enable-linger` (note on failure), `enable --now`
 9. boot gate (≤90s): `pi.service` active **and** the journal shows
    `[interactions] registered` — the same signal `deploy.sh` trusts. On
@@ -142,11 +144,18 @@ The edge runtime IS the setup — after step 2 a standard box is done:
 - **`jarate-deploy` timer** — from step 8; pulls repo changes and restarts
   `pi.service` when the bridge changed (health-gated, auto-rollback —
   [DEPLOY.md](DEPLOY.md))
+- **`jarate-bg-watchdog` timer** — from step 8; the 15-min sweep
+  schedule. `ExecStart` points at `~/scripts/jarate-bg-watchdog`, which
+  live boxes retain (symlink into the pre-#280 checkout); the repo copy
+  of the script left with #280/3c (the sweep work centralised to
+  hall-monitor), so on a fresh box the timer is armed but the sweep
+  unit fails (script absent) until the script is restored
 
 No per-box dispatch machinery to install: context-hungry work goes to the
 fleet control plane (hall-monitor fleetwork, `POST /fleet/dispatch`); the
 old per-box dispatch lane — the callback-webhook runbook and watchdog
-fleet liveness — is not part of standard setup anymore (pointer:
+fleet liveness — is not part of standard setup anymore (the watchdog
+timer's *schedule* is, per the bullet above; pointer:
 [DISPATCH.md](DISPATCH.md)).
 
 Per-agent, hand-authored — see the ref box's `~/AGENTS.md` for the
@@ -221,14 +230,18 @@ cd ~/projects/jarate
    sed "s#__AGENT_NAME__#$(id -un)#g" deploy/pi.service > "$U/pi.service"
    sed "s#%h/projects/jarate#$PWD#g" deploy/jarate-deploy.service > "$U/jarate-deploy.service"
    cp deploy/jarate-deploy.timer "$U"/
+   cp deploy/jarate-bg-watchdog.service "$U"/
+   cp deploy/jarate-bg-watchdog.timer "$U"/
    systemctl --user daemon-reload
    loginctl enable-linger "$(id -un)"     # needs root
-   systemctl --user enable --now pi.service jarate-deploy.timer
+   systemctl --user enable --now pi.service jarate-deploy.timer jarate-bg-watchdog.timer
    ```
 
    Note the sed for `jarate-deploy.service`: the template carries
    `%h/projects/jarate` as its default checkout; point it at yours if it
-   differs.
+   differs. The watchdog templates are `%h`-only (plain copy); their
+   `ExecStart` points at `~/scripts/jarate-bg-watchdog`, which this box
+   must retain (see §4).
 
 4. **Webhook** — same files as §3.7, by hand.
 

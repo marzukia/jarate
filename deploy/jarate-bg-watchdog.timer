@@ -1,0 +1,13 @@
+[Unit]
+Description=Run jarate bg watchdog sweep every 15 min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# Catch up on missed sweeps (box was off); keep the default 1min slack —
+# a 15-min cadence needs no tick precision.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

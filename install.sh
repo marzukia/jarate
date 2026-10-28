@@ -165,7 +165,10 @@ done
 # this list; #283 dropped the four pi-bg* shims, #279 (the drain) dropped
 # jarate-wait/-tail/-kill + pi-wait, and #280/3c dropped the watchdog (the
 # script is gone; its liveness section centralised to hall-monitor#59,
-# its drift tripwire to the agents-docs cascade). The deleted names are
+# its drift tripwire to the agents-docs cascade). #284 re-added the
+# watchdog UNIT template (deploy/, installed by `jarate setup` — not
+# linked here); the script is still gone from the repo, so
+# jarate-bg-watchdog stays in this list. The deleted names are
 # gone from the repo after the step-1 pull, so our symlinks into them
 # dangle. Remove only OUR links (into this checkout) that are now
 # dangling; a live dir or a foreign symlink is left untouched.

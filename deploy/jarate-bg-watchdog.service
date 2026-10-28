@@ -1,0 +1,10 @@
+[Unit]
+Description=Jarate bg watchdog (15-min sweep; the script is retained on live
+boxes at ~/scripts/jarate-bg-watchdog — the repo copy left with #280/3c,
+the sweep work centralised to hall-monitor)
+
+[Service]
+Type=oneshot
+# %h = the unit user's home, expanded by systemd. User units run as the
+# agent user; no User= key here. The script sets its own paths (lib.sh).
+ExecStart=%h/scripts/jarate-bg-watchdog
