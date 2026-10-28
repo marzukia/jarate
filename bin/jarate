@@ -678,14 +678,16 @@ cmd_setup() {
   local unit_dir="$HOME/.config/systemd/user"
   if [ "$SETUP_UNITS" = 1 ]; then
     if [ "$SETUP_DRY" = 1 ]; then
-      sdry "write $unit_dir/{pi.service,jarate-deploy.service,jarate-deploy.timer} from repo templates (%h specifiers)"
-      sdry "systemctl --user daemon-reload; loginctl enable-linger $(id -un); systemctl --user enable --now pi.service jarate-deploy.timer"
+      sdry "write $unit_dir/{pi.service,jarate-deploy.service,jarate-deploy.timer,jarate-bg-watchdog.service,jarate-bg-watchdog.timer} from repo templates (%h specifiers)"
+      sdry "systemctl --user daemon-reload; loginctl enable-linger $(id -un); systemctl --user enable --now pi.service jarate-deploy.timer jarate-bg-watchdog.timer"
     else
       command -v systemctl >/dev/null 2>&1 \
         || die "setup: systemctl not found (need a systemd user session)"
       export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
       [ -f "$SETUP_DIR/deploy/pi.service" ] \
         || die "setup: template missing: $SETUP_DIR/deploy/pi.service (old checkout? git pull)"
+      [ -f "$SETUP_DIR/deploy/jarate-bg-watchdog.service" ] \
+        || die "setup: template missing: $SETUP_DIR/deploy/jarate-bg-watchdog.service (old checkout? git pull)"
       mkdir -p "$unit_dir" || die "setup: mkdir failed: $unit_dir"
       sed "s#__AGENT_NAME__#${SETUP_NAME}#" "$SETUP_DIR/deploy/pi.service" \
         > "$unit_dir/pi.service" || die "setup: pi.service write failed"
@@ -693,13 +695,22 @@ cmd_setup() {
         > "$unit_dir/jarate-deploy.service" || die "setup: jarate-deploy.service write failed"
       cp "$SETUP_DIR/deploy/jarate-deploy.timer" "$unit_dir/" \
         || die "setup: jarate-deploy.timer copy failed"
+      # The watchdog units are %h-only (no checkout path), so plain cp;
+      # the sweep script itself is retained on live boxes at
+      # ~/scripts/jarate-bg-watchdog (the repo copy left with #280/3c).
+      cp "$SETUP_DIR/deploy/jarate-bg-watchdog.service" "$unit_dir/" \
+        || die "setup: jarate-bg-watchdog.service copy failed"
+      cp "$SETUP_DIR/deploy/jarate-bg-watchdog.timer" "$unit_dir/" \
+        || die "setup: jarate-bg-watchdog.timer copy failed"
       systemctl --user daemon-reload || die "setup: daemon-reload failed"
       loginctl enable-linger "$(id -un)" 2>/dev/null \
         || slog "note: enable-linger needs root (loginctl enable-linger $(id -un))"
       systemctl --user enable --now pi.service || die "setup: enable pi.service failed"
       systemctl --user enable --now jarate-deploy.timer \
-        || die "setup: enable timers failed"
-      slog "units installed + enabled (pi.service, jarate-deploy.timer)"
+        || die "setup: enable jarate-deploy.timer failed"
+      systemctl --user enable --now jarate-bg-watchdog.timer \
+        || die "setup: enable jarate-bg-watchdog.timer failed"
+      slog "units installed + enabled (pi.service, jarate-deploy.timer, jarate-bg-watchdog.timer)"
     fi
   fi
 
