@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,7 +11,6 @@ import {
   assembleDoc,
   buildHandover,
   buildHeader,
-  buildLlmPrompt,
   buildSeedKickoff,
   type ExtractCtxState,
   estTokens,
@@ -35,10 +34,8 @@ import {
   msgText,
   ORCHESTRATOR_PRIME_LINE,
   parseKickoff,
-  parseLlmProse,
   parsePriorTags,
   renderDeterministic,
-  renderTemplate,
   resolveHandoffSettings,
   serializeTranscript,
   shouldHandoff,
@@ -55,7 +52,6 @@ import extension, {
   opWindowLabel,
   setHandoffInFlight,
   setHandoffRestartArmed,
-  setHandoverCompleteForTest,
 } from "./index";
 import { stopAllOpTicks } from "./live";
 import { setSystemdRestartHookForTest } from "./restart-ops";
@@ -924,228 +920,19 @@ describe("keptTailMessages (RCA F2)", () => {
   });
 });
 
-// ─── buildLlmPrompt ─────────────────────────────────────────────────────────
-
-describe("buildLlmPrompt", () => {
-  test("includes prior doc (F6 base), skeleton, transcript", () => {
-    const p = buildLlmPrompt({
-      prior: PRIOR_DOC,
-      skeleton: "refs: #40\ncontext: 183k tokens before compaction",
-      transcript: "[user] hello",
-    });
-    expect(p).toContain("PRIOR HANDOVER DOC");
-    expect(p).toContain("Build the bridge.");
-    expect(p).toContain("DETERMINISTIC SKELETON");
-    expect(p).toContain("refs: #40");
-    expect(p).toContain("TRANSCRIPT");
-    expect(p).toContain("[user] hello");
-  });
-  test("first handover: (none — first handover)", () => {
-    const p = buildLlmPrompt({ prior: null, skeleton: "s", transcript: "t" });
-    expect(p).toContain("(none — first handover)");
-  });
-  test("operator instructions forwarded", () => {
-    const p = buildLlmPrompt({
-      prior: null,
-      skeleton: "s",
-      transcript: "t",
-      instructions: "keep decisions",
-    });
-    expect(p).toContain("OPERATOR INSTRUCTIONS: keep decisions");
-  });
-});
-
-// ─── parseLlmProse ──────────────────────────────────────────────────────────
-
-describe("parseLlmProse", () => {
-  const FULL = [
-    "Sure, here you go:",
-    "[MISSION] Ship the bridge.",
-    "Line two of mission.",
-    "[IN_FLIGHT] Fixing the bug",
-    "[DONE] Wrote the tests",
-    "[BLOCKERS] (none)",
-    "[DECISIONS] Chose bun over npm",
-    "[FOLLOWUPS] Tag the corpus",
-    "[GOTCHAS] vLLM is sacred",
-  ].join("\n");
-  test("parses all seven sections", () => {
-    const p = parseLlmProse(FULL);
-    expect(p.mission).toBe("Ship the bridge.\nLine two of mission.");
-    expect(p.inFlight).toBe("Fixing the bug");
-    expect(p.done).toBe("Wrote the tests");
-    expect(p.blockers).toBe("(none)");
-    expect(p.decisions).toBe("Chose bun over npm");
-    expect(p.followups).toBe("Tag the corpus");
-    expect(p.gotchas).toBe("vLLM is sacred");
-  });
-  test("preamble before the first marker is dropped", () => {
-    const p = parseLlmProse("Sure, here you go:\n[MISSION] x");
-    expect(p.mission).toBe("x");
-  });
-  test("inline marker text is kept", () => {
-    const p = parseLlmProse("[MISSION] one-liner\n[DONE] done-thing");
-    expect(p.mission).toBe("one-liner");
-    expect(p.done).toBe("done-thing");
-  });
-  test("missing sections → empty string", () => {
-    const p = parseLlmProse("[MISSION] only");
-    expect(p.mission).toBe("only");
-    expect(p.inFlight).toBe("");
-    expect(p.gotchas).toBe("");
-  });
-  test("case-insensitive markers", () => {
-    const p = parseLlmProse("[mission] lower");
-    expect(p.mission).toBe("lower");
-  });
-});
-
-// ─── renderTemplate ─────────────────────────────────────────────────────────
-
-describe("renderTemplate", () => {
-  const state = extractDeterministic(basePrep(), [], {
-    ...emptyCtx,
-    priorDoc: PRIOR_DOC,
-    contextUsage: null,
-    modelLabel: "vllm/qwen3.8-27b",
-    sessionFile: null,
-    sessionEntryCount: null,
-  });
-  const prose = {
-    mission: "Ship the bridge.",
-    inFlight: "Fixing the bug",
-    done: "Wrote the tests",
-    blockers: "",
-    decisions: "Chose bun over npm",
-    followups: "",
-    gotchas: "vLLM is sacred",
-  };
-  const doc = renderTemplate(state, prose, buildHeader(NOW, "sess-1", 183_000));
-  test("header line", () => {
-    expect(
-      doc.startsWith(
-        "# Handover - 2026-09-23 · session sess-1 · 183k tokens → handoff",
-      ),
-    ).toBe(true);
-  });
-  test("all ten sections in order", () => {
-    const idx = (t: string) => doc.indexOf(`## ${t}`);
-    const titles = [
-      "1 · Mission",
-      "2 · In-flight (NOW)",
-      "3 · Done (condensed)",
-      "4 · Blockers",
-      "5 · Decisions & Rationale",
-      "6 · Open follow-ups",
-      "7 · References",
-      "8 · Gotchas & Constraints",
-      "9 · State (machine)",
-      "10 · Last user asks",
-    ];
-    let last = -1;
-    for (const t of titles) {
-      const i = idx(t);
-      expect(i).toBeGreaterThan(last);
-      last = i;
-    }
-  });
-  test("empty prose sections render (none)", () => {
-    expect(doc).toMatch(/## 4 · Blockers\n\(none\)/);
-    expect(doc).toMatch(/## 6 · Open follow-ups\n\(none\)/);
-  });
-  test("deterministic sections carry the extracted facts", () => {
-    expect(doc).toContain("- PR/issues/tickets:");
-    expect(doc).toContain("- model: vllm/qwen3.8-27b");
-    expect(doc).toContain("183k tokens before compaction");
-    // #291: an answered ask is not pending - "fix the bug in PR #42" has an
-    // assistant answer after it in the span, so the section carries only the
-    // truly open ask (the pointer must not land on a handled item).
-    expect(doc).toContain("1. push branch pi-bg/20260923-021858-3964667");
-    expect(doc).not.toContain("fix the bug in PR #42");
-  });
-  test("file tags cumulative + machine-parseable", () => {
-    const t = parsePriorTags(doc);
-    expect(t.readFiles).toEqual(
-      expect.arrayContaining([
-        "/home/monky/code/app/src/old1.ts",
-        "/home/monky/code/app/src/a.ts",
-      ]),
-    );
-    expect(t.modifiedFiles).toEqual(
-      expect.arrayContaining(["/home/monky/code/app/src/b.ts"]),
-    );
-    expect(doc).toMatch(
-      /<read-files>[\s\S]*<\/read-files>\s*<modified-files>[\s\S]*<\/modified-files>\s*$/,
-    );
-  });
-  test("empty file sets round-trip to [] (no (none) placeholder in tags)", () => {
-    const emptyState = extractDeterministic(
-      {
-        ...basePrep(),
-        messagesToSummarize: [],
-        turnPrefixMessages: [],
-        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-      },
-      [],
-      emptyCtx,
-    );
-    const d = renderTemplate(
-      emptyState,
-      {
-        mission: "m",
-        inFlight: "i",
-        done: "d",
-        blockers: "b",
-        decisions: "d",
-        followups: "f",
-        gotchas: "g",
-      },
-      buildHeader(NOW, "s", 1_000),
-    );
-    expect(d).toContain("<read-files>\n</read-files>");
-    const t = parsePriorTags(d);
-    expect(t.readFiles).toEqual([]);
-    expect(t.modifiedFiles).toEqual([]);
-    // and a prior doc with (none) in the tags is still parsed clean
-    expect(
-      parsePriorTags("<read-files>\n(none)\n</read-files>").readFiles,
-    ).toEqual([]);
-  });
-});
-
 // ─── sizeGuard ──────────────────────────────────────────────────────────────
 
 describe("sizeGuard", () => {
   const state = extractDeterministic(basePrep(), [], emptyCtx);
-  const bigDone = Array.from(
+  const header = buildHeader(NOW, "s", 1_000);
+  const bigTranscript = Array.from(
     { length: 300 },
     (_, i) =>
-      `did thing number ${i} with a fairly long description to burn space`,
+      `[assistant] did thing number ${i} with a fairly long description to burn space`,
   ).join("\n");
-  const prose = {
-    mission: "m",
-    inFlight: "i",
-    done: bigDone,
-    blockers: "b",
-    decisions: "d",
-    followups: "f",
-    gotchas: "g",
-  };
-  const doc = renderTemplate(state, prose, buildHeader(NOW, "s", 1_000));
+  const doc = renderDeterministic(state, bigTranscript, header);
   test("small doc passes through unchanged", () => {
-    const small = renderTemplate(
-      state,
-      {
-        mission: "m",
-        inFlight: "i",
-        done: "d",
-        blockers: "b",
-        decisions: "d",
-        followups: "f",
-        gotchas: "g",
-      },
-      buildHeader(NOW, "s", 1_000),
-    );
+    const small = renderDeterministic(state, "[user] x", header);
     expect(sizeGuard(small, 12_000)).toBe(small);
   });
   test("oversized doc is cut under budget, condensed marker present", () => {
@@ -1156,18 +943,11 @@ describe("sizeGuard", () => {
   });
   test("protected sections survive the cut", () => {
     const out = sizeGuard(doc, 4_000);
-    for (const t of [
-      "2 · In-flight (NOW)",
-      "7 · References",
-      "8 · Gotchas & Constraints",
-      "9 · State (machine)",
-      "10 · Last user asks",
-    ]) {
+    for (const t of ["References", "State", "Last user asks"]) {
       expect(out).toContain(`## ${t}`);
     }
-    // in-flight + gotchas bodies intact (never condensed)
-    expect(out).toContain("\ni\n");
-    expect(out).toMatch(/## 8 · Gotchas & Constraints\ng\n/);
+    // the State body is never condensed (only the Transcript span is)
+    expect(out).toContain("- dispatch:");
     // file tags survive at the end
     expect(out).toMatch(/<read-files>[\s\S]*<\/modified-files>\s*$/);
   });
@@ -1840,20 +1620,15 @@ describe("buildHandover", () => {
       percent: 76,
     }),
   };
-  const pi: any = { sendMessage: () => {} };
 
-  test("deterministic: doc returned, written to store, no LLM call", async () => {
-    const complete = jest.fn(async () => "should not be called");
+  test("deterministic: doc returned, written to store", async () => {
     const doc = await buildHandover({
       preparation: basePrep(),
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
-      complete,
       now: NOW,
     });
-    expect(complete).not.toHaveBeenCalled(); // NO LLM call
     expect(doc).toContain("session sess-77");
     expect(doc).toContain("## Transcript");
     expect(doc).toContain("## References");
@@ -1871,7 +1646,6 @@ describe("buildHandover", () => {
       preparation: basePrep(),
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
       now: NOW,
     });
@@ -1902,7 +1676,6 @@ describe("buildHandover", () => {
         } as any,
       ],
       ctx,
-      pi,
       settings: settings(),
       now: NOW,
     });
@@ -1925,7 +1698,6 @@ describe("buildHandover", () => {
       preparation: basePrep(),
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
       priorDoc: PRIOR_DOC,
       now: NOW,
@@ -1957,7 +1729,6 @@ describe("buildHandover", () => {
       preparation: hugePrep,
       branchEntries: [],
       ctx,
-      pi,
       settings: settings({ sizeGuardTokens: 5_000 }),
       now: NOW,
     });
@@ -1974,7 +1745,6 @@ describe("buildHandover", () => {
       preparation: prep,
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
       now: NOW,
     });
@@ -2007,7 +1777,6 @@ describe("buildHandover", () => {
       preparation: basePrep(),
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
       now: NOW,
     });
@@ -2028,11 +1797,54 @@ describe("buildHandover", () => {
       preparation: basePrep(),
       branchEntries: [],
       ctx,
-      pi,
       settings: settings(),
       now: NOW,
     });
     expect(doc).toMatch(/- scheduled:\n {2}\(none\)/);
+  });
+
+  test("instructions: 'Operator focus' line in the State section", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      settings: settings(),
+      instructions: "focus on the deploy gate",
+      now: NOW,
+    });
+    expect(doc).toContain("- Operator focus: focus on the deploy gate");
+    // the line sits inside the State section (after todos, before the
+    // next section) — nothing else in the doc format changes
+    const iState = doc.indexOf("## State");
+    const iTodos = doc.indexOf("- todos:");
+    const iFocus = doc.indexOf("- Operator focus:");
+    const iNext = doc.indexOf("## Last user asks");
+    expect(iFocus).toBeGreaterThan(iState);
+    expect(iFocus).toBeGreaterThan(iTodos);
+    expect(iFocus).toBeLessThan(iNext);
+  });
+
+  test("no instructions: no 'Operator focus' line (format unchanged)", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      settings: settings(),
+      now: NOW,
+    });
+    expect(doc).not.toContain("Operator focus");
+  });
+
+  test("blank instructions: trimmed, no line", async () => {
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [],
+      ctx,
+      settings: settings(),
+      instructions: "   ",
+      now: NOW,
+    });
+    expect(doc).not.toContain("Operator focus");
   });
 });
 
@@ -2158,13 +1970,14 @@ describe("session_before_compact wiring", () => {
   let compacts = 0;
   const realFetch = globalThis.fetch;
 
-  const mkEvent = (reason: string) => ({
+  const mkEvent = (reason: string, customInstructions?: string) => ({
     type: "session_before_compact",
     preparation: basePrep(),
     branchEntries: [],
     reason,
     willRetry: false,
     signal: new AbortController().signal,
+    customInstructions,
   });
 
   const channelPosts = () =>
@@ -2264,7 +2077,6 @@ describe("session_before_compact wiring", () => {
   });
 
   afterEach(() => {
-    setHandoverCompleteForTest(null);
     setHandoffInFlight(false);
     setHandoffRestartArmed(false);
     stopAllOpTicks();
@@ -2275,31 +2087,14 @@ describe("session_before_compact wiring", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  const PROSE = [
-    "[MISSION] Ship the bridge.",
-    "[IN_FLIGHT] Wire the handler",
-    "[DONE] Wrote tests",
-    "[BLOCKERS] (none)",
-    "[DECISIONS] Chose bun",
-    "[FOLLOWUPS] Tag corpus",
-    "[GOTCHAS] vLLM is sacred",
-  ].join("\n");
-
-  test("disabled (explicit opt-out): built-in path, LLM not called", async () => {
+  test("disabled (explicit opt-out): built-in path", async () => {
     writeSettings({ channels: CHANNELS, handoff: { enabled: false } }); // explicit opt-out
-    let called = 0;
-    setHandoverCompleteForTest(async () => {
-      called++;
-      return PROSE;
-    });
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(out).toBeUndefined();
-    expect(called).toBe(0);
     expect(isHandoffInFlight()).toBe(false);
   });
 
   test("enabled + manual → CompactionResult with durable doc + details tags", async () => {
-    setHandoverCompleteForTest(async () => PROSE);
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(out).toBeDefined();
     const c = out.compaction;
@@ -2319,8 +2114,30 @@ describe("session_before_compact wiring", () => {
     expect(isHandoffInFlight()).toBe(false);
   });
 
+  test("/compact instructions: 'Operator focus' line in the doc State section", async () => {
+    const out = await handlers.session_before_compact(
+      mkEvent("manual", "focus on the deploy gate"),
+      ctx,
+    );
+    expect(out).toBeDefined();
+    expect(out.compaction.summary).toContain(
+      "- Operator focus: focus on the deploy gate",
+    );
+    // the line sits inside the State section (before the next section)
+    const iState = out.compaction.summary.indexOf("## State");
+    const iFocus = out.compaction.summary.indexOf("- Operator focus:");
+    const iNext = out.compaction.summary.indexOf("## Last user asks");
+    expect(iFocus).toBeGreaterThan(iState);
+    expect(iFocus).toBeLessThan(iNext);
+  });
+
+  test("no /compact instructions: no 'Operator focus' line", async () => {
+    const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
+    expect(out).toBeDefined();
+    expect(out.compaction.summary).not.toContain("Operator focus");
+  });
+
   test("arms the restart when it writes a doc (issue #85: compact -> fresh session)", async () => {
-    setHandoverCompleteForTest(async () => PROSE);
     expect(isHandoffRestartArmed()).toBe(false);
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(out).toBeDefined();
@@ -2331,7 +2148,6 @@ describe("session_before_compact wiring", () => {
 
   test("does not arm the restart on the built-in path (no doc written)", async () => {
     writeSettings({ channels: CHANNELS, handoff: { enabled: false } });
-    setHandoverCompleteForTest(async () => PROSE);
     expect(isHandoffRestartArmed()).toBe(false);
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(out).toBeUndefined();
@@ -2339,7 +2155,6 @@ describe("session_before_compact wiring", () => {
   });
 
   test("enabled + threshold: at/over HANDOFF_THRESHOLD → handover", async () => {
-    setHandoverCompleteForTest(async () => PROSE);
     const out = await handlers.session_before_compact(
       mkEvent("threshold"),
       ctx,
@@ -2354,17 +2169,11 @@ describe("session_before_compact wiring", () => {
       contextWindow: 262_144,
       percent: 68.7,
     });
-    let called = 0;
-    setHandoverCompleteForTest(async () => {
-      called++;
-      return PROSE;
-    });
     const out = await handlers.session_before_compact(
       mkEvent("threshold"),
       ctx,
     );
     expect(out).toBeUndefined();
-    expect(called).toBe(0);
   });
 
   test("deterministic: no LLM call, so no fallback needed (500 is gone)", async () => {
@@ -2378,20 +2187,11 @@ describe("session_before_compact wiring", () => {
   });
 
   test("F10: in-flight flag set synchronously; concurrent compaction refused", async () => {
-    let release: () => void = () => {};
-    const gate = new Promise<void>((r) => {
-      release = r;
-    });
-    setHandoverCompleteForTest(async () => {
-      await gate;
-      return PROSE;
-    });
     const p1 = handlers.session_before_compact(mkEvent("manual"), ctx);
     // handler entry is sync up to the first await: flag is already set
     expect(isHandoffInFlight()).toBe(true);
     const p2 = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(p2).toBeUndefined(); // gated while p1 is in flight
-    release();
     const out1 = await p1;
     expect(out1).toBeDefined();
     expect(isHandoffInFlight()).toBe(false);
@@ -2494,16 +2294,6 @@ describe("auto-compact token-% gate", () => {
 
   const flushMacrotasks = () => new Promise((r) => setTimeout(r, 20));
 
-  const PROSE = [
-    "[MISSION] Ship the bridge.",
-    "[IN_FLIGHT] Wire the handler",
-    "[DONE] Wrote tests",
-    "[BLOCKERS] (none)",
-    "[DECISIONS] Chose bun",
-    "[FOLLOWUPS] Tag corpus",
-    "[GOTCHAS] vLLM is sacred",
-  ].join("\n");
-
   beforeEach(async () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-autocompact-"));
     oldHome = process.env.HOME || "";
@@ -2589,7 +2379,6 @@ describe("auto-compact token-% gate", () => {
   });
 
   afterEach(() => {
-    setHandoverCompleteForTest(null);
     setHandoffInFlight(false);
     setHandoffRestartArmed(false);
     stopAllOpTicks();
@@ -2685,7 +2474,6 @@ describe("auto-compact token-% gate", () => {
     expect(isCompacting("ch1")).toBe(true);
     // 2) pi compacts: session_before_compact writes the handover doc
     //    (the SAME path /compact + shouldHandoff uses).
-    setHandoverCompleteForTest(async () => PROSE);
     const out = await handlers.session_before_compact(mkEvent("manual"), ctx);
     expect(out).toBeDefined();
     expect(

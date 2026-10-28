@@ -6,15 +6,14 @@
  * CUSTOM compaction result: `{ compaction: { summary: doc, ... } }` —
  * no cancel, no restart, the op-window flow is untouched (review F1/F3).
  *
- * The doc is a fixed 10-section template:
- *   1-2, 4-6, 8 (Mission, In-flight, Blockers, Decisions, Follow-ups,
- *   Gotchas) + Done (condensed)        → LLM prose over the filled skeleton
- *   3 Done is LLM prose (retirement)
- *   7 References, 9 State, 10 Last user asks → deterministic (no LLM)
- *   plus <read-files>/<modified-files> tags   → deterministic, CUMULATIVE:
- *   prior doc tags ∪ current span fileOps (review F9)
+ * The doc is a deterministic template (NO LLM call): the raw transcript
+ * span (current state first) + References, State, Last user asks
+ * extracted from the session, plus <read-files>/<modified-files> tags →
+ * deterministic, CUMULATIVE: prior doc tags ∪ current span fileOps
+ * (review F9). /compact operator focus instructions are rendered as ONE
+ * line in the State section (absent when none passed).
  *
- * Cumulative: the prior doc (latest.md pointer) is the LLM's base (F6), so
+ * Cumulative: the prior doc (latest.md pointer) is the base (F6), so
  * context compaction never shrinks the doc — it only retires done work.
  * The doc is written to <storeDir>/<YYYYMMDD-HHMM>-<slug>.md BEFORE
  * compaction returns; on disk before the compact is the failure-handling
@@ -24,14 +23,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type {
-  AssistantMessage,
-  Context as PiAiContext,
-  UserMessage,
-} from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
-import type {
   ContextUsage,
-  ExtensionAPI,
   ExtensionContext,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
@@ -77,14 +69,6 @@ export interface HandoverMessage {
   details?: unknown;
 }
 
-/** LLM call seam: tests inject a stub; default = completeSimple on the
- *  session model with the session's own auth (ctx.modelRegistry). */
-export type HandoverComplete = (
-  system: string,
-  user: string,
-  opts?: { signal?: AbortSignal },
-) => Promise<string>;
-
 /** Resolved handoff settings (defaults → ~/.pi/agent → <cwd>/.pi → env). */
 export interface HandoffSettings {
   /** Default TRUE (operator 2026-09-23: handoff is the default behaviour,
@@ -121,17 +105,6 @@ export interface ShouldHandoffFlags {
   freshWindow: boolean;
 }
 
-/** LLM prose sections of the doc (markers, not markdown headers). */
-export interface LlmProse {
-  mission: string;
-  inFlight: string;
-  done: string;
-  blockers: string;
-  decisions: string;
-  followups: string;
-  gotchas: string;
-}
-
 /** Deterministic state extracted from the session (no LLM). */
 export interface ParsedState {
   readFiles: string[];
@@ -149,6 +122,8 @@ export interface ParsedState {
   modelLabel: string;
   sessionStats: string;
   lastUserAsks: string[];
+  /** /compact operator focus instructions (absent when none passed). */
+  operatorFocus?: string;
 }
 
 /** Context inputs extractDeterministic needs from the live ctx. */
@@ -561,135 +536,7 @@ export function isHumanInbound(e: SessionEntry): boolean {
   return true;
 }
 
-export const HANDOVER_SYSTEM_PROMPT = `You write the handover doc sections for an AI agent session that is being compacted.
-The deterministic sections (References, State, Last user asks, file tags) are already filled and EXACT — never restate or correct them.
-
-Write ONLY these sections. Each starts with its marker alone on one line:
-[MISSION] What the agent works toward overall. 1-3 terse lines.
-[IN_FLIGHT] What is happening NOW: active task, exact next steps. Terse lines.
-[DONE] What finished since the prior handover. Condensed — one line per item, retired work.
-[BLOCKERS] What is stuck and why. One line each, or (none).
-[DECISIONS] Decisions made with their rationale. One line each, or (none).
-[FOLLOWUPS] Open follow-ups and recurring tasks. One line each, or (none).
-[GOTCHAS] Gotchas, constraints, environment quirks the next session must know. One line each, or (none).
-
-Rules:
-- Preserve every prior-doc section that is still true. Retire an item to DONE only when the transcript shows it explicitly finished; keep the reason on the DONE line.
-- Terse, factual, no hedging, no markdown headers, no preamble, no commentary.
-- If you lack information for a section, write (none).`;
-
-/** Build the user-side prompt: prior doc (cumulative base, F6), the
- *  deterministic skeleton (context, not to be restated), the transcript. */
-export function buildLlmPrompt(args: {
-  prior: string | null;
-  skeleton: string;
-  transcript: string;
-  instructions?: string;
-}): string {
-  const parts = [
-    "PRIOR HANDOVER DOC (cumulative base — preserve what is still true):",
-    "<<<",
-    args.prior?.trim() || "(none — first handover)",
-    ">>>",
-    "",
-    "DETERMINISTIC SKELETON (already in the doc — do not restate):",
-    "<<<",
-    args.skeleton,
-    ">>>",
-    "",
-    "TRANSCRIPT (messages about to be summarized):",
-    "<<<",
-    args.transcript || "(empty)",
-    ">>>",
-  ];
-  if (args.instructions?.trim())
-    parts.push("", `OPERATOR INSTRUCTIONS: ${args.instructions.trim()}`);
-  parts.push("", "Return the seven marked sections now.");
-  return parts.join("\n");
-}
-
-/** Skeleton shown to the LLM: the deterministic facts, so prose does not
- *  duplicate or contradict them. */
-export function renderLlmSkeleton(state: ParsedState): string {
-  return [
-    `refs: ${state.refs.join(", ") || "(none)"}`,
-    `worktrees: ${state.worktrees.join(", ") || "(none)"}`,
-    `links: ${state.links.join(", ") || "(none)"}`,
-    `context: ${state.contextLine}`,
-    `last user asks: ${state.lastUserAsks.join(" | ") || "(none)"}`,
-    `read files: ${state.readFiles.length}`,
-    `modified files: ${state.modifiedFiles.length}`,
-  ].join("\n");
-}
-
-const PROSE_MARKER_RE =
-  /^\s*\[(MISSION|IN_FLIGHT|DONE|BLOCKERS|DECISIONS|FOLLOWUPS|GOTCHAS)\]:?\s*(.*)$/i;
-
-function markerToKey(marker: string): keyof LlmProse {
-  switch (marker.toUpperCase()) {
-    case "MISSION":
-      return "mission";
-    case "IN_FLIGHT":
-      return "inFlight";
-    case "DONE":
-      return "done";
-    case "BLOCKERS":
-      return "blockers";
-    case "DECISIONS":
-      return "decisions";
-    case "FOLLOWUPS":
-      return "followups";
-    default:
-      return "gotchas";
-  }
-}
-
-/** Parse LLM output into the seven prose sections. Marker lines may
- *  carry inline text ("[DONE] x"); text before the first marker is
- *  dropped (preamble). Missing sections → "". */
-export function parseLlmProse(text: string): LlmProse {
-  const out: LlmProse = {
-    mission: "",
-    inFlight: "",
-    done: "",
-    blockers: "",
-    decisions: "",
-    followups: "",
-    gotchas: "",
-  };
-  const bodies: Partial<Record<keyof LlmProse, string[]>> = {};
-  let current: keyof LlmProse | null = null;
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(/\s+$/, "");
-    const m = line.match(PROSE_MARKER_RE);
-    if (m) {
-      current = markerToKey(m[1]);
-      bodies[current] = [];
-      if (m[2].trim()) bodies[current]!.push(m[2]);
-      continue;
-    }
-    if (current) bodies[current]!.push(raw);
-  }
-  for (const k of Object.keys(out) as (keyof LlmProse)[]) {
-    out[k] = (bodies[k] ?? []).join("\n").trim();
-  }
-  return out;
-}
-
 // ─── Doc assembly ───────────────────────────────────────────────────────────
-
-const SECTION_TITLES = [
-  "1 · Mission",
-  "2 · In-flight (NOW)",
-  "3 · Done (condensed)",
-  "4 · Blockers",
-  "5 · Decisions & Rationale",
-  "6 · Open follow-ups",
-  "7 · References",
-  "8 · Gotchas & Constraints",
-  "9 · State (machine)",
-  "10 · Last user asks",
-] as const;
 
 function pad2(n: number): string {
   return String(n).padStart(2, "0");
@@ -724,6 +571,9 @@ function renderState(s: ParsedState): string {
     "- todos:",
     s.todoBoard ? s.todoBoard : "  (none)",
   ];
+  // /compact operator focus: ONE line, only when instructions were passed
+  // (the line is absent otherwise — tests pin both cases).
+  if (s.operatorFocus) lines.push(`- Operator focus: ${s.operatorFocus}`);
   return lines.join("\n");
 }
 
@@ -742,29 +592,6 @@ export function renderFileTags(s: ParsedState): string {
 }
 
 const NONE = "(none)";
-
-/** Assemble the final doc from deterministic state + LLM prose. */
-export function renderTemplate(
-  state: ParsedState,
-  prose: LlmProse,
-  header: string,
-): string {
-  const or = (s: string) => (s.trim() ? s.trim() : NONE);
-  return [
-    header,
-    `## ${SECTION_TITLES[0]}\n${or(prose.mission)}`,
-    `## ${SECTION_TITLES[1]}\n${or(prose.inFlight)}`,
-    `## ${SECTION_TITLES[2]}\n${or(prose.done)}`,
-    `## ${SECTION_TITLES[3]}\n${or(prose.blockers)}`,
-    `## ${SECTION_TITLES[4]}\n${or(prose.decisions)}`,
-    `## ${SECTION_TITLES[5]}\n${or(prose.followups)}`,
-    `## ${SECTION_TITLES[6]}\n${renderReferences(state)}`,
-    `## ${SECTION_TITLES[7]}\n${or(prose.gotchas)}`,
-    `## ${SECTION_TITLES[8]}\n${renderState(state)}`,
-    `## ${SECTION_TITLES[9]}\n${renderLastAsks(state)}`,
-    renderFileTags(state),
-  ].join("\n\n");
-}
 
 // ─── sizeGuard ──────────────────────────────────────────────────────────────
 
@@ -954,23 +781,15 @@ export interface BuildHandoverArgs {
   preparation: HandoverPreparation;
   branchEntries: SessionEntry[];
   ctx: ExtensionContext;
-  pi: ExtensionAPI;
   settings: HandoffSettings;
-  /** Injectable LLM call (tests stub it). Default: completeSimple on
-   *  ctx.model with the session's own auth. */
-  complete?: HandoverComplete;
   /** Override the prior doc (tests). Default: loadPreviousHandover. */
   priorDoc?: string | null;
-  /** Operator /compact instructions, forwarded to the LLM. */
+  /** /compact operator focus instructions; rendered as ONE line in the
+   *  doc's State section (absent when none). */
   instructions?: string;
-  /** Upstream abort signal (event.signal) — combined with the timeout. */
-  signal?: AbortSignal;
   /** Injectable clock (tests). */
   now?: Date;
 }
-
-/** LLM generation budget; a hang must not wedge the compaction window. */
-export const HANDOVER_GEN_TIMEOUT_MS = 120_000;
 
 function safeGetSessionFile(ctx: ExtensionContext): string | null {
   try {
@@ -1062,61 +881,6 @@ function safeScheduledTasks(): string | null {
   }
 }
 
-/** Default LLM call: the SAME session model, the session's own auth.
- *  Auth via ctx.modelRegistry.getApiKeyAndHeaders(ctx.model) — the bridge
- *  process does not otherwise resolve provider auth. */
-/** process.env → ProviderEnv (Record<string, string>, no undefined). */
-function toProviderEnv(env: NodeJS.ProcessEnv): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
-  return out;
-}
-
-export function makeDefaultComplete(ctx: ExtensionContext): HandoverComplete {
-  return async (system, user, opts) => {
-    const model = ctx.model;
-    if (!model)
-      throw new Error("no session model available for handover generation");
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok)
-      throw new Error(`no API key for handover generation: ${auth.error}`);
-    const effective = auth.baseUrl
-      ? { ...model, baseUrl: auth.baseUrl }
-      : model;
-    const messages: UserMessage[] = [
-      {
-        role: "user",
-        content: [{ type: "text", text: user }],
-        timestamp: Date.now(),
-      },
-    ];
-    const context: PiAiContext = { systemPrompt: system, messages };
-    const res: AssistantMessage = await completeSimple(effective, context, {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      env: auth.env ?? toProviderEnv(process.env),
-      signal: opts?.signal,
-    });
-    // MAJOR-1 (review): a "length" stop = output cap hit = partial prose.
-    // Accepting it makes a truncated doc the cumulative base, so every later
-    // handover inherits the hole. pi's own compaction rejects length stops for
-    // the same reason (compaction.js getSummarizationFailure). Fall back to the
-    // built-in compact instead (no doc written, latest.md untouched).
-    if (
-      res.stopReason === "error" ||
-      res.stopReason === "aborted" ||
-      res.stopReason === "length"
-    )
-      throw new Error(
-        res.errorMessage || `handover generation stopped: ${res.stopReason}`,
-      );
-    return res.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-  };
-}
-
 /** Deterministic handover doc (NO LLM call). The agent already has all the
  *  state - references, worktrees, todos, dispatch, machine state, transcript.
  *  We extract it and write the doc. No model call means no 400/500, no
@@ -1140,9 +904,9 @@ export function renderDeterministic(
   ].join("\n\n");
 }
 
-/** Build the handover doc: deterministic extraction (pure) → template →
- *  sizeGuard → write to the store. NO LLM call. Returns the doc string;
- *  the wiring wraps it into the CompactionResult. */
+/** Build the handover doc: deterministic extraction (pure) →
+ *  renderDeterministic → sizeGuard → write to the store. NO LLM call.
+ *  Returns the doc string; the wiring wraps it into the CompactionResult. */
 export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
   const { preparation, branchEntries, ctx, settings } = args;
   const priorDoc =
@@ -1157,6 +921,10 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
     scheduledText: safeScheduledTasks(),
     todoText: defaultTodoText(ctx.cwd),
   });
+  // /compact operator focus instructions: render as ONE line in the State
+  // section (absent when none passed).
+  const focus = args.instructions?.trim();
+  if (focus) state.operatorFocus = focus;
   const now = args.now ?? new Date();
   const header = buildHeader(now, safeSessionId(ctx), preparation.tokensBefore);
   const transcript = serializeTranscript(

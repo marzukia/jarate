@@ -74,7 +74,6 @@ import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
-  type HandoverComplete,
   isHandoffFreshWindow,
   parsePriorTags,
   resolveHandoffSettings,
@@ -536,12 +535,6 @@ export function isHandoffRestartArmed(): boolean {
 }
 export function setHandoffRestartArmed(v: boolean): void {
   handoffRestartArmed = v;
-}
-/** Test seam: stub the handover LLM call in the session_before_compact
- *  wiring (null → default completeSimple path). */
-let handoverCompleteForTest: HandoverComplete | null = null;
-export function setHandoverCompleteForTest(fn: HandoverComplete | null): void {
-  handoverCompleteForTest = fn;
 }
 
 /**
@@ -2762,9 +2755,9 @@ export default function (pi: ExtensionAPI) {
   // (F1: that emits session_compact_failed and disturbs the op-window
   // settle flow). Gate: handoff.enabled (PR1 default false), reason
   // manual|threshold (threshold only at/over the HANDOFF_THRESHOLD
-  // fraction of the TOTAL window), no handover in flight. LLM failure or
-  // abort → undefined → pi falls back to the built-in compact (the
-  // sanitized channel notice is posted inside buildHandover).
+  // fraction of the TOTAL window), no handover in flight. buildHandover is
+  // deterministic (no LLM call); a throw → undefined → pi falls back to
+  // the built-in compact (console.error in the catch below).
   pi.on("session_before_compact", (event, ctx) => {
     const settings = resolveHandoffSettings(ctx.cwd);
     let percent: number | null = null;
@@ -2795,11 +2788,8 @@ export default function (pi: ExtensionAPI) {
           preparation: event.preparation,
           branchEntries: event.branchEntries,
           ctx,
-          pi,
           settings,
           instructions: event.customInstructions,
-          signal: event.signal,
-          complete: handoverCompleteForTest ?? undefined,
         });
         // Doc written -> THIS compact must restart into a fresh session.
         // Arm now (before returning) so maybeHandoffRestart, which runs on
