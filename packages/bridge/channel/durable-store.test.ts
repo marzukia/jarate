@@ -3,11 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  atomicTmpName,
+  atomicWriteJson,
   CLAIM_TTL_MS,
   createDurableStore,
   generateStoreId,
   parseFutureIsoParam,
   parseMinutesParam,
+  sweepOrphanTmpFiles,
 } from "./durable-store";
 
 // 2026-09-10 is a Thursday.
@@ -192,6 +195,69 @@ describe("durable-store: lifecycle (fake clock, tmp home)", () => {
       store.due("c1", NOW + CLAIM_TTL_MS + 1, tmp).map((r) => r.id),
     ).toEqual(["due", "later"]);
     expect(store.due("c2", NOW + CLAIM_TTL_MS + 1, tmp)).toHaveLength(1);
+  });
+});
+
+describe("durable-store: shared atomic write (one tmp scheme + sweep)", () => {
+  let tmp = "";
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-store-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("atomicTmpName: the one scheme <target>.<pid>.<ts>.tmp", () => {
+    const name = atomicTmpName(`${tmp}/x.json`);
+    expect(name).toMatch(
+      new RegExp(
+        `^${tmp.replace(/[/\\.^+[$\]()|*=]/g, "\\$&")}/x.json\\.\\d+\\.\\d+\\.tmp$`,
+      ),
+    );
+  });
+
+  test("atomicWriteJson: mkdirs the dir, 2-space JSON, no tmp residue", () => {
+    const target = path.join(tmp, "nested", "dir", "x.json");
+    atomicWriteJson(target, { a: 1, b: [1, 2] });
+    expect(fs.readFileSync(target, "utf8")).toBe(
+      JSON.stringify({ a: 1, b: [1, 2] }, null, 2),
+    );
+    expect(
+      fs.readdirSync(path.dirname(target)).filter((n) => n.endsWith(".tmp")),
+    ).toHaveLength(0);
+  });
+
+  test("atomicWriteJson: rename failure throws and leaves the tmp for the sweep", () => {
+    const target = path.join(tmp, "x.json");
+    fs.mkdirSync(target); // rename over a dir fails (ENOTDIR)
+    expect(() => atomicWriteJson(target, { a: 1 })).toThrow();
+    const residue = fs
+      .readdirSync(tmp)
+      .filter((n) => n.startsWith("x.json.") && n.endsWith(".tmp"));
+    expect(residue).toHaveLength(1);
+    expect(sweepOrphanTmpFiles(tmp, "x.json")).toBe(1);
+    expect(fs.readdirSync(tmp).filter((n) => n.endsWith(".tmp"))).toHaveLength(
+      0,
+    );
+  });
+
+  test("sweepOrphanTmpFiles: only <target>.<pid>.<ts>.tmp, never throws", () => {
+    fs.writeFileSync(path.join(tmp, "x.json"), "{}");
+    fs.writeFileSync(path.join(tmp, "x.json.42.1234.tmp"), "stale");
+    fs.writeFileSync(path.join(tmp, "x.json.other.tmp"), "stale");
+    fs.writeFileSync(path.join(tmp, "unrelated.tmp"), "keep");
+    fs.writeFileSync(path.join(tmp, "y.json.42.1234.tmp"), "other target");
+    expect(sweepOrphanTmpFiles(tmp, "x.json")).toBe(2);
+    expect(fs.existsSync(path.join(tmp, "x.json.42.1234.tmp"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "x.json.other.tmp"))).toBe(false);
+    expect(fs.existsSync(path.join(tmp, "unrelated.tmp"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "y.json.42.1234.tmp"))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, "x.json"))).toBe(true);
+    expect(sweepOrphanTmpFiles(path.join(tmp, "no-such-dir"), "x.json")).toBe(
+      0,
+    );
   });
 });
 

@@ -319,6 +319,36 @@ describe("session truncation", () => {
     ]);
   });
 
+  test("truncateSession: atomic rewrite in the shared tmp scheme (no residue, backup kept)", () => {
+    const file = makeSession(tmp, [
+      header,
+      triggerA,
+      assistantA,
+      toolResultA,
+      triggerB,
+      assistantB,
+    ]);
+    const removed = truncateSession(file)!;
+    expect(removed.length).toBeGreaterThan(0);
+    // the tmp file (now <sessionFile>.<pid>.<ts>.tmp, shared scheme) is
+    // renamed away — no .tmp residue in the session dir
+    const dir = path.dirname(file);
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    // F8: the full-session backup (written before the rewrite) survives
+    expect(
+      fs
+        .readdirSync(dir)
+        .some((f) => f.startsWith(`${path.basename(file)}.undo-`)),
+    ).toBe(true);
+    // the file is the truncated session, intact JSONL
+    const kept = fs
+      .readFileSync(file, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    expect(kept[kept.length - 1].id).toBe("tB");
+  });
+
   test("an in-flight trailing trigger is removed with the aborted turn", () => {
     const triggerC = {
       type: "custom_message",

@@ -127,6 +127,20 @@ describe("newWorktree (#12)", () => {
     );
   });
 
+  test("state save is atomic (shared tmp+rename): no tmp residue, valid JSON", () => {
+    const line = newWorktree(repo, undefined, env);
+    expect(line).toMatch(/^\[ok\] worktree /);
+    const stFile = path.join(repo, WORKTREE_STATE_REL);
+    // the atomic write leaves no <target>.<pid>.<ts>.tmp behind
+    expect(
+      fs.readdirSync(path.dirname(stFile)).filter((f) => f.endsWith(".tmp")),
+    ).toEqual([]);
+    // the state file is plain 2-space JSON (the shared atomicWriteJson shape)
+    expect(JSON.parse(fs.readFileSync(stFile, "utf8"))).toEqual(
+      loadWorktreeState(repo),
+    );
+  });
+
   test("explicit ref: worktree forks from that ref, not HEAD", () => {
     // Pin the branch at the initial commit, then advance main one more
     // commit: a worktree that ignored `ref` (mutation W4: from="HEAD")

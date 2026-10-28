@@ -47,6 +47,7 @@ import {
   isBgWebhook,
   isOlderSnowflake,
 } from "./discord";
+import { atomicWriteJson, sweepOrphanTmpFiles } from "./durable-store";
 import type { ChannelConfig, ChannelMessage } from "./types";
 
 // ─── constants ───────────────────────────────────────────────────────────
@@ -165,9 +166,9 @@ export function loadRewakeQueue(
   return { v: 1, pending, delivered };
 }
 
-/** Atomic write (tmp+rename, same pattern as channel-state.json).
- *  Never throws; returns false on I/O failure (the in-memory state
- *  stays authoritative for the process lifetime). */
+/** Atomic write (shared atomicWriteJson: tmp+rename, the one tmp naming
+ *  scheme). Never throws; returns false on I/O failure (the in-memory
+ *  state stays authoritative for the process lifetime). */
 export function saveRewakeQueue(
   stateDir: string | null | undefined,
   channelId: string,
@@ -175,15 +176,26 @@ export function saveRewakeQueue(
 ): boolean {
   if (!stateDir) return false;
   try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    const p = rewakeQueuePath(stateDir, channelId);
-    const tmp = `${p}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(file, null, 2));
-    fs.renameSync(tmp, p);
+    atomicWriteJson(rewakeQueuePath(stateDir, channelId), file);
     return true;
   } catch {
     return false;
   }
+}
+
+/** Sweep orphan tmp files for this channel's rewake queue (crash
+ *  between tmp write and rename). Best-effort: never throws, returns
+ *  the count removed. Called once per real process start (the survival
+ *  drain). */
+export function collectRewakeOrphans(
+  stateDir: string | null | undefined,
+  channelId: string,
+): number {
+  if (!stateDir) return 0;
+  return sweepOrphanTmpFiles(
+    stateDir,
+    path.basename(rewakeQueuePath(stateDir, channelId)),
+  );
 }
 
 /** Append a queued inbound to the pending list (idempotent per

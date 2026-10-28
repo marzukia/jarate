@@ -23,6 +23,8 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { atomicWriteJson } from "./durable-store";
+
 export interface WorktreeState {
   /** ticket id, YYYYMMDD-HHMMSS-NNNN (same shape as pi-bg run ids) */
   id: string;
@@ -75,9 +77,10 @@ export function loadWorktreeState(cwd: string): WorktreeState | null {
   }
 }
 
+/** Save the active-worktree state atomically (tmp+rename, the shared
+ *  atomicWriteJson — a crash mid-write leaves only the tmp file). */
 function saveWorktreeState(cwd: string, st: WorktreeState): void {
-  fs.mkdirSync(path.dirname(stateFile(cwd)), { recursive: true });
-  fs.writeFileSync(stateFile(cwd), `${JSON.stringify(st, null, 2)}\n`);
+  atomicWriteJson(stateFile(cwd), st);
 }
 
 export function clearWorktreeState(cwd: string): void {

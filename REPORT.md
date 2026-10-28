@@ -114,3 +114,80 @@ internal comments untouched per bundle scope)
 - Branch `ja-stale-strings-bundle` pushed to origin (bare mirror
   /srv/fleetwork/jarate.git) and github (marzukia/jarate).
 - PR URL: https://github.com/marzukia/jarate/pull/301
+
+---
+
+# REPORT — issue #258: factor durableStore + shared atomic write
+
+## Change summary
+
+The durable-store extraction (scope 1) had already landed in main via #276
+(commit 42851c77): `channel/durable-store.ts` holds the shared
+load/save/orphan-sweep/id-gen/lifecycle, and `channel/sleep.ts` +
+`channel/tasks.ts` are thin domain layers on top. This run closes the
+atomic-write half (scope 2) of the issue:
+
+- **`channel/durable-store.ts`** — new shared primitives, stdlib-only:
+  - `atomicTmpName(target)` — the ONE tmp naming scheme:
+    `<target>.<pid>.<ts>.tmp`;
+  - `atomicWriteJson(target, value)` — mkdir + tmp + rename (2-space JSON,
+    throws on I/O failure, tmp left for the sweep);
+  - `sweepOrphanTmpFiles(dir, target)` — best-effort orphan sweep (never
+    throws, only touches the target's tmp shape).
+  The store's `save`/`collectOrphans` now delegate to these, so the
+  sleep/tasks path uses the same primitive as everything else.
+- **The 6 named sites** all go through the shared primitive:
+  1. `sleep.ts` / 2. `tasks.ts` — via the store (already #276);
+  3. `todos.ts` `saveBoard` — inline tmp+rename → `atomicWriteJson`
+     (same pid+ts scheme as before, code de-duplicated);
+  4. `restart-queue.ts` `saveRewakeQueue` — `${p}.tmp` (non-pid, no
+     orphan sweep) → `atomicWriteJson`; new `collectRewakeOrphans`
+     (best-effort), swept once per real process start inside
+     `drainRewakeSurvival` (`queue.ts` — the startup path at
+     index.ts:1628; index.ts itself untouched);
+  5. `worktree.ts` `saveWorktreeState` — plain `writeFileSync` (non-atomic)
+     → `atomicWriteJson` (atomic; drops a cosmetic trailing newline,
+     JSON.parse roundtrip unchanged);
+  6. `undo.ts` `truncateSession` — raw JSONL write keeps its content,
+     tmp name converges from `${sessionFile}.undo-tmp` to the shared
+     `atomicTmpName` scheme.
+- Comment-only: the `*.jsonl` skip-filter comments in `undo.ts` /
+  `usage.ts` updated to the new tmp shape (the filter skips both shapes —
+  neither ends in `.jsonl`).
+- `undo.ts` size-ratchet compliance: the new import kept the file at its
+  1090 non-blank budget by condensing one two-line comment (ratcheted
+  files may only shrink; no budget change).
+
+Behavior-preserving: throw semantics per site unchanged (durable-store
+save / todos / worktree / undo throw; restart-queue keeps its
+try/catch→boolean). All existing pins pass unchanged; new tests added for
+the shared contract (naming shape, atomic write + no residue, failure
+leaves the tmp for the sweep, sweep scope/idempotency), the rewake
+orphan sweep (incl. null stateDir + empty dir), the worktree atomic
+save, and the undo tmp-scheme rewrite.
+
+## Gate outputs (repo root, base main e517c322)
+
+- `bun test` (root: bridge + bin + deploy): **1168 pass, 0 fail**
+  (bridge alone: 1106 pass, 0 fail — 1096 baseline + 10 new tests)
+- `bun run typecheck` (`cd packages/bridge && bun x tsc --noEmit`): clean
+- `bunx biome check .`: 80 files, 0 diagnostics
+- `bun scripts/size-ratchet.ts --base origin/main`: SIZE GATE: OK (9
+  ratcheted)
+
+## Files
+
+- packages/bridge/channel/durable-store.ts (+ shared primitives)
+- packages/bridge/channel/durable-store.test.ts (+ contract tests)
+- packages/bridge/channel/todos.ts
+- packages/bridge/channel/restart-queue.ts (+ collectRewakeOrphans)
+- packages/bridge/channel/restart-queue.test.ts
+- packages/bridge/channel/queue.ts (sweep in the startup drain)
+- packages/bridge/channel/worktree.ts
+- packages/bridge/channel/worktree.test.ts
+- packages/bridge/channel/undo.ts
+- packages/bridge/channel/undo.test.ts
+- packages/bridge/channel/usage.ts (comment only)
+
+No changes to `channel/index.ts` (ja-style-v4-nits owns it), no new deps,
+no bun.lock churn.

@@ -13,6 +13,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { atomicWriteJson } from "./durable-store";
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
 export const TODO_STATUSES: TodoStatus[] = [
@@ -89,12 +91,7 @@ export function loadBoard(
 
 /** Save a board atomically (write tmp file in the same dir, rename over). */
 export function saveBoard(board: TodoBoard, home = defaultHome()): void {
-  const dir = todosDir(home);
-  fs.mkdirSync(dir, { recursive: true });
-  const target = boardPath(board.channelId, home);
-  const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(board, null, 2));
-  fs.renameSync(tmp, target);
+  atomicWriteJson(boardPath(board.channelId, home), board);
 }
 
 /** Remove a channel's board file (no-op when absent). */

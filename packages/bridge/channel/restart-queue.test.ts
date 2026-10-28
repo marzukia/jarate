@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   type BgScanChannel,
+  collectRewakeOrphans,
   loadRewakeQueue,
   REWAKE_DELIVERED_CAP,
   REWAKE_LOOKBACK_DEFAULT,
@@ -176,6 +177,52 @@ describe("restart-queue state file (#180)", () => {
       pending: [],
       delivered: [],
     });
+  });
+
+  test("saveRewakeQueue: atomic write leaves no tmp residue (shared pid+ts scheme)", () => {
+    saveRewakeQueue(dir, "ch1", {
+      v: 1,
+      pending: [entry("m1")],
+      delivered: [],
+    });
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    expect(
+      loadRewakeQueue(dir, "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["m1"]);
+  });
+
+  test("saveRewakeQueue: I/O failure → false, orphan tmp left in the shared scheme", () => {
+    fs.mkdirSync(rewakeQueuePath(dir, "ch1")); // rename over a dir fails
+    expect(
+      saveRewakeQueue(dir, "ch1", { v: 1, pending: [], delivered: [] }),
+    ).toBe(false);
+    const residue = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith("rewake-ch1.json.") && f.endsWith(".tmp"));
+    expect(residue).toHaveLength(1);
+  });
+
+  test("collectRewakeOrphans: sweeps <file>.<pid>.<ts>.tmp only; null stateDir → 0", () => {
+    saveRewakeQueue(dir, "ch1", { v: 1, pending: [], delivered: [] });
+    fs.writeFileSync(path.join(dir, "rewake-ch1.json.42.1234.tmp"), "stale");
+    fs.writeFileSync(path.join(dir, "rewake-ch1.json.other.tmp"), "stale");
+    fs.writeFileSync(path.join(dir, "unrelated.tmp"), "keep");
+    fs.writeFileSync(path.join(dir, "rewake-ch2.json.42.1234.tmp"), "other ch");
+    expect(collectRewakeOrphans(dir, "ch1")).toBe(2);
+    expect(collectRewakeOrphans(null, "ch1")).toBe(0);
+    expect(collectRewakeOrphans(undefined, "ch1")).toBe(0);
+    expect(collectRewakeOrphans(dir, "ch1")).toBe(0); // idempotent
+    expect(fs.existsSync(path.join(dir, "unrelated.tmp"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "rewake-ch2.json.42.1234.tmp"))).toBe(
+      true,
+    );
+    expect(fs.existsSync(rewakeQueuePath(dir, "ch1"))).toBe(true);
+  });
+
+  test("collectRewakeOrphans: empty dir → 0, no throw", () => {
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "rewake-empty-"));
+    expect(collectRewakeOrphans(empty, "ch1")).toBe(0);
+    fs.rmSync(empty, { recursive: true, force: true });
   });
 
   test("partial file (wrong section shapes) → per-section fallback", () => {
