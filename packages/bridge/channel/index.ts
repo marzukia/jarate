@@ -235,7 +235,6 @@ export const VERBOSE_LEVEL_NAMES: Record<VerboseLevel, string> = {
 };
 export const verboseOverride = new Map<string, VerboseLevel>();
 
-// #13: per-session context-boundary trackers, keyed by session file path.
 // #40: the last completed run's usage (tokens + est. cost), for
 // `/usage last`. Set at agent_end; null until the first run completes.
 export const lastRunUsage: {
