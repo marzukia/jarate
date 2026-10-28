@@ -206,10 +206,7 @@ export function createDurableStore<T extends DurableEntry>(
   };
 
   const collectOrphans = (home: string): number => {
-    return sweepOrphanTmpFiles(
-      cfg.dir(home),
-      path.basename(cfg.file(home)),
-    );
+    return sweepOrphanTmpFiles(cfg.dir(home), path.basename(cfg.file(home)));
   };
 
   const removeById = (id: string, home: string): boolean => {

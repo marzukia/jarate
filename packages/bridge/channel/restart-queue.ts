@@ -42,12 +42,12 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { atomicWriteJson, sweepOrphanTmpFiles } from "./durable-store";
 import {
   buildChannelMessageFromRaw,
   isBgWebhook,
   isOlderSnowflake,
 } from "./discord";
+import { atomicWriteJson, sweepOrphanTmpFiles } from "./durable-store";
 import type { ChannelConfig, ChannelMessage } from "./types";
 
 // ─── constants ───────────────────────────────────────────────────────────

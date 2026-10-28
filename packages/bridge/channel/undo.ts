@@ -36,7 +36,6 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-
 import { atomicTmpName } from "./durable-store";
 
 const MAX_STORED_BYTES = 20 * 1024 * 1024; // per-file cap for stored copies
@@ -277,8 +276,7 @@ function applyGitSnap(
       touched.add(rel);
     } catch {}
   }
-  // Delete untracked files/dirs that exist now but not in the snapshot
-  // (created after it — i.e. by the undone run, best-effort).
+  // Delete untracked files/dirs not in the snapshot (created after it)
   try {
     const current = git(cwd, ["ls-files", "--others", "--exclude-standard"])
       .trim()

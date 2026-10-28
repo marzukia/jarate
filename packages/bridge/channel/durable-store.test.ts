@@ -3,9 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-  CLAIM_TTL_MS,
   atomicTmpName,
   atomicWriteJson,
+  CLAIM_TTL_MS,
   createDurableStore,
   generateStoreId,
   parseFutureIsoParam,
@@ -211,7 +211,11 @@ describe("durable-store: shared atomic write (one tmp scheme + sweep)", () => {
 
   test("atomicTmpName: the one scheme <target>.<pid>.<ts>.tmp", () => {
     const name = atomicTmpName(`${tmp}/x.json`);
-    expect(name).toMatch(new RegExp(`^${tmp.replace(/[/\\.^+\[$\]()|*=]/g, "\\$&")}/x\.json\\.\\d+\\.\\d+\\.tmp$`));
+    expect(name).toMatch(
+      new RegExp(
+        `^${tmp.replace(/[/\\.^+[$\]()|*=]/g, "\\$&")}/x.json\\.\\d+\\.\\d+\\.tmp$`,
+      ),
+    );
   });
 
   test("atomicWriteJson: mkdirs the dir, 2-space JSON, no tmp residue", () => {
@@ -234,7 +238,9 @@ describe("durable-store: shared atomic write (one tmp scheme + sweep)", () => {
       .filter((n) => n.startsWith("x.json.") && n.endsWith(".tmp"));
     expect(residue).toHaveLength(1);
     expect(sweepOrphanTmpFiles(tmp, "x.json")).toBe(1);
-    expect(fs.readdirSync(tmp).filter((n) => n.endsWith(".tmp"))).toHaveLength(0);
+    expect(fs.readdirSync(tmp).filter((n) => n.endsWith(".tmp"))).toHaveLength(
+      0,
+    );
   });
 
   test("sweepOrphanTmpFiles: only <target>.<pid>.<ts>.tmp, never throws", () => {
@@ -249,7 +255,9 @@ describe("durable-store: shared atomic write (one tmp scheme + sweep)", () => {
     expect(fs.existsSync(path.join(tmp, "unrelated.tmp"))).toBe(true);
     expect(fs.existsSync(path.join(tmp, "y.json.42.1234.tmp"))).toBe(true);
     expect(fs.existsSync(path.join(tmp, "x.json"))).toBe(true);
-    expect(sweepOrphanTmpFiles(path.join(tmp, "no-such-dir"), "x.json")).toBe(0);
+    expect(sweepOrphanTmpFiles(path.join(tmp, "no-such-dir"), "x.json")).toBe(
+      0,
+    );
   });
 });
 

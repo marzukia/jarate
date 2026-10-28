@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   type BgScanChannel,
+  collectRewakeOrphans,
   loadRewakeQueue,
   REWAKE_DELIVERED_CAP,
   REWAKE_LOOKBACK_DEFAULT,
@@ -22,7 +23,6 @@ import {
   rewakeUpdatePendingMsg,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
-  collectRewakeOrphans,
 } from "./restart-queue";
 import type { ChannelConfig, ChannelMessage } from "./types";
 
@@ -180,13 +180,15 @@ describe("restart-queue state file (#180)", () => {
   });
 
   test("saveRewakeQueue: atomic write leaves no tmp residue (shared pid+ts scheme)", () => {
-    saveRewakeQueue(dir, "ch1", { v: 1, pending: [entry("m1")], delivered: [] });
+    saveRewakeQueue(dir, "ch1", {
+      v: 1,
+      pending: [entry("m1")],
+      delivered: [],
+    });
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
     expect(
-      fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")),
-    ).toEqual([]);
-    expect(loadRewakeQueue(dir, "ch1").pending.map((p) => p.msg.messageId)).toEqual(
-      ["m1"],
-    );
+      loadRewakeQueue(dir, "ch1").pending.map((p) => p.msg.messageId),
+    ).toEqual(["m1"]);
   });
 
   test("saveRewakeQueue: I/O failure → false, orphan tmp left in the shared scheme", () => {
@@ -211,7 +213,9 @@ describe("restart-queue state file (#180)", () => {
     expect(collectRewakeOrphans(undefined, "ch1")).toBe(0);
     expect(collectRewakeOrphans(dir, "ch1")).toBe(0); // idempotent
     expect(fs.existsSync(path.join(dir, "unrelated.tmp"))).toBe(true);
-    expect(fs.existsSync(path.join(dir, "rewake-ch2.json.42.1234.tmp"))).toBe(true);
+    expect(fs.existsSync(path.join(dir, "rewake-ch2.json.42.1234.tmp"))).toBe(
+      true,
+    );
     expect(fs.existsSync(rewakeQueuePath(dir, "ch1"))).toBe(true);
   });
 
