@@ -1,47 +1,116 @@
-# REPORT — run 597 (fix #291 handover amnesia)
+# REPORT — jarate post-drain stale-string bundle (#279 follow-up)
 
-## Outcome
+Worker run 2026-10-28 (reactivated by operator order "Get on the jarate waves
+now"; bundle defined 2026-10-24: N1 watchdog cancel hint + t242 DISPATCH.md
+banner). Base: main `e517c322`. Branch: `ja-stale-strings-bundle`.
 
-PR open: https://github.com/marzukia/jarate/pull/298
-- base `marzukia/jarate:main` ← head `worrywarden/jarate:fix/handoff-291-amnesia`
-- branch also in the bare mirror `/srv/fleetwork/jarate.git` @ `c454748a`
-- body: `worker: warden, reviewer pass to follow`
+## Named items (both verified ALREADY FIXED on main)
 
-## Verification (pre-PR)
+### N1 — watchdog STALLED digest cancel hint
 
-- `bun x tsc --noEmit` — clean
-- `bun test` — 1096 pass, 0 fail (1087 baseline + 9 new #291 tests)
-- `bunx biome check .` — 0 diagnostics
-- `bun run size` — OK (8 ratcheted)
-- `HOME=/tmp/fake bash install.sh --dry-run` — clean
+- **Fixing commit: `5dfbe629`** ("split #280/N1a: STALLED digest points at the
+  live cancel path", 2026-10-24, monkytheluffy). Merged via `d1895d36`
+  ("split #280: retire the jarate-bg-watchdog (3-slice centralise +
+  N1a/N1b) (#290)").
+- Evidence: `git show 5dfbe629` — `dispatch/jarate-bg-watchdog`
+  `-lines.append("jarate-bg-kill <t> to cancel")` →
+  `+lines.append("jarate-bg signal KILL <t> to cancel")`; the pinned test
+  (`dispatch/jarate-bg-watchdog.test.ts`) now expects
+  `jarate-bg signal KILL`. Commit message: "Banked N1 (issue #280): the
+  STALLED digest line still posted 'jarate-bg-kill <t> to cancel' —
+  jarate-bg-kill was removed in #283/#286 (drain)… The live cancel path is
+  the retained signal subcommand of the jarate-bg stub: jarate-bg signal
+  KILL <t>."
+- Corroboration: CHANGELOG.md 2026-10-24 entry "N1a — banked STALLED digest
+  fix" (line 35) records the same fix "before the section left" (the
+  watchdog file itself left with `274801fc` / `d1895d36`, #280/3c).
+- Residual check: `git log -S 'jarate-bg-kill <t> to cancel'` → the string
+  no longer exists in any live file on main (only history + CHANGELOG).
 
-## Wall hit (flagged per task rule)
+### t242 nit1 — stale docs/DISPATCH.md:4-7 banner
 
-`git push github fix/handoff-291-amnesia` → **403**: the machine's gh
-account (`worrywarden`, the "warden" identity here) has pull-only on
-`marzukia/jarate` (`push: false`), and the hall-monitor vault's `gh_pat`
-claim flow needs the running Django app (Python ≥3.14; box has 3.13), so
-it was not reachable in-run. Same command retried 3× (credential-helper
-push, permission check, vault lookup) before moving on.
+- **Fixing commits: `293c0722`** ("refactor(dispatch): gut pi-bg dispatch
+  path - fleet is the dispatch (hall-monitor #35) (#272)", 2026-10-20)
+  introduced the retirement note and replaced the stale banner;
+  **`d1895d36`** (#290) completed the wording with "drain declared
+  2026-10-23, #279".
+- Evidence: before `293c0722`, docs/DISPATCH.md lines 3-7 listed
+  `dispatch/jarate-bg` / `jarate-wait` / `jarate-bg-tail` /
+  `jarate-bg-kill` as live components ("Components (all in this repo)").
+  On main, lines 2-8 carry the retirement note: "Retirement note
+  (hall-monitor #35, 2026-10-20; drain declared 2026-10-23, #279):
+  `jarate-bg`'s launch path is RETIRED (stub, rc 10). New dispatches go to
+  hall-monitor fleetwork…". `git log -S 'Retirement note' -- docs/DISPATCH.md`
+  → `293c0722`; `git log -S 'drain declared' -- docs/DISPATCH.md` →
+  `d1895d36`.
 
-Resolution: created fork `worrywarden/jarate` (POST
-`repos/marzukia/jarate/forks`), pushed the branch to the fork, opened
-PR #298 from the fork. The fork is the worker's own account, per the
-task's "own gh account" rule.
+## Residual sweep (live docs; CHANGELOG.md, issues/*, dispatch/jarate-bg
+internal comments untouched per bundle scope)
 
-## Change summary (surgical, generator not rewritten)
+### FIXED
 
-- `channel/handover.ts`
-  - `extractDeterministic`: an ask is pending only when no assistant
-    answer landed after it in the captured range (channel inbounds +
-    span fallback; a kept-tail assistant answers every span ask).
-  - transcript capture split out to `channel/transcript.ts` (size gate:
-    ratcheted files may only shrink; handover.ts budget 1409).
-    Re-exports keep all importers working — the move is verbatim.
-- `channel/transcript.ts` (new)
-  - `serializeTranscript`: the last completed turn (newest user line +
-    everything after it) always survives the 60k cap; on overflow keep
-    the anchor + newest lines, drop the middle with a marker. A mid-turn
-    capture boundary (`isSplitTurn`) gets an explicit marker instead of
-    silent truncation.
-- `RCA.md`: 3 code paths + planned fix + implementation note.
+1. **packages/bridge/README.md:147** — `/jobs` (recent pi-bg run history) →
+   now mirrors docs/COMMANDS.md:79: "history-only scan of the
+   `~/.pi-bg-art` artifacts; post-#279 drain: the `jarate-bg` launcher is a
+   stub, rc 10; new work goes to hall-monitor dispatch". Verified stale:
+   `packages/bridge/channel/jobs.ts:1` — "history-only since the drain,
+   #279"; the in-flight ps view + kill/tail wrappers were removed with the
+   completion side.
+2. **packages/bridge/README.md:174** (file tree) — `jobs.ts /jobs dispatch
+   scan + history` → `jobs.ts /jobs history-only artifact scan` (the
+   "dispatch scan" = the removed in-flight ps view).
+3. **packages/bridge/skills/channel/SKILL.md:32** — same stale `/jobs`
+   (recent pi-bg run history) wording as #1; fixed identically.
+
+### KEPT (verified live)
+
+4. **README.md:117-118** — architecture diagram "terminal callback (embed
+   author `pi-bg fleetwork` · <state>)". Grep `packages/bridge` +
+   `dispatch/` for `pi-bg fleetwork`:
+   - `packages/bridge/channel/fleet-run.ts:10` (live bridge module): "Run
+     events flow through the fleetwork wrapper ([bg: fleetwork] <ticket>
+     lines -> `pi-bg fleetwork` machine-wake cards…)" — the wrapper still
+     emits the card.
+   - `dispatch/jarate-bg:12,282` (live stub, stderr notice): "terminal:
+     state returns as a `pi-bg fleetwork` machine-wake card (… the wake
+     rides webhook_id + the Author: pi-bg marker)".
+   - `dispatch/jarate-bg.test.ts:113` pins the string in the stub notice.
+   - The `Author: pi-bg <name> · <state>` embed shape is live across the
+     bridge test suite (e.g. `Author: pi-bg worker · r44`,
+     `Author: pi-bg restart-wake · planned`).
+   Producer still emits the author string → line kept.
+
+### Not stale (checked, no change)
+
+- `packages/bridge/channel/commands.ts:292` /help string "/jobs - recent
+  pi-bg run history (json for JSON)" — code, not docs; still an accurate
+  description of the view (history of recent pi-bg runs); the section
+  comment (commands.ts:149-152) already carries "History-only since the
+  drain (#279)". Left untouched (docs-only change).
+- `jarate-bg-kill` / `jarate-bg-tail` / `jarate-wait` mentions in
+  docs/COMMANDS.md:356, docs/DEPLOY.md:40-41, docs/DISPATCH.md:17,35,37,41,
+  docs/SETUP.md:118 — all accurate "removed/retired" references, not live
+  descriptions.
+- Branch naming `pi-bg/<id>` (README.md:143, AGENTS.md:40,74,
+  CONTRIBUTING.md:11, templates/newrepo/*) — LIVE convention (PRs #271/#273
+  used `pi-bg/<ticket>` branches); left untouched per bundle scope.
+
+## Gates (repo root, 2026-10-28)
+
+- `bun run test:all` (bun test, bridge + dispatch + bin + deploy): **bridge
+  1096 pass / 0 fail** (30 files, 26.85s); dispatch 26 pass / 0 fail; bin
+  30 pass / 0 fail; deploy 6 pass / 0 fail. No `(fail)` lines.
+- `bun run typecheck` (= `cd packages/bridge && bun x tsc --noEmit`, the
+  script CONTRIBUTING names): clean, rc 0.
+- `bunx biome check .`: "Checked 80 files in 1041ms. No fixes applied." —
+  0 diagnostics.
+- `bun scripts/size-ratchet.ts --base origin/main`: "SIZE GATE: OK
+  (9 ratcheted)", rc 0.
+- `bun install` (packages/bridge) needed for tsc; `bun.lock` unchanged
+  (git status clean after install).
+
+## PR
+
+- Branch `ja-stale-strings-bundle` pushed to origin (bare mirror
+  /srv/fleetwork/jarate.git) and github (marzukia/jarate).
+- PR URL: (filled after `gh pr create`)
