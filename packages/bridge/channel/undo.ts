@@ -37,6 +37,8 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { atomicTmpName } from "./durable-store";
+
 const MAX_STORED_BYTES = 20 * 1024 * 1024; // per-file cap for stored copies
 const GIT_TIMEOUT_MS = 15_000;
 const MAX_RUNS = 10;
@@ -633,7 +635,7 @@ export function findSessionFile(cwd: string): string | null {
   const candidates: Array<[string, number]> = [];
   const scan = (dir: string) => {
     for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.undo-tmp
+      if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.jsonl.<pid>.<ts>.tmp
       const p = path.join(dir, f);
       try {
         candidates.push([p, fs.statSync(p).mtimeMs]);
@@ -776,7 +778,7 @@ export function truncateSession(sessionFile: string, n = 1): string[] | null {
     fs.copyFileSync(sessionFile, `${sessionFile}.undo-${Date.now()}`);
     pruneUndoBackups(sessionFile);
   } catch {}
-  const tmp = `${sessionFile}.undo-tmp`;
+  const tmp = atomicTmpName(sessionFile);
   fs.writeFileSync(tmp, `${kept.join("\n")}\n`);
   fs.renameSync(tmp, sessionFile);
   return removed;

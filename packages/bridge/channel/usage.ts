@@ -253,7 +253,7 @@ export async function renderUsage(
     const files: string[] = [];
     const collect = (dir: string) => {
       for (const f of fs.readdirSync(dir)) {
-        if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.undo-tmp
+        if (!f.endsWith(".jsonl")) continue; // skips *.jsonl.reset-* / *.jsonl.<pid>.<ts>.tmp
         files.push(path.join(dir, f));
       }
     };

@@ -1,6 +1,12 @@
 /**
  * Durable store: the shared JSON-file lifecycle for the sleep and task
- * schedulers (issue #258 — sleep.ts and tasks.ts were structural twins).
+ * schedulers (issue #258 — sleep.ts and tasks.ts were structural twins),
+ * plus the shared atomic-write contract every JSON state file in the
+ * bridge uses: atomicWriteJson / atomicTmpName (ONE tmp naming scheme,
+ * `<target>.<pid>.<ts>.tmp`) and sweepOrphanTmpFiles (the orphan-sweep
+ * contract). Consumers: sleep + tasks (via the store), todos boards,
+ * rewake queues (restart-queue), worktree state; undo's session rewrite
+ * reuses the naming scheme for its raw JSONL write.
  *
  * Both tools persist a list of pending/claimed records under
  * ~/.pi/agent/<tool>/ and share one storage contract:
@@ -80,6 +86,54 @@ export function generateStoreId(now: number): string {
 }
 
 /**
+ * The ONE tmp naming scheme for every atomic write in the bridge:
+ * `<target>.<pid>.<ts>.tmp`. A crash mid-write leaves only the tmp file,
+ * and the orphan sweep below recognizes exactly that shape.
+ */
+export function atomicTmpName(target: string): string {
+  return `${target}.${process.pid}.${Date.now()}.tmp`;
+}
+
+/**
+ * Atomic JSON write: mkdir the target's dir, write the tmp file in the
+ * same dir, rename over the target. Throws on I/O failure (the tmp file
+ * is left for the orphan sweep). The one save primitive for the bridge's
+ * JSON state files — 2-space-indented, no trailing newline.
+ */
+export function atomicWriteJson(target: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = atomicTmpName(target);
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.renameSync(tmp, target);
+}
+
+/**
+ * Sweep orphan tmp files for one target (crash between tmp write and
+ * rename). Best-effort: never throws, returns the count removed. Only
+ * `<target>.<pid>.<ts>.tmp` shapes are touched — other state files and
+ * unrelated .tmp files in the dir are left alone.
+ */
+export function sweepOrphanTmpFiles(dir: string, target: string): number {
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0; // no dir yet — nothing to collect
+  }
+  let removed = 0;
+  for (const n of names) {
+    if (!n.startsWith(`${target}.`) || !n.endsWith(".tmp")) continue;
+    try {
+      fs.unlinkSync(path.join(dir, n));
+      removed++;
+    } catch {
+      // best-effort; a locked/dead tmp file can stay, it is harmless
+    }
+  }
+  return removed;
+}
+
+/**
  * Validate a future-ISO parameter, shared by parseWakeAt ("until") and
  * parseTaskSpec ("at"). `label` keeps the error wording per tool.
  */
@@ -148,36 +202,14 @@ export function createDurableStore<T extends DurableEntry>(
   };
 
   const save = (records: T[], home: string): void => {
-    fs.mkdirSync(cfg.dir(home), { recursive: true });
-    const target = cfg.file(home);
-    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify({ [cfg.wrapperKey]: records }, null, 2),
-    );
-    fs.renameSync(tmp, target);
+    atomicWriteJson(cfg.file(home), { [cfg.wrapperKey]: records });
   };
 
   const collectOrphans = (home: string): number => {
-    const dir = cfg.dir(home);
-    let names: string[];
-    try {
-      names = fs.readdirSync(dir);
-    } catch {
-      return 0; // no dir yet — nothing to collect
-    }
-    const target = path.basename(cfg.file(home));
-    let removed = 0;
-    for (const n of names) {
-      if (!n.startsWith(`${target}.`) || !n.endsWith(".tmp")) continue;
-      try {
-        fs.unlinkSync(path.join(dir, n));
-        removed++;
-      } catch {
-        // best-effort; a locked/dead tmp file can stay, it is harmless
-      }
-    }
-    return removed;
+    return sweepOrphanTmpFiles(
+      cfg.dir(home),
+      path.basename(cfg.file(home)),
+    );
   };
 
   const removeById = (id: string, home: string): boolean => {

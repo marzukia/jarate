@@ -33,6 +33,7 @@ import {
 } from "./index";
 import { persistLivePlaceholders } from "./live";
 import {
+  collectRewakeOrphans,
   rewakeAddPending,
   rewakePending,
   rewakeRemovePending,
@@ -283,6 +284,9 @@ export function drainRewakeSurvival(
   let n = 0;
   for (const ch of channels) {
     if (ch.type !== "discord") continue;
+    // Best-effort cleanup of tmp files orphaned by a crash mid-write
+    // (the shared atomic-write naming scheme makes them recognizable).
+    collectRewakeOrphans(stateDir, ch.id);
     const pending = rewakePending(stateDir, ch.id);
     if (pending.length === 0) continue;
     const q = midTurnQueues.get(ch.id) ?? [];
