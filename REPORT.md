@@ -113,4 +113,4 @@ internal comments untouched per bundle scope)
 
 - Branch `ja-stale-strings-bundle` pushed to origin (bare mirror
   /srv/fleetwork/jarate.git) and github (marzukia/jarate).
-- PR URL: (filled after `gh pr create`)
+- PR URL: https://github.com/marzukia/jarate/pull/301
