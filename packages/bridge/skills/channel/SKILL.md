@@ -29,8 +29,10 @@ usage), `/context [N]` (window breakdown), `/reset` (start a new session),
 assistant turns, reapply an undo), `/verbose [0|1|2|on|off]` (tool-call
 detail level; bare `/verbose` toggles), `/hold [on|off]` (buffer inbound
 messages), `/compact` (compact session context), `/handover` (compact via the
-handover doc), `/model [name]` (switch or list models), `/jobs` (recent pi-bg
-run history), `/todos` (channel todo board), `/sleep`
+handover doc), `/model [name]` (switch or list models), `/jobs`
+(history-only scan of the `~/.pi-bg-art` artifacts; post-#279 drain:
+the `jarate-bg` launcher is a stub, rc 10; new work goes to
+hall-monitor dispatch), `/todos` (channel todo board), `/sleep`
 (list/cancel pending session wakes), `/tasks` (schedule prompt tasks),
 `/diff [range|file]` (publish a diff to a viewer URL), `/new-worktree [ref]`
 / `/merge-worktree [squash]` (worktree flow).
