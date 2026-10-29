@@ -1,6 +1,6 @@
 /**
- * channel/tools.ts — the four LLM tool registrations (god-file split 5/5,
- * 2026-10-20): send-file, todo, sleep, task.
+ * channel/tools.ts — the LLM tool registrations (god-file split 5/5,
+ * 2026-10-20): send-file, channel-send, todo, sleep, task.
  *
  * Extracted from channel/index.ts. Pure move — code is verbatim from
  * index.ts; only import/export boundaries were added. The delivery
@@ -110,6 +110,136 @@ export function registerSendFileTool(
       return {
         content: [{ type: "text", text: r.error || "send failed" }],
         details: {},
+      };
+    },
+  });
+}
+
+// ─── channel-send tool ───────────────────────────────────────────────
+// In-turn (synchronous) post to the agent's OWN configured Discord
+// channel under its OWN bot identity — no shared-token relay, no
+// piboy-bot fanout (04:21Z fanout-identity ruling; warden relay
+// d9h16YGtCBLp). The turn blocks until the Discord POST settles
+// (bounded 10s). Webhook-only channels are rejected: a webhook post
+// would land under the relay identity, not the agent's bot identity.
+
+/** 10s cap, overridable for tests. */
+export function channelSendTimeoutMs(): number {
+  return Number(process.env.CHANNEL_SEND_TIMEOUT_MS ?? 10_000);
+}
+
+export function registerChannelSendTool(
+  pi: ExtensionAPI,
+  channels: ChannelConfig[],
+): void {
+  pi.registerTool({
+    name: "channel-send",
+    label: "Channel send",
+    description:
+      "Post a message to THIS agent's own Discord channel mid-turn (synchronous — the call blocks until the Discord POST completes, 10s cap). The message lands under this agent's own bot identity in its own configured channel (plain markdown text, no embeds). Use it for mid-turn status the user should see immediately (progress, results) instead of waiting for the end-of-turn auto-forward. Returns ok + message id, or the error.",
+    promptSnippet:
+      "Post a message to the agent's own Discord channel mid-turn (synchronous, 10s cap)",
+    promptGuidelines: [
+      "Use channel-send for mid-turn messages the user should see immediately; the end-of-turn reply is auto-forwarded separately — do not duplicate the final answer.",
+    ],
+    parameters: Type.Object({
+      content: Type.String({
+        description:
+          "The message to post (plain markdown text, max 2000 chars)",
+        maxLength: 2000,
+      }),
+    }),
+    async execute(
+      _toolCallId,
+      params: { content: string },
+      _signal,
+      _onUpdate,
+      _ctx: ExtensionContext,
+    ) {
+      const active =
+        lastActiveChannel && lastActiveChannel.type === "discord"
+          ? lastActiveChannel
+          : null;
+      const ch = active || getDefaultChannel(channels);
+      if (ch?.type !== "discord") {
+        return {
+          content: [{ type: "text", text: "No Discord channel available" }],
+          details: {},
+        };
+      }
+      // Own identity (fanout-identity ruling): the agent's OWN bot token
+      // is required — a webhook-only channel would post under the relay
+      // identity, so it is rejected, not fallen back to.
+      const token = getDiscordToken(ch.id) || ch.botToken;
+      if (!token) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Channel ${ch.name}: no bot token (webhook-only channel cannot channel-send under the agent's own identity)`,
+            },
+          ],
+          details: { ok: false, error: "no bot token" },
+        };
+      }
+      // Resolved numeric id, or the configured channel reference — the
+      // same fallback sendDiscordMessage uses internally.
+      const channelId = getDiscordChannelId(ch.id) || ch.channel;
+      if (!channelId) {
+        return {
+          content: [
+            { type: "text", text: `Channel ${ch.name}: no channel id` },
+          ],
+          details: { ok: false, error: "no channel id" },
+        };
+      }
+      const timeoutMs = channelSendTimeoutMs();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error(`channel-send timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      });
+      let r: { success: boolean; messageId?: string; error?: string };
+      try {
+        r = await Promise.race([
+          sendDiscordMessage(ch, params.content),
+          timeout,
+        ]);
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `[!] channel-send failed: ${(e as Error).message}`,
+            },
+          ],
+          details: { ok: false, error: (e as Error).message },
+        };
+      } finally {
+        clearTimeout(timer);
+      }
+      if (r.success) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `[ok] posted to ${ch.name} (message ${r.messageId ?? "unknown id"})`,
+            },
+          ],
+          details: { ok: true, messageId: r.messageId, channelId },
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `[!] channel-send failed: ${r.error ?? "send failed"}`,
+          },
+        ],
+        details: { ok: false, error: r.error ?? "send failed" },
       };
     },
   });

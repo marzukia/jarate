@@ -14,6 +14,7 @@ import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
 import {
+  registerChannelSendTool,
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
@@ -1518,5 +1519,277 @@ describe("tasks (integration)", () => {
       expect(r.content[0].text).toContain("[!]");
     }
     expect(loadTasks(tmp)).toHaveLength(0);
+  });
+});
+
+describe("channel-send (integration)", () => {
+  let tmp = "";
+  let realHome = "";
+  let pi: any;
+  let ctx: any;
+  let handlers: Record<string, (...a: any[]) => any> = {};
+  let tools: Record<string, any> = {};
+  let fetchCalls: {
+    url: string;
+    method: string;
+    headers?: Record<string, string>;
+    body?: any;
+  }[] = [];
+  let fetchImpl: ((url: any, init?: any) => Promise<any>) | null = null;
+  const realFetch = globalThis.fetch;
+
+  const inbound = (body: string, id: string): ChannelMessage => ({
+    channelId: "ch1",
+    channelName: "Test",
+    channelType: "discord",
+    messageId: id,
+    from: "u",
+    fromId: "uid",
+    body,
+    timestamp: new Date().toISOString(),
+    attachments: [],
+    isRoom: false,
+  });
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-chsend-"));
+    realHome = process.env.HOME!;
+    process.env.HOME = tmp; // isolate from the real home
+    fs.mkdirSync(path.join(tmp, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            botToken: "tok1",
+            ownerUserId: "uid",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    handlers = {};
+    tools = {};
+    fetchCalls = [];
+    fetchImpl = null;
+    pi = {
+      registerMessageRenderer: () => {},
+      registerTool: (t: any) => {
+        tools[t.name] = t;
+      },
+      on: (n: string, fn: any) => {
+        handlers[n] = fn;
+      },
+      sendMessage: () => {},
+    };
+    extension(pi);
+    // The factory registers LLM tools in session_start, which this
+    // harness does not run — register the channel-send tool directly.
+    registerChannelSendTool(pi, loadChannelConfig(tmp));
+    ctx = {
+      cwd: tmp,
+      ui: { setStatus: () => {} },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      abort: () => {},
+    };
+    globalThis.fetch = (async (url: any, init?: any) => {
+      fetchCalls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        headers: init?.headers,
+        body: init?.body,
+      });
+      if (fetchImpl) return fetchImpl(url, init);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      };
+    }) as any;
+  });
+
+  afterEach(() => {
+    clearDiscordStatesForTest();
+    globalThis.fetch = realFetch;
+    process.env.HOME = realHome;
+    delete process.env.CHANNEL_SEND_TIMEOUT_MS;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("posts to the configured channel with the configured token (exact url/headers/payload)", async () => {
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "mid-turn status" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const post = fetchCalls.find((c) => c.method === "POST");
+    expect(post, "a POST must be issued").toBeDefined();
+    // exact url: the agent's own configured channel
+    expect(post!.url).toBe("https://discord.com/api/v10/channels/ch1/messages");
+    // exact headers: the agent's own bot token
+    expect(post!.headers).toEqual({
+      Authorization: "Bot tok1",
+      "Content-Type": "application/json",
+    });
+    // exact payload: plain content + silent allowed_mentions, no embeds
+    expect(post!.body).toBe(
+      JSON.stringify({
+        content: "mid-turn status",
+        allowed_mentions: { parse: [] },
+      }),
+    );
+    const payload = JSON.parse(post!.body);
+    expect(payload.embeds).toBeUndefined();
+    expect(payload.components).toBeUndefined();
+    // structured result: ok + message id
+    expect(r.content[0].text).toBe("[ok] posted to Test (message out1)");
+    expect(r.details).toEqual({
+      ok: true,
+      messageId: "out1",
+      channelId: "ch1",
+    });
+  });
+
+  test("markdown content passes through verbatim (plain message, no embeds)", async () => {
+    const md = "## heading\n**bold** and `code`\n- item";
+    await tools["channel-send"].execute(
+      "1",
+      { content: md },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const post = fetchCalls.find((c) => c.method === "POST");
+    expect(JSON.parse(post!.body).content).toBe(md);
+  });
+
+  test("after an inbound, posts to THAT channel under THAT token (own identity, no fanout)", async () => {
+    await handleInbound(pi, inbound("hello", "m1"), ctx);
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "own lane" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const post = fetchCalls.find(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(post, "the post must land on the agent's own channel").toBeDefined();
+    expect(post!.headers!.Authorization).toBe("Bot tok1");
+    expect(JSON.parse(post!.body).content).toBe("own lane");
+    expect(r.details).toEqual({
+      ok: true,
+      messageId: "out1",
+      channelId: "ch1",
+    });
+  });
+
+  test("API failure -> [!] + error, no success", async () => {
+    fetchImpl = (_url: any, init?: any) => {
+      if (init?.method === "POST") {
+        return Promise.resolve({
+          ok: false,
+          status: 403,
+          json: async () => ({}),
+          text: async () => "Missing Access",
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: "out1" }),
+        text: async () => "",
+      });
+    };
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toContain("[!]");
+    expect(r.content[0].text).toContain("403");
+    expect(r.details.ok).toBe(false);
+    expect(r.details.error).toContain("403");
+  });
+
+  test("bounded timeout: a hung POST fails at the cap (env-overridable)", async () => {
+    process.env.CHANNEL_SEND_TIMEOUT_MS = "50";
+    fetchImpl = () => new Promise(() => {}); // never settles
+    const t0 = Date.now();
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(r.content[0].text).toContain("[!]");
+    expect(r.content[0].text).toContain("timed out");
+    expect(r.details.ok).toBe(false);
+    expect(r.details.error).toContain("timed out after 50ms");
+  });
+
+  test("no channel available", async () => {
+    await handlers.session_shutdown(); // clears lastActiveChannel
+    const barePi: any = {
+      registerTool: (t: any) => {
+        tools["channel-send"] = t;
+      },
+    };
+    registerChannelSendTool(barePi, []);
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toBe("No Discord channel available");
+  });
+
+  test("webhook-only channel (no bot token) is rejected — no relay identity", async () => {
+    await handlers.session_shutdown(); // clears lastActiveChannel
+    fs.writeFileSync(
+      path.join(tmp, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            webhookUrl: "https://discord.com/api/webhooks/1/abc",
+            ack: true,
+          },
+        ],
+      }),
+    );
+    const barePi: any = {
+      registerTool: (t: any) => {
+        tools["channel-send"] = t;
+      },
+    };
+    registerChannelSendTool(barePi, loadChannelConfig(tmp));
+    const r = await tools["channel-send"].execute(
+      "1",
+      { content: "x" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toContain("no bot token");
+    expect(r.details.ok).toBe(false);
+    // no POST is issued (no webhook/relay fallback)
+    expect(fetchCalls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 });
