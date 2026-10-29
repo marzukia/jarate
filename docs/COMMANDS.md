@@ -13,8 +13,8 @@ Every machine /command reply the user sees starts with ONE ASCII tag
 (kimaki style, no emoji). Bracketed state tags: `[ok]` applied / success,
 `[!]` error / rejected / usage, `[..]` in progress, `[new]` new session,
 `[queued]` in line, `[-]` stopped / none. **Tag scope (Andryo 2026-10-20):**
-`[ok]`/`[!]` are machine output only (fenced /command replies, pi-postcheck
-lines, bg-card embeds). Chat one-liners (op status: compacted, restart wake,
+`[ok]`/`[!]` are machine output only (pi-postcheck lines, bg-card
+embeds). Chat one-liners (op status: compacted, restart wake,
 interrupted, run failure) ship as plain words with no tag. Queue acks and
 the mid-run interrupt are SILENT at verbose 0, post at verbose 1+.
 Read-only list commands carry a
@@ -36,10 +36,10 @@ docs/STYLE.md 2.3). Webhook callback embeds are framed and untagged.
 | `/stop` | `[-] stopped` |
 | `/hold [on|off]` | `[ok] hold on - …` / `[ok] hold off` |
 | `/status` | `[status] …` (error: `[!] status unavailable`) |
-| `/usage [all\|session\|last]` | markdown list, unfenced (`**usage · session**` + `- key: value` bullets) (error: bare plain one-liner; stats failure: `[!] usage stats unavailable` fenced) |
+| `/usage [all\|session\|last]` | markdown list, unfenced (`**usage · session**` + `- key: value` bullets) (error: bare plain one-liner; stats failure: `[!] usage stats unavailable`, bare plain one-liner) |
 | `/context [N]` | markdown list, unfenced (`**context · top N/M**` + bullets, est tokens char/4); error: `[!] no session file found` / `[!] session file unreadable` |
-| `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (fenced) |
-| `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (fenced) |
+| `/new-worktree [ref]` | `[ok] worktree …` / `[!] …` (plain) |
+| `/merge-worktree [squash]` | `[ok] merged …` / `[!] …` (plain) |
 | `/jobs` | markdown list, unfenced (`**recent (newest first) · N**` + bullets); `json` stays fenced |
 | `/reset` | `[new] …` |
 | `/restart` | `[..] …` |

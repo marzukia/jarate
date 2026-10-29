@@ -34,8 +34,7 @@ references context `ci` when the org upgrades to Pro.
 **No emoji** in command acks, warnings, or anything posted to Discord —
 use kimaki-style ASCII tags where the scheme applies: `[new]`/`[..]`/
 `[queued]` state, `- ` list items. `[ok]`/`[!]` are machine output ONLY
-(Andryo 2026-10-20): fenced `/command` replies, `pi-postcheck` lines,
-bg-card embeds. Chat one-liners (op status: compacted, restart wake,
+(Andryo 2026-10-20): `pi-postcheck` lines, bg-card embeds. Chat one-liners (op status: compacted, restart wake,
 interrupted, run failure) are plain words, no tag, no fence. Queue acks +
 interrupt notifications are silent at verbose 0 (post at verbose 1+). Emoji
 only where the platform requires them (Discord reactions, e.g. the 👀
