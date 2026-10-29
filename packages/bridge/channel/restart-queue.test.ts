@@ -549,11 +549,16 @@ describe("restart-queue option 1: bounded startup history scan", () => {
 
 describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
   let dir: string;
-  const SESSION = "/tmp/session-abc.jsonl";
+  // #307 F1 /tmp hygiene: the session file lives in the per-test mkdtemp dir
+  // (hydrogen's /tmp is shared across agent test runs; a bare name collides
+  // and lingers - the 2026-10-29 stale-file class). afterEach's rmSync(dir)
+  // covers cleanup.
+  let SESSION = "";
   const NOW = Date.parse("2026-10-29T06:00:00Z");
 
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-amnesia-"));
+    SESSION = path.join(dir, "session-abc.jsonl");
   });
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -599,7 +604,12 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
     rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
     writeSession([]); // the NEW session file is empty
     // Check against a DIFFERENT session file than the one committed against.
-    const out = rewakeUnpersisted(dir, "ch1", "/tmp/session-NEW.jsonl", NOW);
+    const out = rewakeUnpersisted(
+      dir,
+      "ch1",
+      path.join(dir, "session-NEW.jsonl"),
+      NOW,
+    );
     expect(out).toEqual([]);
   });
 
@@ -654,7 +664,12 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
 
   test("unreadable session file → empty set (no re-queue, never throws)", () => {
     rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
-    const out = rewakeUnpersisted(dir, "ch1", "/tmp/does-not-exist.jsonl", NOW);
+    const out = rewakeUnpersisted(
+      dir,
+      "ch1",
+      path.join(dir, "does-not-exist.jsonl"),
+      NOW,
+    );
     expect(out).toEqual([]);
   });
 });
