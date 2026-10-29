@@ -979,7 +979,9 @@ describe("sizeGuard", () => {
     // the oldest task framing (tail) survives, untruncated
     expect(out).toContain(framing);
     // middle is condensed
-    expect(out).not.toContain("middle work item 150 with a fairly long description to burn space");
+    expect(out).not.toContain(
+      "middle work item 150 with a fairly long description to burn space",
+    );
   });
   test("#306: long tail lines survive untruncated (framing > 200 chars)", () => {
     const framing = `[user] ACTIVE TASK: ${"x".repeat(300)} finish the #306 fixes`;

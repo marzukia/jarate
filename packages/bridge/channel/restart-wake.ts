@@ -47,7 +47,7 @@ import { egressText } from "./discord";
 export const CLEAN_STOP_MAX_AGE_MS = 24 * 3_600_000;
 
 /** Dedup window for racing startups (issue #111: two starts within 60s). */
-export const WAKE_DEDUP_WINDOW_MS = 60_000;
+export const WAKE_DEDUP_WINDOW_MS = 30 * 60_000;
 
 /** Cap the inflight list (a restart can strand many tickets; keep the
  *  message bounded, point at /jobs for the rest). */
@@ -333,12 +333,18 @@ export function wakeLockPath(stateDir: string): string {
 }
 
 /** Atomically claim the wake slot: true for exactly one startup per
- *  WAKE_DEDUP_WINDOW_MS, even when two startups race (O_EXCL create).
- *  A claim that never posts (crash between claim and post) just eats
- *  the 60s window — the next start after the window still posts. */
+ *  (restart class, WAKE_DEDUP_WINDOW_MS), even when two startups race
+ *  (O_EXCL create). #306: the window is 30min — the observed
+ *  double-post gap was 21.7min (two clean startups, both posting
+ *  "planned"); and the lock is CLASS-AWARE: a different restart class
+ *  (an unplanned start after a planned card) always takes over, so the
+ *  crash signal is never suppressed by an earlier planned card. A claim
+ *  that never posts (crash between claim and post) just eats the window
+ *  — the next start after the window still posts. */
 export function claimWake(
   stateDir: string,
   now = Date.now(),
+  klass: RestartClass = "planned",
   windowMs: number = WAKE_DEDUP_WINDOW_MS,
 ): boolean {
   const p = wakeLockPath(stateDir);
@@ -346,21 +352,29 @@ export function claimWake(
     try {
       fs.mkdirSync(stateDir, { recursive: true });
       const fd = fs.openSync(p, "wx");
-      fs.writeSync(fd, `${now}\n`);
+      fs.writeSync(fd, `${now} ${klass}\n`);
       fs.closeSync(fd);
       return true;
     } catch (e) {
       if ((e as NodeJS.ErrnoException)?.code !== "EEXIST") return false;
       let t = Number.NaN;
+      let prevKlass: string | null = null;
       try {
-        t = Number(fs.readFileSync(p, "utf8").trim());
+        const raw = fs.readFileSync(p, "utf8").trim();
+        const sp = raw.lastIndexOf(" ");
+        t = Number(sp === -1 ? raw : raw.slice(0, sp));
+        prevKlass = sp === -1 ? null : raw.slice(sp + 1);
       } catch {
         return false; // unreadable claim: assume someone holds it
       }
       if (!Number.isFinite(t)) return false; // same: unknown age = held
-      if (now - t < windowMs) return false;
+      // #306: a different restart class always takes over (the crash
+      // signal must not be suppressed); the legacy lock (no class)
+      // dedupes conservatively (treated as the same class).
+      const sameKlass = prevKlass === null || prevKlass === klass;
+      if (sameKlass && now - t < windowMs) return false;
       try {
-        fs.unlinkSync(p); // stale claim: take over
+        fs.unlinkSync(p); // stale (or class-change) claim: take over
       } catch {
         return false; // lost the unlink race to the other start
       }
@@ -501,7 +515,7 @@ export async function runRestartWake(
   // Consume the marker only on a real process start: in-process /new and
   // /reload cycles must not burn it.
   const restartClass = readCleanStop(deps.stateDir, now);
-  if (!claimWake(deps.stateDir, now)) {
+  if (!claimWake(deps.stateDir, now, restartClass)) {
     return { posted: false, reason: "dedup", restartClass };
   }
   const runs = readRunRecords(deps.runDir ?? defaultRunDir());
