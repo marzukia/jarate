@@ -159,6 +159,7 @@ import {
   todoBoardContextBlock,
 } from "./todos";
 import {
+  registerChannelSendTool,
   registerSendFileTool,
   registerSleepTool,
   registerTaskTool,
@@ -1885,6 +1886,7 @@ export default function (pi: ExtensionAPI) {
       )
     ) {
       registerSendFileTool(pi, channels);
+      registerChannelSendTool(pi, channels);
       registerTodoTool(pi, channels);
       registerSleepTool(pi, channels);
       registerTaskTool(pi, channels);
