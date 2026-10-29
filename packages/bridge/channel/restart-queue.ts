@@ -97,6 +97,35 @@ interface RewakeQueueFile {
   /** Message ids committed to pi (sendToPi), newest last, capped.
    *  The dedupe set for the startup history scan. */
   delivered: string[];
+  /** #306 amnesia: per-delivered-id commit metadata (the full prompt
+   *  sent to pi + the inbound's ChannelMessage + commit time + the
+   *  session file path at commit). Additive, v:1 unchanged — absent on
+   *  files written before the field. */
+  deliveredMeta?: Record<string, DeliveredMeta>;
+}
+
+/** #306 amnesia: commit metadata for one delivered id. `prompt` is the
+ *  FULL prompt (channel ctx + body) sendToPi sent to pi — it matches the
+ *  session file's custom_message content exactly, so a committed id is
+ *  "persisted" iff its prompt is in the session file. `msg` is the
+ *  inbound's ChannelMessage, kept so an accepted-but-unpersisted id can
+ *  be re-queued (the re-wake drain re-renders via handleInbound). `sf`
+ *  is the session file path at commit — the SAME-FILE guard: a /new
+ *  session (a different file) must not re-queue the old session's
+ *  messages. */
+export interface DeliveredMeta {
+  prompt: string;
+  msg: ChannelMessage;
+  at: number;
+  sf: string;
+}
+
+/** #306 amnesia: an accepted-but-unpersisted delivered id, ready to
+ *  re-queue (the re-wake drain delivers it at the next agent_end). */
+export interface AmnesiaEntry {
+  id: string;
+  msg: ChannelMessage;
+  at: number;
 }
 
 const EMPTY: RewakeQueueFile = { v: 1, pending: [], delivered: [] };
@@ -163,7 +192,28 @@ export function loadRewakeQueue(
   if (Array.isArray(d.delivered))
     for (const id of d.delivered)
       if (typeof id === "string") delivered.push(id);
-  return { v: 1, pending, delivered };
+  const deliveredMeta: Record<string, DeliveredMeta> = {};
+  if (typeof d.deliveredMeta === "object" && d.deliveredMeta !== null)
+    for (const [id, m] of Object.entries(
+      d.deliveredMeta as Record<string, unknown>,
+    )) {
+      const meta = m as Record<string, unknown>;
+      if (
+        typeof meta?.prompt === "string" &&
+        typeof meta?.msg === "object" &&
+        meta?.msg !== null &&
+        typeof (meta.msg as Record<string, unknown>)?.messageId === "string" &&
+        typeof meta?.at === "number" &&
+        typeof meta?.sf === "string"
+      )
+        deliveredMeta[id] = {
+          prompt: meta.prompt,
+          msg: meta.msg as ChannelMessage,
+          at: meta.at,
+          sf: meta.sf,
+        };
+    }
+  return { v: 1, pending, delivered, deliveredMeta };
 }
 
 /** Atomic write (shared atomicWriteJson: tmp+rename, the one tmp naming
@@ -281,13 +331,17 @@ export function rewakeClearPending(
 
 /** Commit a message to pi: remove it from pending (if still there —
  *  a cursor-replay re-delivery of a pending id commits through here)
- *  and record its id in the delivered set (capped). No write when
- *  nothing changed (already-delivered, non-queued direct inbounds
- *  that have no pending copy still record once, then no-op). */
+ *  and record its id in the delivered set (capped). #306: also record
+ *  commit metadata (the full prompt + the inbound's ChannelMessage +
+ *  commit time + the session file path) when provided — the amnesia
+ *  resurrection cross-checks this against the resumed session file.
+ *  No write when nothing changed (already-delivered, non-queued direct
+ *  inbounds that have no pending copy still record once, then no-op). */
 export function rewakeCommitDelivered(
   stateDir: string | null | undefined,
   channelId: string,
   messageId: string,
+  meta?: DeliveredMeta,
 ): void {
   const file = loadRewakeQueue(stateDir, channelId);
   let changed = false;
@@ -296,11 +350,34 @@ export function rewakeCommitDelivered(
     file.pending = next;
     changed = true;
   }
-  if (!file.delivered.includes(messageId)) {
+  const idAlreadyDelivered = file.delivered.includes(messageId);
+  if (!idAlreadyDelivered) {
     file.delivered.push(messageId);
     if (file.delivered.length > REWAKE_DELIVERED_CAP)
       file.delivered.splice(0, file.delivered.length - REWAKE_DELIVERED_CAP);
     changed = true;
+  }
+  // #306: record/refresh the commit metadata (capped with the delivered
+  // set — a pruned id's meta is dropped too, so the map cannot grow
+  // unbounded). A re-commit of an already-delivered id refreshes its
+  // meta (a newer commit is the one that can be amnesiac).
+  if (meta) {
+    if (!file.deliveredMeta) file.deliveredMeta = {};
+    file.deliveredMeta[messageId] = meta;
+    const ids = Object.keys(file.deliveredMeta);
+    if (ids.length > REWAKE_DELIVERED_CAP) {
+      // Keep the meta for the ids still in the delivered set (newest
+      // last); drop the rest.
+      const keep = new Set(file.delivered);
+      for (const id of ids) if (!keep.has(id)) delete file.deliveredMeta[id];
+    }
+    if (!idAlreadyDelivered) changed = true;
+    else if (!file.deliveredMeta[messageId]) changed = true;
+    else if (
+      file.deliveredMeta[messageId].at !== meta.at ||
+      file.deliveredMeta[messageId].sf !== meta.sf
+    )
+      changed = true;
   }
   if (changed) saveRewakeQueue(stateDir, channelId, file);
 }
@@ -327,6 +404,150 @@ export function rewakeDeliveredIds(
   channelId: string,
 ): Set<string> {
   return new Set(loadRewakeQueue(stateDir, channelId).delivered);
+}
+
+// ─── #306 amnesia: accepted-but-unpersisted resurrection ────────────────
+
+/** #306 amnesia age guard: a committed id older than this is never
+ *  re-queued (bounds the resurrection to the last 24h — a long-dead
+ *  commit is almost certainly answered in a since-rotated session). */
+export const AMNESIA_MAX_AGE_MS = 24 * 3_600_000;
+
+// #306 amnesia: the active session file, captured at session_start
+// (safeSessionFile ?? findSessionFile). sendToPi stamps it into the
+// delivered-set commit metadata (the SAME-FILE guard); the startup
+// amnesia check cross-checks the delivered set against this file.
+let currentSessionFile: string | null = null;
+
+/** Capture the active session file for the amnesia commit stamp.
+ *  Called once at session_start. */
+export function setCurrentSessionFile(file: string | null): void {
+  currentSessionFile = file;
+}
+
+/** The session file captured at the last session_start (null = unknown).
+ *  Used by sendToPi to stamp the commit metadata's same-file guard. */
+export function getCurrentSessionFile(): string | null {
+  return currentSessionFile;
+}
+
+/** #306 amnesia: build the commit metadata for one sendToPi commit.
+ *  `prompt` is the FULL prompt (channel ctx + body) sent to pi — it
+ *  matches the session file's custom_message content exactly. `msg` is
+ *  the inbound's ChannelMessage (or a minimal reconstruction from the
+ *  display body when the caller has no inbound), kept so an
+ *  accepted-but-unpersisted id can be re-queued. `sf` is the session
+ *  file path at commit (the SAME-FILE guard). */
+export function buildDeliveredMeta(
+  text: string,
+  msg: ChannelMessage | undefined,
+  messageId: string,
+): DeliveredMeta {
+  return {
+    prompt: text,
+    // Every sendToPi call site that carries a messageId passes the
+    // inbound's ChannelMessage; the fallback (a synthetic prompt with no
+    // inbound) keeps the real messageId so the re-queue dedupes it
+    // correctly (the channel itself is routed by config, not msg).
+    msg: msg ?? {
+      channelId: "",
+      channelName: "",
+      channelType: "discord",
+      messageId,
+      from: "",
+      body: text,
+      timestamp: new Date().toISOString(),
+      attachments: [],
+      isRoom: false,
+    },
+    at: Date.now(),
+    sf: currentSessionFile ?? "",
+  };
+}
+
+/** Read the set of prompt strings persisted in a pi session file
+ *  (JSONL). A bridge inbound lands as a `custom_message` entry whose
+ *  `content` is the FULL prompt (channel ctx + body) — exactly what
+ *  sendToPi sent. A TUI/`message` user-role entry (string content, or
+ *  the joined text blocks of an array content) is included too. Never
+ *  throws: an unreadable file yields an empty set (the caller then
+ *  re-queues nothing — at-most-once over at-least-once is the safe
+ *  direction when the session file itself is suspect). */
+export function readSessionPrompts(sessionFile: string): Set<string> {
+  const out = new Set<string>();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(sessionFile, "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let o: any;
+    try {
+      o = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!o || typeof o !== "object") continue;
+    if (o.type === "custom_message" && typeof o.content === "string") {
+      out.add(o.content);
+      continue;
+    }
+    if (o.type === "message" && o.message?.role === "user") {
+      const c = o.message.content;
+      if (typeof c === "string") {
+        out.add(c);
+      } else if (Array.isArray(c)) {
+        const text = c
+          .filter(
+            (b: any) =>
+              typeof b === "string" ||
+              (b && typeof b === "object" && typeof b.text === "string"),
+          )
+          .map((b: any) => (typeof b === "string" ? b : b.text))
+          .join("");
+        if (text) out.add(text);
+      }
+    }
+  }
+  return out;
+}
+
+/** #306 amnesia: the delivered ids pi ACCEPTED (committed at sendToPi)
+ *  but never PERSISTED to the session file (a mid-turn restart killed
+ *  the process before the steering queue drained). These are the ids the
+ *  delivered set says "done" but the session file does not have — the
+ *  silent amnesia. Returns them ready to re-queue.
+ *
+ *  Guards: (1) SAME-FILE — only ids committed against THIS session file
+ *  (meta.sf === sessionFile); a /new session (a different file) must not
+ *  re-queue the old session's messages. (2) AGE — only commits within
+ *  maxAgeMs. (3) PERSISTED — an id whose prompt is in the session file
+ *  is answered; skip it. */
+export function rewakeUnpersisted(
+  stateDir: string | null | undefined,
+  channelId: string,
+  sessionFile: string | null | undefined,
+  now = Date.now(),
+  maxAgeMs = AMNESIA_MAX_AGE_MS,
+): AmnesiaEntry[] {
+  if (!sessionFile) return [];
+  const file = loadRewakeQueue(stateDir, channelId);
+  const meta = file.deliveredMeta;
+  if (!meta) return [];
+  const persisted = readSessionPrompts(sessionFile);
+  const out: AmnesiaEntry[] = [];
+  for (const id of file.delivered) {
+    const m = meta[id];
+    if (!m) continue; // no commit metadata (pre-field file) — cannot check
+    if (m.sf !== sessionFile) continue; // same-file guard
+    if (now - m.at > maxAgeMs) continue; // stale
+    if (persisted.has(m.prompt)) continue; // persisted — answered
+    out.push({ id, msg: m.msg, at: m.at });
+  }
+  return out;
 }
 
 // ─── option 1: bounded startup history scan ──────────────────────────────

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { WebSocketServer } from "ws";
 import { clearRegistryCache } from "./censor";
+import { pruneSeenIds, seedSeenSets, wakeEmbedKey } from "./channel-state";
 import {
   allowedMentionsFor,
   clearDiscordStatesForTest,
@@ -11,6 +12,7 @@ import {
   connectDiscordPresence,
   deferInteraction,
   deleteDeferredAck,
+  deliverInboundMessage,
   disconnectDiscord,
   discordFetch,
   editInteractionMessage,
@@ -439,6 +441,7 @@ test("gateway reply carries repliedMessage too (T1)", () => {
       polling: false,
       callbacks: { onMessage: () => {}, onError: () => {} },
       startupPending: false,
+      seen: { seenIds: new Set(), seenWakeKeys: new Set() },
     } as any);
   if (!states.has("r1")) states.set("r1", state);
   const seen: any[] = [];
@@ -660,6 +663,137 @@ test("patchChannelState: corrupt file starts fresh, keeps nothing (T4)", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─── #306: persistent seen sets — at-most-once across cursor rewinds ───
+
+function seenState(channelId: string, stateDir: string | null): any {
+  return {
+    config: { id: "c1", type: "discord" },
+    channelId,
+    botUserId: "bot-1",
+    lastMessageId: null,
+    stateDir,
+    seen: { seenIds: new Set<string>(), seenWakeKeys: new Set<string>() },
+    callbacks: { onMessage: () => {}, onError: () => {} },
+  };
+}
+
+test("#306: a message re-fetched after a cursor rewind is dropped (seen set)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-seen1-"));
+  try {
+    const st = seenState("999", dir);
+    expect(
+      deliverInboundMessage(st, {
+        id: "100",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(true);
+    expect(st.lastMessageId).toBe("100");
+    // Op-window rewind: the persisted cursor goes back below 100.
+    st.lastMessageId = "50";
+    // Respawn backfill re-fetches 100 (above the rewound cursor) → dropped.
+    expect(
+      deliverInboundMessage(st, {
+        id: "100",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(false);
+    // A genuinely new message still delivers.
+    expect(
+      deliverInboundMessage(st, {
+        id: "200",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(true);
+    // The seen set is persisted to channel-state.json (seen section).
+    const onDisk = JSON.parse(
+      fs.readFileSync(path.join(dir, "channel-state.json"), "utf-8"),
+    );
+    expect(onDisk.seen["999"]).toEqual(["100", "200"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#306: the seen set survives a process restart (persist + reload)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-seen2-"));
+  try {
+    const st1 = seenState("999", dir);
+    expect(
+      deliverInboundMessage(st1, {
+        id: "100",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(true);
+    // "Restart": a fresh state seeded from the persisted file.
+    const st2 = {
+      ...seenState("999", dir),
+      seen: seedSeenSets(loadChannelStateFile(dir), "999"),
+    };
+    expect(st2.seen.seenIds.has("100")).toBe(true);
+    // The re-fetched 100 is dropped even across the restart.
+    expect(
+      deliverInboundMessage(st2, {
+        id: "100",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(false);
+    // Newer messages still deliver.
+    expect(
+      deliverInboundMessage(st2, {
+        id: "200",
+        author: { id: "u-1", username: "u" },
+      }),
+    ).toBe(true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#306: a double-posted restart-wake card is delivered at most once", () => {
+  const st = seenState("999", null);
+  const wake = (id: string, klass: string) => ({
+    id,
+    webhook_id: "wh-1",
+    author: { id: "bot-wh", bot: true, username: "wh" },
+    embeds: [
+      {
+        author: { name: `pi-bg restart-wake · ${klass}` },
+        title: "pi-bg",
+        description: "restart complete",
+      },
+    ],
+  });
+  expect(wakeEmbedKey(wake("300", "planned"))).not.toBeNull();
+  // First copy delivers.
+  expect(deliverInboundMessage(st, wake("300", "planned"))).toBe(true);
+  // The double-posted copy (a DIFFERENT Discord message id, identical
+  // card) is dropped by the wake key — at-most-once at the session.
+  expect(deliverInboundMessage(st, wake("301", "planned"))).toBe(false);
+  // A different card (different class) still delivers.
+  expect(deliverInboundMessage(st, wake("302", "unplanned"))).toBe(true);
+  // Non-wake messages are unaffected by the wake key.
+  expect(
+    deliverInboundMessage(st, {
+      id: "303",
+      author: { id: "u-1", username: "u" },
+    }),
+  ).toBe(true);
+});
+
+test("#306: pruneSeenIds drops >72h-old snowflakes, keeps short/short-ids", () => {
+  const now = Date.now();
+  const old = (
+    (BigInt(now - 80 * 3_600_000) - 1420070400000n) <<
+    22n
+  ).toString();
+  const fresh = ((BigInt(now) - 1420070400000n) << 22n).toString();
+  expect(pruneSeenIds([old, fresh, "100"], now)).toEqual([fresh, "100"]);
+  // The cap keeps the newest ids only.
+  const many = Array.from({ length: 600 }, (_, i) => `9${i}`);
+  expect(pruneSeenIds(many, now)).toHaveLength(500);
+  expect(pruneSeenIds(many, now)[0]).toBe(`9${100}`);
 });
 
 // ─── T5: ping suppression on outbound ────────────────────────────────────

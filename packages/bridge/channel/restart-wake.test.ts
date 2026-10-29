@@ -319,7 +319,7 @@ describe("clean-stop marker (issue #111)", () => {
   });
 });
 
-// ─── startup dedup (60s window) ──────────────────────────────────────────
+// ─── startup dedup (30min window, class-aware — #306) ───────────────────
 
 describe("claimWake dedup (issue #111)", () => {
   test("first claim wins; racing start within 60s loses", () => {
@@ -353,6 +353,24 @@ describe("claimWake dedup (issue #111)", () => {
     expect(claimWake(tmp, T0 + 10_000)).toBe(false);
     // after the 60s window the claim is stale: next start takes over
     expect(claimWake(tmp, T0 + WAKE_DEDUP_WINDOW_MS + 10_000)).toBe(true);
+  });
+
+  test("#306: two clean (planned) startups 21.7min apart → one card", () => {
+    expect(claimWake(tmp, T0, "planned")).toBe(true);
+    // the observed evidence gap: 21.7min, same class → deduped
+    expect(claimWake(tmp, T0 + 21 * 60_000 + 43_000, "planned")).toBe(false);
+    // an UNPLANNED start (crash) in the same window still posts — the
+    // crash signal is not suppressed by the earlier planned card
+    expect(claimWake(tmp, T0 + 25 * 60_000, "unclean")).toBe(true);
+    // a fresh planned restart after the class change posts again
+    expect(claimWake(tmp, T0 + 40 * 60_000, "planned")).toBe(true);
+  });
+
+  test("#306: legacy lock (no class) dedupes conservatively", () => {
+    fs.mkdirSync(tmp, { recursive: true });
+    fs.writeFileSync(path.join(tmp, "restart-wake.lock"), `${T0}\n`);
+    expect(claimWake(tmp, T0 + 10_000, "planned")).toBe(false);
+    expect(claimWake(tmp, T0 + 10_000, "unclean")).toBe(false);
   });
 });
 

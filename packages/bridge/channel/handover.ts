@@ -660,15 +660,28 @@ const GUARD_CONDENSE_ORDER = [
   "Transcript",
 ];
 
+const CONDENSE_MARKER = "… (condensed by size guard)";
+
+// #306: the Transcript section is current-state-first (transcript.ts:
+// serializeTranscript renders the newest span at the top and the oldest
+// task framing at the bottom) — keep BOTH ends and condense the middle.
+// Head lines are truncated (newest work, cheap to summarize); tail lines
+// are kept whole (the active-task framing must survive). Repeated passes
+// converge: an existing marker is stripped before re-cutting, and a
+// 2-content-line body is the fixed point (idempotent).
 function condenseBody(body: string): string {
   const lines = body.split("\n");
   if (lines.length <= 2) return body;
-  const keep = Math.max(1, Math.floor(lines.length * 0.4));
-  const kept = lines
-    .slice(0, keep)
-    .map((l) => (l.length > 200 ? `${l.slice(0, 197)}...` : l));
-  kept.push("… (condensed by size guard)");
-  return kept.join("\n");
+  const content = lines.filter((l) => l !== CONDENSE_MARKER);
+  if (content.length <= 2) return body;
+  const keep = Math.max(2, Math.floor(content.length * 0.4));
+  const headKeep = Math.max(1, Math.floor(keep / 2));
+  const tailKeep = Math.max(0, keep - headKeep);
+  if (headKeep + tailKeep >= content.length) return body;
+  const trunc = (l: string) => (l.length > 200 ? `${l.slice(0, 197)}...` : l);
+  const head = content.slice(0, headKeep).map(trunc);
+  const tail = tailKeep > 0 ? content.slice(-tailKeep) : [];
+  return [...head, CONDENSE_MARKER, ...tail].join("\n");
 }
 
 /** Cap the doc at maxTokens (default 12k). Deterministic sections and the

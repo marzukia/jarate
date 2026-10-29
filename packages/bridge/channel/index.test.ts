@@ -56,6 +56,7 @@ import {
   queueMidTurnInbound,
 } from "./queue";
 import { setProcessExitHookForTest } from "./restart-ops";
+import { getCurrentSessionFile, rewakeCommitDelivered } from "./restart-queue";
 import { fit } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
 import { performUndo } from "./undo";
@@ -4613,5 +4614,78 @@ describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
     // (before=<persisted cursor>)
     expect(fetchCalls.some((c) => c.url.includes("/users/@me"))).toBe(true);
     expect(fetchCalls.some((c) => c.url.includes("before=123456"))).toBe(true);
+  });
+
+  test("#306 amnesia: session_start re-queues accepted-but-unpersisted inbounds", async () => {
+    // The resumed session file (a DIFFERENT prompt — the committed id
+    // was never persisted: the mid-turn restart killed pi first).
+    const sessionFile = path.join(tmp, "session.jsonl");
+    fs.writeFileSync(
+      sessionFile,
+      JSON.stringify({
+        type: "custom_message",
+        content: "ctx\n\nsome other body",
+      }) + "\n",
+    );
+    (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
+    // A delivered id committed against THIS session file, with metadata.
+    rewakeCommitDelivered(path.join(tmp, ".tmp"), "ch1", "100", {
+      prompt: "ctx\n\nbody 100",
+      msg: {
+        channelId: "ch1",
+        channelName: "Test",
+        channelType: "discord",
+        messageId: "100",
+        from: "Beepy",
+        body: "body 100",
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        isRoom: false,
+      },
+      at: Date.now(),
+      sf: sessionFile,
+    });
+    midTurnQueues.clear();
+    await handlers.session_start?.({ reason: "startup" }, ctx);
+    // The amnesia re-queue is synchronous: the entry is back in the
+    // in-memory re-wake queue (delivered at the next agent_end).
+    const q = midTurnQueues.get("ch1");
+    expect(q?.some((e) => e.msg.messageId === "100")).toBe(true);
+    // The session file slot was captured for the commit stamp.
+    expect(getCurrentSessionFile()).toBe(sessionFile);
+  });
+
+  test("#306 amnesia: a persisted (answered) commit is NOT re-queued", async () => {
+    const sessionFile = path.join(tmp, "session2.jsonl");
+    // The session file HAS the committed id's exact prompt — answered.
+    fs.writeFileSync(
+      sessionFile,
+      JSON.stringify({ type: "custom_message", content: "ctx\n\nbody 200" }) +
+        "\n",
+    );
+    (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
+    rewakeCommitDelivered(path.join(tmp, ".tmp"), "ch1", "200", {
+      prompt: "ctx\n\nbody 200",
+      msg: {
+        channelId: "ch1",
+        channelName: "Test",
+        channelType: "discord",
+        messageId: "200",
+        from: "Beepy",
+        body: "body 200",
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        isRoom: false,
+      },
+      at: Date.now(),
+      sf: sessionFile,
+    });
+    midTurnQueues.clear();
+    await handlers.session_start?.({ reason: "startup" }, ctx);
+    // The persisted commit is not re-queued: the queue has no "200"
+    // (an empty queue is the expected shape — nothing to deliver).
+    expect(
+      midTurnQueues.get("ch1")?.some((e) => e.msg.messageId === "200") ?? false,
+    ).toBe(false);
   });
 });

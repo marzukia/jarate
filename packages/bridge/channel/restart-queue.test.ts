@@ -12,6 +12,7 @@ import {
   REWAKE_LOOKBACK_MAX,
   REWAKE_SCAN_MAX_AGE_MS,
   type RewakePendingEntry,
+  readSessionPrompts,
   rewakeAddPending,
   rewakeClearPending,
   rewakeCommitDelivered,
@@ -20,6 +21,7 @@ import {
   rewakeQueuePath,
   rewakeRemovePending,
   rewakeSetPendingAck,
+  rewakeUnpersisted,
   rewakeUpdatePendingMsg,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
@@ -540,5 +542,119 @@ describe("restart-queue option 1: bounded startup history scan", () => {
   test("non-array fetch result (API oddity) → treated as empty window", async () => {
     const { r } = await runScan({ id: "out1" } as unknown as any[]);
     expect(r).toEqual({ scanned: 0, requeued: 0 });
+  });
+});
+
+// ─── #306 amnesia: accepted-but-unpersisted resurrection ────────────────
+
+describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
+  let dir: string;
+  const SESSION = "/tmp/session-abc.jsonl";
+  const NOW = Date.parse("2026-10-29T06:00:00Z");
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-amnesia-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const meta = (
+    id: string,
+    over: Partial<import("./restart-queue").DeliveredMeta> = {},
+  ): import("./restart-queue").DeliveredMeta => ({
+    prompt: `ctx\n\nbody ${id}`,
+    msg: msg(id),
+    at: NOW,
+    sf: SESSION,
+    ...over,
+  });
+
+  // Write a pi session file (JSONL) with the given custom_message prompts.
+  const writeSession = (prompts: string[]) => {
+    const lines = prompts.map((p) =>
+      JSON.stringify({ type: "custom_message", content: p }),
+    );
+    fs.writeFileSync(SESSION, lines.join("\n") + "\n");
+  };
+
+  test("accepted but NOT persisted → re-queued (the amnesia gap)", () => {
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
+    // The session file has a DIFFERENT prompt — 100 was never persisted.
+    writeSession(["ctx\n\nsome other body"]);
+    const out = rewakeUnpersisted(dir, "ch1", SESSION, NOW);
+    expect(out.map((e) => e.id)).toEqual(["100"]);
+    expect(out[0].msg.messageId).toBe("100");
+  });
+
+  test("accepted AND persisted → NOT re-queued (answered in the session)", () => {
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
+    // The session file HAS 100's exact prompt — pi persisted it.
+    writeSession(["ctx\n\nbody 100"]);
+    const out = rewakeUnpersisted(dir, "ch1", SESSION, NOW);
+    expect(out).toEqual([]);
+  });
+
+  test("same-file guard: a /new session (different file) re-queues nothing", () => {
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
+    writeSession([]); // the NEW session file is empty
+    // Check against a DIFFERENT session file than the one committed against.
+    const out = rewakeUnpersisted(dir, "ch1", "/tmp/session-NEW.jsonl", NOW);
+    expect(out).toEqual([]);
+  });
+
+  test("age guard: a commit older than 24h is never re-queued", () => {
+    const stale = NOW - 25 * 3_600_000;
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100", { at: stale }));
+    writeSession([]);
+    const out = rewakeUnpersisted(dir, "ch1", SESSION, NOW);
+    expect(out).toEqual([]);
+  });
+
+  test("no commit metadata (pre-field file) → nothing to check, no re-queue", () => {
+    rewakeCommitDelivered(dir, "ch1", "100"); // no meta
+    writeSession([]);
+    const out = rewakeUnpersisted(dir, "ch1", SESSION, NOW);
+    expect(out).toEqual([]);
+  });
+
+  test("no session file (unknown) → no re-queue (conservative)", () => {
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
+    const out = rewakeUnpersisted(dir, "ch1", null, NOW);
+    expect(out).toEqual([]);
+  });
+
+  test("readSessionPrompts: custom_message + user-role messages", () => {
+    const f = path.join(dir, "s.jsonl");
+    fs.writeFileSync(
+      f,
+      [
+        JSON.stringify({ type: "custom_message", content: "prompt A" }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "user", content: "user text" },
+        }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "block1" }, "block2"],
+          },
+        }),
+        JSON.stringify({ type: "message", message: { role: "assistant" } }),
+        "not json",
+      ].join("\n") + "\n",
+    );
+    const prompts = readSessionPrompts(f);
+    expect(prompts.has("prompt A")).toBe(true);
+    expect(prompts.has("user text")).toBe(true);
+    expect(prompts.has("block1block2")).toBe(true);
+    expect(prompts.size).toBe(3); // assistant + the bad line are not prompts
+  });
+
+  test("unreadable session file → empty set (no re-queue, never throws)", () => {
+    rewakeCommitDelivered(dir, "ch1", "100", meta("100"));
+    const out = rewakeUnpersisted(dir, "ch1", "/tmp/does-not-exist.jsonl", NOW);
+    expect(out).toEqual([]);
   });
 });

@@ -33,10 +33,14 @@ import {
 } from "./index";
 import { persistLivePlaceholders } from "./live";
 import {
+  buildDeliveredMeta,
   collectRewakeOrphans,
+  getCurrentSessionFile,
   rewakeAddPending,
+  rewakeCommitDelivered,
   rewakePending,
   rewakeRemovePending,
+  rewakeUnpersisted,
   rewakeUpdatePendingMsg,
 } from "./restart-queue";
 import {
@@ -442,4 +446,60 @@ export async function deleteQueuedInbound(
     if (ch) deleteDiscordMessage(ch, ack.ackId).catch(() => {});
   }
   renumberQueuedAcks(channelId);
+}
+
+/** #306 amnesia: re-queue accepted-but-unpersisted inbounds at a real
+ *  process start. A mid-turn restart kills pi before the steering queue
+ *  drains — the id is committed to the delivered set (at acceptance) but
+ *  the message never reached the session file, so the #180 history scan
+ *  skips it and the cursor is past it; the resume acts without it,
+ *  silently. Cross-check the delivered set against the session file
+ *  captured at session_start (same-file guard) and re-queue the gap:
+ *  the re-wake drain delivers it at the next agent_end (or the
+ *  wake-fail direct kick). Returns the count re-queued. */
+export function amnesiaRequeue(
+  stateDir: string,
+  channels: ChannelConfig[],
+): number {
+  const sessionFile = getCurrentSessionFile();
+  let n = 0;
+  for (const ch of channels) {
+    if (ch.type !== "discord") continue;
+    const unpersisted = rewakeUnpersisted(stateDir, ch.id, sessionFile);
+    if (unpersisted.length === 0) continue;
+    const q = midTurnQueues.get(ch.id) ?? [];
+    for (const e of unpersisted) {
+      rewakeAddPending(stateDir, ch.id, { msg: e.msg, queuedAt: e.at });
+      if (!q.some((x) => x.msg.messageId === e.msg.messageId))
+        q.push({ msg: e.msg, queuedAt: e.at });
+    }
+    midTurnQueues.set(ch.id, q);
+    n += unpersisted.length;
+  }
+  if (n > 0)
+    console.log(
+      `[channel] #306 amnesia: re-queued ${n} committed-but-unpersisted inbound(s)`,
+    );
+  return n;
+}
+
+/** #306 amnesia + #186 (F1): commit one inbound to the persistent
+ *  delivered set (stamping the amnesia metadata) AND prune the drained
+ *  in-memory copy — otherwise the agent_end re-wake pops it and
+ *  delivers the same inbound twice. Called from sendToPi when the
+ *  inbound has a messageId. */
+export function commitInbound(
+  stateDir: string | null | undefined,
+  channelId: string,
+  messageId: string,
+  text: string,
+  inboundMsg: ChannelMessage | undefined,
+): void {
+  rewakeCommitDelivered(
+    stateDir,
+    channelId,
+    messageId,
+    buildDeliveredMeta(text, inboundMsg, messageId),
+  );
+  dropQueuedInbound(channelId, messageId);
 }

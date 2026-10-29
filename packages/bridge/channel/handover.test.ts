@@ -956,6 +956,50 @@ describe("sizeGuard", () => {
     const twice = sizeGuard(once, 4_000);
     expect(twice).toBe(once);
   });
+  test("#306: condense keeps the transcript head AND the tail (task framing)", () => {
+    // current-state-first layout: line 0 = newest work, last line = the
+    // oldest active-task framing (the 212k-token handover symptom).
+    const framing =
+      "[user] ACTIVE TASK: finish the #306 handover fixes and open the PR";
+    const lines = [
+      "[assistant] latest work item 0 in flight",
+      ...Array.from(
+        { length: 298 },
+        (_, i) =>
+          `[assistant] middle work item ${i} with a fairly long description to burn space`,
+      ),
+      framing,
+    ];
+    const d = renderDeterministic(state, lines.join("\n"), header);
+    expect(estTokens(d)).toBeGreaterThan(4_000);
+    const out = sizeGuard(d, 4_000);
+    expect(out).toContain("… (condensed by size guard)");
+    // newest work (head) survives
+    expect(out).toContain("latest work item 0 in flight");
+    // the oldest task framing (tail) survives, untruncated
+    expect(out).toContain(framing);
+    // middle is condensed
+    expect(out).not.toContain(
+      "middle work item 150 with a fairly long description to burn space",
+    );
+  });
+  test("#306: long tail lines survive untruncated (framing > 200 chars)", () => {
+    const framing = `[user] ACTIVE TASK: ${"x".repeat(300)} finish the #306 fixes`;
+    const lines = [
+      "[assistant] latest work item 0",
+      ...Array.from(
+        { length: 298 },
+        (_, i) =>
+          `[assistant] middle work item ${i} to burn a considerable amount of space`,
+      ),
+      framing,
+    ];
+    const d = renderDeterministic(state, lines.join("\n"), header);
+    expect(estTokens(d)).toBeGreaterThan(4_000);
+    const out = sizeGuard(d, 4_000);
+    expect(out).toContain("… (condensed by size guard)");
+    expect(out).toContain(framing);
+  });
 });
 
 // ─── splitDoc / assembleDoc header round-trip (issue #134 double-##) ────────

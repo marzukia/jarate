@@ -105,11 +105,12 @@ import {
   unlinkLivePlaceholders,
 } from "./live";
 import {
+  amnesiaRequeue,
   clearQueuedInbound,
+  commitInbound,
   consumeQueuedAck,
   deleteQueuedInbound,
   drainRewakeSurvival,
-  dropQueuedInbound,
   extractQueueSuffix,
   midTurnQueues,
   popOldestQueuedInbound,
@@ -127,10 +128,10 @@ import {
   loadRewakeQueue,
   rewakeAddPending,
   rewakeClearPending,
-  rewakeCommitDelivered,
   rewakeRemovePending,
   rewakeSetPendingAck,
   scanUndeliveredBgInbounds,
+  setCurrentSessionFile,
 } from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
@@ -822,6 +823,8 @@ export async function runMidRunInterrupt(
       entry.title ?? "",
       entry.display ?? entry.msg.body,
       entry.msg.messageId,
+      undefined,
+      entry.msg,
     );
   } finally {
     interruptingChannels.delete(channelId);
@@ -1617,8 +1620,12 @@ export default function (pi: ExtensionAPI) {
     // — clear the files too, so a restart never resurrects a
     // /new-dropped queue.
     const rewakeStateDir = path.join(ctx.cwd, ".tmp");
+    // #306 amnesia: capture the session file (commit stamp + startup cross-check).
+    const sf = safeSessionFile(ctx) ?? findSessionFile(ctx.cwd) ?? "";
+    setCurrentSessionFile(sf);
     if (event?.reason === "startup") {
       drainRewakeSurvival(rewakeStateDir, enabled);
+      amnesiaRequeue(rewakeStateDir, enabled);
     } else {
       for (const ch of enabled)
         if (ch.type === "discord") rewakeClearPending(rewakeStateDir, ch.id);
@@ -3800,7 +3807,7 @@ export async function handleInbound(
     const fwdText = withCtx(fwd);
     if (gateForRewake(fwdText, title, disp)) return;
     if (prior.length > 0) pendingAttachments.delete(msg.channelId);
-    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId);
+    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId, undefined, msg);
     return;
   }
 
@@ -3833,7 +3840,7 @@ export async function handleInbound(
     const fwdText = withCtx(fwd);
     if (gateForRewake(fwdText, title, disp)) return;
     pendingAttachments.delete(msg.channelId);
-    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId);
+    sendToPi(pi, ch.id, fwdText, title, disp, msg.messageId, undefined, msg);
     return;
   }
 
@@ -3848,11 +3855,11 @@ export async function handleInbound(
   // turn in the re-wake queue (kimaki parity: interrupt = jump the queue,
   // ". queue" = wait your turn).
   const { prompt: queuedBody, forceQueue } = extractQueueSuffix(body);
-  const plainText = withCtx(queuedBody || "(empty)");
-  if (gateForRewake(plainText, title, queuedBody || "(empty)", !forceQueue))
-    return;
+  const disp = queuedBody || "(empty)";
+  const plainText = withCtx(disp);
+  if (gateForRewake(plainText, title, disp, !forceQueue)) return;
 
-  sendToPi(pi, ch.id, plainText, title, queuedBody || "(empty)", msg.messageId);
+  sendToPi(pi, ch.id, plainText, title, disp, msg.messageId, undefined, msg);
 }
 
 // ─── Send to pi session ──────────────────────────────────────────────────
@@ -3865,6 +3872,7 @@ export function sendToPi(
   displayBody: string,
   messageId?: string,
   messageIds?: string[],
+  inboundMsg?: ChannelMessage,
 ): boolean {
   const ids = messageIds ?? (messageId ? [messageId] : []);
   if (ids.length > 0) {
@@ -3894,12 +3902,8 @@ export function sendToPi(
     // sendMessage throw returns false BEFORE this line: the file keeps
     // the entry, the next restart re-delivers (at-least-once).
     if (messageId) {
-      rewakeCommitDelivered(runtimeStateDir, channelId, messageId);
-      // #186 (F1): the commit prunes the FILE copy; prune the drained
-      // in-memory copy too (same id still queued by the survival drain
-      // or a replay re-queue) — otherwise the agent_end re-wake pops
-      // it and delivers the same inbound twice.
-      dropQueuedInbound(channelId, messageId);
+      // #306 amnesia + #186 (F1): commit + prune the drained copy.
+      commitInbound(runtimeStateDir, channelId, messageId, text, inboundMsg);
     }
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
