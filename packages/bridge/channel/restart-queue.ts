@@ -42,7 +42,12 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type SeenState, wakeEmbedKey } from "./channel-state";
+import {
+  loadChannelStateFile,
+  type SeenState,
+  seedSeenSets,
+  wakeEmbedKey,
+} from "./channel-state";
 import {
   buildChannelMessageFromRaw,
   isBgWebhook,
@@ -591,13 +596,13 @@ export interface BgScanOpts {
   lookback?: number;
   maxAgeMs?: number;
   now?: number;
-  /** #1083 fix A (belt): the #306 seen state per channel, seeded once
-   *  per boot from channel-state.json (an independent store from the
-   *  rewake file, capped higher, plus wake-key dedupe of double-posted
-   *  cards). An at-most-once cross-check that only ADDS drops: a
-   *  candidate whose id is in seen or whose wake key is in seenWake is
-   *  dropped before re-queue. Absent = the delivered/pending check
-   *  alone (at-least-once, pre-#1083 behavior). */
+  /** #1083 fix A (belt): override for the #306 seen state per channel.
+   *  Absent = the scan seeds it itself from channel-state.json in
+   *  stateDir (seeded once per scan, per channel — one boot, one
+   *  file). An at-most-once cross-check that only ADDS drops: a
+   *  candidate whose id is in seen or whose wake key is in seenWake
+   *  is dropped before re-queue. The delivered check stays the
+   *  primary authority (at-least-once bias preserved). */
   seenLookup?: (configId: string) => SeenState | null;
   /** Called once per re-queued candidate. The caller owns BOTH the
    *  memory push (deduped) and any logging; the file append happens
@@ -646,8 +651,14 @@ export async function scanUndeliveredBgInbounds(
     const file = loadRewakeQueue(opts.stateDir, ch.config.id);
     const pending = new Set(file.pending.map((p) => p.msg.messageId));
     const delivered = new Set(file.delivered);
-    // #1083 fix A: the #306 seen state for this channel (belt).
-    const seen = opts.seenLookup?.(ch.config.id) ?? null;
+    // #1083 fix A: the #306 seen state (an independent store from the
+    // rewake file — the file can be lost/corrupt/cap-evicted while
+    // channel-state.json is healthy). One load per channel per boot.
+    const seen =
+      opts.seenLookup?.(ch.config.id) ??
+      (ch.discordId
+        ? seedSeenSets(loadChannelStateFile(opts.stateDir), ch.discordId)
+        : null);
     for (const raw of raws) {
       scanned += 1;
       const id = String(raw.id);

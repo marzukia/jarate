@@ -30,7 +30,6 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
-import { type SeenState, seedSeenSets } from "./channel-state";
 import {
   buildInteractionHandler,
   channelError,
@@ -1825,22 +1824,10 @@ export default function (pi: ExtensionAPI) {
           };
         })
         .filter((s) => s.token.length > 0);
-      // #1083 fix A: seed the #306 seen state once per boot, per
-      // channel (channel-state.json — an independent store from the
-      // rewake file). The scan cross-checks it before re-queueing.
-      const seenStateByConfig = new Map<string, SeenState>();
-      for (const s of scanChannels) {
-        if (!s.discordId) continue;
-        seenStateByConfig.set(
-          s.config.id,
-          seedSeenSets(loadChannelStateFile(rewakeStateDir), s.discordId),
-        );
-      }
       void scanUndeliveredBgInbounds({
         stateDir: rewakeStateDir,
         channels: scanChannels,
         fetcher: (token, urlPath) => discordFetch(token, urlPath),
-        seenLookup: (chId) => seenStateByConfig.get(chId) ?? null,
         requeue: (entry, chId) => {
           const id = entry.msg.messageId;
           const q = midTurnQueues.get(chId) ?? [];
