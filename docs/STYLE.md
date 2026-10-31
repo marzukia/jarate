@@ -31,7 +31,12 @@ Last revised: 2026-10-20 (v4).
     usage paths alike (operator 2026-09-16) - EXCEPT summary bodies,
     which ship as markdown per 2.3 (2026-10-18). No 40-col wrap inside
     any fence; raw log lines are hard-capped at 160 chars, not
-    wrapped (2026-10-05 C9).
+    wrapped (2026-10-05 C9). SUPERSEDED for machine surfaces (Andryo
+    2026-10-31): jarate machine lines (op ticks, placeholders,
+    /stop·/compact acks, restart wakes, [queued]/[buffered] notes,
+    command one-liners) are PLAIN TEXT - one-liners ship italic
+    (`*text*`), multi-line blocks ship plain, no code fences, no
+    embeds. Agent final output keeps the markdown pipeline.
 2.5 State glyphs (in-turn frames only): `┣` active, `├` pending/done,
     `┤` cancelled.
 
@@ -53,9 +58,11 @@ Last revised: 2026-10-20 (v4).
 4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
     (retired lane; last full frame spec in pre-#281 docs/DISPATCH.md)
 4.4 Machine output posted to Discord (script errors, command output,
-    logs, JSON, paths) goes in a code fence. One-line errors: inline
-    code. Multi-line or raw logs: fenced block. (2026-09-15 operator;
-    applies to all jarate scripts incl. pi-postcheck.)
+    logs, JSON, paths) is plain text: one-line output ships ITALIC
+    (`*text*`), multi-line output ships plain, NO code fence
+    (2026-10-31 Andryo; supersedes the 2026-09-15 fence rule for
+    jarate machine surfaces - the rule still applies to ad-hoc
+    operator pastes of raw logs.)
 
 ## 5 Precedence
 AGENTS.md (injected) > this file > session habit. Edit this file when a

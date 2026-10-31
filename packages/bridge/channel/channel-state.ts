@@ -9,7 +9,8 @@
 // at-most-once record:
 //   seen     — message ids already delivered (delivery-ordered, capped,
 //             age-pruned by snowflake time)
-//   seenWake — restart-wake card keys (hash of the wake embed); a
+//   seenWake — restart-wake line keys (hash of the wake content; legacy
+//             embed-keyed cards still hash the embed); a
 //             double-posted card (retry double-post; two clean startups
 //             both posting) has two Discord message ids but one key.
 // Both sections live in channel-state.json next to the cursors.
@@ -95,20 +96,26 @@ function djb2(s: string): number {
   return h;
 }
 
-/** The dedupe key for a restart-wake card: the hash of the wake embed
- *  (author + title + description + fields + footer). A double-posted
- *  card has two Discord message ids but one key → at-most-once at the
- *  session. Non-wake messages → null. */
+/** The dedupe key for a restart-wake card: the hash of the wake
+ *  content (2026-10-31 plain-italic shape: `*restart-wake · planned*`,
+ *  content prefix `restart-wake ·`); the legacy embed shape (in-flight
+ *  history) is keyed on the embed author + title + description + fields
+ *  + footer. A double-posted wake has two Discord message ids but one
+ *  key → at-most-once at the session. Non-wake messages → null. */
 export function wakeEmbedKey(raw: any): string | null {
+  const c = typeof raw?.content === "string" ? raw.content : "";
+  if (c.replace(/^\*+/, "").startsWith(WAKE_TAG)) return `w${djb2(c)}`;
   const author = raw?.embeds?.[0]?.author?.name;
-  if (typeof author !== "string" || !author.startsWith(WAKE_TAG)) return null;
-  const e = raw.embeds[0];
-  const parts: string[] = [author];
-  if (e.title) parts.push(e.title);
-  if (e.description) parts.push(e.description);
-  for (const f of e.fields ?? []) parts.push(`${f.name}:${f.value}`);
-  if (e.footer?.text) parts.push(e.footer.text);
-  return `w${djb2(parts.join("\n"))}`;
+  if (typeof author === "string" && author.startsWith("pi-bg restart-wake")) {
+    const e = raw.embeds[0];
+    const parts: string[] = [author];
+    if (e.title) parts.push(e.title);
+    if (e.description) parts.push(e.description);
+    for (const f of e.fields ?? []) parts.push(`${f.name}:${f.value}`);
+    if (e.footer?.text) parts.push(e.footer.text);
+    return `w${djb2(parts.join("\n"))}`;
+  }
+  return null;
 }
 
 export interface SeenState {

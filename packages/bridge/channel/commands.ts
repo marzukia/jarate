@@ -3,7 +3,7 @@
  *
  * God-file split 1/5 (2026-10-19). Moved verbatim from index.ts:
  * matchCommand + isOwnerUser/hasOwnerConfigured + the /jobs ! shell
- * passthrough, wrapFence/channelError/failurePostText, HELP_TEXT, the
+ * passthrough, channelError/failurePostText, HELP_TEXT, the
  * native INTERACTIONS_CREATE handler (buildInteractionHandler),
  * /compact execute+report (startCompact), the /tasks spec-string
  * adapters, and runChannelCommand (the 22-case switch).
@@ -30,7 +30,7 @@ import {
   sendDiscordMessage,
   setChannelCursor,
 } from "./discord";
-import { fmtTokensLC, styleGuard } from "./format";
+import { fmtTokensLC } from "./format";
 import { resolveHandoffSettings } from "./handover";
 import {
   agentBusy,
@@ -65,7 +65,7 @@ import { jobsView } from "./jobs";
 import {
   armCompactTick,
   COMPACT_PLACEHOLDER,
-  fence,
+  machine,
   settleCompactTick,
 } from "./live";
 import {
@@ -183,16 +183,6 @@ export function runShellPassthrough(
   });
 }
 
-/** Fenced code block sized to the content's backtick runs. */
-export function wrapFence(t: string): string {
-  const n = (t.match(/`+/g) || ["`"]).reduce(
-    (m, r) => Math.max(m, r.length),
-    0,
-  );
-  const f = "`".repeat(Math.max(3, n + 1));
-  return `${f}\n${t}\n${f}`;
-}
-
 /**
  * Error -> short channel-safe text. The single funnel for error text
  * posted to Discord (run failures, command catches): known error classes
@@ -270,8 +260,9 @@ export function failurePostText(
   return null;
 }
 
-// Fenced at egress (every command reply ships in a code block) - so no
-// markdown markup inside: backticks/asterisks would render literally.
+// Plain text, no fences (machine surfaces, Andryo 2026-10-31): the block
+// ships multi-line = plain, no italics, so no markdown markup inside:
+// backticks/asterisks would render literally.
 const HELP_TEXT = [
   "Commands",
   "/stop - stop the current run",
@@ -365,15 +356,14 @@ export function buildInteractionHandler(
       );
       text = r.btw
         ? undefined
-        : (r.immediate ?? (r.consumed ? undefined : fence("ok")));
+        : (r.immediate ?? (r.consumed ? undefined : machine("ok")));
     } catch (e) {
       const t = channelError(e);
       if (t !== null) text = `command failed: ${t}`;
     }
-    // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
-    // machine-state lines; already-fenced immediates pass through unchanged.
-    if (text !== undefined)
-      await editInteractionMessage(botToken, d, styleGuard(text));
+    // Command replies ship as plain machine text (Andryo 2026-10-31):
+    // single-line acks italic, multi-line blocks plain - no fences.
+    if (text !== undefined) await editInteractionMessage(botToken, d, text);
   };
 }
 
@@ -395,10 +385,10 @@ export function startCompact(
     // Replace the ticking placeholder in place when one is armed; the
     // fresh-post fallback covers the native slash path and the (impossible
     // in practice) settle-before-post race. Both settle paths post the
-    // SAME bare line: status is prose (STYLE.md v4 §2.3), and styleGuard
-    // is a no-op on the plain one-liner that reaches the fresh-post path.
-    const guarded = styleGuard(text);
-    if (!settleCompactTick(ch.id, text))
+    // SAME machine line: single-line status ships italic (Andryo
+    // 2026-10-31), no fence.
+    const guarded = machine(text);
+    if (!settleCompactTick(ch.id, guarded))
       sendDiscordMessage(ch, guarded).catch(() => {});
   };
   try {
@@ -508,7 +498,7 @@ export async function runChannelCommand(
   const ownerOnly = isOwner
     ? {}
     : {
-        immediate: fence(
+        immediate: machine(
           hasOwnerConfigured(ch)
             ? "[!] owner only"
             : "[!] owner only (no owner configured: set channels[].ownerUserId or ownerUserIds)",
@@ -518,7 +508,7 @@ export async function runChannelCommand(
   // readable line, not a TypeError (2026-10-01: a button tap crashed here
   // before the type gate was fixed).
   if (typeof name !== "string" || name.length === 0)
-    return { immediate: fence("[!] unknown command") };
+    return { immediate: machine("[!] unknown command") };
   switch (name.toLowerCase()) {
     case "stop": {
       // /stop while compacting is owner-only (isOwner pattern): it aborts
@@ -527,7 +517,7 @@ export async function runChannelCommand(
       // re-run ungated after the window closes and drop the channel's
       // re-wake queue (including owner messages) + abort the next run.
       if (isCompacting(ch.id) && !isOwner)
-        return { immediate: fence("[!] owner only") };
+        return { immediate: machine("[!] owner only") };
       // A restart-class op captured its Discord cursor at window open;
       // /stop clears the window AND restores that cursor so inbounds
       // delivered during the op replay on the next boot instead of being
@@ -573,10 +563,10 @@ export async function runChannelCommand(
       const heldDepth = held ? (midTurnQueues.get(ch.id)?.length ?? 0) : 0;
       return {
         immediate: restartCancelled
-          ? fence("[-] stopped (restart cancelled)")
+          ? machine("[-] stopped (restart cancelled)")
           : heldDepth > 0
-            ? fence(`[-] stopped - ${heldDepth} held in line`)
-            : fence("[-] stopped"),
+            ? machine(`[-] stopped - ${heldDepth} held in line`)
+            : machine("[-] stopped"),
       };
     }
     case "hold": {
@@ -585,13 +575,13 @@ export async function runChannelCommand(
       const on =
         a === "" ? !isHeld(ch) : a === "on" || a === "1" || a === "yes";
       if (a !== "" && !on && a !== "off" && a !== "0" && a !== "no")
-        return { immediate: fence("[!] usage: /hold on|off") };
+        return { immediate: machine("[!] usage: /hold on|off") };
       const depth = midTurnQueues.get(ch.id)?.length ?? 0;
       if (on === isHeld(ch))
         return {
           immediate: on
-            ? fence(`[ok] hold on - ${depth} in line`)
-            : fence("[ok] hold off"),
+            ? machine(`[ok] hold on - ${depth} in line`)
+            : machine("[ok] hold off"),
         };
       setHeld(ch.id, on);
       if (on) {
@@ -603,13 +593,13 @@ export async function runChannelCommand(
         return {
           immediate:
             depth > 0
-              ? fence(`[ok] hold on - ${depth} in line`)
-              : fence("[ok] hold on - buffered until /hold off"),
+              ? machine(`[ok] hold on - ${depth} in line`)
+              : machine("[ok] hold on - buffered until /hold off"),
         };
       }
       // off: drain — send the oldest now when idle; the existing re-wake
       // loop (agent_end) chains the rest, one run each, in order.
-      if (depth === 0) return { immediate: fence("[ok] hold off") };
+      if (depth === 0) return { immediate: machine("[ok] hold off") };
       if (ctx.isIdle() && !isCompacting(ch.id)) {
         const entry = popChannelQueuedInbound(ch.id);
         // Awaits the drained inbound: its send must finish before this
@@ -623,16 +613,19 @@ export async function runChannelCommand(
             );
           });
         return {
-          immediate: fence(`[ok] hold off - ${depth} in line, running`),
+          immediate: machine(`[ok] hold off - ${depth} in line, running`),
         };
       }
-      return { immediate: fence(`[ok] hold off - ${depth} in line, will run`) };
+      return {
+        immediate: machine(`[ok] hold off - ${depth} in line, will run`),
+      };
     }
     case "help":
-      return { immediate: fence(HELP_TEXT) };
+      return { immediate: machine(HELP_TEXT) };
     case "btw": {
       const question = (arg || "").trim();
-      if (!question) return { immediate: fence("[!] usage: /btw <question>") };
+      if (!question)
+        return { immediate: machine("[!] usage: /btw <question>") };
       const msg: ChannelMessage = {
         channelId: ch.id,
         channelName: ch.name,
@@ -693,9 +686,9 @@ export async function runChannelCommand(
             parts.push(`interrupt in ${Math.ceil(msLeft / 1000)}s`);
           }
         }
-        text = fence(`[status] ${parts.join(" · ")}`);
+        text = machine(`[status] ${parts.join(" · ")}`);
       } catch {
-        text = fence("[!] status unavailable");
+        text = machine("[!] status unavailable");
       }
       return { immediate: text };
     }
@@ -705,9 +698,10 @@ export async function runChannelCommand(
       const scope = (arg ?? "").trim().toLowerCase();
       if (scope === "last") {
         const lu = lastRunUsage.value;
-        if (!lu) return { immediate: "no completed run yet (run one first)" };
+        if (!lu)
+          return { immediate: machine("no completed run yet (run one first)") };
         const at = lu.at.toISOString().slice(11, 19);
-        return { immediate: usageSummary("last run", at, lu.stats) };
+        return { immediate: machine(usageSummary("last run", at, lu.stats)) };
       }
       // Read-only token stats from the session store. Session discovery
       // reuses the /undo path: active ctx session file, else newest .jsonl
@@ -718,7 +712,7 @@ export async function runChannelCommand(
         const text = await renderUsage(arg, ctx.cwd, safeSessionFile(ctx));
         return { immediate: text };
       } catch {
-        return { immediate: fence("[!] usage stats unavailable") };
+        return { immediate: machine("[!] usage stats unavailable") };
       }
     }
     case "context": {
@@ -726,15 +720,16 @@ export async function runChannelCommand(
       // (char/4, no model, no pricing) + category totals. Read-only, open
       // to all like /usage. Session discovery is the same /undo path;
       // the markdown list is built by renderContext, errors are one
-      // [!] line (fenced machine one-liners stay fenced), no stack.
+      // [!] line (machine one-liners ship italic, Andryo 2026-10-31), no
+      // stack.
       try {
         const text = await renderContext(arg, ctx.cwd, safeSessionFile(ctx));
         // Success = the markdown summary list (unfenced - Andryo
-        // 2026-10-18); [!] errors stay fenced one-liners.
-        return { immediate: text.startsWith("[!]") ? fence(text) : text };
+        // 2026-10-18); [!] errors ship italic one-liners.
+        return { immediate: text.startsWith("[!]") ? machine(text) : text };
       } catch {
-        // fenced, mirroring the /usage catch (PR #242 review F4)
-        return { immediate: fence("[!] context stats unavailable") };
+        // italic one-liner, mirroring the /usage catch (PR #242 review F4)
+        return { immediate: machine("[!] context stats unavailable") };
       }
     }
     case "diff": {
@@ -743,16 +738,17 @@ export async function runChannelCommand(
       try {
         const text = await publishDiff(ctx.cwd, arg);
         // #87: the viewer URL is the one link the user asked for - a
-        // fenced URL is monospace, not clickable. Fence the status line,
-        // leave the URL bare (publishDiff keeps the URL on its own last
-        // line for exactly this split).
+        // fenced URL is monospace, not clickable. No fence now (Andryo
+        // 2026-10-31): machine() formats the status (italic one-liner /
+        // plain block) and the URL stays bare + clickable (publishDiff
+        // keeps the URL on its own last line for exactly this split).
         const nl = text.lastIndexOf("\n");
         const last = nl > 0 ? text.slice(nl + 1) : "";
         if (/^https?:\/\/\S+$/i.test(last))
-          return { immediate: `${fence(text.slice(0, nl))}\n${last}` };
-        return { immediate: fence(text) };
+          return { immediate: `${machine(text.slice(0, nl))}\n${last}` };
+        return { immediate: machine(text) };
       } catch {
-        return { immediate: fence("[!] diff publish failed") };
+        return { immediate: machine("[!] diff publish failed") };
       }
     }
     case "reset": {
@@ -795,7 +791,7 @@ export async function runChannelCommand(
         if (live) archiveStaleSessions(live);
       });
       return native
-        ? { immediate: fence("[..] resetting...") }
+        ? { immediate: machine("[..] resetting...") }
         : { consumed: true };
     }
     case "restart": {
@@ -831,7 +827,7 @@ export async function runChannelCommand(
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native
-        ? { immediate: fence("[..] restarting...") }
+        ? { immediate: machine("[..] restarting...") }
         : { consumed: true };
     }
     case "undo": {
@@ -839,9 +835,9 @@ export async function runChannelCommand(
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const n = parseUndoCount(arg);
       if (n === null)
-        return { immediate: fence("[!] usage: /undo [N] (N is 1 or more)") };
+        return { immediate: machine("[!] usage: /undo [N] (N is 1 or more)") };
       const r = await runUndo(ctx, n);
-      if (!r.restarted) return { immediate: fence(r.text) };
+      if (!r.restarted) return { immediate: machine(r.text) };
       // #84 L2: drain queued inbounds while the process is still alive — a
       // restart wipes the in-memory maps at shutdown (no Discord delete), so
       // a queued ack posted now would be orphaned in the channel forever.
@@ -866,14 +862,14 @@ export async function runChannelCommand(
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native
-        ? { immediate: fence("[..] undoing...") }
+        ? { immediate: machine("[..] undoing...") }
         : { consumed: true };
     }
     case "redo": {
       if (!isOwner) return ownerOnly;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
       const r = await runRedo(ctx);
-      if (!r.restarted) return { immediate: fence(r.text) };
+      if (!r.restarted) return { immediate: machine(r.text) };
       // #84 L2: drain queued inbounds while the process is still alive — a
       // restart wipes the in-memory maps at shutdown (no Discord delete), so
       // a queued ack posted now would be orphaned in the channel forever.
@@ -894,7 +890,7 @@ export async function runChannelCommand(
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
       return native
-        ? { immediate: fence("[..] redoing...") }
+        ? { immediate: machine("[..] redoing...") }
         : { consumed: true };
     }
     case "verbose": {
@@ -904,13 +900,13 @@ export async function runChannelCommand(
       // Bare command: show the current level (read-only, no change).
       if (a === "")
         return {
-          immediate: fence(
+          immediate: machine(
             `[ok] verbose: ${prev} (${VERBOSE_LEVEL_NAMES[prev]})`,
           ),
         };
       const next = parseVerboseLevel(a);
       if (next === null)
-        return { immediate: fence("[!] usage: /verbose 0|1|2") };
+        return { immediate: machine("[!] usage: /verbose 0|1|2") };
       verboseOverride.set(ch.id, next);
       persistChannelRuntimeState(ch.id, { verbose: next });
       // Live >0 -> 0 transition: delete the in-flight block so it does
@@ -919,7 +915,7 @@ export async function runChannelCommand(
       // command path, see onDeleteStatusBlock above).
       if (prev > 0 && next === 0) await onDeleteStatusBlock?.(ch);
       return {
-        immediate: fence(
+        immediate: machine(
           `[ok] verbose: ${next} (${VERBOSE_LEVEL_NAMES[next]})`,
         ),
       };
@@ -943,7 +939,7 @@ export async function runChannelCommand(
           ? "run in progress"
           : "compact already in progress";
         return {
-          immediate: fence(
+          immediate: machine(
             `[queued] compact (${why})${replacing ? ", replaces earlier" : ""}`,
           ),
         };
@@ -954,7 +950,8 @@ export async function runChannelCommand(
       const err = startCompact(pi, { ch, instructions }, ctx, !native);
       if (err !== null) {
         const t = channelError(err);
-        if (t !== null) return { immediate: fence(`[!] compact failed: ${t}`) };
+        if (t !== null)
+          return { immediate: machine(`[!] compact failed: ${t}`) };
       }
       return native ? { immediate: COMPACT_PLACEHOLDER } : { consumed: true };
     }
@@ -972,7 +969,7 @@ export async function runChannelCommand(
           ? "run in progress"
           : "compact already in progress";
         return {
-          immediate: fence(
+          immediate: machine(
             `[queued] handover (${why})${replacing ? ", replaces earlier" : ""}`,
           ),
         };
@@ -982,12 +979,12 @@ export async function runChannelCommand(
       if (err !== null) {
         const t = channelError(err);
         if (t !== null)
-          return { immediate: fence(`[!] handover failed: ${t}`) };
+          return { immediate: machine(`[!] handover failed: ${t}`) };
       }
       if (!settings.enabled)
         sendDiscordMessage(
           ch,
-          styleGuard(
+          machine(
             "handoff disabled - standard compact (set handoff.enabled=true for the handover doc)",
           ),
         ).catch(() => {});
@@ -998,12 +995,13 @@ export async function runChannelCommand(
       // (zero in-flight runs fleet-wide), so the kill/tail subcommands and
       // their dispatch scripts are gone with the completion side. The
       // history view is informational, open to all channel members
-      // (private channel). json = machine output (fenced); text = the
-      // markdown summary list (unfenced - Andryo 2026-10-18: no fence,
-      // no width budget).
+      // (private channel). json = machine output (plain, no fence -
+      // Andryo 2026-10-31); text = the markdown summary list (unfenced -
+      // Andryo 2026-10-18: no fence, no width budget).
       const sub = ((arg || "").trim().split(/\s+/)[0] ?? "").toLowerCase();
       return {
-        immediate: sub === "json" ? fence(jobsView("json")) : jobsView("text"),
+        immediate:
+          sub === "json" ? machine(jobsView("json")) : jobsView("text"),
       };
     }
     case "new-worktree": {
@@ -1011,10 +1009,10 @@ export async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       const ref = (arg ?? "").trim() || undefined;
       try {
-        return { immediate: fence(newWorktree(ctx.cwd, ref)) };
+        return { immediate: machine(newWorktree(ctx.cwd, ref)) };
       } catch (e) {
         return {
-          immediate: fence(
+          immediate: machine(
             `[!] worktree failed: ${channelError(e) ?? "error"}`,
           ),
         };
@@ -1027,10 +1025,10 @@ export async function runChannelCommand(
       const mode =
         (arg ?? "").trim().toLowerCase() === "squash" ? "squash" : "keep";
       try {
-        return { immediate: fence(mergeWorktree(ctx.cwd, mode)) };
+        return { immediate: machine(mergeWorktree(ctx.cwd, mode)) };
       } catch (e) {
         return {
-          immediate: fence(`[!] merge failed: ${channelError(e) ?? "error"}`),
+          immediate: machine(`[!] merge failed: ${channelError(e) ?? "error"}`),
         };
       }
     }
@@ -1044,7 +1042,7 @@ export async function runChannelCommand(
         );
         const wakes = loadWakes();
         if (wakes.length === 0)
-          return { immediate: fence("[wake] no pending wakes") };
+          return { immediate: machine("[wake] no pending wakes") };
         const pending = wakes.filter((w) => w.status === "pending").length;
         const lines = wakes.map((w) => {
           const chName = names.get(w.channelId) || w.channelName || w.channelId;
@@ -1067,15 +1065,15 @@ export async function runChannelCommand(
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: fence("[!] usage: /sleep cancel <id>") };
+        if (!id) return { immediate: machine("[!] usage: /sleep cancel <id>") };
         const ok = cancelWake(id);
         return {
-          immediate: fence(
+          immediate: machine(
             ok ? `[ok] cancelled wake ${id}` : `[!] no wake with id ${id}`,
           ),
         };
       }
-      return { immediate: fence("[!] usage: /sleep [list | cancel <id>]") };
+      return { immediate: machine("[!] usage: /sleep [list | cancel <id>]") };
     }
     case "tasks": {
       if (!isOwner) return ownerOnly;
@@ -1087,7 +1085,7 @@ export async function runChannelCommand(
         );
         const tasks = loadTasks();
         if (tasks.length === 0)
-          return { immediate: fence("[tasks] no scheduled tasks") };
+          return { immediate: machine("[tasks] no scheduled tasks") };
         const pending = tasks.filter((t) => t.status === "pending").length;
         const lines = tasks.map((t) =>
           formatTaskLine(t, names.get(t.channelId) || t.channelName),
@@ -1100,35 +1098,27 @@ export async function runChannelCommand(
       }
       if (sub === "cancel") {
         const id = argText.slice("cancel".length).trim();
-        if (!id) return { immediate: fence("[!] usage: /tasks cancel <id>") };
+        if (!id) return { immediate: machine("[!] usage: /tasks cancel <id>") };
         const ok = cancelTask(id);
         return {
-          immediate: fence(
+          immediate: machine(
             ok ? `[ok] cancelled task ${id}` : `[!] no task with id ${id}`,
           ),
         };
       }
       if (sub === "add") {
+        const addUsage =
+          '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>';
         const rest = argText.slice("add".length).trim();
         const m = rest.match(/^"([^"]*)"\s*([\s\S]*)$/);
-        if (!m)
-          return {
-            immediate: fence(
-              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
-            ),
-          };
+        if (!m) return { immediate: machine(addUsage) };
         const prompt = m[1]!.trim();
         const spec = specStringParams(m[2] ?? "");
-        if (!spec)
-          return {
-            immediate: fence(
-              '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
-            ),
-          };
+        if (!spec) return { immediate: machine(addUsage) };
         const res = parseTaskSpec({ prompt, ...spec });
         if (!res.spec || res.error)
           return {
-            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
+            immediate: machine(`[!] ${res.error ?? "invalid task spec"}`),
           };
         const task = scheduleTask({
           channelId: ch.id,
@@ -1137,7 +1127,7 @@ export async function runChannelCommand(
           spec: res.spec,
         });
         return {
-          immediate: fence(
+          immediate: machine(
             `[ok] task ${task.id} scheduled: ${taskWhenLabel(task)}, next fire ` +
               `${new Date(task.nextFireAt).toISOString()}, ` +
               `cancel with /tasks cancel ${task.id}`,
@@ -1145,35 +1135,29 @@ export async function runChannelCommand(
         };
       }
       if (sub === "reschedule") {
+        const resUsage =
+          "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>";
         const rest = argText.slice("reschedule".length).trim();
         const parts = rest.split(/\s+/).filter(Boolean);
         const id = parts[0] ?? "";
-        if (!id)
-          return {
-            immediate: fence(
-              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
-            ),
-          };
+        if (!id) return { immediate: machine(resUsage) };
         // validate the id against THIS session's tasks before touching the spec
         const t = loadTasks().find((x) => x.id === id && x.channelId === ch.id);
-        if (!t) return { immediate: fence(`[!] no task with id ${id}`) };
+        if (!t) return { immediate: machine(`[!] no task with id ${id}`) };
         const spec = specStringParams(parts.slice(1).join(" "));
-        if (!spec)
-          return {
-            immediate: fence(
-              "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
-            ),
-          };
+        if (!spec) return { immediate: machine(resUsage) };
         const res = parseTaskSpec({ prompt: t.prompt, ...spec });
         if (!res.spec || res.error)
           return {
-            immediate: fence(`[!] ${res.error ?? "invalid task spec"}`),
+            immediate: machine(`[!] ${res.error ?? "invalid task spec"}`),
           };
         const r = rescheduleTask(id, res.spec, ch.id);
         if (!r.task || r.error)
-          return { immediate: fence(`[!] ${r.error ?? "reschedule failed"}`) };
+          return {
+            immediate: machine(`[!] ${r.error ?? "reschedule failed"}`),
+          };
         return {
-          immediate: fence(
+          immediate: machine(
             `[ok] rescheduled task ${r.task.id}: ${taskWhenLabel(t)} -> ` +
               `${taskWhenLabel(r.task)}, ` +
               `next fire ${new Date(r.task.nextFireAt).toISOString()}`,
@@ -1181,7 +1165,7 @@ export async function runChannelCommand(
         };
       }
       return {
-        immediate: fence(
+        immediate: machine(
           "[!] usage: /tasks [list | add | reschedule | cancel]",
         ),
       };
@@ -1203,12 +1187,12 @@ export async function runChannelCommand(
           immediate:
             parts.length > 0
               ? parts.join("\n\n")
-              : fence("[todos] no open todos"),
+              : machine("[todos] no open todos"),
         };
       }
       const board = loadBoard(ch.id);
       if (!board || board.todos.length === 0)
-        return { immediate: fence("[todos] no open todos") };
+        return { immediate: machine("[todos] no open todos") };
       return { immediate: renderBoard(board.todos) };
     }
     case "model": {
@@ -1220,12 +1204,12 @@ export async function runChannelCommand(
       } catch {}
       if (!req) {
         if (models.length === 0)
-          return { immediate: fence("[model] no models available") };
+          return { immediate: machine("[model] no models available") };
         const names = models
           .slice(0, 20)
           .map((m: any) => `${m.provider}/${m.id}`);
         return {
-          immediate: fence(
+          immediate: machine(
             `[model] ${models.length} available:\n${names.join("\n")}${models.length > 20 ? `\n…+${models.length - 20} more` : ""}`,
           ),
         };
@@ -1251,16 +1235,16 @@ export async function runChannelCommand(
             .map((m: any) => `${m.provider}/${m.id}`)
             .join(", ");
           return {
-            immediate: fence(
+            immediate: machine(
               `[!] ambiguous "${req}": ${cands}${partial.length > 5 ? "…" : ""}`,
             ),
           };
         }
       }
-      if (!found) return { immediate: fence(`[!] model not found: ${req}`) };
+      if (!found) return { immediate: machine(`[!] model not found: ${req}`) };
       const ok = await pi.setModel(found);
       return {
-        immediate: fence(
+        immediate: machine(
           ok
             ? `[ok] model ${found.provider}/${found.id}`
             : `[!] no auth configured for ${found.provider}/${found.id}`,

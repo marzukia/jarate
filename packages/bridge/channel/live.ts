@@ -254,43 +254,45 @@ export function simulateProcessDeathForTest(): void {
 // restart-class ops (/reset /restart /undo /redo), the working block
 // (statusTick), and mid-run interrupts. `render` returns the next line
 // or null to pause (window closed — the entry is KEPT so a settle can
-// still replace the message in place). Same ASCII style as before:
-// `[..] compacting… 5s` / the live working frame (each tick re-renders
-// the full frame, header `┌ working · N calls · 10s`).
+// still replace the message in place). Machine-surface style (Andryo
+// 2026-10-31): no code fences, no embeds — one-line ticks ship
+// italic (`*[..] compacting… 5s*`); the live working frame keeps its
+// box shape, fence-less (header `┌ working · N calls · 10s`).
 interface OpTickEntry {
   ch: ChannelConfig;
   msgId: string;
   since: number;
   timer: ReturnType<typeof setInterval>;
   render: (secs: number) => string | null;
-  fenced: boolean;
 }
 export const opTicks = new Map<string, OpTickEntry>();
 
-/** `[..] <label>… <inc>s` — 5s-increment elapsed, shared tick style. */
+/** `[..] <label>… <inc>s` — 5s-increment elapsed, shared tick style.
+ *  Machine surface (Andryo 2026-10-31): short one-line ticks ship
+ *  italic, no code fence. */
 export function opTickLine(label: string, secs: number): string {
   const inc = Math.floor(secs / 5) * 5;
-  return `[..] ${label}… ${inc}s`;
+  return `*[..] ${label}… ${inc}s*`;
 }
 
-/** Fenced block (STYLE.md v4): fences are for /command replies (§2.4),
- * in-turn working frames (§2.1), and machine output (§4.4). One-line
- * op status ([..]) is PROSE and ships unfenced (§2.3); [ok]/[!] tags are
- * machine output ONLY (Andryo 2026-10-20). The v3 box-drawing alignment
- * rationale applies only to multi-line frames, not single status lines. */
-export const fence = (s: string): string => `\`\`\`
-${s}
-\`\`\``;
+/** Machine-surface formatting (Andryo 2026-10-31: plain text, no
+ *  embeds, no code fences): a short single line (ack, wake, placeholder,
+ *  tick) ships ITALIC; a multi-line block (help, json, lists) ships
+ *  plain. Stray asterisks in the text are escaped so the italic markup
+ *  survives Discord parsing. */
+export const machine = (s: string): string => {
+  if (s.includes("\n")) return s;
+  return `*${s.replace(/\*/g, "\\*")}*`;
+};
 
 /** Arm (or re-arm, same key) a live tick on a placeholder message.
- *  `fenced` (default false): multi-line working frames post inside a
- *  code fence (§2.1); one-line op status ticks post bare (§2.3). */
+ *  Ticks post bare machine text (no fence — Andryo 2026-10-31); the
+ *  `render` output is the final form (italic one-liners, bare frames). */
 export function armOpTick(
   key: string,
   ch: ChannelConfig,
   msgId: string,
   render: (secs: number) => string | null,
-  fenced = false,
 ): void {
   const prev = opTicks.get(key);
   if (prev) clearInterval(prev.timer);
@@ -303,34 +305,22 @@ export function armOpTick(
       clearInterval(entry.timer); // paused; entry kept for the settle
       return;
     }
-    editDiscordMessage(
-      entry.ch,
-      entry.msgId,
-      entry.fenced ? fence(text) : text,
-    ).catch(() => {});
+    editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
   }, 5000);
   (timer as any).unref?.();
-  opTicks.set(key, { ch, msgId, since, timer, render, fenced });
+  opTicks.set(key, { ch, msgId, since, timer, render });
 }
 
 /** Replace the ticking placeholder in place with the final line. Returns
  *  false when no tick was armed (native slash path / settle raced the
- *  post) — the caller then falls back to a fresh post. `fenced` matches
- *  the tick that armed (default false: one-line op status is prose, §2.3
- *  — the same settle must produce the SAME bare form as the fresh-post
- *  fallback). */
-export function settleOpTick(
-  key: string,
-  text: string,
-  fenced = false,
-): boolean {
+ *  post) — the caller then falls back to a fresh post. The settle must
+ *  produce the SAME plain form as the fresh-post fallback. */
+export function settleOpTick(key: string, text: string): boolean {
   const entry = opTicks.get(key);
   if (!entry) return false;
   clearInterval(entry.timer);
   opTicks.delete(key);
-  editDiscordMessage(entry.ch, entry.msgId, fenced ? fence(text) : text).catch(
-    () => {},
-  );
+  editDiscordMessage(entry.ch, entry.msgId, text).catch(() => {});
   return true;
 }
 
@@ -353,8 +343,9 @@ export function stopAllOpTicks(): void {
 }
 
 // ─── Compact placeholder (built on the shared op-tick) ──────────────
-// One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
-export const COMPACT_PLACEHOLDER = "[..] compacting...";
+// One-line op status = machine surface: italic, no code fence (Andryo
+// 2026-10-31); the tick edits it in place (opTickLine).
+export const COMPACT_PLACEHOLDER = "*[..] compacting...*";
 
 export function armCompactTick(ch: ChannelConfig, msgId: string): void {
   armOpTick(`compact:${ch.id}`, ch, msgId, (secs) =>

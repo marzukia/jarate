@@ -21,7 +21,6 @@ import {
   runShellPassthrough,
 } from "./commands";
 import { clearDiscordStatesForTest } from "./discord";
-import { styleGuard } from "./format";
 import extension, {
   clearAllCompacting,
   clearAllInterrupts,
@@ -38,7 +37,7 @@ import extension, {
   setRuntimeStateDir,
   verboseOverride,
 } from "./index";
-import { fence, stopAllCompactTicks } from "./live";
+import { machine, stopAllCompactTicks } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -861,7 +860,7 @@ describe("buildInteractionHandler (defer-first ack)", () => {
     expect(JSON.parse(edit!.body).content).toContain("no owner configured");
   });
 
-  test("raw command lines pass the same styleGuard sweep as text replies (#169)", async () => {
+  test("raw command lines pass the same machine sweep as text replies (#169)", async () => {
     // /usage last with no completed run returns a bare line (no fence, no tag
     // in the command) — the interaction edit carries exactly what the
     // sweep produces: v4 (operator 2026-10-19) tag lines are prose, so
@@ -874,9 +873,8 @@ describe("buildInteractionHandler (defer-first ack)", () => {
       await h(d("usage", { options: [{ name: "scope", value: "last" }] }));
       const edit = calls.find((c) => c.url.endsWith("/messages/@original"));
       const content = JSON.parse(edit!.body).content;
-      expect(content).toBe(styleGuard(raw));
-      expect(content).toBe(raw); // v4: tag lines ship unfenced
-      expect(content.startsWith("```")).toBe(false);
+      expect(content).toBe(machine(raw));
+      expect(content.startsWith("*")).toBe(true);
     } finally {
       (lastRunUsage as { value: any }).value = saved;
     }
@@ -1217,7 +1215,7 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact keep the jarate", "m1"), ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
     await tick();
-    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
       true,
     );
     opts.onComplete({
@@ -1231,7 +1229,7 @@ describe("compact: defer mid-run + always report", () => {
     // fresh post — no double message when the compact lands. k/m form
     // (fmtTokensLC) so the line fits the 40-col budget even at 9-digit
     // token counts.
-    const reportText = "compacted: 220k -> 35k";
+    const reportText = machine("compacted: 220k -> 35k");
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
@@ -1264,7 +1262,7 @@ describe("compact: defer mid-run + always report", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
       true,
     );
 
@@ -1272,15 +1270,18 @@ describe("compact: defer mid-run + always report", () => {
     jest.advanceTimersByTime(4999);
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1);
-    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    expect(edits()).toEqual(["*[..] compacting… 5s*"]);
     // subsequent ticks keep updating the SAME message in place
     jest.advanceTimersByTime(5000);
-    expect(edits()).toEqual(["[..] compacting… 5s", "[..] compacting… 10s"]);
+    expect(edits()).toEqual([
+      "*[..] compacting… 5s*",
+      "*[..] compacting… 10s*",
+    ]);
     jest.advanceTimersByTime(5000);
     expect(edits()).toEqual([
-      "[..] compacting… 5s",
-      "[..] compacting… 10s",
-      "[..] compacting… 15s",
+      "*[..] compacting… 5s*",
+      "*[..] compacting… 10s*",
+      "*[..] compacting… 15s*",
     ]);
 
     // Settle: the report replaces the placeholder in place, tick stops.
@@ -1289,7 +1290,7 @@ describe("compact: defer mid-run + always report", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe("compacted: 100 -> 10");
+    expect(edits().at(-1)).toBe(machine("compacted: 100 -> 10"));
     jest.advanceTimersByTime(60000);
     expect(edits().length).toBe(4); // no further ticks after settle
     expect(channelPosts().some((t) => t.startsWith("[ok]"))).toBe(false);
@@ -1302,12 +1303,12 @@ describe("compact: defer mid-run + always report", () => {
     };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
-    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
       true,
     );
     opts.onError(new Error("model down"));
     await tick();
-    const failText = "compact failed: model down";
+    const failText = machine("compact failed: model down");
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
@@ -1340,16 +1341,16 @@ describe("compact: defer mid-run + always report", () => {
             (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
         );
     // the placeholder POST is the bare one-liner — status is prose (§2.3)
-    expect(channelPosts()).toContain("[..] compacting...");
+    expect(channelPosts()).toContain("*[..] compacting...*");
     // the 5s tick edits the SAME message in place, bare
     jest.advanceTimersByTime(5000);
-    expect(edits()).toEqual(["[..] compacting… 5s"]);
+    expect(edits()).toEqual(["*[..] compacting… 5s*"]);
     // the settle replaces it in place, bare — the fresh-post fallback form
     opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe("compacted: 220k -> 35k");
+    expect(edits().at(-1)).toBe(machine("compacted: 220k -> 35k"));
     jest.advanceTimersByTime(60000);
     // nothing in the whole op window (posts + in-place edits) carries a fence
     for (const t of [...channelPosts(), ...edits()])
@@ -1378,7 +1379,7 @@ describe("compact: defer mid-run + always report", () => {
     };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     // POST still in flight -> tick not armed. Settle now.
-    const settleText = "compacted: 220k -> 35k";
+    const settleText = machine("compacted: 220k -> 35k");
     opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
     await tick();
     // the fallback fresh post is bare and identical to the tick-settle form
@@ -1391,8 +1392,8 @@ describe("compact: defer mid-run + always report", () => {
     release.fn?.();
     await tick();
     await tick();
-    expect(channelPosts().filter((t) => t === "[..] compacting...")).toEqual([
-      "[..] compacting...",
+    expect(channelPosts().filter((t) => t === "*[..] compacting...*")).toEqual([
+      "*[..] compacting...*",
     ]);
     const editContents = fetchCalls
       .filter((c) => c.method === "PATCH")
@@ -1426,7 +1427,7 @@ describe("compact: defer mid-run + always report", () => {
       channelPosts().some(
         (t) =>
           t ===
-          styleGuard("compact failed: Nothing to compact (session too small)"),
+          machine("compact failed: Nothing to compact (session too small)"),
       ),
     ).toBe(true);
   });
@@ -1440,7 +1441,7 @@ describe("compact: defer mid-run + always report", () => {
     expect(
       channelPosts().some((t) => t.includes("compact failed: boom-ctx")),
     ).toBe(true);
-    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
       false,
     );
   });
@@ -1466,7 +1467,7 @@ describe("compact: defer mid-run + always report", () => {
     await handlers.agent_end({ messages: [] }, ctx);
     expect(opts?.customInstructions).toBe("keep the jarate");
     await tick();
-    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
       true,
     );
   });
@@ -1648,10 +1649,10 @@ describe("/diff (issue #7)", () => {
 
   test("/diff publishes the working tree diff and replies with url + stats", async () => {
     await handleInbound(pi, inbound("/diff", "dm1"), ctx);
-    // #87: the viewer URL ships bare after the fence (clickable), the
-    // status line stays fenced
+    // #87: the viewer URL ships bare after the status line (clickable),
+    // the status line is a short italic machine line (2026-10-31)
     expect(unwarped(replyContent())).toBe(
-      `${fence("[ok] working tree · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
+      `${machine("[ok] working tree · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
     );
     const up = fetchCalls.find((c) =>
       c.url.startsWith("https://drop.test/api/"),
@@ -1675,16 +1676,17 @@ describe("/diff (issue #7)", () => {
       ),
       ctx,
     );
-    // #87: bare URL after the fence, same split as the worktree path
+    // #87: bare URL after the status line, same split as the worktree
+    // path (status is now a short italic machine line, 2026-10-31)
     expect(replyContent()).toBe(
-      `${fence("[ok] pasted diff · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
+      `${machine("[ok] pasted diff · 1 file +1 -1 · ttl 7d")}\nhttps://drop.test/feedd00d.html`,
     );
   });
 
   test("/diff with unresolvable arg replies usage", async () => {
     await handleInbound(pi, inbound("/diff hello\nworld", "dm3"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence(
+      machine(
         "[!] usage: /diff [git-range | file | diff-paste] (default: working tree)",
       ),
     );
@@ -1694,7 +1696,7 @@ describe("/diff (issue #7)", () => {
     fs.rmSync(path.join(tmp, ".config"), { recursive: true, force: true });
     await handleInbound(pi, inbound("/diff", "dm4"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence(
+      machine(
         "[!] webdrop not configured (need WEBDROP_SERVER + WEBDROP_TOKEN or ~/.config/webdrop/config.toml)",
       ),
     );
@@ -1909,11 +1911,11 @@ describe("wave 2c bridge commands", () => {
     await handlers.agent_end({ messages: [fin] }, ctx);
     const patch = patches().find((p) => p.includes("┌ done"));
     expect(patch).toBeDefined();
-    const lines = String(JSON.parse(patch!).content).split("\n");
-    // fenced frame: ``` / lines / ``` with the trailing usage line
-    // right before the closing bar
-    expect(lines.at(-2)).toBe("└");
-    expect(lines.at(-3)).toBe("│ ~219.4k tok · ~$0.096");
+    const lines = String(JSON.parse(patch!).content).trimEnd().split("\n");
+    // fence-less frame: box lines with the trailing usage line right
+    // before the closing bar (2026-10-31: no code fence)
+    expect(lines.at(-1)).toBe("└");
+    expect(lines.at(-2)).toBe("│ ~219.4k tok · ~$0.096");
     for (const l of lines.slice(1, -1))
       expect([...l].length).toBeLessThanOrEqual(32);
   });
@@ -1967,12 +1969,11 @@ describe("wave 2c bridge commands", () => {
       expect(post).toContain("- done ");
       // markdown list, unfenced (Andryo 2026-10-18)
       expect(post!.startsWith("```")).toBe(false);
-      // json = machine output (fenced)
+      // json = machine output: plain text, no fence (2026-10-31)
       await handleInbound(pi, inbound("/jobs json", "m2"), ctx);
-      const jsonPost = posts()
-        .filter((t) => t.startsWith("```"))
-        .find((t) => t.includes('"history"'));
+      const jsonPost = posts().find((t) => t.includes('"history"'));
       expect(jsonPost).toBeDefined();
+      expect(jsonPost!.startsWith("```")).toBe(false);
       // kill/tail died with the completion side: no wrapper output, the
       // arg is just ignored and the view renders
       await handleInbound(
@@ -1998,7 +1999,7 @@ describe("wave 2c bridge commands", () => {
     await handleInbound(pi, inbound("/new-worktree", "m2"), ctx);
     const ok = posts().find((t) => unwarped(t).includes("[ok] worktree "));
     expect(ok).toBeDefined();
-    expect(ok!.startsWith("```")).toBe(true);
+    expect(ok!.startsWith("*")).toBe(true); // italic machine line (2026-10-31)
     expect(unwarped(ok!)).toContain("branch pi-bg/");
     expect(unwarped(ok!).replace(/ /g, "")).toContain(path.join(tmp, "wt"));
     const st = loadWorktreeStateFile();

@@ -29,7 +29,7 @@ import extension, {
   setInterruptCtx,
   verboseOverride,
 } from "./index";
-import { fence, stopAllOpTicks } from "./live";
+import { machine, stopAllOpTicks } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -771,9 +771,9 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     jest.advanceTimersByTime(4699); // t=4999
     expect(edits().length).toBe(0);
     jest.advanceTimersByTime(1); // t=5000
-    expect(edits()).toEqual(["[..] resetting… 5s"]);
+    expect(edits()).toEqual(["*[..] resetting… 5s*"]);
     jest.advanceTimersByTime(5000); // t=10000
-    expect(edits()).toEqual(["[..] resetting… 5s", "[..] resetting… 10s"]);
+    expect(edits()).toEqual(["*[..] resetting… 5s*", "*[..] resetting… 10s*"]);
 
     // respawn clears the window -> ticks stop
     clearAllCompacting();
@@ -811,10 +811,10 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     await handlers.session_start?.(null, ctx);
     await tick();
 
-    // the placeholder is REPLACED in place with the bare final line, not
-    // re-posted (status is prose — unfenced placeholder, unfenced settle;
-    // same form on both sides per v4 §2.3)
-    const finalText = "[new] new session (context cleared)";
+    // the placeholder is REPLACED in place with the italic machine line,
+    // not re-posted (2026-10-31: machine surfaces are plain + italic, no
+    // fence; same form on both sides)
+    const finalText = machine("[new] new session (context cleared)");
     expect(
       edits()
         .slice(editsBefore)
@@ -846,12 +846,12 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     );
     await handlers.session_start?.(null, ctx);
     await tick();
-    // bare fresh post — same prose form as the bare placeholder, never fenced
-    expect(channelPosts().some((t) => t === finalText)).toBe(true);
-    expect(channelPosts().some((t) => t === fence(finalText))).toBe(false);
-    expect(edits().some((t) => t === finalText || t === fence(finalText))).toBe(
-      false,
-    );
+    // italic fresh post — same machine form as the placeholder, never fenced
+    expect(channelPosts().some((t) => t === machine(finalText))).toBe(true);
+    expect(channelPosts().some((t) => t === finalText)).toBe(false);
+    expect(
+      edits().some((t) => t === finalText || t === machine(finalText)),
+    ).toBe(false);
     expect(fs.existsSync(p)).toBe(false); // consumed
   });
 
@@ -1386,7 +1386,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     // abort fired, settle-wait running, tick armed on the queued ack
     // (one-line op status = prose, bare tick per v4 §2.3)
     jest.advanceTimersByTime(5000);
-    expect(ackEdits()).toEqual(["[..] interrupting… 5s"]);
+    expect(ackEdits()).toEqual(["*[..] interrupting… 5s*"]);
 
     ctx.isIdle = () => true;
     jest.advanceTimersByTime(50);
