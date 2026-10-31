@@ -169,10 +169,12 @@ describe("restart-queue state file (#180)", () => {
     expect(Object.keys(file.deliveredMeta ?? {}).length).toBe(
       REWAKE_DELIVERED_META_CAP,
     );
-    expect(file.deliveredMeta?.["m0"]).toBeUndefined(); // oldest evicted
-    expect(file.deliveredMeta?.["m9"]).toBeUndefined(); // 10 oldest evicted
-    expect(file.deliveredMeta?.["m10"]).toBeDefined(); // kept floor
-    expect(file.deliveredMeta?.[`m${REWAKE_DELIVERED_META_CAP + 9}`]).toBeDefined(); // newest kept
+    expect(file.deliveredMeta?.m0).toBeUndefined(); // oldest evicted
+    expect(file.deliveredMeta?.m9).toBeUndefined(); // 10 oldest evicted
+    expect(file.deliveredMeta?.m10).toBeDefined(); // kept floor
+    expect(
+      file.deliveredMeta?.[`m${REWAKE_DELIVERED_META_CAP + 9}`],
+    ).toBeDefined(); // newest kept
   });
 
   test("clear pending empties the line but keeps the delivered set", () => {
@@ -197,7 +199,10 @@ describe("restart-queue state file (#180)", () => {
     saveRewakeQueue(dir, "ch1", {
       v: 1,
       pending: [],
-      delivered: Array.from({ length: REWAKE_DELIVERED_CAP + 5 }, (_, i) => `d${i}`),
+      delivered: Array.from(
+        { length: REWAKE_DELIVERED_CAP + 5 },
+        (_, i) => `d${i}`,
+      ),
     });
     rewakeCommitDelivered(dir, "ch1", `d${REWAKE_DELIVERED_CAP + 5}`);
     const file = loadRewakeQueue(dir, "ch1");

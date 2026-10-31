@@ -42,13 +42,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type SeenState, wakeEmbedKey } from "./channel-state";
 import {
   buildChannelMessageFromRaw,
   isBgWebhook,
   isOlderSnowflake,
 } from "./discord";
 import { atomicWriteJson, sweepOrphanTmpFiles } from "./durable-store";
-import { type SeenState, wakeEmbedKey } from "./channel-state";
 import type { ChannelConfig, ChannelMessage } from "./types";
 
 // ─── constants ───────────────────────────────────────────────────────────

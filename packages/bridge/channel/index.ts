@@ -30,6 +30,7 @@ import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
+import { type SeenState, seedSeenSets } from "./channel-state";
 import {
   buildInteractionHandler,
   channelError,
@@ -134,10 +135,6 @@ import {
   scanUndeliveredBgInbounds,
   setCurrentSessionFile,
 } from "./restart-queue";
-import {
-  seedSeenSets,
-  type SeenState,
-} from "./channel-state";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {

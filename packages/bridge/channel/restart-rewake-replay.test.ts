@@ -21,16 +21,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   loadChannelStateFile,
-  seedSeenSets,
   type SeenState,
+  seedSeenSets,
   wakeEmbedKey,
 } from "./channel-state";
 import {
   type BgScanChannel,
   loadRewakeQueue,
+  rewakeCommitDelivered,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
-  rewakeCommitDelivered,
 } from "./restart-queue";
 import { WAKE_TAG } from "./restart-wake";
 import type { ChannelConfig } from "./types";
@@ -97,9 +97,7 @@ async function scan(
 
 /** The boot-path seen seed: channel-state.json → seen state for the
  *  scan (keyed by Discord channel id). */
-const seenFromDisk = (
-  chId: string,
-): SeenState | null =>
+const seenFromDisk = (chId: string): SeenState | null =>
   chId === CONFIG.id
     ? seedSeenSets(loadChannelStateFile(dir), DISCORD_ID)
     : null;
