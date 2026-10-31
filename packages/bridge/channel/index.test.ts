@@ -48,7 +48,7 @@ import extension, {
   verboseOverride,
   workingMaxMs,
 } from "./index";
-import { settleOpTick, stopAllOpTicks } from "./live";
+import { machine, settleOpTick, stopAllOpTicks } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -666,7 +666,7 @@ describe("extension handlers (A1/A2/A4)", () => {
       (c) =>
         c.method === "POST" &&
         c.url.endsWith("/channels/ch1/messages") &&
-        String(JSON.parse(c.body).content).includes("┌ working"), // fenced working frame (live-frame unification)
+        String(JSON.parse(c.body).content).includes("┌ working"), // working frame (fence-less, 2026-10-31; live-frame unification)
     );
     expect(placeholder).toBeDefined(); // live block existed during the run
     const deleted = fetchCalls.find(
@@ -714,10 +714,10 @@ describe("extension handlers (A1/A2/A4)", () => {
     ).toBe(false);
     const doneBody = String(JSON.parse(doneEdit!.body).content);
     expect(doneBody).toContain("│ └ bash ls"); // sub-step, last = └
-    // multi-line frame lives in a code fence (mockup3), same fence() as
-    // every other machine line
-    expect(doneBody.startsWith("```\n")).toBe(true);
-    expect(doneBody.trimEnd()).toMatch(/\n└\n```$/); // closing bar, then fence
+    // multi-line frame ships fence-less (2026-10-31: plain text, no
+    // code fences on machine surfaces)
+    expect(doneBody).not.toContain("```");
+    expect(doneBody.trimEnd()).toMatch(/\n└$/); // closing bar, no fence
     const deleted = fetchCalls.find(
       (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
     );
@@ -759,8 +759,8 @@ describe("extension handlers (A1/A2/A4)", () => {
     let last = edits().at(-1)!;
     expect(last).toContain("┌ working · 1 call");
     expect(last).toContain("│ └ bash git push");
-    expect(last.trimEnd()).toMatch(/\n└\n```$/); // full frame, fenced
-    expect((last.match(/^```/gm) ?? []).length).toBe(2); // exactly one fence
+    expect(last.trimEnd()).toMatch(/\n└$/); // full frame, fence-less (2026-10-31)
+    expect(last).not.toContain("```"); // no code fence (2026-10-31)
 
     // 5s-step tick: still the full frame (not a one-line status), same
     // message id, elapsed stepped to 5s
@@ -768,7 +768,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     last = edits().at(-1)!;
     expect(last).toContain("┌ working · 1 call · 5s");
     expect(last).toContain("│ └ bash git push");
-    expect((last.match(/^```/gm) ?? []).length).toBe(2); // exactly one fence (F1)
+    expect(last).not.toContain("```"); // no code fence (F1, 2026-10-31)
     const tickEdit = fetchCalls
       .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
       .at(-1);
@@ -834,7 +834,7 @@ describe("extension handlers (A1/A2/A4)", () => {
     jest.advanceTimersByTime(workingMaxMs() - 5000 + 5000);
     await Promise.resolve();
     await Promise.resolve();
-    expect(edits().at(-1)).toBe("run stalled - /stop to abort");
+    expect(edits().at(-1)).toBe(machine("run stalled - /stop to abort"));
 
     // tick is gone: advancing further must not edit the frame again
     const n = edits().length;
@@ -934,7 +934,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "POST" &&
           c.url.endsWith("/channels/ch1/messages") &&
-          String(JSON.parse(c.body).content).includes("┌ working"), // fenced working frame (live-frame unification)
+          String(JSON.parse(c.body).content).includes("┌ working"), // working frame (fence-less, 2026-10-31; live-frame unification)
       ),
     ).toBe(true); // live block exists (mock id out1)
 
@@ -1702,7 +1702,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === "interrupted",
+          String(JSON.parse(c.body).content) === machine("interrupted"),
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -1738,7 +1738,7 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) =>
           c.method === "PATCH" &&
           c.url.includes(`/channels/ch1/messages/${ackId}`) &&
-          String(JSON.parse(c.body).content) === "interrupted",
+          String(JSON.parse(c.body).content) === machine("interrupted"),
       );
       const deleteIdx = fetchCalls.findIndex(
         (c) =>
@@ -1782,12 +1782,12 @@ describe("extension handlers (A1/A2/A4)", () => {
         .map((c) => String(JSON.parse(c.body).content));
       // the tick moved while the settle wait ran (one-line status = prose,
       // no fence, v4 §2.3)...
-      expect(ackPatches).toContain("[..] interrupting… 5s");
+      expect(ackPatches).toContain("*[..] interrupting… 5s*");
       // ...but the cap path SETTLES the tick back to the queued line (the
       // message's TRUE state — an interrupt did not happen), NOT a frozen
       // mid-interrupt line (#84 L1)...
-      expect(ackPatches.at(-1)).toBe("[queued] 1 in line");
-      expect(ackPatches).not.toContain("interrupted");
+      expect(ackPatches.at(-1)).toBe(machine("[queued] 1 in line"));
+      expect(ackPatches).not.toContain(machine("interrupted"));
       // ...and the ack is NOT deleted (it stays with the queued entry).
       expect(
         fetchCalls.some(
@@ -1864,7 +1864,8 @@ describe("extension handlers (A1/A2/A4)", () => {
           (c) =>
             c.method === "POST" &&
             c.url.endsWith("/channels/ch1/messages") &&
-            String(JSON.parse(c.body).content) === "[queued] 1 in line",
+            String(JSON.parse(c.body).content) ===
+              machine("[queued] 1 in line"),
         ),
       ).toBe(true);
 
@@ -1880,7 +1881,7 @@ describe("extension handlers (A1/A2/A4)", () => {
             c.url.includes(`/channels/ch1/messages/${ackId}`),
         )
         .map((c) => String(JSON.parse(c.body).content));
-      expect(ackPatches).toContain("interrupted");
+      expect(ackPatches).toContain(machine("interrupted"));
     });
   });
 
@@ -2866,11 +2867,11 @@ describe("extension handlers (A1/A2/A4)", () => {
         (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
       )
       .map((c) => JSON.parse(c.body).content);
-    // agent_end posts go through mdToDiscord: the bare warning line is
-    // guarded (fenced; no 40-col wrap since 2026-10-18)
-    expect(
-      contents.filter((t) => t === styleGuard(REPEAT_WARNING)).length,
-    ).toBe(1);
+    // agent_end posts go through mdToDiscord: the short warning line is
+    // a machine surface — italic, no fence (2026-10-31)
+    expect(contents.filter((t) => t === machine(REPEAT_WARNING)).length).toBe(
+      1,
+    );
   });
 
   test("F1: /undo re-run — session_start re-sends the parked trigger after the undo-restart", async () => {

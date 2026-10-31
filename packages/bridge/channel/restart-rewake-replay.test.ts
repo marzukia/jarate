@@ -32,7 +32,7 @@ import {
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
-import { WAKE_TAG } from "./restart-wake";
+
 import type { ChannelConfig } from "./types";
 
 const DISCORD_ID = "123456789012345678";
@@ -114,15 +114,11 @@ const writeStateFile = (seen: string[], seenWake: string[]) => {
   );
 };
 
-// One wake card shape (the #306 double-post target: same embed, two
-// message ids, one wake key).
-const WAKE_EMBED = {
-  author: { name: `${WAKE_TAG} · worker` },
-  title: "worker · OK",
-  description: "task w1 done",
-};
+// One wake line shape (the #306 double-post target: same content, two
+// message ids, one wake key - the 2026-10-31 plain-italic shape).
+const WAKE_LINE = "*restart-wake · planned*";
 const wakeRaw = (id: string | number) =>
-  raw(id, T_3H25M, { embeds: [WAKE_EMBED] });
+  raw(id, T_3H25M, { content: WAKE_LINE });
 
 describe("#1083 restart re-wake replay (port of the investigation repro)", () => {
   test("control: a committed post is NOT re-queued (delivered set is the primary authority)", async () => {

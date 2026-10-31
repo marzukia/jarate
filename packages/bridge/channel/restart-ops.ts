@@ -42,7 +42,7 @@ import {
   setHandoffRestartArmed,
   setUserStoppedRun,
 } from "./index";
-import { armOpTick, opTickLine } from "./live";
+import { armOpTick, machine, opTickLine } from "./live";
 import { clearQueuedInbound, midTurnQueues } from "./queue";
 import { sanitizeUnknownValue } from "./sanitize";
 import { defaultHome } from "./todos";
@@ -192,10 +192,10 @@ export function consumeOpMarker(pi: ExtensionAPI, ctx: ExtensionContext): void {
     `[op] ${m.op} settled: channel ${ch.id} back in service (cursor rewound, inbounds replay)`,
   );
   if (m.msgId)
-    editDiscordMessage(ch, m.msgId, m.finalText).catch(() =>
-      sendDiscordMessage(ch, m.finalText).catch(() => {}),
+    editDiscordMessage(ch, m.msgId, machine(m.finalText)).catch(() =>
+      sendDiscordMessage(ch, machine(m.finalText)).catch(() => {}),
     );
-  else sendDiscordMessage(ch, m.finalText).catch(() => {});
+  else sendDiscordMessage(ch, machine(m.finalText)).catch(() => {});
 }
 
 /** Flip seeded=true on the handoff op marker (F4 crash-safety flip). */
@@ -329,8 +329,9 @@ export function beginRestartOp(
   });
   writeOpMarker(ctx, ch, op, finalText, marker);
   if (ch.type !== "discord") return Promise.resolve(null);
-  // One-line op status = prose, ships unfenced (STYLE.md v4 §2.3).
-  return sendDiscordMessage(ch, `[..] ${label}...`)
+  // One-line op status = machine surface: italic, no code fence (Andryo
+  // 2026-10-31); the op-tick edits it in place (opTickLine).
+  return sendDiscordMessage(ch, machine(`[..] ${label}...`))
     .then((r) => {
       if (r.success && r.messageId) {
         updateOpMarkerMsgId(ctx, ch.id, r.messageId);
@@ -376,7 +377,7 @@ function armRestartWatchdog(
     clearOpMarker(ctx); // the respawn that would settle it never came
     clearCompacting(ch.id); // also drops the pending op-shutdown timer
     drainQueuedAfterCompact(pi, ctx);
-    const line = `restart failed - check unit ${unit}`;
+    const line = machine(`restart failed - check unit ${unit}`);
     if (ch.type === "discord") sendDiscordMessage(ch, line).catch(() => {});
     // F7 (design v2, PR2): a swallowed restart leaves THIS process alive
     // and the unit "active" — systemd will never auto-respawn it. Die on

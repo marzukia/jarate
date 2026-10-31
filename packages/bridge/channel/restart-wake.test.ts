@@ -17,7 +17,6 @@ import {
   runRestartWake,
   selectInflight,
   WAKE_DEDUP_WINDOW_MS,
-  WAKE_TAG,
   type WakePayload,
   type WakeTarget,
   writeCleanStop,
@@ -85,37 +84,17 @@ function fakeFetch(results: Array<number | Error>): {
   return { impl, calls };
 }
 
-// ─── inflight summary builder (fixture run records) ──────────────────────
+// ─── wake line builder (2026-10-31: plain italic, no embeds) ──────────
 
-describe("buildWakePayload (issue #111 + embed card family)", () => {
-  test("clean + zero inflight = empty content + green planned embed (Author: pi-bg marker)", () => {
-    const p = buildWakePayload({ clean: true, runs: [], now: T0 });
-    // 2026-10-21 de-prefix: no visible [bg: line - the marker is the
-    // embed author (serialized to `Author: pi-bg …` for isBgCallbackBody)
-    expect(p.content).toBe("");
-    expect(p.embeds).toHaveLength(1);
-    const e = p.embeds[0];
-    expect(e.author?.name).toBe(`${WAKE_TAG} \u00b7 planned`);
-    expect(e.title).toBe("restart-wake \u00b7 planned");
-    expect(e.color).toBe(0x57f287);
-    expect(e.description).toBe(
-      "pi restarted as planned (clean stop) - back online. No in-flight pi-bg work.",
-    );
-    expect(e.footer.text).toBe("restart-wake");
-    expect(e.fields).toBeUndefined();
+describe("buildWakePayload (issue #111, 2026-10-31 plain-italic shape)", () => {
+  test("clean + zero inflight = exactly the spec planned line", () => {
+    const p = buildWakePayload({ clean: true, runs: [] });
+    expect(p.content).toBe("*restart-wake \u00b7 planned*");
   });
 
-  test("unclean + zero inflight = red unplanned embed, no-in-flight fact in description", () => {
-    const p = buildWakePayload({ clean: false, runs: [], now: T0 });
-    const e = p.embeds[0];
-    expect(p.content).toBe("");
-    expect(e.author?.name).toBe("pi-bg restart-wake \u00b7 unplanned");
-    expect(e.title).toBe("restart-wake \u00b7 unplanned");
-    expect(e.color).toBe(0xed4245);
-    expect(e.description).toBe(
-      "pi is back online but the last stop was NOT clean (crash, OOM, or kill) - the last turn was interrupted. No in-flight pi-bg work.",
-    );
-    expect(e.footer.text).toBe("restart-wake");
+  test("unclean + zero inflight = exactly the spec unplanned line", () => {
+    const p = buildWakePayload({ clean: false, runs: [] });
+    expect(p.content).toBe("*restart-wake \u00b7 unplanned*");
   });
 
   test("terminal states are not inflight (done/killed ignored)", () => {
@@ -123,87 +102,56 @@ describe("buildWakePayload (issue #111 + embed card family)", () => {
       rec({ run: "a", state: "done", finished: "2026-10-01T12:00:00Z" }),
       rec({ run: "b", state: "killed", reason: "pi-bg-kill" }),
     ];
-    const p = buildWakePayload({ clean: true, runs, now: T0 });
-    expect(p.content).toBe("");
-    expect(p.embeds[0].description).toContain("No in-flight pi-bg work.");
-    expect(p.embeds[0].fields).toBeUndefined();
+    const p = buildWakePayload({ clean: true, runs });
+    expect(p.content).toBe("*restart-wake \u00b7 planned*");
   });
 
-  test("inflight rows: ticket profile age, one row each (detail in /jobs)", () => {
+  test("inflight suffix: count of state=running records on the same line", () => {
     const runs = [
       rec({
         run: "20261001-103700-9",
         profile: "reviewer",
-        started: "2026-10-01T11:37:00Z", // 23m before T0
+        started: "2026-10-01T11:37:00Z",
       }),
       rec({
         run: "20261001-115900-10",
         profile: "worker",
-        started: "2026-10-01T11:59:30Z", // 30s before T0
+        started: "2026-10-01T11:59:30Z",
+        state: "running",
       }),
+      rec({ run: "done-run", state: "done" }),
     ];
-    const p = buildWakePayload({ clean: false, runs, now: T0 });
-    expect(p.content).toBe("");
-    expect(p.embeds[0].fields).toEqual([
-      {
-        name: "in-flight",
-        value: "20261001-103700-9 reviewer 23m\n20261001-115900-10 worker 30s",
-      },
-    ]);
-  });
-
-  test("oldest first, capped at MAX_INFLIGHT with a /jobs pointer", () => {
-    const runs = Array.from({ length: MAX_INFLIGHT + 2 }, (_, i) =>
-      rec({
-        run: `20261001-11${String(i).padStart(2, "0")}-0`,
-        started: `2026-10-01T11:${String(i).padStart(2, "0")}:00Z`,
-      }),
+    const p = buildWakePayload({ clean: false, runs });
+    expect(p.content).toBe(
+      "*restart-wake \u00b7 unplanned \u00b7 in-flight 2*",
     );
-    const p = buildWakePayload({ clean: true, runs, now: T0 });
-    expect(p.content).toBe("");
-    const value = p.embeds[0].fields?.[0]?.value ?? "";
-    const lines = value.split("\n");
-    // oldest (i=0) listed first, newest (i>=10) dropped
-    expect(lines[0]).toBe("20261001-1100-0 worker 1h0m");
-    expect(lines).toContain("+2 more - see /jobs");
-    expect(value).not.toContain("20261001-1110-0");
-    expect(value).not.toContain("20261001-1111-0");
   });
 
-  test("no width budget: long profile ships in full, never clipped", () => {
+  test("many inflight: the count is the FULL total, not the capped list", () => {
+    const runs = Array.from({ length: MAX_INFLIGHT + 2 }, (_, i) =>
+      rec({ run: `20261001-11${String(i).padStart(2, "0")}-0` }),
+    );
+    const p = buildWakePayload({ clean: true, runs });
+    expect(p.content).toBe(
+      `*restart-wake \u00b7 planned \u00b7 in-flight ${MAX_INFLIGHT + 2}*`,
+    );
+  });
+
+  test("no width budget: long profile does not change the count line", () => {
     const profile = "x".repeat(60);
     const p = buildWakePayload({
       clean: true,
       runs: [rec({ run: "20261001-110000-1", state: "running", profile })],
-      now: T0,
     });
-    const value = p.embeds[0].fields?.[0]?.value ?? "";
-    expect(value).toContain(`20261001-110000-1 ${profile} 23m`);
-    expect(value).not.toContain("…");
+    expect(p.content).toBe("*restart-wake \u00b7 planned \u00b7 in-flight 1*");
   });
 
-  test("emoji profile stays intact (no clip to split a surrogate pair)", () => {
-    const emoji = "\u{1F600}"; // 2 code units, 1 code point
-    const p = buildWakePayload({
-      clean: true,
-      runs: [rec({ profile: emoji.repeat(30) })],
-      now: T0,
-    });
-    const loneSurrogate =
-      /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
-    expect(JSON.stringify(p).match(loneSurrogate)).toBe(null);
-  });
-
-  test("missing profile / started degrade without crashing", () => {
+  test("missing profile degrades without crashing (count still 1)", () => {
     const p = buildWakePayload({
       clean: true,
       runs: [{ run: "20261001-110000-1", state: "running" } as RunRecord],
-      now: T0,
     });
-    expect(p.content).toBe("");
-    expect(p.embeds[0].fields).toEqual([
-      { name: "in-flight", value: "20261001-110000-1 ? 0s" },
-    ]);
+    expect(p.content).toBe("*restart-wake \u00b7 planned \u00b7 in-flight 1*");
   });
 });
 
@@ -380,17 +328,7 @@ describe("postWakePayload (issue #111)", () => {
   const target: WakeTarget = { channelId: "1545018100590846033" };
   const opts = { backoffMs: 1, timeoutMs: 50 };
   const payload = (): WakePayload => ({
-    content: "",
-    embeds: [
-      {
-        author: { name: "pi-bg restart-wake \u00b7 planned" },
-        title: "restart-wake \u00b7 planned",
-        color: 0x57f287,
-        description:
-          "pi restarted as planned (clean stop) - back online. No in-flight pi-bg work.",
-        footer: { text: "restart-wake" },
-      },
-    ],
+    content: "*restart-wake \u00b7 planned*",
   });
 
   test("no token, no webhook = silent no-op (dev runs)", async () => {
@@ -401,7 +339,7 @@ describe("postWakePayload (issue #111)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("bot route: posts content + embeds to the channel messages API", async () => {
+  test("bot route: posts the italic wake content to the channel messages API", async () => {
     const { impl, calls } = fakeFetch([200]);
     await expect(
       postWakePayload({ ...target, botToken: "tok" }, payload(), {
@@ -416,8 +354,7 @@ describe("postWakePayload (issue #111)", () => {
     expect(calls[0].headers.Authorization).toBe("Bot tok");
     const body = JSON.parse(calls[0].body ?? "{}");
     expect(body.content).toBe(payload().content);
-    expect(body.embeds).toHaveLength(1);
-    expect(body.embeds[0].title).toBe("restart-wake \u00b7 planned");
+    expect(body.embeds).toBeUndefined();
   });
 
   test("webhook-only route works", async () => {
@@ -541,7 +478,7 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("full wake: planned restart, 1 inflight, embed card, bus webhook first", async () => {
+  test("full wake: planned restart, 1 inflight, italic line, bus webhook first", async () => {
     writeCleanStop(stateDir(), new Date(T0 - 10_000));
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
     const { impl, calls } = fakeFetch([200]);
@@ -562,17 +499,11 @@ describe("runRestartWake (issue #111)", () => {
     // and the webhook post is the FIRST route (isBgWebhook)
     expect(calls[0].url).toBe("https://bus.example/hook");
     const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toBe("");
-    expect(posted.embeds).toHaveLength(1);
-    expect(posted.embeds[0].author.name).toBe(
-      "pi-bg restart-wake \u00b7 planned",
+    expect(posted.content).toBe(
+      "*restart-wake \u00b7 planned \u00b7 in-flight 1*",
     );
-    expect(posted.embeds[0].title).toBe("restart-wake \u00b7 planned");
-    expect(posted.embeds[0].color).toBe(0x57f287);
-    expect(posted.embeds[0].footer.text).toBe("restart-wake");
-    expect(posted.embeds[0].fields).toEqual([
-      { name: "in-flight", value: "20261001-113000-7 worker 23m" },
-    ]);
+    expect(posted.embeds).toBeUndefined();
+    expect(r.message).toBe("*restart-wake \u00b7 planned \u00b7 in-flight 1*");
   });
 
   test("channel webhookUrl beats the resolved bus webhook", async () => {
@@ -590,7 +521,7 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls[0].url).toBe("https://ch.example/hook");
   });
 
-  test("unclean + inflight posted card matches the builder", async () => {
+  test("unclean + inflight posted line matches the builder", async () => {
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
     const { impl, calls } = fakeFetch([200]);
     const r = await runRestartWake({
@@ -605,13 +536,10 @@ describe("runRestartWake (issue #111)", () => {
     expect(r.posted).toBe(true);
     expect(r.restartClass).toBe("unclean");
     const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toBe("");
-    expect(posted.embeds[0].author.name).toBe(
-      "pi-bg restart-wake \u00b7 unplanned",
+    expect(posted.content).toBe(
+      "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
     );
-    expect(posted.embeds[0].fields).toEqual([
-      { name: "in-flight", value: "20261001-113000-7 worker 23m" },
-    ]);
+    expect(posted.embeds).toBeUndefined();
   });
 
   test("dedup: second startup within 60s does not post", async () => {

@@ -39,7 +39,6 @@ import {
   runChannelCommand,
   runShellPassthrough,
   startCompact,
-  wrapFence,
 } from "./commands";
 import {
   connectDiscord,
@@ -70,7 +69,7 @@ import {
   unreactMessage,
 } from "./discord";
 import { isFleetRun } from "./fleet-run";
-import { fmtTokensLC, mdToDiscord, styleGuard } from "./format";
+import { fmtTokensLC, mdToDiscord } from "./format";
 import { FRAME_COL_MAX } from "./frame";
 import {
   buildHandover,
@@ -86,11 +85,11 @@ import {
   compactPlaceholders,
   earlySendText,
   earlySent,
-  fence,
   finalText,
   interruptEntryInFlight,
   LIVE_TEXT_THROTTLE_MS,
   type LiveFrameRec,
+  machine,
   opTickLine,
   opTicks,
   persistLivePlaceholders,
@@ -120,6 +119,7 @@ import {
   resolveChannel,
   updateQueuedInbound,
 } from "./queue";
+import { buildRepliedMessageBlock } from "./reply-context";
 import {
   consumeOpMarker,
   handoffRestartForSize,
@@ -555,14 +555,14 @@ export function opWindowLabel(channelId: string): OpLabel | null {
 
 /** Double-op refusal text (F5, owner 2026-09-11): name the ACTIVE op —
  *  a compaction window says "already compacting", a restart-class op
- *  window says "already restarting". One-line op status = prose, ships
- *  unfenced (STYLE.md v4 §2.3). */
+ *  window says "already restarting". Machine one-liner: italic (Andryo
+ *  2026-10-31), no fence. */
 export function opBusyRefusal(channelId: string): string {
-  // Bare chat one-liner - plain words, no tag (machine output only, Andryo
-  // 2026-10-20).
-  return opWindowLabel(channelId) === "compacting"
-    ? "already compacting"
-    : "already restarting";
+  return machine(
+    opWindowLabel(channelId) === "compacting"
+      ? "already compacting"
+      : "already restarting",
+  );
 }
 
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
@@ -611,7 +611,7 @@ export function beginCompacting(
     // terminal line (a frozen counting tick is the stale placeholder this
     // fix kills), then clear + drain as before. No-op for restart-class ops
     // (their tick is not armed; the op marker covers them).
-    settleCompactTick(ch.id, "compact stalled");
+    settleCompactTick(ch.id, machine("compact stalled"));
     clearCompacting(ch.id, true);
     drainQueuedAfterCompact(pi, ctx);
   }, COMPACT_FALLBACK_MS);
@@ -753,7 +753,7 @@ export async function runMidRunInterrupt(
       );
       // Settle the tick before the delete: the final edit must land while
       // the ack message still exists (same race as the success path).
-      settleOpTick(`interrupt:${channelId}`, `interrupted`);
+      settleOpTick(`interrupt:${channelId}`, machine(`interrupted`));
       consumeQueuedAck(channelId, messageId);
       // #180: the entry is dropped (never sent to pi) — prune the
       // survived copy so a restart does not re-deliver the cancel.
@@ -805,7 +805,10 @@ export async function runMidRunInterrupt(
       const pos = at + 1;
       const ack = queuedAcks.get(messageId);
       if (ack) ack.pos = pos;
-      settleOpTick(`interrupt:${channelId}`, `[queued] ${pos} in line`);
+      settleOpTick(
+        `interrupt:${channelId}`,
+        machine(`[queued] ${pos} in line`),
+      );
       console.log(
         `[channel] mid-run interrupt: settle exceeded cap, ${messageId} left to re-wake`,
       );
@@ -815,7 +818,7 @@ export async function runMidRunInterrupt(
     // the ack message in place, so the final edit must land while the
     // message still exists. consumeQueuedAck then deletes it.
     const tickKey = `interrupt:${channelId}`;
-    settleOpTick(tickKey, `interrupted`);
+    settleOpTick(tickKey, machine(`interrupted`));
     consumeQueuedAck(channelId, messageId); // entry is owned by the fresh run
     sendToPi(
       pi,
@@ -1090,7 +1093,8 @@ export const RUN_FRAME_MAX_STEPS = 8;
 /**
  * Unified run frame (v3, mockup3 + live-frame unification): ONE builder
  * for the live "working" status and the end-of-run done/failed summary —
- * same shape, same fence, same Discord message; only the header changes
+ * same shape, fence-less (Andryo 2026-10-31), same Discord message; only
+ * the header changes
  * state:
  *
  *   ┌ working · 12 calls · 96s
@@ -2048,7 +2052,7 @@ export default function (pi: ExtensionAPI) {
         editDiscordMessage(
           t.ch,
           t.msgId,
-          "compact interrupted - restart",
+          machine("compact interrupted - restart"),
         ).catch(() => {}),
       );
     }
@@ -2110,14 +2114,16 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Live status frame (edit-in-place, deleted at run end) ───
   // Shared op-tick (5s): the block re-renders the FULL working frame —
-  // same builder and fence as the end-of-run done frame (live-frame
-  // unification 2026-09-13), 5s-step elapsed, even while no tool call has
+  // same builder, fence-less (Andryo 2026-10-31), as the end-of-run done
+  // frame (live-frame unification 2026-09-13), 5s-step elapsed, even
+  // while no tool call has
   // fired yet (model thinking: `┌ working · 0 calls · 10s`). Render
   // returns null when the run closes or the block is gone; the entry stops
   // at agent_end.
-  /** Current live working frame for ch, fenced: sub-steps = calls so far
-   *  (level 1: essentials only). count = shown length, so the live header
-   *  matches the done frame that morphs this message at run end. */
+  /** Current live working frame for ch (fence-less - Andryo 2026-10-31):
+   *  sub-steps = calls so far (level 1: essentials only). count = shown
+   *  length, so the live header matches the done frame that morphs this
+   *  message at run end. */
   const workingFrameBody = (ch: ChannelConfig, secs: number): string => {
     const shown = (
       verboseLevel(ch) === 1
@@ -2127,34 +2133,28 @@ export default function (pi: ExtensionAPI) {
     return runFrame("working", shown, shown.length, secs);
   };
   const workingFrame = (ch: ChannelConfig, secs: number): string =>
-    fence(workingFrameBody(ch, secs));
+    workingFrameBody(ch, secs);
   const armWorkingTick = () => {
     const ch = lastActiveChannel;
     if (!ch || !statusMsgId) return;
     const key = `working:${ch.id}`;
-    armOpTick(
-      key,
-      ch,
-      statusMsgId,
-      () => {
-        if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
-        const wch = lastActiveChannel;
-        if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
-        const secs = Math.floor((Date.now() - runStartedAt) / 1000);
-        // #84 L3: cap the frame's lifetime. A run that never ends would
-        // count up forever — settle to the true state (stalled) and stop.
-        if (Date.now() - runStartedAt >= workingMaxMs()) {
-          settleOpTick(key, "run stalled - /stop to abort");
-          return null;
-        }
-        // UNFENCED body: the fenced=true tick arg fences it exactly once
-        // (review F1).
-        const body = workingFrameBody(wch, Math.floor(secs / 5) * 5);
-        persistLivePlaceholders(); // #84: keep the crash-settle body fresh
-        return body;
-      },
-      true,
-    );
+    armOpTick(key, ch, statusMsgId, () => {
+      if (!runOpen || !statusMsgId || !lastActiveChannel) return null;
+      const wch = lastActiveChannel;
+      if (wch.type !== "discord" || statusChannelId !== wch.id) return null;
+      const secs = Math.floor((Date.now() - runStartedAt) / 1000);
+      // #84 L3: cap the frame's lifetime. A run that never ends would
+      // count up forever — settle to the true state (stalled) and stop.
+      if (Date.now() - runStartedAt >= workingMaxMs()) {
+        settleOpTick(key, machine("run stalled - /stop to abort"));
+        return null;
+      }
+      // BARE body: the tick posts it verbatim (no fence pass - Andryo
+      // 2026-10-31).
+      const body = workingFrameBody(wch, Math.floor(secs / 5) * 5);
+      persistLivePlaceholders(); // #84: keep the crash-settle body fresh
+      return body;
+    });
   };
 
   // ─── Live intermediate text (SPEC B) ──────────────────────────────────
@@ -2299,14 +2299,12 @@ export default function (pi: ExtensionAPI) {
           : editDiscordMessage(
               fch,
               msgId,
-              fence(
-                runFrame(
-                  opts.state ?? "stopped",
-                  shown,
-                  shown.length,
-                  Math.round((Date.now() - runStartedAt) / 1000),
-                  opts.trailing,
-                ),
+              runFrame(
+                opts.state ?? "stopped",
+                shown,
+                shown.length,
+                Math.round((Date.now() - runStartedAt) / 1000),
+                opts.trailing,
               ),
             ).catch(() => {});
       if (opts.deletes) opts.deletes.push(p);
@@ -2372,7 +2370,7 @@ export default function (pi: ExtensionAPI) {
             : editDiscordMessage(
                 fch,
                 state.frame.msgId,
-                fence(state.frame.body.replace(/^┌ working/, "┌ stopped")),
+                state.frame.body.replace(/^┌ working/, "┌ stopped"),
               )
           ).catch(() => {}),
         );
@@ -2389,9 +2387,11 @@ export default function (pi: ExtensionAPI) {
       const ch = chOf(c.channelId);
       if (!ch) continue;
       rest.push(
-        editDiscordMessage(ch, c.msgId, "compact interrupted - restart").catch(
-          () => {},
-        ),
+        editDiscordMessage(
+          ch,
+          c.msgId,
+          machine("compact interrupted - restart"),
+        ).catch(() => {}),
       );
     }
     for (const q of state.queueAcks) {
@@ -2661,7 +2661,7 @@ export default function (pi: ExtensionAPI) {
         // repeated final, abort the run, post one warning line instead.
         userStoppedRun = true;
         if (ch.type === "discord")
-          sendDiscordMessage(ch, REPEAT_WARNING).catch(() => {});
+          sendDiscordMessage(ch, machine(REPEAT_WARNING)).catch(() => {});
         try {
           ctx.abort();
         } catch {}
@@ -2719,7 +2719,7 @@ export default function (pi: ExtensionAPI) {
     if (err !== null) {
       const t = channelError(err);
       if (t !== null)
-        sendDiscordMessage(pc.ch, styleGuard(`compact failed: ${t}`)).catch(
+        sendDiscordMessage(pc.ch, machine(`compact failed: ${t}`)).catch(
           () => {},
         );
     }
@@ -3036,7 +3036,7 @@ export default function (pi: ExtensionAPI) {
           userStoppedRun = true;
           if (ch.type === "discord") {
             try {
-              const r = await send(REPEAT_WARNING);
+              const r = await send(machine(REPEAT_WARNING));
               if (!r.success)
                 console.error(
                   `[channel] repetition warning failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -3130,41 +3130,20 @@ export function channelTitle(
   return `${type}/${name}`;
 }
 
-// ─── Reply message context ────────────────────────────────────────────────
-// When the user replies to a message, its author + text are injected as a
-// <replied-message> block so the LLM knows what is being pointed at.
-// Ported from kimaki's reply-context handling.
-
-function escapePromptAttr(value: string): string {
-  return value.replace(/"/g, "'").replace(/\s+/g, " ");
-}
-
-function escapePromptText(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-/** Build the <replied-message> LLM block, or "" when there is no reply ref. Exported for tests. */
-export function buildRepliedMessageBlock(rm?: {
-  author: string;
-  text: string;
-}): string {
-  if (!rm?.text) return "";
-  const author = rm.author ? ` author="${escapePromptAttr(rm.author)}"` : "";
-  return `This message was a reply to message\n\n<replied-message${author}>\n${escapePromptText(rm.text)}\n</replied-message>`;
-}
+// Reply message context lives in ./reply-context (size-gate split).
+export { buildRepliedMessageBlock };
 
 /** #177: true when the inbound is a machine wake (pi-bg callback,
  *  dead-letter alert, ETL alert). Machine wakes are never more urgent than
  *  the in-flight turn: they ride the re-wake queue and deliver at agent_end,
  *  and arm no mid-run interrupt (queue-only, #177).
  *
- *  Classifies via isBgCallbackBody: the 2026-10-21 de-prefix shape
- *  (content="", body = serialized embed starting `Author: pi-bg`) and the
- *  legacy "[bg:" content prefix (one release: in-flight history, dead
- *  letters, not-yet-restyled cross-repo producers). */
+ *  Classifies via isBgCallbackBody: the 2026-10-31 plain-italic wake
+ *  content (`*restart-wake · planned|unplanned*`), the 2026-10-21
+ *  de-prefix shape (content="", body = serialized embed starting
+ *  `Author: pi-bg`), and the legacy "[bg:" content prefix (one release:
+ *  in-flight history, dead letters, not-yet-restyled cross-repo
+ *  producers). */
 export function isBgInbound(msg: ChannelMessage): boolean {
   return isBgCallbackBody(msg.body.trimStart());
 }
@@ -3448,9 +3427,9 @@ export async function handleInbound(
   // /status /reset /verbose — owner only. Commands consume the message.
   const replyCmd = (text: string) => {
     if (!ch) return;
-    // Command replies ship fenced (STYLE.md 2.7): the guard fences bare
-    // machine-state lines; already-fenced replies pass through unchanged.
-    sendDiscordMessage(ch, styleGuard(text), {
+    // Command replies ship as plain machine text (Andryo 2026-10-31):
+    // single-line acks italic, multi-line blocks plain - no fences.
+    sendDiscordMessage(ch, text, {
       replyToMessageId: msg.messageId,
     }).catch(() => {});
   };
@@ -3555,7 +3534,7 @@ export async function handleInbound(
   if (bang && ch) {
     noAck();
     if (!isOwnerUser(ch, msg.fromId)) {
-      replyCmd(fence("[!] ! shell is owner-only"));
+      replyCmd(machine("[!] ! shell is owner-only"));
       return;
     }
     const shellCmd = bang[1].trim();
@@ -3576,7 +3555,7 @@ export async function handleInbound(
     ]
       .filter(Boolean)
       .join(" · ");
-    replyCmd(r.out ? `${wrapFence(shown)}\n${tail}` : tail);
+    replyCmd(r.out ? `${shown}\n${tail}` : machine(tail));
     return;
   }
 
@@ -3637,7 +3616,7 @@ export async function handleInbound(
     // ticks only edit the ack message, so it stays silent too. The entry
     // still queues (and re-wakes) exactly as today; verbose 1+ posts it.
     if (verboseLevel(ch) === 0) return true;
-    sendDiscordMessage(ch, `[queued] ${pos} in line`, {
+    sendDiscordMessage(ch, machine(`[queued] ${pos} in line`), {
       replyToMessageId: msg.messageId,
     })
       .then((res) => {
@@ -3766,7 +3745,9 @@ export async function handleInbound(
         // 2026-10-20) - the summary is the later todo board post.
         sendDiscordMessage(
           ch,
-          `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
+          machine(
+            `[buffered] ${n} ${n === 1 ? "file" : "files"} - send text to attach them`,
+          ),
           { replyToMessageId: msg.messageId },
         ).catch(() => {});
         return;

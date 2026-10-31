@@ -23,6 +23,7 @@ import {
   earlySendText,
   LIVE_TEXT_PLACEHOLDER,
   LIVE_TEXT_THROTTLE_MS,
+  machine,
   persistLivePlaceholders,
   readLivePlaceholders,
   simulateProcessDeathForTest,
@@ -32,6 +33,18 @@ import {
 } from "./live";
 import { midTurnQueues, queuedAcks, queueMidTurnInbound } from "./queue";
 import type { ChannelMessage } from "./types";
+
+describe("machine (plain-italic surfaces)", () => {
+  test("single line with one inner * ships italic with the star escaped", () => {
+    expect(machine("a * b")).toBe("*a \\* b*");
+  });
+  test("single line with two inner * ships italic with both escaped", () => {
+    expect(machine("x * y * z")).toBe("*x \\* y \\* z*");
+  });
+  test("multi-line input passes through plain", () => {
+    expect(machine("line1\nline2 *")).toBe("line1\nline2 *");
+  });
+});
 
 // Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
 // suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;

@@ -9,7 +9,7 @@ import extension, {
   deliverDueWakes,
   handleInbound,
 } from "./index";
-import { fence } from "./live";
+import { machine } from "./live";
 import { CLAIM_TTL_MS, loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { loadTasks, markTaskClaimed, scheduleTask } from "./tasks";
 import { loadBoard, renderBoard, saveBoard } from "./todos";
@@ -29,7 +29,11 @@ import { type ChannelMessage, loadChannelConfig } from "./types";
 // index.test.ts guard in the split-off files).
 delete process.env.PI_SESSION_ID;
 
-const unwarped = (s: string) => s.replace(/\n +/g, " ");
+const unwarped = (s: string) =>
+  s
+    .replace(/\n +/g, " ")
+    .replace(/^\*([\s\S]*)\*$/, "$1")
+    .replace(/\\\*/g, "*");
 
 // ─── Todo board: /todos command, context injection, tool, worker intake ──
 // Same harness shape as the "extension handlers" block, plus a HOME
@@ -164,7 +168,7 @@ describe("todo board (integration)", () => {
 
   test("/todos with an empty board says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[todos] no open todos"));
+    expect(replyContent()).toBe(machine("[todos] no open todos"));
   });
 
   test("/todos needs no owner", async () => {
@@ -228,7 +232,7 @@ describe("todo board (integration)", () => {
 
   test("/todos all with no boards says 'no open todos'", async () => {
     await handleInbound(pi, inbound("/todos all", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[todos] no open todos"));
+    expect(replyContent()).toBe(machine("[todos] no open todos"));
   });
 
   test("/todos all ships the full channel name - no 40-col clip (2026-10-18)", async () => {
@@ -565,7 +569,7 @@ describe("sleep (integration)", () => {
 
   test("/sleep with no wakes says 'no pending wakes'", async () => {
     await handleInbound(pi, inbound("/sleep", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[wake] no pending wakes"));
+    expect(replyContent()).toBe(machine("[wake] no pending wakes"));
   });
 
   test("/sleep list shows pending wakes with id, channel, time, note", async () => {
@@ -593,18 +597,18 @@ describe("sleep (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound(`/sleep cancel ${w.id}`, "m1"), ctx);
-    expect(replyContent()).toBe(fence(`[ok] cancelled wake ${w.id}`));
+    expect(replyContent()).toBe(machine(`[ok] cancelled wake ${w.id}`));
     expect(loadWakes(tmp)).toHaveLength(0);
   });
 
   test("/sleep cancel: unknown id, missing id, bogus subcommand", async () => {
     await handleInbound(pi, inbound("/sleep cancel nope", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[!] no wake with id nope"));
+    expect(replyContent()).toBe(machine("[!] no wake with id nope"));
     await handleInbound(pi, inbound("/sleep cancel", "m2"), ctx);
-    expect(replyContent()).toBe(fence("[!] usage: /sleep cancel <id>"));
+    expect(replyContent()).toBe(machine("[!] usage: /sleep cancel <id>"));
     await handleInbound(pi, inbound("/sleep xyz", "m3"), ctx);
     expect(replyContent()).toBe(
-      fence("[!] usage: /sleep [list | cancel <id>]"),
+      machine("[!] usage: /sleep [list | cancel <id>]"),
     );
   });
 
@@ -899,39 +903,45 @@ describe("tasks (integration)", () => {
 
   test("/tasks with no tasks says 'no scheduled tasks'", async () => {
     await handleInbound(pi, inbound("/tasks", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[tasks] no scheduled tasks"));
+    expect(replyContent()).toBe(machine("[tasks] no scheduled tasks"));
   });
 
-  test("fence rule: machine replies fenced; summaries are markdown (2026-09-16 + 2026-10-18)", async () => {
-    // /command replies ship in a code block (operator 2026-09-16) - still
-    // true for machine one-liners, /help, and add/cancel results.
-    const fencedCmds = [
-      "/help",
+  test("machine surfaces: short one-liners italic, multi-line plain (2026-10-31)", async () => {
+    // Machine one-liner replies ship ITALIC (2026-10-31: plain text +
+    // italics, no embeds, no code fences); multi-line blocks ship plain.
+    const oneLiners = [
       "/tasks add",
       "/tasks reschedule",
       "/tasks cancel",
       "/sleep cancel",
       "/model",
     ];
-    for (let i = 0; i < fencedCmds.length; i++) {
-      await handleInbound(pi, inbound(fencedCmds[i], `m${i}`), ctx);
+    for (let i = 0; i < oneLiners.length; i++) {
+      await handleInbound(pi, inbound(oneLiners[i], `m${i}`), ctx);
       const c = replyContent();
-      expect(c.startsWith("```"), `${fencedCmds[i]} -> ${c.slice(0, 50)}`).toBe(
+      expect(c.startsWith("*"), `${oneLiners[i]} -> ${c.slice(0, 50)}`).toBe(
         true,
       );
+      expect(c).not.toContain("\n");
+      expect(c).not.toContain("```");
     }
-    // Summary lists (Andryo 2026-10-18): normal markdown - no fence, no
-    // box characters, no width budget. Empty-state one-liners stay fenced.
+    // /help: multi-line block -> plain, no fence
+    await handleInbound(pi, inbound("/help", "mh"), ctx);
+    const h = replyContent();
+    expect(h).toContain("\n");
+    expect(h).not.toContain("```");
+    // Summary lists: normal markdown - no fence, no box characters, no
+    // width budget. Empty-state one-liners ship italic.
     const summaryCmds = ["/jobs", "/todos", "/tasks", "/sleep"];
     for (let i = 0; i < summaryCmds.length; i++) {
       await handleInbound(pi, inbound(summaryCmds[i], `s${i}`), ctx);
       const c = replyContent();
-      if (c.startsWith("```")) {
-        const body = c.replace(/^```\n/, "").replace(/\n```$/, "");
-        expect(body).not.toContain("\n"); // empty/error one-liner
-      } else {
+      if (c.includes("\n")) {
         expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
+      } else {
+        expect(c.startsWith("*")).toBe(true);
       }
+      expect(c).not.toContain("```");
     }
     // /context + /usage (PR #242 review F4): §2.3 summaries too. With a
     // session file present the success path ships unfenced markdown;
@@ -983,10 +993,10 @@ describe("tasks (integration)", () => {
     c = replyContent();
     expect(c.startsWith("```")).toBe(false);
     expect(c).not.toMatch(/[┌┐└┘├┤┣│─]/);
-    // error path (no session file): fenced one-liner
+    // error path (no session file): italic one-liner
     fs.rmSync(sessFile);
     await handleInbound(pi, inbound("/context", "cx2"), ctx);
-    expect(replyContent()).toBe(fence("[!] no session file found"));
+    expect(replyContent()).toBe(machine("[!] no session file found"));
   });
 
   test("/tasks list shows tasks with id, channel, schedule, next fire, prompt", async () => {
@@ -1036,18 +1046,18 @@ describe("tasks (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound(`/tasks cancel ${t.id}`, "m1"), ctx);
-    expect(replyContent()).toBe(fence(`[ok] cancelled task ${t.id}`));
+    expect(replyContent()).toBe(machine(`[ok] cancelled task ${t.id}`));
     expect(loadTasks(tmp)).toHaveLength(0);
   });
 
   test("/tasks cancel: unknown id, missing id, bogus subcommand", async () => {
     await handleInbound(pi, inbound("/tasks cancel nope", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[!] no task with id nope"));
+    expect(replyContent()).toBe(machine("[!] no task with id nope"));
     await handleInbound(pi, inbound("/tasks cancel", "m2"), ctx);
-    expect(replyContent()).toBe(fence("[!] usage: /tasks cancel <id>"));
+    expect(replyContent()).toBe(machine("[!] usage: /tasks cancel <id>"));
     await handleInbound(pi, inbound("/tasks xyz", "m3"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence("[!] usage: /tasks [list | add | reschedule | cancel]"),
+      "[!] usage: /tasks [list | add | reschedule | cancel]",
     );
   });
 
@@ -1231,14 +1241,14 @@ describe("tasks (integration)", () => {
       home: tmp,
     });
     await handleInbound(pi, inbound("/tasks reschedule nope 30", "m1"), ctx);
-    expect(replyContent()).toBe(fence("[!] no task with id nope"));
+    expect(replyContent()).toBe(machine("[!] no task with id nope"));
     // same id shape on another channel is not THIS session's task
     await handleInbound(
       pi,
       inbound(`/tasks reschedule ${other.id} 30`, "m2"),
       ctx,
     );
-    expect(replyContent()).toBe(fence(`[!] no task with id ${other.id}`));
+    expect(replyContent()).toBe(machine(`[!] no task with id ${other.id}`));
     // untouched
     expect(
       loadTasks(tmp).find((x) => x.id === t.id)!.nextFireAt,
@@ -1257,12 +1267,9 @@ describe("tasks (integration)", () => {
       },
       home: tmp,
     });
-    const addUsage = fence(
-      '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>',
-    );
-    const resUsage = fence(
-      "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>",
-    );
+    const addUsage = '[!] usage: /tasks add "<prompt>" <minutes|ISO|cron [tz]>';
+    const resUsage =
+      "[!] usage: /tasks reschedule <id> <minutes|ISO|cron [tz]>";
     // form errors -> usage line
     await handleInbound(pi, inbound("/tasks add", "m1"), ctx);
     expect(unwarped(replyContent())).toBe(addUsage);
@@ -1282,24 +1289,20 @@ describe("tasks (integration)", () => {
     expect(unwarped(replyContent())).toBe(resUsage); // missing spec
     // content errors -> one [!] line (from parseTaskSpec / rescheduleTask)
     await handleInbound(pi, inbound('/tasks add "" 30', "m7"), ctx);
-    expect(unwarped(replyContent())).toBe(fence("[!] prompt is required"));
+    expect(unwarped(replyContent())).toBe("[!] prompt is required");
     await handleInbound(pi, inbound('/tasks add "x" 0', "m8"), ctx);
-    expect(unwarped(replyContent())).toBe(
-      fence("[!] minutes must be greater than 0"),
-    );
+    expect(unwarped(replyContent())).toBe("[!] minutes must be greater than 0");
     await handleInbound(pi, inbound('/tasks add "x" 99999', "m9"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence("[!] minutes too large (max 43200 = 30d)"),
+      "[!] minutes too large (max 43200 = 30d)",
     );
     await handleInbound(pi, inbound('/tasks add "x" yesterday', "m10"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence(
-        '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
-      ),
+      '[!] invalid at: "yesterday" (ISO time, e.g. 2026-09-10T15:00:00Z)',
     );
     await handleInbound(pi, inbound('/tasks add "x" 99 * * * *', "m11"), ctx);
     expect(unwarped(replyContent())).toBe(
-      fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
+      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
     );
     await handleInbound(
       pi,
@@ -1307,9 +1310,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(unwarped(replyContent())).toBe(
-      fence(
-        '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
-      ),
+      '[!] unknown timezone "Not/AZone" (IANA name, e.g. Australia/Melbourne)',
     );
     await handleInbound(
       pi,
@@ -1317,7 +1318,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(unwarped(replyContent())).toBe(
-      fence('[!] invalid cron "99 * * * *": minute out of range 0-59: 99'),
+      '[!] invalid cron "99 * * * *": minute out of range 0-59: 99',
     );
     await handleInbound(
       pi,
@@ -1325,9 +1326,7 @@ describe("tasks (integration)", () => {
       ctx,
     );
     expect(unwarped(replyContent())).toBe(
-      fence(
-        '[!] invalid at: "not-a-time" (ISO time, e.g. 2026-09-10T15:00:00Z)',
-      ),
+      '[!] invalid at: "not-a-time" (ISO time, e.g. 2026-09-10T15:00:00Z)',
     );
     // seed untouched, nothing scheduled on any path above
     expect(loadTasks(tmp).map((x) => x.id)).toEqual([t.id]);

@@ -2,18 +2,22 @@
 //
 // When the pi process really starts (session_start reason "startup"), the
 // bridge posts ONE "back online" message to the agent's channel. Shape
-// (2026-10-19 EMBED CARD family; 2026-10-21, Andryo: the visible `[bg:`
-// content prefix is dropped - no visible `[bg:` lines in agent channels):
-//   - content is EMPTY; the card is the ONE embed: title
-//     `restart-wake · planned|unplanned` (green/red), a short
-//     description, the in-flight ticket rows as an `in-flight` field
-//     (multiline value, rows are `run profile elapsed`), and a footer
-//     with the producer name (no timestamp)
-//   - the EMBED AUTHOR is `pi-bg restart-wake · planned|unplanned` -
-//     the machine-wake MARKER (isBgCallbackBody classifies the
-//     serialized `Author: pi-bg`). The WAKE itself rides webhook_id:
-//     isBgWebhook exempts any webhook-posted message from the
-//     other-bot filter, so the post lands as an agent turn
+// (2026-10-31, Andryo: machine surfaces are plain text + italics - no
+// embeds, no code fences; this SUPERSEDES the 2026-10-19 EMBED CARD
+// convention for this surface):
+//   - ONE short italic line, no more than a few words: the content is
+//     `*restart-wake · planned*` / `*restart-wake · unplanned*` - the
+//     planned/unplanned distinction is the functional signal (no
+//     author/title/description/footer/embed at all)
+//   - bg runs in flight at restart: a compact suffix on the SAME line:
+//     `*restart-wake · planned · in-flight N*` (N = count of
+//     state=running records; the old multiline in-flight field is gone,
+//     detail lives in /jobs)
+//   - the WAKE itself rides webhook_id: isBgWebhook exempts any
+//     webhook-posted message from the other-bot filter, so the post
+//     lands as an agent turn. isBgCallbackBody classifies the plain
+//     `restart-wake ·` content prefix (and the legacy `Author: pi-bg`
+//     embed shape, kept for in-flight history)
 //
 // Guards (issue #111):
 //   - never blocks startup: the caller fires and forgets (void + catch);
@@ -145,40 +149,20 @@ export function elapsedStr(sec: number): string {
   return `${Math.floor(sec / 86400)}d`;
 }
 
-/** The machine-wake marker: the wake post's EMBED AUTHOR name prefix
- *  (2026-10-21 de-prefix — the visible `[bg:` content line is gone;
- *  isBgCallbackBody classifies the serialized `Author: pi-bg`). The
- *  marker is NOT the wake predicate — isBgWebhook (discord.ts) exempts
- *  ANY webhook-posted message (Andryo 2026-10-20); without a
+/** The machine-wake marker: the wake post's CONTENT prefix (Andryo
+ *  2026-10-31 plain-italic shape: the post is ONE italic line,
+ *  `*restart-wake · planned|unplanned*` - no embed at all). The marker
+ *  is NOT the wake predicate — isBgWebhook (discord.ts) exempts ANY
+ *  webhook-posted message (Andryo 2026-10-20); without a
  *  webhook_id the other-bot filter swallows the message and the wake
- *  never lands. */
-export const WAKE_TAG = "pi-bg restart-wake";
+ *  never lands. isBgCallbackBody matches the prefix (legacy in-flight
+ *  cards match via the serialized `Author: pi-bg` embed instead). */
+export const WAKE_TAG = "restart-wake \u00b7";
 
-/** Discord embed field for the wake card. */
-export interface WakeEmbedField {
-  name: string;
-  value: string;
-  inline?: boolean;
-}
-
-/** One embed in the wake post (the EMBED CARD family, 2026-10-19,
- *  Andryo: author / title / color / description / fields / footer, no
- *  timestamp). The author name is the machine-wake marker. */
-export interface WakeEmbed {
-  author: { name: string };
-  title: string;
-  color: number;
-  description: string;
-  fields?: WakeEmbedField[];
-  footer: { text: string };
-}
-
-/** The wake post body: EMPTY content + exactly one embed carrying the
- *  facts (the 2026-10-21 de-prefix: the operator sees only the card;
- *  the machine-wake marker is the embed author). */
+/** The wake post body: ONE short italic content line (Andryo 2026-10-31
+ *  - machine surfaces are plain text + italics, no embeds). */
 export interface WakePayload {
   content: string;
-  embeds: WakeEmbed[];
 }
 
 export interface WakeMessageOpts {
@@ -188,81 +172,33 @@ export interface WakeMessageOpts {
   now?: number;
 }
 
-/** Build the wake post payload (2026-10-19 EMBED CARD family;
- *  2026-10-21, Andryo: the visible `[bg:` prefix is dropped). Pure —
- *  all I/O is injected by the caller.
+/** Build the wake post payload (Andryo 2026-10-31: ONE short italic
+ *  line, no more than a few words - no embed, no description, no
+ *  footer). Pure — all I/O is injected by the caller.
  *
- *  `content` is EMPTY (2026-10-21 de-prefix): no visible `[bg:` line
- *  in the channel. The worst facts ride the card: the author name
- *  `pi-bg restart-wake · <planned|unplanned>` is the machine-wake
- *  marker (serialized to `Author: pi-bg …`, classified by
- *  isBgCallbackBody), and the title/description carry planned vs
- *  unplanned + the in-flight count.
- *
- *  `embeds` holds exactly ONE embed: title `restart-wake · planned`
- *  (green 0x57F287) / `restart-wake · unplanned` (red 0xED4245), a short
- *  human-readable description (the no-in-flight fact lives here when the
- *  list is empty), the in-flight ticket rows as a single `in-flight`
- *  field (multiline value), and a footer with the producer name (no
- *  timestamp). Job rows are `run profile elapsed` — cwd/task detail
- *  lives in /jobs.
- *
- *  The in-flight rows are the actionable part - they ship as RAW LINES
- *  in the field value: no frame, no width budget, no truncation. A
- *  profile (or its elapsed) that is long ships whole.
- *
- *  Cap: at most MAX_INFLIGHT rows, oldest first (the oldest is the most
- *  actionable: it has been running longest). Overflow appends one
- *  `+N more - see /jobs` line instead of a per-ticket list, which would
- *  balloon the post.
- */
+ *  The content is `*restart-wake · <planned|unplanned>*` (the
+ *  planned/unplanned distinction is the functional signal), with a
+ *  compact suffix ` · in-flight N` on the SAME line when bg runs were
+ *  in flight at the restart (N = count of state=running records; the
+ *  old multiline ticket field is gone - job rows are `run profile
+ *  elapsed` in /jobs). */
 export function buildWakePayload({
   clean,
   runs,
-  now = Date.now(),
 }: WakeMessageOpts): WakePayload {
-  const { list, more } = selectInflight(runs);
   const klass = clean ? "planned" : "unplanned";
-  const color = clean ? 0x57f287 : 0xed4245;
-  let description = clean
-    ? "pi restarted as planned (clean stop) - back online."
-    : "pi is back online but the last stop was NOT clean (crash, OOM, or kill) - the last turn was interrupted.";
-  if (list.length === 0) {
-    description += " No in-flight pi-bg work.";
-  }
-  const embed: WakeEmbed = {
-    author: { name: `${WAKE_TAG} \u00b7 ${klass}` },
-    title: `restart-wake \u00b7 ${klass}`,
-    color,
-    description,
-    footer: { text: "restart-wake" },
-  };
-  if (list.length > 0) {
-    const rows = list.map((r) => {
-      const who =
-        r.profile && String(r.profile).length > 0 ? String(r.profile) : "?";
-      return `${r.run} ${who} ${elapsedStr(elapsedSeconds(r.started, now))}`;
-    });
-    if (more > 0) rows.push(`+${more} more - see /jobs`);
-    embed.fields = [{ name: "in-flight", value: rows.join("\n") }];
-  }
-  return { content: "", embeds: [embed] };
+  const count = runs.filter((r) => r.state === "running").length;
+  const line =
+    count > 0
+      ? `restart-wake \u00b7 ${klass} \u00b7 in-flight ${count}`
+      : `restart-wake \u00b7 ${klass}`;
+  return { content: `*${line}*` };
 }
 
-/** Censor every string part the wake ships (docs/secret-censor.md):
- *  ticket/run ids come from run records and can carry secrets. */
+/** Censor the wake's content (docs/secret-censor.md): the in-flight
+ *  count ships in the content line. */
 function egressPayload(p: WakePayload): WakePayload {
-  return {
-    content: egressText(p.content),
-    embeds: p.embeds.map((e) => ({
-      ...e,
-      author: e.author ? { name: egressText(e.author.name) } : e.author,
-      title: egressText(e.title),
-      description: egressText(e.description),
-      footer: { text: egressText(e.footer.text) },
-      fields: e.fields?.map((f) => ({ ...f, value: egressText(f.value) })),
-    })),
-  };
+  return { content: egressText(p.content) };
 }
 
 // ─── clean-stop marker ───────────────────────────────────────────────────
@@ -529,7 +465,7 @@ export async function runRestartWake(
     now,
   });
   log(
-    `[wake] restart class=${restartClass} inflight=${selectInflight(runs).list.length}`,
+    `[wake] restart class=${restartClass} inflight=${runs.filter((r) => r.state === "running").length}`,
   );
   // Bus webhook resolution: the channel config's webhookUrl when set,
   // else the pi-bg dispatch bus (the webhook route that wakes the agent).

@@ -255,6 +255,9 @@ export function mergeTodoLines(existing: Todo[], lines: string[]): Todo[] {
  *  - an embed whose author is `pi-bg …` — the 2026-10-21 de-prefix shape
  *    (producers post content "" + an embed author starting `pi-bg`;
  *    serializeEmbeds renders it as `Author: pi-bg …`)
+ *  - OR the plain-italic restart-wake content `*restart-wake · …*` —
+ *    the 2026-10-31 restyle (machine surfaces: no embeds, no fences;
+ *    the wake is ONE short italic line)
  *  - OR the legacy content prefix `[bg:` — kept for ONE release (2026-10-21
  *    operator decision: strip the visible `[bg:` prefix from jarate
  *    producers): in-flight channel history and dead-letter re-posts (P5,
@@ -262,5 +265,9 @@ export function mergeTodoLines(existing: Todo[], lines: string[]): Todo[] {
  *    not restyled yet. Drop this arm after the migration release.
  */
 export function isBgCallbackBody(body: string): boolean {
-  return body.startsWith("[bg:") || /\bAuthor: pi-bg\b/.test(body);
+  return (
+    body.startsWith("[bg:") ||
+    /\bAuthor: pi-bg\b/.test(body) ||
+    body.replace(/^\*+/, "").startsWith("restart-wake \u00b7")
+  );
 }
