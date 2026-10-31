@@ -48,6 +48,7 @@ import {
   isOlderSnowflake,
 } from "./discord";
 import { atomicWriteJson, sweepOrphanTmpFiles } from "./durable-store";
+import { type SeenState, wakeEmbedKey } from "./channel-state";
 import type { ChannelConfig, ChannelMessage } from "./types";
 
 // ─── constants ───────────────────────────────────────────────────────────
@@ -57,13 +58,19 @@ import type { ChannelConfig, ChannelMessage } from "./types";
 export const REWAKE_LOOKBACK_DEFAULT = 50;
 /** Hard clamp for the lookback bound (the scan is one REST call). */
 export const REWAKE_LOOKBACK_MAX = 200;
-/** Delivered-id cap per channel. Tied to the lookback clamp (MAX + 1)
- *  so the invariant holds with margin at the edge: any machine-wake post
- *  inside the scan window, if ever committed, is within the last
- *  DELIVERED_CAP
- *  commits and therefore still in the set. A test pins the tie — raising
- *  REWAKE_LOOKBACK_MAX without the cap cannot slip through silently. */
-export const REWAKE_DELIVERED_CAP = REWAKE_LOOKBACK_MAX + 1;
+/** Delivered-id cap per channel. Decoupled from the lookback clamp
+ *  (#1083, replay-gap root fix): sized to survive many restarts of
+ *  commit volume (5,000 ids ≈ ~100KB of ~20-byte strings), not just one
+ *  scan window — the old tie (LOOKBACK_MAX + 1) evicted an id 201+
+ *  commits after its commit, which a busy window breaks. The at-least-
+ *  once bias is unchanged: a commit recorded post-acceptance stays the
+ *  single dedupe authority for the scan. deliveredMeta detail is capped
+ *  separately (REWAKE_DELIVERED_META_CAP). */
+export const REWAKE_DELIVERED_CAP = 5000;
+/** deliveredMeta cap per channel (#1083, decoupled from the id cap):
+ *  it stores full prompts — the 24h amnesia guard needs only recent
+ *  commits, so keep it small and independent of the 5,000 id horizon. */
+export const REWAKE_DELIVERED_META_CAP = 50;
 /** Age guard for the scan: applied uniformly to EVERY scan (file health
  *  is not inspected) — a candidate older than this is dropped, never
  *  re-queued. It bounds the re-queue to the last 72h of history: even a
@@ -357,19 +364,29 @@ export function rewakeCommitDelivered(
       file.delivered.splice(0, file.delivered.length - REWAKE_DELIVERED_CAP);
     changed = true;
   }
-  // #306: record/refresh the commit metadata (capped with the delivered
-  // set — a pruned id's meta is dropped too, so the map cannot grow
-  // unbounded). A re-commit of an already-delivered id refreshes its
-  // meta (a newer commit is the one that can be amnesiac).
+  // #306: record/refresh the commit metadata. #1083: capped SEPARATELY
+  // and small (REWAKE_DELIVERED_META_CAP) — it stores full prompts while
+  // the id list carries the 5,000-entry dedupe horizon. A pruned id's
+  // meta is dropped too, so the map cannot grow unbounded. A re-commit
+  // of an already-delivered id refreshes its meta (a newer commit is the
+  // one that can be amnesiac).
   if (meta) {
     if (!file.deliveredMeta) file.deliveredMeta = {};
     file.deliveredMeta[messageId] = meta;
     const ids = Object.keys(file.deliveredMeta);
-    if (ids.length > REWAKE_DELIVERED_CAP) {
+    if (ids.length > REWAKE_DELIVERED_META_CAP) {
       // Keep the meta for the ids still in the delivered set (newest
       // last); drop the rest.
       const keep = new Set(file.delivered);
       for (const id of ids) if (!keep.has(id)) delete file.deliveredMeta[id];
+      // Still over cap (delivered outlives meta by design): keep the
+      // newest (insertion order — oldest first), drop the remainder.
+      const remaining = Object.keys(file.deliveredMeta);
+      for (const id of remaining.slice(
+        0,
+        remaining.length - REWAKE_DELIVERED_META_CAP,
+      ))
+        delete file.deliveredMeta[id];
     }
     if (!idAlreadyDelivered) changed = true;
     else if (!file.deliveredMeta[messageId]) changed = true;
@@ -574,6 +591,14 @@ export interface BgScanOpts {
   lookback?: number;
   maxAgeMs?: number;
   now?: number;
+  /** #1083 fix A (belt): the #306 seen state per channel, seeded once
+   *  per boot from channel-state.json (an independent store from the
+   *  rewake file, capped higher, plus wake-key dedupe of double-posted
+   *  cards). An at-most-once cross-check that only ADDS drops: a
+   *  candidate whose id is in seen or whose wake key is in seenWake is
+   *  dropped before re-queue. Absent = the delivered/pending check
+   *  alone (at-least-once, pre-#1083 behavior). */
+  seenLookup?: (configId: string) => SeenState | null;
   /** Called once per re-queued candidate. The caller owns BOTH the
    *  memory push (deduped) and any logging; the file append happens
    *  here, so scan + memory stay in sync. */
@@ -621,12 +646,26 @@ export async function scanUndeliveredBgInbounds(
     const file = loadRewakeQueue(opts.stateDir, ch.config.id);
     const pending = new Set(file.pending.map((p) => p.msg.messageId));
     const delivered = new Set(file.delivered);
+    // #1083 fix A: the #306 seen state for this channel (belt).
+    const seen = opts.seenLookup?.(ch.config.id) ?? null;
     for (const raw of raws) {
       scanned += 1;
       const id = String(raw.id);
       if (!isBgWebhook(raw)) continue; // human/peer: not a machine wake
       if (id === ch.cursor) continue; // the cursor message is accounted
       if (delivered.has(id) || pending.has(id)) continue; // already done
+      // #1083 fix A: the #306 seen sets (an independent store — the
+      // rewake file can be lost/corrupt/cap-evicted while the seen
+      // section is healthy). seenWake additionally dedupes a
+      // double-posted wake card by content hash (the re-post has a new
+      // id the id checks miss). At-most-once: only adds drops, the
+      // delivered check above stays the primary authority.
+      const wk = wakeEmbedKey(raw);
+      if (
+        seen &&
+        (seen.seenIds.has(id) || (wk !== null && seen.seenWakeKeys.has(wk)))
+      )
+        continue;
       const t = Date.parse(String(raw.timestamp ?? ""));
       if (Number.isFinite(t) && now - t > maxAgeMs) continue; // stale
       opts.requeue(

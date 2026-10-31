@@ -7,6 +7,7 @@ import {
   collectRewakeOrphans,
   loadRewakeQueue,
   REWAKE_DELIVERED_CAP,
+  REWAKE_DELIVERED_META_CAP,
   REWAKE_LOOKBACK_DEFAULT,
   REWAKE_LOOKBACK_ENV,
   REWAKE_LOOKBACK_MAX,
@@ -143,8 +144,35 @@ describe("restart-queue state file (#180)", () => {
     expect(fs.readFileSync(p, "utf8")).toBe(before); // no-op: no write
   });
 
-  test("delivered cap is tied to the lookback clamp (F3: margin at the edge)", () => {
-    expect(REWAKE_DELIVERED_CAP).toBe(REWAKE_LOOKBACK_MAX + 1);
+  test("delivered id cap is decoupled from the lookback clamp (#1083: sized to survive many restarts)", () => {
+    // The old tie (LOOKBACK_MAX + 1 = 201) evicted an id 201+ commits
+    // after its commit — a busy 3h window breaks it and the boot scan
+    // re-queued the already-delivered post. The cap now outlives
+    // realistic commit volume; meta detail is capped separately + small.
+    expect(REWAKE_DELIVERED_CAP).toBeGreaterThan(REWAKE_LOOKBACK_MAX);
+    expect(REWAKE_DELIVERED_CAP).toBeGreaterThanOrEqual(5000);
+    expect(REWAKE_DELIVERED_META_CAP).toBeLessThan(REWAKE_DELIVERED_CAP);
+  });
+
+  test("delivered meta is capped separately (REWAKE_DELIVERED_META_CAP) while ids keep the full horizon", () => {
+    for (let i = 0; i < REWAKE_DELIVERED_META_CAP + 10; i++)
+      rewakeCommitDelivered(dir, "ch1", `m${i}`, {
+        prompt: `prompt ${i}`,
+        msg: msg(`m${i}`),
+        at: Date.now(),
+        sf: `/tmp/s.jsonl`,
+      });
+    const file = loadRewakeQueue(dir, "ch1");
+    // ids: all 60 kept (well under the 5,000 cap)
+    expect(file.delivered.length).toBe(REWAKE_DELIVERED_META_CAP + 10);
+    // meta: pruned to the cap, newest kept (oldest evicted)
+    expect(Object.keys(file.deliveredMeta ?? {}).length).toBe(
+      REWAKE_DELIVERED_META_CAP,
+    );
+    expect(file.deliveredMeta?.["m0"]).toBeUndefined(); // oldest evicted
+    expect(file.deliveredMeta?.["m9"]).toBeUndefined(); // 10 oldest evicted
+    expect(file.deliveredMeta?.["m10"]).toBeDefined(); // kept floor
+    expect(file.deliveredMeta?.[`m${REWAKE_DELIVERED_META_CAP + 9}`]).toBeDefined(); // newest kept
   });
 
   test("clear pending empties the line but keeps the delivered set", () => {
@@ -164,12 +192,18 @@ describe("restart-queue state file (#180)", () => {
   test("delivered set is capped (oldest drop off) — a restart with an empty queue writes no file at all", () => {
     // No file exists before the first state change.
     expect(fs.existsSync(rewakeQueuePath(dir, "ch1"))).toBe(false);
-    for (let i = 0; i < REWAKE_DELIVERED_CAP + 5; i++)
-      rewakeCommitDelivered(dir, "ch1", `d${i}`);
+    // Seed an over-cap list directly (5,000+ file writes per test is
+    // not the point — the splice happens at commit time).
+    saveRewakeQueue(dir, "ch1", {
+      v: 1,
+      pending: [],
+      delivered: Array.from({ length: REWAKE_DELIVERED_CAP + 5 }, (_, i) => `d${i}`),
+    });
+    rewakeCommitDelivered(dir, "ch1", `d${REWAKE_DELIVERED_CAP + 5}`);
     const file = loadRewakeQueue(dir, "ch1");
     expect(file.delivered.length).toBe(REWAKE_DELIVERED_CAP);
-    expect(file.delivered[0]).toBe("d5"); // d0..d4 dropped
-    expect(file.delivered.at(-1)).toBe(`d${REWAKE_DELIVERED_CAP + 4}`);
+    expect(file.delivered[0]).toBe("d6"); // d0..d5 dropped
+    expect(file.delivered.at(-1)).toBe(`d${REWAKE_DELIVERED_CAP + 5}`);
   });
 
   test("corrupt file (not JSON) → empty state, no throw (option 1 backstop)", () => {
