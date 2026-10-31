@@ -104,6 +104,7 @@ import {
   truncateLiveText,
   unlinkLivePlaceholders,
 } from "./live";
+import { stripNoReply } from "./no-reply";
 import {
   amnesiaRequeue,
   clearQueuedInbound,
@@ -2627,11 +2628,13 @@ export default function (pi: ExtensionAPI) {
     if (!ch || !agentBusy) return;
     const msg = event.message;
     const early = earlySendText(msg);
-    const text = early ?? finalText(msg);
-    if (!text) return;
-    if (isNoReply(text)) {
-      // Silence chosen: close the turn (ack + live text) without posting.
-      // earlySent keeps collectFinals from re-posting it at agent_end.
+    const raw = early ?? finalText(msg);
+    if (!raw) return;
+    const text = stripNoReply(raw);
+    if (!text) {
+      // Silence chosen (no content beyond NO_REPLY lines): close the turn
+      // (ack + live text) without posting. earlySent keeps collectFinals
+      // from re-posting it at agent_end.
       earlySent.add(msg);
       if (isLiveTextChannel(ch)) await deleteLiveText(ch);
       if (ch.type === "discord") {
@@ -2650,7 +2653,7 @@ export default function (pi: ExtensionAPI) {
       // here (posted on the first tool call, below the tool-call block)
       // instead of a separate early-sent message. The <reply-to> tag is
       // stripped; threading applies only to standalone messages.
-      liveTextLatest = parseReplyTo(early).text;
+      liveTextLatest = parseReplyTo(text).text;
       await updateLiveText(ch, liveTextArmed);
     } else {
       if (early === null && recordFinalRepeat(ch.id, text)) {
@@ -3016,7 +3019,8 @@ export default function (pi: ExtensionAPI) {
       userStoppedRun = false;
 
       for (const f of finals) {
-        if (isNoReply(f.text)) {
+        const text = stripNoReply(f.text);
+        if (!text) {
           // Silence chosen: clear the ack if threaded, post nothing.
           if (ch.type === "discord" && f.replyTo) {
             const token = getDiscordToken(ch.id) || ch.botToken;
@@ -3026,7 +3030,7 @@ export default function (pi: ExtensionAPI) {
           }
           continue;
         }
-        if (recordFinalRepeat(ch.id, f.text)) {
+        if (recordFinalRepeat(ch.id, text)) {
           // Repetition loop (seen across the whole run, incl. the
           // message_end path): one warning, abort, skip the repeated final.
           userStoppedRun = true;
@@ -3044,7 +3048,7 @@ export default function (pi: ExtensionAPI) {
           }
           continue;
         }
-        const chunks = chunkText(f.text, 1900);
+        const chunks = chunkText(text, 1900);
         for (let i = 0; i < chunks.length; i++) {
           try {
             const r = await send(chunks[i], i === 0 ? f.replyTo : undefined);
