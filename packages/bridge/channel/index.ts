@@ -76,6 +76,7 @@ import {
   isHandoffFreshWindow,
   parsePriorTags,
   resolveHandoffSettings,
+  runSessionStartAskCheck,
   shouldHandoff,
 } from "./handover";
 import { registerJarateTool } from "./jarate";
@@ -95,7 +96,6 @@ import {
   persistLivePlaceholders,
   readLivePlaceholders,
   setLivePlaceholderSnapshot,
-  settleCompactTick,
   settleOpTick,
   stopAllOpTicks,
   stopOpTick,
@@ -121,6 +121,8 @@ import {
 } from "./queue";
 import { buildRepliedMessageBlock } from "./reply-context";
 import {
+  COMPACT_FALLBACK_MS,
+  compactWindowStuckRecover,
   consumeOpMarker,
   handoffRestartForSize,
   safeSessionFile,
@@ -135,6 +137,10 @@ import {
   setCurrentSessionFile,
 } from "./restart-queue";
 import { runRestartWake, writeCleanStop } from "./restart-wake";
+import {
+  armRotationStaleWatch,
+  clearRotationStaleWatch,
+} from "./rotation-stale";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
   cancelPendingWakes,
@@ -481,7 +487,9 @@ export function clearAllInterrupts(): void {
 // fallback timer. While set, inbounds for that channel are QUEUED WITHOUT
 // arming the mid-run interrupt: an interrupt calls ctx.abort(), which kills
 // the in-flight compaction (live incident on the frank agent, 2026-09-10).
-const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
+// #315 H2: this is also the STUCK-LABEL timeout (N) - a completion event
+// that never arrives must not leave the label stuck (the P0 rotation
+// stall); the timeout runs compactWindowStuckRecover (restart-ops.ts).
 /** Op window labels: compaction + the restart-class ops. */
 export type OpLabel =
   | "compacting"
@@ -607,13 +615,7 @@ export function beginCompacting(
   const label = opts.label ?? "compacting";
   const rewindTo = opts.rewindTo ?? null;
   const timer = setTimeout(() => {
-    // #84: the completion event never arrived — settle the placeholder to a
-    // terminal line (a frozen counting tick is the stale placeholder this
-    // fix kills), then clear + drain as before. No-op for restart-class ops
-    // (their tick is not armed; the op marker covers them).
-    settleCompactTick(ch.id, machine("compact stalled"));
-    clearCompacting(ch.id, true);
-    drainQueuedAfterCompact(pi, ctx);
+    compactWindowStuckRecover(pi, ch, ctx, label);
   }, COMPACT_FALLBACK_MS);
   (timer as any).unref?.();
   compactingChannels.set(ch.id, {
@@ -1866,6 +1868,13 @@ export default function (pi: ExtensionAPI) {
         );
     }
 
+    // #315 guards (P0 + P1): the per-agent rotation-stale / live-size
+    // watch (armed for the whole session, cleared at session_shutdown)
+    // and the session-start amnesia check (bounded one fetch per
+    // channel; fire-and-forget like the scan above).
+    armRotationStaleWatch(ctx);
+    void runSessionStartAskCheck(ctx.cwd, enabled);
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -1969,6 +1978,7 @@ export default function (pi: ExtensionAPI) {
     // also fire this — harmless, the marker is only consumed on a real
     // process start.
     writeCleanStop(path.join(workspaceRoot, ".tmp"));
+    clearRotationStaleWatch(); // #315: the per-agent watch dies with the session
     if (typingTimer) {
       clearInterval(typingTimer);
       typingTimer = null;

@@ -42,7 +42,7 @@ import {
   setHandoffRestartArmed,
   setUserStoppedRun,
 } from "./index";
-import { armOpTick, machine, opTickLine } from "./live";
+import { armOpTick, machine, opTickLine, settleCompactTick } from "./live";
 import { clearQueuedInbound, midTurnQueues } from "./queue";
 import { sanitizeUnknownValue } from "./sanitize";
 import { defaultHome } from "./todos";
@@ -54,6 +54,9 @@ import {
   resolveSystemdUnit,
 } from "./types";
 import { findSessionFile, performRedo, performUndo } from "./undo";
+
+// #315 H2: stuck-label fallback for the compact window (10 min). If the completion event never arrives, compactWindowStuckRecover below closes the window and re-runs the restart gate.
+export const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
 
 // ─── /undo + /redo: session + file revert ──────────────────────────────
 // See channel/undo.ts. The conversation revert works like /reset: pi resumes
@@ -621,6 +624,38 @@ export async function maybeHandoffRestart(
     moveSessionFileAside(ctx, live);
     archiveStaleSessions(live);
   });
+}
+
+// #315 H2 (P0 root fix): the stuck-label timeout for the compacting window
+// (the COMPACT_FALLBACK_MS belt in beginCompacting). Substitutes for the
+// missing settle: #84 first — the completion event never arrived, settle
+// the placeholder to a terminal line (a frozen counting tick is the stale
+// placeholder that fix kills), then clear + drain as before (no-op for
+// restart-class ops: their tick is not armed, the op marker covers them).
+// Then #315: the session_compact handler's gate re-run is what opens the
+// restart op for a doc-written compact (the arm set in session_before_
+// compact is still pending), so re-run it here. Mirrors the settle
+// exactly: the gate itself decides (arm / fresh window / settings).
+// Idempotent: the arm is a boolean consumed by the gate, and this only
+// fires while the window is STILL open — any settle or close clears the
+// entry and cancels this timer, so a second doc write in the same episode
+// (which re-opens the window with a fresh timer) cannot double-fire or
+// re-open a closed window.
+export function compactWindowStuckRecover(
+  pi: ExtensionAPI,
+  ch: ChannelConfig,
+  ctx: ExtensionContext,
+  label: OpLabel,
+): void {
+  settleCompactTick(ch.id, machine("compact stalled"));
+  clearCompacting(ch.id, true);
+  drainQueuedAfterCompact(pi, ctx);
+  if (label === "compacting") {
+    console.error(
+      `[op:compacting] STUCK: ${ch.id} window open ${COMPACT_FALLBACK_MS / 60000} min with no completion event; closing and re-running the restart gate (settle never arrived)`,
+    );
+    handoffRestartForSize(pi, ctx);
+  }
 }
 
 // /undo + /redo share the idle guard: abort the in-flight run, drop the
