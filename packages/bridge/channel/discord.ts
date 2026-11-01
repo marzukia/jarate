@@ -1585,6 +1585,31 @@ export async function editInteractionMessage(
   }
 }
 
+/** Delete the deferred slash-command message (#316): restart-class ops
+ *  (/reset /restart /undo /redo) carry their status in the VISIBLE
+ *  channel placeholder posted by beginRestartOp — editing the ephemeral
+ *  ack to the identical text double-posts the op status line. Clear
+ *  the ack instead (DELETE @original). Same error-swallow pattern as
+ *  editInteractionMessage: a failed delete must not kill the tap flow
+ *  (the channel placeholder still lands). */
+export async function clearInteractionMessage(
+  botToken: string,
+  d: any,
+): Promise<void> {
+  try {
+    await discordFetch(
+      botToken,
+      `/webhooks/${d.application_id}/${d.token}/messages/@original`,
+      { method: "DELETE" },
+    );
+  } catch (e) {
+    console.error(
+      "[interactions] clear failed:",
+      sanitizeSensitiveText(String(e)),
+    );
+  }
+}
+
 /** Post-defer tap RESULT: edit the deferred original in place (PATCH
  *  @original) — the documented replacement for the deprecated
  *  "followup POST right after a defer edits the original" behavior.

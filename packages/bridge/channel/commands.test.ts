@@ -22,6 +22,7 @@ import {
 } from "./commands";
 import { clearDiscordStatesForTest } from "./discord";
 import extension, {
+  beginCompacting,
   clearAllCompacting,
   clearAllInterrupts,
   handleInbound,
@@ -37,7 +38,7 @@ import extension, {
   setRuntimeStateDir,
   verboseOverride,
 } from "./index";
-import { machine, stopAllCompactTicks } from "./live";
+import { machine, stopAllCompactTicks, stopOpTick } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -1069,6 +1070,71 @@ describe("buildInteractionHandler: registered slash commands route to their disp
       if (oldWtDir === undefined) delete process.env.PI_BG_WT_DIR;
       else process.env.PI_BG_WT_DIR = oldWtDir;
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("/reset: ONE op status line - the ack is cleared, not re-posted (#316)", async () => {
+    // Pre-fix, the native /reset returned
+    // { immediate: machine("[..] resetting...") } and the handler EDITED
+    // the ephemeral deferred ack to exactly the text that beginRestartOp
+    // posts as the visible channel placeholder - two identical status
+    // lines for one tap. Count interaction edits + channel posts: the
+    // placeholder post is the ONLY op status line, the ack is deleted
+    // (DELETE @original), and no ack edit carries the op text.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ich-rst-"));
+    ctx.cwd = tmp;
+    ctx.shutdown = () => {};
+    const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+    await h(d("reset") as any);
+    const webhook = "/webhooks/appr/tokr123/messages/@original";
+    const ackEdits = calls.filter(
+      (c) => c.method === "PATCH" && c.url.includes(webhook),
+    );
+    const ackDeletes = calls.filter(
+      (c) => c.method === "DELETE" && c.url.includes(webhook),
+    );
+    const posts = calls
+      .filter(
+        (c) => c.url.includes("/channels/777/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+    expect(posts).toEqual([machine("[..] resetting...")]);
+    expect(ackEdits).toHaveLength(0);
+    expect(ackDeletes).toHaveLength(1);
+    // Drain the op machinery: the 300ms shutdown timer must not run the
+    // shutdown chain (systemd spawn / process.exit) after this test.
+    clearAllCompacting();
+    stopOpTick(`op:${ch.id}`);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("/reset mid-compaction: the busy refusal is the ONLY line (ack edit, no channel post)", async () => {
+    // Unchanged by #316: the refusal has no channel placeholder, so its
+    // ephemeral-only refusal edit is already the only line - it must
+    // NOT be cleared and must NOT post to the channel.
+    beginCompacting(pi, ch, ctx, { label: "compacting" });
+    try {
+      const h = buildInteractionHandler(pi, ctx, ch, "tok-r");
+      await h(d("reset") as any);
+      const webhook = "/webhooks/appr/tokr123/messages/@original";
+      const ackEdits = calls.filter(
+        (c) => c.method === "PATCH" && c.url.includes(webhook),
+      );
+      const ackDeletes = calls.filter(
+        (c) => c.method === "DELETE" && c.url.includes(webhook),
+      );
+      const posts = calls.filter(
+        (c) => c.url.includes("/channels/777/messages") && c.method === "POST",
+      );
+      expect(deferredTexts().at(-1)).toContain("already compacting");
+      expect(ackEdits).toHaveLength(1);
+      expect(ackDeletes).toHaveLength(0);
+      expect(posts).toHaveLength(0);
+    } finally {
+      clearAllCompacting();
     }
   });
 
