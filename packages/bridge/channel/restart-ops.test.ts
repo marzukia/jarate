@@ -37,9 +37,15 @@ import {
   queueMidTurnInbound,
 } from "./queue";
 import {
+  armRotationStaleWatch,
   buildRestartCommand,
+  checkRotationStale,
+  clearRotationStaleWatch,
   moveSessionFileAside,
+  newestHandoffDocMtime,
   parseUndoCount,
+  ROTATION_STALE_DOC_WINDOW_MS,
+  ROTATION_STALE_SIZE_BYTES,
   setLiveKickoffStateHookForTest,
   setProcessExitHookForTest,
   setSystemdRestartHookForTest,
@@ -1639,5 +1645,264 @@ describe("moveSessionFileAside (F5)", () => {
     const newer = mkSession("newer.jsonl", 1_000);
     moveSessionFileAside({ cwd: tmp } as any);
     expect(fs.existsSync(newer)).toBe(false);
+  });
+});
+
+// ─── #315 P0 guard: rotation-stale + live-size watch ────────────────────
+
+describe("#315 P0: checkRotationStale (the exact conditions)", () => {
+  const t = 1_762_000_000_000;
+  const H = 3_600_000;
+  test("stale: a doc written in the last 2 h AND the live mtime strictly older than the newest doc mtime", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - H,
+        liveMtimeMs: t - H - 1,
+        liveSizeBytes: 1000,
+      }),
+    ).toEqual({ stale: true, oversized: false });
+  });
+  test("not stale: live mtime EQUAL to the doc mtime (the compare is strictly-older)", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - H,
+        liveMtimeMs: t - H,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+  });
+  test("not stale: the live mtime is newer than the doc mtime (the rotation produced a fresh file)", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - H,
+        liveMtimeMs: t - H + 1,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+  });
+  test("not stale: the newest doc is OLDER than the 2 h window (even with a stale live mtime)", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - 3 * H,
+        liveMtimeMs: t - 3 * H - 1,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+  });
+  test("not stale at the EXACT 2 h boundary (the window is 'in the last 2 h')", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - ROTATION_STALE_DOC_WINDOW_MS,
+        liveMtimeMs: t - ROTATION_STALE_DOC_WINDOW_MS - 1,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+  });
+  test("not stale: no doc / no live file", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: null,
+        liveMtimeMs: t - H - 1,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - H,
+        liveMtimeMs: null,
+        liveSizeBytes: 1000,
+      }).stale,
+    ).toBe(false);
+  });
+  test("oversized: the live size ABOVE 1.5 MB (independent of the mtime compare)", () => {
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: null,
+        liveMtimeMs: null,
+        liveSizeBytes: ROTATION_STALE_SIZE_BYTES + 1,
+      }).oversized,
+    ).toBe(true);
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: null,
+        liveMtimeMs: null,
+        liveSizeBytes: ROTATION_STALE_SIZE_BYTES,
+      }).oversized,
+    ).toBe(false);
+    expect(
+      checkRotationStale({
+        now: t,
+        newestDocMtimeMs: t - H,
+        liveMtimeMs: t - H - 1,
+        liveSizeBytes: ROTATION_STALE_SIZE_BYTES + 1,
+      }),
+    ).toEqual({ stale: true, oversized: true });
+  });
+});
+
+describe("#315 P0: newestHandoffDocMtime", () => {
+  test("the max mtime over the *.md doc files; latest.md is the pointer, not a doc", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "315-store-"));
+    try {
+      fs.writeFileSync(path.join(dir, "latest.md"), "pointer");
+      const a = path.join(dir, "20261101-0329-x.md");
+      const b = path.join(dir, "20261101-0656-y.md");
+      fs.writeFileSync(a, "doc A");
+      fs.writeFileSync(b, "doc B");
+      fs.utimesSync(a, new Date(1_000), new Date(1_000));
+      fs.utimesSync(b, new Date(2_000), new Date(2_000));
+      fs.utimesSync(
+        path.join(dir, "latest.md"),
+        new Date(9_999),
+        new Date(9_999),
+      );
+      fs.writeFileSync(path.join(dir, "notes.txt"), "not a doc");
+      expect(newestHandoffDocMtime(dir)).toBeCloseTo(2_000, 0);
+      expect(newestHandoffDocMtime(path.join(dir, "missing"))).toBeNull();
+      const empty = fs.mkdtempSync(path.join(os.tmpdir(), "315-empty-"));
+      try {
+        expect(newestHandoffDocMtime(empty)).toBeNull();
+      } finally {
+        fs.rmSync(empty, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
+  let tmp = "";
+  let oldHome = "";
+  let proj = "";
+  let storeDir = "";
+  let liveFile = "";
+  let posted: string[] = [];
+  const realFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "315-watch-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, "home", ".pi", "agent"), { recursive: true });
+    proj = path.join(tmp, "proj");
+    fs.mkdirSync(proj, { recursive: true });
+    fs.mkdirSync(path.join(proj, ".pi"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, "home", ".pi", "agent", "settings.json"),
+      JSON.stringify({ handoff: { storeDir: path.join(tmp, "store") } }),
+    );
+    fs.writeFileSync(
+      path.join(proj, ".pi", "settings.json"),
+      JSON.stringify({
+        channels: [
+          {
+            id: "ch1",
+            name: "Test",
+            type: "discord",
+            enabled: true,
+            channel: "ch1",
+            botToken: "tok1",
+          },
+        ],
+      }),
+    );
+    storeDir = path.join(tmp, "store");
+    fs.mkdirSync(storeDir, { recursive: true });
+    const doc = path.join(storeDir, "20261101-0329-x.md");
+    fs.writeFileSync(doc, "doc");
+    fs.utimesSync(doc, new Date(1_000), new Date(1_000));
+    liveFile = path.join(tmp, "live.jsonl");
+    fs.writeFileSync(liveFile, "x");
+    // live mtime (500) < doc mtime (1000): the doc is in the 2 h window (the fake clock is pinned at 2000) and the live file is older.
+    fs.utimesSync(liveFile, new Date(500), new Date(500));
+    posted = [];
+    globalThis.fetch = (async (url: any, init?: any) => {
+      if (init?.method === "POST" && String(url).endsWith("/messages")) {
+        posted.push(String(init?.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "out1" }),
+          text: async () => "",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }) as any;
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    clearRotationStaleWatch();
+    globalThis.fetch = realFetch;
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const ctx: any = {
+    cwd: "",
+    sessionManager: { getSessionFile: () => "" },
+  };
+
+  test("the first check runs immediately; the say is latched per episode; clear stops the ticks", () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(2000);
+    ctx.cwd = proj;
+    ctx.sessionManager = { getSessionFile: () => liveFile };
+    armRotationStaleWatch(ctx);
+    expect(posted.length).toBe(1); // the immediate check: stale
+    expect(posted[0]).toContain("ROTATION-STALE");
+    jest.advanceTimersByTime(5 * 60_000); // one tick: still latched
+    expect(posted.length).toBe(1);
+    // fix the condition: the live mtime goes past the doc mtime
+    fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
+    jest.advanceTimersByTime(5 * 60_000); // tick: clears the latch, no post
+    expect(posted.length).toBe(1);
+    // stale again: the latch reset means the next episode re-posts
+    fs.utimesSync(liveFile, new Date(500), new Date(500));
+    jest.advanceTimersByTime(5 * 60_000);
+    expect(posted.length).toBe(2);
+    clearRotationStaleWatch();
+    jest.advanceTimersByTime(5 * 60_000);
+    expect(posted.length).toBe(2);
+  });
+
+  test("the size flag at 1.5 MB is independent of the mtime compare", () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(2000);
+    ctx.cwd = proj;
+    ctx.sessionManager = { getSessionFile: () => liveFile };
+    // live mtime past the doc mtime: NOT stale, but over 1.5 MB
+    fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
+    fs.writeFileSync(liveFile, "x".repeat(1.5 * 1024 * 1024 + 100));
+    fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
+    armRotationStaleWatch(ctx);
+    expect(posted.length).toBe(1);
+    expect(posted[0]).toContain("above 1.5 MB");
+    expect(posted[0]).not.toContain("ROTATION-STALE");
+  });
+
+  test("a healthy rotation (live mtime newer than the doc mtime, small file) posts nothing", () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(2000);
+    ctx.cwd = proj;
+    ctx.sessionManager = { getSessionFile: () => liveFile };
+    fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
+    armRotationStaleWatch(ctx);
+    jest.advanceTimersByTime(5 * 60_000 * 3);
+    expect(posted.length).toBe(0);
   });
 });
