@@ -1,3 +1,134 @@
+# REPORT — issue #315: PIR guards (P0 rotation-stale + P1 handoff amnesia)
+
+Worker run 2026-11-01. Base: main `1eed27ed`. Branch:
+`feature/315-pir-guards` (pushed to origin, the bare mirror
+/srv/fleetwork/jarate.git; the mirror is in sync with GitHub - both at
+`1eed27ed` - so no direct GitHub push was needed). Two commits, one
+per verified scope:
+
+- `9f9cac63` — Scope A (P0): `packages/bridge/channel/restart-ops.{ts,
+  test.ts}` (+427)
+- `5f2af44b` — Scope B (P1): `packages/bridge/channel/handover.ts`,
+  `packages/bridge/channel/handover.test.ts`,
+  `packages/bridge/channel/index.ts` (+556)
+
+Final head: `5f2af44b` (2026-11-01 19:21 AEDT). 983 insertions / 1
+deletion across 5 files; no other files touched, no bun.lock churn,
+zero fleet identifiers in the diff (checked).
+
+## Scope A — P0: rotation-stale + live-size watch (deterministic)
+
+`channel/restart-ops.ts` (all new code appended; file stays at 800
+non-blank lines - under the 800 gate, not ratcheted):
+
+- `checkRotationStale(input)` - pure function, the EXACT #315
+  conditions, nothing else:
+  - ROTATION-STALE = a handoff doc written in the last 2 h (`now -
+    newestDocMtimeMs < 2 h`, strict) AND the live session file mtime
+    STRICTLY older than the newest doc mtime (numeric compare, no
+    inference);
+  - size flag = live session file above 1.5 MB (independent of the
+    mtime compare).
+- `newestHandoffDocMtime(storeDir)` - max mtime over the store's *.md
+  doc files (`latest.md` is the pointer, not a doc); null when the
+  store is missing/empty.
+- `armRotationStaleWatch(ctx)` / `clearRotationStaleWatch()` - a 5-min
+  per-agent tick (armed at session_start, cleared at
+  session_shutdown; unref'd; one process = one agent). The check also
+  runs immediately on arm (a stalled rotation is deep into its 2 h
+  window by boot time). On a hit: log line every tick + ONE say to the
+  responsible lane (default channel, the existing `machine()` one-line
+  say path), latched once per episode (resets when the condition
+  clears) so the tick does not re-post.
+
+## Scope B — P1: handoff amnesia checks (doc write + session start)
+
+`channel/handover.ts` + `channel/index.ts` wiring:
+
+- **doc write** (`buildHandover`, before `writeHandover`): when the
+  branch carries a pending human-inbound ask, count UNANSWERED
+  operator asks in `[write_ts - 30 min, write_ts]` (the same "no
+  assistant entry after it" rule the extraction uses; the doc caps at
+  2, so the expected count is capped at 2) vs the count listed under
+  the doc's "Last user asks". Mismatch = `console.warn` + the doc is
+  tagged `INCOMPLETE-ASKS` in the protected "Last user asks" section
+  body (sizeGuard never condenses it; parseKickoff's lastAsk only
+  reads numbered lines, so the tag stays inert for the boot seed). The
+  check runs only when the branch has a pending ask: when it does not,
+  the list is the span fallback (older summarized span content, never
+  in-window) or (none), and the window does not apply.
+- **session start** (`runSessionStartAskCheck`, wired fire-and-forget
+  in the session_start handler): when the latest handoff doc exists
+  and says (none), ONE bounded history fetch per enabled Discord
+  channel (the #180 lookback, `REWAKE_LOOKBACK_DEFAULT`) flags any
+  UNANSWERED operator message < 30 min old - "unanswered" = no bot
+  post after it (author.id === botUserId; unknown bot id = any
+  non-webhook bot post counts; a machine-wake card never counts as an
+  answer). Log line + say to that channel via the existing `machine()`
+  say path. A dead network at boot is a silent no-op, never a startup
+  failure. `ASK_SELF_CHECK_WINDOW_MS` (30 min), `docAsksIsNone`,
+  `sessionStartAskFlag`, `ChannelHistoryMessage` exported for tests.
+- `index.ts`: +11 lines (2 imports, `armRotationStaleWatch(ctx)` +
+  `void runSessionStartAskCheck(ctx.cwd, enabled)` in session_start,
+  `clearRotationStaleWatch()` in session_shutdown) - the ratcheted
+  budget (3815) is untouched.
+
+## Scope C — root fix: NOT applied (vault plan 138 not settled)
+
+The conditional root fix (scope C) rides the follow-up: vault plan 138
+returns "Plan not found" via the vault API (re-verified this run) and
+the evidence report file does not exist - the plan is not settled, so
+per the task brief the root fix is out of scope for this branch.
+Scopes A + B (the deterministic guards) stand on their own.
+
+## Gate outputs (repo root, final head 5f2af44b)
+
+- `cd packages/bridge && bun x tsc --noEmit`: **clean** (run at both
+  commits and at the final head)
+- `cd packages/bridge && bun x bun test`: **1169 pass, 0 fail**
+  (32 files, ~28s) - the 1087 baseline + 82 new tests (28 in
+  restart-ops.test.ts, 54 in handover.test.ts) - no `(fail)` lines;
+  full-suite clean at both commits
+- `bunx biome check .`: **0 diagnostics** ("No fixes applied"; the 3
+  infos are pre-existing and not errors, rc 0)
+- `bun run size` (`scripts/size-ratchet.ts`): **SIZE GATE: OK (9
+  ratcheted)** - restart-ops.ts landed at exactly 800 non-blank lines
+  (the 800 gate; the file is < 2000 lines, so it must stay in-gate -
+  NOT ratcheted, per the size rule)
+
+## Test coverage (82 new)
+
+- **restart-ops.test.ts** - `checkRotationStale`: every exact condition
+  (stale / boundary at exactly 2 h / live mtime equal / live mtime
+  newer / no doc / no live file / oversized above 1.5 MB at the exact
+  boundary / stale + oversized independence); `newestHandoffDocMtime`
+  (max mtime, latest.md excluded, non-*.md excluded, missing/empty
+  store = null); the watch lifecycle under fake timers (immediate
+  check, per-episode latch, latch reset on clear, re-arm, size flag
+  independence, healthy rotation posts nothing).
+- **handover.test.ts** - `docAsksIsNone` ((none) / listed / missing
+  section); `sessionStartAskFlag`: the exact condition (flag, answered,
+  machine-wake card is not an answer with a known bot id, a different
+  bot's post is not an answer, unknown-bot-id fallback both ways, 45-min
+  outside, exactly-30-min outside - strict <, doc lists an ask, NaN ts
+  excluded); `buildHandover` doc-write self-check (in-window match no
+  tag / answered no tag / out-of-window mismatch = warn + INCOMPLETE-
+  ASKS on the written doc / 3-ask cap no tag); `runSessionStartAskCheck`
+  wiring (flag say / no doc = no fetch / doc lists an ask = no say).
+
+## Push
+
+- `git push origin feature/315-pir-guards` -> bare mirror
+  /srv/fleetwork/jarate.git (verified via `git ls-remote origin`:
+  `refs/heads/feature/315-pir-guards` at `5f2af44b`). The mirror is in
+  sync with GitHub (both main at `1eed27ed`, verified via
+  `git ls-remote github`), so per the push rule no direct GitHub push
+  was needed; the fleet mirror->GitHub sync carries the branch.
+- No PR yet: per the PR flow the branch awaits the adversarial
+  reviewer agent (VERDICT: PASS) before `gh pr create` + merge.
+
+---
+
 # REPORT — jarate post-drain stale-string bundle (#279 follow-up)
 
 Worker run 2026-10-28 (reactivated by operator order "Get on the jarate waves
