@@ -31,7 +31,6 @@ import {
 } from "./handover";
 import {
   beginCompacting,
-  COMPACT_FALLBACK_MS,
   type CompactingEntry,
   clearCompacting,
   compactingChannels,
@@ -55,6 +54,9 @@ import {
   resolveSystemdUnit,
 } from "./types";
 import { findSessionFile, performRedo, performUndo } from "./undo";
+
+// #315 H2: stuck-label fallback for the compact window (10 min). If the completion event never arrives, compactWindowStuckRecover below closes the window and re-runs the restart gate.
+export const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
 
 // ─── /undo + /redo: session + file revert ──────────────────────────────
 // See channel/undo.ts. The conversation revert works like /reset: pi resumes

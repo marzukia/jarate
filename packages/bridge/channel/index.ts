@@ -121,6 +121,7 @@ import {
 } from "./queue";
 import { buildRepliedMessageBlock } from "./reply-context";
 import {
+  COMPACT_FALLBACK_MS,
   compactWindowStuckRecover,
   consumeOpMarker,
   handoffRestartForSize,
@@ -489,7 +490,6 @@ export function clearAllInterrupts(): void {
 // #315 H2: this is also the STUCK-LABEL timeout (N) - a completion event
 // that never arrives must not leave the label stuck (the P0 rotation
 // stall); the timeout runs compactWindowStuckRecover (restart-ops.ts).
-export const COMPACT_FALLBACK_MS = 10 * 60 * 1000;
 /** Op window labels: compaction + the restart-class ops. */
 export type OpLabel =
   | "compacting"

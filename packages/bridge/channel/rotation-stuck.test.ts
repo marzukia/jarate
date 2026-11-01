@@ -255,8 +255,7 @@ describe("#315 scope C: compacting window close + stuck-label timeout", () => {
     expect(isHandoffRestartArmed()).toBe(true);
     expect(compactingEntries("ch1")).toBe(1);
 
-    // Nothing settles: the stuck-label timeout fires ONCE (the first
-    // window's timer was replaced by the second beginCompacting).
+    // Nothing settles: the stuck-label timeout fires ONCE (the second session_before_compact re-arms but does not open a window, so the single window timer set by beginCompacting is unchanged).
     jest.advanceTimersByTime(FALLBACK_MS);
     await flushUntil(() =>
       fs.existsSync(path.join(tmp, ".tmp", "op-marker.json")),

@@ -1,6 +1,6 @@
 # REPORT — #315 PIR guards: full branch (scopes A + B + C)
 
-Worker run 2026-11-01; this report commit is the 2026-11-01 no-exemption line-wrap re-flow (every prose line rejoined to one flowing line per paragraph; machine-output blocks stay as-is) plus the update to the full branch (the prior version documented only scopes A + B and predates the scope-C commit). Base: main `1eed27ed`. Branch: `feature/315-pir-guards`, head `174b941c`; PR #318 tracks the branch and its head moves with this push. Three scope commits, one per verified scope:
+Worker run 2026-11-01; this report commit is the 2026-11-01 no-exemption line-wrap re-flow (every prose line rejoined to one flowing line per paragraph; machine-output blocks stay as-is) plus the update to the full branch (the prior version documented only scopes A + B and predates the scope-C commit). Base: main `1eed27ed`. Branch: `feature/315-pir-guards`, head = the commit containing this report (its parent is `e34e8be4`); PR #318 tracks the branch and its head moves with this push. Three scope commits, one per verified scope:
 
 - `9f9cac63` — scope A (P0 deterministic guard): `packages/bridge/channel/restart-ops.{ts,test.ts}` (+427).
 - `5f2af44b` — scope B (P1 amnesia checks): `packages/bridge/channel/handover.{ts,test.ts}`, `packages/bridge/channel/index.ts` (+556 / -1).
@@ -45,9 +45,10 @@ Already in code, verified: `session_before_compact` calls `setHandoffRestartArme
 
 ## Gate outputs (per head, repo root)
 
-- Scope A + B (head `5f2af44b`): `bun x tsc --noEmit` clean (run at both commits and at the final head); `bun x bun test` **1169 pass, 0 fail** (32 files, ~28 s — the 1087 baseline + 82 new tests: 28 in restart-ops.test.ts, 54 in handover.test.ts); `bunx biome check .` 0 diagnostics (the 3 infos pre-existing, not errors, rc 0); `bun run size` — SIZE GATE: OK (9 ratcheted; restart-ops.ts at exactly 800 non-blank lines, in-gate, not ratcheted).
+- Scope A + B (head `5f2af44b`): `bun x tsc --noEmit` clean (run at both commits and at the final head); `bun x bun test` **1169 pass, 0 fail** (32 files, ~28 s — the 1140 baseline + 29 new tests, across restart-ops.test.ts and handover.test.ts (count correction: the base is 1140 — verified by a full suite run at main `1eed27ed` — not the stale 1087 in AGENTS.md; the 1169 total is unchanged)); `bunx biome check .` 0 diagnostics (the 3 infos pre-existing, not errors, rc 0); `bun run size` — SIZE GATE: OK (9 ratcheted; restart-ops.ts at exactly 800 non-blank lines, in-gate, not ratcheted).
 - Scope C (head `174b941c`): `bun x tsc --noEmit` clean; `bun x bun test` **1173 pass, 0 fail** (1169 baseline + 4 new); `bunx biome check .` clean (0 errors/warnings; the 3 pre-existing infos unchanged from the branch baseline); `bun run size` — OK (index.ts stays inside its ratcheted budget: 3807 ≤ 3815; restart-ops.ts back under 800 after the split).
 - Fail-without-fix (scope C): scratch revert of the fix hunks (helper without the STUCK close + gate re-run): (b) and (d) FAIL, (a) and (c) still pass; restore: all 4 pass.
+- Fix round (head = the commit containing this report): export-gate fix — moved the +1 top-level export (`COMPACT_FALLBACK_MS`) out of `channel/index.ts` (definition now in `channel/restart-ops.ts`, imported at the usage site; pure wiring, behavior identical) so `bun run size -- --base origin/main` passes (line-count AND export gates); plus this report's count corrections (1140 baseline + 29 new) and the rotation-stuck (d) comment fix.
 
 ## Notes
 
