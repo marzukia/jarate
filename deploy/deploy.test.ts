@@ -32,6 +32,20 @@
  *    exactly once with ec=143 (a wrapper logs the $1 the real on_exit
  *    receives); the EXIT-only path records once on nonzero exit, zero on
  *    zero; an early TERM (DEPLOY_TRIED empty) no-ops via the existing guard.
+ *
+ * 3. #319 guards (the 2026-11-01 franky incident: the backoff skipped the
+ *    whole tick, so a dead pi.service stayed down 11h):
+ *    - liveness decoupled from the backoff: the pi liveness check runs on
+ *      EVERY tick (even backed-off / up-to-date ticks), counts consecutive
+ *      down ticks in state line 3 ("pi-down <n>"), and on the 3rd down tick
+ *      ("> 2", per the issue design) restarts the service + logs one PAGE
+ *      line per episode; an active service resets the counter (line 3
+ *      dropped); record_fail preserves line 3 and stamps line 2 with the
+ *      fail epoch;
+ *    - backoff expiry: a backed-off commit's skip is time-boxed by the
+ *      first-fail epoch on line 2 (JARATE_BACKOFF_MAX_AGE_S, default 3600s);
+ *      a stale or legacy (timestamp-less) line forces a deploy attempt,
+ *      which re-arms the backoff with a fresh timestamp.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
@@ -132,8 +146,14 @@ interface Fixture {
   a: string; // deployed commit (local main)
   b: string; // incoming commit (origin/main only)
   state: () => string;
-  /** .deploy-state line 2 ("<commit> <fails>"), "" when absent */
+  /** .deploy-state line 2, first two fields ("<commit> <fails>"); the #319 epoch is excluded */
   failLine: () => string;
+  /** .deploy-state line 3 ("pi-down <n>"), "" when absent */
+  stateLine3: () => string;
+  /** overwrite .deploy-state with the given lines (one per file line) */
+  seedState: (lines: string[]) => void;
+  /** install a PATH-first systemctl shim reporting is-active = active */
+  activeService: () => void;
   markerPath: string;
   logText: () => string;
   /** logText after letting the script's `tee -a $LOG_FILE` flush */
@@ -233,7 +253,17 @@ function fixture(): Fixture {
   env.DEPLOY_TEST_BUN_MODE = "fail";
 
   const state = () => fs.readFileSync(path.join(repo, ".deploy-state"), "utf8");
-  const failLine = () => state().trim().split("\n")[1] ?? "";
+  const failLine = () =>
+    (state().trim().split("\n")[1] ?? "").split(" ").slice(0, 2).join(" ");
+  const stateLine3 = () => state().trim().split("\n")[2] ?? "";
+  const seedState = (lines: string[]) =>
+    fs.writeFileSync(path.join(repo, ".deploy-state"), `${lines.join("\n")}\n`);
+  // bunBin is prepended to PATH by deploy.sh, so a shim there wins.
+  const activeService = () => {
+    const shim = path.join(bunBin, "systemctl");
+    fs.writeFileSync(shim, "#!/bin/sh\necho active\n");
+    fs.chmodSync(shim, 0o755);
+  };
 
   const logText = () => {
     const dir = path.join(home, ".local", "share", "jarate", "logs");
@@ -328,6 +358,9 @@ function fixture(): Fixture {
     b,
     state,
     failLine,
+    stateLine3,
+    seedState,
+    activeService,
     markerPath,
     logText,
     log,
@@ -345,8 +378,12 @@ describe("deploy.sh #235: SIGTERM kill records the fail (no livelock)", () => {
     expect(r.code).toBe(1);
     // Exactly one fail recorded: counter 0->1, not 0->2. If the EXIT trap
     // had not been cleared by the TERM trap, the resulting shell exit would
-    // have re-fired on_exit and bumped it to 2.
-    expect(f.state()).toBe(`${f.a}\n${f.b} 1\n`);
+    // have re-fired on_exit and bumped it to 2. #319: line 2 carries the
+    // fail epoch and line 3 the pi-down counter (the fixture's service is
+    // never active, so the liveness check counts this tick as down 1).
+    expect(f.state()).toMatch(
+      new RegExp(`^${f.a}\n${f.b} 1 \\d+\npi-down 1\n$`),
+    );
     // The pre-kill lines made it to the log; the post-kill ones (record +
     // die) cannot: the cgroup TERM kills the log tee too (EPIPE, ignored by
     // the `trap '' PIPE` added in #235), so the state file is the record.
@@ -358,7 +395,9 @@ describe("deploy.sh #235: SIGTERM kill records the fail (no livelock)", () => {
     const f = fixture();
     const r = await f.run({ mode: "fail" });
     expect(r.code).toBe(1);
-    expect(f.state()).toBe(`${f.a}\n${f.b} 1\n`);
+    expect(f.state()).toMatch(
+      new RegExp(`^${f.a}\n${f.b} 1 \\d+\npi-down 1\n$`),
+    );
     const t = await f.log();
     expect(countOf(t, "recorded fail #")).toBe(1);
     expect(t).toContain(`recorded fail #1 on ${f.b}`);
@@ -384,6 +423,107 @@ describe("deploy.sh #235: SIGTERM kill records the fail (no livelock)", () => {
   });
 });
 
+describe("deploy.sh #319: backoff expiry + liveness decoupled from backoff", () => {
+  test("backoff: fresh first-fail ts still skips (no early expiry)", async () => {
+    const f = fixture();
+    f.seedState([f.b, `${f.b} 3 ${Math.floor(Date.now() / 1000) - 60}`]);
+    // mode "hang" would wedge in typecheck if the gate re-ran; the backoff
+    // must short-circuit first (exit 0, before any bun call).
+    const r = await f.run({ mode: "hang" });
+    expect(r.code).toBe(0);
+    const t = await f.log();
+    expect(t).toContain("skipping tick");
+    expect(t).not.toContain("backoff expired");
+    expect(fs.existsSync(f.markerPath)).toBe(false); // bun never reached
+  });
+
+  test("backoff: stale ts forces the deploy attempt, then re-arms fresh", async () => {
+    const f = fixture();
+    f.seedState([f.a, `${f.b} 3 ${Math.floor(Date.now() / 1000) - 7200}`]);
+    // The forced attempt reaches the gate and fails (typecheck stub exit 3).
+    const r1 = await f.run({ mode: "fail" });
+    expect(r1.code).toBe(1);
+    expect(fs.existsSync(f.markerPath)).toBe(true); // the gate re-ran
+    let t = await f.log();
+    expect(t).toContain("backoff expired");
+    expect(t).toContain("forcing deploy attempt");
+    // The forced attempt records fail #4 with a FRESH epoch.
+    expect(f.failLine()).toBe(`${f.b} 4`);
+    // Next tick: the fresh epoch is within the window -> backoff re-arms.
+    fs.rmSync(f.markerPath, { force: true });
+    const r2 = await f.run({ mode: "hang" });
+    expect(r2.code).toBe(0);
+    t = await f.log();
+    expect(countOf(t, "backoff expired")).toBe(1); // only tick 1 forced
+    expect(fs.existsSync(f.markerPath)).toBe(false);
+  });
+
+  test("backoff: legacy line (no timestamp) is expired — forces the attempt", async () => {
+    const f = fixture();
+    f.seedState([f.a, `${f.b} 3`]);
+    const r = await f.run({ mode: "fail" });
+    expect(r.code).toBe(1);
+    expect(fs.existsSync(f.markerPath)).toBe(true);
+    const t = await f.log();
+    expect(t).toContain("backoff expired (3 fails");
+    expect(t).toContain("age unknown");
+  });
+
+  test("liveness: pi-down counter; restart + PAGE on the 3rd down tick, one PAGE per episode", async () => {
+    const f = fixture();
+    // Up-to-date ticks (deployed = incoming commit): liveness runs, deploy
+    // short-circuits. The fixture's service is never active -> down ticks.
+    f.seedState([f.b]);
+    const r1 = await f.run({ mode: "fail" });
+    expect(r1.code).toBe(0);
+    expect(f.stateLine3()).toBe("pi-down 1");
+    expect(await f.log()).not.toContain("PAGE:");
+    const r2 = await f.run({ mode: "fail" });
+    expect(r2.code).toBe(0);
+    expect(f.stateLine3()).toBe("pi-down 2");
+    expect(await f.log()).not.toContain("PAGE:");
+    // 3rd consecutive down tick ("> 2", per the issue design): restart + PAGE.
+    const r3 = await f.run({ mode: "fail" });
+    expect(r3.code).toBe(0);
+    expect(f.stateLine3()).toBe("pi-down 3");
+    const t = await f.log();
+    expect(t).toContain(
+      "PAGE: fake.service down 3 consecutive ticks; restarting",
+    );
+    // fake.service is not a real unit in the fixture -> the restart attempt
+    // fails and is logged (the PAGE record survives the unit error).
+    expect(t).toContain("PAGE: restart fake.service failed");
+    // 4th down tick: the counter keeps going, but one PAGE per episode.
+    const r4 = await f.run({ mode: "fail" });
+    expect(r4.code).toBe(0);
+    expect(f.stateLine3()).toBe("pi-down 4");
+    expect(countOf(await f.log(), "PAGE: fake.service down")).toBe(1);
+  });
+
+  test("liveness: an active service resets the counter (line 3 dropped, no PAGE)", async () => {
+    const f = fixture();
+    f.activeService(); // systemctl shim: is-active -> active
+    f.seedState([f.b, "", "pi-down 3"]);
+    const r = await f.run({ mode: "fail" });
+    expect(r.code).toBe(0);
+    expect(f.stateLine3()).toBe("");
+    expect(await f.log()).not.toContain("PAGE:");
+  });
+
+  test("record_fail: preserves the pi-down line and stamps the fail epoch", async () => {
+    const f = fixture();
+    f.seedState([f.a, "", "pi-down 2"]);
+    const r = await f.run({ mode: "fail" });
+    expect(r.code).toBe(1);
+    // The liveness check runs first (down 2 -> 3, PAGE at the crossing),
+    // then the failed deploy records fail #1 with the epoch and line 3
+    // survives the record_fail rewrite.
+    expect(f.state()).toMatch(
+      new RegExp(`^${f.a}\n${f.b} 1 \\d+\npi-down 3\n$`),
+    );
+    expect(await f.log()).toContain("PAGE: fake.service down 3");
+  });
+});
 describe("deploy.sh #235: sourced harness (real on_exit + real traps, ec=143)", () => {
   test("TERM: record_fail exactly once, on_exit receives ec=143", async () => {
     const f = fixture();
