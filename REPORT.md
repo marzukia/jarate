@@ -1,404 +1,81 @@
-# REPORT — issue #315: PIR guards (P0 rotation-stale + P1 handoff amnesia)
+# REPORT — #315 scope C: P0 root fix (stuck-label gate re-run + arm-at-doc-write)
 
-Worker run 2026-11-01. Base: main `1eed27ed`. Branch:
-`feature/315-pir-guards` (pushed to origin, the bare mirror
-/srv/fleetwork/jarate.git; the mirror is in sync with GitHub - both at
-`1eed27ed` - so no direct GitHub push was needed). Two commits, one
-per verified scope:
+Branch: `feature/315-pir-guards` (off 9d48bd25). No PR (task instruction).
 
-- `9f9cac63` — Scope A (P0): `packages/bridge/channel/restart-ops.{ts,
-  test.ts}` (+427)
-- `5f2af44b` — Scope B (P1): `packages/bridge/channel/handover.ts`,
-  `packages/bridge/channel/handover.test.ts`,
-  `packages/bridge/channel/index.ts` (+556)
+## Root cause (confirmed)
 
-Final head: `5f2af44b` (2026-11-01 19:21 AEDT). 983 insertions / 1
-deletion across 5 files; no other files touched, no bun.lock churn,
-zero fleet identifiers in the diff (checked).
+`beginCompacting` (index.ts) arms a 10-min fallback timer
+(`COMPACT_FALLBACK_MS`). When the `session_compact`/`session_compact_failed`
+completion event never arrives, that timer closes the op window
+(`clearCompacting`) and drains — but it never re-runs
+`handoffRestartForSize`. The arm set at doc write
+(`session_before_compact` → `setHandoffRestartArmed(true)`) is only
+consumed by the settle's gate re-run, so it stays pending: the handoff
+restart op never opens and the rotation stalls. The stuck `compacting`
+label also makes every later restart gate return early.
 
-## Scope A — P0: rotation-stale + live-size watch (deterministic)
+## H1 — arm at doc write
 
-`channel/restart-ops.ts` (all new code appended; file stays at 800
-non-blank lines - under the 800 gate, not ratcheted):
+Already in code: `session_before_compact` calls
+`setHandoffRestartArmed(true)` immediately after the doc write
+(index.ts:~2816), independent of any settle. Verified by hermetic test
+(c). No code change.
 
-- `checkRotationStale(input)` - pure function, the EXACT #315
-  conditions, nothing else:
-  - ROTATION-STALE = a handoff doc written in the last 2 h (`now -
-    newestDocMtimeMs < 2 h`, strict) AND the live session file mtime
-    STRICTLY older than the newest doc mtime (numeric compare, no
-    inference);
-  - size flag = live session file above 1.5 MB (independent of the
-    mtime compare).
-- `newestHandoffDocMtime(storeDir)` - max mtime over the store's *.md
-  doc files (`latest.md` is the pointer, not a doc); null when the
-  store is missing/empty.
-- `armRotationStaleWatch(ctx)` / `clearRotationStaleWatch()` - a 5-min
-  per-agent tick (armed at session_start, cleared at
-  session_shutdown; unref'd; one process = one agent). The check also
-  runs immediately on arm (a stalled rotation is deep into its 2 h
-  window by boot time). On a hit: log line every tick + ONE say to the
-  responsible lane (default channel, the existing `machine()` one-line
-  say path), latched once per episode (resets when the condition
-  clears) so the tick does not re-post.
+## H2 — stuck-label timeout re-runs the gate
 
-## Scope B — P1: handoff amnesia checks (doc write + session start)
+`beginCompacting`'s fallback timer now calls
+`compactWindowStuckRecover(pi, ch, ctx, label)` (new helper in
+restart-ops.ts, next to the mechanism-B code):
 
-`channel/handover.ts` + `channel/index.ts` wiring:
+1. #84 behavior preserved: settle the placeholder to a terminal line
+   (`settleCompactTick` "compact stalled"), clear the window, drain the
+   queue.
+2. For `label === "compacting"` only: a loud distinct line —
+   `[op:compacting] STUCK: <id> window open 10 min with no completion
+   event; closing and re-running the restart gate (settle never arrived)`
+   (console.error, distinct from the #84 path) — then
+   `handoffRestartForSize(pi, ctx)`, mirroring the session_compact
+   handler exactly: the gate itself decides (arm / fresh window /
+   settings).
 
-- **doc write** (`buildHandover`, before `writeHandover`): when the
-  branch carries a pending human-inbound ask, count UNANSWERED
-  operator asks in `[write_ts - 30 min, write_ts]` (the same "no
-  assistant entry after it" rule the extraction uses; the doc caps at
-  2, so the expected count is capped at 2) vs the count listed under
-  the doc's "Last user asks". Mismatch = `console.warn` + the doc is
-  tagged `INCOMPLETE-ASKS` in the protected "Last user asks" section
-  body (sizeGuard never condenses it; parseKickoff's lastAsk only
-  reads numbered lines, so the tag stays inert for the boot seed). The
-  check runs only when the branch has a pending ask: when it does not,
-  the list is the span fallback (older summarized span content, never
-  in-window) or (none), and the window does not apply.
-- **session start** (`runSessionStartAskCheck`, wired fire-and-forget
-  in the session_start handler): when the latest handoff doc exists
-  and says (none), ONE bounded history fetch per enabled Discord
-  channel (the #180 lookback, `REWAKE_LOOKBACK_DEFAULT`) flags any
-  UNANSWERED operator message < 30 min old - "unanswered" = no bot
-  post after it (author.id === botUserId; unknown bot id = any
-  non-webhook bot post counts; a machine-wake card never counts as an
-  answer). Log line + say to that channel via the existing `machine()`
-  say path. A dead network at boot is a silent no-op, never a startup
-  failure. `ASK_SELF_CHECK_WINDOW_MS` (30 min), `docAsksIsNone`,
-  `sessionStartAskFlag`, `ChannelHistoryMessage` exported for tests.
-- `index.ts`: +11 lines (2 imports, `armRotationStaleWatch(ctx)` +
-  `void runSessionStartAskCheck(ctx.cwd, enabled)` in session_start,
-  `clearRotationStaleWatch()` in session_shutdown) - the ratcheted
-  budget (3815) is untouched.
-
-## Scope C — root fix: NOT applied (vault plan 138 not settled)
-
-The conditional root fix (scope C) rides the follow-up: vault plan 138
-returns "Plan not found" via the vault API (re-verified this run) and
-the evidence report file does not exist - the plan is not settled, so
-per the task brief the root fix is out of scope for this branch.
-Scopes A + B (the deterministic guards) stand on their own.
-
-## Gate outputs (repo root, final head 5f2af44b)
-
-- `cd packages/bridge && bun x tsc --noEmit`: **clean** (run at both
-  commits and at the final head)
-- `cd packages/bridge && bun x bun test`: **1169 pass, 0 fail**
-  (32 files, ~28s) - the 1087 baseline + 82 new tests (28 in
-  restart-ops.test.ts, 54 in handover.test.ts) - no `(fail)` lines;
-  full-suite clean at both commits
-- `bunx biome check .`: **0 diagnostics** ("No fixes applied"; the 3
-  infos are pre-existing and not errors, rc 0)
-- `bun run size` (`scripts/size-ratchet.ts`): **SIZE GATE: OK (9
-  ratcheted)** - restart-ops.ts landed at exactly 800 non-blank lines
-  (the 800 gate; the file is < 2000 lines, so it must stay in-gate -
-  NOT ratcheted, per the size rule)
-
-## Test coverage (82 new)
-
-- **restart-ops.test.ts** - `checkRotationStale`: every exact condition
-  (stale / boundary at exactly 2 h / live mtime equal / live mtime
-  newer / no doc / no live file / oversized above 1.5 MB at the exact
-  boundary / stale + oversized independence); `newestHandoffDocMtime`
-  (max mtime, latest.md excluded, non-*.md excluded, missing/empty
-  store = null); the watch lifecycle under fake timers (immediate
-  check, per-episode latch, latch reset on clear, re-arm, size flag
-  independence, healthy rotation posts nothing).
-- **handover.test.ts** - `docAsksIsNone` ((none) / listed / missing
-  section); `sessionStartAskFlag`: the exact condition (flag, answered,
-  machine-wake card is not an answer with a known bot id, a different
-  bot's post is not an answer, unknown-bot-id fallback both ways, 45-min
-  outside, exactly-30-min outside - strict <, doc lists an ask, NaN ts
-  excluded); `buildHandover` doc-write self-check (in-window match no
-  tag / answered no tag / out-of-window mismatch = warn + INCOMPLETE-
-  ASKS on the written doc / 3-ask cap no tag); `runSessionStartAskCheck`
-  wiring (flag say / no doc = no fetch / doc lists an ask = no say).
-
-## Push
-
-- `git push origin feature/315-pir-guards` -> bare mirror
-  /srv/fleetwork/jarate.git (verified via `git ls-remote origin`:
-  `refs/heads/feature/315-pir-guards` at `5f2af44b`). The mirror is in
-  sync with GitHub (both main at `1eed27ed`, verified via
-  `git ls-remote github`), so per the push rule no direct GitHub push
-  was needed; the fleet mirror->GitHub sync carries the branch.
-- No PR yet: per the PR flow the branch awaits the adversarial
-  reviewer agent (VERDICT: PASS) before `gh pr create` + merge.
-
----
-
-# REPORT — jarate post-drain stale-string bundle (#279 follow-up)
-
-Worker run 2026-10-28 (reactivated by operator order "Get on the jarate waves
-now"; bundle defined 2026-10-24: N1 watchdog cancel hint + t242 DISPATCH.md
-banner). Base: main `e517c322`. Branch: `ja-stale-strings-bundle`.
-
-## Named items (both verified ALREADY FIXED on main)
-
-### N1 — watchdog STALLED digest cancel hint
-
-- **Fixing commit: `5dfbe629`** ("split #280/N1a: STALLED digest points at the
-  live cancel path", 2026-10-24, monkytheluffy). Merged via `d1895d36`
-  ("split #280: retire the jarate-bg-watchdog (3-slice centralise +
-  N1a/N1b) (#290)").
-- Evidence: `git show 5dfbe629` — `dispatch/jarate-bg-watchdog`
-  `-lines.append("jarate-bg-kill <t> to cancel")` →
-  `+lines.append("jarate-bg signal KILL <t> to cancel")`; the pinned test
-  (`dispatch/jarate-bg-watchdog.test.ts`) now expects
-  `jarate-bg signal KILL`. Commit message: "Banked N1 (issue #280): the
-  STALLED digest line still posted 'jarate-bg-kill <t> to cancel' —
-  jarate-bg-kill was removed in #283/#286 (drain)… The live cancel path is
-  the retained signal subcommand of the jarate-bg stub: jarate-bg signal
-  KILL <t>."
-- Corroboration: CHANGELOG.md 2026-10-24 entry "N1a — banked STALLED digest
-  fix" (line 35) records the same fix "before the section left" (the
-  watchdog file itself left with `274801fc` / `d1895d36`, #280/3c).
-- Residual check: `git log -S 'jarate-bg-kill <t> to cancel'` → the string
-  no longer exists in any live file on main (only history + CHANGELOG).
-
-### t242 nit1 — stale docs/DISPATCH.md:4-7 banner
-
-- **Fixing commits: `293c0722`** ("refactor(dispatch): gut pi-bg dispatch
-  path - fleet is the dispatch (hall-monitor #35) (#272)", 2026-10-20)
-  introduced the retirement note and replaced the stale banner;
-  **`d1895d36`** (#290) completed the wording with "drain declared
-  2026-10-23, #279".
-- Evidence: before `293c0722`, docs/DISPATCH.md lines 3-7 listed
-  `dispatch/jarate-bg` / `jarate-wait` / `jarate-bg-tail` /
-  `jarate-bg-kill` as live components ("Components (all in this repo)").
-  On main, lines 2-8 carry the retirement note: "Retirement note
-  (hall-monitor #35, 2026-10-20; drain declared 2026-10-23, #279):
-  `jarate-bg`'s launch path is RETIRED (stub, rc 10). New dispatches go to
-  hall-monitor fleetwork…". `git log -S 'Retirement note' -- docs/DISPATCH.md`
-  → `293c0722`; `git log -S 'drain declared' -- docs/DISPATCH.md` →
-  `d1895d36`.
-
-## Residual sweep (live docs; CHANGELOG.md, issues/*, dispatch/jarate-bg
-internal comments untouched per bundle scope)
-
-### FIXED
-
-1. **packages/bridge/README.md:147** — `/jobs` (recent pi-bg run history) →
-   now mirrors docs/COMMANDS.md:79: "history-only scan of the
-   `~/.pi-bg-art` artifacts; post-#279 drain: the `jarate-bg` launcher is a
-   stub, rc 10; new work goes to hall-monitor dispatch". Verified stale:
-   `packages/bridge/channel/jobs.ts:1` — "history-only since the drain,
-   #279"; the in-flight ps view + kill/tail wrappers were removed with the
-   completion side.
-2. **packages/bridge/README.md:174** (file tree) — `jobs.ts /jobs dispatch
-   scan + history` → `jobs.ts /jobs history-only artifact scan` (the
-   "dispatch scan" = the removed in-flight ps view).
-3. **packages/bridge/skills/channel/SKILL.md:32** — same stale `/jobs`
-   (recent pi-bg run history) wording as #1; fixed identically.
-
-### KEPT (verified live)
-
-4. **README.md:117-118** — architecture diagram "terminal callback (embed
-   author `pi-bg fleetwork` · <state>)". Grep `packages/bridge` +
-   `dispatch/` for `pi-bg fleetwork`:
-   - `packages/bridge/channel/fleet-run.ts:10` (live bridge module): "Run
-     events flow through the fleetwork wrapper ([bg: fleetwork] <ticket>
-     lines -> `pi-bg fleetwork` machine-wake cards…)" — the wrapper still
-     emits the card.
-   - `dispatch/jarate-bg:12,282` (live stub, stderr notice): "terminal:
-     state returns as a `pi-bg fleetwork` machine-wake card (… the wake
-     rides webhook_id + the Author: pi-bg marker)".
-   - `dispatch/jarate-bg.test.ts:113` pins the string in the stub notice.
-   - The `Author: pi-bg <name> · <state>` embed shape is live across the
-     bridge test suite (e.g. `Author: pi-bg worker · r44`,
-     `Author: pi-bg restart-wake · planned`).
-   Producer still emits the author string → line kept.
-
-### Not stale (checked, no change)
-
-- `packages/bridge/channel/commands.ts:292` /help string "/jobs - recent
-  pi-bg run history (json for JSON)" — code, not docs; still an accurate
-  description of the view (history of recent pi-bg runs); the section
-  comment (commands.ts:149-152) already carries "History-only since the
-  drain (#279)". Left untouched (docs-only change).
-- `jarate-bg-kill` / `jarate-bg-tail` / `jarate-wait` mentions in
-  docs/COMMANDS.md:356, docs/DEPLOY.md:40-41, docs/DISPATCH.md:17,35,37,41,
-  docs/SETUP.md:118 — all accurate "removed/retired" references, not live
-  descriptions.
-- Branch naming `pi-bg/<id>` (README.md:143, AGENTS.md:40,74,
-  CONTRIBUTING.md:11, templates/newrepo/*) — LIVE convention (PRs #271/#273
-  used `pi-bg/<ticket>` branches); left untouched per bundle scope.
-
-## Gates (repo root, 2026-10-28)
-
-- `bun run test:all` (bun test, bridge + dispatch + bin + deploy): **bridge
-  1096 pass / 0 fail** (30 files, 26.85s); dispatch 26 pass / 0 fail; bin
-  30 pass / 0 fail; deploy 6 pass / 0 fail. No `(fail)` lines.
-- `bun run typecheck` (= `cd packages/bridge && bun x tsc --noEmit`, the
-  script CONTRIBUTING names): clean, rc 0.
-- `bunx biome check .`: "Checked 80 files in 1041ms. No fixes applied." —
-  0 diagnostics.
-- `bun scripts/size-ratchet.ts --base origin/main`: "SIZE GATE: OK
-  (9 ratcheted)", rc 0.
-- `bun install` (packages/bridge) needed for tsc; `bun.lock` unchanged
-  (git status clean after install).
-
-## PR
-
-- Branch `ja-stale-strings-bundle` pushed to origin (bare mirror
-  /srv/fleetwork/jarate.git) and github (marzukia/jarate).
-- PR URL: https://github.com/marzukia/jarate/pull/301
-
----
-
-# REPORT — issue #258: factor durableStore + shared atomic write
-
-## Change summary
-
-The durable-store extraction (scope 1) had already landed in main via #276
-(commit 42851c77): `channel/durable-store.ts` holds the shared
-load/save/orphan-sweep/id-gen/lifecycle, and `channel/sleep.ts` +
-`channel/tasks.ts` are thin domain layers on top. This run closes the
-atomic-write half (scope 2) of the issue:
-
-- **`channel/durable-store.ts`** — new shared primitives, stdlib-only:
-  - `atomicTmpName(target)` — the ONE tmp naming scheme:
-    `<target>.<pid>.<ts>.tmp`;
-  - `atomicWriteJson(target, value)` — mkdir + tmp + rename (2-space JSON,
-    throws on I/O failure, tmp left for the sweep);
-  - `sweepOrphanTmpFiles(dir, target)` — best-effort orphan sweep (never
-    throws, only touches the target's tmp shape).
-  The store's `save`/`collectOrphans` now delegate to these, so the
-  sleep/tasks path uses the same primitive as everything else.
-- **The 6 named sites** all go through the shared primitive:
-  1. `sleep.ts` / 2. `tasks.ts` — via the store (already #276);
-  3. `todos.ts` `saveBoard` — inline tmp+rename → `atomicWriteJson`
-     (same pid+ts scheme as before, code de-duplicated);
-  4. `restart-queue.ts` `saveRewakeQueue` — `${p}.tmp` (non-pid, no
-     orphan sweep) → `atomicWriteJson`; new `collectRewakeOrphans`
-     (best-effort), swept once per real process start inside
-     `drainRewakeSurvival` (`queue.ts` — the startup path at
-     index.ts:1628; index.ts itself untouched);
-  5. `worktree.ts` `saveWorktreeState` — plain `writeFileSync` (non-atomic)
-     → `atomicWriteJson` (atomic; drops a cosmetic trailing newline,
-     JSON.parse roundtrip unchanged);
-  6. `undo.ts` `truncateSession` — raw JSONL write keeps its content,
-     tmp name converges from `${sessionFile}.undo-tmp` to the shared
-     `atomicTmpName` scheme.
-- Comment-only: the `*.jsonl` skip-filter comments in `undo.ts` /
-  `usage.ts` updated to the new tmp shape (the filter skips both shapes —
-  neither ends in `.jsonl`).
-- `undo.ts` size-ratchet compliance: the new import kept the file at its
-  1090 non-blank budget by condensing one two-line comment (ratcheted
-  files may only shrink; no budget change).
-
-Behavior-preserving: throw semantics per site unchanged (durable-store
-save / todos / worktree / undo throw; restart-queue keeps its
-try/catch→boolean). All existing pins pass unchanged; new tests added for
-the shared contract (naming shape, atomic write + no residue, failure
-leaves the tmp for the sweep, sweep scope/idempotency), the rewake
-orphan sweep (incl. null stateDir + empty dir), the worktree atomic
-save, and the undo tmp-scheme rewrite.
-
-## Gate outputs (repo root, base main e517c322)
-
-- `bun test` (root: bridge + bin + deploy): **1168 pass, 0 fail**
-  (bridge alone: 1106 pass, 0 fail — 1096 baseline + 10 new tests)
-- `bun run typecheck` (`cd packages/bridge && bun x tsc --noEmit`): clean
-- `bunx biome check .`: 80 files, 0 diagnostics
-- `bun scripts/size-ratchet.ts --base origin/main`: SIZE GATE: OK (9
-  ratcheted)
+Idempotency: the arm is a boolean consumed by the gate; the timer only
+fires while the window is still open (any settle/close clears the entry
+and cancels the timer), so a second doc write in the same episode
+(re-opens the window with a fresh timer) cannot double-fire or re-open a
+closed window — test (d).
 
 ## Files
 
-- packages/bridge/channel/durable-store.ts (+ shared primitives)
-- packages/bridge/channel/durable-store.test.ts (+ contract tests)
-- packages/bridge/channel/todos.ts
-- packages/bridge/channel/restart-queue.ts (+ collectRewakeOrphans)
-- packages/bridge/channel/restart-queue.test.ts
-- packages/bridge/channel/queue.ts (sweep in the startup drain)
-- packages/bridge/channel/worktree.ts
-- packages/bridge/channel/worktree.test.ts
-- packages/bridge/channel/undo.ts
-- packages/bridge/channel/undo.test.ts
-- packages/bridge/channel/usage.ts (comment only)
+- `packages/bridge/channel/index.ts` — timer calls the helper;
+  `COMPACT_FALLBACK_MS` exported (stuck-label comment).
+- `packages/bridge/channel/restart-ops.ts` — `compactWindowStuckRecover`
+  added; the #315 rotation-stale section **moved out** to
+  `rotation-stale.ts` (size gate: restart-ops.ts would have crossed the
+  800-line non-bloat line; split, not ratcheted). No behavior change in
+  the move (tests + import sources updated).
+- `packages/bridge/channel/rotation-stale.ts` — new sibling module,
+  verbatim move of the #315 P0 guard section.
+- `packages/bridge/channel/rotation-stuck.test.ts` — 4 new hermetic
+  tests (fake timers + fake ctx):
+  (a) window closes on settle (success + failed), (b) stuck timeout
+  closes + loud line + gate re-run opens the op, (c) arm on doc write,
+  (d) idempotency.
 
-No changes to `channel/index.ts` (ja-style-v4-nits owns it), no new deps,
-no bun.lock churn.
+## Verification
 
+- Scratch revert of the fix hunks (helper without the STUCK close +
+  gate re-run): (b) and (d) FAIL, (a) and (c) still pass. Restore: all
+  4 pass.
+- `bun x tsc --noEmit` — clean.
+- `bun x bun test` — **1173 pass, 0 fail** (1169 baseline + 4 new).
+- `bunx biome check .` — clean (0 errors/warnings; 3 pre-existing infos
+  unchanged from branch baseline).
+- `bun scripts/size-ratchet.ts` — OK (index.ts stays inside its
+  ratchet budget: 3807 ≤ 3815; restart-ops.ts back under 800).
 
-# REPORT — issue #284 (re-add the fresh-onboard 15-min watchdog timer template)
+## Notes
 
-## Outcome
-
-PR open: https://github.com/marzukia/jarate/pull/302 (branch
-`pi-bg/284-watchdog-template`, commit `548d9192` + report commit, base
-`main` e517c322). Issue #282 closed via gh with the ordered comment
-("Removed in #287 (374130af); residual doc refs in NEW-AGENT.md are the
-live pi/webdrop CLI, not the orphans.").
-
-## Change summary
-
-1. **Templates** — `deploy/jarate-bg-watchdog.{service,timer}` (new).
-   Mirrors the `deploy/jarate-deploy.{service,timer}` conventions
-   (`%h` specifiers, `[Install] WantedBy=timers.target`).
-   `ExecStart=%h/scripts/jarate-bg-watchdog` — the script live boxes
-   retain (symlink into the pre-#280 checkout; verified: the repo copy
-   `dispatch/jarate-bg-watchdog` is GONE since #280/3c, 274801fc, and
-   install.sh links neither it nor the template — it only cleans up
-   dangling symlinks for it). Cadence verbatim from the pre-scrub
-   template (git show 94d99e65^:dispatch/pi-bg-watchdog.timer):
-   `OnBootSec=5min`, `OnUnitActiveSec=15min`, `Persistent=true`,
-   `AccuracySec=1min`.
-2. **`bin/jarate` setup (step 9)** — copies the two `%h`-only templates
-   (plain `cp`, no sed; no checkout path in them), adds the
-   template-missing guard, `enable --now jarate-bg-watchdog.timer`,
-   per-unit die messages, dry-run plan line updated.
-3. **`docs/SETUP.md`** — step 8 unit list; what-it-does-not-do bullet
-   (fresh box: timer armed, sweep unit fails until the script is
-   restored — documented consequence of #280/3c); manual procedure
-   (cp + enable lines + note).
-4. **`install.sh`** — comments-only. The retired-name cleanup list
-   (line ~172) verified to already match post-#280/#283 reality: all 9
-   names are gone from the repo and none are linked, so
-   `jarate-bg-watchdog` correctly stays in the cleanup list (the
-   re-added template is installed by `jarate setup`, not linked by
-   install.sh). Comment now says so explicitly.
-5. **Tests** — `bin/jarate.test.ts`: setup fixture copies the two new
-   templates from the repo; `--yes` asserts the unit files land in
-   `~/.config/systemd/user/` with the right content
-   (`ExecStart=%h/scripts/jarate-bg-watchdog`, `OnUnitActiveSec=15min`,
-   `WantedBy=timers.target`) + `--user enable --now
-   jarate-bg-watchdog.timer` in the systemctl log.
-
-Existing boxes keep their installed `pi-bg-watchdog` units (ExecStart
-points at the retained script); not migrated by this change (per issue).
-
-## Gate outputs (repo root, commit 548d9192)
-
-- `bun test`: **1158 pass, 0 fail** (bridge 1087 + bin 30 + dispatch +
-  deploy 6) — first run had 17 fails from missing node_modules (fresh
-  worktree); `bun install` → all green.
-- `cd packages/bridge && bun x tsc --noEmit`: **clean**
-- `bunx biome check .`: **Checked 80 files. No fixes applied.** (0
-  diagnostics)
-- `bun scripts/size-ratchet.ts --base origin/main`: **SIZE GATE: OK
-  (9 ratcheted)**
-- `HOME=/tmp/fake-home-284 bash install.sh --dry-run`: **rc=0**, output
-  unchanged vs baseline (same link lines, same PATH [!] notes on the
-  empty fake HOME, settings.json untouched)
-- `bin/jarate` non-blank lines 760 → 769 (budget 800, not ratcheted);
-  `bin/jarate.test.ts` 1042 → 1051 (test x3 budget)
-
-## Hygiene
-
-- `gh issue close 282 --comment "Removed in #287 (374130af); residual
-  doc refs in NEW-AGENT.md are the live pi/webdrop CLI, not the
-  orphans."` — done (✓ Closed issue marzukia/jarate#282). Verified
-  374130af is an ancestor of main.
-
-## Push + PR
-
-- `git push origin pi-bg/284-watchdog-template` → bare mirror
-  /srv/fleetwork/jarate.git (branch at 548d9192, verified via
-  `git ls-remote origin`)
-- `git push github pi-bg/284-watchdog-template` → new branch on GitHub
-- `gh pr create --base main --head pi-bg/284-watchdog-template` →
-  **https://github.com/marzukia/jarate/pull/302**
+- No CHANGELOG entry: recent bridge fixes on this line (#311/#312/#313)
+  did not update it; the top entry is 2026-10-24 (#280).
+- No fleet identifiers in the diff.
+- No PR (per task instruction).

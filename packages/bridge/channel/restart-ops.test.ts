@@ -37,19 +37,21 @@ import {
   queueMidTurnInbound,
 } from "./queue";
 import {
-  armRotationStaleWatch,
   buildRestartCommand,
-  checkRotationStale,
-  clearRotationStaleWatch,
   moveSessionFileAside,
-  newestHandoffDocMtime,
   parseUndoCount,
-  ROTATION_STALE_DOC_WINDOW_MS,
-  ROTATION_STALE_SIZE_BYTES,
   setLiveKickoffStateHookForTest,
   setProcessExitHookForTest,
   setSystemdRestartHookForTest,
 } from "./restart-ops";
+import {
+  armRotationStaleWatch,
+  checkRotationStale,
+  clearRotationStaleWatch,
+  newestHandoffDocMtime,
+  ROTATION_STALE_DOC_WINDOW_MS,
+  ROTATION_STALE_SIZE_BYTES,
+} from "./rotation-stale";
 import {
   type ChannelMessage,
   loadChannelConfig,
