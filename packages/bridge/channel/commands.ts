@@ -22,6 +22,7 @@ import { BTW_HINT } from "./btw";
 import { renderContext } from "./context";
 import { publishDiff } from "./diff";
 import {
+  clearInteractionMessage,
   deferInteraction,
   editInteractionMessage,
   getDiscordChannelId,
@@ -344,6 +345,7 @@ export function buildInteractionHandler(
         )
       : undefined;
     let text: string | undefined;
+    let clearAck = false;
     try {
       const r = await runChannelCommand(
         pi,
@@ -354,6 +356,7 @@ export function buildInteractionHandler(
         interactionUserId(d),
         true,
       );
+      clearAck = r.clearAck === true;
       text = r.btw
         ? undefined
         : (r.immediate ?? (r.consumed ? undefined : machine("ok")));
@@ -363,7 +366,14 @@ export function buildInteractionHandler(
     }
     // Command replies ship as plain machine text (Andryo 2026-10-31):
     // single-line acks italic, multi-line blocks plain - no fences.
+    // #316: a restart-class op (native path) gets its status line from
+    // the VISIBLE channel placeholder posted by beginRestartOp — an
+    // identical ack edit would double-post it. Clear the deferred ack
+    // (DELETE @original) instead of editing. Every other command still
+    // edits the ack as its only line (incl. the busy-refusal, which
+    // posts nothing to the channel).
     if (text !== undefined) await editInteractionMessage(botToken, d, text);
+    else if (clearAck) await clearInteractionMessage(botToken, d);
   };
 }
 
@@ -487,7 +497,15 @@ export async function runChannelCommand(
   arg: string | undefined,
   fromId: string | undefined,
   native: boolean,
-): Promise<{ immediate?: string; btw?: boolean; consumed?: boolean }> {
+): Promise<{
+  immediate?: string;
+  btw?: boolean;
+  consumed?: boolean;
+  /** Native path only (#316): the op's status line is the channel
+   *  placeholder (beginRestartOp) — the interaction handler clears the
+   *  deferred ack instead of editing it, keeping ONE status line. */
+  clearAck?: boolean;
+}> {
   const isOwner = isOwnerUser(ch, fromId);
   // A recognised command is NEVER handed to the agent as plain text when the
   // sender is not permitted. It used to be (`immediate` was only set on the
@@ -790,9 +808,9 @@ export async function runChannelCommand(
         // session (turns != 0) instead of a truly fresh one (issue #85).
         if (live) archiveStaleSessions(live);
       });
-      return native
-        ? { immediate: machine("[..] resetting...") }
-        : { consumed: true };
+      // #316: the channel placeholder IS the status line; the identical
+      // ephemeral ack edit would double-post it - clear the ack.
+      return native ? { consumed: true, clearAck: true } : { consumed: true };
     }
     case "restart": {
       if (!isOwner) return ownerOnly;
@@ -826,9 +844,7 @@ export async function runChannelCommand(
         "restarted - session resumed",
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: machine("[..] restarting...") }
-        : { consumed: true };
+      return native ? { consumed: true, clearAck: true } : { consumed: true };
     }
     case "undo": {
       if (!isOwner) return ownerOnly;
@@ -861,9 +877,7 @@ export async function runChannelCommand(
         r.text,
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: machine("[..] undoing...") }
-        : { consumed: true };
+      return native ? { consumed: true, clearAck: true } : { consumed: true };
     }
     case "redo": {
       if (!isOwner) return ownerOnly;
@@ -889,9 +903,7 @@ export async function runChannelCommand(
         r.text,
       );
       scheduleOpShutdown(pi, ctx, ch, placeholderP);
-      return native
-        ? { immediate: machine("[..] redoing...") }
-        : { consumed: true };
+      return native ? { consumed: true, clearAck: true } : { consumed: true };
     }
     case "verbose": {
       if (!isOwner) return ownerOnly;
