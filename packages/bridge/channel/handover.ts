@@ -27,12 +27,26 @@ import type {
   ExtensionContext,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import {
+  discordFetch,
+  getDiscordChannelId,
+  getDiscordStates,
+  getDiscordToken,
+  sendDiscordMessage,
+} from "./discord";
 import { fmtTokensLC } from "./format";
 import { jobsView } from "./jobs";
+import { machine } from "./live";
+import { REWAKE_LOOKBACK_DEFAULT } from "./restart-queue";
+import { sanitizeUnknownValue } from "./sanitize";
 import { formatTaskLine, loadTasks } from "./tasks";
 import { defaultHome, loadBoard, renderBoard } from "./todos";
 import { keptTailMessages, msgText, serializeTranscript } from "./transcript";
-import { getDefaultChannel, loadChannelConfig } from "./types";
+import {
+  type ChannelConfig,
+  getDefaultChannel,
+  loadChannelConfig,
+} from "./types";
 
 // re-exported for the tests + existing importers
 export {
@@ -946,6 +960,62 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
   );
   let doc = renderDeterministic(state, transcript, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
+  // #315 P1: doc-write self-check - count UNANSWERED operator asks in
+  // [write_ts - 30 min, write_ts] present in the session transcript
+  // ("unanswered" = no assistant entry after it, the same check the
+  // extraction uses; the doc lists at most 2, so the expected count is
+  // capped at 2) vs the count listed under the doc's "Last user asks".
+  // Mismatch = warn + tag the doc INCOMPLETE-ASKS: the tag lands in the
+  // protected "Last user asks" section body (sizeGuard never condenses
+  // it) and parseKickoff's lastAsk only reads numbered lines, so the
+  // tag stays inert for the boot seed. The check runs only when the
+  // doc's list is a branch-asks list: when the branch carries no
+  // pending ask, the list is the span fallback (older summarized span
+  // content, never in-window) or (none), and the window does not apply.
+  const nowMs = now.getTime();
+  const inAskWindow = (e: SessionEntry): boolean => {
+    const t = Date.parse(
+      String((e as { timestamp?: unknown }).timestamp ?? ""),
+    );
+    return (
+      Number.isFinite(t) && t >= nowMs - ASK_SELF_CHECK_WINDOW_MS && t <= nowMs
+    );
+  };
+  let lastAssistantIdx = -1;
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const e = branchEntries[i];
+    if (
+      e.type === "message" &&
+      (e as { message?: { role?: string } }).message?.role === "assistant"
+    ) {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+  const isPendingBranchAsk = (e: SessionEntry, i: number): boolean =>
+    e.type === "custom_message" &&
+    e.customType === "channel-inbound" &&
+    isHumanInbound(e) &&
+    lastAssistantIdx <= i;
+  const anyBranchAsk = branchEntries.some((e, i) => isPendingBranchAsk(e, i));
+  if (anyBranchAsk) {
+    const windowUnanswered = branchEntries.filter(
+      (e, i) => isPendingBranchAsk(e, i) && inAskWindow(e),
+    ).length;
+    const expectedAsks = Math.min(2, windowUnanswered);
+    if (expectedAsks !== state.lastUserAsks.length) {
+      console.warn(
+        `[handover] INCOMPLETE-ASKS: ${windowUnanswered} unanswered operator ask(s) in the last 30 min, ${state.lastUserAsks.length} listed (self-check, issue #315)`,
+      );
+      const parts = splitDoc(doc);
+      const asksSection = parts.sections.find((x) =>
+        x.title.includes("user asks"),
+      );
+      if (asksSection)
+        asksSection.body = `${asksSection.body}\n> INCOMPLETE-ASKS: ${windowUnanswered} unanswered operator ask(s) in the last 30 min, ${state.lastUserAsks.length} listed`;
+      doc = assembleDoc(parts);
+    }
+  }
   writeHandover(doc, { storeDir: settings.storeDir, now });
   return doc;
 }
@@ -1187,4 +1257,112 @@ export function parseKickoff(doc: string, live?: KickoffLiveState): string {
     `Scheduled: ${scheduled || NONE}\n` +
     ORCHESTRATOR_PRIME_LINE
   );
+}
+
+// ─── #315 P1: amnesia guards (doc write + session start) ───────────────
+
+/** #315 P1: the self-check / session-start window is 30 min. */
+export const ASK_SELF_CHECK_WINDOW_MS = 30 * 60 * 1000;
+
+/** One message from the channel history fetch (the #180 scan shape,
+ *  reduced to what the flag needs). */
+export interface ChannelHistoryMessage {
+  /** message ts (ms epoch; NaN when unparseable - excluded). */
+  ts: number;
+  /** authored by a bot account (any bot, incl. webhooks). */
+  bot: boolean;
+  /** webhook-posted (the machine-wake lane). */
+  webhook: boolean;
+  /** author id (null when unknown). */
+  authorId: string | null;
+}
+
+/** True when the doc's "Last user asks" section lists NO asks (the
+ *  (none) case the session-start check looks for). */
+export function docAsksIsNone(doc: string): boolean {
+  const { sections } = splitDoc(doc);
+  const s = sections.find((x) => x.title.includes("user asks"));
+  if (!s) return false;
+  return !s.body.split("\n").some((l) => /^\d+\./.test(l.trim()));
+}
+
+/** #315 P1, the exact condition: the doc says (none) but channel
+ *  history shows an UNANSWERED operator message < 30 min old = flag.
+ *  "Operator" = a human (non-bot) author. "Unanswered" = no bot post
+ *  AFTER it in the window (author.id === botUserId; when the bot id is
+ *  unknown, any non-webhook bot post counts - a machine-wake card
+ *  never counts as an answer). Positional, no inference. Returns the
+ *  flag line; null when nothing to flag. */
+export function sessionStartAskFlag(
+  doc: string,
+  history: ChannelHistoryMessage[],
+  botUserId: string | null,
+  now: number = Date.now(),
+): string | null {
+  if (!docAsksIsNone(doc)) return null;
+  const isAnswer = (m: ChannelHistoryMessage): boolean =>
+    botUserId != null ? m.authorId === botUserId : m.bot && !m.webhook;
+  const unanswered = history.filter(
+    (m) =>
+      !m.bot &&
+      Number.isFinite(m.ts) &&
+      now - m.ts < ASK_SELF_CHECK_WINDOW_MS &&
+      !history.some((x) => x.ts > m.ts && isAnswer(x)),
+  );
+  if (unanswered.length === 0) return null;
+  return `session start: the handoff doc says (none) but ${unanswered.length} unanswered operator message(s) < 30m old in channel history (issue #315 P1)`;
+}
+
+/** #315 P1 wiring (session_start): load the latest handoff doc; when it
+ *  exists and says (none), ONE bounded history fetch per enabled Discord
+ *  channel (the #180 lookback) and flag any unanswered operator message
+ *  < 30 min old - log line + say to that channel (the existing
+ *  machine() one-liner say path). Fire-and-forget: a dead network at
+ *  boot is a silent no-op, never a startup failure. */
+export async function runSessionStartAskCheck(
+  cwd: string,
+  channels: ChannelConfig[],
+): Promise<void> {
+  try {
+    const settings = resolveHandoffSettings(cwd);
+    const doc = loadPreviousHandover({ storeDir: settings.storeDir });
+    if (!doc || !docAsksIsNone(doc)) return;
+    for (const ch of channels) {
+      if (ch.type !== "discord") continue;
+      const discordId = getDiscordChannelId(ch.id) ?? ch.channel;
+      const token = getDiscordToken(ch.id) || ch.botToken || "";
+      if (token.length === 0 || !discordId) continue;
+      try {
+        const raw = await discordFetch(
+          token,
+          `/channels/${discordId}/messages?limit=${REWAKE_LOOKBACK_DEFAULT}`,
+        );
+        const arr = Array.isArray(raw)
+          ? (raw as Array<Record<string, any>>)
+          : [];
+        const history = arr.map((m) => ({
+          ts: Date.parse(String(m.timestamp ?? "")),
+          bot: !!m.author?.bot,
+          webhook: m.webhook_id != null,
+          authorId: typeof m.author?.id === "string" ? m.author.id : null,
+        }));
+        const botUserId = getDiscordStates().get(ch.id)?.botUserId ?? null;
+        const line = sessionStartAskFlag(doc, history, botUserId, Date.now());
+        if (line) {
+          console.log(`[handoff] ${line}`);
+          sendDiscordMessage(ch, machine(line)).catch(() => {});
+        }
+      } catch (e) {
+        console.error(
+          "[handover] session-start ask check failed:",
+          sanitizeUnknownValue(e),
+        );
+      }
+    }
+  } catch (e) {
+    console.error(
+      "[handover] session-start ask check failed:",
+      sanitizeUnknownValue(e),
+    );
+  }
 }

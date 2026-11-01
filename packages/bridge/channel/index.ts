@@ -76,6 +76,7 @@ import {
   isHandoffFreshWindow,
   parsePriorTags,
   resolveHandoffSettings,
+  runSessionStartAskCheck,
   shouldHandoff,
 } from "./handover";
 import { registerJarateTool } from "./jarate";
@@ -121,6 +122,8 @@ import {
 } from "./queue";
 import { buildRepliedMessageBlock } from "./reply-context";
 import {
+  armRotationStaleWatch,
+  clearRotationStaleWatch,
   consumeOpMarker,
   handoffRestartForSize,
   safeSessionFile,
@@ -1866,6 +1869,13 @@ export default function (pi: ExtensionAPI) {
         );
     }
 
+    // #315 guards (P0 + P1): the per-agent rotation-stale / live-size
+    // watch (armed for the whole session, cleared at session_shutdown)
+    // and the session-start amnesia check (bounded one fetch per
+    // channel; fire-and-forget like the scan above).
+    armRotationStaleWatch(ctx);
+    void runSessionStartAskCheck(ctx.cwd, enabled);
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -1969,6 +1979,7 @@ export default function (pi: ExtensionAPI) {
     // also fire this — harmless, the marker is only consumed on a real
     // process start.
     writeCleanStop(path.join(workspaceRoot, ".tmp"));
+    clearRotationStaleWatch(); // #315: the per-agent watch dies with the session
     if (typingTimer) {
       clearInterval(typingTimer);
       typingTimer = null;

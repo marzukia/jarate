@@ -8,10 +8,13 @@ import {
   setChannelCursor,
 } from "./discord";
 import {
+  ASK_SELF_CHECK_WINDOW_MS,
   assembleDoc,
   buildHandover,
   buildHeader,
   buildSeedKickoff,
+  type ChannelHistoryMessage,
+  docAsksIsNone,
   type ExtractCtxState,
   estTokens,
   extractDeterministic,
@@ -37,7 +40,9 @@ import {
   parsePriorTags,
   renderDeterministic,
   resolveHandoffSettings,
+  runSessionStartAskCheck,
   serializeTranscript,
+  sessionStartAskFlag,
   shouldHandoff,
   sizeGuard,
   splitDoc,
@@ -2536,5 +2541,366 @@ describe("auto-compact token-% gate", () => {
     await flushMacrotasks();
     expect(compacts).toBe(1);
     expect(isCompacting("ch1")).toBe(false);
+  });
+});
+
+// ─── #315 P1: amnesia guards (doc write + session start) ───────────────
+
+describe("#315 P1: docAsksIsNone", () => {
+  const doc = (asks: string) =>
+    [
+      "# Handover - 2026-11-01 · session x · 100k tokens → handoff",
+      "",
+      "## Last user asks",
+      asks,
+      "",
+      "<read-files>",
+      "</read-files>",
+      "<modified-files>",
+      "</modified-files>",
+    ].join("\n");
+  test("(none) → true; a listed ask → false; missing section → false", () => {
+    expect(docAsksIsNone(doc("(none)"))).toBe(true);
+    expect(docAsksIsNone(doc("1. do the thing"))).toBe(false);
+    expect(
+      docAsksIsNone(
+        "# Handover\n\n<read-files>\n</read-files>\n<modified-files>\n</modified-files>",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("#315 P1: sessionStartAskFlag (the exact condition)", () => {
+  const docNone = [
+    "# Handover - 2026-11-01 · session x · 100k tokens → handoff",
+    "",
+    "## Last user asks",
+    "(none)",
+    "",
+    "<read-files>",
+    "</read-files>",
+    "<modified-files>",
+    "</modified-files>",
+  ].join("\n");
+  const docListed = docNone.replace("(none)", "1. do the thing");
+  const t = 1_762_000_000_000;
+  const op = (ts: number, id = "op1"): ChannelHistoryMessage => ({
+    ts,
+    bot: false,
+    webhook: false,
+    authorId: id,
+  });
+  const bot = (ts: number, id: string): ChannelHistoryMessage => ({
+    ts,
+    bot: true,
+    webhook: false,
+    authorId: id,
+  });
+  const wake = (ts: number, id: string): ChannelHistoryMessage => ({
+    ts,
+    bot: true,
+    webhook: true,
+    authorId: id,
+  });
+
+  test("doc (none) + unanswered operator message < 30 min old = flag", () => {
+    const line = sessionStartAskFlag(docNone, [op(t - 10 * 60_000)], "bot1", t);
+    expect(line).toContain("1 unanswered operator message(s)");
+    expect(line).toContain("issue #315 P1");
+  });
+  test("answered (a bot post by the bot after it) → null", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - 10 * 60_000), bot(t - 9 * 60_000, "bot1")],
+        "bot1",
+        t,
+      ),
+    ).toBeNull();
+  });
+  test("a machine-wake card after it is not an answer (bot id known) → flag", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - 10 * 60_000), wake(t - 9 * 60_000, "wk1")],
+        "bot1",
+        t,
+      ),
+    ).not.toBeNull();
+  });
+  test("a different bot's post is not an answer (bot id known) → flag", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - 10 * 60_000), bot(t - 9 * 60_000, "otherbot")],
+        "bot1",
+        t,
+      ),
+    ).not.toBeNull();
+  });
+  test("bot id unknown: a non-webhook bot post counts as an answer → null", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - 10 * 60_000), bot(t - 9 * 60_000, "bot1")],
+        null,
+        t,
+      ),
+    ).toBeNull();
+  });
+  test("bot id unknown: a webhook card does not count → flag", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - 10 * 60_000), wake(t - 9 * 60_000, "wk1")],
+        null,
+        t,
+      ),
+    ).not.toBeNull();
+  });
+  test("a 45 min old operator message (outside the 30 min window) → null", () => {
+    expect(
+      sessionStartAskFlag(docNone, [op(t - 45 * 60_000)], "bot1", t),
+    ).toBeNull();
+  });
+  test("an operator message exactly 30 min old is outside (strict <) → null", () => {
+    expect(
+      sessionStartAskFlag(
+        docNone,
+        [op(t - ASK_SELF_CHECK_WINDOW_MS)],
+        "bot1",
+        t,
+      ),
+    ).toBeNull();
+  });
+  test("the doc lists an ask (not (none)) → null even when unanswered", () => {
+    expect(
+      sessionStartAskFlag(docListed, [op(t - 10 * 60_000)], "bot1", t),
+    ).toBeNull();
+  });
+  test("an unparseable ts (NaN) is excluded → null", () => {
+    const bad: ChannelHistoryMessage = {
+      ts: NaN,
+      bot: false,
+      webhook: false,
+      authorId: "op1",
+    };
+    expect(sessionStartAskFlag(docNone, [bad], "bot1", t)).toBeNull();
+  });
+});
+
+describe("#315 P1: buildHandover doc-write self-check (INCOMPLETE-ASKS)", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-315-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    storeDir = path.join(tmp, "handovers");
+  });
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const settings = (over: Partial<HandoffSettings> = {}): HandoffSettings => ({
+    ...HANDOFF_DEFAULTS,
+    storeDir,
+    enabled: true,
+    ...over,
+  });
+  const ctx: any = {
+    cwd: tmp,
+    model: { id: "m", name: "M", provider: "p" },
+    modelRegistry: {},
+    sessionManager: {
+      getSessionFile: () => null,
+      getSessionId: () => "sess-315",
+      getEntries: () => new Array(5).fill({ type: "message" }),
+    },
+    getContextUsage: () => ({
+      tokens: 200_000,
+      contextWindow: 262_144,
+      percent: 90,
+    }),
+  };
+
+  const human = (id: string, body: string, ts: number) => ({
+    id,
+    type: "custom_message",
+    customType: "channel-inbound",
+    timestamp: new Date(ts).toISOString(),
+    content: `<channel-ctx type="discord" from="op1">ctx</channel-ctx>\n\n${body}`,
+    details: { body },
+  });
+  const assistant = (id: string, ts: number) => ({
+    id,
+    type: "message",
+    timestamp: new Date(ts).toISOString(),
+    message: { role: "assistant", content: "reply" },
+  });
+
+  test("an in-window unanswered ask is listed by the extraction → no mismatch, no tag", async () => {
+    const t = Date.now();
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [human("h1", "do the thing", t - 5 * 60_000)] as any[],
+      ctx,
+      settings: settings(),
+      now: new Date(t),
+    });
+    expect(doc).not.toContain("INCOMPLETE-ASKS");
+    expect(loadPreviousHandover({ storeDir })).not.toContain("INCOMPLETE-ASKS");
+  });
+  test("an answered in-window ask (an assistant entry after it) + no other branch asks → no mismatch (the span fallback is not windowed)", async () => {
+    const t = Date.now();
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [
+        human("h1", "do the thing", t - 5 * 60_000),
+        assistant("a1", t - 4 * 60_000),
+      ] as any[],
+      ctx,
+      settings: settings(),
+      now: new Date(t),
+    });
+    expect(doc).not.toContain("INCOMPLETE-ASKS");
+  });
+  test("an ask outside the 30 min window (still listed by the extraction) → mismatch → warn + INCOMPLETE-ASKS tag on the written doc", async () => {
+    const t = Date.now();
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [human("h1", "do the thing", t - 40 * 60_000)] as any[],
+      ctx,
+      settings: settings(),
+      now: new Date(t),
+    });
+    expect(doc).toContain("INCOMPLETE-ASKS");
+    expect(loadPreviousHandover({ storeDir })).toContain("INCOMPLETE-ASKS");
+  });
+  test("three in-window unanswered asks (the doc caps at 2) → expected 2 = listed 2 → no tag", async () => {
+    const t = Date.now();
+    const doc = await buildHandover({
+      preparation: basePrep(),
+      branchEntries: [
+        human("h1", "a", t - 29 * 60_000),
+        human("h2", "b", t - 20 * 60_000),
+        human("h3", "c", t - 10 * 60_000),
+      ] as any[],
+      ctx,
+      settings: settings(),
+      now: new Date(t),
+    });
+    expect(doc).not.toContain("INCOMPLETE-ASKS");
+  });
+});
+
+describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  let sentBodies: string[] = [];
+  const realFetch = globalThis.fetch;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-315w-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, "home", ".pi", "agent"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, "home", ".pi", "agent", "settings.json"),
+      JSON.stringify({ handoff: { storeDir: path.join(tmp, "handovers") } }),
+    );
+    storeDir = path.join(tmp, "handovers");
+    fs.mkdirSync(storeDir, { recursive: true });
+    sentBodies = [];
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.includes("/messages?limit=")) {
+        // the history fetch: one unanswered operator message 10 min ago
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              id: "m1",
+              timestamp: new Date(Date.now() - 10 * 60_000).toISOString(),
+              author: { id: "op1", bot: false },
+            },
+          ],
+          text: async () => "",
+        };
+      }
+      if (init?.method === "POST" && u.endsWith("/messages")) {
+        sentBodies.push(String(init?.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "out1" }),
+          text: async () => "",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }) as any;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const ch = {
+    id: "ch1",
+    name: "Test",
+    type: "discord" as const,
+    enabled: true,
+    channel: "12345",
+    botToken: "tok1",
+  };
+  const writeDoc = (asks: string) => {
+    const doc = [
+      "# Handover - 2026-11-01 · session x · 100k tokens → handoff",
+      "",
+      "## Last user asks",
+      asks,
+      "",
+      "<read-files>",
+      "</read-files>",
+      "<modified-files>",
+      "</modified-files>",
+    ].join("\n");
+    fs.writeFileSync(path.join(storeDir, "20261101-0700-x.md"), doc);
+    fs.writeFileSync(
+      path.join(storeDir, "latest.md"),
+      `# Handover pointer\npath: ${path.join(storeDir, "20261101-0700-x.md")}\nupdated: 2026-11-01T07:00:00Z\n`,
+    );
+  };
+
+  test("doc (none) + an unanswered operator message < 30 min in history → say to the channel", async () => {
+    writeDoc("(none)");
+    await runSessionStartAskCheck(tmp, [ch] as any);
+    expect(sentBodies.length).toBe(1);
+    expect(sentBodies[0]).toContain("issue #315 P1");
+  });
+  test("no doc in the store → no fetch, no say", async () => {
+    let historyFetched = false;
+    const probe = globalThis.fetch;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      if (String(url).includes("/messages?limit=")) historyFetched = true;
+      return (probe as any)(url, init);
+    }) as any;
+    await runSessionStartAskCheck(tmp, [ch] as any);
+    expect(historyFetched).toBe(false);
+    expect(sentBodies.length).toBe(0);
+  });
+  test("the doc lists an ask (not (none)) → no say", async () => {
+    writeDoc("1. do the thing");
+    await runSessionStartAskCheck(tmp, [ch] as any);
+    expect(sentBodies.length).toBe(0);
   });
 });
