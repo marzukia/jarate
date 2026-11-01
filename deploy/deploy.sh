@@ -24,8 +24,11 @@
 # broken commit otherwise re-deploys, re-rolls-back and re-restarts
 # pi.service every timer tick.
 #
-# .deploy-state: line 1 = deployed commit, line 2 (optional) =
-# "<failed-commit> <consecutive-fails>".
+# Expiry (#319): the skip is not forever — line 2 carries the first-fail epoch, and after JARATE_BACKOFF_MAX_AGE_S (default 1h) the tick forces a deploy attempt; a legacy line without a timestamp is expired (unknown age).
+#
+# Liveness (#319): the pi liveness check runs EVERY tick, before the fetch, backoff, and up-to-date exits — a backed-off tick still sees a dead pi (the 2026-11-01 franky incident); consecutive down ticks are counted in state line 3, and on the 3rd consecutive down tick (> 2, per the #319 design) the tick restarts pi.service and logs one PAGE line per episode (the operator net is the hall-monitor liveness sweep).
+#
+# .deploy-state: line 1 = deployed commit, line 2 (optional) = "<failed-commit> <consecutive-fails> [first-fail-epoch]", line 3 (optional) = "pi-down <n>".
 #
 # Only bash + git + bun + systemctl/journalctl (user) are required.
 
@@ -48,6 +51,8 @@ LOCK_FILE="${JARATE_DEPLOY_LOCK:-/run/user/$(id -u)/jarate-deploy.lock}"
 LOG_DIR="$HOME/.local/share/jarate/logs"
 LOG_FILE="$LOG_DIR/deploy-$(date '+%Y%m%d-%H%M%S').log"
 GATE_TIMEOUT_S="${JARATE_GATE_TIMEOUT_S:-90}"
+# #319: backoff expiry in seconds; the backoff re-arms per forced attempt.
+BACKOFF_MAX_AGE_S="${JARATE_BACKOFF_MAX_AGE_S:-3600}"
 
 mkdir -p "$LOG_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -58,7 +63,7 @@ GATE_REASON=""
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "DEPLOY FAIL: $*"; exit 1; }
 
-# state helpers: line 1 = deployed commit, line 2 = "<commit> <fails>"
+# state helpers: line 1 = deployed commit, line 2 = "<commit> <fails> [ts]", line 3 = "pi-down <n>" (all-but-line-1 optional).
 state_deployed() { sed -n 1p "$STATE_FILE" 2>/dev/null | tr -d '[:space:]'; }
 state_fail_commit() { sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $1}'; }
 state_fail_count() {
@@ -66,14 +71,29 @@ state_fail_count() {
   n="$(sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $2}')"
   [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '0'
 }
+state_fail_ts() {
+  local t
+  t="$(sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $3}')"
+  [[ "$t" =~ ^[0-9]+$ ]] && printf '%s' "$t" || printf ''
+}
+state_pi_down() {
+  local n
+  n="$(sed -n 3p "$STATE_FILE" 2>/dev/null | awk '{print $2}')"
+  [[ "$n" =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '0'
+}
 
 # record_fail <tried-commit> <deployed-after>: bump the same-commit
 # fail counter (line 2) and record what is actually deployed (line 1).
+#
+# #319: line 2 gains the fail epoch (backoff expiry clock); line 3 (the pi-down counter) is preserved. A missing state file must not abort the handler under set -e (the fail is the whole point of the handler).
 record_fail() {
   local tried="$1" deployed_after="$2"
-  local cur=0
+  local cur=0 down_line=""
   [[ "$(state_fail_commit)" == "$tried" ]] && cur="$(state_fail_count)"
-  printf '%s\n%s %s\n' "$deployed_after" "$tried" "$((cur + 1))" >"$STATE_FILE"
+  down_line="$(sed -n 3p "$STATE_FILE" 2>/dev/null || true)"
+  printf '%s\n%s %s %s\n' "$deployed_after" "$tried" "$((cur + 1))" "$(date +%s)" >"$STATE_FILE"
+  if [[ -n "$down_line" ]]; then printf '%s\n' "$down_line" >>"$STATE_FILE"; fi
+  return 0
 }
 
 # --- health gate -------------------------------------------------------------
@@ -146,6 +166,45 @@ rollback() {
   exit 2
 }
 
+# --- liveness (#319 guard 1: decoupled from the commit backoff) -------------
+#
+# Runs EVERY tick, before any exit that would skip the rest of the tick. Best-effort: a liveness failure must never kill the tick.
+liveness_check() {
+  local active down=0
+  active="$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)"
+  if [[ "$active" != "active" && "$active" != "activating" ]]; then
+    down="$(( $(state_pi_down) + 1 ))"
+    if (( down == 3 )); then
+      log "PAGE: $SERVICE down $down consecutive ticks; restarting"
+      systemctl --user start "$SERVICE" 2>/dev/null \
+        || log "PAGE: restart $SERVICE failed (unit or bus error)"
+    fi
+  fi
+  # Persist line 3 only while the file carries content: a fresh checkout without a state file has no counter to keep (its first tick deploys, which stop/starts + gates the service regardless); an absent line 2 gets an empty placeholder so the line-2 helpers never read line 3.
+  if [[ -s "$STATE_FILE" ]]; then
+    local l3
+    l3="$(sed -n 3p "$STATE_FILE" 2>/dev/null)"
+    if (( down > 0 )); then
+      local head
+      head="$(sed -n '1,2p' "$STATE_FILE")"
+      if [[ -z "$(sed -n 2p "$STATE_FILE")" && -n "$(sed -n 1p "$STATE_FILE")" ]]; then
+        head="${head}"$'\n'
+      fi
+      printf '%s\npi-down %s\n' "$head" "$down" >"$STATE_FILE"
+    elif [[ "$l3" == pi-down* ]]; then
+      local l1 l2
+      l1="$(sed -n 1p "$STATE_FILE")"
+      l2="$(sed -n 2p "$STATE_FILE")"
+      if [[ -n "$l2" ]]; then
+        printf '%s\n%s\n' "$l1" "$l2" >"$STATE_FILE"
+      else
+        printf '%s\n' "$l1" >"$STATE_FILE"
+      fi
+    fi
+  fi
+  return 0
+}
+
 # --- main --------------------------------------------------------------------
 
 main() {
@@ -166,6 +225,9 @@ main() {
     log "another deploy holds $LOCK_FILE; skipping this tick"
     exit 0
   fi
+
+  # #319 guard 1: pi liveness on EVERY tick, before the fetch, backoff, and up-to-date exits.
+  liveness_check
 
   git fetch origin
   local new_commit
@@ -189,11 +251,17 @@ main() {
     log "no $STATE_FILE yet; assuming current HEAD ($prev_commit) is deployed"
   fi
 
-  # Backoff: 3+ consecutive fails on the SAME commit -> skip the tick
-  # (single log line) until the commit changes or --force.
+  # Backoff: 3+ consecutive fails on the SAME commit -> skip the tick (single log line) until the commit changes, the backoff expires, or --force. #319 guard 2: expiry — past BACKOFF_MAX_AGE_S the tick forces a deploy attempt; a legacy line without a timestamp is expired (unknown age).
   if [[ $FORCE -eq 0 && "$fail_commit" == "$new_commit" && $fails -ge 3 ]]; then
-    log "backoff: $fails consecutive fails on $new_commit; skipping tick (deploy --force to override)"
-    exit 0
+    local fail_ts now_s age_str
+    fail_ts="$(state_fail_ts)"
+    now_s="$(date +%s)"
+    if [[ -n "$fail_ts" ]] && (( now_s - fail_ts < BACKOFF_MAX_AGE_S )); then
+      log "backoff: $fails consecutive fails on $new_commit (age $(( now_s - fail_ts ))s < $BACKOFF_MAX_AGE_S s); skipping tick (deploy --force to override)"
+      exit 0
+    fi
+    if [[ -n "$fail_ts" ]]; then age_str="$(( now_s - fail_ts ))s"; else age_str="unknown"; fi
+    log "backoff expired ($fails fails on $new_commit, age $age_str); forcing deploy attempt"
   fi
 
   # A non-zero exit records the failed attempt (backoff counter) and
