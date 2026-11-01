@@ -23,20 +23,12 @@
 # stop the tick (one log line) until the commit changes or --force — a
 # broken commit otherwise re-deploys, re-rolls-back and re-restarts
 # pi.service every timer tick.
-# Expiry (#319): the skip is not forever — line 2 carries the first-fail
-# epoch, and after JARATE_BACKOFF_MAX_AGE_S (default 1h) the tick forces a
-# deploy attempt. A legacy line without a timestamp is expired (unknown age).
 #
-# Liveness (#319): the pi liveness check runs EVERY tick, before the fetch,
-# backoff, and up-to-date exits — a backed-off tick still sees a dead pi
-# (2026-11-01 franky incident: backoff skipped the tick, pi died, nothing
-# restarted it). Consecutive down ticks are counted (state line 3); on the
-# 3rd (> 2, per the #319 design) the tick restarts pi.service and logs one
-# PAGE line per episode (the operator net is the hall-monitor liveness sweep).
+# Expiry (#319): the skip is not forever — line 2 carries the first-fail epoch, and after JARATE_BACKOFF_MAX_AGE_S (default 1h) the tick forces a deploy attempt; a legacy line without a timestamp is expired (unknown age).
 #
-# .deploy-state: line 1 = deployed commit, line 2 (optional) =
-# "<failed-commit> <consecutive-fails> [first-fail-epoch]", line 3
-# (optional) = "pi-down <n>".
+# Liveness (#319): the pi liveness check runs EVERY tick, before the fetch, backoff, and up-to-date exits — a backed-off tick still sees a dead pi (the 2026-11-01 franky incident); consecutive down ticks are counted in state line 3, and on the 3rd consecutive down tick (> 2, per the #319 design) the tick restarts pi.service and logs one PAGE line per episode (the operator net is the hall-monitor liveness sweep).
+#
+# .deploy-state: line 1 = deployed commit, line 2 (optional) = "<failed-commit> <consecutive-fails> [first-fail-epoch]", line 3 (optional) = "pi-down <n>".
 #
 # Only bash + git + bun + systemctl/journalctl (user) are required.
 
@@ -71,8 +63,7 @@ GATE_REASON=""
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "DEPLOY FAIL: $*"; exit 1; }
 
-# state helpers: line 1 = deployed commit, line 2 = "<commit> <fails> [ts]",
-# line 3 = "pi-down <n>" (all-but-line-1 optional).
+# state helpers: line 1 = deployed commit, line 2 = "<commit> <fails> [ts]", line 3 = "pi-down <n>" (all-but-line-1 optional).
 state_deployed() { sed -n 1p "$STATE_FILE" 2>/dev/null | tr -d '[:space:]'; }
 state_fail_commit() { sed -n 2p "$STATE_FILE" 2>/dev/null | awk '{print $1}'; }
 state_fail_count() {
@@ -93,13 +84,13 @@ state_pi_down() {
 
 # record_fail <tried-commit> <deployed-after>: bump the same-commit
 # fail counter (line 2) and record what is actually deployed (line 1).
-# #319: line 2 gains the fail epoch (backoff expiry clock); line 3 (the
-# pi-down counter) is preserved.
+#
+# #319: line 2 gains the fail epoch (backoff expiry clock); line 3 (the pi-down counter) is preserved. A missing state file must not abort the handler under set -e (the fail is the whole point of the handler).
 record_fail() {
   local tried="$1" deployed_after="$2"
   local cur=0 down_line=""
   [[ "$(state_fail_commit)" == "$tried" ]] && cur="$(state_fail_count)"
-  down_line="$(sed -n 3p "$STATE_FILE" 2>/dev/null)"
+  down_line="$(sed -n 3p "$STATE_FILE" 2>/dev/null || true)"
   printf '%s\n%s %s %s\n' "$deployed_after" "$tried" "$((cur + 1))" "$(date +%s)" >"$STATE_FILE"
   if [[ -n "$down_line" ]]; then printf '%s\n' "$down_line" >>"$STATE_FILE"; fi
   return 0
@@ -189,10 +180,7 @@ liveness_check() {
         || log "PAGE: restart $SERVICE failed (unit or bus error)"
     fi
   fi
-  # Persist line 3 only while the file carries content: a fresh checkout
-  # without a state file has no counter to keep (its first tick deploys,
-  # which stop/starts + gates the service regardless). An absent line 2
-  # gets an empty placeholder so the line-2 helpers never read line 3.
+  # Persist line 3 only while the file carries content: a fresh checkout without a state file has no counter to keep (its first tick deploys, which stop/starts + gates the service regardless); an absent line 2 gets an empty placeholder so the line-2 helpers never read line 3.
   if [[ -s "$STATE_FILE" ]]; then
     local l3
     l3="$(sed -n 3p "$STATE_FILE" 2>/dev/null)"
