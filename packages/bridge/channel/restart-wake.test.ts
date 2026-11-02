@@ -10,15 +10,21 @@ import {
   elapsedSeconds,
   elapsedStr,
   MAX_INFLIGHT,
+  markWakePosted,
   postWakePayload,
   type RunRecord,
   readCleanStop,
   readRunRecords,
   runRestartWake,
   selectInflight,
-  WAKE_DEDUP_WINDOW_MS,
+  WAKE_AUDIT_WINDOW_MS,
+  WAKE_DEDUP_POSTED_WINDOW_MS,
   type WakePayload,
   type WakeTarget,
+  wakeAuditEvaluate,
+  wakeAuditInit,
+  wakeAuditOutcome,
+  wakeAuditStart,
   writeCleanStop,
 } from "./restart-wake";
 
@@ -267,20 +273,31 @@ describe("clean-stop marker (issue #111)", () => {
   });
 });
 
-// ─── startup dedup (30min window, class-aware — #306) ───────────────────
+// ─── startup dedup (#322 G3: <epoch-ms> <class> <posted:0|1>) ─────────
 
-describe("claimWake dedup (issue #111)", () => {
-  test("first claim wins; racing start within 60s loses", () => {
-    expect(claimWake(tmp, T0)).toBe(true);
-    expect(claimWake(tmp, T0 + 59_000)).toBe(false);
-    // a crash at T0+30s that never posted: the next start after the
-    // window still claims
-    expect(claimWake(tmp, T0 + WAKE_DEDUP_WINDOW_MS + 1)).toBe(true);
+describe("claimWake dedup (#322 G3)", () => {
+  test("first claim wins; an UNPOSTED claim never suppresses (crash between claim and post)", () => {
+    expect(claimWake(tmp, T0)).toEqual({ claimed: true, prev: null });
+    // the prior claim never posted: the next start 10s later takes over
+    expect(claimWake(tmp, T0 + 10_000).claimed).toBe(true);
   });
 
-  test("stale claim (>= 60s old) is taken over", () => {
-    expect(claimWake(tmp, T0)).toBe(true);
-    expect(claimWake(tmp, T0 + WAKE_DEDUP_WINDOW_MS)).toBe(true);
+  test("a POSTED claim in-window (<= 5m) suppresses, older than the window posts", () => {
+    expect(claimWake(tmp, T0)).toEqual({ claimed: true, prev: null });
+    expect(markWakePosted(tmp, T0, "planned")).toBe(true);
+    const suppressed = claimWake(tmp, T0 + 4 * 60_000);
+    expect(suppressed.claimed).toBe(false);
+    expect(suppressed.prev).toEqual({ t: T0, klass: "planned", posted: true });
+    // past the window: take over
+    expect(
+      claimWake(tmp, T0 + WAKE_DEDUP_POSTED_WINDOW_MS + 10_000).claimed,
+    ).toBe(true);
+  });
+
+  test("posted claim exactly at the window edge is taken over", () => {
+    claimWake(tmp, T0);
+    markWakePosted(tmp, T0, "planned");
+    expect(claimWake(tmp, T0 + WAKE_DEDUP_POSTED_WINDOW_MS).claimed).toBe(true);
   });
 
   test("unreadable claim content = assume held (no post)", () => {
@@ -289,36 +306,62 @@ describe("claimWake dedup (issue #111)", () => {
       path.join(tmp, "restart-wake.lock"),
       "\u0000garbage\u0000",
     );
-    expect(claimWake(tmp, T0)).toBe(false);
+    const r = claimWake(tmp, T0);
+    expect(r.claimed).toBe(false);
+    expect(r.prev).not.toBeNull();
     // and the foreign claim file is left in place (not torn down)
     expect(fs.existsSync(path.join(tmp, "restart-wake.lock"))).toBe(true);
   });
 
-  test("a crash after claiming eats the window, then it opens again", () => {
-    // start claims, dies before posting (lock file stays, fresh ts)
-    expect(claimWake(tmp, T0)).toBe(true);
-    // another start 10s later sees the fresh claim: no double post
-    expect(claimWake(tmp, T0 + 10_000)).toBe(false);
-    // after the 60s window the claim is stale: next start takes over
-    expect(claimWake(tmp, T0 + WAKE_DEDUP_WINDOW_MS + 10_000)).toBe(true);
+  test("class-aware: a different restart class always takes over (crash signal never suppressed)", () => {
+    claimWake(tmp, T0, "planned");
+    markWakePosted(tmp, T0, "planned");
+    expect(claimWake(tmp, T0 + 10_000, "unclean").claimed).toBe(true);
   });
 
-  test("#306: two clean (planned) startups 21.7min apart → one card", () => {
-    expect(claimWake(tmp, T0, "planned")).toBe(true);
-    // the observed evidence gap: 21.7min, same class → deduped
-    expect(claimWake(tmp, T0 + 21 * 60_000 + 43_000, "planned")).toBe(false);
-    // an UNPLANNED start (crash) in the same window still posts — the
-    // crash signal is not suppressed by the earlier planned card
-    expect(claimWake(tmp, T0 + 25 * 60_000, "unclean")).toBe(true);
-    // a fresh planned restart after the class change posts again
-    expect(claimWake(tmp, T0 + 40 * 60_000, "planned")).toBe(true);
+  test("#306 21.7min double-post signature no longer suppresses: the 5m window is sized to the crash-flap class (a suppressed start is at most a duplicate card, G1 logs it)", () => {
+    claimWake(tmp, T0, "planned");
+    markWakePosted(tmp, T0, "planned");
+    expect(claimWake(tmp, T0 + 21 * 60_000 + 43_000, "planned").claimed).toBe(
+      true,
+    );
   });
 
-  test("#306: legacy lock (no class) dedupes conservatively", () => {
+  test("legacy 2-field and 1-field claims are posted=0: they never suppress", () => {
     fs.mkdirSync(tmp, { recursive: true });
+    fs.writeFileSync(path.join(tmp, "restart-wake.lock"), `${T0} planned\n`);
+    expect(claimWake(tmp, T0 + 10_000, "planned").claimed).toBe(true);
+    // the original 1-field legacy format (no class)
     fs.writeFileSync(path.join(tmp, "restart-wake.lock"), `${T0}\n`);
-    expect(claimWake(tmp, T0 + 10_000, "planned")).toBe(false);
-    expect(claimWake(tmp, T0 + 10_000, "unclean")).toBe(false);
+    expect(claimWake(tmp, T0 + 10_000, "unclean").claimed).toBe(true);
+  });
+});
+
+describe("markWakePosted (#322 G3)", () => {
+  test("sets posted=1 on the matching claim (atomic)", () => {
+    claimWake(tmp, T0, "planned");
+    expect(markWakePosted(tmp, T0, "planned")).toBe(true);
+    expect(fs.readFileSync(path.join(tmp, "restart-wake.lock"), "utf8")).toBe(
+      `${T0} planned 1\n`,
+    );
+  });
+
+  test("never flips a taken-over file (different epoch)", () => {
+    claimWake(tmp, T0, "planned");
+    expect(markWakePosted(tmp, T0 + 5_000, "planned")).toBe(false);
+  });
+
+  test("missing claim file = false (never throws)", () => {
+    expect(markWakePosted(tmp, T0, "planned")).toBe(false);
+  });
+
+  test("a legacy 2-field own claim (epoch+class match) gets the posted flag", () => {
+    fs.mkdirSync(tmp, { recursive: true });
+    fs.writeFileSync(path.join(tmp, "restart-wake.lock"), `${T0} planned\n`);
+    expect(markWakePosted(tmp, T0, "planned")).toBe(true);
+    expect(fs.readFileSync(path.join(tmp, "restart-wake.lock"), "utf8")).toBe(
+      `${T0} planned 1\n`,
+    );
   });
 });
 
@@ -542,7 +585,7 @@ describe("runRestartWake (issue #111)", () => {
     expect(posted.embeds).toBeUndefined();
   });
 
-  test("dedup: second startup within 60s does not post", async () => {
+  test("dedup: second startup within the 5m window of a posted claim does not post", async () => {
     const { impl, calls } = fakeFetch([200, 200]);
     const a = await runRestartWake({
       reason: "startup",
@@ -587,6 +630,296 @@ describe("runRestartWake (issue #111)", () => {
       log: (l) => log.push(l),
     });
     expect(r).toMatchObject({ posted: false, reason: "post-failed" });
-    expect(log.join(" ")).toContain("post failed");
+    expect(log.join(" ")).toContain("post-failed");
+  });
+
+  test("G3: a failed post leaves the claim unposted — the next start in-window still posts", async () => {
+    const boom = [500, 500, 500, 500, 500, 500, 200]; // 6 failures, then success
+    const { impl, calls } = fakeFetch(boom);
+    const postOpts = { backoffMs: 1, timeoutMs: 50 };
+    const a = await runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      now: T0,
+      fetchImpl: impl,
+      postOpts,
+      log: (l) => log.push(l),
+    });
+    expect(a).toMatchObject({ posted: false, reason: "post-failed" });
+    const b = await runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      now: T0 + 30_000,
+      fetchImpl: impl,
+      postOpts,
+      log: (l) => log.push(l),
+    });
+    expect(b.posted).toBe(true);
+    expect(calls).toHaveLength(7); // the signal cannot go dark twice in a row
+  });
+
+  test("G3: a legacy 2-field claim does not suppress", async () => {
+    fs.mkdirSync(stateDir(), { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir(), "restart-wake.lock"),
+      `${T0} planned\n`,
+    );
+    const { impl, calls } = fakeFetch([200]);
+    const r = await runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      now: T0 + 10_000,
+      fetchImpl: impl,
+      log: (l) => log.push(l),
+    });
+    expect(r.posted).toBe(true);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("G3: posted claim <= 5m old suppresses; posted claim > 5m old posts", async () => {
+    const { impl, calls } = fakeFetch([200, 200]);
+    const base = {
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      fetchImpl: impl,
+      log: (l: string) => log.push(l),
+    };
+    await runRestartWake({ ...base, reason: "startup", now: T0 });
+    // 4m after the post: in-window, same class, posted -> suppressed
+    const b = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: T0 + 4 * 60_000,
+    });
+    expect(b).toMatchObject({ posted: false, reason: "dedup" });
+    // 6m after the post: the window is over -> posts
+    const c = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: T0 + 6 * 60_000,
+    });
+    expect(c.posted).toBe(true);
+    expect(calls).toHaveLength(2);
+  });
+});
+
+// ─── #322 G1: every terminal reason logs one line ────────────────────
+
+describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
+  const runDir = () => path.join(tmp, "runs");
+  const stateDir = () => path.join(tmp, ".tmp");
+  const target: WakeTarget = { channelId: "1", botToken: "tok" };
+  let log: string[];
+  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
+
+  beforeEach(() => {
+    log = [];
+    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+  });
+
+  afterEach(() => {
+    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
+    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
+  });
+
+  const run = (over: Partial<Parameters<typeof runRestartWake>[0]>) =>
+    runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      now: T0,
+      log: (l) => log.push(l),
+      ...over,
+    } as Parameters<typeof runRestartWake>[0]);
+
+  // the five terminal tokens; each startup must end in exactly one
+  const terminalTokens =
+    /not-startup|no-channel|dedup suppressed|posted:|post-failed/;
+
+  test("not-startup logs its reason", async () => {
+    await run({ reason: "reload" });
+    expect(log.join("\n")).toContain("[wake] not-startup: reason=reload");
+  });
+
+  test("no-channel logs its reason", async () => {
+    await run({ target: null });
+    expect(log.join("\n")).toContain("[wake] no-channel");
+  });
+
+  test("posted logs its reason", async () => {
+    const { impl } = fakeFetch([200]);
+    await run({ fetchImpl: impl });
+    expect(log.join("\n")).toContain("[wake] posted: class=unclean");
+  });
+
+  test("post-failed logs its reason", async () => {
+    const { impl } = fakeFetch([500, 500, 500, 500, 500, 500]);
+    await run({ fetchImpl: impl, postOpts: { backoffMs: 1, timeoutMs: 50 } });
+    expect(log.join("\n")).toContain("[wake] post-failed");
+  });
+
+  test("dedup suppresses with the G1 line: age and same-class values are correct", async () => {
+    const { impl } = fakeFetch([200, 200]);
+    await run({ fetchImpl: impl });
+    log = [];
+    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    expect(b).toMatchObject({ posted: false, reason: "dedup" });
+    // the dedup path logs EXACTLY one line, with the prior claim's age
+    // and its same-class verdict
+    expect(log).toEqual(["[wake] dedup suppressed: age=30000 same-class=true"]);
+  });
+
+  test("every startup ends in exactly one terminal line (grep-able)", async () => {
+    const cases: Array<{ label: string; over: Record<string, unknown> }> = [
+      { label: "not-startup", over: { reason: "reload" } },
+      { label: "no-channel", over: { target: null } },
+      { label: "posted", over: {} },
+      {
+        label: "post-failed",
+        over: { postOpts: { backoffMs: 1, timeoutMs: 50 } },
+      },
+    ];
+    for (const c of cases) {
+      // fresh state dir per case: the claim file must not leak across
+      const sd = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-g1-"));
+      try {
+        const { impl } = fakeFetch(
+          c.label === "posted" ? [200] : [500, 500, 500, 500, 500, 500],
+        );
+        log = [];
+        await runRestartWake({
+          reason: "startup",
+          stateDir: sd,
+          runDir: runDir(),
+          target,
+          now: T0,
+          fetchImpl: impl,
+          log: (l) => log.push(l),
+          ...c.over,
+        });
+        const hits = log.filter((l) => terminalTokens.test(l));
+        expect(hits, c.label).toHaveLength(1);
+      } finally {
+        fs.rmSync(sd, { recursive: true, force: true });
+      }
+    }
+    // the dedup branch: one state dir, posted first start, second start
+    const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-g1-"));
+    try {
+      const { impl: impl2 } = fakeFetch([200, 200]);
+      log = [];
+      await runRestartWake({
+        reason: "startup",
+        stateDir: fresh,
+        runDir: runDir(),
+        target,
+        now: T0,
+        fetchImpl: impl2,
+        log: (l) => log.push(l),
+      });
+      log = [];
+      await runRestartWake({
+        reason: "startup",
+        stateDir: fresh,
+        runDir: runDir(),
+        target,
+        now: T0 + 30_000,
+        fetchImpl: impl2,
+        log: (l) => log.push(l),
+      });
+      expect(log.filter((l) => terminalTokens.test(l))).toHaveLength(1);
+      expect(log.join("\n")).toContain("dedup suppressed");
+    } finally {
+      fs.rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── #322 G2: per-window numeric audit (no inference) ──────────────────
+
+describe("wake audit G2 (issue #322)", () => {
+  const W = WAKE_AUDIT_WINDOW_MS;
+
+  test("invariant holds: no flag when every startup has a terminal outcome", () => {
+    const s = wakeAuditInit();
+    const ws = 100 * W;
+    expect(wakeAuditStart(s, ws + 10_000)).toBeNull();
+    wakeAuditOutcome(s, "posted");
+    expect(wakeAuditStart(s, ws + 20_000)).toBeNull();
+    wakeAuditOutcome(s, "dedup");
+    // window roll evaluates the closed window: 2 starts == 2 accounted
+    expect(wakeAuditStart(s, ws + W + 1_000)).toBeNull();
+    wakeAuditOutcome(s, "posted"); // balance the new window
+    expect(wakeAuditEvaluate(s)).toBeNull();
+  });
+
+  test("violation: a startup with no terminal outcome -> one deterministic flag line", () => {
+    const s = wakeAuditInit();
+    const ws = 100 * W;
+    wakeAuditStart(s, ws + 10_000); // start with no outcome (the gap)
+    wakeAuditStart(s, ws + 20_000);
+    wakeAuditOutcome(s, "posted"); // only one accounted
+    const flag = wakeAuditStart(s, ws + W + 1_000); // closes the window
+    expect(flag).toBe(
+      `[wake] audit flag: window=${ws} starts=2 accounted=1 ` +
+        "(posted=1 dedup=0 post-failed=0 no-channel=0)",
+    );
+    // the new window starts clean
+    wakeAuditOutcome(s, "posted");
+    expect(wakeAuditEvaluate(s)).toBeNull();
+  });
+
+  test("wakeAuditEvaluate: null when the invariant holds, the flag line when it does not", () => {
+    const s = wakeAuditInit();
+    s.windowStart = 100 * W;
+    s.starts = 1;
+    s.posted = 1;
+    expect(wakeAuditEvaluate(s)).toBeNull();
+    s.starts = 2; // one startup never accounted
+    expect(wakeAuditEvaluate(s)).toContain("[wake] audit flag:");
+    expect(wakeAuditEvaluate(s)).toContain("starts=2");
+    expect(wakeAuditEvaluate(s)).toContain("accounted=1");
+  });
+
+  test("runRestartWake logs the flag line when a closed window violates the invariant", async () => {
+    const s = wakeAuditInit();
+    const ws = Math.floor(T0 / W) * W;
+    const log: string[] = [];
+    const { impl, calls } = fakeFetch([200, 200]);
+    const base = {
+      stateDir: path.join(tmp, ".tmp"),
+      runDir: path.join(tmp, "runs"),
+      target: { channelId: "1", botToken: "tok" } as WakeTarget,
+      fetchImpl: impl,
+      log: (l: string) => log.push(l),
+      auditState: s,
+    };
+    const r1 = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: ws + 10_000,
+    });
+    expect(r1.reason).toBe("posted");
+    // a startup that never reaches a terminal state (the gap G2 catches)
+    wakeAuditStart(s, ws + 30_000);
+    const r2 = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: ws + W + 10_000,
+    });
+    expect(r2.reason).toBe("posted");
+    expect(calls).toHaveLength(2);
+    const joined = log.join("\n");
+    expect(joined).toContain("[wake] audit flag:");
+    expect(joined).toContain("starts=2");
+    expect(joined).toContain("accounted=1");
   });
 });
