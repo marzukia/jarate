@@ -1,7 +1,7 @@
 /**
  * deploy/jarate-rollout.sh — fleet-wide rollout (#314, G4 of P1 #322), pure-helper tests.
  *
- * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / resolve_key_file / first_key_line / classify_lane / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
+ * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / resolve_key_file / first_key_line / classify_lane / wait_marker / enumerate_agents / smoke_target are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
  *
  * The cross-user flow (sudo, systemctl, curl) is operator-run (vault plan); only the pure helpers are tested here.
  */
@@ -36,7 +36,8 @@ eval "$(extract '/^classify_lane() {/,/^}/p')"
 eval "$(extract '/^first_key_line() {/,/^}/p')"
 eval "$(extract '/^wait_marker() {/,/^}/p')"
 eval "$(extract '/^enumerate_agents() {/,/^}/p')"
-for fn in validate_hm_base resolve_key_file classify_lane first_key_line wait_marker enumerate_agents; do
+eval "$(extract '/^smoke_target() {/,/^}/p')"
+for fn in validate_hm_base resolve_key_file classify_lane first_key_line wait_marker enumerate_agents smoke_target; do
   declare -f "$fn" >/dev/null || { echo "harness: extraction of $fn from jarate-rollout.sh failed" >&2; exit 90; }
 done
 
@@ -105,6 +106,12 @@ case "$CASE" in
       echo "dave:x:1005:1005::/home/dave:/usr/bin/dash"
     } >"$pf"
     enumerate_agents "$pf"
+    ;;
+  smoketarget)
+    # #332: the smoke-say recipient is 'warden' EXCEPT on the warden lane itself, which self-says (the say edge 400s) and targets 'piboy' instead.
+    smoke_target warden
+    smoke_target frank
+    smoke_target piboy
     ;;
   waitpos)
     d="$T/live"
@@ -235,6 +242,14 @@ describe("jarate-rollout.sh: enumerate_agents (deterministic enumeration)", () =
       "dave",
       "root",
     ]);
+  });
+});
+
+describe("jarate-rollout.sh: smoke_target (smoke-say recipient, #332)", () => {
+  test("the warden lane targets piboy (a self-say 400s); other lanes target warden (frank + piboy controls)", async () => {
+    const r = await runCase("smoketarget");
+    expect(r.code).toBe(0);
+    expect(r.out.trim().split("\n")).toEqual(["piboy", "warden", "warden"]);
   });
 });
 
