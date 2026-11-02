@@ -7,6 +7,7 @@ Every change that ships to the fleet gets a git tag; the tag is the version. Unt
 - Cut the tag at the commit that is ready to ship (after PR merge, green CI, review PASS). The first fleet tag is cut by the operator after this change merges; no tag is cut as part of this change.
 - Tags are release marks, not commit decoration: a tag points at the exact commit the fleet should run. Rolling the fleet to a new version = cut a tag, run the rollout.
 - The tag's SHA is what the rollout pins per agent (`/var/tmp/jarate-pinned/<uid>`); the bridge compares its checkout's git HEAD against that SHA at every pi start (SHA compare only — no LLM in the enforcement path) and pages warden exactly once per process on a mismatch.
+- The drift check's `localHead()` verifies the checkout the bridge loads from (the module resolves its checkout via `realpath` from its own module path); under the documented symlinks-into-`~/projects/jarate` deployment that is the same tree the rollout moves, but a box loading the bridge from any other checkout would be checked against the wrong tree.
 
 ## The two deploy paths
 

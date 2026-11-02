@@ -125,15 +125,14 @@ main() {
   local agents=() u h
   for u in "${users[@]}"; do
     h="$(getent passwd "$u" | awk -F: '{print $6}')"
-    [[ -d "$h/projects/jarate/.git" ]] && agents+=("$u")
+    [[ -e "$h/projects/jarate/.git" ]] && agents+=("$u") # -e: .git is a dir in a clone, a file in a git worktree
   done
   [[ ${#agents[@]} -gt 0 ]] || die "no agent users found (no ~/projects/jarate checkout under any login-shell user)"
 
-  # Fail fast on a bad tag (validated in the first agent's repo after a
-  # fetch — the tag must exist after `git fetch --tags`).
+  # Fail fast on a bad tag (validated in the first agent's repo after a fetch; `git fetch --tags --force` so origin tags are authoritative over a stale pre-existing local tag of the same name).
   local first_home
   first_home="$(getent passwd "${agents[0]}" | awk -F: '{print $6}')"
-  as_user "${agents[0]}" git -C "$first_home/projects/jarate" fetch --tags origin || die "fetch --tags failed in ${agents[0]}"
+  as_user "${agents[0]}" git -C "$first_home/projects/jarate" fetch --tags --force origin || die "fetch --tags failed in ${agents[0]}"
   as_user "${agents[0]}" git -C "$first_home/projects/jarate" rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null || die "tag $TAG does not exist after fetch --tags"
 
   local tag_sha
