@@ -79,6 +79,12 @@ import {
   runSessionStartAskCheck,
   shouldHandoff,
 } from "./handover";
+import {
+  armInbox,
+  consumeRecordedByRef,
+  recordChannelPost,
+  redeliverOnCompact,
+} from "./inbox";
 import { registerJarateTool } from "./jarate";
 import {
   armOpTick,
@@ -197,18 +203,15 @@ import { isVoiceAttachment, voiceNoteText } from "./voice";
 export let lastActiveChannel: ChannelConfig | null = null;
 export let sessionStartTs = 0;
 export let agentBusy = false;
-// /undo run store: the in-flight run's snapshot handle (pre-state captured
-// at run start, file touches staged during the run, finalized at agent_end).
+// /undo run store: the in-flight run's snapshot handle (pre-state captured at run start, file touches staged during the run, finalized at agent_end).
 let undoRun: UndoRun | null = null;
 
-// 30s poller for due wakes + scheduled tasks (session_start /
-// session_shutdown owned).
+// 30s poller for due wakes + scheduled tasks (session_start / session_shutdown owned).
 let schedPoller: ReturnType<typeof setInterval> | null = null;
 // 60s ticker that auto-flushes buffered file-only batches at 10 minutes
 // (session_start / session_shutdown owned). (#24)
 let bufferFlushTicker: ReturnType<typeof setInterval> | null = null;
-// /compact queued while the session is busy (run in progress, or a
-// compaction already in flight). pi's compact() starts with await
+// /compact queued while the session is busy (run in progress, or a compaction already in flight). pi's compact() starts with await
 // abort(), so a mid-run compact would silently kill the in-flight
 // reply; we defer to agent_end instead. One slot: a later /compact
 // replaces the earlier. Flushed at agent_end, or when the blocking
@@ -1875,6 +1878,9 @@ export default function (pi: ExtensionAPI) {
     armRotationStaleWatch(ctx);
     void runSessionStartAskCheck(ctx.cwd, enabled);
 
+    // #254 wave 2: wire the inbox deliverer + redeliver the unread set on every session start (each start wipes the session, so an unread row must re-fire; fleet runs already returned above).
+    armInbox(pi, defaultCh ?? enabled.find((c) => c.type === "discord"));
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -2759,6 +2765,10 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
+    // #254 wave 2: redeliver the unread inbox rows on the post-compaction wake (deferred until pi is idle; skipped when a handoff restart is armed — the rows stay unread for the post-restart redelivery — or this is a fleet run).
+    redeliverOnCompact(
+      () => ctx.isIdle() && !isHandoffRestartArmed() && !isFleetRun(),
+    );
     // Mechanism B: the restart gate runs AFTER the settle above (F1).
     // No-op unless handoff is enabled; on a qualifying compact it restarts
     // into a fresh seeded session (armed by the doc write in
@@ -3432,6 +3442,9 @@ export async function handleInbound(
   const rawBody = msg.body.trim();
   const title = channelTitle(ch, msg);
 
+  // #254 wave 2: record at receipt (before delivery); the live delivery paths consume it (delivered = read — inbox.ts module header).
+  const inboxRec = recordChannelPost(msg);
+
   // ── Channel commands ─────────────────────────────────────────────────
   // stop / /stop — anyone. /help /btw — anyone.
   // /status /reset /verbose — owner only. Commands consume the message.
@@ -3481,19 +3494,11 @@ export async function handleInbound(
         msg.fromId,
         false,
       );
-      if (r.btw) {
+      // The command handled the message (btw fired, consumed with its own reply, or posted an immediate reply): no ack, no fall-through to a run — the recorded row is consumed (delivered = read).
+      if (r.btw || r.consumed || r.immediate !== undefined) {
+        if (r.immediate !== undefined) replyCmd(r.immediate);
         noAck();
-        return;
-      }
-      if (r.consumed) {
-        // The command posted its own reply (e.g. the ticking compact
-        // placeholder) — no ack, no fall-through to a run.
-        noAck();
-        return;
-      }
-      if (r.immediate !== undefined) {
-        noAck();
-        replyCmd(r.immediate);
+        inboxRec.consume("live: command handled");
         return;
       }
     }
@@ -3545,6 +3550,7 @@ export async function handleInbound(
     noAck();
     if (!isOwnerUser(ch, msg.fromId)) {
       replyCmd(machine("[!] ! shell is owner-only"));
+      inboxRec.consume("live: ! shell rejected");
       return;
     }
     const shellCmd = bang[1].trim();
@@ -3566,6 +3572,7 @@ export async function handleInbound(
       .filter(Boolean)
       .join(" · ");
     replyCmd(r.out ? `${shown}\n${tail}` : machine(tail));
+    inboxRec.consume("live: ! shell executed");
     return;
   }
 
@@ -3897,8 +3904,9 @@ export function sendToPi(
     // sendMessage throw returns false BEFORE this line: the file keeps
     // the entry, the next restart re-delivers (at-least-once).
     if (messageId) {
-      // #306 amnesia + #186 (F1): commit + prune the drained copy.
+      // #306 amnesia + #186 (F1): commit + prune the drained copy; #254: consume the recorded row (if any) at the delivery commit — by ref, a no-op for messages this process never recorded (tasks, wakes, redelivery).
       commitInbound(runtimeStateDir, channelId, messageId, text, inboundMsg);
+      consumeRecordedByRef(messageId, "live: delivered to pi");
     }
   } catch (e) {
     console.error("[channel] sendMessage failed:", sanitizeUnknownValue(e));
