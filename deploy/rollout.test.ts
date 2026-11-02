@@ -1,7 +1,7 @@
 /**
  * deploy/jarate-rollout.sh — fleet-wide rollout (#314, G4 of P1 #322), pure-helper tests.
  *
- * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / first_key_line / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
+ * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / resolve_key_file / first_key_line / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
  *
  * The cross-user flow (sudo, systemctl, curl) is operator-run (vault plan); only the pure helpers are tested here.
  */
@@ -13,8 +13,7 @@ import { spawn } from "bun";
 
 const ROLLOUT = path.join(import.meta.dir, "jarate-rollout.sh");
 
-// Leak guard: every fixture mkdtemp dir is tracked and force-removed in a
-// file-level afterEach, so a failed or aborted test cannot leave dirs in /tmp.
+// Leak guard: every fixture mkdtemp dir is tracked and force-removed in a file-level afterEach, so a failed or aborted test cannot leave dirs in /tmp.
 const tmpDirs: string[] = [];
 afterEach(() => {
   for (const d of tmpDirs.splice(0)) {
@@ -22,12 +21,7 @@ afterEach(() => {
   }
 });
 
-/**
- * The sourced-harness script. $1 = tmp dir, $2 = jarate-rollout.sh path,
- * $3 = scenario. Extracts the REAL helper bodies from the script and
- * evals them, then runs the scenario's invocations, recording the
- * results in $T/out (one per line).
- */
+/** The sourced-harness script. $1 = tmp dir, $2 = jarate-rollout.sh path, $3 = scenario. Extracts the REAL helper bodies from the script and evals them, then runs the scenario's invocations, recording the results in $T/out (one per line). */
 const HARNESS = `#!/usr/bin/env bash
 set -euo pipefail
 T="$1"
@@ -36,10 +30,11 @@ CASE="$3"
 
 extract() { sed -n "$1" "$SRC"; }
 eval "$(extract '/^validate_hm_base() {/,/^}/p')"
+eval "$(extract '/^resolve_key_file() {/,/^}/p')"
 eval "$(extract '/^first_key_line() {/,/^}/p')"
 eval "$(extract '/^wait_marker() {/,/^}/p')"
 eval "$(extract '/^enumerate_agents() {/,/^}/p')"
-for fn in validate_hm_base first_key_line wait_marker enumerate_agents; do
+for fn in validate_hm_base resolve_key_file first_key_line wait_marker enumerate_agents; do
   declare -f "$fn" >/dev/null || { echo "harness: extraction of $fn from jarate-rollout.sh failed" >&2; exit 90; }
 done
 
@@ -60,12 +55,22 @@ case "$CASE" in
     first_key_line "$T/no-such-file" >/dev/null 2>&1 && echo "missing exit 0" || echo "missing exit 1"
     printf '# only comments\\n\\n# more\\n' >"$T/key2"
     first_key_line "$T/key2" >/dev/null 2>&1 && echo "onlycomments exit 0" || echo "onlycomments exit 1"
-    printf '# onboarding key file\\nBASE_URL=http://10.1.2.3:8001\\nX_AGENT_KEY=agentkey-new\\n' >"$T/key3"
+    printf '# onboarding key file\\nBASE_URL=http://10.1.2.3:8001\\nX_AGENT_KEY=  agentkey-padded  \\n' >"$T/key3"
     first_key_line "$T/key3" >"$T/k3" 2>/dev/null && echo "newformat exit 0" || echo "newformat exit 1"
     cat "$T/k3"
     printf 'BASE_URL=http://10.1.2.3:8001\\nhm_agent_abc123\\n' >"$T/key4"
     first_key_line "$T/key4" >"$T/k4" 2>/dev/null && echo "hmagent exit 0" || echo "hmagent exit 1"
     cat "$T/k4"
+    ;;
+  keyresolve)
+    mkdir -p "$T/h1/.config/hall-monitor" "$T/h2/.config/hall-monitor" "$T/h3"
+    touch "$T/h1/.config/hall-monitor/agent-key" "$T/h1/.config/hall-monitor/key" "$T/h1/hall-monitor.key"
+    touch "$T/h2/.config/hall-monitor/key" "$T/h2/hall-monitor.key"
+    touch "$T/h3/hall-monitor.key"
+    resolve_key_file "$T/h1" | sed "s|^$T/||"
+    resolve_key_file "$T/h2" | sed "s|^$T/||"
+    resolve_key_file "$T/h3" | sed "s|^$T/||"
+    resolve_key_file "$T/hnone" >/dev/null 2>&1 && echo "none exit 0" || echo "none exit 1"
     ;;
   enum)
     pf="$T/passwd"
@@ -146,7 +151,7 @@ describe("jarate-rollout.sh: validate_hm_base (no default, strict shape)", () =>
 });
 
 describe("jarate-rollout.sh: first_key_line (the agent-key file shape)", () => {
-  test("first non-comment, non-blank line wins (legacy); X_AGENT_KEY= / hm_agent_ lines win (onboarding format); missing / comment-only files fail", async () => {
+  test("legacy bare-key: the first non-comment, non-blank line wins; X_AGENT_KEY= (value trimmed) / hm_agent_ lines win (onboarding format); missing / comment-only files fail", async () => {
     const r = await runCase("keyline");
     expect(r.code).toBe(0);
     const lines = r.out.trim().split("\n");
@@ -156,9 +161,23 @@ describe("jarate-rollout.sh: first_key_line (the agent-key file shape)", () => {
       "missing exit 1",
       "onlycomments exit 1",
       "newformat exit 0",
-      "agentkey-new",
+      "agentkey-padded",
       "hmagent exit 0",
       "hm_agent_abc123",
+    ]);
+  });
+});
+
+describe("jarate-rollout.sh: resolve_key_file (the fleet agent-key path chain)", () => {
+  test("first existing candidate wins (agent-key -> key -> hall-monitor.key); none existing fails", async () => {
+    const r = await runCase("keyresolve");
+    expect(r.code).toBe(0);
+    const lines = r.out.trim().split("\n");
+    expect(lines).toEqual([
+      "h1/.config/hall-monitor/agent-key",
+      "h2/.config/hall-monitor/key",
+      "h3/hall-monitor.key",
+      "none exit 1",
     ]);
   });
 });

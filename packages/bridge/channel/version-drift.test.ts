@@ -8,7 +8,7 @@
  *   - pointer == local HEAD = in-parity (no fetch)
  *   - pointer != HEAD + JARATE_INBOX_URL/KEY set = ONE page to warden (POST <base>/fleet/say, X-Agent-Key; 2xx = delivered)
  *   - page failure (4xx) = logged, never thrown
- *   - key file fallback (first non-comment line of the agent-key file)
+ *   - key file fallback: the fleet path chain (agent-key -> key -> hall-monitor.key, first existing) + extraction by shape (X_AGENT_KEY= wins — onboarding files carry BASE_URL= before it — then hm_agent_, else the first non-comment line)
  *   - no URL/key = local log line, no fetch
  *   - JARATE_PINNED_DIR override respected
  *   - once per process (a second start no-ops); reset re-arms
@@ -19,6 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   checkVersionDrift,
+  keyFileCandidates,
   localHead,
   readKeyFile,
   resetDriftStateForTests,
@@ -85,13 +86,16 @@ function withHttp(status: number, calls: PageCall[]): void {
 }
 
 // Point JARATE_INBOX_KEY_FILE at a fixture (os.homedir() reads the passwd entry, not $HOME, so the path override is the test seam).
-function homeWithKeyFile(key: string): void {
+function homeWithKeyFile(
+  content: string,
+  name = "agent-key",
+): void {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-drift-home-"));
   tmpDirs.push(home);
   const dir = path.join(home, ".config", "hall-monitor");
   fs.mkdirSync(dir, { recursive: true });
-  const f = path.join(dir, "agent-key");
-  fs.writeFileSync(f, `# comment line\n\n${key}\nsecond-line-ignored\n`);
+  const f = path.join(dir, name);
+  fs.writeFileSync(f, content);
   process.env.JARATE_INBOX_KEY_FILE = f;
 }
 
@@ -158,7 +162,7 @@ describe("version-drift: the startup parity check", () => {
     await freshCheck();
     const calls: PageCall[] = [];
     pinTo("2".repeat(40));
-    homeWithKeyFile("file-fallback-key");
+    homeWithKeyFile(`# comment line\n\nfile-fallback-key\nsecond-line-ignored\n`);
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
     withHttp(200, calls);
     const r = await checkVersionDrift();
@@ -166,11 +170,37 @@ describe("version-drift: the startup parity check", () => {
     expect(calls[0].key).toBe("file-fallback-key");
   });
 
+  test("key file fallback, onboarding shape: BASE_URL= precedes X_AGENT_KEY= — the X_AGENT_KEY value (trimmed) is the key, not the BASE_URL line", async () => {
+    await freshCheck();
+    const calls: PageCall[] = [];
+    pinTo("6".repeat(40));
+    homeWithKeyFile(
+      `# onboarding\n\nBASE_URL=https://hm.example:8001/api\nX_AGENT_KEY=  hm_agent_onboard  \n`,
+    );
+    process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
+    withHttp(200, calls);
+    const r = await checkVersionDrift();
+    expect(r?.status).toBe("drift-paged");
+    expect(calls[0].key).toBe("hm_agent_onboard");
+  });
+
+  test("key file fallback, bare key at the fallback path (~/.config/hall-monitor/key): resolved when agent-key is absent", async () => {
+    await freshCheck();
+    const calls: PageCall[] = [];
+    pinTo("7".repeat(40));
+    homeWithKeyFile(`# comment\n\n  hm_agent_bare  \n`, "key");
+    process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
+    withHttp(200, calls);
+    const r = await checkVersionDrift();
+    expect(r?.status).toBe("drift-paged");
+    expect(calls[0].key).toBe("hm_agent_bare");
+  });
+
   test("no URL/key = local log line, no fetch (drift-local)", async () => {
     await freshCheck();
     const calls: PageCall[] = [];
     pinTo("3".repeat(40));
-    homeWithKeyFile("file-fallback-key"); // no URL set, so the key is moot
+    homeWithKeyFile(`# comment\n\nfile-fallback-key\n`); // no URL set, so the key is moot
     withHttp(200, calls);
     const r = await checkVersionDrift();
     expect(r?.status).toBe("drift-local");
@@ -206,8 +236,29 @@ describe("version-drift: the startup parity check", () => {
   });
 });
 
-describe("version-drift: readKeyFile (the agent-key file shape)", () => {
-  test("first non-comment, non-blank line wins", () => {
+describe("version-drift: readKeyFile (the agent-key file shapes)", () => {
+  test("onboarding shape: the X_AGENT_KEY= line wins (BASE_URL= precedes it); the value after the = is trimmed", () => {
+    const f = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")),
+      "agent-key",
+    );
+    tmpDirs.push(path.dirname(f));
+    fs.writeFileSync(
+      f,
+      `# comment\n\nBASE_URL=https://hm.example:8001/api\nX_AGENT_KEY=  hm_agent_onboard  \nsecond-line-ignored\n`,
+    );
+    expect(readKeyFile(f)).toBe("hm_agent_onboard");
+  });
+  test("an hm_agent_ line wins over the legacy bare fallback (bare-key shape after comments)", () => {
+    const f = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")),
+      "key",
+    );
+    tmpDirs.push(path.dirname(f));
+    fs.writeFileSync(f, `# comment\n\n  hm_agent_bare  \nlegacy-bare\n`);
+    expect(readKeyFile(f)).toBe("hm_agent_bare");
+  });
+  test("legacy bare-key shape: the first non-comment, non-blank line wins", () => {
     const f = path.join(
       fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")),
       "agent-key",
@@ -219,7 +270,31 @@ describe("version-drift: readKeyFile (the agent-key file shape)", () => {
     );
     expect(readKeyFile(f)).toBe("the-key");
   });
-  test("missing file = empty", () => {
+  test("comment-only file = empty; missing file = empty", () => {
+    const f = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")),
+      "agent-key",
+    );
+    tmpDirs.push(path.dirname(f));
+    fs.writeFileSync(f, `# only comments\n\n# more\n`);
+    expect(readKeyFile(f)).toBe("");
     expect(readKeyFile("/nonexistent/agent-key")).toBe("");
+  });
+});
+
+describe("version-drift: keyFileCandidates (the fleet agent-key path chain)", () => {
+  test("JARATE_INBOX_KEY_FILE set = override only (the test seam)", () => {
+    process.env.JARATE_INBOX_KEY_FILE = "/tmp/fixture/key";
+    expect(keyFileCandidates()).toEqual(["/tmp/fixture/key"]);
+  });
+  test("unset = the three fleet paths in resolution order (agent-key -> key -> hall-monitor.key)", () => {
+    delete process.env.JARATE_INBOX_KEY_FILE;
+    const cands = keyFileCandidates();
+    expect(cands.length).toBe(3);
+    expect(cands[0]).toBe(
+      path.join(os.homedir(), ".config", "hall-monitor", "agent-key"),
+    );
+    expect(cands[1]).toBe(path.join(os.homedir(), ".config", "hall-monitor", "key"));
+    expect(cands[2]).toBe(path.join(os.homedir(), "hall-monitor.key"));
   });
 });

@@ -16,7 +16,7 @@
 #   3. ff-move the checkout to the tag (plain ff; divergent = fail loud, no merge, no rebase)
 #   4. restart pi.service (the user systemd instance)
 #   5. verify: /var/tmp/jarate-live/<uid> mtime advances after the restart (≤90s wait loop, fail loud)
-#   6. verify: one delivered smoke say via hall-monitor (POST <base>/api/fleet/say, X-Agent-Key = the first non-comment non-blank line of the user's ~/.config/hall-monitor/agent-key; 2xx = delivered)
+#   6. verify: one delivered smoke say via hall-monitor (POST <base>/api/fleet/say, X-Agent-Key = the user's agent key, resolved from the first existing of ~/.config/hall-monitor/agent-key, ~/.config/hall-monitor/key, ~/hall-monitor.key — the key is the X_AGENT_KEY= line, or the first non-comment line when absent; 2xx = delivered)
 #   7. write /var/tmp/jarate-pinned/<uid> = the tag's SHA
 #
 # A per-user failure stops the whole run (fail loud, exit 1); already rolled users keep their pins (their drift check stays quiet), the failed user keeps none (its drift check pages warden — the mismatch is real and is what should be heard about).
@@ -34,9 +34,7 @@ GATE_TIMEOUT_S="${JARATE_ROLLOUT_GATE_TIMEOUT_S:-90}"
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "ROLLOUT FAIL: $*"; exit 1; }
 
-# Cross-user step: the password over stdin (never in argv/ps); the
-# command's own env is set with `env` inside the target user (sudo
-# strips XDG_RUNTIME_DIR).
+# Cross-user step: the password over stdin (never in argv/ps); the command's own env is set with `env` inside the target user (sudo strips XDG_RUNTIME_DIR).
 as_user() {
   local user="$1"
   shift
@@ -45,14 +43,26 @@ as_user() {
 
 # --- pure helpers (sourced-harness tested in rollout.test.ts) --------------
 
-# validate_hm_base <base>: ok when <base> is http(s)://host[:port] with no
-# path and no trailing slash (the endpoint is appended as /api/fleet/say).
+# validate_hm_base <base>: ok when <base> is http(s)://host[:port] with no path and no trailing slash (the endpoint is appended as /api/fleet/say).
 validate_hm_base() {
   local base="${1:-}"
   [[ -n "$base" && "$base" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
 }
 
-# first_key_line <file>: the agent key from the user's ~/.config/hall-monitor/agent-key: an X_AGENT_KEY= line wins (value after the =), then an hm_agent_ line (the new onboarding key-file format, where the first non-comment line is BASE_URL=...), else the first non-comment, non-blank line (legacy bare-key files); 1 when the file is missing or nothing matches.
+# resolve_key_file <home>: the first EXISTING candidate of the fleet agent-key paths — $home/.config/hall-monitor/agent-key (onboarding shape: comment lines, then BASE_URL=, then X_AGENT_KEY=), $home/.config/hall-monitor/key (bare key after comment lines), $home/hall-monitor.key (bare key) — lanes onboarded at different times carry different paths on the same host; 1 when none exist (the caller names them in the die message).
+resolve_key_file() {
+  local home="$1"
+  local f
+  for f in "$home/.config/hall-monitor/agent-key" "$home/.config/hall-monitor/key" "$home/hall-monitor.key"; do
+    if [[ -e "$f" ]]; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# first_key_line <file>: the agent key from the user's agent-key file (the fleet path chain — see resolve_key_file): an X_AGENT_KEY= line wins (the value after the =, trimmed), then an hm_agent_ line (the new onboarding key-file format, where the first non-comment line is BASE_URL=...), else the first non-comment, non-blank line (legacy bare-key files); 1 when the file is missing or nothing matches.
 first_key_line() {
   local f="$1" line legacy=""
   [[ -r "$f" ]] || return 1
@@ -61,8 +71,14 @@ first_key_line() {
     line="${line%"${line##*[![:space:]]}"}"
     [[ -n "$line" && "$line" != \#* ]] || continue
     if [[ "$line" == X_AGENT_KEY=* ]]; then
-      printf '%s\n' "${line#X_AGENT_KEY=}"
-      return 0
+      local rest
+      rest="${line#X_AGENT_KEY=}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      rest="${rest%"${rest##*[![:space:]]}"}"
+      if [[ -n "$rest" ]]; then
+        printf '%s\n' "$rest"
+        return 0
+      fi
     fi
     if [[ "$line" == hm_agent_* ]]; then
       printf '%s\n' "$line"
@@ -77,9 +93,7 @@ first_key_line() {
   return 1
 }
 
-# wait_marker <dir> <uid> <bar_epoch_s> <timeout_s>: 0 when the marker's
-# mtime (epoch seconds) is strictly newer than <bar_epoch_s>; 1 on
-# timeout. Polls every 3s.
+# wait_marker <dir> <uid> <bar_epoch_s> <timeout_s>: 0 when the marker's mtime (epoch seconds) is strictly newer than <bar_epoch_s>; 1 on timeout. Polls every 3s.
 wait_marker() {
   local dir="$1" uid="$2" bar_s="$3" timeout_s="$4"
   local f="$dir/$uid" deadline m
@@ -96,9 +110,7 @@ wait_marker() {
   return 1
 }
 
-# enumerate_agents <passwd_file>: login-shell usernames, sorted — the
-# deterministic enumeration input (a user is an AGENT when, on top, they
-# have a ~/projects/jarate checkout; that check is in the main loop).
+# enumerate_agents <passwd_file>: login-shell usernames, sorted — the deterministic enumeration input (a user is an AGENT when, on top, they have a ~/projects/jarate checkout; that check is in the main loop).
 enumerate_agents() {
   local pf="$1"
   awk -F: '{
@@ -139,7 +151,7 @@ main() {
   tag_sha="$(as_user "${agents[0]}" git -C "$first_home/projects/jarate" rev-parse "refs/tags/$TAG^{commit}")"
   log "rollout $TAG ($tag_sha) across ${#agents[@]} agent(s): ${agents[*]}"
 
-  local uid repo prev key code host
+  local uid repo prev key key_file code host
   for u in "${agents[@]}"; do
     uid="$(id -u "$u")"
     h="$(getent passwd "$u" | awk -F: '{print $6}')"
@@ -174,7 +186,8 @@ main() {
     wait_marker "$LIVE_DIR" "$uid" "$bar_s" "$GATE_TIMEOUT_S" || die "agent $u: $LIVE_DIR/$uid did not advance within ${GATE_TIMEOUT_S}s after restart (pi.service did not come up)"
 
     # 6. verify: one delivered smoke say via hall-monitor (2xx).
-    key="$(first_key_line "$h/.config/hall-monitor/agent-key")" || die "agent $u: no agent key at ~/.config/hall-monitor/agent-key"
+    key_file="$(resolve_key_file "$h")" || die "agent $u: no agent key file (tried: $h/.config/hall-monitor/agent-key, $h/.config/hall-monitor/key, $h/hall-monitor.key)"
+    key="$(first_key_line "$key_file")" || die "agent $u: no agent key line in $key_file"
     host="$(hostname)"
     code="$(curl -s -o /dev/null -w '%{http_code}' \
       -X POST "$HM_BASE/api/fleet/say" \

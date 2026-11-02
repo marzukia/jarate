@@ -1,6 +1,6 @@
 // version-drift.ts — fleet-wide version parity, startup drift check (#314, G4 of P1 #322): at pi start, compare the git HEAD of the checkout the bridge loads from against the pinned tag SHA the fleet rollout wrote at /var/tmp/jarate-pinned/<uid>. SHA compare only — no LLM in the enforcement path (the page is a plain fetch).
 //
-// Config (same env pattern as the inbox leg, channel/inbox.ts): JARATE_INBOX_URL = the hall-monitor API base (…/api), operator-set in the pi.service env file; JARATE_INBOX_KEY = the per-agent key (X-Agent-Key), falling back to the first non-comment line of ~/.config/hall-monitor/agent-key. Neither set = the drift line is logged locally and the page is skipped. JARATE_PINNED_DIR overrides the pointer dir (tests).
+// Config (same env pattern as the inbox leg, channel/inbox.ts): JARATE_INBOX_URL = the hall-monitor API base (…/api), operator-set in the pi.service env file; JARATE_INBOX_KEY = the per-agent key (X-Agent-Key), falling back to the agent-key file resolved from the fleet path chain (~/.config/hall-monitor/agent-key -> ~/.config/hall-monitor/key -> ~/hall-monitor.key, first existing; lanes onboarded at different times carry different paths on the same host) and extracted by shape priority (an X_AGENT_KEY= line wins — onboarding files carry BASE_URL= before it — then an hm_agent_ line, else the first non-comment line). Neither set = the drift line is logged locally and the page is skipped. JARATE_PINNED_DIR overrides the pointer dir (tests).
 //
 // States: missing pointer file = feature dormant (silent no-op — the rollout has not pinned this host yet); match = in-parity; mismatch = one page to warden via POST <base>/fleet/say (2xx = delivered; a page failure is logged, never thrown — the check must never break startup).
 //
@@ -26,25 +26,54 @@ export function setDriftHttp(fn: DriftHttpFn | null): void {
 
 const HTTP_TIMEOUT_MS = 10_000;
 
-// The key file the operator hands out: the first non-comment, non-blank line. Lazy (os.homedir() does not follow $HOME — it reads the passwd entry — so JARATE_INBOX_KEY_FILE is the override tests use to point at a fixture).
-function keyFile(): string {
-  return (
-    process.env.JARATE_INBOX_KEY_FILE ??
-    path.join(os.homedir(), ".config", "hall-monitor", "agent-key")
-  );
+// The agent-key file candidates, in resolution order — lanes onboarded at different times carry different paths on the same host: ~/.config/hall-monitor/agent-key (onboarding shape: comment lines, then BASE_URL=, then X_AGENT_KEY=), ~/.config/hall-monitor/key (bare key after comment lines), ~/hall-monitor.key (bare key). JARATE_INBOX_KEY_FILE overrides (the seam tests use; os.homedir() does not follow $HOME — it reads the passwd entry).
+export function keyFileCandidates(): string[] {
+  if (process.env.JARATE_INBOX_KEY_FILE)
+    return [process.env.JARATE_INBOX_KEY_FILE];
+  const home = os.homedir();
+  return [
+    path.join(home, ".config", "hall-monitor", "agent-key"),
+    path.join(home, ".config", "hall-monitor", "key"),
+    path.join(home, "hall-monitor.key"),
+  ];
 }
 
-// The key file the operator hands out: the first non-comment, non-blank line (exported for the fallback test; same shape as inbox's readKeyFile, local to keep this module free of the inbox -> index import cycle).
-export function readKeyFile(file: string): string {
-  try {
-    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
-      const t = line.trim();
-      if (t && !t.startsWith("#")) return t;
+// The agent-key file: the first EXISTING candidate of keyFileCandidates() (the first path when none exist — readKeyFile returns "" for a missing file, so the failure path still names it).
+function keyFile(): string {
+  if (process.env.JARATE_INBOX_KEY_FILE)
+    return process.env.JARATE_INBOX_KEY_FILE;
+  for (const cand of keyFileCandidates()) {
+    try {
+      if (fs.existsSync(cand)) return cand;
+    } catch {
+      // unreadable stat = next candidate
     }
+  }
+  return keyFileCandidates()[0];
+}
+
+// The agent key from its file, by shape priority (same shape as the rollout's first_key_line): an X_AGENT_KEY= line wins (the value after the =, trimmed — onboarding files carry BASE_URL= before it, so the first non-comment line alone is the wrong line), then an hm_agent_ line, else the first non-comment, non-blank line (legacy bare-key files). Exported for the fallback test; local to keep this module free of the inbox -> index import cycle.
+export function readKeyFile(file: string): string {
+  let lines: string[] = [];
+  try {
+    lines = fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim());
   } catch {
     // missing/unreadable key file = no key
   }
-  return "";
+  const keyLines = lines.filter((t) => t && !t.startsWith("#"));
+  let legacy = "";
+  for (const t of keyLines) {
+    if (t.startsWith("X_AGENT_KEY=")) {
+      const v = t.slice("X_AGENT_KEY=".length).trim();
+      if (v) return v;
+    }
+    if (t.startsWith("hm_agent_")) return t;
+    if (!legacy) legacy = t;
+  }
+  return legacy;
 }
 
 // Resolve the page target (base + key); null = no page leg (local log only).
@@ -105,8 +134,7 @@ export function resetDriftStateForTests(): void {
   checkedOnce = false;
 }
 
-// The startup drift check: at most one run per process; never throws (the
-// caller is fire-and-forget, but the guard is defense in depth).
+// The startup drift check: at most one run per process; never throws (the caller is fire-and-forget, but the guard is defense in depth).
 export async function checkVersionDrift(): Promise<DriftResult | null> {
   if (checkedOnce) return null;
   checkedOnce = true;
@@ -152,16 +180,14 @@ async function runCheck(): Promise<DriftResult> {
   }
   const head = localHead();
   if (!head) {
-    // The checkout is not a usable git repo (or git is missing): the
-    // check cannot compare — dormant, logged so it is observable.
+    // The checkout is not a usable git repo (or git is missing): the check cannot compare — dormant, logged so it is observable.
     console.log("[drift] no git HEAD available; drift check skipped");
     return { status: "dormant", head: "", pinned, detail: "no git HEAD" };
   }
   if (head.toLowerCase() === pinned.toLowerCase()) {
     return { status: "in-parity", head, pinned, detail: "" };
   }
-  // Mismatch: ONE page to warden (no retry loop — one page per start; the
-  // once-per-process flag dedups /new and /reload re-sessions).
+  // Mismatch: ONE page to warden (no retry loop — one page per start; the once-per-process flag dedups /new and /reload re-sessions).
   const target = resolveDriftTarget();
   if (!target) {
     const line = `version drift: local HEAD ${head.slice(0, 7)} != pinned ${pinned.slice(0, 7)} (no page leg: JARATE_INBOX_URL/JARATE_INBOX_KEY unset)`;

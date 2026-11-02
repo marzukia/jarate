@@ -27,7 +27,7 @@ Deterministic enumeration: an agent is a login-shell user (bash/sh/zsh/dash in `
 3. **Plain fast-forward to the tag** (`git merge --ff-only`). A divergent checkout fails loud — no merge, no rebase, ever.
 4. **Restart `pi.service`** via the user systemd instance (`sudo -u <user> env XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart pi.service`).
 5. **Liveness verify:** `/var/tmp/jarate-live/<uid>` mtime must advance after the restart (≤90s wait loop, `JARATE_ROLLOUT_GATE_TIMEOUT_S`; fail loud).
-6. **Delivery verify:** one smoke say via hall-monitor — `POST <base>/api/fleet/say` with the user's `X-Agent-Key` (first non-comment line of `~/.config/hall-monitor/agent-key`); 2xx = delivered, anything else fails the user. The hall-monitor base comes from arg 2 or `JARATE_HM_URL` — no hardcoded default; unset = fail loud.
+6. **Delivery verify:** one smoke say via hall-monitor — `POST <base>/api/fleet/say` with the user's `X-Agent-Key` (the agent-key file resolved from the first existing of `~/.config/hall-monitor/agent-key`, `~/.config/hall-monitor/key`, `~/hall-monitor.key` — lanes onboarded at different times carry different paths; the key is the `X_AGENT_KEY=` line (value trimmed — onboarding files carry `BASE_URL=` before `X_AGENT_KEY=`), then an `hm_agent_` line, else the first non-comment line); 2xx = delivered, anything else fails the user. The hall-monitor base comes from arg 2 or `JARATE_HM_URL` — no hardcoded default; unset = fail loud.
 7. **Pin:** only after steps 1–6 all pass, `/var/tmp/jarate-pinned/<uid>` gets the tag's SHA. That is what the bridge's startup drift check compares against — a failed rollout leaves no pin, so the box stays visibly drifted (and pages warden) until it is rolled.
 
 A per-user failure stops the whole run (fail loud, exit 1); already-rolled users keep their pins, the failed user keeps none. Re-run the plan at the same tag to finish the host (rolled users are already at the tag — the ff is a no-op, and the restart + verifies + pin complete them).
@@ -44,5 +44,5 @@ A per-user failure stops the whole run (fail loud, exit 1); already-rolled users
 ## Tests
 
 - `deploy.test.ts` — the SIGTERM fail-recording / backoff / liveness behavior of `deploy.sh` (end-to-end against a fake HOME + local git origin, plus the sourced-harness ec=143 proof).
-- `rollout.test.ts` — the `jarate-rollout.sh` pure helpers (`validate_hm_base`, `first_key_line`, `wait_marker`, `enumerate_agents`), extracted verbatim from the script (an extraction failure exits 90, so a rename in the script is what the tests catch).
+- `rollout.test.ts` — the `jarate-rollout.sh` pure helpers (`validate_hm_base`, `resolve_key_file`, `first_key_line`, `wait_marker`, `enumerate_agents`), extracted verbatim from the script (an extraction failure exits 90, so a rename in the script is what the tests catch).
 - `packages/bridge/channel/version-drift.test.ts` — the startup drift check (pointer missing / match / mismatch / page failure / key-file fallback / env overrides / once-per-process; no real network — the HTTP leg is injected).
