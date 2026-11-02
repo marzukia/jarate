@@ -4205,6 +4205,48 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     expect(compactPosts()).toHaveLength(1);
   });
 
+  test("double-fire with a SLOW placeholder post: the entry-arm flag bails the agent_settled gate (2026-11-02 #jimmy)", async () => {
+    // The 2026-11-02 22:53Z incident: the placeholder post is a real
+    // Discord post in flight, so the agent_settled 0ms gate timer fires
+    // while startCompact#1 has NOT yet armed the window. Pre-fix both
+    // gates passed and both compacts ran - the second hit pi's
+    // 'Already compacted' by-design no-op and surfaced as a spurious
+    // 'compact failed:' line. The window flag is now armed
+    // synchronously at startCompact entry, before the post await.
+    const baseFetch = (globalThis as any).fetch;
+    let plainPosts = 0;
+    const release: { fn?: () => void } = {};
+    (globalThis as any).fetch = async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        if (plainPosts === 1) await new Promise<void>((r) => (release.fn = r)); // hold the placeholder post
+      }
+      return baseFetch(url, init);
+    };
+    let compactCalls = 0;
+    ctx.compact = () => {
+      compactCalls += 1;
+    };
+    ctx.isIdle = () => true;
+    // First shot (agent_end): the gate passes, startCompact#1 begins -
+    // the flag is armed NOW, the placeholder post is still held.
+    await handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx);
+    await tick();
+    expect(isCompacting("ch1")).toBe(true); // entry arm, post in flight
+    expect(compactCalls).toBe(0); // ctx.compact waits for the post
+    // Second shot (agent_settled, the reliable one): the gate must see
+    // the flag and bail - no second startCompact, no second compact.
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick();
+    expect(compactCalls).toBe(0); // bailed at the gate
+    // The placeholder post lands: exactly ONE ctx.compact runs.
+    release.fn?.();
+    await tick(20);
+    expect(compactCalls).toBe(1);
+    expect(compactPosts()).toHaveLength(1);
+  });
+
   test("gate-started compact: placeholder is posted BEFORE the compact starts; a fast settle settles in place (no orphan, 2026-11-02 race)", async () => {
     // The auto-compact gate (postPlaceholder=true) goes through the same startCompact as /compact: the placeholder post is awaited bounded (~5s) before ctx.compact runs. A fast settle (the 2026-11-02 vLLM case) therefore settles AFTER the tick is armed - the report replaces the placeholder in place. One placeholder post, one in-place settle, no fresh 'compacted:' post, no frozen line.
     const baseFetch = (globalThis as any).fetch;

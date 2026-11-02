@@ -507,7 +507,11 @@ export type OpLabel =
 
 export interface CompactingEntry {
   since: number;
-  timer: ReturnType<typeof setTimeout>;
+  /** Null for the startCompact ENTRY arm (2026-11-02 #jimmy
+   *  double-fire fix): the flag is armed synchronously before the
+   *  placeholder-post await; beginCompacting (original position)
+   *  replaces it with the full window (fallback timer, log). */
+  timer: ReturnType<typeof setTimeout> | null;
   /** Which op owns the window (status display + tick text). */
   label: OpLabel;
   /** Discord cursor captured at window open; restart-class ops rewind to
@@ -587,7 +591,7 @@ export function clearCompacting(channelId: string, warn = false): void {
     persistLivePlaceholders();
     return;
   }
-  clearTimeout(e.timer);
+  if (e.timer) clearTimeout(e.timer);
   compactingChannels.delete(channelId);
   persistLivePlaceholders();
   // F1: window closed = restart-class op cancelled — drop the pending
