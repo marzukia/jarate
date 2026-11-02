@@ -57,6 +57,7 @@ import {
 } from "./queue";
 import { setProcessExitHookForTest } from "./restart-ops";
 import { getCurrentSessionFile, rewakeCommitDelivered } from "./restart-queue";
+import { resetStartupMessageSuppressionForTests } from "./startup-suppress";
 import { fit } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
 import { performUndo } from "./undo";
@@ -4615,6 +4616,11 @@ describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
     // (before=<persisted cursor>)
     expect(fetchCalls.some((c) => c.url.includes("/users/@me"))).toBe(true);
     expect(fetchCalls.some((c) => c.url.includes("before=123456"))).toBe(true);
+    // the startup reason drives an unclean runRestartWake (no clean-stop
+    // marker here), which sets the #328 once-per-process startup-suppress
+    // flag; reset it so later suites (discord.test.ts M3: a first start
+    // with no pending restart mark) do not see a stale suppression
+    resetStartupMessageSuppressionForTests();
   });
 
   test("#306 amnesia: session_start re-queues accepted-but-unpersisted inbounds", async () => {

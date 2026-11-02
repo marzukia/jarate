@@ -120,6 +120,10 @@ afterEach(() => {
 // ─── M3: startup message gated on bot identity ─────────────────────────────
 
 test("startup message waits until bot identity resolves (M3)", async () => {
+  // first start, no pending restart mark: the #328 suppression flag
+  // must be unset (test-hook reset — other suites share the module
+  // registry and may have set it on an unclean start)
+  resetStartupMessageSuppressionForTests();
   const posts: any[] = [];
   let meFail = true;
   setFetch(async (u, init) => {
@@ -1155,78 +1159,88 @@ test("startSlashReput: default env = 6h unref'd timer", () => {
 // INTERACTION_CREATE frame on the wire reaches the handler registered via
 // setDiscordInteractionHandler. This test fails against the pre-5431caed
 // code (missing intent bit + event name INTERACTIONS_CREATE, plural).
-test("gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the handler (#169)", async () => {
-  const token = "tok-seam-169";
-  const wss = new WebSocketServer({ port: 0 });
-  const port = (wss.address() as { port: number }).port;
-  const identified: any[] = [];
-  const frames: any[] = [];
-  wss.on("connection", (sock) => {
-    sock.on("message", (data: any) => {
-      const m = JSON.parse(String(data));
-      frames.push(m);
-      if (m.op === 2) {
-        identified.push(m.d);
-        sock.send(
-          JSON.stringify({ op: 10, d: { heartbeat_interval: 41000, seq: 1 } }),
-        );
-        sock.send(
-          JSON.stringify({
-            op: 0,
-            s: 2,
-            t: "READY",
-            d: { user: { id: "bot9" }, session_id: "sess9" },
-          }),
-        );
-        sock.send(
-          JSON.stringify({
-            op: 0,
-            s: 3,
-            t: "INTERACTION_CREATE",
-            // Live guild shape (capture 2026-10-08): the actor lives at
-            // member.user; a guild INTERACTION_CREATE has NO top-level
-            // user, and a type-1 (PING) frame carries no data.
-            d: {
-              type: 1,
-              id: "ix9",
-              token: "ixtok",
-              application_id: "app9",
-              channel_id: "888",
-              guild_id: "g9",
-              member: { user: { id: "u9" } },
-            },
-          }),
-        );
-      } else if (m.op === 11) {
-        sock.send(JSON.stringify({ op: 1, d: m.d }));
-      }
+test(
+  "gateway seam: IDENTIFY has INTERACTIONS intent; type-1 frame reaches the handler (#169)",
+  async () => {
+    const token = "tok-seam-169";
+    const wss = new WebSocketServer({ port: 0 });
+    const port = (wss.address() as { port: number }).port;
+    const identified: any[] = [];
+    const frames: any[] = [];
+    wss.on("connection", (sock) => {
+      sock.on("message", (data: any) => {
+        const m = JSON.parse(String(data));
+        frames.push(m);
+        if (m.op === 2) {
+          identified.push(m.d);
+          sock.send(
+            JSON.stringify({
+              op: 10,
+              d: { heartbeat_interval: 41000, seq: 1 },
+            }),
+          );
+          sock.send(
+            JSON.stringify({
+              op: 0,
+              s: 2,
+              t: "READY",
+              d: { user: { id: "bot9" }, session_id: "sess9" },
+            }),
+          );
+          sock.send(
+            JSON.stringify({
+              op: 0,
+              s: 3,
+              t: "INTERACTION_CREATE",
+              // Live guild shape (capture 2026-10-08): the actor lives at
+              // member.user; a guild INTERACTION_CREATE has NO top-level
+              // user, and a type-1 (PING) frame carries no data.
+              d: {
+                type: 1,
+                id: "ix9",
+                token: "ixtok",
+                application_id: "app9",
+                channel_id: "888",
+                guild_id: "g9",
+                member: { user: { id: "u9" } },
+              },
+            }),
+          );
+        } else if (m.op === 11) {
+          sock.send(JSON.stringify({ op: 1, d: m.d }));
+        }
+      });
     });
-  });
 
-  const received: any[] = [];
-  setDiscordInteractionHandler(token, (d) => received.push(d));
-  const savedGateway = process.env.DISCORD_GATEWAY_URL;
-  process.env.DISCORD_GATEWAY_URL = `ws://127.0.0.1:${port}`;
+    const received: any[] = [];
+    setDiscordInteractionHandler(token, (d) => received.push(d));
+    const savedGateway = process.env.DISCORD_GATEWAY_URL;
+    process.env.DISCORD_GATEWAY_URL = `ws://127.0.0.1:${port}`;
 
-  try {
-    await connectDiscordPresence(token);
-    // poll: the frame lands right after READY
-    const t0 = Date.now();
-    while (received.length === 0 && Date.now() - t0 < 5000) await tick(25);
+    try {
+      await connectDiscordPresence(token);
+      // poll: the frame lands right after READY (15s cap: the hermetic
+      // ws handshake can be slow on a loaded CI runner; the default 5s
+      // test timeout would fire first and mask a real miss)
+      const t0 = Date.now();
+      while (received.length === 0 && Date.now() - t0 < 15000) await tick(25);
 
-    expect(identified.length).toBe(1);
-    expect(identified[0].intents & 0x2, "INTERACTIONS intent bit").toBe(0x2);
-    expect(received.length).toBe(1);
-    expect(received[0].member.user.id).toBe("u9");
-    expect(received[0].type).toBe(1);
-    expect(received[0].channel_id).toBe("888");
-  } finally {
-    if (savedGateway === undefined) delete process.env.DISCORD_GATEWAY_URL;
-    else process.env.DISCORD_GATEWAY_URL = savedGateway;
-    stopDiscordPresence(token);
-    wss.close();
-  }
-});
+      expect(identified.length).toBe(1);
+      expect(identified[0].intents & 0x2, "INTERACTIONS intent bit").toBe(0x2);
+      expect(received.length).toBe(1);
+      expect(received[0].member.user.id).toBe("u9");
+      expect(received[0].type).toBe(1);
+      expect(received[0].channel_id).toBe("888");
+    } finally {
+      if (savedGateway === undefined) delete process.env.DISCORD_GATEWAY_URL;
+      else process.env.DISCORD_GATEWAY_URL = savedGateway;
+      stopDiscordPresence(token);
+      wss.close();
+    }
+    // the 15s poll cap needs headroom over the default 5s test timeout
+  },
+  { timeout: 20000 },
+);
 
 test("deferInteraction posts callback type 5; editInteractionMessage PATCHes @original (P0)", async () => {
   const calls: { url: string; method: string; body: any }[] = [];

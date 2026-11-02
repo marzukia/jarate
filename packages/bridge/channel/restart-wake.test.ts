@@ -484,6 +484,9 @@ describe("runRestartWake (issue #111)", () => {
   const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
+    // #328: an unclean start sets the once-per-process startup-suppress
+    // flag; reset between tests (shared module registry)
+    resetStartupMessageSuppressionForTests();
     log = [];
     // deterministic bus-webhook resolution (the real file is env-dependent)
     process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
@@ -727,6 +730,9 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
   const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
+    // #328: an unclean start sets the once-per-process startup-suppress
+    // flag; reset between tests (shared module registry)
+    resetStartupMessageSuppressionForTests();
     log = [];
     process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
   });
@@ -910,6 +916,9 @@ describe("wake audit G2 (issue #322)", () => {
   });
 
   test("runRestartWake logs the flag line when a closed window violates the invariant", async () => {
+    // an unclean start sets the #328 once-per-process suppress flag;
+    // reset it afterwards (shared module registry)
+    resetStartupMessageSuppressionForTests();
     const s = wakeAuditInit();
     const ws = Math.floor(T0 / W) * W;
     const log: string[] = [];
@@ -941,6 +950,7 @@ describe("wake audit G2 (issue #322)", () => {
     expect(joined).toContain("[wake] audit flag:");
     expect(joined).toContain("starts=2");
     expect(joined).toContain("accounted=1");
+    resetStartupMessageSuppressionForTests();
   });
 });
 
