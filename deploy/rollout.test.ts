@@ -44,10 +44,10 @@ SRC="$2"
 CASE="$3"
 
 extract() { sed -n "$1" "$SRC"; }
-eval "$(extract '/^validate_hm_base() {/,/^}/')"
-eval "$(extract '/^first_key_line() {/,/^}/')"
-eval "$(extract '/^wait_marker() {/,/^}/')"
-eval "$(extract '/^enumerate_agents() {/,/^}/')"
+eval "$(extract '/^validate_hm_base() {/,/^}/p')"
+eval "$(extract '/^first_key_line() {/,/^}/p')"
+eval "$(extract '/^wait_marker() {/,/^}/p')"
+eval "$(extract '/^enumerate_agents() {/,/^}/p')"
 for fn in validate_hm_base first_key_line wait_marker enumerate_agents; do
   declare -f "$fn" >/dev/null || { echo "harness: extraction of $fn from jarate-rollout.sh failed" >&2; exit 90; }
 done
@@ -58,7 +58,7 @@ case "$CASE" in
       validate_hm_base "$base" && echo "ok $base" || echo "bad $base"
     done
     for base in "" "ftp://x" "http://127.0.0.1:8001/" "http://x/path" "http://x:9999/"; do
-      validate_hm_base "$base" && echo "ok ${base:-<empty>}" || echo "bad ${base:-<empty>}"
+      validate_hm_base "$base" && echo "ok \${base:-EMPTY}" || echo "bad \${base:-EMPTY}"
     done
     ;;
   keyline)
@@ -136,7 +136,7 @@ describe("jarate-rollout.sh: validate_hm_base (no default, strict shape)", () =>
       "ok https://hall",
       "ok http://10.1.2.3",
       "ok https://h.example:443",
-      "bad <empty>",
+      "bad EMPTY",
       "bad ftp://x",
       "bad http://127.0.0.1:8001/",
       "bad http://x/path",
