@@ -100,10 +100,10 @@ import {
   type LiveFrameRec,
   machine,
   opTickLine,
-  opTicks,
   persistLivePlaceholders,
   readLivePlaceholders,
   setLivePlaceholderSnapshot,
+  settleCompactPlaceholdersOnShutdown,
   settleOpTick,
   stopAllOpTicks,
   stopOpTick,
@@ -582,8 +582,6 @@ export function opBusyRefusal(channelId: string): string {
 /** Clear the flag (no-op when not set). `warn` = the 10-min fallback timer
  *  fired without a completion event. */
 export function clearCompacting(channelId: string, warn = false): void {
-  // #84: the placeholder-line record follows the window's life
-  compactPlaceholders.delete(channelId);
   const e = compactingChannels.get(channelId);
   if (!e) {
     persistLivePlaceholders();
@@ -2056,25 +2054,9 @@ export default function (pi: ExtensionAPI) {
     // entry's text is lost with the process; there is nothing to redeliver).
     for (const [channelId, messageId] of interruptInFlight)
       consumeQueuedAck(channelId, messageId, shutdownDeletes);
-    // Open compact window (no op marker to settle it on respawn): a
-    // mid-compact crash would otherwise leave the ticking "[..] compacting…"
-    // line frozen. Restart-class op windows are settled by the respawn's
-    // op marker instead — leave them.
-    for (const [id, e] of compactingChannels) {
-      if (e.label !== "compacting") continue;
-      const t = opTicks.get(`compact:${id}`);
-      if (!t) continue;
-      clearInterval(t.timer);
-      opTicks.delete(`compact:${id}`);
-      compactPlaceholders.delete(id); // #84: record follows the settle
-      shutdownDeletes.push(
-        editDiscordMessage(
-          t.ch,
-          t.msgId,
-          machine("compact interrupted - restart"),
-        ).catch(() => {}),
-      );
-    }
+    // Compact placeholder (belt, 2026-11-02 orphan fix): drive every live compact record to its terminal state BEFORE clearAllCompacting + stopAllOpTicks drop the paused ticks without a final replacement (orphan froze "[..] compacting...").
+    for (const p of settleCompactPlaceholdersOnShutdown(channels))
+      shutdownDeletes.push(p);
     for (const ch of channels) {
       if (ch.type === "discord") {
         disconnectDiscord(ch.id);
@@ -2730,11 +2712,11 @@ export default function (pi: ExtensionAPI) {
   // is active, so agent_end will never flush it — flush it when the
   // blocking compaction settles, success or failure. (Aborted-settle is
   // fine: a superseding compaction's own settle flushes the pending one.)
-  const flushPendingCompact = (ctx: ExtensionContext): boolean => {
+  const flushPendingCompact = async (ctx: ExtensionContext) => {
     if (!pendingCompact) return false;
     const pc = pendingCompact;
     pendingCompact = null;
-    const err = startCompact(pi, pc, ctx, true);
+    const err = await startCompact(pi, pc, ctx, true);
     if (err !== null) {
       const t = channelError(err);
       if (t !== null)
@@ -2750,9 +2732,9 @@ export default function (pi: ExtensionAPI) {
   // swept by this settle. When no new compaction started, drain whatever
   // was queued behind the window (no agent_end fires on its own while pi
   // is idle, so queued inbounds would stall otherwise).
-  const settleCompacting = (ctx: ExtensionContext): void => {
+  const settleCompacting = async (ctx: ExtensionContext): Promise<void> => {
     for (const id of [...compactingChannels.keys()]) clearCompacting(id);
-    const started = flushPendingCompact(ctx);
+    const started = await flushPendingCompact(ctx);
     if (started) return;
     // Drain on BOTH settle paths, but deferred one macrotask. pi's SUCCESS
     // path emits session_compact BEFORE clearing its own compaction state
@@ -2767,7 +2749,13 @@ export default function (pi: ExtensionAPI) {
     setTimeout(() => drainQueuedAfterCompact(pi, ctx), 0);
   };
   pi.on("session_compact", (_event, ctx) => {
-    settleCompacting(ctx);
+    // Async (the flushed /compact posts its placeholder first): fire-and-forget so the emit is never held; the drain is deferred.
+    settleCompacting(ctx).catch((e) =>
+      console.error(
+        "[channel] settle compacting failed:",
+        sanitizeUnknownValue(e),
+      ),
+    );
     // #254 wave 2: redeliver the unread inbox rows on the post-compaction wake (deferred until pi is idle; skipped when a handoff restart is armed — the rows stay unread for the post-restart redelivery — or this is a fleet run).
     redeliverOnCompact(
       () => ctx.isIdle() && !isHandoffRestartArmed() && !isFleetRun(),
@@ -2780,7 +2768,12 @@ export default function (pi: ExtensionAPI) {
     handoffRestartForSize(pi, ctx);
   });
   pi.on("session_compact_failed", (_event, ctx) => {
-    settleCompacting(ctx);
+    settleCompacting(ctx).catch((e) =>
+      console.error(
+        "[channel] settle compacting failed:",
+        sanitizeUnknownValue(e),
+      ),
+    );
   });
 
   // ─── Handover compaction (mechanism A, design v2, PR1) ────────────────
@@ -2909,11 +2902,13 @@ export default function (pi: ExtensionAPI) {
         undoRun = null;
         console.error("[undo] finish failed:", sanitizeUnknownValue(e));
       }
-      // Deferred /compact (queued while this run was in progress). The
-      // IIFE inside pi's compact() awaits abort()+waitForIdle() before it
-      // compacts, so it runs only after this run settles (including the
-      // re-wake continuation below) and cannot abort that run.
-      flushPendingCompact(ctx);
+      // Deferred /compact (queued while this run was in progress). The IIFE inside pi's compact() awaits abort()+waitForIdle() before it compacts, so it runs only after this run settles. Fire-and-forget: the post must not hold the emit.
+      flushPendingCompact(ctx).catch((e) =>
+        console.error(
+          "[channel] flush pending compact failed:",
+          sanitizeUnknownValue(e),
+        ),
+      );
 
       // Proactive token-% gate (first shot): context at/over the handoff
       // threshold with nothing in flight → the same compact /compact runs.
@@ -3348,10 +3343,8 @@ export async function maybeAutoCompactByToken(
   console.log(
     `[handoff] auto-compact: ctx ${percent}% >= ${settings.threshold * 100}%`,
   );
-  // Same path /compact uses: ctx.compact + the op window (beginCompacting)
-  // inside startCompact. postPlaceholder=true = the text-command path
-  // (ticking placeholder, settle-in-place report).
-  const err = startCompact(pi, { ch }, ctx, true);
+  // Same path /compact uses (postPlaceholder = the text-command path).
+  const err = await startCompact(pi, { ch }, ctx, true);
   if (err !== null) console.error(`[handoff] auto-compact failed: ${err}`);
 }
 

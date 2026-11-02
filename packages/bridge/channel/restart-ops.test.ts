@@ -1350,6 +1350,34 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     expect(settled).toBe(true);
   });
 
+  test("2026-11-02: shutdown settles an ORPHANED compact placeholder (window closed, line never replaced) by DELETE", async () => {
+    // The 2026-11-02 20:17Z incident state: the placeholder line is live, its tick is armed-but-paused (window closed -> first render null), and the compact's result line was already posted fresh. The old shutdown stopped the paused tick WITHOUT a final replacement and unlinked the record - the line sat frozen forever. Now the shutdown drives every persisted compact record to its terminal state: window CLOSED -> DELETE (the result line is already posted; the placeholder is a redundant duplicate).
+    await handlers.session_start?.(null, ctx);
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await tick(); // placeholder post landed, tick armed (out1)
+    expect(channelPosts().some((t) => t.includes("[..] compacting..."))).toBe(
+      true,
+    );
+    // The orphan: the window closed without the placeholder's in-place settle (the settle fresh-posted while the post was still landing in the old order). The tick pauses (render null); the record stays live (it follows the tick's life, not the window's).
+    clearAllCompacting();
+    expect(isCompacting("ch1")).toBe(false);
+
+    await handlers.session_shutdown?.(); // awaits its REST settles
+
+    const deleted = fetchCalls.some(
+      (c) => c.method === "DELETE" && c.url.includes("/messages/out1"),
+    );
+    expect(deleted).toBe(true);
+    // closed window -> NOT the interrupted edit (that is the open-window terminal state, the test above).
+    const interrupted = fetchCalls.some(
+      (c) =>
+        c.method === "PATCH" &&
+        c.url.includes("/messages/out1") &&
+        String(c.body).includes("compact interrupted"),
+    );
+    expect(interrupted).toBe(false);
+  });
+
   test("second /reset while an op window is open is rejected; /compact sees the active op; /status shows the op label", async () => {
     await handleInbound(pi, inbound("/reset", "m1"), ctx);
     await tick();
