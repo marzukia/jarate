@@ -86,10 +86,7 @@ function withHttp(status: number, calls: PageCall[]): void {
 }
 
 // Point JARATE_INBOX_KEY_FILE at a fixture (os.homedir() reads the passwd entry, not $HOME, so the path override is the test seam).
-function homeWithKeyFile(
-  content: string,
-  name = "agent-key",
-): void {
+function homeWithKeyFile(content: string, name = "agent-key"): void {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-drift-home-"));
   tmpDirs.push(home);
   const dir = path.join(home, ".config", "hall-monitor");
@@ -162,7 +159,9 @@ describe("version-drift: the startup parity check", () => {
     await freshCheck();
     const calls: PageCall[] = [];
     pinTo("2".repeat(40));
-    homeWithKeyFile(`# comment line\n\nfile-fallback-key\nsecond-line-ignored\n`);
+    homeWithKeyFile(
+      `# comment line\n\nfile-fallback-key\nsecond-line-ignored\n`,
+    );
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
     withHttp(200, calls);
     const r = await checkVersionDrift();
@@ -294,7 +293,9 @@ describe("version-drift: keyFileCandidates (the fleet agent-key path chain)", ()
     expect(cands[0]).toBe(
       path.join(os.homedir(), ".config", "hall-monitor", "agent-key"),
     );
-    expect(cands[1]).toBe(path.join(os.homedir(), ".config", "hall-monitor", "key"));
+    expect(cands[1]).toBe(
+      path.join(os.homedir(), ".config", "hall-monitor", "key"),
+    );
     expect(cands[2]).toBe(path.join(os.homedir(), "hall-monitor.key"));
   });
 });
