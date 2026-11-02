@@ -3025,6 +3025,120 @@ describe("#315 P1 leg: isFinalAssistant + lastSentMessage", () => {
   });
 });
 
+describe("#315 P1 leg: send-pipeline gate (r1 F1)", () => {
+  const thinkOnlyEntry = (id: string, ts: number, text: string) => ({
+    id,
+    type: "message",
+    timestamp: new Date(ts).toISOString(),
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      timestamp: ts,
+    },
+  });
+  test("(a) a NO_REPLY-only last final is NOT sent; the field = the previous posted final", () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("the posted reply");
+    expect(sent?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(a) a NO_REPLY-only final with no other final → null", () => {
+    expect(
+      lastSentMessage([
+        finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+      ] as any[]),
+    ).toBeNull();
+  });
+  test("(b) a thinking-tag-only last final is NOT sent; the field = the previous posted final", () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      thinkOnlyEntry("f2", T0 - 10 * 60_000, "\u003cthink\u003e"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("the posted reply");
+    expect(sent?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(b) content + leaked thinking tags → the field shows the cleaned text the operator saw", () => {
+    expect(
+      lastSentMessage([
+        thinkOnlyEntry(
+          "f1",
+          T0 - 10 * 60_000,
+          "\u003cthink\u003ehmm\u003c/think\u003e done",
+        ),
+      ] as any[])?.text,
+    ).toBe("done");
+  });
+  test("content + NO_REPLY token lines → the field shows the token-stripped text", () => {
+    expect(
+      lastSentMessage([
+        finalEntry("f1", T0 - 10 * 60_000, "NO_REPLY\nthe posted reply"),
+      ] as any[])?.text,
+    ).toBe("the posted reply");
+  });
+  test("(c) the third consecutive identical final is dropped (recordFinalRepeat); the field = the previous posted one", () => {
+    const entries = [
+      humanEntry("h1", "a", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("loop");
+    expect(sent?.ts).toBe(T0 - 40 * 60_000);
+  });
+  test("(c) a new inbound resets the repeat streak (live semantics) → the third is posted", () => {
+    const entries = [
+      humanEntry("h1", "a", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      humanEntry("h2", "b", T0 - 45 * 60_000),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    expect(lastSentMessage(entries)?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(d) doc-write guard: a silent (NO_REPLY-only) NEWER final does not fire LAST-SENT-MISSING", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries),
+    ).toBeNull();
+  });
+  test("(d) doc-write guard: a thinking-tag-only NEWER final does not fire", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      thinkOnlyEntry("f2", T0 - 10 * 60_000, "\u003cthink\u003e"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries),
+    ).toBeNull();
+  });
+  test("(d) doc-write guard: a repeat-dropped NEWER final does not fire", () => {
+    const entries = [
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    expect(lastSentMissing("loop", T0 - 40 * 60_000, entries)).toBeNull();
+  });
+  test("(d) doc-write guard still fires for a genuinely posted newer final", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "a real newer reply"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries)?.text,
+    ).toBe("a real newer reply");
+  });
+});
+
 describe("#315 P1 leg: buildHandover - the Last sent message field", () => {
   let tmp = "";
   let oldHome = "";
@@ -3147,6 +3261,81 @@ describe("#315 P1 leg: buildHandover - the Last sent message field", () => {
     expect(loadPreviousHandover({ storeDir })).not.toContain(
       "LAST-SENT-MISSING",
     );
+  });
+  test("(a) last final is NO_REPLY-only → the field = the previous posted final, no tag", async () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\nthe reply that was sent");
+    expect(doc).not.toContain("NO_REPLY");
+    expect(doc).not.toContain("LAST-SENT-MISSING");
+  });
+  test("(b) last final is thinking-tag-only → the field = the previous posted final, no tag", async () => {
+    const thinkOnly = {
+      id: "f2",
+      type: "message",
+      timestamp: new Date(T0 - 10 * 60_000).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "\u003cthink\u003e" }],
+        timestamp: T0 - 10 * 60_000,
+      },
+    };
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      thinkOnly,
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\nthe reply that was sent");
+    expect(doc).not.toContain("\u003cthink\u003e");
+    expect(doc).not.toContain("LAST-SENT-MISSING");
+  });
+  test("(b) a content + leaked thinking tags final → the field shows the cleaned text the operator saw", async () => {
+    const entries = [
+      finalEntry(
+        "f1",
+        T0 - 10 * 60_000,
+        "\u003cthink\u003ehmm\u003c/think\u003e done",
+      ),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\ndone");
+  });
+  test("(c) every final is silent (NO_REPLY-only) → the section renders (none)", async () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\n(none)");
   });
 });
 

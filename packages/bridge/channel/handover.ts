@@ -138,7 +138,7 @@ export interface ParsedState {
   modelLabel: string;
   sessionStats: string;
   lastUserAsks: string[];
-  /** #315 P1 leg: the last assistant FINAL message (the reply that was actually sent to the channel), from the FULL transcript (NOT the size-limited tail window — a mid-turn split must still surface it). "" when the transcript has no assistant final. Numeric ts (ms epoch) of lastSent; 0 when none — the doc-write guard compares numerically. */
+  /** #315 P1 leg: the last assistant FINAL the send pipeline actually POSTS (silent / thinking-tag-only / repeat-dropped finals are not sent — the field walks back to the previous posted one), from the FULL transcript (NOT the size-limited tail window — a mid-turn split must still surface it). "" when no posted final exists. Numeric ts (ms epoch) of lastSent; 0 when none — the doc-write guard compares numerically. */
   lastSent: string;
   lastSentTs: number;
   /** /compact operator focus instructions (absent when none passed). */

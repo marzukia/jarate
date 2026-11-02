@@ -68,6 +68,7 @@ import {
   suppressAutoReact,
   unreactMessage,
 } from "./discord";
+import { finalRepeatStep } from "./final-repeat";
 import { isFleetRun } from "./fleet-run";
 import { fmtTokensLC, mdToDiscord } from "./format";
 import { FRAME_COL_MAX } from "./frame";
@@ -878,21 +879,11 @@ const finalReps = new Map<string, string[]>();
 export const REPEAT_WARNING =
   "repetition loop detected - run stopped. Say /reset if it persists.";
 
-/** Record a posted final; true on the third consecutive identical one. */
+/** Record a posted final; true on the third consecutive identical one. The drop decision is the shared pure core (final-repeat.ts), also replayed by the #315 last-sent extraction. */
 export function recordFinalRepeat(channelId: string, text: string): boolean {
-  const t = text.trim();
-  const arr = finalReps.get(channelId) ?? [];
-  if (arr.length > 0 && arr[arr.length - 1] === t) arr.push(t);
-  else {
-    arr.length = 0;
-    arr.push(t);
-  }
-  if (arr.length >= 3) {
-    finalReps.set(channelId, []);
-    return true;
-  }
-  finalReps.set(channelId, arr);
-  return false;
+  const { drop, next } = finalRepeatStep(finalReps.get(channelId) ?? [], text);
+  finalReps.set(channelId, next);
+  return drop;
 }
 
 /** Reset the repetition counter for a channel. */
