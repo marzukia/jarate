@@ -52,19 +52,28 @@ validate_hm_base() {
   [[ -n "$base" && "$base" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
 }
 
-# first_key_line <file>: the first non-comment, non-blank line (the agent
-# key the operator hands out); 1 when the file is missing or has none.
+# first_key_line <file>: the agent key from the user's ~/.config/hall-monitor/agent-key: an X_AGENT_KEY= line wins (value after the =), then an hm_agent_ line (the new onboarding key-file format, where the first non-comment line is BASE_URL=...), else the first non-comment, non-blank line (legacy bare-key files); 1 when the file is missing or nothing matches.
 first_key_line() {
-  local f="$1" line
+  local f="$1" line legacy=""
   [[ -r "$f" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
-    if [[ -n "$line" && "$line" != \#* ]]; then
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    if [[ "$line" == X_AGENT_KEY=* ]]; then
+      printf '%s\n' "${line#X_AGENT_KEY=}"
+      return 0
+    fi
+    if [[ "$line" == hm_agent_* ]]; then
       printf '%s\n' "$line"
       return 0
     fi
+    [[ -z "$legacy" ]] && legacy="$line"
   done <"$f"
+  if [[ -n "$legacy" ]]; then
+    printf '%s\n' "$legacy"
+    return 0
+  fi
   return 1
 }
 

@@ -60,6 +60,12 @@ case "$CASE" in
     first_key_line "$T/no-such-file" >/dev/null 2>&1 && echo "missing exit 0" || echo "missing exit 1"
     printf '# only comments\\n\\n# more\\n' >"$T/key2"
     first_key_line "$T/key2" >/dev/null 2>&1 && echo "onlycomments exit 0" || echo "onlycomments exit 1"
+    printf '# onboarding key file\\nBASE_URL=http://10.1.2.3:8001\\nX_AGENT_KEY=agentkey-new\\n' >"$T/key3"
+    first_key_line "$T/key3" >"$T/k3" 2>/dev/null && echo "newformat exit 0" || echo "newformat exit 1"
+    cat "$T/k3"
+    printf 'BASE_URL=http://10.1.2.3:8001\\nhm_agent_abc123\\n' >"$T/key4"
+    first_key_line "$T/key4" >"$T/k4" 2>/dev/null && echo "hmagent exit 0" || echo "hmagent exit 1"
+    cat "$T/k4"
     ;;
   enum)
     pf="$T/passwd"
@@ -140,7 +146,7 @@ describe("jarate-rollout.sh: validate_hm_base (no default, strict shape)", () =>
 });
 
 describe("jarate-rollout.sh: first_key_line (the agent-key file shape)", () => {
-  test("first non-comment, non-blank line wins; missing / comment-only files fail", async () => {
+  test("first non-comment, non-blank line wins (legacy); X_AGENT_KEY= / hm_agent_ lines win (onboarding format); missing / comment-only files fail", async () => {
     const r = await runCase("keyline");
     expect(r.code).toBe(0);
     const lines = r.out.trim().split("\n");
@@ -149,6 +155,10 @@ describe("jarate-rollout.sh: first_key_line (the agent-key file shape)", () => {
       "the-key",
       "missing exit 1",
       "onlycomments exit 1",
+      "newformat exit 0",
+      "agentkey-new",
+      "hmagent exit 0",
+      "hm_agent_abc123",
     ]);
   });
 });
