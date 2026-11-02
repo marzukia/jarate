@@ -383,11 +383,7 @@ export async function redeliverUnread(
       );
       return 0;
     }
-    // Rows this process already delivered live are skipped: the delivery
-    // commit marked them before the receive settled (or the receive is
-    // still in flight), and the live path owns the consume — redelivering
-    // them here (the compaction drain and the post-compaction redelivery
-    // fire in the same settle) would double-deliver.
+    // Rows this process already delivered live are skipped: the delivery commit marked them before the receive settled (or the receive is still in flight), and the live path owns the consume — redelivering them here (the compaction drain and the post-compaction redelivery fire in the same settle) would double-deliver.
     const rows = list.messages.filter(
       (r) => !r.source_ref || !liveDeliveredRefs.has(r.source_ref),
     );
