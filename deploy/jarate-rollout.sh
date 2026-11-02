@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+#
+# jarate fleet rollout (#314, G4 of P1 #322) — one run = the whole host,
+# on the named tag.
+#
+# The tag is the version (tag discipline, deploy/README.md): every change
+# that ships to the fleet is tagged, and untagged main is not a deploy
+# target. This script moves every agent checkout on the host to the tag,
+# restarts each pi.service, verifies liveness + delivery, and writes the
+# pinned-SHA pointer the bridge's startup drift check compares against.
+#
+# Runs as root under a hall-monitor vault plan (SUDO_PW); cross-user
+# steps use `printf '%s\n' "$SUDO_PW" | sudo -S -u <user> ...` (the
+# printf keeps the password out of `ps` output) with
+# XDG_RUNTIME_DIR=/run/user/<uid> for the user systemd instance. One
+# operator tap: the plan is approved, the run does the whole host.
+#
+# Usage: jarate-rollout.sh <tag> [hm-base]
+#   <tag>     the release tag (must exist after `git fetch --tags`)
+#   hm-base   the hall-monitor base (http://host:port) — or the
+#             JARATE_HM_URL env var. NO default: unset = fail loud.
+#
+# Per agent user (deterministic enumeration: users with a
+# ~/projects/jarate checkout, in /etc/passwd order):
+#   1. dirty-tree check (fail loud — never move a dirty checkout)
+#   2. git fetch --tags (as the user)
+#   3. ff-move the checkout to the tag (plain ff; divergent = fail loud,
+#      no merge, no rebase)
+#   4. restart pi.service (the user systemd instance)
+#   5. verify: /var/tmp/jarate-live/<uid> mtime advances after the
+#      restart (≤90s wait loop, fail loud)
+#   6. verify: one delivered smoke say via hall-monitor
+#      (POST <base>/api/fleet/say, X-Agent-Key = the first non-comment
+#      line of the user's ~/.config/hall-monitor/agent-key; 2xx = delivered)
+#   7. write /var/tmp/jarate-pinned/<uid> = the tag's SHA
+#
+# A per-user failure stops the whole run (fail loud, exit 1); already
+# rolled users keep their pins (their drift check stays quiet), the
+# failed user keeps none (its drift check pages warden — the mismatch
+# is real and is what should be heard about).
+#
+# Only bash + git + sudo + curl + getent are required.
+
+set -euo pipefail
+
+TAG="${1:-}"
+HM_BASE="${2:-${JARATE_HM_URL:-}}"
+LIVE_DIR="${JARATE_LIVE_DIR:-/var/tmp/jarate-live}"
+PINNED_DIR="${JARATE_PINNED_DIR:-/var/tmp/jarate-pinned}"
+GATE_TIMEOUT_S="${JARATE_ROLLOUT_GATE_TIMEOUT_S:-90}"
+
+log() { echo "[$(date '+%F %T')] $*"; }
+die() { log "ROLLOUT FAIL: $*"; exit 1; }
+
+# Cross-user step: the password over stdin (never in argv/ps); the
+# command's own env is set with `env` inside the target user (sudo
+# strips XDG_RUNTIME_DIR).
+as_user() {
+  local user="$1"
+  shift
+  printf '%s\n' "$SUDO_PW" | sudo -S -u "$user" "$@"
+}
+
+# --- pure helpers (sourced-harness tested in rollout.test.ts) --------------
+
+# validate_hm_base <base>: ok when <base> is http(s)://host[:port] with no
+# path and no trailing slash (the endpoint is appended as /api/fleet/say).
+validate_hm_base() {
+  local base="${1:-}"
+  [[ -n "$base" && "$base" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+}
+
+# first_key_line <file>: the first non-comment, non-blank line (the agent
+# key the operator hands out); 1 when the file is missing or has none.
+first_key_line() {
+  local f="$1" line
+  [[ -r "$f" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    if [[ -n "$line" && "$line" != \#* ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done <"$f"
+  return 1
+}
+
+# wait_marker <dir> <uid> <bar_epoch_s> <timeout_s>: 0 when the marker's
+# mtime (epoch seconds) is strictly newer than <bar_epoch_s>; 1 on
+# timeout. Polls every 3s.
+wait_marker() {
+  local dir="$1" uid="$2" bar_s="$3" timeout_s="$4"
+  local f="$dir/$uid" deadline m
+  deadline=$(( $(date +%s) + timeout_s ))
+  while (( $(date +%s) < deadline )); do
+    if [[ -f "$f" ]]; then
+      m="$(stat -c %Y "$f" 2>/dev/null || true)"
+      if [[ -n "$m" && "$m" -gt "$bar_s" ]]; then
+        return 0
+      fi
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+# enumerate_agents <passwd_file>: login-shell usernames, sorted — the
+# deterministic enumeration input (a user is an AGENT when, on top, they
+# have a ~/projects/jarate checkout; that check is in the main loop).
+enumerate_agents() {
+  local pf="$1"
+  awk -F: '{
+    sh = $7
+    sub(".*/", "", sh)
+    if (sh == "bash" || sh == "sh" || sh == "zsh" || sh == "dash") print $1
+  }' "$pf" | sort -u
+}
+
+# --- main -----------------------------------------------------------------
+
+main() {
+  [[ -n "$TAG" ]] || die "usage: $0 <tag> [hm-base] (hm-base or JARATE_HM_URL required; no default)"
+  validate_hm_base "$HM_BASE" || die "hall-monitor base is not http(s)://host[:port] (arg 2 or JARATE_HM_URL; no default)"
+  [[ -n "${SUDO_PW:-}" ]] || die "SUDO_PW is not set (the vault plan credential)"
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+
+  local users=()
+  while IFS= read -r u; do
+    users+=("$u")
+  done < <(enumerate_agents /etc/passwd)
+
+  # Agent = has a ~/projects/jarate checkout.
+  local agents=() u h
+  for u in "${users[@]}"; do
+    h="$(getent passwd "$u" | awk -F: '{print $6}')"
+    [[ -d "$h/projects/jarate/.git" ]] && agents+=("$u")
+  done
+  [[ ${#agents[@]} -gt 0 ]] || die "no agent users found (no ~/projects/jarate checkout under any login-shell user)"
+
+  # Fail fast on a bad tag (validated in the first agent's repo after a
+  # fetch — the tag must exist after `git fetch --tags`).
+  local first_home
+  first_home="$(getent passwd "${agents[0]}" | awk -F: '{print $6}')"
+  as_user "${agents[0]}" git -C "$first_home/projects/jarate" fetch --tags origin || die "fetch --tags failed in ${agents[0]}"
+  as_user "${agents[0]}" git -C "$first_home/projects/jarate" rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null || die "tag $TAG does not exist after fetch --tags"
+
+  local tag_sha
+  tag_sha="$(as_user "${agents[0]}" git -C "$first_home/projects/jarate" rev-parse "refs/tags/$TAG^{commit}")"
+  log "rollout $TAG ($tag_sha) across ${#agents[@]} agent(s): ${agents[*]}"
+
+  local uid repo prev key code host
+  for u in "${agents[@]}"; do
+    uid="$(id -u "$u")"
+    h="$(getent passwd "$u" | awk -F: '{print $6}')"
+    repo="$h/projects/jarate"
+    log "agent $u (uid $uid): starting"
+
+    # 1. dirty tree — fail loud before anything moves.
+    if [[ -n "$(as_user "$u" git -C "$repo" status --porcelain)" ]]; then
+      die "agent $u: dirty tree at $repo (a dirty checkout is never moved by a rollout)"
+    fi
+
+    # 2. fetch the tags.
+    as_user "$u" git -C "$repo" fetch --tags origin || die "agent $u: git fetch --tags failed"
+
+    # 3. plain ff to the tag; divergent = fail loud (no merge, no rebase).
+    prev="$(as_user "$u" git -C "$repo" rev-parse HEAD)"
+    if [[ "$prev" != "$tag_sha" ]]; then
+      as_user "$u" git -C "$repo" merge --ff-only "refs/tags/$TAG" || die "agent $u: checkout diverged from $TAG at $prev (plain ff refused; fix the branch by hand)"
+    fi
+
+    # 4. restart pi.service via the user systemd instance.
+    local bar_s
+    bar_s="$(date +%s)"
+    if [[ -f "$LIVE_DIR/$uid" ]]; then
+      local pre
+      pre="$(stat -c %Y "$LIVE_DIR/$uid" 2>/dev/null || echo 0)"
+      [[ "$pre" -gt "$bar_s" ]] && bar_s="$pre"
+    fi
+    as_user "$u" env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart pi.service || die "agent $u: restart pi.service failed"
+
+    # 5. verify: the live marker mtime advances after the restart.
+    wait_marker "$LIVE_DIR" "$uid" "$bar_s" "$GATE_TIMEOUT_S" || die "agent $u: $LIVE_DIR/$uid did not advance within ${GATE_TIMEOUT_S}s after restart (pi.service did not come up)"
+
+    # 6. verify: one delivered smoke say via hall-monitor (2xx).
+    key="$(first_key_line "$h/.config/hall-monitor/agent-key")" || die "agent $u: no agent key at ~/.config/hall-monitor/agent-key"
+    host="$(hostname)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' \
+      -X POST "$HM_BASE/api/fleet/say" \
+      -H "X-Agent-Key: $key" \
+      -H 'Content-Type: application/json' \
+      -d "{\"to\": \"warden\", \"message\": \"smoke: rolled $TAG (${tag_sha:0:7}) on $host for $u\"}")"
+    [[ "$code" =~ ^2[0-9][0-9]$ ]] || die "agent $u: smoke say failed (http $code)"
+
+    # 7. pin: the tag's SHA, written only after the rollout fully passed.
+    mkdir -p "$PINNED_DIR"
+    printf '%s\n' "$tag_sha" >"$PINNED_DIR/$uid"
+    log "agent $u: pinned $tag_sha ($TAG); rollout verified"
+  done
+
+  log "rollout $TAG complete: ${#agents[@]} agent(s) on $tag_sha"
+}
+
+# Guard so tests can source the pure helpers without running main.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

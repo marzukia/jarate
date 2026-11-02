@@ -181,6 +181,7 @@ import {
   syncTodoBoard,
 } from "./tools";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
+import { checkVersionDrift } from "./version-drift";
 import {
   type AttachmentRef,
   type ChannelConfig,
@@ -1616,6 +1617,14 @@ export default function (pi: ExtensionAPI) {
       );
       return;
     }
+
+    // Startup drift check (#314): compare the checkout's git HEAD against
+    // the pinned tag SHA (fleet rollout parity); one page to warden on
+    // mismatch, once per process. Fire-and-forget: never blocks or
+    // fails startup; missing pointer file = silent no-op. (Gated out on
+    // fleet dispatch runs above: their checkout is an intentional base,
+    // not the live deployment.)
+    void checkVersionDrift();
 
     // #180: re-wake survival (same startup machinery as the wake below;
     // reason "startup" = a real process start, the same guard
