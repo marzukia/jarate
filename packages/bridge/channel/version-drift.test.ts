@@ -1,18 +1,12 @@
 /**
- * version-drift.ts — fleet-wide version parity, startup drift check
- * (issue #314, G4 of P1 #322).
+ * version-drift.ts — fleet-wide version parity, startup drift check (issue #314, G4 of P1 #322).
  *
- * Hermetic: no test touches the live hall-monitor API (the HTTP leg is
- * injected via setDriftHttp), and the pinned-SHA pointer lives in a temp
- * dir via JARATE_PINNED_DIR. The git HEAD is the real HEAD of this
- * worktree (the module resolves its own checkout via realpath — the test
- * runs inside the repo, so it is a usable git repo).
+ * Hermetic: no test touches the live hall-monitor API (the HTTP leg is injected via setDriftHttp), and the pinned-SHA pointer lives in a temp dir via JARATE_PINNED_DIR. The git HEAD is the real HEAD of this worktree (the module resolves its own checkout via realpath — the test runs inside the repo, so it is a usable git repo).
  *
  * Coverage:
  *   - pointer file missing = feature dormant (silent no-op, no fetch)
  *   - pointer == local HEAD = in-parity (no fetch)
- *   - pointer != HEAD + JARATE_INBOX_URL/KEY set = ONE page to warden
- *     (POST <base>/fleet/say, X-Agent-Key; 2xx = delivered)
+ *   - pointer != HEAD + JARATE_INBOX_URL/KEY set = ONE page to warden (POST <base>/fleet/say, X-Agent-Key; 2xx = delivered)
  *   - page failure (4xx) = logged, never thrown
  *   - key file fallback (first non-comment line of the agent-key file)
  *   - no URL/key = local log line, no fetch
@@ -31,8 +25,7 @@ import {
   setDriftHttp,
 } from "./version-drift";
 
-// Leak guard: every fixture mkdtemp dir is tracked and force-removed in a
-// file-level afterEach, so a failed or aborted test cannot leave dirs in /tmp.
+// Leak guard: every fixture mkdtemp dir is tracked and force-removed in a file-level afterEach, so a failed or aborted test cannot leave dirs in /tmp.
 const tmpDirs: string[] = [];
 afterEach(() => {
   for (const d of tmpDirs.splice(0)) {
@@ -49,8 +42,7 @@ afterEach(() => {
 const REAL_HEAD = localHead();
 expect(REAL_HEAD).toMatch(/^[0-9a-f]{40}$/); // the test must run inside the repo
 
-// The uid this process runs as (the pointer filename; the test writes the
-// pointer itself, so only consistency with the module matters).
+// The uid this process runs as (the pointer filename; the test writes the pointer itself, so only consistency with the module matters).
 const UID = typeof process.getuid === "function" ? process.getuid() : 0;
 
 // A recorded page call from the injected HTTP leg.
@@ -92,8 +84,7 @@ function withHttp(status: number, calls: PageCall[]): void {
   });
 }
 
-// Point JARATE_INBOX_KEY_FILE at a fixture (os.homedir() reads the
-// passwd entry, not $HOME, so the path override is the test seam).
+// Point JARATE_INBOX_KEY_FILE at a fixture (os.homedir() reads the passwd entry, not $HOME, so the path override is the test seam).
 function homeWithKeyFile(key: string): void {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-drift-home-"));
   tmpDirs.push(home);
@@ -104,10 +95,7 @@ function homeWithKeyFile(key: string): void {
   process.env.JARATE_INBOX_KEY_FILE = f;
 }
 
-// Re-arm the once-per-process flag cleanly: index.test.ts's session_start
-// fires checkVersionDrift fire-and-forget, so an in-flight check from a
-// previous file can grab the flag after a bare reset. Flush it (settle),
-// then re-arm.
+// Re-arm the once-per-process flag cleanly: index.test.ts's session_start fires checkVersionDrift fire-and-forget, so an in-flight check from a previous file can grab the flag after a bare reset. Flush it (settle), then re-arm.
 async function freshCheck(): Promise<void> {
   resetDriftStateForTests();
   await new Promise((r) => setTimeout(r, 25));

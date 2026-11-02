@@ -1,16 +1,9 @@
 /**
- * deploy/jarate-rollout.sh — fleet-wide rollout (#314, G4 of P1 #322),
- * pure-helper tests.
+ * deploy/jarate-rollout.sh — fleet-wide rollout (#314, G4 of P1 #322), pure-helper tests.
  *
- * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL
- * validate_hm_base / first_key_line / wait_marker / enumerate_agents
- * are extracted verbatim from jarate-rollout.sh (sed range over the
- * function bodies) and eval'd in a stubbed subshell, so the tests
- * exercise the script's own code — a rename or logic change in the
- * script is what the tests catch (an extraction failure exits 90).
+ * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / first_key_line / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
  *
- * The cross-user flow (sudo, systemctl, curl) is operator-run (vault
- * plan); only the pure helpers are tested here.
+ * The cross-user flow (sudo, systemctl, curl) is operator-run (vault plan); only the pure helpers are tested here.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";

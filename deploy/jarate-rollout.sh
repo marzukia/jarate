@@ -1,43 +1,25 @@
 #!/usr/bin/env bash
 #
-# jarate fleet rollout (#314, G4 of P1 #322) — one run = the whole host,
-# on the named tag.
+# jarate fleet rollout (#314, G4 of P1 #322) — one run = the whole host, on the named tag.
 #
-# The tag is the version (tag discipline, deploy/README.md): every change
-# that ships to the fleet is tagged, and untagged main is not a deploy
-# target. This script moves every agent checkout on the host to the tag,
-# restarts each pi.service, verifies liveness + delivery, and writes the
-# pinned-SHA pointer the bridge's startup drift check compares against.
+# The tag is the version (tag discipline, deploy/README.md): every change that ships to the fleet is tagged, and untagged main is not a deploy target. This script moves every agent checkout on the host to the tag, restarts each pi.service, verifies liveness + delivery, and writes the pinned-SHA pointer the bridge's startup drift check compares against.
 #
-# Runs as root under a hall-monitor vault plan (SUDO_PW); cross-user
-# steps use `printf '%s\n' "$SUDO_PW" | sudo -S -u <user> ...` (the
-# printf keeps the password out of `ps` output) with
-# XDG_RUNTIME_DIR=/run/user/<uid> for the user systemd instance. One
-# operator tap: the plan is approved, the run does the whole host.
+# Runs as root under a hall-monitor vault plan (SUDO_PW); cross-user steps use `printf '%s\n' "$SUDO_PW" | sudo -S -u <user> ...` (the printf keeps the password out of `ps` output) with XDG_RUNTIME_DIR=/run/user/<uid> for the user systemd instance. One operator tap: the plan is approved, the run does the whole host.
 #
 # Usage: jarate-rollout.sh <tag> [hm-base]
 #   <tag>     the release tag (must exist after `git fetch --tags`)
-#   hm-base   the hall-monitor base (http://host:port) — or the
-#             JARATE_HM_URL env var. NO default: unset = fail loud.
+#   hm-base   the hall-monitor base (http://host:port) — or the JARATE_HM_URL env var. NO default: unset = fail loud.
 #
-# Per agent user (deterministic enumeration: users with a
-# ~/projects/jarate checkout, in /etc/passwd order):
+# Per agent user (deterministic enumeration: users with a ~/projects/jarate checkout, in /etc/passwd order):
 #   1. dirty-tree check (fail loud — never move a dirty checkout)
 #   2. git fetch --tags (as the user)
-#   3. ff-move the checkout to the tag (plain ff; divergent = fail loud,
-#      no merge, no rebase)
+#   3. ff-move the checkout to the tag (plain ff; divergent = fail loud, no merge, no rebase)
 #   4. restart pi.service (the user systemd instance)
-#   5. verify: /var/tmp/jarate-live/<uid> mtime advances after the
-#      restart (≤90s wait loop, fail loud)
-#   6. verify: one delivered smoke say via hall-monitor
-#      (POST <base>/api/fleet/say, X-Agent-Key = the first non-comment
-#      line of the user's ~/.config/hall-monitor/agent-key; 2xx = delivered)
+#   5. verify: /var/tmp/jarate-live/<uid> mtime advances after the restart (≤90s wait loop, fail loud)
+#   6. verify: one delivered smoke say via hall-monitor (POST <base>/api/fleet/say, X-Agent-Key = the first non-comment non-blank line of the user's ~/.config/hall-monitor/agent-key; 2xx = delivered)
 #   7. write /var/tmp/jarate-pinned/<uid> = the tag's SHA
 #
-# A per-user failure stops the whole run (fail loud, exit 1); already
-# rolled users keep their pins (their drift check stays quiet), the
-# failed user keeps none (its drift check pages warden — the mismatch
-# is real and is what should be heard about).
+# A per-user failure stops the whole run (fail loud, exit 1); already rolled users keep their pins (their drift check stays quiet), the failed user keeps none (its drift check pages warden — the mismatch is real and is what should be heard about).
 #
 # Only bash + git + sudo + curl + getent are required.
 
