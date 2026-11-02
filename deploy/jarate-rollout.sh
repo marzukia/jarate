@@ -4,13 +4,13 @@
 #
 # The tag is the version (tag discipline, deploy/README.md): every change that ships to the fleet is tagged, and untagged main is not a deploy target. This script moves every agent checkout on the host to the tag, restarts each pi.service, verifies liveness + delivery, and writes the pinned-SHA pointer the bridge's startup drift check compares against.
 #
-# Runs as root under a hall-monitor vault plan (SUDO_PW); cross-user steps use `printf '%s\n' "$SUDO_PW" | sudo -S -u <user> ...` (the printf keeps the password out of `ps` output) with XDG_RUNTIME_DIR=/run/user/<uid> for the user systemd instance. One operator tap: the plan is approved, the run does the whole host.
+# Runs under a hall-monitor vault plan (SUDO_PW). The plan executor is the worker account, not root (#326, first rollout plan 180): when EUID is not 0 the script self-elevates at the top of main() — it re-execs itself under sudo (the password over stdin via `printf '%s\n' "$SUDO_PW" | sudo -S ...`, never in argv/ps, args + env preserved), and fails loud when not root AND SUDO_PW is unset. Cross-user steps use `printf '%s\n' "$SUDO_PW" | sudo -S -u <user> ...` (the printf keeps the password out of `ps` output) with XDG_RUNTIME_DIR=/run/user/<uid> for the user systemd instance. One operator tap: the plan is approved, the run does the whole host.
 #
 # Usage: jarate-rollout.sh <tag> [hm-base]
 #   <tag>     the release tag (must exist after `git fetch --tags`)
 #   hm-base   the hall-monitor base (http://host:port) — or the JARATE_HM_URL env var. NO default: unset = fail loud.
 #
-# Per agent user (deterministic enumeration: users with a ~/projects/jarate checkout, in /etc/passwd order):
+# Per agent user (deterministic lane set, in /etc/passwd order: login-shell users with a ~/projects/jarate checkout AND a resolvable HM agent key — see classify_lane; a checkout without a resolvable key is a visible skip (dev checkout), a resolvable key without a checkout fails loud):
 #   1. dirty-tree check (fail loud — never move a dirty checkout)
 #   2. git fetch --tags (as the user)
 #   3. ff-move the checkout to the tag (plain ff; divergent = fail loud, no merge, no rebase)
@@ -63,6 +63,20 @@ resolve_key_file() {
 }
 
 # first_key_line <file>: the agent key from the user's agent-key file (the fleet path chain — see resolve_key_file): an X_AGENT_KEY= line wins (the value after the =, trimmed), then an hm_agent_ line (the new onboarding key-file format, where the first non-comment line is BASE_URL=...), else the first non-comment, non-blank line (legacy bare-key files); 1 when the file is missing or nothing matches.
+# classify_lane <home>: the fleet-lane class of a login-shell user's home — roll (a ~/projects/jarate checkout AND a resolvable HM agent key via resolve_key_file: the lane to roll), skip (checkout, no resolvable key: a dev checkout — the caller logs a visible, deterministic skip, never a silent one), fail (resolvable key, no checkout: the lane is broken — the caller dies), ignore (neither: not an agent).
+classify_lane() {
+  local home="$1"
+  local has_checkout=0 has_key=0
+  [[ -e "$home/projects/jarate/.git" ]] && has_checkout=1 # -e: .git is a dir in a clone, a file in a git worktree
+  resolve_key_file "$home" >/dev/null && has_key=1
+  case "$has_checkout/$has_key" in
+    "1/1") printf '%s\n' "roll" ;;
+    "1/0") printf '%s\n' "skip" ;;
+    "0/1") printf '%s\n' "fail" ;;
+    *) printf '%s\n' "ignore" ;;
+  esac
+}
+
 first_key_line() {
   local f="$1" line legacy=""
   [[ -r "$f" ]] || return 1
@@ -110,7 +124,7 @@ wait_marker() {
   return 1
 }
 
-# enumerate_agents <passwd_file>: login-shell usernames, sorted — the deterministic enumeration input (a user is an AGENT when, on top, they have a ~/projects/jarate checkout; that check is in the main loop).
+# enumerate_agents <passwd_file>: login-shell usernames, sorted — the deterministic enumeration input (a user is a roll-set AGENT when, on top, classify_lane says roll — checkout + resolvable HM agent key; that check is in the main loop).
 enumerate_agents() {
   local pf="$1"
   awk -F: '{
@@ -123,6 +137,11 @@ enumerate_agents() {
 # --- main -----------------------------------------------------------------
 
 main() {
+  # Self-elevation (#326): the vault plan executor is the worker account, not root — a non-root start re-execs the whole script under sudo, feeding SUDO_PW to `sudo -S` on stdin (never echoed, never in argv); args + env are preserved, so the set -euo pipefail semantics carry over the re-exec. Not root AND SUDO_PW unset = die loud.
+  if [[ "$(id -u)" -ne 0 ]]; then
+    [[ -n "${SUDO_PW:-}" ]] || die "not root and SUDO_PW is not set (run as root, or via a hall-monitor vault plan that injects SUDO_PW)"
+    printf '%s\n' "$SUDO_PW" | exec sudo -S "$0" "$@"
+  fi
   [[ -n "$TAG" ]] || die "usage: $0 <tag> [hm-base] (hm-base or JARATE_HM_URL required; no default)"
   validate_hm_base "$HM_BASE" || die "hall-monitor base is not http(s)://host[:port] (arg 2 or JARATE_HM_URL; no default)"
   [[ -n "${SUDO_PW:-}" ]] || die "SUDO_PW is not set (the vault plan credential)"
@@ -133,13 +152,18 @@ main() {
     users+=("$u")
   done < <(enumerate_agents /etc/passwd)
 
-  # Agent = has a ~/projects/jarate checkout.
-  local agents=() u h
+  # Roll set: a login-shell user with a ~/projects/jarate checkout AND a resolvable HM agent key (classify_lane). A checkout without a resolvable key is a dev checkout (visible skip); a resolvable key without a checkout is a broken lane (die loud).
+  local agents=() u h cls
   for u in "${users[@]}"; do
     h="$(getent passwd "$u" | awk -F: '{print $6}')"
-    [[ -e "$h/projects/jarate/.git" ]] && agents+=("$u") # -e: .git is a dir in a clone, a file in a git worktree
+    cls="$(classify_lane "$h")"
+    case "$cls" in
+      roll) agents+=("$u") ;;
+      skip) log "skip $u: no agent key (dev checkout)" ;;
+      fail) die "$u: resolvable HM agent key but no ~/projects/jarate checkout (a fleet lane missing its checkout is broken)" ;;
+    esac
   done
-  [[ ${#agents[@]} -gt 0 ]] || die "no agent users found (no ~/projects/jarate checkout under any login-shell user)"
+  [[ ${#agents[@]} -gt 0 ]] || die "no agent users found (no login-shell user with a ~/projects/jarate checkout AND a resolvable HM agent key)"
 
   # Fail fast on a bad tag (validated in the first agent's repo after a fetch; `git fetch --tags --force` so origin tags are authoritative over a stale pre-existing local tag of the same name).
   local first_home

@@ -1,7 +1,7 @@
 /**
  * deploy/jarate-rollout.sh — fleet-wide rollout (#314, G4 of P1 #322), pure-helper tests.
  *
- * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / resolve_key_file / first_key_line / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
+ * Sourced-harness pattern (task spec, same as deploy.test.ts): the REAL validate_hm_base / resolve_key_file / first_key_line / classify_lane / wait_marker / enumerate_agents are extracted verbatim from jarate-rollout.sh (sed range over the function bodies) and eval'd in a stubbed subshell, so the tests exercise the script's own code — a rename or logic change in the script is what the tests catch (an extraction failure exits 90).
  *
  * The cross-user flow (sudo, systemctl, curl) is operator-run (vault plan); only the pure helpers are tested here.
  */
@@ -31,10 +31,11 @@ CASE="$3"
 extract() { sed -n "$1" "$SRC"; }
 eval "$(extract '/^validate_hm_base() {/,/^}/p')"
 eval "$(extract '/^resolve_key_file() {/,/^}/p')"
+eval "$(extract '/^classify_lane() {/,/^}/p')"
 eval "$(extract '/^first_key_line() {/,/^}/p')"
 eval "$(extract '/^wait_marker() {/,/^}/p')"
 eval "$(extract '/^enumerate_agents() {/,/^}/p')"
-for fn in validate_hm_base resolve_key_file first_key_line wait_marker enumerate_agents; do
+for fn in validate_hm_base resolve_key_file classify_lane first_key_line wait_marker enumerate_agents; do
   declare -f "$fn" >/dev/null || { echo "harness: extraction of $fn from jarate-rollout.sh failed" >&2; exit 90; }
 done
 
@@ -71,6 +72,21 @@ case "$CASE" in
     resolve_key_file "$T/h2" | sed "s|^$T/||"
     resolve_key_file "$T/h3" | sed "s|^$T/||"
     resolve_key_file "$T/hnone" >/dev/null 2>&1 && echo "none exit 0" || echo "none exit 1"
+    ;;
+  lane)
+    mkdir -p "$T/h_ckptkey/projects/jarate" "$T/h_ckptkey/.config/hall-monitor" "$T/h_ckpt/projects/jarate" "$T/h_key/.config/hall-monitor"
+    touch "$T/h_ckptkey/projects/jarate/.git" "$T/h_ckptkey/.config/hall-monitor/agent-key" "$T/h_ckpt/projects/jarate/.git" "$T/h_key/.config/hall-monitor/key"
+    classify_lane "$T/h_ckptkey"
+    classify_lane "$T/h_ckpt"
+    classify_lane "$T/h_key"
+    classify_lane "$T/h_none"
+    ;;
+  laneorder)
+    # passwd-order determinism: classification output follows the (deliberately unsorted) input order, the main loop's iteration order.
+    mkdir -p "$T/b/projects/jarate" "$T/b/.config/hall-monitor" "$T/a" "$T/c/projects/jarate" "$T/c/.config/hall-monitor" "$T/d/projects/jarate"
+    touch "$T/b/projects/jarate/.git" "$T/b/.config/hall-monitor/key" "$T/c/projects/jarate/.git" "$T/c/.config/hall-monitor/agent-key" "$T/d/projects/jarate/.git"
+    for h in "$T/d" "$T/a" "$T/c" "$T/b"; do printf '%s ' "$(classify_lane "$h")"; done
+    echo
     ;;
   enum)
     pf="$T/passwd"
@@ -179,6 +195,24 @@ describe("jarate-rollout.sh: resolve_key_file (the fleet agent-key path chain)",
       "h3/hall-monitor.key",
       "none exit 1",
     ]);
+  });
+});
+
+describe("jarate-rollout.sh: classify_lane (the fleet lane set, #326)", () => {
+  test("(checkout, key) = roll; (checkout, no key) = skip; (no checkout, key) = fail; (no checkout, no key) = ignore", async () => {
+    const r = await runCase("lane");
+    expect(r.code).toBe(0);
+    expect(r.out.trim().split("\n")).toEqual([
+      "roll",
+      "skip",
+      "fail",
+      "ignore",
+    ]);
+  });
+  test("classification output follows the input order (passwd-order determinism, no reordering)", async () => {
+    const r = await runCase("laneorder");
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("skip ignore roll roll");
   });
 });
 
