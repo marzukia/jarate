@@ -79,6 +79,7 @@ import {
   runSessionStartAskCheck,
   shouldHandoff,
 } from "./handover";
+import { armInbox, recordChannelPost, redeliverOnCompact } from "./inbox";
 import { registerJarateTool } from "./jarate";
 import {
   armOpTick,
@@ -1875,6 +1876,9 @@ export default function (pi: ExtensionAPI) {
     armRotationStaleWatch(ctx);
     void runSessionStartAskCheck(ctx.cwd, enabled);
 
+    // #254 wave 2: wire the inbox deliverer + redeliver the unread set on every session start (each start wipes the session, so an unread row must re-fire; fleet runs already returned above).
+    armInbox(pi, defaultCh ?? enabled.find((c) => c.type === "discord"));
+
     // /undo re-run (F1): RPC-mode pi never auto-prompts at startup, so the
     // kept trigger in the session file alone would not re-run the prompt.
     // performUndo parked a durable rerun trigger before the restart; if
@@ -2759,6 +2763,10 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("session_compact", (_event, ctx) => {
     settleCompacting(ctx);
+    // #254 wave 2: redeliver the unread inbox rows on the post-compaction wake (deferred until pi is idle; skipped when a handoff restart is armed — the rows stay unread for the post-restart redelivery — or this is a fleet run).
+    redeliverOnCompact(
+      () => ctx.isIdle() && !isHandoffRestartArmed() && !isFleetRun(),
+    );
     // Mechanism B: the restart gate runs AFTER the settle above (F1).
     // No-op unless handoff is enabled; on a qualifying compact it restarts
     // into a fresh seeded session (armed by the doc write in
@@ -3431,6 +3439,8 @@ export async function handleInbound(
 
   const rawBody = msg.body.trim();
   const title = channelTitle(ch, msg);
+
+  recordChannelPost(msg);
 
   // ── Channel commands ─────────────────────────────────────────────────
   // stop / /stop — anyone. /help /btw — anyone.
