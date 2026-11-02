@@ -16,7 +16,7 @@
 #   3. ff-move the checkout to the tag (plain ff; divergent = fail loud, no merge, no rebase)
 #   4. restart pi.service (the user systemd instance)
 #   5. verify: /var/tmp/jarate-live/<uid> mtime advances after the restart (≤90s wait loop, fail loud)
-#   6. verify: one delivered smoke say via hall-monitor (POST <base>/api/fleet/say, X-Agent-Key = the user's agent key, resolved from the first existing of ~/.config/hall-monitor/agent-key, ~/.config/hall-monitor/key, ~/hall-monitor.key — the key is the X_AGENT_KEY= line, or the first non-comment line when absent; 2xx = delivered)
+#   6. verify: one delivered smoke say via hall-monitor (POST <base>/api/fleet/say, X-Agent-Key = the user's agent key, resolved from the first existing of ~/.config/hall-monitor/agent-key, ~/.config/hall-monitor/key, ~/hall-monitor.key — the key is the X_AGENT_KEY= line, or the first non-comment line when absent; 2xx = delivered; the recipient is smoke_target: 'warden', except the warden lane itself targets 'piboy' — a self-say 400s, #332)
 #   7. write /var/tmp/jarate-pinned/<uid> = the tag's SHA
 #
 # A per-user failure stops the whole run (fail loud, exit 1); already rolled users keep their pins (their drift check stays quiet), the failed user keeps none (its drift check pages warden — the mismatch is real and is what should be heard about).
@@ -48,6 +48,16 @@ as_user() {
 validate_hm_base() {
   local base="${1:-}"
   [[ -n "$base" && "$base" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+}
+
+# smoke_target <user>: the step 6 smoke-say recipient — 'warden' (the fixed, always-live lane), EXCEPT when <user> IS 'warden', in which case 'piboy': the hall-monitor say edge 400s a self-say ('Cannot say to yourself'), and plan 247's 7th (warden) lane failed on exactly that (2026-11-02, #332).
+smoke_target() {
+  local user="${1:-}"
+  if [[ "$user" == "warden" ]]; then
+    printf '%s\n' "piboy"
+  else
+    printf '%s\n' "warden"
+  fi
 }
 
 # resolve_key_file <home>: the first EXISTING candidate of the fleet agent-key paths — $home/.config/hall-monitor/agent-key (onboarding shape: comment lines, then BASE_URL=, then X_AGENT_KEY=), $home/.config/hall-monitor/key (bare key after comment lines), $home/hall-monitor.key (bare key) — lanes onboarded at different times carry different paths on the same host; 1 when none exist (the caller names them in the die message).
@@ -224,7 +234,7 @@ main() {
     # 5. verify: the live marker mtime advances after the restart.
     wait_marker "$LIVE_DIR" "$uid" "$bar_s" "$GATE_TIMEOUT_S" || die "agent $u: $LIVE_DIR/$uid did not advance within ${GATE_TIMEOUT_S}s after restart (pi.service did not come up)"
 
-    # 6. verify: one delivered smoke say via hall-monitor (2xx).
+    # 6. verify: one delivered smoke say via hall-monitor (2xx). Recipient = smoke_target: 'warden', except the warden lane itself targets 'piboy' (a self-say 400s, #332).
     key_file="$(resolve_key_file "$h")" || die "agent $u: no agent key file (tried: $h/.config/hall-monitor/agent-key, $h/.config/hall-monitor/key, $h/hall-monitor.key)"
     key="$(first_key_line "$key_file")" || die "agent $u: no agent key line in $key_file"
     host="$(hostname)"
@@ -232,7 +242,7 @@ main() {
       -X POST "$HM_BASE/api/fleet/say" \
       -H "X-Agent-Key: $key" \
       -H 'Content-Type: application/json' \
-      -d "{\"to\": \"warden\", \"message\": \"smoke: rolled $TAG (${tag_sha:0:7}) on $host for $u\"}")"
+      -d "{\"to\": \"$(smoke_target "$u")\", \"message\": \"smoke: rolled $TAG (${tag_sha:0:7}) on $host for $u\"}")"
     [[ "$code" =~ ^2[0-9][0-9]$ ]] || die "agent $u: smoke say failed (http $code)"
 
     # 7. pin: the tag's SHA, written only after the rollout fully passed.
