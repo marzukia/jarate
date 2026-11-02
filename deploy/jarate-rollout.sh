@@ -10,7 +10,7 @@
 #   <tag>     the release tag (must exist after `git fetch --tags`)
 #   hm-base   the hall-monitor base (http://host:port) — or the JARATE_HM_URL env var. NO default: unset = fail loud.
 #
-# Per agent user (deterministic lane set, in /etc/passwd order: login-shell users with a ~/projects/jarate checkout AND a resolvable HM agent key — see classify_lane; a checkout without a resolvable key is a visible skip (dev checkout), a resolvable key without a checkout fails loud):
+# Per agent user (deterministic lane set, in /etc/passwd order: login-shell users with a ~/projects/jarate checkout AND a resolvable HM agent key — see classify_lane; a checkout without a resolvable key is a visible skip (dev checkout), a resolvable key without a checkout fails loud; a lane whose live marker is older than JARATE_ROLLOUT_LAPSED_S (default 300s) pre-restart is a visible lapsed skip (no restart, no smoke-say, no pin), a missing marker is fresh (roll — the post-restart 90s gate judges it); the post-restart 90s gate is unchanged for live lanes):
 #   1. dirty-tree check (fail loud — never move a dirty checkout)
 #   2. git fetch --tags (as the user)
 #   3. ff-move the checkout to the tag (plain ff; divergent = fail loud, no merge, no rebase)
@@ -30,6 +30,7 @@ HM_BASE="${2:-${JARATE_HM_URL:-}}"
 LIVE_DIR="${JARATE_LIVE_DIR:-/var/tmp/jarate-live}"
 PINNED_DIR="${JARATE_PINNED_DIR:-/var/tmp/jarate-pinned}"
 GATE_TIMEOUT_S="${JARATE_ROLLOUT_GATE_TIMEOUT_S:-90}"
+LAPSED_S="${JARATE_ROLLOUT_LAPSED_S:-300}"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 die() { log "ROLLOUT FAIL: $*"; exit 1; }
@@ -63,16 +64,23 @@ resolve_key_file() {
 }
 
 # first_key_line <file>: the agent key from the user's agent-key file (the fleet path chain — see resolve_key_file): an X_AGENT_KEY= line wins (the value after the =, trimmed), then an hm_agent_ line (the new onboarding key-file format, where the first non-comment line is BASE_URL=...), else the first non-comment, non-blank line (legacy bare-key files); 1 when the file is missing or nothing matches.
-# classify_lane <home>: the fleet-lane class of a login-shell user's home — roll (a ~/projects/jarate checkout AND a resolvable HM agent key via resolve_key_file: the lane to roll), skip (checkout, no resolvable key: a dev checkout — the caller logs a visible, deterministic skip, never a silent one), fail (resolvable key, no checkout: the lane is broken — the caller dies), ignore (neither: not an agent).
+# classify_lane <home> <marker_age>: the fleet-lane class of a login-shell user's home (marker_age = the pre-restart live marker's age in seconds, or "missing" when the marker file does not exist) — roll (a ~/projects/jarate checkout AND a resolvable HM agent key via resolve_key_file AND a fresh or missing marker: the lane to roll), lapsed (checkout + resolvable key but the pre-restart live marker is older than $LAPSED_S: the lane has lapsed — the caller logs a visible skip and does not restart, does not smoke-say, does not pin; the post-restart 90s gate is unchanged for live lanes), skip (checkout, no resolvable key: a dev checkout — the caller logs a visible, deterministic skip, never a silent one; the key check runs FIRST, so a stale marker on a no-key user is this skip, never lapsed), fail (resolvable key, no checkout: the lane is broken — the caller dies), ignore (neither: not an agent). Lapsed is a pure mtime comparison (no inference in the enforcement path); a missing marker is FRESH (roll — operator ruling 2026-11-02: no evidence of liveness is not evidence of lapse; the post-restart 90s gate judges it).
 classify_lane() {
   local home="$1"
-  local has_checkout=0 has_key=0
-  [[ -e "$home/projects/jarate/.git" ]] && has_checkout=1 # -e: .git is a dir in a clone, a file in a git worktree
+  local marker_age="${2:-missing}"
+  local has_checkout=0 has_key=0 lapsed=0
   resolve_key_file "$home" >/dev/null && has_key=1
-  case "$has_checkout/$has_key" in
-    "1/1") printf '%s\n' "roll" ;;
-    "1/0") printf '%s\n' "skip" ;;
-    "0/1") printf '%s\n' "fail" ;;
+  [[ -e "$home/projects/jarate/.git" ]] && has_checkout=1 # -e: .git is a dir in a clone, a file in a git worktree
+  if [[ "$has_key" -eq 1 && "$has_checkout" -eq 1 && "$marker_age" != "missing" ]]; then
+    if (( marker_age > LAPSED_S )); then
+      lapsed=1
+    fi
+  fi
+  case "$has_checkout/$has_key/$lapsed" in
+    "1/1/0") printf '%s\n' "roll" ;;
+    "1/1/1") printf '%s\n' "lapsed" ;;
+    "1/0/0") printf '%s\n' "skip" ;;
+    "0/1/0") printf '%s\n' "fail" ;;
     *) printf '%s\n' "ignore" ;;
   esac
 }
@@ -152,14 +160,21 @@ main() {
     users+=("$u")
   done < <(enumerate_agents /etc/passwd)
 
-  # Roll set: a login-shell user with a ~/projects/jarate checkout AND a resolvable HM agent key (classify_lane). A checkout without a resolvable key is a dev checkout (visible skip); a resolvable key without a checkout is a broken lane (die loud).
-  local agents=() u h cls
+  # Roll set: a login-shell user with a ~/projects/jarate checkout AND a resolvable HM agent key (classify_lane). A checkout without a resolvable key is a dev checkout (visible skip); a resolvable key without a checkout is a broken lane (die loud). Pre-restart lapsed check: the live marker's age is read from $LIVE_DIR/<uid> BEFORE the restart step — marker exists AND mtime older than $LAPSED_S seconds = lapsed (visible skip, no restart, no smoke-say, no pin); missing marker = fresh (the post-restart 90s gate judges it).
+  local agents=() u h cls m_uid m_mt m_age
   for u in "${users[@]}"; do
     h="$(getent passwd "$u" | awk -F: '{print $6}')"
-    cls="$(classify_lane "$h")"
+    m_uid="$(id -u "$u")"
+    m_age="missing"
+    if [[ -f "$LIVE_DIR/$m_uid" ]]; then
+      m_mt="$(stat -c %Y "$LIVE_DIR/$m_uid" 2>/dev/null || echo 0)"
+      m_age=$(( $(date +%s) - m_mt ))
+    fi
+    cls="$(classify_lane "$h" "$m_age")"
     case "$cls" in
       roll) agents+=("$u") ;;
       skip) log "skip $u: no agent key (dev checkout)" ;;
+      lapsed) log "skip $u: lane lapsed (live marker ${m_age}s old pre-restart)" ;;
       fail) die "$u: resolvable HM agent key but no ~/projects/jarate checkout (a fleet lane missing its checkout is broken)" ;;
     esac
   done
