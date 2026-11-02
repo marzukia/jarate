@@ -181,7 +181,6 @@ import {
   syncTodoBoard,
 } from "./tools";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
-import { checkVersionDrift } from "./version-drift";
 import {
   type AttachmentRef,
   type ChannelConfig,
@@ -199,6 +198,7 @@ import {
   type UndoRun,
 } from "./undo";
 import { estimateCost, hasUsage, sumRunUsage, type UsageStats } from "./usage";
+import { checkVersionDrift } from "./version-drift";
 import { isVoiceAttachment, voiceNoteText } from "./voice";
 
 export let lastActiveChannel: ChannelConfig | null = null;
@@ -1618,13 +1618,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Startup drift check (#314): compare the checkout's git HEAD against
-    // the pinned tag SHA (fleet rollout parity); one page to warden on
-    // mismatch, once per process. Fire-and-forget: never blocks or
-    // fails startup; missing pointer file = silent no-op. (Gated out on
-    // fleet dispatch runs above: their checkout is an intentional base,
-    // not the live deployment.)
-    void checkVersionDrift();
+    void checkVersionDrift(); // #314 startup drift check: the checkout's git HEAD vs the pinned tag SHA — one page to warden on mismatch; once per process, fire-and-forget, silent when unpinned (gated out on fleet dispatch runs above: their checkout is an intentional base, not the live deployment)
 
     // #180: re-wake survival (same startup machinery as the wake below;
     // reason "startup" = a real process start, the same guard

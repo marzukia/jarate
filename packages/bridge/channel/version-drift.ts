@@ -129,7 +129,12 @@ export async function checkVersionDrift(): Promise<DriftResult | null> {
 async function runCheck(): Promise<DriftResult> {
   const f = pinnedPointerFile();
   if (!f || !fs.existsSync(f)) {
-    return { status: "dormant", head: "", pinned: "", detail: "no pointer file" };
+    return {
+      status: "dormant",
+      head: "",
+      pinned: "",
+      detail: "no pointer file",
+    };
   }
   let pinned = "";
   try {
@@ -138,7 +143,12 @@ async function runCheck(): Promise<DriftResult> {
     pinned = "";
   }
   if (!pinned) {
-    return { status: "dormant", head: "", pinned: "", detail: "empty pointer file" };
+    return {
+      status: "dormant",
+      head: "",
+      pinned: "",
+      detail: "empty pointer file",
+    };
   }
   const head = localHead();
   if (!head) {
@@ -191,7 +201,12 @@ async function runCheck(): Promise<DriftResult> {
     console.error(
       `[drift] page to warden failed (http ${res.status}); drift: HEAD ${head.slice(0, 7)} != pinned ${pinned.slice(0, 7)}`,
     );
-    return { status: "drift-page-failed", head, pinned, detail: `http ${res.status}` };
+    return {
+      status: "drift-page-failed",
+      head,
+      pinned,
+      detail: `http ${res.status}`,
+    };
   } catch (e) {
     console.error(
       `[drift] page to warden failed: ${e instanceof Error ? e.message : String(e)}`,

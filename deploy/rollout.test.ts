@@ -29,8 +29,6 @@ afterEach(() => {
   }
 });
 
-const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "");
-
 /**
  * The sourced-harness script. $1 = tmp dir, $2 = jarate-rollout.sh path,
  * $3 = scenario. Extracts the REAL helper bodies from the script and
@@ -112,10 +110,13 @@ function runCase(
   fs.writeFileSync(path.join(tmp, "harness.sh"), HARNESS);
   fs.chmodSync(path.join(tmp, "harness.sh"), 0o755);
   prep?.(tmp);
-  const p = spawn(["bash", path.join(tmp, "harness.sh"), tmp, ROLLOUT, caseName], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const p = spawn(
+    ["bash", path.join(tmp, "harness.sh"), tmp, ROLLOUT, caseName],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   const outP = new Response(p.stdout).text();
   const errP = new Response(p.stderr).text();
   const codeP = p.exited;

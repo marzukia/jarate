@@ -73,10 +73,7 @@ function pinTo(sha: string | "none"): string {
   return dir;
 }
 
-function withHttp(
-  status: number,
-  calls: PageCall[],
-): void {
+function withHttp(status: number, calls: PageCall[]): void {
   setDriftHttp(async (url, init) => {
     const body = JSON.parse(String(init.body)) as {
       to: string;
@@ -84,7 +81,10 @@ function withHttp(
     };
     calls.push({
       url,
-      key: String((init.headers as Record<string, string> | undefined)?.["X-Agent-Key"] ?? ""),
+      key: String(
+        (init.headers as Record<string, string> | undefined)?.["X-Agent-Key"] ??
+          "",
+      ),
       to: body.to,
       message: body.message,
     });
@@ -104,8 +104,19 @@ function homeWithKeyFile(key: string): void {
   process.env.JARATE_INBOX_KEY_FILE = f;
 }
 
+// Re-arm the once-per-process flag cleanly: index.test.ts's session_start
+// fires checkVersionDrift fire-and-forget, so an in-flight check from a
+// previous file can grab the flag after a bare reset. Flush it (settle),
+// then re-arm.
+async function freshCheck(): Promise<void> {
+  resetDriftStateForTests();
+  await new Promise((r) => setTimeout(r, 25));
+  resetDriftStateForTests();
+}
+
 describe("version-drift: the startup parity check", () => {
   test("pointer file missing = dormant, silent, no fetch", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("none");
     withHttp(200, calls);
@@ -115,6 +126,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("pointer == local HEAD = in-parity, no fetch", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo(REAL_HEAD);
     withHttp(200, calls);
@@ -125,6 +137,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("mismatch + URL/key set = ONE page to warden, 2xx = delivered", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("0".repeat(40));
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api/";
@@ -141,6 +154,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("page failure (4xx) = drift-page-failed, never thrown", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("1".repeat(40));
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
@@ -153,6 +167,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("key file fallback: JARATE_INBOX_KEY unset, agent-key file provides the key", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("2".repeat(40));
     homeWithKeyFile("file-fallback-key");
@@ -164,6 +179,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("no URL/key = local log line, no fetch (drift-local)", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("3".repeat(40));
     homeWithKeyFile("file-fallback-key"); // no URL set, so the key is moot
@@ -175,6 +191,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("JARATE_PINNED_DIR override: the pointer is read from the override dir", async () => {
+    await freshCheck();
     pinTo("4".repeat(40)); // the active dir (env override) carries the mismatch
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
     process.env.JARATE_INBOX_KEY = "test-agent-key";
@@ -186,6 +203,7 @@ describe("version-drift: the startup parity check", () => {
   });
 
   test("once per process: a second start no-ops (no second page); reset re-arms", async () => {
+    await freshCheck();
     const calls: PageCall[] = [];
     pinTo("5".repeat(40));
     process.env.JARATE_INBOX_URL = "http://127.0.0.1:18001/api";
@@ -202,9 +220,15 @@ describe("version-drift: the startup parity check", () => {
 
 describe("version-drift: readKeyFile (the agent-key file shape)", () => {
   test("first non-comment, non-blank line wins", () => {
-    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")), "agent-key");
+    const f = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "jarate-key-")),
+      "agent-key",
+    );
     tmpDirs.push(path.dirname(f));
-    fs.writeFileSync(f, `# comment\n\n  # indented comment\n  the-key  \nnext\n`);
+    fs.writeFileSync(
+      f,
+      `# comment\n\n  # indented comment\n  the-key  \nnext\n`,
+    );
     expect(readKeyFile(f)).toBe("the-key");
   });
   test("missing file = empty", () => {
