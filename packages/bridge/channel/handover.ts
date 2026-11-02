@@ -6,12 +6,7 @@
  * CUSTOM compaction result: `{ compaction: { summary: doc, ... } }` —
  * no cancel, no restart, the op-window flow is untouched (review F1/F3).
  *
- * The doc is a deterministic template (NO LLM call): the raw transcript
- * span (current state first) + References, State, Last user asks
- * extracted from the session, plus <read-files>/<modified-files> tags →
- * deterministic, CUMULATIVE: prior doc tags ∪ current span fileOps
- * (review F9). /compact operator focus instructions are rendered as ONE
- * line in the State section (absent when none passed).
+ * The doc is a deterministic template (NO LLM call): the raw transcript span (current state first) + References, State, Last user asks and Last sent message extracted from the session, plus <read-files>/<modified-files> tags → deterministic, CUMULATIVE: prior doc tags ∪ current span fileOps (review F9). /compact operator focus instructions are rendered as ONE line in the State section (absent when none passed).
  *
  * Cumulative: the prior doc (latest.md pointer) is the base (F6), so
  * context compaction never shrinks the doc — it only retires done work.
@@ -36,6 +31,13 @@ import {
 } from "./discord";
 import { fmtTokensLC } from "./format";
 import { jobsView } from "./jobs";
+import {
+  docLastSentIsNone,
+  lastSentMessage,
+  lastSentMissing,
+  sessionStartSentFlag,
+  tagLastSentMissing,
+} from "./last-sent";
 import { machine } from "./live";
 import { REWAKE_LOOKBACK_DEFAULT } from "./restart-queue";
 import { sanitizeUnknownValue } from "./sanitize";
@@ -136,6 +138,9 @@ export interface ParsedState {
   modelLabel: string;
   sessionStats: string;
   lastUserAsks: string[];
+  /** #315 P1 leg: the last assistant FINAL message (the reply that was actually sent to the channel), from the FULL transcript (NOT the size-limited tail window — a mid-turn split must still surface it). "" when the transcript has no assistant final. Numeric ts (ms epoch) of lastSent; 0 when none — the doc-write guard compares numerically. */
+  lastSent: string;
+  lastSentTs: number;
   /** /compact operator focus instructions (absent when none passed). */
   operatorFocus?: string;
 }
@@ -408,6 +413,9 @@ export function extractDeterministic(
     }
   }
 
+  // #315 P1 leg: the last assistant FINAL message — the reply actually sent to the channel. A full-transcript type/role scan (last-sent.ts), NOT the size-limited tail window: a mid-turn split (last entry = a tool call) must still surface it.
+  const sent = lastSentMessage(branchEntries);
+
   return {
     readFiles,
     modifiedFiles,
@@ -429,6 +437,8 @@ export function extractDeterministic(
     lastUserAsks: asks
       .slice(-2)
       .map((a) => (a.length > 280 ? `${a.slice(0, 277)}...` : a)),
+    lastSent: sent?.text ?? "",
+    lastSentTs: sent?.ts ?? 0,
   };
 }
 
@@ -660,6 +670,7 @@ const GUARD_PROTECTED = [
   "Gotchas",
   "State (machine)",
   "user asks",
+  "sent message",
 ];
 /** Condense order: retired/cheap-to-lose content first. Transcript is LAST
  *  (B2, polish sweep): it is the raw conversation content, not prose
@@ -927,6 +938,7 @@ export function renderDeterministic(
     `## References\n${renderReferences(state)}`,
     `## State\n${renderState(state)}`,
     `## Last user asks\n${renderLastAsks(state)}`,
+    `## Last sent message\n${or(state.lastSent)}`,
     renderFileTags(state),
   ].join("\n\n");
 }
@@ -1015,6 +1027,18 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
         asksSection.body = `${asksSection.body}\n> INCOMPLETE-ASKS: ${windowUnanswered} unanswered operator ask(s) in the last 30 min, ${state.lastUserAsks.length} listed`;
       doc = assembleDoc(parts);
     }
+  }
+  // #315 P1 leg: doc-write self-check for the last sent message — re-scan the FULL transcript; an assistant final newer than the field (or any, when the field is (none)) means the extraction dropped the last reply: one LAST-SENT-MISSING flag line + tag the doc (the #315 P1 section-tag mechanism; the section is sizeGuard-protected, so the tag survives the size cut).
+  const missed = lastSentMissing(
+    state.lastSent,
+    state.lastSentTs,
+    branchEntries,
+  );
+  if (missed) {
+    console.warn(
+      `[handover] LAST-SENT-MISSING: the transcript carries an assistant final (ts=${missed.ts}) newer than the doc field (issue #315 P1 leg)`,
+    );
+    doc = tagLastSentMissing(doc, missed);
   }
   writeHandover(doc, { storeDir: settings.storeDir, now });
   return doc;
@@ -1313,12 +1337,7 @@ export function sessionStartAskFlag(
   return `session start: the handoff doc says (none) but ${unanswered.length} unanswered operator message(s) < 30m old in channel history (issue #315 P1)`;
 }
 
-/** #315 P1 wiring (session_start): load the latest handoff doc; when it
- *  exists and says (none), ONE bounded history fetch per enabled Discord
- *  channel (the #180 lookback) and flag any unanswered operator message
- *  < 30 min old - log line + say to that channel (the existing
- *  machine() one-liner say path). Fire-and-forget: a dead network at
- *  boot is a silent no-op, never a startup failure. */
+/** #315 P1 wiring (session_start): load the latest handoff doc; when it exists, ONE bounded history fetch per enabled Discord channel (the #180 lookback) runs BOTH session-start checks: the unanswered-ask flag (the doc's "Last user asks" = (none) + an unanswered operator message < 30 min old) and the last-sent flag (the doc's "Last sent message" = (none) + a post by this agent < 30 min old - the restored agent posted just before rotation; the doc dropped it). Each flag = one log line + one say to that channel (the existing machine() one-liner say path). Fire-and-forget: a dead network at boot is a silent no-op, never a startup failure. */
 export async function runSessionStartAskCheck(
   cwd: string,
   channels: ChannelConfig[],
@@ -1326,7 +1345,10 @@ export async function runSessionStartAskCheck(
   try {
     const settings = resolveHandoffSettings(cwd);
     const doc = loadPreviousHandover({ storeDir: settings.storeDir });
-    if (!doc || !docAsksIsNone(doc)) return;
+    if (!doc) return;
+    const askGate = docAsksIsNone(doc);
+    const sentGate = docLastSentIsNone(doc);
+    if (!askGate && !sentGate) return;
     for (const ch of channels) {
       if (ch.type !== "discord") continue;
       const discordId = getDiscordChannelId(ch.id) ?? ch.channel;
@@ -1347,10 +1369,16 @@ export async function runSessionStartAskCheck(
           authorId: typeof m.author?.id === "string" ? m.author.id : null,
         }));
         const botUserId = getDiscordStates().get(ch.id)?.botUserId ?? null;
-        const line = sessionStartAskFlag(doc, history, botUserId, Date.now());
-        if (line) {
-          console.log(`[handoff] ${line}`);
-          sendDiscordMessage(ch, machine(line)).catch(() => {});
+        const line = askGate
+          ? sessionStartAskFlag(doc, history, botUserId, Date.now())
+          : null;
+        const sentLine = sentGate
+          ? sessionStartSentFlag(doc, history, botUserId, Date.now())
+          : null;
+        for (const l of [line, sentLine]) {
+          if (!l) continue;
+          console.log(`[handoff] ${l}`);
+          sendDiscordMessage(ch, machine(l)).catch(() => {});
         }
       } catch (e) {
         console.error(
