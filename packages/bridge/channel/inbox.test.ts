@@ -1,18 +1,24 @@
 // inbox.test.ts — hermetic tests for the #254 wave-2 bridge leg: the HTTP leg is a mock (no live hall-monitor API in unit tests) that emulates the server contract (idempotent receive on (agent, source_ref); unread-only list, oldest first, limit clamped 1..200 with the total count; consume = unread -> consumed / unread -> actioned, plain re-ack of a consumed or actioned row = 200 no-op with the first-read time and note untouched).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   armInbox,
+  consumeRecordedByRef,
   type InboxKind,
   type InboxRow,
   inboxConfigured,
+  readKeyFile,
   recordChannelPost,
   recordInbox,
   redeliverOnCompact,
   redeliverUnread,
   renderRow,
   resetInboxConfigCache,
+  setInboxConfigTtlForTests,
   setInboxDeliverer,
   setInboxHttp,
 } from "./inbox";
@@ -32,6 +38,8 @@ interface MockState {
   consumeResults: { status: number; row: InboxRow | null }[];
   failGet: boolean;
   failConsume: boolean;
+  failReceive: boolean;
+  delayMs: number;
 }
 
 function mockFetch(state: MockState) {
@@ -45,6 +53,8 @@ function mockFetch(state: MockState) {
       | Record<string, unknown>
       | undefined;
     state.calls.push({ url, method, body });
+    if (state.delayMs > 0)
+      await new Promise((r) => setTimeout(r, state.delayMs));
     const resp = (
       obj: unknown,
       status: number,
@@ -56,6 +66,7 @@ function mockFetch(state: MockState) {
 
     // POST /api/fleet/inbox/receive — idempotent on (agent, source_ref): a re-post returns the existing row (no field changes, no status reset); a null ref is a one-off (always created).
     if (method === "POST" && u.pathname === "/api/inbox/receive") {
+      if (state.failReceive) return resp({ detail: "boom" }, 500);
       const ref = (body?.source_ref as string | undefined) ?? null;
       const existing = ref
         ? state.rows.find((r) => r.source_ref === ref)
@@ -119,6 +130,8 @@ function installMock(): void {
     consumeResults: [],
     failGet: false,
     failConsume: false,
+    failReceive: false,
+    delayMs: 0,
   };
   delivererCalls = [];
   delivererFail = false;
@@ -140,11 +153,27 @@ beforeEach(() => {
 afterEach(() => {
   setInboxHttp(null);
   setInboxDeliverer(null);
+  setInboxConfigTtlForTests(5_000);
   delete process.env.JARATE_INBOX_URL;
   delete process.env.JARATE_INBOX_KEY;
   delete process.env.JARATE_INBOX_AGENT;
   resetInboxConfigCache();
 });
+
+// Capture console.warn for the duration of a test (restore() puts the original back).
+function captureWarns(): { warns: string[]; restore(): void } {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (m: unknown, ...rest: unknown[]) => {
+    warns.push([m, ...rest].map(String).join(" "));
+  };
+  return {
+    warns,
+    restore: () => {
+      console.warn = orig;
+    },
+  };
+}
 
 function seedRow(
   kind: InboxKind,
@@ -442,12 +471,33 @@ describe("failure paths (a dead API never breaks delivery; a failed delivery nev
     expect(state.rows[0].status).toBe("unread");
   });
 
-  test("a failed consume after a successful delivery leaves the row unread (at-least-once: it re-delivers next trigger)", async () => {
+  test("a failed consume after a successful delivery leaves the row unread and is NOT in the return (at-least-once: it re-delivers next trigger; the honest counter is consumed, not delivered)", async () => {
     seedRow("channel_post", "op", "x");
     state.failConsume = true;
-    expect(await redeliverUnread("startup")).toBe(1);
+    expect(await redeliverUnread("startup")).toBe(0);
     expect(delivererCalls.length).toBe(1);
     expect(state.rows[0].status).toBe("unread");
+  });
+
+  test("a deliverer that throws leaves the row unread (catch branch; the row re-fires on the next trigger)", async () => {
+    seedRow("channel_post", "op", "x");
+    setInboxDeliverer(async () => {
+      throw new Error("deliverer boom");
+    });
+    expect(await redeliverUnread("startup")).toBe(0);
+    expect(state.rows[0].status).toBe("unread");
+    expect(state.consumeResults.length).toBe(0);
+  });
+
+  test("an over-cap unread set (count > page) warns that the remainder re-fires on the next trigger", async () => {
+    const { warns, restore } = captureWarns();
+    try {
+      for (let i = 0; i < 201; i++) seedRow("channel_post", "op", `m${i}`);
+      expect(await redeliverUnread("startup")).toBe(200);
+      expect(warns.some((w) => w.includes("beyond the 200 cap"))).toBe(true);
+    } finally {
+      restore();
+    }
   });
 
   test("the in-flight guard serializes concurrent triggers", async () => {
@@ -463,5 +513,145 @@ describe("failure paths (a dead API never breaks delivery; a failed delivery nev
     expect(await p2).toBe(0);
     release!();
     expect(await p1).toBe(1);
+  });
+});
+
+describe("live-delivery consume (delivered = read; review #321 f1)", () => {
+  test("a live-delivered row is consumed and never redelivered on the next trigger", async () => {
+    const rec = recordChannelPost({
+      from: "op",
+      body: "deploy",
+      messageId: "900",
+    });
+    await flush();
+    expect(state.rows.length).toBe(1);
+    expect(state.rows[0].status).toBe("unread");
+    rec.consume("live: delivered to pi");
+    await flush();
+    const consume = state.calls.find((c) => c.url.endsWith("/inbox/consume"));
+    expect(consume).toBeDefined();
+    expect(consume!.body!.note).toBe("live: delivered to pi");
+    expect(state.rows[0].status).toBe("consumed");
+    // The next trigger (e.g. the next startup): the consumed row is not in the unread set, never re-delivers.
+    expect(await redeliverUnread("startup")).toBe(0);
+  });
+
+  test("a one-off (no id) row is consumed by its row id", async () => {
+    const rec = recordChannelPost({ from: "op", body: "no id" });
+    rec.consume("live: delivered to pi");
+    await flush();
+    expect(state.rows.length).toBe(1);
+    expect(state.rows[0].source_ref).toBeNull();
+    expect(state.rows[0].status).toBe("consumed");
+  });
+
+  test("a live-delivered row is skipped by a redelivery trigger in the same window (the compaction drain / post-compaction redelivery race)", async () => {
+    state.delayMs = 20; // the receive is still in flight when the trigger fires
+    const rec = recordChannelPost({ from: "op", body: "x", messageId: "91" });
+    rec.consume("live: delivered to pi");
+    // The redelivery fires while the receive is in flight (or its consume is): the row is marked live-delivered, so the redelivery skips it.
+    expect(await redeliverUnread("compaction")).toBe(0);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(delivererCalls.length).toBe(0); // no redelivery
+    expect(state.rows[0].status).toBe("consumed"); // the live path owns the consume
+  });
+
+  test("consumeRecordedByRef consumes the row even when the receive is still in flight (the mid-run interrupt path)", async () => {
+    state.delayMs = 20;
+    recordChannelPost({ from: "op", body: "x", messageId: "77" });
+    consumeRecordedByRef("77", "live: mid-run interrupt delivered");
+    await new Promise((r) => setTimeout(r, 100));
+    expect(state.rows.length).toBe(1);
+    expect(state.rows[0].status).toBe("consumed");
+    expect(state.rows[0].consumed_note).toBe(
+      "live: mid-run interrupt delivered",
+    );
+  });
+
+  test("consumeRecordedByRef is a no-op for a message this process never recorded", async () => {
+    seedRow("channel_post", "op", "x");
+    consumeRecordedByRef("never-recorded", "live");
+    await flush();
+    expect(state.rows[0].status).toBe("unread");
+    expect(state.consumeResults.length).toBe(0);
+  });
+
+  test("a double consume is a server 200 no-op (the row keeps its first note)", async () => {
+    const rec = recordChannelPost({ from: "op", body: "x", messageId: "92" });
+    rec.consume("first");
+    rec.consume("second");
+    await flush();
+    expect(state.rows[0].status).toBe("consumed");
+    expect(state.rows[0].consumed_note).toBe("first");
+  });
+
+  test("an intake failure (API 500) warn-logs (the at-most-once leg is observable) and the consume is a no-op", async () => {
+    const { warns, restore } = captureWarns();
+    try {
+      state.failReceive = true;
+      const rec = recordChannelPost({ from: "op", body: "x", messageId: "81" });
+      rec.consume("live: delivered to pi");
+      await flush();
+      expect(warns.some((w) => w.includes("intake failed"))).toBe(true);
+      expect(state.rows.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a live consume failure (API 500 on consume) warns and leaves the row unread (at-least-once: it re-delivers on the next trigger)", async () => {
+    const { warns, restore } = captureWarns();
+    try {
+      const rec = recordChannelPost({ from: "op", body: "x", messageId: "83" });
+      await flush();
+      state.failConsume = true;
+      rec.consume("live: delivered to pi");
+      await flush();
+      expect(warns.some((w) => w.includes("live consume failed"))).toBe(true);
+      expect(state.rows[0].status).toBe("unread");
+    } finally {
+      restore();
+    }
+  });
+
+  test("an over-cap receive body is truncated client-side with a warn (the server-side payload limit is the backstop)", async () => {
+    const { warns, restore } = captureWarns();
+    try {
+      recordChannelPost({
+        from: "op",
+        body: "x".repeat(20_000),
+        messageId: "82",
+      });
+      await flush();
+      const post = state.calls.find((c) => c.url.endsWith("/inbox/receive"))!;
+      const body = post.body!.body as string;
+      expect(body.endsWith("… (truncated)")).toBe(true);
+      expect(body.length).toBe(16_000 + "… (truncated)".length);
+      expect(warns.some((w) => w.includes("char cap"))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("config: key file fallback + TTL", () => {
+  test("readKeyFile: the first non-comment, non-blank line; missing file = empty", () => {
+    const file = path.join(os.tmpdir(), `inbox-key-test-${process.pid}.txt`);
+    fs.writeFileSync(file, "# a comment\n\n   file-key-123  \nother-line\n");
+    expect(readKeyFile(file)).toBe("file-key-123");
+    expect(
+      readKeyFile(path.join(os.tmpdir(), "inbox-key-missing-never.txt")),
+    ).toBe("");
+    fs.unlinkSync(file);
+  });
+
+  test("the config is cached for the TTL and re-read after expiry (5s default, injectable for tests)", async () => {
+    setInboxConfigTtlForTests(20);
+    resetInboxConfigCache();
+    expect(inboxConfigured()).toBe(true);
+    delete process.env.JARATE_INBOX_URL;
+    expect(inboxConfigured()).toBe(true); // still within the TTL: the stale config is served
+    await new Promise((r) => setTimeout(r, 40));
+    expect(inboxConfigured()).toBe(false); // the cache expired: the env is re-read (URL gone = off)
   });
 });
