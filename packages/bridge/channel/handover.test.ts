@@ -26,6 +26,7 @@ import {
   HANDOFF_DEFAULTS,
   HANDOFF_FRESH_WINDOW_MS,
   type HandoffSettings,
+  type HandoverMessage,
   type HandoverPreparation,
   inboundSender,
   isHandoffFreshWindow,
@@ -58,6 +59,14 @@ import extension, {
   setHandoffInFlight,
   setHandoffRestartArmed,
 } from "./index";
+import {
+  docLastSentIsNone,
+  isFinalAssistant,
+  lastSentMessage,
+  lastSentMissing,
+  sessionStartSentFlag,
+  tagLastSentMissing,
+} from "./last-sent";
 import { stopAllOpTicks } from "./live";
 import { setSystemdRestartHookForTest } from "./restart-ops";
 import { renderBoard, saveBoard, type Todo } from "./todos";
@@ -2900,6 +2909,731 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
   });
   test("the doc lists an ask (not (none)) → no say", async () => {
     writeDoc("1. do the thing");
+    await runSessionStartAskCheck(tmp, [ch] as any);
+    expect(sentBodies.length).toBe(0);
+  });
+});
+
+// ─── #315 P1 leg: last-sent-message guards (field + guards) ─────────────
+
+const T0 = 1_762_000_000_000;
+
+const finalEntry = (id: string, ts: number, text: string) => ({
+  id,
+  type: "message",
+  timestamp: new Date(ts).toISOString(),
+  message: {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    timestamp: ts,
+  },
+});
+const toolCallEntry = (id: string, ts: number, withText = false) => ({
+  id,
+  type: "message",
+  timestamp: new Date(ts).toISOString(),
+  message: {
+    role: "assistant",
+    content: [
+      ...(withText ? [{ type: "text", text: "checking on it" }] : []),
+      { type: "toolCall", name: "bash", arguments: {} },
+    ],
+    timestamp: ts,
+  },
+});
+const toolResultEntry = (id: string, ts: number, text = "ok") => ({
+  id,
+  type: "message",
+  timestamp: new Date(ts).toISOString(),
+  message: {
+    role: "toolResult",
+    toolCallId: "c1",
+    toolName: "bash",
+    content: [{ type: "text", text }],
+    timestamp: ts,
+  },
+});
+const humanEntry = (id: string, body: string, ts: number) => ({
+  id,
+  type: "custom_message",
+  customType: "channel-inbound",
+  timestamp: new Date(ts).toISOString(),
+  content: `<channel-ctx type="discord" from="op1">ctx</channel-ctx>\n\n${body}`,
+  details: { body },
+});
+const splitPrep = (
+  firstKept: string,
+  span: HandoverMessage[] = [],
+): HandoverPreparation => ({
+  firstKeptEntryId: firstKept,
+  messagesToSummarize: span,
+  turnPrefixMessages: [],
+  isSplitTurn: true,
+  tokensBefore: 183_000,
+  fileOps: {
+    read: new Set(),
+    written: new Set(),
+    edited: new Set(),
+  },
+});
+
+describe("#315 P1 leg: isFinalAssistant + lastSentMessage", () => {
+  test("text-only assistant = final; a toolCall present is NOT a final", () => {
+    expect(isFinalAssistant(finalEntry("a1", T0, "reply") as any)).toBe(true);
+    expect(isFinalAssistant(toolCallEntry("a2", T0) as any)).toBe(false);
+    // an intermediate early-send message (text + toolCall) is NOT a final
+    expect(isFinalAssistant(toolCallEntry("a3", T0, true) as any)).toBe(false);
+    expect(isFinalAssistant(toolResultEntry("a4", T0) as any)).toBe(false);
+  });
+  test("a textless final (thinking only) is NOT a final", () => {
+    const e = {
+      id: "a5",
+      type: "message",
+      timestamp: new Date(T0).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "hmm" }],
+        timestamp: T0,
+      },
+    };
+    expect(isFinalAssistant(e as any)).toBe(false);
+  });
+  test("mid-turn transcript (last entry = a tool call) → the last final", () => {
+    const entries = [
+      humanEntry("h1", "do the thing", T0 - 30 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      toolCallEntry("tc1", T0 - 24 * 60_000),
+      toolResultEntry("tr1", T0 - 24 * 60_000 + 1_000),
+      toolCallEntry("tc2", T0 - 24 * 60_000 + 2_000),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("the reply that was sent");
+    expect(sent?.ts).toBe(T0 - 25 * 60_000);
+  });
+  test("the NEWEST final wins; no finals → null", () => {
+    const entries = [
+      finalEntry("f1", T0 - 40 * 60_000, "older reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "newer reply"),
+    ] as any[];
+    expect(lastSentMessage(entries)?.text).toBe("newer reply");
+    expect(
+      lastSentMessage([
+        toolCallEntry("tc1", T0),
+        toolResultEntry("tr1", T0 + 1_000),
+      ] as any[]),
+    ).toBeNull();
+  });
+});
+
+describe("#315 P1 leg: send-pipeline gate (r1 F1)", () => {
+  const thinkOnlyEntry = (id: string, ts: number, text: string) => ({
+    id,
+    type: "message",
+    timestamp: new Date(ts).toISOString(),
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text }],
+      timestamp: ts,
+    },
+  });
+  test("(a) a NO_REPLY-only last final is NOT sent; the field = the previous posted final", () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("the posted reply");
+    expect(sent?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(a) a NO_REPLY-only final with no other final → null", () => {
+    expect(
+      lastSentMessage([
+        finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+      ] as any[]),
+    ).toBeNull();
+  });
+  test("(b) a thinking-tag-only last final is NOT sent; the field = the previous posted final", () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      thinkOnlyEntry("f2", T0 - 10 * 60_000, "\u003cthink\u003e"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("the posted reply");
+    expect(sent?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(b) content + leaked thinking tags → the field shows the cleaned text the operator saw", () => {
+    expect(
+      lastSentMessage([
+        thinkOnlyEntry(
+          "f1",
+          T0 - 10 * 60_000,
+          "\u003cthink\u003ehmm\u003c/think\u003e done",
+        ),
+      ] as any[])?.text,
+    ).toBe("done");
+  });
+  test("content + NO_REPLY token lines → the field shows the token-stripped text", () => {
+    expect(
+      lastSentMessage([
+        finalEntry("f1", T0 - 10 * 60_000, "NO_REPLY\nthe posted reply"),
+      ] as any[])?.text,
+    ).toBe("the posted reply");
+  });
+  test("(c) the third consecutive identical final is dropped (recordFinalRepeat); the field = the previous posted one", () => {
+    const entries = [
+      humanEntry("h1", "a", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    const sent = lastSentMessage(entries);
+    expect(sent?.text).toBe("loop");
+    expect(sent?.ts).toBe(T0 - 40 * 60_000);
+  });
+  test("(c) a new inbound resets the repeat streak (live semantics) → the third is posted", () => {
+    const entries = [
+      humanEntry("h1", "a", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      humanEntry("h2", "b", T0 - 45 * 60_000),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    expect(lastSentMessage(entries)?.ts).toBe(T0 - 30 * 60_000);
+  });
+  test("(d) doc-write guard: a silent (NO_REPLY-only) NEWER final does not fire LAST-SENT-MISSING", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries),
+    ).toBeNull();
+  });
+  test("(d) doc-write guard: a thinking-tag-only NEWER final does not fire", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      thinkOnlyEntry("f2", T0 - 10 * 60_000, "\u003cthink\u003e"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries),
+    ).toBeNull();
+  });
+  test("(d) doc-write guard: a repeat-dropped NEWER final does not fire", () => {
+    const entries = [
+      finalEntry("f1", T0 - 50 * 60_000, "loop"),
+      finalEntry("f2", T0 - 40 * 60_000, "loop"),
+      finalEntry("f3", T0 - 30 * 60_000, "loop"),
+    ] as any[];
+    expect(lastSentMissing("loop", T0 - 40 * 60_000, entries)).toBeNull();
+  });
+  test("(d) doc-write guard still fires for a genuinely posted newer final", () => {
+    const entries = [
+      finalEntry("f1", T0 - 30 * 60_000, "the posted reply"),
+      finalEntry("f2", T0 - 10 * 60_000, "a real newer reply"),
+    ] as any[];
+    expect(
+      lastSentMissing("the posted reply", T0 - 30 * 60_000, entries)?.text,
+    ).toBe("a real newer reply");
+  });
+});
+
+describe("#315 P1 leg: buildHandover - the Last sent message field", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-ls-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    storeDir = path.join(tmp, "handovers");
+  });
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  const settings = (over: Partial<HandoffSettings> = {}): HandoffSettings => ({
+    ...HANDOFF_DEFAULTS,
+    storeDir,
+    enabled: true,
+    ...over,
+  });
+  const ctx: any = {
+    cwd: tmp,
+    model: { id: "m", name: "M", provider: "p" },
+    modelRegistry: {},
+    sessionManager: {
+      getSessionFile: () => null,
+      getSessionId: () => "sess-ls",
+      getEntries: () => [],
+    },
+    getContextUsage: () => ({
+      tokens: 200_000,
+      contextWindow: 262_144,
+      percent: 90,
+    }),
+  };
+
+  test("mid-turn split (last entry = a tool call) → the doc carries the last sent message verbatim, and ONLY in the field", async () => {
+    const entries = [
+      humanEntry("h1", "do the thing", T0 - 30 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      toolCallEntry("tc1", T0 - 24 * 60_000),
+      toolResultEntry("tr1", T0 - 24 * 60_000 + 1_000),
+      toolCallEntry("tc2", T0 - 24 * 60_000 + 2_000),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("tc1"),
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\nthe reply that was sent");
+    // not in the size-limited tail window: exactly ONE occurrence
+    expect(doc.split("the reply that was sent").length - 1).toBe(1);
+  });
+  test("long turn, the sent message sits OUTSIDE the tail window + size guard ran → still in the field verbatim", async () => {
+    const longTurn: any[] = [];
+    for (let i = 0; i < 10; i++) {
+      longTurn.push(
+        toolCallEntry(`tc${i}`, T0 - 10 * 60_000 + i * 10_000, true),
+        toolResultEntry(
+          `tr${i}`,
+          T0 - 10 * 60_000 + i * 10_000 + 1_000,
+          `x`.repeat(2_000),
+        ),
+      );
+    }
+    const entries = [
+      humanEntry("h1", "do the thing", T0 - 40 * 60_000),
+      finalEntry(
+        "f1",
+        T0 - 35 * 60_000,
+        "SENT-OUTSIDE-TAIL the long-turn reply",
+      ),
+      ...longTurn,
+    ];
+    const doc = await buildHandover({
+      preparation: splitPrep("tc0"),
+      branchEntries: entries,
+      ctx,
+      settings: settings({ sizeGuardTokens: 1_500 }),
+      now: new Date(T0),
+    });
+    // the size guard actually ran (the transcript got condensed)
+    expect(doc).toContain("… (condensed by size guard)");
+    // the protected field survived the size cut, verbatim
+    expect(doc).toContain(
+      "## Last sent message\nSENT-OUTSIDE-TAIL the long-turn reply",
+    );
+  });
+  test("no assistant final in the transcript → the section renders (none)", async () => {
+    const entries = [
+      humanEntry("h1", "do the thing", T0 - 30 * 60_000),
+      toolCallEntry("tc1", T0 - 24 * 60_000),
+      toolResultEntry("tr1", T0 - 24 * 60_000 + 1_000),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("tc1"),
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\n(none)");
+  });
+  test("consistent extraction → no LAST-SENT-MISSING tag on the written doc", async () => {
+    const entries = [
+      humanEntry("h1", "do the thing", T0 - 30 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      toolCallEntry("tc1", T0 - 24 * 60_000),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("tc1"),
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).not.toContain("LAST-SENT-MISSING");
+    expect(loadPreviousHandover({ storeDir })).not.toContain(
+      "LAST-SENT-MISSING",
+    );
+  });
+  test("(a) last final is NO_REPLY-only → the field = the previous posted final, no tag", async () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      finalEntry("f2", T0 - 10 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\nthe reply that was sent");
+    expect(doc).not.toContain("NO_REPLY");
+    expect(doc).not.toContain("LAST-SENT-MISSING");
+  });
+  test("(b) last final is thinking-tag-only → the field = the previous posted final, no tag", async () => {
+    const thinkOnly = {
+      id: "f2",
+      type: "message",
+      timestamp: new Date(T0 - 10 * 60_000).toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "\u003cthink\u003e" }],
+        timestamp: T0 - 10 * 60_000,
+      },
+    };
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "the reply that was sent"),
+      thinkOnly,
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\nthe reply that was sent");
+    expect(doc).not.toContain("\u003cthink\u003e");
+    expect(doc).not.toContain("LAST-SENT-MISSING");
+  });
+  test("(b) a content + leaked thinking tags final → the field shows the cleaned text the operator saw", async () => {
+    const entries = [
+      finalEntry(
+        "f1",
+        T0 - 10 * 60_000,
+        "\u003cthink\u003ehmm\u003c/think\u003e done",
+      ),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\ndone");
+  });
+  test("(c) every final is silent (NO_REPLY-only) → the section renders (none)", async () => {
+    const entries = [
+      humanEntry("h1", "watch", T0 - 60 * 60_000),
+      finalEntry("f1", T0 - 25 * 60_000, "NO_REPLY"),
+    ] as any[];
+    const doc = await buildHandover({
+      preparation: splitPrep("f9"), // outside the branch → empty transcript tail
+      branchEntries: entries,
+      ctx,
+      settings: settings(),
+      now: new Date(T0),
+    });
+    expect(doc).toContain("## Last sent message\n(none)");
+  });
+});
+
+describe("#315 P1 leg: lastSentMissing (the doc-write guard)", () => {
+  const newer = [finalEntry("f1", T0 - 10 * 60_000, "newer reply")] as any[];
+  test("field (none) + a final in the transcript → the final is the miss", () => {
+    expect(lastSentMissing("(none)", 0, newer)?.text).toBe("newer reply");
+  });
+  test("empty field + a final in the transcript → the final is the miss", () => {
+    expect(lastSentMissing("", 0, newer)?.text).toBe("newer reply");
+  });
+  test("stale field (older ts) + a newer final → the newer one is the miss", () => {
+    const stale = [finalEntry("f0", T0 - 40 * 60_000, "stale reply"), ...newer];
+    expect(lastSentMissing("stale reply", T0 - 40 * 60_000, stale)?.text).toBe(
+      "newer reply",
+    );
+  });
+  test("field is current (the latest final) → no miss", () => {
+    expect(lastSentMissing("newer reply", T0 - 10 * 60_000, newer)).toBeNull();
+  });
+  test("field (none) but the transcript has NO final → no miss", () => {
+    expect(
+      lastSentMissing("(none)", 0, [
+        toolCallEntry("tc1", T0),
+        toolResultEntry("tr1", T0 + 1_000),
+      ] as any[]),
+    ).toBeNull();
+  });
+  test("numeric compare only: an unorderable field (ts 0) vs a dated final → miss", () => {
+    expect(lastSentMissing("stale reply", 0, newer)?.text).toBe("newer reply");
+  });
+});
+
+describe("#315 P1 leg: tagLastSentMissing (the tag mechanism)", () => {
+  const doc = [
+    "# Handover - 2026-11-02 · session x · 100k tokens → handoff",
+    "",
+    "## Last sent message",
+    "(none)",
+    "",
+    "<read-files>",
+    "</read-files>",
+    "<modified-files>",
+    "</modified-files>",
+  ].join("\n");
+  const missed = { text: "newer reply", ts: T0 - 10 * 60_000 };
+  test("tags the section body with one > line (the #315 P1 mechanism)", () => {
+    const tagged = tagLastSentMissing(doc, missed);
+    expect(tagged).toContain("> LAST-SENT-MISSING:");
+    expect(tagged).toContain(`(ts=${missed.ts})`);
+    // the tag lands in the section body (inert for the boot seed)
+    const { sections } = splitDoc(tagged);
+    const s = sections.find((x) => x.title.includes("sent message"));
+    expect(s?.body.split("\n").filter((l) => l.startsWith(">")).length).toBe(1);
+  });
+  test("no section → the doc is returned unchanged", () => {
+    expect(tagLastSentMissing("# Handover\n", missed)).toBe("# Handover\n");
+  });
+  test("a tagged (none) doc still reads (none) (docLastSentIsNone)", () => {
+    expect(docLastSentIsNone(tagLastSentMissing(doc, missed))).toBe(true);
+  });
+});
+
+describe("#315 P1 leg: docLastSentIsNone", () => {
+  const doc = (sent: string) =>
+    [
+      "# Handover - 2026-11-02 · session x · 100k tokens → handoff",
+      "",
+      "## Last sent message",
+      sent,
+      "",
+      "<read-files>",
+      "</read-files>",
+      "<modified-files>",
+      "</modified-files>",
+    ].join("\n");
+  test("(none) → true; a listed message → false; missing section → false", () => {
+    expect(docLastSentIsNone(doc("(none)"))).toBe(true);
+    expect(docLastSentIsNone(doc("the reply that was sent"))).toBe(false);
+    expect(
+      docLastSentIsNone(
+        "# Handover\n\n<read-files>\n</read-files>\n<modified-files>\n</modified-files>",
+      ),
+    ).toBe(false);
+  });
+  test("a multi-line message → false", () => {
+    expect(docLastSentIsNone(doc("line one\nline two"))).toBe(false);
+  });
+});
+
+describe("#315 P1 leg: sessionStartSentFlag (the session-start guard)", () => {
+  const docNone = [
+    "# Handover - 2026-11-02 · session x · 100k tokens → handoff",
+    "",
+    "## Last sent message",
+    "(none)",
+    "",
+    "<read-files>",
+    "</read-files>",
+    "<modified-files>",
+    "</modified-files>",
+  ].join("\n");
+  const docListed = docNone.replace("(none)", "the reply that was sent");
+  const own = (ts: number, id: string): ChannelHistoryMessage => ({
+    ts,
+    bot: true,
+    webhook: false,
+    authorId: id,
+  });
+  const wake = (ts: number, id: string): ChannelHistoryMessage => ({
+    ts,
+    bot: true,
+    webhook: true,
+    authorId: id,
+  });
+  const other = (ts: number, id: string): ChannelHistoryMessage => ({
+    ts,
+    bot: false,
+    webhook: false,
+    authorId: id,
+  });
+
+  test("doc (none) + a post by this agent < 30 min old = flag", () => {
+    const line = sessionStartSentFlag(
+      docNone,
+      [own(T0 - 10 * 60_000, "bot1")],
+      "bot1",
+      T0,
+    );
+    expect(line).toContain("1 message(s) < 30m ago");
+    expect(line).toContain("issue #315 P1 leg");
+  });
+  test("a 45 min old post (outside the 30 min window) → null", () => {
+    expect(
+      sessionStartSentFlag(
+        docNone,
+        [own(T0 - 45 * 60_000, "bot1")],
+        "bot1",
+        T0,
+      ),
+    ).toBeNull();
+  });
+  test("a post exactly 30 min old is outside (strict <) → null", () => {
+    expect(
+      sessionStartSentFlag(
+        docNone,
+        [own(T0 - ASK_SELF_CHECK_WINDOW_MS, "bot1")],
+        "bot1",
+        T0,
+      ),
+    ).toBeNull();
+  });
+  test("bot id known: a different bot's post is not this agent's → null", () => {
+    expect(
+      sessionStartSentFlag(
+        docNone,
+        [own(T0 - 10 * 60_000, "otherbot")],
+        "bot1",
+        T0,
+      ),
+    ).toBeNull();
+  });
+  test("bot id unknown: a non-webhook bot post counts → flag", () => {
+    expect(
+      sessionStartSentFlag(docNone, [own(T0 - 10 * 60_000, "bot1")], null, T0),
+    ).not.toBeNull();
+  });
+  test("bot id unknown: a machine-wake card is not the agent's reply → null", () => {
+    expect(
+      sessionStartSentFlag(docNone, [wake(T0 - 10 * 60_000, "wk1")], null, T0),
+    ).toBeNull();
+  });
+  test("a human post is not this agent's → null", () => {
+    expect(
+      sessionStartSentFlag(
+        docNone,
+        [other(T0 - 10 * 60_000, "op1")],
+        "bot1",
+        T0,
+      ),
+    ).toBeNull();
+  });
+  test("the doc lists the sent message (not (none)) → null even with a recent post", () => {
+    expect(
+      sessionStartSentFlag(
+        docListed,
+        [own(T0 - 10 * 60_000, "bot1")],
+        "bot1",
+        T0,
+      ),
+    ).toBeNull();
+  });
+  test("an unparseable ts (NaN) is excluded → null", () => {
+    const bad: ChannelHistoryMessage = {
+      ts: NaN,
+      bot: true,
+      webhook: false,
+      authorId: "bot1",
+    };
+    expect(sessionStartSentFlag(docNone, [bad], "bot1", T0)).toBeNull();
+  });
+});
+
+describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  let sentBodies: string[] = [];
+  const realFetch = globalThis.fetch;
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-lsw-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = path.join(tmp, "home");
+    fs.mkdirSync(path.join(tmp, "home", ".pi", "agent"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmp, "home", ".pi", "agent", "settings.json"),
+      JSON.stringify({ handoff: { storeDir: path.join(tmp, "handovers") } }),
+    );
+    storeDir = path.join(tmp, "handovers");
+    fs.mkdirSync(storeDir, { recursive: true });
+    sentBodies = [];
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (u.includes("/messages?limit=")) {
+        // the history fetch: one post by this agent 10 min ago
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              id: "b1",
+              timestamp: new Date(Date.now() - 10 * 60_000).toISOString(),
+              author: { id: "bot1", bot: true },
+            },
+          ],
+          text: async () => "",
+        };
+      }
+      if (init?.method === "POST" && u.endsWith("/messages")) {
+        sentBodies.push(String(init?.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "out1" }),
+          text: async () => "",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }) as any;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+  const ch = {
+    id: "ch1",
+    name: "Test",
+    type: "discord" as const,
+    enabled: true,
+    channel: "12345",
+    botToken: "tok1",
+  };
+  const writeDoc = (sent: string) => {
+    const doc = [
+      "# Handover - 2026-11-02 · session x · 100k tokens → handoff",
+      "",
+      "## Last user asks",
+      "1. do the thing",
+      "",
+      "## Last sent message",
+      sent,
+      "",
+      "<read-files>",
+      "</read-files>",
+      "<modified-files>",
+      "</modified-files>",
+    ].join("\n");
+    fs.writeFileSync(path.join(storeDir, "20261102-0300-x.md"), doc);
+    fs.writeFileSync(
+      path.join(storeDir, "latest.md"),
+      `# Handover pointer\npath: ${path.join(storeDir, "20261102-0300-x.md")}\nupdated: 2026-11-02T03:00:00Z\n`,
+    );
+  };
+
+  test("doc (none) + a post by this agent < 30 min in history → say to the channel", async () => {
+    writeDoc("(none)");
+    await runSessionStartAskCheck(tmp, [ch] as any);
+    expect(sentBodies.length).toBe(1);
+    expect(sentBodies[0]).toContain("issue #315 P1 leg");
+  });
+  test("the doc lists the sent message (not (none)) → no say", async () => {
+    writeDoc("the reply that was sent");
     await runSessionStartAskCheck(tmp, [ch] as any);
     expect(sentBodies.length).toBe(0);
   });
