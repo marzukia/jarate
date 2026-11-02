@@ -51,6 +51,11 @@ import {
   suppressAutoReact,
 } from "./discord";
 import { parseVerboseLevel } from "./index";
+import {
+  isStartupMessageSuppressedForThisStart,
+  resetStartupMessageSuppressionForTests,
+  suppressStartupMessageForThisStart,
+} from "./startup-suppress";
 
 // Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
 // suite inherits PI_SESSION_ID=fleetwork-<ticket> from its run wrapper;
@@ -89,6 +94,7 @@ const cfg = (id: string, extra: Record<string, unknown> = {}): any => ({
 });
 
 afterEach(() => {
+  resetStartupMessageSuppressionForTests();
   for (const id of [
     "m3",
     "l3",
@@ -105,6 +111,8 @@ afterEach(() => {
     "qu",
     "ip",
     "cs",
+    "ss1",
+    "ss2",
   ])
     disconnectDiscord(id);
 });
@@ -145,6 +153,64 @@ test("startup message waits until bot identity resolves (M3)", async () => {
   await pollDiscord("m3");
   await tick();
   expect(posts.length).toBe(1);
+});
+
+// ─── #328: the startupMessage post sites honor the shared flag ─────────
+
+test("#328: suppressed unclean start — the poller site skips the startup message and consumes the pending mark", async () => {
+  const posts: any[] = [];
+  setFetch(async (u, init) => {
+    const method = init?.method || "GET";
+    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-1" });
+    if (method === "POST" && u.includes("/messages")) {
+      posts.push(JSON.parse(init.body));
+      return jsonResp(200, { id: "posted-1" });
+    }
+    if (u.includes("/messages")) return jsonResp(200, []);
+    return jsonResp(200, null);
+  });
+  suppressStartupMessageForThisStart(); // the unclean restart-wake path set it
+  seedChannelStateForTest("ss2", "999");
+  const st = getDiscordStates().get("ss2");
+  st!.config = cfg("ss2", { startupMessage: "hello" });
+  st!.startupPending = true;
+  await pollDiscord("ss2"); // resolves identity, hits the post site
+  await tick();
+  expect(posts).toEqual([]); // the card owns the one post
+  expect(st!.startupPending).toBe(false); // consumed: no re-post on a later poll
+  await pollDiscord("ss2");
+  await tick();
+  expect(posts).toEqual([]);
+});
+
+test("#328: the connect-timeout site skips the startup message when the flag is set (unplanned restart)", async () => {
+  const posts: any[] = [];
+  setFetch(async (u, init) => {
+    const method = init?.method || "GET";
+    if (u.endsWith("/users/@me")) return jsonResp(200, { id: "bot-1" });
+    if (method === "POST" && u.includes("/messages")) {
+      posts.push(JSON.parse(init.body));
+      return jsonResp(200, { id: "posted-1" });
+    }
+    if (u.includes("/messages")) return jsonResp(200, []);
+    return jsonResp(200, null);
+  });
+  suppressStartupMessageForThisStart();
+  const ok = await connectDiscord(cfg("ss1", { startupMessage: "hello" }), {
+    onMessage: () => {},
+    onError: () => {},
+  });
+  expect(ok).toBe(true);
+  // identity resolved at connect → the 3s setTimeout post site fires
+  await tick(3500);
+  expect(posts).toEqual([]);
+});
+
+test("#328: the flag is one-directional for the process — a later start in the same process stays suppressed", async () => {
+  suppressStartupMessageForThisStart();
+  expect(isStartupMessageSuppressedForThisStart()).toBe(true);
+  // no public reset outside the test hook: the flag is per process
+  expect(isStartupMessageSuppressedForThisStart()).toBe(true);
 });
 
 // ─── L3: channel id cache is per-token ─────────────────────────────────────

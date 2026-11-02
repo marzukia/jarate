@@ -27,6 +27,10 @@ import {
   wakeAuditStart,
   writeCleanStop,
 } from "./restart-wake";
+import {
+  isStartupMessageSuppressedForThisStart,
+  resetStartupMessageSuppressionForTests,
+} from "./startup-suppress";
 
 let tmp: string;
 
@@ -521,8 +525,10 @@ describe("runRestartWake (issue #111)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("full wake: planned restart, 1 inflight, italic line, bus webhook first", async () => {
-    writeCleanStop(stateDir(), new Date(T0 - 10_000));
+  test("full wake: unclean restart, 1 inflight, italic line, bus webhook first", async () => {
+    // #328: the planned class no longer posts a card (the startup
+    // message is the post), so the card path is exercised here with
+    // the unclean class (no marker).
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
     const { impl, calls } = fakeFetch([200]);
     const r = await runRestartWake({
@@ -536,21 +542,22 @@ describe("runRestartWake (issue #111)", () => {
     });
     expect(r.posted).toBe(true);
     expect(r.reason).toBe("posted");
-    expect(r.restartClass).toBe("planned");
+    expect(r.restartClass).toBe("unclean");
     expect(calls).toHaveLength(1);
     // the channel config has no webhookUrl -> the pi-bg bus resolves it,
     // and the webhook post is the FIRST route (isBgWebhook)
     expect(calls[0].url).toBe("https://bus.example/hook");
     const posted = JSON.parse(calls[0].body ?? "{}");
     expect(posted.content).toBe(
-      "*restart-wake \u00b7 planned \u00b7 in-flight 1*",
+      "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
     );
     expect(posted.embeds).toBeUndefined();
-    expect(r.message).toBe("*restart-wake \u00b7 planned \u00b7 in-flight 1*");
+    expect(r.message).toBe(
+      "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
+    );
   });
 
   test("channel webhookUrl beats the resolved bus webhook", async () => {
-    writeCleanStop(stateDir(), new Date(T0 - 10_000));
     const { impl, calls } = fakeFetch([200]);
     await runRestartWake({
       reason: "startup",
@@ -740,9 +747,10 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
       ...over,
     } as Parameters<typeof runRestartWake>[0]);
 
-  // the five terminal tokens; each startup must end in exactly one
+  // the terminal tokens (including the #328 suppressed-planned branch);
+  // each startup must end in exactly one
   const terminalTokens =
-    /not-startup|no-channel|dedup suppressed|posted:|post-failed/;
+    /not-startup|no-channel|dedup suppressed|posted:|post-failed|suppressed-planned/;
 
   test("not-startup logs its reason", async () => {
     await run({ reason: "reload" });
@@ -786,11 +794,16 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
         label: "post-failed",
         over: { postOpts: { backoffMs: 1, timeoutMs: 50 } },
       },
+      { label: "suppressed-planned", over: {} }, // #328: fresh marker = planned
     ];
     for (const c of cases) {
       // fresh state dir per case: the claim file must not leak across
       const sd = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-g1-"));
       try {
+        // the suppressed-planned branch: a fresh clean-stop marker makes
+        // the start classified planned (startup message is the post)
+        if (c.label === "suppressed-planned")
+          writeCleanStop(sd, new Date(T0 - 60_000));
         const { impl } = fakeFetch(
           c.label === "posted" ? [200] : [500, 500, 500, 500, 500, 500],
         );
@@ -855,7 +868,10 @@ describe("wake audit G2 (issue #322)", () => {
     wakeAuditOutcome(s, "posted");
     expect(wakeAuditStart(s, ws + 20_000)).toBeNull();
     wakeAuditOutcome(s, "dedup");
-    // window roll evaluates the closed window: 2 starts == 2 accounted
+    // #328: the suppressed-planned bucket keeps the invariant closed
+    expect(wakeAuditStart(s, ws + 30_000)).toBeNull();
+    wakeAuditOutcome(s, "suppressed-planned");
+    // window roll evaluates the closed window: 3 starts == 3 accounted
     expect(wakeAuditStart(s, ws + W + 1_000)).toBeNull();
     wakeAuditOutcome(s, "posted"); // balance the new window
     expect(wakeAuditEvaluate(s)).toBeNull();
@@ -870,7 +886,7 @@ describe("wake audit G2 (issue #322)", () => {
     const flag = wakeAuditStart(s, ws + W + 1_000); // closes the window
     expect(flag).toBe(
       `[wake] audit flag: window=${ws} starts=2 accounted=1 ` +
-        "(posted=1 dedup=0 post-failed=0 no-channel=0)",
+        "(posted=1 dedup=0 post-failed=0 no-channel=0 suppressed-planned=0)",
     );
     // the new window starts clean
     wakeAuditOutcome(s, "posted");
@@ -883,7 +899,11 @@ describe("wake audit G2 (issue #322)", () => {
     s.starts = 1;
     s.posted = 1;
     expect(wakeAuditEvaluate(s)).toBeNull();
-    s.starts = 2; // one startup never accounted
+    // #328: the suppressed-planned bucket accounts for a startup too
+    s.starts = 2;
+    s.suppressedPlanned = 1;
+    expect(wakeAuditEvaluate(s)).toBeNull();
+    s.suppressedPlanned = 0; // one startup never accounted
     expect(wakeAuditEvaluate(s)).toContain("[wake] audit flag:");
     expect(wakeAuditEvaluate(s)).toContain("starts=2");
     expect(wakeAuditEvaluate(s)).toContain("accounted=1");
@@ -921,5 +941,129 @@ describe("wake audit G2 (issue #322)", () => {
     expect(joined).toContain("[wake] audit flag:");
     expect(joined).toContain("starts=2");
     expect(joined).toContain("accounted=1");
+  });
+});
+
+// ─── #328: one post per restart (planned -> startup message only,
+// unplanned -> restart-wake card only) ──────────────────────────────
+
+describe("runRestartWake #328 (one post per restart)", () => {
+  const runDir = () => path.join(tmp, "runs");
+  const stateDir = () => path.join(tmp, ".tmp");
+  const target: WakeTarget = { channelId: "1", botToken: "tok" };
+  let log: string[];
+  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
+
+  beforeEach(() => {
+    log = [];
+    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+    resetStartupMessageSuppressionForTests();
+  });
+
+  afterEach(() => {
+    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
+    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
+    resetStartupMessageSuppressionForTests();
+  });
+
+  const run = (over: Partial<Parameters<typeof runRestartWake>[0]>) =>
+    runRestartWake({
+      reason: "startup",
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      now: T0,
+      log: (l) => log.push(l),
+      ...over,
+    } as Parameters<typeof runRestartWake>[0]);
+
+  test("planned: the card is NOT sent (zero fetch calls), reason is suppressed-planned, the startup message is NOT suppressed", async () => {
+    writeCleanStop(stateDir(), new Date(T0 - 60_000));
+    const { impl, calls } = fakeFetch([200]);
+    const r = await run({ fetchImpl: impl });
+    expect(r).toEqual({
+      posted: false,
+      reason: "suppressed-planned",
+      restartClass: "planned",
+    });
+    expect(calls).toHaveLength(0); // no card -> no hall-monitor page
+    expect(log.join("\n")).toContain(
+      "[wake] suppressed-planned: startup message is the post",
+    );
+    // the startup message is the one post: the flag stays unset
+    expect(isStartupMessageSuppressedForThisStart()).toBe(false);
+  });
+
+  test("planned consumes the marker but takes no claim: the next unclean start still posts its card", async () => {
+    writeCleanStop(stateDir(), new Date(T0 - 60_000));
+    const { impl, calls } = fakeFetch([200, 200]);
+    const a = await run({ fetchImpl: impl });
+    expect(a.reason).toBe("suppressed-planned");
+    expect(fs.existsSync(cleanStopPath(stateDir()))).toBe(false); // consumed
+    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    expect(b).toMatchObject({ posted: true, reason: "posted" });
+    expect(calls).toHaveLength(1); // only the unclean card was ever posted
+  });
+
+  test("unclean: the card is the post and the startup message is suppressed (flag set)", async () => {
+    const { impl, calls } = fakeFetch([200]);
+    const r = await run({ fetchImpl: impl });
+    expect(r).toMatchObject({
+      posted: true,
+      reason: "posted",
+      restartClass: "unclean",
+    });
+    expect(calls).toHaveLength(1);
+    expect(isStartupMessageSuppressedForThisStart()).toBe(true);
+  });
+
+  test("crash-flap: the deduped second unclean start also suppresses the startup message (one card total)", async () => {
+    const { impl, calls } = fakeFetch([200, 200]);
+    const a = await run({ fetchImpl: impl });
+    expect(a.posted).toBe(true);
+    expect(isStartupMessageSuppressedForThisStart()).toBe(true);
+    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    expect(b).toMatchObject({ posted: false, reason: "dedup" });
+    expect(isStartupMessageSuppressedForThisStart()).toBe(true);
+    expect(calls).toHaveLength(1); // the second start adds no post
+  });
+
+  test("G2: a window mixing posted + suppressed-planned + dedup stays closed (no flag)", async () => {
+    const s = wakeAuditInit();
+    const ws = Math.floor(T0 / WAKE_AUDIT_WINDOW_MS) * WAKE_AUDIT_WINDOW_MS;
+    const logLines: string[] = [];
+    const { impl } = fakeFetch([200, 200]);
+    const base = {
+      stateDir: stateDir(),
+      runDir: runDir(),
+      target,
+      fetchImpl: impl,
+      log: (l: string) => logLines.push(l),
+      auditState: s,
+    };
+    // start 1: unclean -> posted
+    const r1 = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: ws + 10_000,
+    });
+    expect(r1.reason).toBe("posted");
+    // start 2: planned -> suppressed-planned (the marker is fresh)
+    writeCleanStop(stateDir(), new Date(ws + 20_000 - 60_000));
+    const r2 = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: ws + 20_000,
+    });
+    expect(r2.reason).toBe("suppressed-planned");
+    // start 3: unclean, 15s after start 1's posted claim -> dedup
+    const r3 = await runRestartWake({
+      ...base,
+      reason: "startup",
+      now: ws + 25_000,
+    });
+    expect(r3.reason).toBe("dedup");
+    expect(wakeAuditEvaluate(s)).toBeNull();
+    expect(logLines.join("\n")).not.toContain("[wake] audit flag:");
   });
 });

@@ -36,6 +36,7 @@ import {
 } from "./queue";
 import { setSystemdRestartHookForTest } from "./restart-ops";
 import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
+import { resetStartupMessageSuppressionForTests } from "./startup-suppress";
 import type { ChannelMessage } from "./types";
 
 // Fleet-run gate (hall-monitor #35 gut): a dispatch agent running this
@@ -717,6 +718,7 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     sent.filter((s) => s.m?.customType === CHANNEL_MSG_TYPE);
 
   beforeEach(() => {
+    resetStartupMessageSuppressionForTests(); // #328 flag is per process
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "issue180-"));
     oldHome = process.env.HOME || "";
     process.env.HOME = path.join(tmp, "home");
@@ -819,19 +821,20 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     clearDiscordStatesForTest();
     const p2 = mkProcess();
     const ctx2 = mkCtx(true); // idle
-    script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
+    // #328: clean (planned) restart — the wake card is NOT posted (the
+    // startup message is the one post), so nothing card-shaped lands in
+    // the poll history.
+    script.polls = [[], [], []];
     script.scan = [];
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    // survival drain re-queued the callback before anything else ran
-    expect(midTurnQueues.get("ch1")?.length).toBe(1);
-    // the wake post comes in via the poll → direct send (idle)
+    // #328: no card means nothing re-wakes the queue — the #180 kick
+    // (the wake post never lands) delivers the survived callback
+    // directly (the bridge is idle)
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("Author: pi-bg restart-wake"),
+        String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     );
-    // the wake run ends → re-wake delivers the survived callback
-    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     const delivered = customSends(p2.sent).filter((s) =>
       String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
     );
@@ -1039,13 +1042,16 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     script.polls = [[bgRaw("2000")], [], []]; // first poll = the replay
     script.scan = [];
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
+    // #328: clean restart — no card; the kick or the op-window replay
+    // delivers the survived entry, whichever lands first commits and
+    // prunes the other copy (no memory-state assertion: the kick may
+    // have popped the drained copy before this line)
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
         String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
       ),
     );
-    // the replay run ends -> the re-wake must NOT pop the drained copy
+    // the delivery run ends -> nothing may pop a second copy
     await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
     const delivered = customSends(p2.sent).filter((s) =>
       String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
@@ -1081,7 +1087,9 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     script.polls = [[bgRaw("2000")], [], []]; // the replay delivers + commits
     script.scan = [bgRaw("2000")]; // the scan window also sees the id
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    expect(midTurnQueues.get("ch1")?.length).toBe(1); // the drained copy
+    // #328: clean restart — no card; the kick or the replay delivers
+    // the survived entry (no memory-state assertion: the kick may have
+    // popped the drained copy before this line)
     await waitFor(() =>
       customSends(p2.sent).some((s) =>
         String(s.m.details?.body ?? "").includes("Author: pi-bg worker · 2000"),
@@ -1132,8 +1140,14 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     script.polls = [[], [], []];
     script.scan = [];
     await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    // the survival drain re-queues the EDITED body, not the stale one
-    expect(midTurnQueues.get("ch1")?.[0].msg.body).toBe(bgBodyEdited);
+    // #328: clean restart — no card; the kick delivers the survived
+    // entry directly, and it must be the EDITED copy (the drain
+    // re-queued the edited msg from the file, not the stale one)
+    await waitFor(() =>
+      customSends(p2.sent).some((s) =>
+        String(s.m.details?.body ?? "").includes("task 2000 done EDITED"),
+      ),
+    );
   });
 
   test("crash with a live [queued] line: ack id survives in the file, restored + deleted exactly once", async () => {

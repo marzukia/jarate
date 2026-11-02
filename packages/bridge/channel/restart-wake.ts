@@ -37,13 +37,20 @@
 //
 // #322 guards (deterministic, no inference in the enforcement path):
 //   - G1: runRestartWake logs ONE line for EVERY terminal reason
-//     (posted | post-failed | dedup suppressed | no-channel | not-startup);
-//     the dedup path is no longer silent (the thin-record class is gone)
+//     (posted | post-failed | dedup suppressed | no-channel | not-startup |
+//     suppressed-planned); the dedup path is no longer silent (the
+//     thin-record class is gone)
 //   - G2: per-agent per-window numeric audit: starts ==
-//     posted + dedup + post-failed + no-channel; a violation logs one
-//     flag line (pure numeric compare)
+//     posted + dedup + post-failed + no-channel + suppressed-planned;
+//     a violation logs one flag line (pure numeric compare)
 //   - G3: the claim file carries a posted flag; the window suppresses
 //     ONLY when the prior same-class claim is in-window AND posted=1
+//   - #328: exactly ONE post per restart start — the planned class
+//     posts ONLY the startup message (this wake is suppressed, reason
+//     "suppressed-planned"); the unclean class posts ONLY the wake
+//     card (the startupMessage post is suppressed for this start via
+//     the shared once-per-process flag in startup-suppress.ts, set
+//     before the claim so a deduped crash-flap start suppresses too)
 //
 // Out of scope here (documented follow-ups, see PR body):
 //   - P1-2/P1-3 cursor-replay holes can still lose queued inbounds across
@@ -56,6 +63,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { egressText } from "./discord";
+import { suppressStartupMessageForThisStart } from "./startup-suppress";
 
 // ─── constants ───────────────────────────────────────────────────────────
 
@@ -418,6 +426,9 @@ export interface WakeAuditState {
   dedup: number;
   postFailed: number;
   noChannel: number;
+  /** #328: a planned restart whose wake was suppressed because the
+   *  startup message is the one post. */
+  suppressedPlanned: number;
 }
 
 export function wakeAuditInit(): WakeAuditState {
@@ -428,6 +439,7 @@ export function wakeAuditInit(): WakeAuditState {
     dedup: 0,
     postFailed: 0,
     noChannel: 0,
+    suppressedPlanned: 0,
   };
 }
 
@@ -439,12 +451,17 @@ const defaultWakeAudit: WakeAuditState = wakeAuditInit();
  *  enforcement path is deterministic, no inference). */
 export function wakeAuditEvaluate(state: WakeAuditState): string | null {
   const accounted =
-    state.posted + state.dedup + state.postFailed + state.noChannel;
+    state.posted +
+    state.dedup +
+    state.postFailed +
+    state.noChannel +
+    state.suppressedPlanned;
   if (state.starts === accounted) return null;
   return (
     `[wake] audit flag: window=${state.windowStart} starts=${state.starts} ` +
     `accounted=${accounted} (posted=${state.posted} dedup=${state.dedup} ` +
-    `post-failed=${state.postFailed} no-channel=${state.noChannel})`
+    `post-failed=${state.postFailed} no-channel=${state.noChannel} ` +
+    `suppressed-planned=${state.suppressedPlanned})`
   );
 }
 
@@ -465,6 +482,7 @@ function rollWakeAuditWindow(
   state.dedup = 0;
   state.postFailed = 0;
   state.noChannel = 0;
+  state.suppressedPlanned = 0;
   return flag;
 }
 
@@ -488,15 +506,21 @@ export function wakeAuditStart(
   return flag;
 }
 
-/** Count a terminal outcome of a startup event (the four outcomes
+/** Count a terminal outcome of a startup event (the five outcomes
  *  that make up `accounted`; not-startup is not a startup event). */
 export function wakeAuditOutcome(
   state: WakeAuditState,
-  outcome: "posted" | "dedup" | "post-failed" | "no-channel",
+  outcome:
+    | "posted"
+    | "dedup"
+    | "post-failed"
+    | "no-channel"
+    | "suppressed-planned",
 ): void {
   if (outcome === "posted") state.posted += 1;
   else if (outcome === "dedup") state.dedup += 1;
   else if (outcome === "post-failed") state.postFailed += 1;
+  else if (outcome === "suppressed-planned") state.suppressedPlanned += 1;
   else state.noChannel += 1;
 }
 
@@ -616,7 +640,13 @@ export interface RestartWakeDeps {
 
 export interface RestartWakeResult {
   posted: boolean;
-  reason: "posted" | "not-startup" | "no-channel" | "dedup" | "post-failed";
+  reason:
+    | "posted"
+    | "not-startup"
+    | "no-channel"
+    | "dedup"
+    | "post-failed"
+    | "suppressed-planned";
   message?: string;
   restartClass?: RestartClass;
 }
@@ -625,7 +655,11 @@ export interface RestartWakeResult {
  *  `void runRestartWake(deps).catch(...)` — it must never block startup.
  *  #322 G1: EVERY terminal reason logs exactly one line — a process
  *  start (reason=startup) always ends in one of posted | post-failed |
- *  dedup suppressed | no-channel | not-startup, each greppable. */
+ *  dedup suppressed | no-channel | suppressed-planned | not-startup,
+ *  each greppable. #328: the planned class ends in suppressed-planned
+ *  (the startup message is the one post; no card is sent), and the
+ *  unclean class sets the startup-suppress flag before the claim (the
+ *  card is the one post; the startup message is skipped). */
 export async function runRestartWake(
   deps: RestartWakeDeps,
 ): Promise<RestartWakeResult> {
@@ -649,6 +683,27 @@ export async function runRestartWake(
   // Consume the marker only on a real process start: in-process /new and
   // /reload cycles must not burn it.
   const restartClass = readCleanStop(deps.stateDir, now);
+  if (restartClass === "planned") {
+    // #328: the startup message is the one post for a planned restart —
+    // the wake card is NOT sent (no hall-monitor card) and the
+    // startup-suppress flag stays unset, so the startupMessage post
+    // path posts as usual. No claim is taken: the next unclean start
+    // still claims and posts its card.
+    wakeAuditOutcome(audit, "suppressed-planned");
+    log("[wake] suppressed-planned: startup message is the post");
+    return {
+      posted: false,
+      reason: "suppressed-planned",
+      restartClass,
+    };
+  }
+  // #328: unclean start — the wake card is the one post; the
+  // startupMessage post is suppressed for this start (shared
+  // once-per-process flag, read by the discord.ts post sites). Set
+  // BEFORE the claim: a deduped crash-flap start must not add a
+  // second post, and a post-failed start documents itself via the
+  // post-failed line while the next start re-posts the card (G3).
+  suppressStartupMessageForThisStart();
   const claim = claimWake(deps.stateDir, now, restartClass);
   if (!claim.claimed) {
     const prev = claim.prev ?? { t: now, klass: null, posted: false };
@@ -664,7 +719,7 @@ export async function runRestartWake(
   // per docs/secret-censor.md): ticket/run ids come from run records and
   // can carry secrets.
   const payload = buildWakePayload({
-    clean: restartClass === "planned",
+    clean: false, // #328: the planned class returned above; only unclean posts
     runs,
     now,
   });
