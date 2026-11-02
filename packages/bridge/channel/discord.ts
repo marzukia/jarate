@@ -28,6 +28,7 @@ import {
 import { serializeEmbeds } from "./format";
 import { isSupportedImageMime, optimizeImageBuffer } from "./image-optimizer";
 import { sanitizeSensitiveText } from "./sanitize";
+import { isStartupMessageSuppressedForThisStart } from "./startup-suppress";
 import type {
   AttachmentContent,
   AttachmentRef,
@@ -323,6 +324,14 @@ export async function connectDiscord(
     if (botUserId) {
       setTimeout(() => {
         if (states.get(config.id) === state && state.config.startupMessage) {
+          // #328: unclean restart — the restart-wake card is the one
+          // post; skip the startup message for this start.
+          if (isStartupMessageSuppressedForThisStart()) {
+            console.log(
+              "[startup] message suppressed for this start (restart-wake is the post)",
+            );
+            return;
+          }
           sendDiscordMessage(state.config, state.config.startupMessage).catch(
             () => {},
           );
@@ -461,9 +470,18 @@ export async function pollDiscord(configId: string): Promise<void> {
       state.config.startupMessage
     ) {
       state.startupPending = false;
-      sendDiscordMessage(state.config, state.config.startupMessage).catch(
-        () => {},
-      );
+      // #328: unclean restart — the restart-wake card is the one post;
+      // skip the startup message for this start (consume the pending
+      // mark so the presence-READY site does not re-post either).
+      if (isStartupMessageSuppressedForThisStart()) {
+        console.log(
+          "[startup] message suppressed for this start (restart-wake is the post)",
+        );
+      } else {
+        sendDiscordMessage(state.config, state.config.startupMessage).catch(
+          () => {},
+        );
+      }
     }
     const url = lastMessageId
       ? `/channels/${channelId}/messages?after=${lastMessageId}&limit=10`
@@ -1062,6 +1080,19 @@ export function getDiscordStates(): Map<string, DiscordState> {
   return states;
 }
 
+/** #328: mark a directly delivered (wake-fail kick) inbound as seen so
+ *  an op-window replay (poll after=<rewound cursor>) drops it instead
+ *  of double-delivering. The kick path bypasses
+ *  deliverInboundMessage (the seenDrop site), so without this mark the
+ *  replay would deliver the same id a second time (F1 shape: the
+ *  kick lands before the first poll of a rewound cursor). */
+export function markSeenDirectDelivery(
+  configId: string,
+  messageId: string,
+): void {
+  states.get(configId)?.seen.seenIds.add(messageId);
+}
+
 // ─── Gateway presence + typing ───────────────────────────────────────────
 
 const DEFAULT_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -1259,7 +1290,12 @@ function connectPresence(st: PresenceState): void {
             s.startupPending = false;
             const text = s.config.startupMessage;
             setTimeout(() => {
-              if (states.get(s.config.id) === s)
+              // #328: unclean restart — the restart-wake card is the
+              // one post; skip the startup message for this start.
+              if (
+                states.get(s.config.id) === s &&
+                !isStartupMessageSuppressedForThisStart()
+              )
                 sendDiscordMessage(s.config, text).catch(() => {});
             }, 3000);
           }

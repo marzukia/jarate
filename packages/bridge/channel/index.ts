@@ -55,6 +55,7 @@ import {
   loadDiscordAttachment,
   loadPersistedCursors,
   MAX_ATTACHMENT_BYTES,
+  markSeenDirectDelivery,
   patchChannelState,
   registerDiscordCommands,
   sendDiscordMessage,
@@ -1775,6 +1776,9 @@ export default function (pi: ExtensionAPI) {
             return;
           }
           if (r.reason === "dedup") return; // a racing start owns the post
+          // #328: "suppressed-planned" falls through here too — the card
+          // is intentionally not sent, so nothing else wakes the agent;
+          // the kick keeps the survived queue alive (same as post-failed).
           // #180: the wake post never lands — the wake inbound is what
           // starts the run whose agent_end re-wakes the survived queue.
           // Kick the oldest entry directly (the bridge is idle at
@@ -1785,6 +1789,11 @@ export default function (pi: ExtensionAPI) {
             console.log(
               `[channel] wake post failed: delivering queued inbound directly (${queued.channelId})`,
             );
+            // #328: mark the directly delivered id seen so an op-window
+            // replay (first poll after a rewound cursor) drops it instead
+            // of double-delivering (the kick bypasses the poller's
+            // seenDrop site).
+            markSeenDirectDelivery(queued.channelId, queued.msg.messageId);
             handleInbound(pi, queued.msg, ctx, true).catch((e) =>
               console.error(
                 "[channel] wake-fail direct delivery failed:",
