@@ -10,7 +10,11 @@
 import * as fs from "node:fs";
 import path from "node:path";
 
-import { editDiscordMessage } from "./discord";
+import {
+  deleteDiscordMessage,
+  editDiscordMessage,
+  sendDiscordMessage,
+} from "./discord";
 import {
   interruptCancelled,
   interruptInFlight,
@@ -353,6 +357,63 @@ export function armCompactTick(ch: ChannelConfig, msgId: string): void {
   );
   compactPlaceholders.set(ch.id, msgId); // #84: crash settle for this line
   persistLivePlaceholders();
+}
+
+/**
+ * Post the compact placeholder and await it bounded (~5s) — the post-first order of startCompact (2026-11-02 orphan fix): the tick must be armed before ctx.compact() can settle. Returns the posted message id, or null on failure/timeout (the report's fresh-post fallback covers that path). A post that resolves LATE, after the timeout, does not count: arming after the settle would re-create the orphan.
+ */
+export async function postCompactPlaceholder(
+  ch: ChannelConfig,
+): Promise<string | null> {
+  const post = sendDiscordMessage(ch, COMPACT_PLACEHOLDER).catch(() => null);
+  const result = (await Promise.race([
+    post,
+    new Promise<null>((res) => {
+      const timer = setTimeout(res, 5000);
+      (timer as any).unref?.();
+    }),
+  ])) as { success?: boolean; messageId?: string } | null;
+  return result?.success && result.messageId ? result.messageId : null;
+}
+
+/**
+ * session_shutdown belt (2026-11-02 orphan fix): drive EVERY live compact placeholder to a terminal state BEFORE stopAllOpTicks drops the paused ticks and unlinkLivePlaceholders drops the record. The in-memory op-tick map is not authoritative — a tick whose window is already closed pauses on its first render (null) and the line would freeze. Terminal state per record: window OPEN -> the interrupted line (the crash-settle wording; no op marker settles this on respawn); window CLOSED -> the result line is already posted, the placeholder is a redundant duplicate -> delete. The record is pure-compact (restart-class op windows are settled by the respawn's op marker). Must run before clearAllCompacting (it would make every open window read as closed). Failures are caught — shutdown never blocks on them. Returns the REST promises for the caller to await.
+ */
+export function settleCompactPlaceholdersOnShutdown(
+  channels: ChannelConfig[],
+): Promise<unknown>[] {
+  const out: Promise<unknown>[] = [];
+  const compactMsgs = new Map<string, string>();
+  for (const rec of readLivePlaceholders()?.compacts ?? [])
+    compactMsgs.set(rec.channelId, rec.msgId);
+  for (const [id, msgId] of compactPlaceholders) compactMsgs.set(id, msgId);
+  for (const [id, msgId] of compactMsgs) {
+    const ch = channels.find((c) => c.id === id && c.type === "discord");
+    if (!ch) continue;
+    try {
+      const open = isCompacting(id);
+      out.push(
+        (open
+          ? editDiscordMessage(
+              ch,
+              msgId,
+              machine("compact interrupted - restart"),
+            )
+          : deleteDiscordMessage(ch, msgId)
+        ).catch(() => {}),
+      );
+    } catch (e) {
+      console.error(
+        "[channel] shutdown compact settle failed:",
+        sanitizeUnknownValue(e),
+      );
+    }
+    const t = opTicks.get(`compact:${id}`);
+    if (t) clearInterval(t.timer);
+    opTicks.delete(`compact:${id}`);
+    compactPlaceholders.delete(id); // #84: record follows the settle
+  }
+  return out;
 }
 
 export function settleCompactTick(channelId: string, text: string): boolean {

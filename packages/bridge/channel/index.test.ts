@@ -48,7 +48,7 @@ import extension, {
   verboseOverride,
   workingMaxMs,
 } from "./index";
-import { machine, settleOpTick, stopAllOpTicks } from "./live";
+import { machine, opTicks, settleOpTick, stopAllOpTicks } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -4203,6 +4203,55 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     await tick();
     expect(isCompacting("ch1")).toBe(true);
     expect(compactPosts()).toHaveLength(1);
+  });
+
+  test("gate-started compact: placeholder is posted BEFORE the compact starts; a fast settle settles in place (no orphan, 2026-11-02 race)", async () => {
+    // The auto-compact gate (postPlaceholder=true) goes through the same startCompact as /compact: the placeholder post is awaited bounded (~5s) before ctx.compact runs. A fast settle (the 2026-11-02 vLLM case) therefore settles AFTER the tick is armed - the report replaces the placeholder in place. One placeholder post, one in-place settle, no fresh 'compacted:' post, no frozen line.
+    const baseFetch = (globalThis as any).fetch;
+    let plainPosts = 0;
+    (globalThis as any).fetch = async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        if (plainPosts === 1) await new Promise((r) => setTimeout(r, 10));
+      }
+      return baseFetch(url, init);
+    };
+    ctx.compact = (o?: any) => {
+      setTimeout(
+        () =>
+          o.onComplete({
+            tokensBefore: 222_822,
+            estimatedTokensAfter: 32_000,
+          }),
+        20,
+      );
+    };
+    ctx.isIdle = () => true;
+    await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
+    await tick(60);
+    expect(isCompacting("ch1")).toBe(false); // the settle's belt cleared it
+    expect(compactPosts()).toHaveLength(1);
+    const posts = fetchCalls
+      .filter(
+        (c) => c.url.includes("/channels/ch1/messages") && c.method === "POST",
+      )
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+    const settleText = machine(
+      `compacted: ${fmtTokensLC(222822)} -> ${fmtTokensLC(32000)}`,
+    );
+    expect(posts.filter((t: unknown) => t === settleText)).toHaveLength(0);
+    const editContents = fetchCalls
+      .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+      .map(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+      );
+    expect(editContents).toContain(settleText);
+    expect(opTicks.has("compact:ch1")).toBe(false);
   });
 
   test("under threshold at settled: no compact", async () => {

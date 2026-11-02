@@ -38,7 +38,7 @@ import extension, {
   setRuntimeStateDir,
   verboseOverride,
 } from "./index";
-import { machine, stopAllCompactTicks, stopOpTick } from "./live";
+import { machine, opTicks, stopAllCompactTicks, stopOpTick } from "./live";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -1423,11 +1423,9 @@ describe("compact: defer mid-run + always report", () => {
       expect(t).not.toContain("```");
   });
 
-  test("v4: settle before the placeholder post lands -> fresh post is BARE, same text as the tick settle", async () => {
-    // Hold the placeholder POST open so onComplete runs before the tick is
-    // armed — the settle must fall back to a fresh post that carries the
-    // SAME bare line the tick settle would have posted (the old race shipped
-    // fenced via tick, bare via fallback).
+  test("v4: a slow placeholder post times out the bounded wait -> fresh post is BARE, and the late post must not arm (no orphan)", async () => {
+    // Post-first order: startCompact awaits the placeholder post bounded (~5s) before it starts the compact, so a fast settle can no longer beat the post. The only settle-before-land path left is a post SLOWER than the bound: the bounded wait times out, the compact runs and settles without an armed tick (fresh-post fallback, bare, same text as the tick settle), and the late-resolving post must NOT arm (arming after the settle is what froze the 2026-11-02 orphan line).
+    jest.useFakeTimers();
     const baseFetch = globalThis.fetch as any;
     let plainPosts = 0;
     const release: { fn?: () => void } = {};
@@ -1443,32 +1441,87 @@ describe("compact: defer mid-run + always report", () => {
     ctx.compact = (o?: any) => {
       opts = o;
     };
-    await handleInbound(pi, inbound("/compact", "m1"), ctx);
-    // POST still in flight -> tick not armed. Settle now.
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+    const h = handleInbound(pi, inbound("/compact", "m1"), ctx);
+    // The placeholder POST is held; startCompact is now WAITING on it (bounded ~5s) - ctx.compact has not run yet.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(opts).toBeNull(); // post not landed -> compact not started
+    jest.advanceTimersByTime(5000); // the bounded wait elapses
+    await h; // startCompact proceeds: ctx.compact ran
+    expect(opts).not.toBeNull();
+    // Settle: no armed tick (the post never resolved in time) -> fresh post, bare, identical to the tick-settle form.
     const settleText = machine("compacted: 220k -> 35k");
     opts.onComplete({ tokensBefore: 220000, estimatedTokensAfter: 35000 });
-    await tick();
-    // the fallback fresh post is bare and identical to the tick-settle form
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
     expect(channelPosts().filter((t) => t === settleText)).toEqual([
       settleText,
     ]);
     expect(settleText).not.toContain("```");
-    // release the placeholder: it lands bare; the tick then arms onto an
-    // already-closed window and renders null (no edit, no double post)
+    // The placeholder resolves LATE: it lands bare but must NOT arm - the window is already closed, so no edit ever touches it (the old code armed here and the line froze; the shutdown/crash belt now drives such a late line to its terminal state).
     release.fn?.();
-    await tick();
-    await tick();
+    await Promise.resolve();
+    await Promise.resolve();
+    jest.advanceTimersByTime(10000);
     expect(channelPosts().filter((t) => t === "*[..] compacting...*")).toEqual([
       "*[..] compacting...*",
     ]);
+    for (const t of edits()) expect(t).not.toContain("```");
+    expect(channelPosts().filter((t) => t === settleText)).toHaveLength(1);
+  });
+
+  test("fast settle: a compact that settles while the placeholder is still landing yields ONE settled line (no orphan, 2026-11-02 race)", async () => {
+    // The 2026-11-02 20:17Z incident: a fast local vLLM settle landed while the placeholder POST was still in flight. Post-first order (the post is awaited bounded before ctx.compact runs) arms the tick BEFORE the settle can fire, so the settle replaces the placeholder in place - exactly one 'compacted: ...' line, no orphaned '[..] compacting...' line.
+    const baseFetch = globalThis.fetch as any;
+    let plainPosts = 0;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        // placeholder post lands at ~10ms, well inside the ~5s bound
+        if (plainPosts === 1) await new Promise((r) => setTimeout(r, 10));
+      }
+      return baseFetch(url, init);
+    }) as any;
+    let _opts: any = null;
+    ctx.compact = (o?: any) => {
+      _opts = o;
+      // the fast settle: 20ms, after the post (10ms)
+      setTimeout(
+        () =>
+          o.onComplete({
+            summary: "s",
+            firstKeptEntryId: "e",
+            tokensBefore: 212_000,
+            estimatedTokensAfter: 32_000,
+          }),
+        20,
+      );
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await new Promise((r) => setTimeout(r, 60));
+    const settleText = machine("compacted: 212k -> 32k");
+    // ONE placeholder post, and it was settled IN PLACE (edit) - the report never fresh-posts (no double line, no orphan).
+    expect(channelPosts().filter((t) => t === "*[..] compacting...*")).toEqual([
+      "*[..] compacting...*",
+    ]);
+    expect(channelPosts().filter((t) => t === settleText)).toHaveLength(0);
     const editContents = fetchCalls
-      .filter((c) => c.method === "PATCH")
+      .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
       .map(
         (c) =>
           (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
       );
-    for (const t of editContents) expect(t).not.toContain("```");
-    expect(channelPosts().filter((t) => t === settleText)).toHaveLength(1);
+    expect(editContents).toContain(settleText);
+    // the tick is gone (settle cleared it) - the line cannot tick on or sit frozen.
+    expect(opTicks.has("compact:ch1")).toBe(false);
   });
 
   test("idle /compact with no instructions compacts without customInstructions", async () => {
@@ -1489,13 +1542,21 @@ describe("compact: defer mid-run + always report", () => {
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     opts.onError(new Error("Nothing to compact (session too small)"));
     await tick();
+    // The tick is armed before the compact starts (post-then-compact), so the settle replaces the placeholder IN PLACE (no fresh post).
+    const failText = machine(
+      "compact failed: Nothing to compact (session too small)",
+    );
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
     expect(
-      channelPosts().some(
-        (t) =>
-          t ===
-          machine("compact failed: Nothing to compact (session too small)"),
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          failText,
       ),
     ).toBe(true);
+    expect(channelPosts().some((t) => t === failText)).toBe(false);
   });
 
   test("sync throw from ctx.compact is reported, not swallowed", async () => {
@@ -1504,12 +1565,19 @@ describe("compact: defer mid-run + always report", () => {
     };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
     await tick();
-    expect(
-      channelPosts().some((t) => t.includes("compact failed: boom-ctx")),
-    ).toBe(true);
-    expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
-      false,
+    // The placeholder was posted (post-then-compact) and the sync throw settles it IN PLACE with the failure line - no raw placeholder survives, and the failure line is not a fresh channel post on the text path (it rides the placeholder's edit).
+    const failText = machine("compact failed: boom-ctx");
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
+    expect(
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          failText,
+      ),
+    ).toBe(true);
+    expect(channelPosts().some((t) => t === failText)).toBe(false);
   });
 
   test("mid-run /compact defers; agent_end flushes it with the stored instructions", async () => {
@@ -1529,8 +1597,9 @@ describe("compact: defer mid-run + always report", () => {
         t.includes("[queued] compact (run in progress)"),
       ),
     ).toBe(true);
-    // run ends → flush (flushed compact posts its own ticking placeholder)
+    // run ends → flush (fire-and-forget: the flushed compact posts its own ticking placeholder before it starts)
     await handlers.agent_end({ messages: [] }, ctx);
+    for (let i = 0; i < 20 && !opts; i++) await tick();
     expect(opts?.customInstructions).toBe("keep the jarate");
     await tick();
     expect(channelPosts().some((t) => t.includes("*[..] compacting..."))).toBe(
@@ -1556,6 +1625,7 @@ describe("compact: defer mid-run + always report", () => {
       ),
     ).toBe(true);
     await handlers.agent_end({ messages: [] }, ctx);
+    for (let i = 0; i < 20 && !opts; i++) await tick();
     expect(opts?.customInstructions).toBe("second");
   });
 

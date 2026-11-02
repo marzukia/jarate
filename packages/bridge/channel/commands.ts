@@ -67,6 +67,7 @@ import {
   armCompactTick,
   COMPACT_PLACEHOLDER,
   machine,
+  postCompactPlaceholder,
   settleCompactTick,
 } from "./live";
 import {
@@ -384,23 +385,26 @@ export function buildInteractionHandler(
 // op status is prose, Andryo 2026-10-20). A sync throw returns the
 // sanitized error message (null on success) so the caller reports it on
 // its own path (command reply vs channel post).
-export function startCompact(
+// Post order (2026-11-02 orphan fix): the placeholder is posted first and awaited bounded (postCompactPlaceholder) so the tick is armed before ctx.compact() can settle — see that function's doc.
+export async function startCompact(
   pi: ExtensionAPI,
   pending: { ch: ChannelConfig; instructions?: string },
   ctx: ExtensionContext,
   postPlaceholder = false,
-): string | null {
+): Promise<string | null> {
   const { ch, instructions } = pending;
   const report = (text: string) => {
-    // Replace the ticking placeholder in place when one is armed; the
-    // fresh-post fallback covers the native slash path and the (impossible
-    // in practice) settle-before-post race. Both settle paths post the
-    // SAME machine line: single-line status ships italic (Andryo
-    // 2026-10-31), no fence.
+    // Replace the ticking placeholder in place when one is armed; the fresh-post fallback covers the native slash path and a failed/timeout placeholder post (the 2026-11-02 orphan race).
     const guarded = machine(text);
     if (!settleCompactTick(ch.id, guarded))
       sendDiscordMessage(ch, guarded).catch(() => {});
   };
+  // Post-then-compact: armed before the compact can run (no orphan).
+  const armedMsgId =
+    postPlaceholder && ch.type === "discord"
+      ? await postCompactPlaceholder(ch)
+      : null;
+  if (armedMsgId !== null) armCompactTick(ch, armedMsgId);
   try {
     ctx.compact({
       customInstructions: instructions,
@@ -428,18 +432,13 @@ export function startCompact(
       },
     });
     beginCompacting(pi, pending.ch, ctx);
-    if (postPlaceholder && ch.type === "discord") {
-      // Fire-and-forget: the placeholder gets its live tick; a settle
-      // faster than the post simply gets the fresh-post fallback via report().
-      sendDiscordMessage(ch, COMPACT_PLACEHOLDER)
-        .then((r) => {
-          if (r.success && r.messageId) armCompactTick(ch, r.messageId);
-        })
-        .catch(() => {});
-    }
     return null;
   } catch (e) {
-    return sanitizeSensitiveText(e instanceof Error ? e.message : String(e));
+    const t = sanitizeSensitiveText(e instanceof Error ? e.message : String(e));
+    // A sync throw would leave the armed tick orphaned (render null).
+    if (armedMsgId !== null)
+      settleCompactTick(ch.id, machine(`compact failed: ${t}`));
+    return t;
   }
 }
 
@@ -956,10 +955,8 @@ export async function runChannelCommand(
           ),
         };
       }
-      // Text path: startCompact posts the placeholder (armed with its live
-      // tick) and reports settle-in-place. Native: the deferred interaction
-      // shows the placeholder instead; the report posts fresh.
-      const err = startCompact(pi, { ch, instructions }, ctx, !native);
+      // Text path: startCompact posts the placeholder (armed, post-then-compact) and reports settle-in-place. Native: the deferred interaction shows the placeholder instead; the report posts fresh.
+      const err = await startCompact(pi, { ch, instructions }, ctx, !native);
       if (err !== null) {
         const t = channelError(err);
         if (t !== null)
@@ -987,7 +984,7 @@ export async function runChannelCommand(
         };
       }
       const settings = resolveHandoffSettings(ctx.cwd);
-      const err = startCompact(pi, { ch, instructions }, ctx, !native);
+      const err = await startCompact(pi, { ch, instructions }, ctx, !native);
       if (err !== null) {
         const t = channelError(err);
         if (t !== null)
