@@ -39,6 +39,7 @@ import extension, {
   verboseOverride,
 } from "./index";
 import { machine, opTicks, stopAllCompactTicks, stopOpTick } from "./live";
+import { settlePiCompact } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -1263,6 +1264,7 @@ describe("compact: defer mid-run + always report", () => {
     jest.useRealTimers();
     stopAllCompactTicks();
     clearAllCompacting();
+    settlePiCompact();
     for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
     queuedAcks.clear();
     pendingInterrupts.clear();
@@ -1540,12 +1542,10 @@ describe("compact: defer mid-run + always report", () => {
       opts = o;
     };
     await handleInbound(pi, inbound("/compact", "m1"), ctx);
-    opts.onError(new Error("Nothing to compact (session too small)"));
+    opts.onError(new Error("LLM request failed: 500"));
     await tick();
     // The tick is armed before the compact starts (post-then-compact), so the settle replaces the placeholder IN PLACE (no fresh post).
-    const failText = machine(
-      "compact failed: Nothing to compact (session too small)",
-    );
+    const failText = machine("compact failed: LLM request failed: 500");
     const edits = fetchCalls.filter(
       (c) => c.method === "PATCH" && c.url.includes("/messages/"),
     );
@@ -1557,6 +1557,65 @@ describe("compact: defer mid-run + always report", () => {
       ),
     ).toBe(true);
     expect(channelPosts().some((t) => t === failText)).toBe(false);
+  });
+
+  test("no-op compact error (pi's by-design guards) posts NO 'compact failed:' line (2026-11-02 #jimmy)", async () => {
+    // The #jimmy 22:53Z incident: a redundant second compact hit pi's 'Already compacted' guard and surfaced as a spurious 'compact failed:' line. These errors are by-design no-ops - the ticking placeholder settles with a neutral line (in place when armed, silent when the placeholder post never landed), never a failure post. All other error texts keep the failure line.
+    const baseFetch = globalThis.fetch as any;
+    let plainPosts = 0;
+    globalThis.fetch = (async (url: any, init?: any) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/channels/ch1/messages")) {
+        plainPosts += 1;
+        if (plainPosts === 1) await new Promise((r) => setTimeout(r, 10));
+      }
+      return baseFetch(url, init);
+    }) as any;
+    const edits = () =>
+      fetchCalls
+        .filter((c) => c.method === "PATCH" && c.url.includes("/messages/"))
+        .map(
+          (c) =>
+            (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content,
+        );
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m1"), ctx);
+    await new Promise((r) => setTimeout(r, 30)); // the placeholder lands, tick armed
+    expect(opts).not.toBeNull();
+    // No-op 1: the prior compact already landed (the #jimmy double-fire).
+    opts.onError(new Error("Already compacted"));
+    await tick();
+    expect(
+      [...channelPosts(), ...edits()].some(
+        (t) => typeof t === "string" && t.includes("compact failed"),
+      ),
+    ).toBe(false);
+    // The armed tick settles IN PLACE with the neutral line - no fresh post.
+    expect(edits().at(-1)).toBe(machine("no change - already compacted"));
+    expect(
+      channelPosts().filter(
+        (t) => t === machine("no change - already compacted"),
+      ),
+    ).toHaveLength(0);
+    // No-op 2 (a fresh /compact; the first onError closed the window): the session is too small.
+    let opts2: any = null;
+    ctx.compact = (o?: any) => {
+      opts2 = o;
+    };
+    await handleInbound(pi, inbound("/compact", "m2"), ctx);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(opts2).not.toBeNull();
+    opts2.onError(new Error("Nothing to compact (session too small)"));
+    await tick();
+    expect(
+      [...channelPosts(), ...edits()].some(
+        (t) => typeof t === "string" && t.includes("compact failed"),
+      ),
+    ).toBe(false);
+    expect(edits().at(-1)).toBe(machine("no change - nothing to compact"));
   });
 
   test("sync throw from ctx.compact is reported, not swallowed", async () => {
@@ -1675,6 +1734,53 @@ describe("compact: defer mid-run + always report", () => {
     );
     await tick();
     expect(opts?.customInstructions).toBe("second");
+  });
+
+  test("manual /compact during an in-flight pi (threshold) compact is skipped; the settle flushes it and a real error still posts the failure line (2026-11-02 #franky)", async () => {
+    // A pi-initiated compact (reason threshold) is in flight: the channel is idle and the op window is NOT open - exactly the window where a manual /compact used to double-fire into pi's in-flight compact (the #franky TypeError class).
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    ctx.isIdle = () => true;
+    handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "threshold" },
+      ctx,
+    );
+    // The manual trigger is skipped (queued behind the in-flight pi compact) - no ctx.compact while the guard is armed.
+    await handleInbound(pi, inbound("/compact the jarate", "m1"), ctx);
+    expect(opts).toBeNull();
+    expect(
+      channelPosts().some((t) =>
+        unwarped(t).includes("[queued] compact (compact already in progress)"),
+      ),
+    ).toBe(true);
+    // The pi compact settles: the guard clears and the queued trigger flushes (its own compact runs with the stored instructions).
+    handlers.session_compact?.(
+      {
+        compactionEntry: {},
+        fromExtension: false,
+        reason: "threshold",
+        willRetry: false,
+      },
+      ctx,
+    );
+    for (let i = 0; i < 20 && !opts; i++) await tick();
+    expect(opts?.customInstructions).toBe("the jarate");
+    // A real error on the flushed compact still posts the failure line (in place on the placeholder, as before the PR).
+    opts.onError(new Error("LLM request failed: 500"));
+    await tick();
+    const failText = machine("compact failed: LLM request failed: 500");
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
+    expect(
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          failText,
+      ),
+    ).toBe(true);
   });
 });
 

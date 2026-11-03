@@ -64,12 +64,15 @@ import {
 } from "./index";
 import { jobsView } from "./jobs";
 import {
+  armCompacting,
   armCompactTick,
   COMPACT_PLACEHOLDER,
   machine,
   postCompactPlaceholder,
+  settleCompactNoOp,
   settleCompactTick,
 } from "./live";
+import { isPiCompactInFlight } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -399,6 +402,7 @@ export async function startCompact(
     if (!settleCompactTick(ch.id, guarded))
       sendDiscordMessage(ch, guarded).catch(() => {});
   };
+  armCompacting(ch); // double-fire guard (2026-11-02 #jimmy): the window flag is armed SYNCHRONOUSLY here, before the placeholder-post await - the agent_settled gate timer fires in that window and must see the flag; the second startCompact was the redundant compact behind the spurious 'Already compacted' failure line
   // Post-then-compact: armed before the compact can run (no orphan).
   const armedMsgId =
     postPlaceholder && ch.type === "discord"
@@ -427,8 +431,9 @@ export async function startCompact(
       },
       onError: (err) => {
         const t = channelError(err);
-        if (t !== null) report(`compact failed: ${t}`);
         clearCompacting(pending.ch.id);
+        if (!settleCompactNoOp(ch.id, t) && t !== null)
+          report(`compact failed: ${t}`);
       },
     });
     beginCompacting(pi, pending.ch, ctx);
@@ -438,6 +443,7 @@ export async function startCompact(
     // A sync throw would leave the armed tick orphaned (render null).
     if (armedMsgId !== null)
       settleCompactTick(ch.id, machine(`compact failed: ${t}`));
+    clearCompacting(ch.id); // the sync-throw early exit must not leave the entry arm (flag) set
     return t;
   }
 }
@@ -939,7 +945,7 @@ export async function runChannelCommand(
         // the second instead of queueing it (F5: name the active op).
         return { immediate: opBusyRefusal(ch.id) };
       }
-      if (!ctx.isIdle()) {
+      if (!ctx.isIdle() || isPiCompactInFlight()) {
         // Run in progress (compact would abort it) or a compaction already
         // in flight: queue it. One slot — a later /compact replaces the
         // earlier. Flushed at agent_end or when the current compaction
@@ -971,7 +977,7 @@ export async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       const instructions = (arg || "").trim() || undefined;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      if (!ctx.isIdle()) {
+      if (!ctx.isIdle() || isPiCompactInFlight()) {
         const replacing = getPendingCompact() !== null;
         setPendingCompact({ ch, instructions });
         const why = agentBusy

@@ -30,6 +30,7 @@ import extension, {
   verboseOverride,
 } from "./index";
 import { machine, stopAllOpTicks } from "./live";
+import { settlePiCompact } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -236,6 +237,7 @@ describe("handoff mechanism B (size-gated restart)", () => {
     (globalThis as any).fetch = realFetch;
     (handlers as any) = {};
     clearAllCompacting();
+    settlePiCompact();
     stopAllOpTicks();
     setHandoffRestartArmed(false);
     process.env.HOME = oldHome;
@@ -629,6 +631,7 @@ describe("restart-class ops (/reset /restart): block + tick + cursor replay", ()
     jest.useRealTimers();
     stopAllOpTicks();
     clearAllCompacting();
+    settlePiCompact();
     clearAllInterrupts();
     resetRuntimeStateForTest(); // no hold/verbose leaks across tests (#84 L2)
     setInterruptCtx(null);

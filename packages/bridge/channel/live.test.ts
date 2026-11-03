@@ -31,6 +31,7 @@ import {
   stopAllOpTicks,
   truncateLiveText,
 } from "./live";
+import { settlePiCompact } from "./pi-compact-guard";
 import { midTurnQueues, queuedAcks, queueMidTurnInbound } from "./queue";
 import type { ChannelMessage } from "./types";
 
@@ -314,6 +315,7 @@ describe("live intermediate text (SPEC B)", () => {
     midTurnQueues.clear();
     pendingAttachments.clear();
     clearAllInterrupts();
+    settlePiCompact();
     setInterruptCtx(null);
     setRuntimeStateDir(null);
     await handlers.agent_end?.({ messages: [] }, ctx);
@@ -675,6 +677,7 @@ describe("#84: placeholder settlement (all exit paths)", () => {
     stopAllOpTicks();
     stopAllCompactTicks();
     clearAllCompacting();
+    settlePiCompact();
     midTurnQueues.clear();
     queuedAcks.clear();
     clearAllInterrupts();

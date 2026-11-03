@@ -113,6 +113,11 @@ import {
 } from "./live";
 import { stripNoReply } from "./no-reply";
 import {
+  armPiCompact,
+  isPiCompactInFlight,
+  settlePiCompact,
+} from "./pi-compact-guard";
+import {
   amnesiaRequeue,
   clearQueuedInbound,
   commitInbound,
@@ -507,7 +512,8 @@ export type OpLabel =
 
 export interface CompactingEntry {
   since: number;
-  timer: ReturnType<typeof setTimeout>;
+  /** Null for the startCompact ENTRY arm (2026-11-02 #jimmy double-fire fix): the flag is armed synchronously before the placeholder-post await; beginCompacting (original position) replaces it with the full window (fallback timer, log). */
+  timer: ReturnType<typeof setTimeout> | null;
   /** Which op owns the window (status display + tick text). */
   label: OpLabel;
   /** Discord cursor captured at window open; restart-class ops rewind to
@@ -587,7 +593,7 @@ export function clearCompacting(channelId: string, warn = false): void {
     persistLivePlaceholders();
     return;
   }
-  clearTimeout(e.timer);
+  if (e.timer) clearTimeout(e.timer);
   compactingChannels.delete(channelId);
   persistLivePlaceholders();
   // F1: window closed = restart-class op cancelled — drop the pending
@@ -2733,6 +2739,7 @@ export default function (pi: ExtensionAPI) {
   // was queued behind the window (no agent_end fires on its own while pi
   // is idle, so queued inbounds would stall otherwise).
   const settleCompacting = async (ctx: ExtensionContext): Promise<void> => {
+    settlePiCompact();
     for (const id of [...compactingChannels.keys()]) clearCompacting(id);
     const started = await flushPendingCompact(ctx);
     if (started) return;
@@ -2786,6 +2793,7 @@ export default function (pi: ExtensionAPI) {
   // deterministic (no LLM call); a throw → undefined → pi falls back to
   // the built-in compact (console.error in the catch below).
   pi.on("session_before_compact", (event, ctx) => {
+    if (event.reason !== "manual") armPiCompact();
     const settings = resolveHandoffSettings(ctx.cwd);
     let percent: number | null = null;
     try {
@@ -3322,15 +3330,11 @@ export async function maybeAutoCompactByToken(
   if (!settings.enabled) return;
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(cwd));
   if (ch?.type !== "discord") return;
-  // A compact/restart op window is open for this channel: let it settle —
-  // its own settle re-runs this gate.
-  if (isCompacting(ch.id)) return;
-  // Handover doc build in flight, or a doc was just written (the fresh
-  // window covers the just-seeded session): don't re-compact.
+  if (isCompacting(ch.id) || isPiCompactInFlight()) return;
+  // Handover doc build in flight, or a doc was just written (the fresh window covers the just-seeded session): don't re-compact.
   if (isHandoffInFlight()) return;
   if (isHandoffFreshWindow(settings.storeDir)) return;
-  // A re-wake run started after agent_end (still active at agent_settled):
-  // let it settle — its own agent_settled re-checks.
+  // A re-wake run started after agent_end (still active at agent_settled): let it settle - its own agent_settled re-checks.
   if (!ctx.isIdle()) return;
   let percent: number | null = null;
   try {
