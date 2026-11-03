@@ -4821,11 +4821,22 @@ describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
 
   test("#306 amnesia: a persisted (answered) commit is NOT re-queued", async () => {
     const sessionFile = path.join(tmp, "session2.jsonl");
-    // The session file HAS the committed id's exact prompt — answered.
+    // The session file HAS the committed id's exact prompt AND the
+    // assistant answer in its turn window (#315: a persisted-but-
+    // UNANSWERED prompt is re-kicked, so the "answered" case needs the
+    // answer entry).
     fs.writeFileSync(
       sessionFile,
-      JSON.stringify({ type: "custom_message", content: "ctx\n\nbody 200" }) +
-        "\n",
+      `${[
+        JSON.stringify({ type: "custom_message", content: "ctx\n\nbody 200" }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "ok 200" }],
+          },
+        }),
+      ].join("\n")}\n`,
     );
     (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
     rewakeCommitDelivered(path.join(tmp, ".tmp"), "ch1", "200", {

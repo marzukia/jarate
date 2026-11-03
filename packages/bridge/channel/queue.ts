@@ -32,6 +32,7 @@ import {
   runtimeStateDir,
 } from "./index";
 import { persistLivePlaceholders } from "./live";
+import { rewakeUnanswered } from "./rekick-queue";
 import {
   buildDeliveredMeta,
   collectRewakeOrphans,
@@ -40,7 +41,6 @@ import {
   rewakeCommitDelivered,
   rewakePending,
   rewakeRemovePending,
-  rewakeUnanswered,
   rewakeUnpersisted,
   rewakeUpdatePendingMsg,
 } from "./restart-queue";

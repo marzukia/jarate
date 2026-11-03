@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  REKICK_MAX_AGE_MS,
+  rewakeUnanswered,
+  scanUnansweredPrompts,
+} from "./rekick-queue";
+import {
   type BgScanChannel,
   collectRewakeOrphans,
   loadRewakeQueue,
@@ -22,11 +27,8 @@ import {
   rewakeQueuePath,
   rewakeRemovePending,
   rewakeSetPendingAck,
-  REKICK_MAX_AGE_MS,
-  rewakeUnanswered,
   rewakeUnpersisted,
   rewakeUpdatePendingMsg,
-  scanUnansweredPrompts,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
@@ -622,7 +624,7 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
     const lines = prompts.map((p) =>
       JSON.stringify({ type: "custom_message", content: p }),
     );
-    fs.writeFileSync(SESSION, lines.join("\n") + "\n");
+    fs.writeFileSync(SESSION, `${lines.join("\n")}\n`);
   };
 
   test("accepted but NOT persisted → re-queued (the amnesia gap)", () => {
@@ -680,7 +682,7 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
     const f = path.join(dir, "s.jsonl");
     fs.writeFileSync(
       f,
-      [
+      `${[
         JSON.stringify({ type: "custom_message", content: "prompt A" }),
         JSON.stringify({
           type: "message",
@@ -695,7 +697,7 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
         }),
         JSON.stringify({ type: "message", message: { role: "assistant" } }),
         "not json",
-      ].join("\n") + "\n",
+      ].join("\n")}\n`,
     );
     const prompts = readSessionPrompts(f);
     expect(prompts.has("prompt A")).toBe(true);
@@ -742,8 +744,13 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
     ...over,
   });
 
-  const cm = (content: string) => JSON.stringify({ type: "custom_message", content });
-  const sys = () => JSON.stringify({ type: "message", message: { role: "system", content: "" } });
+  const cm = (content: string) =>
+    JSON.stringify({ type: "custom_message", content });
+  const sys = () =>
+    JSON.stringify({
+      type: "message",
+      message: { role: "system", content: "" },
+    });
   const asstText = (text: string) =>
     JSON.stringify({
       type: "message",
@@ -752,7 +759,10 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
   const asstThinking = () =>
     JSON.stringify({
       type: "message",
-      message: { role: "assistant", content: [{ type: "thinking", thinking: "..." }] },
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "..." }],
+      },
     });
   const asstToolCall = () =>
     JSON.stringify({
@@ -768,7 +778,7 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
       message: { role: "toolResult", toolName: "bash", content: [] },
     });
   const writeSession = (lines: string[]) =>
-    fs.writeFileSync(SESSION, lines.join("\n") + "\n");
+    fs.writeFileSync(SESSION, `${lines.join("\n")}\n`);
 
   // ── scanUnansweredPrompts ──
 
@@ -831,12 +841,14 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
   });
 
   test("unreadable file -> empty set (conservative, never throws)", () => {
-    expect(scanUnansweredPrompts(path.join(dir, "nope.jsonl"))).toEqual(new Set());
+    expect(scanUnansweredPrompts(path.join(dir, "nope.jsonl"))).toEqual(
+      new Set(),
+    );
   });
 
   test("torn tail line (process died mid-write) is skipped, the rest is scanned", () => {
     const f = path.join(dir, "torn.jsonl");
-    fs.writeFileSync(f, cm("op question 1") + "\n{torn");
+    fs.writeFileSync(f, `${cm("op question 1")}\n{torn`);
     expect(scanUnansweredPrompts(f)).toEqual(new Set(["op question 1"]));
   });
 
@@ -844,11 +856,7 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
 
   test("incident: committed + persisted + unanswered -> re-queued (the gap this closes)", () => {
     rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
-    writeSession([
-      cm("op question 200"),
-      sys(),
-      cm("machine wake"),
-    ]);
+    writeSession([cm("op question 200"), sys(), cm("machine wake")]);
     const out = rewakeUnanswered(dir, "ch1", SESSION, NOW);
     expect(out.map((e) => e.id)).toEqual(["200"]);
     expect(out[0].msg.messageId).toBe("200");
@@ -865,7 +873,9 @@ describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
     writeSession([cm("a different prompt")]);
     expect(rewakeUnanswered(dir, "ch1", SESSION, NOW)).toEqual([]);
     // and the amnesia check still sees it (the two paths partition the gap)
-    expect(rewakeUnpersisted(dir, "ch1", SESSION, NOW).map((e) => e.id)).toEqual(["200"]);
+    expect(
+      rewakeUnpersisted(dir, "ch1", SESSION, NOW).map((e) => e.id),
+    ).toEqual(["200"]);
   });
 
   test("same-file guard: a /new session (different file) re-kicks nothing", () => {

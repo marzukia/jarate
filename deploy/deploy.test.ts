@@ -594,7 +594,7 @@ case "$SCENARIO" in
     # settling mid-wait).
     touch "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
     sleep() {
-      SLEEPCOUNT=\$(( \${SLEEPCOUNT:-0} + 1 ))
+      SLEEPCOUNT=$(( \${SLEEPCOUNT:-0} + 1 ))
       if [[ $SLEEPCOUNT -ge 1 ]]; then touch -d '10 minutes ago' "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"; fi
       return 0
     }
@@ -699,7 +699,11 @@ case "$SCENARIO" in`,
       ),
     );
     const p = spawn(["bash", script, tmp, DEPLOY, "no-sessions"], {
-      env: { ...process.env, HOME: path.join(tmp, "home"), JARATE_IDLE_QUIET_S: "20" },
+      env: {
+        ...process.env,
+        HOME: path.join(tmp, "home"),
+        JARATE_IDLE_QUIET_S: "20",
+      },
     });
     const code = await p.exited;
     const log = fs.readFileSync(path.join(tmp, "hlog"), "utf8");

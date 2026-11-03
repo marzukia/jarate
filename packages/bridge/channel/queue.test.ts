@@ -1288,29 +1288,37 @@ describe("unansweredRequeue (#315: the roll killed a live turn mid-question)", (
     commit("777", PROMPT);
     fs.writeFileSync(
       SESSION,
-      [
+      `${[
         JSON.stringify({ type: "custom_message", content: PROMPT }),
-        JSON.stringify({ type: "message", message: { role: "system", content: "" } }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "system", content: "" },
+        }),
         JSON.stringify({ type: "custom_message", content: "machine wake" }),
-      ].join("\n") + "\n",
+      ].join("\n")}\n`,
     );
     expect(unansweredRequeue(stateDir(), [CH])).toBe(1);
     const f = loadRewakeQueue(stateDir(), "ch1");
     expect(f.pending.map((p) => p.msg.messageId)).toEqual(["777"]);
-    expect(midTurnQueues.get("ch1")?.map((q) => q.msg.messageId)).toEqual(["777"]);
+    expect(midTurnQueues.get("ch1")?.map((q) => q.msg.messageId)).toEqual([
+      "777",
+    ]);
   });
 
   test("answered trigger -> nothing re-queued", () => {
     commit("777", PROMPT);
     fs.writeFileSync(
       SESSION,
-      [
+      `${[
         JSON.stringify({ type: "custom_message", content: PROMPT }),
         JSON.stringify({
           type: "message",
-          message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "answer" }],
+          },
         }),
-      ].join("\n") + "\n",
+      ].join("\n")}\n`,
     );
     expect(unansweredRequeue(stateDir(), [CH])).toBe(0);
     expect(loadRewakeQueue(stateDir(), "ch1").pending).toEqual([]);
@@ -1320,7 +1328,8 @@ describe("unansweredRequeue (#315: the roll killed a live turn mid-question)", (
     commit("777", PROMPT);
     fs.writeFileSync(
       SESSION,
-      [JSON.stringify({ type: "custom_message", content: PROMPT })].join("\n") + "\n",
+      [JSON.stringify({ type: "custom_message", content: PROMPT })].join("\n") +
+        "\n",
     );
     expect(unansweredRequeue(stateDir(), [CH])).toBe(1);
     expect(unansweredRequeue(stateDir(), [CH])).toBe(1); // already pending: file no-op, memory guard

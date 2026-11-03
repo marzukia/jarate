@@ -119,7 +119,6 @@ import {
 } from "./pi-compact-guard";
 import {
   amnesiaRequeue,
-  unansweredRequeue,
   clearQueuedInbound,
   commitInbound,
   consumeQueuedAck,
@@ -131,6 +130,7 @@ import {
   queuedAcks,
   queueMidTurnInbound,
   resolveChannel,
+  unansweredRequeue,
   updateQueuedInbound,
 } from "./queue";
 import { buildRepliedMessageBlock } from "./reply-context";
@@ -1636,10 +1636,7 @@ export default function (pi: ExtensionAPI) {
     if (event?.reason === "startup") {
       drainRewakeSurvival(rewakeStateDir, enabled);
       amnesiaRequeue(rewakeStateDir, enabled);
-      // #315 (incident 2026-11-03): the mirror of the amnesia path — the
-      // prompt IS in the session file but its turn was killed before an
-      // answer. Re-queued entries ride the startup kick below (the
-      // wake-fail direct delivery while the bridge is idle).
+      // #315: mirror of the amnesia path — prompt persisted, turn killed pre-answer.
       unansweredRequeue(rewakeStateDir, enabled);
     } else {
       for (const ch of enabled)
