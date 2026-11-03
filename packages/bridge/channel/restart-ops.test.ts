@@ -323,6 +323,27 @@ describe("handoff mechanism B (size-gated restart)", () => {
     expect(fs.existsSync(markerPath())).toBe(false);
   });
 
+  test("jarate#337: no XDG_RUNTIME_DIR (one-shot worker pi) - the compact settles, no restart op", async () => {
+    // The xdg-isolation test preload SETS XDG_RUNTIME_DIR; the one-shot worker run has none. Delete it for the guard, restore after.
+    writeSettings({ enabled: true, storeDir });
+    fs.writeFileSync(liveFile, "x".repeat(1_572_864)); // 1.5 MB
+    const oldXdg = process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_RUNTIME_DIR;
+    try {
+      await handleInbound(pi, inbound("/compact", "m1"), ctx);
+      handlers.session_compact?.({ type: "session_compact" }, ctx);
+      await waitOpShutdown();
+    } finally {
+      if (oldXdg !== undefined) process.env.XDG_RUNTIME_DIR = oldXdg;
+    }
+    // The op was skipped: no window, no shutdown, no systemd request, no marker, no placeholder post, live file untouched. No F7 death - the run continues on the in-place compact.
+    expect(shutdowns).toBe(0);
+    expect(restarter).toEqual([]);
+    expect(fs.existsSync(liveFile)).toBe(true);
+    expect(fs.existsSync(markerPath())).toBe(false);
+    expect(channelPosts().some((t) => t.includes("handing-off"))).toBe(false);
+  });
+
   test("every compact restarts (issue #85 follow-up): 2.5MB file, no cap check", async () => {
     // The file-size cap is gone: the restart fires on every handoff
     // qualifying compact regardless of file size.
@@ -1937,6 +1958,23 @@ describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
     fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
     armRotationStaleWatch(ctx);
     jest.advanceTimersByTime(5 * 60_000 * 3);
+    expect(posted.length).toBe(0);
+  });
+
+  test("jarate#337: no XDG_RUNTIME_DIR (one-shot worker run) - the tick is skipped even when stale", () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(2000);
+    ctx.cwd = proj;
+    ctx.sessionManager = { getSessionFile: () => liveFile };
+    // live mtime (500) < doc mtime (1000): stale conditions hold, but the one-shot run has no unit rotation to watch and a shared-store doc is a foreign session's. No say, no size flag.
+    const oldXdg = process.env.XDG_RUNTIME_DIR;
+    delete process.env.XDG_RUNTIME_DIR;
+    try {
+      armRotationStaleWatch(ctx);
+      jest.advanceTimersByTime(5 * 60_000);
+    } finally {
+      if (oldXdg !== undefined) process.env.XDG_RUNTIME_DIR = oldXdg;
+    }
     expect(posted.length).toBe(0);
   });
 });

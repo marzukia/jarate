@@ -2,7 +2,7 @@
  * channel/rotation-stale.ts — #315 P0 guard: rotation-stale + live-size
  * watch (deterministic). Split out of restart-ops.ts (size gate, 2026-11).
  *
- * Per-agent tick (armed at session_start, cleared at session_shutdown).
+ * Per-agent tick (armed at session_start, cleared at session_shutdown). Unit-managed pi only (jarate#337, 2026-11-03): without XDG_RUNTIME_DIR the rotation the watch guards can never fire (one-shot worker run), and the shared handoff store makes a foreign session's doc a cross-session false positive - the tick is skipped there.
  * EXACT conditions from issue #315 - nothing else: ROTATION-STALE = a
  * handoff doc written in the last 2 h AND the live session file mtime
  * OLDER than the newest doc mtime (numeric compare, no inference); the
@@ -92,6 +92,8 @@ let rotationStaleSizeNotified = false;
 /** One tick: read the live session file + newest doc mtime, evaluate the
  *  exact #315 conditions, log + say (latched once per episode). */
 function rotationStaleTick(ctx: ExtensionContext): void {
+  // jarate#337: non-unit pi (one-shot worker run) - the rotation can never fire here, and the shared store cross-session-false-positives. Skip.
+  if (!process.env.XDG_RUNTIME_DIR) return;
   const settings = resolveHandoffSettings(ctx.cwd);
   let live: string | null = null;
   try {

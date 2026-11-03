@@ -2,6 +2,16 @@
 
 Notable changes to the jarate stack (pi + piscord bridge). Newest first.
 
+## 2026-11-03 — one-shot work-run pi no longer dies at the 80% context handoff (#337)
+
+A fleet work-run pi (one-shot, launched by run-wrapper.sh as the agent user, no XDG_RUNTIME_DIR in the env) hit the 80% auto-compact and ran the discord-pi restart-into-fresh-session op. That op only completes where systemd can respawn the process (a user unit); a one-shot run has no unit, so the 15s watchdog fired and F7 `process.exit(1)` killed the run at 80% context (t1510, t1527 - both janky atkspeed, 2026-11-03), posting `handing-off...` + `restart failed - check unit pi.service` to the agent channel each time.
+
+- `maybeHandoffRestart` (channel/restart-ops.ts): the restart op is skipped when XDG_RUNTIME_DIR is unset - the in-place compact stands, no op window, no watchdog, no F7 death, no channel post. Unit-managed pi (XDG set) is unchanged. Single env-var condition, no inference in the enforcement path.
+- `rotationStaleTick` (channel/rotation-stale.ts): the #315 watch is skipped under the same condition - the rotation it guards can never fire there, and the shared `~/.jarate/handovers` store made a foreign session's doc a cross-session false positive (the #janky ROTATION-STALE spam).
+- Tests: both guards covered in channel/restart-ops.test.ts (the xdg-isolation preload sets XDG; the tests delete + restore it).
+
+Deploy: the per-agent jarate-deploy timer fetches main + health-gates + auto-rolls back, so merge = live.
+
 ## 2026-10-24 — watchdog split: `dispatch/jarate-bg-watchdog` is gone (#280)
 
 The ~2,432-line watchdog left in three slices (the remove-centralise

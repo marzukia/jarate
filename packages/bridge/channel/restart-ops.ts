@@ -576,6 +576,13 @@ export async function maybeHandoffRestart(
 ): Promise<void> {
   const settings = resolveHandoffSettings(ctx.cwd);
   if (!settings.enabled) return;
+  // jarate#337 (P0, 2026-11-03 janky work-run class, t1510/t1527): the restart-into-fresh-session op only completes where systemd can respawn the process (a systemd user unit with XDG_RUNTIME_DIR in the env); a one-shot worker pi (run-wrapper.sh, no XDG) has no unit to restart, so the op window opens, the 15s watchdog fires, and F7 exit(1) kills the run at 80% context. Skip the op: pi's in-place compact stands, the run continues. Unit-managed pi (XDG set) is unchanged.
+  if (!process.env.XDG_RUNTIME_DIR) {
+    console.log(
+      "[handoff] no XDG_RUNTIME_DIR - not under a systemd user unit; the restart op cannot complete here (one-shot run). Skipping; the in-place compact stands (jarate#337)",
+    );
+    return;
+  }
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
   if (ch?.type !== "discord") return;
   // A settle-flushed /compact re-opened the window (label "compacting"):
