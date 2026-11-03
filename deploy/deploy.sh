@@ -166,6 +166,57 @@ rollback() {
   exit 2
 }
 
+# --- idle boundary (#315, incident 2026-11-03 lane janky) -------------------
+#
+# The 11:41:57 self-roll restarted pi.service 62s into a live turn the op
+# had just triggered; the turn died and the op's question sat unanswered
+# until a manual wake. A roll must not restart a lane mid-turn: wait for
+# an idle boundary — the newest session file must be QUIET for
+# JARATE_IDLE_QUIET_S. pi appends to the session file per message_end
+# (verified: dist/core/session-manager.js _persist -> appendFileSync on
+# message_end), so a live turn writes constantly; the only quiet stretch
+# inside a live turn is a single long LLM generation, which is why the
+# quiet window is generous (120s). Bounded: after JARATE_IDLE_WAIT_S the
+# roll proceeds anyway (a stuck agent must not block deploys forever —
+# the bridge-side #315 re-kick recovers any message a late kill still
+# loses). --force skips the wait entirely (the operator's override path).
+# Best-effort: no session files or an unreadable tree = no signal, and a
+# missing signal must never block a deploy.
+IDLE_QUIET_S="${JARATE_IDLE_QUIET_S:-120}"
+IDLE_WAIT_S="${JARATE_IDLE_WAIT_S:-600}"
+IDLE_POLL_S="${JARATE_IDLE_POLL_S:-15}"
+
+wait_idle_boundary() {
+  if [[ $FORCE -eq 1 ]]; then
+    log "idle wait: skipped (--force)"
+    return 0
+  fi
+  local sessions="$HOME/.pi/agent/sessions"
+  local deadline=$(( $(date +%s) + IDLE_WAIT_S ))
+  local quiet=0
+  while :; do
+    # Newest non-archived session file across the lane's cwds
+    # (sessions/<cwd-dir>/*.jsonl; *.reset-* are rotation archives).
+    local newest mts
+    newest="$(find "$sessions" -maxdepth 2 -type f -name '*.jsonl' ! -name '*.reset-*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+    if [[ -z "$newest" ]]; then
+      log "idle boundary: no session files; restarting"
+      return 0
+    fi
+    mts="$(stat -c %Y "$newest" 2>/dev/null || echo 0)"
+    quiet=$(( $(date +%s) - mts ))
+    if (( quiet >= IDLE_QUIET_S )); then
+      log "idle boundary: last session write ${quiet}s ago (>= ${IDLE_QUIET_S}s); restarting"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      log "idle wait: lane still active after ${IDLE_WAIT_S}s (last write ${quiet}s ago); restarting anyway"
+      return 0
+    fi
+    sleep "$IDLE_POLL_S"
+  done
+}
+
 # --- liveness (#319 guard 1: decoupled from the commit backoff) -------------
 #
 # Runs EVERY tick, before any exit that would skip the rest of the tick. Best-effort: a liveness failure must never kill the tick.
@@ -318,6 +369,12 @@ main() {
   bun run typecheck || die "pre-deploy typecheck failed"
   bun run test || die "pre-deploy tests failed"
 
+  # #315: do not restart the lane mid-turn (the 2026-11-03 11:41:57 roll
+  # killed a live turn 62s in; the op's question was lost until a manual
+  # wake). Bounded wait; --force skips. The rollback stop below needs no
+  # wait: the initial stop already settled the turn (or is about to), and
+  # the rollback runs seconds later on a booting process.
+  wait_idle_boundary
   # stop -> since -> start (not restart): the old process can re-log
   # '[interactions]' lines while shutting down, which would be a stale ready
   # signal inside the gate window. systemctl stop returns after exit, so the

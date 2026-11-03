@@ -22,8 +22,11 @@ import {
   rewakeQueuePath,
   rewakeRemovePending,
   rewakeSetPendingAck,
+  REKICK_MAX_AGE_MS,
+  rewakeUnanswered,
   rewakeUnpersisted,
   rewakeUpdatePendingMsg,
+  scanUnansweredPrompts,
   saveRewakeQueue,
   scanUndeliveredBgInbounds,
 } from "./restart-queue";
@@ -710,5 +713,184 @@ describe("restart-queue #306 amnesia (accepted-but-unpersisted)", () => {
       NOW,
     );
     expect(out).toEqual([]);
+  });
+});
+
+// ─── #315 (incident 2026-11-03): delivered-but-unanswered re-kick ─────────
+
+describe("restart-queue #315 re-kick (delivered-but-unanswered)", () => {
+  let dir: string;
+  let SESSION = "";
+  const NOW = Date.parse("2026-11-03T01:00:00Z");
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-rekick-"));
+    SESSION = path.join(dir, "session-rekick.jsonl");
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const meta = (
+    id: string,
+    over: Partial<import("./restart-queue").DeliveredMeta> = {},
+  ): import("./restart-queue").DeliveredMeta => ({
+    prompt: `op question ${id}`,
+    msg: msg(id),
+    at: NOW,
+    sf: SESSION,
+    ...over,
+  });
+
+  const cm = (content: string) => JSON.stringify({ type: "custom_message", content });
+  const sys = () => JSON.stringify({ type: "message", message: { role: "system", content: "" } });
+  const asstText = (text: string) =>
+    JSON.stringify({
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    });
+  const asstThinking = () =>
+    JSON.stringify({
+      type: "message",
+      message: { role: "assistant", content: [{ type: "thinking", thinking: "..." }] },
+    });
+  const asstToolCall = () =>
+    JSON.stringify({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }],
+      },
+    });
+  const toolRes = () =>
+    JSON.stringify({
+      type: "message",
+      message: { role: "toolResult", toolName: "bash", content: [] },
+    });
+  const writeSession = (lines: string[]) =>
+    fs.writeFileSync(SESSION, lines.join("\n") + "\n");
+
+  // ── scanUnansweredPrompts ──
+
+  test("incident shape: prompt, then system, then next inbound, no answer -> unanswered", () => {
+    writeSession([
+      cm("op question 1"), // the killed turn's trigger
+      sys(),
+      cm("machine wake"), // next inbound after the restart
+      asstText("wake answer"),
+    ]);
+    expect(scanUnansweredPrompts(SESSION)).toEqual(new Set(["op question 1"]));
+  });
+
+  test("prompt with a settled assistant answer -> answered", () => {
+    writeSession([cm("op question 1"), asstText("here is the answer")]);
+    expect(scanUnansweredPrompts(SESSION)).toEqual(new Set());
+  });
+
+  test("thinking-only assistant after the prompt (killed mid-thinking) -> unanswered", () => {
+    writeSession([cm("op question 1"), asstThinking()]);
+    expect(scanUnansweredPrompts(SESSION)).toEqual(new Set(["op question 1"]));
+  });
+
+  test("toolCall-only assistant (killed mid-tools, no final text) -> unanswered", () => {
+    writeSession([cm("op question 1"), asstToolCall(), toolRes()]);
+    expect(scanUnansweredPrompts(SESSION)).toEqual(new Set(["op question 1"]));
+  });
+
+  test("answer to a LATER inbound does not count (window ends at the next inbound)", () => {
+    writeSession([
+      cm("op question 1"),
+      cm("machine wake"),
+      asstText("only the wake was answered"),
+    ]);
+    expect(scanUnansweredPrompts(SESSION)).toEqual(new Set(["op question 1"]));
+  });
+
+  test("re-kick loop terminates: first occurrence unanswered, LAST answered -> answered", () => {
+    writeSession([
+      cm("op question 1"), // original, turn killed
+      cm("machine wake"),
+      cm("op question 1"), // the re-kick redelivery
+      asstText("answered on the re-kick turn"),
+    ]);
+    const out = scanUnansweredPrompts(SESSION);
+    expect(out.has("op question 1")).toBe(false); // the LAST occurrence was answered
+    expect(out.has("machine wake")).toBe(true); // ...its own window (empty here) stays unanswered
+  });
+
+  test("last occurrence unanswered -> unanswered even if an earlier one was answered", () => {
+    writeSession([
+      cm("op question 1"),
+      asstText("first answer"),
+      cm("machine wake"),
+      cm("op question 1"), // redelivered, turn killed again
+    ]);
+    const out = scanUnansweredPrompts(SESSION);
+    expect(out.has("op question 1")).toBe(true); // the killed REDelivery is the open question
+    expect(out.has("machine wake")).toBe(true);
+  });
+
+  test("unreadable file -> empty set (conservative, never throws)", () => {
+    expect(scanUnansweredPrompts(path.join(dir, "nope.jsonl"))).toEqual(new Set());
+  });
+
+  test("torn tail line (process died mid-write) is skipped, the rest is scanned", () => {
+    const f = path.join(dir, "torn.jsonl");
+    fs.writeFileSync(f, cm("op question 1") + "\n{torn");
+    expect(scanUnansweredPrompts(f)).toEqual(new Set(["op question 1"]));
+  });
+
+  // ── rewakeUnanswered ──
+
+  test("incident: committed + persisted + unanswered -> re-queued (the gap this closes)", () => {
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
+    writeSession([
+      cm("op question 200"),
+      sys(),
+      cm("machine wake"),
+    ]);
+    const out = rewakeUnanswered(dir, "ch1", SESSION, NOW);
+    expect(out.map((e) => e.id)).toEqual(["200"]);
+    expect(out[0].msg.messageId).toBe("200");
+  });
+
+  test("committed + persisted + ANSWERED -> not re-queued", () => {
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
+    writeSession([cm("op question 200"), asstText("done")]);
+    expect(rewakeUnanswered(dir, "ch1", SESSION, NOW)).toEqual([]);
+  });
+
+  test("committed but NOT persisted -> not here (the amnesia path owns that gap)", () => {
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
+    writeSession([cm("a different prompt")]);
+    expect(rewakeUnanswered(dir, "ch1", SESSION, NOW)).toEqual([]);
+    // and the amnesia check still sees it (the two paths partition the gap)
+    expect(rewakeUnpersisted(dir, "ch1", SESSION, NOW).map((e) => e.id)).toEqual(["200"]);
+  });
+
+  test("same-file guard: a /new session (different file) re-kicks nothing", () => {
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
+    writeSession([]);
+    expect(
+      rewakeUnanswered(dir, "ch1", path.join(dir, "session-NEW.jsonl"), NOW),
+    ).toEqual([]);
+  });
+
+  test(`age guard: a commit older than ${REKICK_MAX_AGE_MS / 60000}m is not re-kicked`, () => {
+    const stale = NOW - (REKICK_MAX_AGE_MS + 60_000);
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200", { at: stale }));
+    writeSession([cm("op question 200")]);
+    expect(rewakeUnanswered(dir, "ch1", SESSION, NOW)).toEqual([]);
+  });
+
+  test("no commit metadata (pre-field file) -> nothing to check", () => {
+    rewakeCommitDelivered(dir, "ch1", "200");
+    writeSession([cm("op question 200")]);
+    expect(rewakeUnanswered(dir, "ch1", SESSION, NOW)).toEqual([]);
+  });
+
+  test("no session file (unknown) -> no re-kick (conservative)", () => {
+    rewakeCommitDelivered(dir, "ch1", "200", meta("200"));
+    expect(rewakeUnanswered(dir, "ch1", null, NOW)).toEqual([]);
   });
 });

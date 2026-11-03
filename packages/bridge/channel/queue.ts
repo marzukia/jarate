@@ -40,6 +40,7 @@ import {
   rewakeCommitDelivered,
   rewakePending,
   rewakeRemovePending,
+  rewakeUnanswered,
   rewakeUnpersisted,
   rewakeUpdatePendingMsg,
 } from "./restart-queue";
@@ -479,6 +480,41 @@ export function amnesiaRequeue(
   if (n > 0)
     console.log(
       `[channel] #306 amnesia: re-queued ${n} committed-but-unpersisted inbound(s)`,
+    );
+  return n;
+}
+
+/** #315 (incident 2026-11-03): re-queue delivered-but-unanswered inbounds
+ *  at a real process start — the mirror of amnesiaRequeue's
+ *  accepted-but-unpersisted path. The 11:41:57 roll killed a live turn
+ *  62s into the op's question: the prompt was persisted to the session
+ *  file, the delivered set said done, no answer followed, and the agent
+ *  idled out (the #306 flag fired report-only; the startup kick found
+ *  .pending empty). The re-queued entry is picked up by the EXISTING
+ *  startup kick (the wake-fail direct delivery while the bridge is
+ *  idle) or the next agent_end re-wake — no new delivery path. */
+export function unansweredRequeue(
+  stateDir: string,
+  channels: ChannelConfig[],
+): number {
+  const sessionFile = getCurrentSessionFile();
+  let n = 0;
+  for (const ch of channels) {
+    if (ch.type !== "discord") continue;
+    const unanswered = rewakeUnanswered(stateDir, ch.id, sessionFile);
+    if (unanswered.length === 0) continue;
+    const q = midTurnQueues.get(ch.id) ?? [];
+    for (const e of unanswered) {
+      rewakeAddPending(stateDir, ch.id, { msg: e.msg, queuedAt: e.at });
+      if (!q.some((x) => x.msg.messageId === e.msg.messageId))
+        q.push({ msg: e.msg, queuedAt: e.at });
+    }
+    midTurnQueues.set(ch.id, q);
+    n += unanswered.length;
+  }
+  if (n > 0)
+    console.log(
+      `[channel] #315 re-kick: re-queued ${n} delivered-but-unanswered inbound(s)`,
     );
   return n;
 }
