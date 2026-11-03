@@ -377,20 +377,7 @@ export async function postCompactPlaceholder(
   return result?.success && result.messageId ? result.messageId : null;
 }
 
-/**
- * Synchronous op-window flag arm (2026-11-02 #jimmy double-fire fix):
- * startCompact calls this at entry, BEFORE the first await (the
- * placeholder post), so the second gate check — agent_end AND
- * agent_settled both arm one 0ms timer per settled turn — sees the
- * flag and bails instead of running a second ctx.compact() (whose
- * 'Already compacted' / 'Nothing to compact' no-op surfaced as a
- * spurious 'compact failed:' line, and whose leading this.abort()
- * could kill a re-wake run). beginCompacting keeps its original
- * position (the full window: 10-min fallback timer + log); its
- * leading clearCompacting consumes this partial (timer-less) entry
- * and opens the real one. The entry arm must be cleared on the
- * startCompact sync-throw path (clearCompacting in the catch).
- */
+/** Synchronous op-window flag arm (2026-11-02 #jimmy double-fire fix): startCompact calls this at entry, BEFORE the first await (the placeholder post), so the second gate check - agent_end AND agent_settled both arm one 0ms timer per settled turn - sees the flag and bails instead of running a second ctx.compact() (whose 'Already compacted' / 'Nothing to compact' no-op surfaced as a spurious 'compact failed:' line, and whose leading this.abort() could kill a re-wake run). beginCompacting keeps its original position (the full window: 10-min fallback timer + log); its leading clearCompacting consumes this partial (timer-less) entry and opens the real one. The entry arm must be cleared on the startCompact sync-throw path (clearCompacting in the catch). */
 export function armCompacting(ch: ChannelConfig): void {
   if (compactingChannels.has(ch.id)) return;
   compactingChannels.set(ch.id, {
@@ -409,14 +396,7 @@ const COMPACT_NOOP_LINES: Record<string, string> = {
   "Nothing to compact (session too small)": "no change - nothing to compact",
 };
 
-/**
- * Settle the compact tick for a by-design no-op error (2026-11-02
- * #jimmy double-fire): the armed tick settles with the neutral line
- * in place (silent when the placeholder post never landed) and NO
- * 'compact failed:' line is ever posted. Returns true when the text
- * is a known no-op (the caller then skips the failure report); false
- * for aborts (null) and real failures (the caller reports those).
- */
+/** Settle the compact tick for a by-design no-op error (2026-11-02 #jimmy double-fire): the armed tick settles with the neutral line in place (silent when the placeholder post never landed) and NO 'compact failed:' line is ever posted. Returns true when the text is a known no-op (the caller then skips the failure report); false for aborts (null) and real failures (the caller reports those). */
 export function settleCompactNoOp(
   channelId: string,
   t: string | null,

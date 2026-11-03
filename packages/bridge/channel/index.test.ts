@@ -50,6 +50,11 @@ import extension, {
 } from "./index";
 import { machine, opTicks, settleOpTick, stopAllOpTicks } from "./live";
 import {
+  isPiCompactInFlight,
+  PI_COMPACT_STALE_MS,
+  settlePiCompact,
+} from "./pi-compact-guard";
+import {
   clearQueuedInbound,
   midTurnQueues,
   queuedAcks,
@@ -4153,6 +4158,7 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     (globalThis as any).fetch = realFetch;
     (handlers as any) = {};
     clearAllCompacting();
+    settlePiCompact();
     stopAllOpTicks();
     process.env.HOME = oldHome;
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -4206,13 +4212,7 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
   });
 
   test("double-fire with a SLOW placeholder post: the entry-arm flag bails the agent_settled gate (2026-11-02 #jimmy)", async () => {
-    // The 2026-11-02 22:53Z incident: the placeholder post is a real
-    // Discord post in flight, so the agent_settled 0ms gate timer fires
-    // while startCompact#1 has NOT yet armed the window. Pre-fix both
-    // gates passed and both compacts ran - the second hit pi's
-    // 'Already compacted' by-design no-op and surfaced as a spurious
-    // 'compact failed:' line. The window flag is now armed
-    // synchronously at startCompact entry, before the post await.
+    // The 2026-11-02 22:53Z incident: the placeholder post is a real Discord post in flight, so the agent_settled 0ms gate timer fires while startCompact#1 has NOT yet armed the window. Pre-fix both gates passed and both compacts ran - the second hit pi's 'Already compacted' by-design no-op and surfaced as a spurious 'compact failed:' line. The window flag is now armed synchronously at startCompact entry, before the post await.
     const baseFetch = (globalThis as any).fetch;
     let plainPosts = 0;
     const release: { fn?: () => void } = {};
@@ -4352,6 +4352,74 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     }
     expect(rejections).toEqual([]);
     expect(isCompacting("ch1")).toBe(false);
+  });
+
+  test("pi-compact guard: armed on session_before_compact (reason != manual), settled by session_compact AND session_compact_failed; manual does not arm (2026-11-02 #franky)", async () => {
+    // A manual compact is owned by startCompact's own op window: no arm.
+    await handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "manual" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(false);
+    // A pi-initiated compact (threshold) arms the guard.
+    await handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "threshold" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(true);
+    // session_compact settles it.
+    handlers.session_compact?.(
+      { type: "session_compact", reason: "threshold" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(false);
+    // Armed again (overflow); session_compact_failed settles it too - an aborted pi compact settles through the failed event.
+    await handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "overflow" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(true);
+    handlers.session_compact_failed?.(
+      { type: "session_compact_failed", reason: "overflow", aborted: true },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(false);
+  });
+
+  test("token gate yields to an in-flight pi-initiated compact; the settle re-runs it (2026-11-02 #franky)", async () => {
+    // A pi-initiated compact (threshold) is in flight: the channel is idle and the token % is over the threshold - pre-fix the settled-turn gate double-fired into pi's in-flight compact.
+    await handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "threshold" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(true);
+    ctx.isIdle = () => true;
+    // The gate bails at the guard - no compact window, no placeholder.
+    await maybeAutoCompactByToken(pi, ctx);
+    expect(isCompacting("ch1")).toBe(false);
+    expect(compactPosts()).toHaveLength(0);
+    // The settle clears the guard; the same shot then fires normally.
+    handlers.session_compact?.(
+      { type: "session_compact", reason: "threshold" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(false);
+    await maybeAutoCompactByToken(pi, ctx);
+    expect(isCompacting("ch1")).toBe(true);
+  });
+
+  test("pi-compact guard: the armed flag clears on the bounded stale window when no settle event arrives (crash mid-compact; no leak)", async () => {
+    jest.useFakeTimers();
+    await handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "overflow" },
+      ctx,
+    );
+    expect(isPiCompactInFlight()).toBe(true);
+    // No settle event ever arrives (the process died mid-compact): the flag self-clears on the bounded timeout instead of leaking.
+    jest.advanceTimersByTime(PI_COMPACT_STALE_MS);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(isPiCompactInFlight()).toBe(false);
+    jest.useRealTimers();
   });
 });
 
@@ -4720,10 +4788,10 @@ describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
     const sessionFile = path.join(tmp, "session.jsonl");
     fs.writeFileSync(
       sessionFile,
-      JSON.stringify({
+      `${JSON.stringify({
         type: "custom_message",
         content: "ctx\n\nsome other body",
-      }) + "\n",
+      })}\n`,
     );
     (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
     // A delivered id committed against THIS session file, with metadata.

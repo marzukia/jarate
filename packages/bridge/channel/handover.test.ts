@@ -68,6 +68,7 @@ import {
   tagLastSentMissing,
 } from "./last-sent";
 import { stopAllOpTicks } from "./live";
+import { settlePiCompact } from "./pi-compact-guard";
 import { setSystemdRestartHookForTest } from "./restart-ops";
 import { renderBoard, saveBoard, type Todo } from "./todos";
 import type { ChannelMessage } from "./types";
@@ -2139,6 +2140,7 @@ describe("session_before_compact wiring", () => {
     setHandoffRestartArmed(false);
     stopAllOpTicks();
     clearAllCompacting();
+    settlePiCompact();
     clearDiscordStatesForTest();
     process.env.HOME = oldHome;
     globalThis.fetch = realFetch;
@@ -2441,6 +2443,7 @@ describe("auto-compact token-% gate", () => {
     setHandoffRestartArmed(false);
     stopAllOpTicks();
     clearAllCompacting();
+    settlePiCompact();
     clearDiscordStatesForTest();
     process.env.HOME = oldHome;
     globalThis.fetch = realFetch;

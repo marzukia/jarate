@@ -39,6 +39,7 @@ import extension, {
   verboseOverride,
 } from "./index";
 import { machine, opTicks, stopAllCompactTicks, stopOpTick } from "./live";
+import { settlePiCompact } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -1263,6 +1264,7 @@ describe("compact: defer mid-run + always report", () => {
     jest.useRealTimers();
     stopAllCompactTicks();
     clearAllCompacting();
+    settlePiCompact();
     for (const id of [...midTurnQueues.keys()]) clearQueuedInbound(id);
     queuedAcks.clear();
     pendingInterrupts.clear();
@@ -1558,12 +1560,7 @@ describe("compact: defer mid-run + always report", () => {
   });
 
   test("no-op compact error (pi's by-design guards) posts NO 'compact failed:' line (2026-11-02 #jimmy)", async () => {
-    // The #jimmy 22:53Z incident: a redundant second compact hit pi's
-    // 'Already compacted' guard and surfaced as a spurious 'compact
-    // failed:' line. These errors are by-design no-ops - the ticking
-    // placeholder settles with a neutral line (in place when armed,
-    // silent when the placeholder post never landed), never a
-    // failure post. All other error texts keep the failure line.
+    // The #jimmy 22:53Z incident: a redundant second compact hit pi's 'Already compacted' guard and surfaced as a spurious 'compact failed:' line. These errors are by-design no-ops - the ticking placeholder settles with a neutral line (in place when armed, silent when the placeholder post never landed), never a failure post. All other error texts keep the failure line.
     const baseFetch = globalThis.fetch as any;
     let plainPosts = 0;
     globalThis.fetch = (async (url: any, init?: any) => {
@@ -1738,6 +1735,53 @@ describe("compact: defer mid-run + always report", () => {
     );
     await tick();
     expect(opts?.customInstructions).toBe("second");
+  });
+
+  test("manual /compact during an in-flight pi (threshold) compact is skipped; the settle flushes it and a real error still posts the failure line (2026-11-02 #franky)", async () => {
+    // A pi-initiated compact (reason threshold) is in flight: the channel is idle and the op window is NOT open - exactly the window where a manual /compact used to double-fire into pi's in-flight compact (the #franky TypeError class).
+    let opts: any = null;
+    ctx.compact = (o?: any) => {
+      opts = o;
+    };
+    ctx.isIdle = () => true;
+    handlers.session_before_compact?.(
+      { type: "session_before_compact", reason: "threshold" },
+      ctx,
+    );
+    // The manual trigger is skipped (queued behind the in-flight pi compact) - no ctx.compact while the guard is armed.
+    await handleInbound(pi, inbound("/compact the jarate", "m1"), ctx);
+    expect(opts).toBeNull();
+    expect(
+      channelPosts().some((t) =>
+        unwarped(t).includes("[queued] compact (compact already in progress)"),
+      ),
+    ).toBe(true);
+    // The pi compact settles: the guard clears and the queued trigger flushes (its own compact runs with the stored instructions).
+    handlers.session_compact?.(
+      {
+        compactionEntry: {},
+        fromExtension: false,
+        reason: "threshold",
+        willRetry: false,
+      },
+      ctx,
+    );
+    for (let i = 0; i < 20 && !opts; i++) await tick();
+    expect(opts?.customInstructions).toBe("the jarate");
+    // A real error on the flushed compact still posts the failure line (in place on the placeholder, as before the PR).
+    opts.onError(new Error("LLM request failed: 500"));
+    await tick();
+    const failText = machine("compact failed: LLM request failed: 500");
+    const edits = fetchCalls.filter(
+      (c) => c.method === "PATCH" && c.url.includes("/messages/"),
+    );
+    expect(
+      edits.some(
+        (c) =>
+          (typeof c.body === "string" ? JSON.parse(c.body) : c.body).content ===
+          failText,
+      ),
+    ).toBe(true);
   });
 });
 

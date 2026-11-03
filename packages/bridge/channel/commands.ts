@@ -72,6 +72,7 @@ import {
   settleCompactNoOp,
   settleCompactTick,
 } from "./live";
+import { isPiCompactInFlight } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
   midTurnQueues,
@@ -944,7 +945,7 @@ export async function runChannelCommand(
         // the second instead of queueing it (F5: name the active op).
         return { immediate: opBusyRefusal(ch.id) };
       }
-      if (!ctx.isIdle()) {
+      if (!ctx.isIdle() || isPiCompactInFlight()) {
         // Run in progress (compact would abort it) or a compaction already
         // in flight: queue it. One slot — a later /compact replaces the
         // earlier. Flushed at agent_end or when the current compaction
@@ -976,7 +977,7 @@ export async function runChannelCommand(
       if (!isOwner) return ownerOnly;
       const instructions = (arg || "").trim() || undefined;
       if (isCompacting(ch.id)) return { immediate: opBusyRefusal(ch.id) };
-      if (!ctx.isIdle()) {
+      if (!ctx.isIdle() || isPiCompactInFlight()) {
         const replacing = getPendingCompact() !== null;
         setPendingCompact({ ch, instructions });
         const why = agentBusy

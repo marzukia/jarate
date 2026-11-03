@@ -113,6 +113,11 @@ import {
 } from "./live";
 import { stripNoReply } from "./no-reply";
 import {
+  armPiCompact,
+  isPiCompactInFlight,
+  settlePiCompact,
+} from "./pi-compact-guard";
+import {
   amnesiaRequeue,
   clearQueuedInbound,
   commitInbound,
@@ -2737,6 +2742,7 @@ export default function (pi: ExtensionAPI) {
   // was queued behind the window (no agent_end fires on its own while pi
   // is idle, so queued inbounds would stall otherwise).
   const settleCompacting = async (ctx: ExtensionContext): Promise<void> => {
+    settlePiCompact();
     for (const id of [...compactingChannels.keys()]) clearCompacting(id);
     const started = await flushPendingCompact(ctx);
     if (started) return;
@@ -2790,6 +2796,7 @@ export default function (pi: ExtensionAPI) {
   // deterministic (no LLM call); a throw → undefined → pi falls back to
   // the built-in compact (console.error in the catch below).
   pi.on("session_before_compact", (event, ctx) => {
+    if (event.reason !== "manual") armPiCompact();
     const settings = resolveHandoffSettings(ctx.cwd);
     let percent: number | null = null;
     try {
@@ -3326,15 +3333,11 @@ export async function maybeAutoCompactByToken(
   if (!settings.enabled) return;
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(cwd));
   if (ch?.type !== "discord") return;
-  // A compact/restart op window is open for this channel: let it settle —
-  // its own settle re-runs this gate.
-  if (isCompacting(ch.id)) return;
-  // Handover doc build in flight, or a doc was just written (the fresh
-  // window covers the just-seeded session): don't re-compact.
+  if (isCompacting(ch.id) || isPiCompactInFlight()) return;
+  // Handover doc build in flight, or a doc was just written (the fresh window covers the just-seeded session): don't re-compact.
   if (isHandoffInFlight()) return;
   if (isHandoffFreshWindow(settings.storeDir)) return;
-  // A re-wake run started after agent_end (still active at agent_settled):
-  // let it settle — its own agent_settled re-checks.
+  // A re-wake run started after agent_end (still active at agent_settled): let it settle - its own agent_settled re-checks.
   if (!ctx.isIdle()) return;
   let percent: number | null = null;
   try {
