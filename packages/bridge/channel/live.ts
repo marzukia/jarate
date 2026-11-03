@@ -388,9 +388,7 @@ export function armCompacting(ch: ChannelConfig): void {
   });
 }
 
-/** By-design no-op compact errors (pi's own guards, 2026-11-02 #jimmy
- *  incident): the error is the expected state, not a failure. Keyed
- *  on the channelError first-line text of pi's Error message. */
+/** By-design no-op compact errors (pi's own guards, 2026-11-02 #jimmy incident): the error is the expected state, not a failure. Keyed on the channelError first-line text of pi's Error message. */
 const COMPACT_NOOP_LINES: Record<string, string> = {
   "Already compacted": "no change - already compacted",
   "Nothing to compact (session too small)": "no change - nothing to compact",

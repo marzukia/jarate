@@ -512,10 +512,7 @@ export type OpLabel =
 
 export interface CompactingEntry {
   since: number;
-  /** Null for the startCompact ENTRY arm (2026-11-02 #jimmy
-   *  double-fire fix): the flag is armed synchronously before the
-   *  placeholder-post await; beginCompacting (original position)
-   *  replaces it with the full window (fallback timer, log). */
+  /** Null for the startCompact ENTRY arm (2026-11-02 #jimmy double-fire fix): the flag is armed synchronously before the placeholder-post await; beginCompacting (original position) replaces it with the full window (fallback timer, log). */
   timer: ReturnType<typeof setTimeout> | null;
   /** Which op owns the window (status display + tick text). */
   label: OpLabel;

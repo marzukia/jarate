@@ -4229,14 +4229,12 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
       compactCalls += 1;
     };
     ctx.isIdle = () => true;
-    // First shot (agent_end): the gate passes, startCompact#1 begins -
-    // the flag is armed NOW, the placeholder post is still held.
+    // First shot (agent_end): the gate passes, startCompact#1 begins - the flag is armed NOW, the placeholder post is still held.
     await handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx);
     await tick();
     expect(isCompacting("ch1")).toBe(true); // entry arm, post in flight
     expect(compactCalls).toBe(0); // ctx.compact waits for the post
-    // Second shot (agent_settled, the reliable one): the gate must see
-    // the flag and bail - no second startCompact, no second compact.
+    // Second shot (agent_settled, the reliable one): the gate must see the flag and bail - no second startCompact, no second compact.
     await handlers.agent_settled?.({ type: "agent_settled" }, ctx);
     await tick();
     expect(compactCalls).toBe(0); // bailed at the gate

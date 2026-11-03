@@ -1600,8 +1600,7 @@ describe("compact: defer mid-run + always report", () => {
         (t) => t === machine("no change - already compacted"),
       ),
     ).toHaveLength(0);
-    // No-op 2 (a fresh /compact; the first onError closed the window):
-    // the session is too small.
+    // No-op 2 (a fresh /compact; the first onError closed the window): the session is too small.
     let opts2: any = null;
     ctx.compact = (o?: any) => {
       opts2 = o;
