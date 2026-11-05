@@ -9,11 +9,19 @@
  * their top-level entry `id`; entries with missing or all-zero usage are
  * skipped; a partial last line (live jsonl still being written) is tolerated.
  *
- * Cost model: OpenRouter list rates for our vLLM model, canonical table in
- * /home/monky/scripts/pi-token-cost.py:
- *   prompt 0.42/1M, completion 3.00/1M, cacheRead 0.085/1M.
- * cacheWrite is priced at the prompt rate (same assumption as that script;
- * it is 0 on our vLLM so it never affects the estimate).
+ * Cost model: per-model OpenRouter list rates (USD per 1M tokens), keyed by
+ * the `model` field on pi's assistant messages (exact match). Local vLLM
+ * models (qwen3.8-27b, any provider) and unknown models fall back to
+ * VLLM_QWEN_RATES - the historical single rate (OpenRouter list rates for
+ * our vLLM model, canonical table in /home/monky/scripts/pi-token-cost.py:
+ * prompt 0.42/1M, completion 3.00/1M, cacheRead 0.085/1M; cacheWrite at the
+ * prompt rate, the script's assumption - it is 0 on our vLLM so it never
+ * affects the estimate). OpenRouter API fetch 2026-11-05
+ * (https://openrouter.ai/api/v1/models): x-ai/grok-4.6 = 2.00 / 6.00 /
+ * 0.50 (no cacheWrite listed = not billed; the >200K-prompt override tier
+ * is not modeled - the estimator is a single-rate approximation);
+ * deepseek/deepseek-v4.1-flash = 0.045 / 0.50 / 0.018 (no cacheWrite
+ * listed).
  */
 
 import * as fs from "node:fs";
@@ -26,6 +34,11 @@ export interface UsageStats {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  /** Per-model breakdown, keyed by the message `model` field ("" when the
+   * message carries no model). Set lazily on the first usage-bearing turn;
+   * estimateCost prices each bucket at its model's rate. Absent on zero-usage
+   * stats (keeps the historical shape for empty results). */
+  models?: Record<string, UsageStats>;
 }
 
 const EMPTY: UsageStats = {
@@ -36,22 +49,84 @@ const EMPTY: UsageStats = {
   cacheWrite: 0,
 };
 
-const PRICING_PER_M = {
+/** USD per 1M tokens. */
+export interface ModelRates {
+  prompt: number;
+  completion: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+const VLLM_QWEN_RATES: ModelRates = {
   prompt: 0.42,
   completion: 3.0,
   cacheRead: 0.085,
   // cacheWrite has no list price; billed at the prompt rate (assumption).
   cacheWrite: 0.42,
-} as const;
+};
 
-export function estimateCost(s: UsageStats): number {
+const OPENROUTER_RATES: Record<string, ModelRates> = {
+  "x-ai/grok-4.6": {
+    prompt: 2.0,
+    completion: 6.0,
+    cacheRead: 0.5,
+    cacheWrite: 0.0,
+  },
+  "deepseek/deepseek-v4.1-flash": {
+    prompt: 0.045,
+    completion: 0.5,
+    cacheRead: 0.018,
+    cacheWrite: 0.0,
+  },
+};
+
+/** The rate table for a message's model id: exact table match, else the
+ * local vLLM qwen fallback. "" / missing model = fallback. */
+export function ratesFor(model: string | undefined): ModelRates {
+  return (model && OPENROUTER_RATES[model]) || VLLM_QWEN_RATES;
+}
+
+function costAt(s: UsageStats, r: ModelRates): number {
   return (
-    (s.input * PRICING_PER_M.prompt +
-      s.output * PRICING_PER_M.completion +
-      s.cacheRead * PRICING_PER_M.cacheRead +
-      s.cacheWrite * PRICING_PER_M.cacheWrite) /
+    (s.input * r.prompt +
+      s.output * r.completion +
+      s.cacheRead * r.cacheRead +
+      s.cacheWrite * r.cacheWrite) /
     1_000_000
   );
+}
+
+export function estimateCost(s: UsageStats): number {
+  if (s.models) {
+    let total = 0;
+    for (const [m, bucket] of Object.entries(s.models))
+      total += costAt(bucket, ratesFor(m || undefined));
+    return total;
+  }
+  return costAt(s, VLLM_QWEN_RATES);
+}
+
+/** Accumulate one usage-bearing turn into the total AND its per-model
+ * bucket (lazy init on first hit). */
+function addBucket(
+  s: UsageStats,
+  model: string,
+  input: number,
+  output: number,
+  cacheRead: number,
+  cacheWrite: number,
+): void {
+  if (s.models === undefined) s.models = {};
+  let b = s.models[model];
+  if (b === undefined) {
+    b = { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    s.models[model] = b;
+  }
+  b.turns += 1;
+  b.input += input;
+  b.output += output;
+  b.cacheRead += cacheRead;
+  b.cacheWrite += cacheWrite;
 }
 
 /** Human-readable token count: 999 -> "999", 61000 -> "61K", 8.2e6 ->
@@ -75,7 +150,14 @@ export function fmtTokens(n: number): string {
 export function sumRunUsage(messages: unknown[]): UsageStats {
   const s: UsageStats = { ...EMPTY };
   for (const m of messages) {
-    const msg = m as { role?: unknown; usage?: unknown } | null | undefined;
+    const msg = m as
+      | {
+          role?: unknown;
+          usage?: unknown;
+          model?: unknown;
+        }
+      | null
+      | undefined;
     if (msg?.role !== "assistant") continue;
     const u = msg.usage;
     if (typeof u !== "object" || u === null) continue;
@@ -93,6 +175,14 @@ export function sumRunUsage(messages: unknown[]): UsageStats {
     s.output += output;
     s.cacheRead += cacheRead;
     s.cacheWrite += cacheWrite;
+    addBucket(
+      s,
+      typeof msg.model === "string" ? msg.model : "",
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+    );
   }
   return s;
 }
@@ -106,7 +196,7 @@ function addEntry(s: UsageStats, entry: unknown, seen: Set<string>): void {
   const o = entry as {
     type?: unknown;
     id?: unknown;
-    message?: { role?: unknown; usage?: unknown };
+    message?: { role?: unknown; usage?: unknown; model?: unknown };
   };
   if (o.type !== "message" || o.message?.role !== "assistant") return;
   const u = o.message.usage;
@@ -130,6 +220,14 @@ function addEntry(s: UsageStats, entry: unknown, seen: Set<string>): void {
   s.output += output;
   s.cacheRead += cacheRead;
   s.cacheWrite += cacheWrite;
+  addBucket(
+    s,
+    typeof o.message.model === "string" ? o.message.model : "",
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+  );
 }
 
 /** Stream a file line by line (never loaded whole); yields a torn last line.
@@ -213,6 +311,22 @@ export function usageSummary(
   // number operator watches; cacheRead can exceed the new-input count.
   const total = s.input + s.cacheRead;
   const pct = total > 0 ? Math.round((s.cacheRead / total) * 100) : 0;
+  // Per-model breakdown only when two or more distinct models carry tokens -
+  // the single-model line stays byte-identical to the historical shape.
+  let estLine = `- est: $${estimateCost(s).toFixed(2)}`;
+  if (s.models) {
+    const names = Object.keys(s.models).filter((m) => {
+      const b = s.models![m];
+      return b.input + b.output + b.cacheRead + b.cacheWrite > 0;
+    });
+    if (names.length > 1) {
+      const parts = names.map(
+        (m) =>
+          `${m || "default"} $${costAt(s.models![m], ratesFor(m || undefined)).toFixed(2)}`,
+      );
+      estLine = `- est: $${estimateCost(s).toFixed(2)} (${parts.join(" · ")})`;
+    }
+  }
   return [
     `**usage · ${label}**`,
     "",
@@ -221,7 +335,7 @@ export function usageSummary(
     `- in: ${fmtTokens(s.input)}`,
     `- out: ${fmtTokens(s.output)}`,
     `- cached: ${fmtTokens(s.cacheRead)} (${pct}%)`,
-    `- est: $${estimateCost(s).toFixed(2)}`,
+    estLine,
   ].join("\n");
 }
 

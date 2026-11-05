@@ -7,6 +7,7 @@ import {
   estimateCost,
   fmtTokens,
   hasUsage,
+  ratesFor,
   renderUsage,
   summarizeSessionFile,
   sumRunUsage,
@@ -22,6 +23,19 @@ const asst = (id: string, usage: Record<string, number> | undefined): string =>
     parentId: `p-${id}`,
     timestamp: "2026-09-10T08:00:00.000Z",
     message: { role: "assistant", content: [], usage },
+  });
+
+const asstModel = (
+  id: string,
+  usage: Record<string, number> | undefined,
+  model: string,
+): string =>
+  JSON.stringify({
+    type: "message",
+    id,
+    parentId: `p-${id}`,
+    timestamp: "2026-09-10T08:00:00.000Z",
+    message: { role: "assistant", content: [], usage, model },
   });
 
 const user = (id: string): string =>
@@ -138,6 +152,76 @@ describe("estimateCost (OpenRouter list rates, pi-token-cost.py)", () => {
     s.cacheWrite = 1_000_000;
     expect(estimateCost(s)).toBeCloseTo(0.42 + 3.0 + 0.085 + 0.42, 10);
   });
+
+  test("per-model: x-ai/grok-4.6 at 2.00/6.00/0.50, cacheWrite unbilled", () => {
+    const s = {
+      ...{
+        turns: 1,
+        input: 1_000_000,
+        output: 1_000_000,
+        cacheRead: 1_000_000,
+        cacheWrite: 1_000_000,
+      },
+      models: {
+        "x-ai/grok-4.6": {
+          turns: 1,
+          input: 1_000_000,
+          output: 1_000_000,
+          cacheRead: 1_000_000,
+          cacheWrite: 1_000_000,
+        },
+      },
+    };
+    expect(estimateCost(s)).toBeCloseTo(2.0 + 6.0 + 0.5 + 0.0, 10);
+  });
+
+  test("per-model: deepseek/deepseek-v4.1-flash at 0.045/0.50/0.018", () => {
+    const s = {
+      turns: 1,
+      input: 1_000_000,
+      output: 1_000_000,
+      cacheRead: 1_000_000,
+      cacheWrite: 0,
+      models: {
+        "deepseek/deepseek-v4.1-flash": {
+          turns: 1,
+          input: 1_000_000,
+          output: 1_000_000,
+          cacheRead: 1_000_000,
+          cacheWrite: 0,
+        },
+      },
+    };
+    expect(estimateCost(s)).toBeCloseTo(0.045 + 0.5 + 0.018, 10);
+  });
+
+  test("per-model: unknown + missing model fall back to the vLLM qwen rate", () => {
+    const qwen = {
+      turns: 1,
+      input: 1_000_000,
+      output: 1_000_000,
+      cacheRead: 1_000_000,
+      cacheWrite: 0,
+    };
+    const s = {
+      turns: 2,
+      input: 2_000_000,
+      output: 2_000_000,
+      cacheRead: 2_000_000,
+      cacheWrite: 0,
+      models: { "qwen3.8-27b": qwen, "": qwen },
+    };
+    expect(estimateCost(s)).toBeCloseTo(2 * (0.42 + 3.0 + 0.085), 10);
+  });
+
+  test("ratesFor: exact match wins, else fallback", () => {
+    expect(ratesFor("x-ai/grok-4.6").prompt).toBe(2.0);
+    expect(ratesFor("deepseek/deepseek-v4.1-flash").completion).toBe(0.5);
+    expect(ratesFor("qwen3.8-27b").prompt).toBe(0.42);
+    expect(ratesFor("").prompt).toBe(0.42);
+    expect(ratesFor(undefined).prompt).toBe(0.42);
+    expect(ratesFor("no/such-model").completion).toBe(3.0);
+  });
 });
 
 // ─── summarizeSessionFile ──────────────────────────────────────────────────
@@ -220,7 +304,29 @@ describe("summarizeSessionFile", () => {
       output: 30,
       cacheRead: 12,
       cacheWrite: 3,
+      // no `model` on the fixtures -> everything lands in the "" bucket
+      models: {
+        "": {
+          turns: 2,
+          input: 300,
+          output: 30,
+          cacheRead: 12,
+          cacheWrite: 3,
+        },
+      },
     });
+  });
+
+  test("per-model bucketing: model field on assistant messages splits the cost", async () => {
+    const f = writeSession(tmp, "s3.jsonl", [
+      asstModel("b1", A(1_000_000, 100), "x-ai/grok-4.6"),
+      asst("b2", A(500_000, 50)), // no model -> "" bucket (vLLM fallback)
+    ]);
+    const s = await summarizeSessionFile(f);
+    expect(s.models!["x-ai/grok-4.6"].input).toBe(1_000_000);
+    expect(s.models![""].input).toBe(500_000);
+    // grok 1M in @2.00 + 100 out @6.00 ; default 500K in @0.42 + 50 out @3.00
+    expect(estimateCost(s)).toBeCloseTo(2.0 + 0.0006 + 0.21 + 0.00015, 10);
   });
 
   test("tolerates a torn partial last line (live jsonl)", async () => {
@@ -348,6 +454,36 @@ describe("renderUsage", () => {
     expect(await renderUsage(undefined, "/cwd", null)).toBe(
       "no session file found",
     );
+  });
+
+  test("mixed models: est line carries the per-model breakdown", async () => {
+    const sessions = setHome("h-mixed");
+    const f = writeSession(
+      path.join(sessions, "--cwd--"),
+      "2026-11-05T00-00-00-000Z_00000000-0000-0000-0000-000000000030.jsonl",
+      [
+        asstModel("m1", A(1_000_000, 100_000), "x-ai/grok-4.6"),
+        asst("m2", A(1_000_000, 0)), // no model -> default bucket
+      ],
+    );
+    const text = await renderUsage(undefined, "/cwd", f);
+    // grok: 1M in @2.00 + 100K out @6.00 = 2.60 ; default: 1M in @0.42 = 0.42
+    // total 3.02 ; breakdown in first-seen order (grok, then default)
+    expect(text).toContain(
+      "- est: $3.02 (x-ai/grok-4.6 $2.60 · default $0.42)",
+    );
+  });
+
+  test("single model: est line stays byte-identical to the historical shape", async () => {
+    const sessions = setHome("h-single");
+    const f = writeSession(
+      path.join(sessions, "--cwd--"),
+      "2026-11-05T00-00-00-000Z_00000000-0000-0000-0000-000000000031.jsonl",
+      [asstModel("g1", A(1_000_000, 100_000), "x-ai/grok-4.6")],
+    );
+    const text = await renderUsage(undefined, "/cwd", f);
+    const est = text.split("\n").find((l) => l.startsWith("- est:"))!;
+    expect(est).toBe("- est: $2.60"); // no breakdown parens for a single model
   });
 
   test("empty lifetime store -> error line, not a throw", async () => {
