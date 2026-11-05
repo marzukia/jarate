@@ -709,7 +709,7 @@ describe("setup", () => {
       channel: "123",
       botToken: "aa.bb.cc",
       default: true,
-      forwardToolCalls: true,
+      forwardToolCalls: false,
       ack: false,
       ownerUserId: "456",
     });
