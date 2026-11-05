@@ -556,6 +556,8 @@ cmd_setup() {
   # --- 6. settings.json (jq merge, timestamped .bak first) ------------------
   local settings="$HOME/.pi/agent/settings.json"
   local entry
+  # forwardToolCalls:false = new agents boot at verbose 0 (text only); the
+  # operator raises it per channel with /verbose (op order 2026-11-05).
   entry="$(jq -cn \
     --arg id "discord-$SETUP_NAME" \
     --arg name "${SETUP_NAME^^}" \
@@ -563,7 +565,7 @@ cmd_setup() {
     --arg tok "$SETUP_TOK" \
     --arg owner "$SETUP_OWNER" \
     '{id:$id,name:$name,type:"discord",enabled:true,channel:$ch,botToken:$tok,
-      default:true,forwardToolCalls:true,ack:false}
+      default:true,forwardToolCalls:false,ack:false}
      + (if $owner == "" then {} else {ownerUserId:$owner} end)')"
   local merge_filter='(.packages // []) as $pk | (.channels // []) as $cs
     | .packages = (($pk + [$pkg]) | unique)
