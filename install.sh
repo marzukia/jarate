@@ -188,6 +188,12 @@ for tool in pi-bg pi-bg-kill pi-bg-tail pi-bg-watchdog \
 done
 link_into "$HOME/scripts/jarate"     "$JARATE_DIR/bin/jarate"
 link_into "$HOME/bin/jarate"         "$JARATE_DIR/bin/jarate"
+# pi-token-cost.py (A2, #346): the ctx-report cost estimator is vendored in
+# the repo; ~/scripts is a pointer to it, never a copy (fragile-disk state).
+# install.sh OWNS the name: the pre-existing file copy (the hydrogen
+# /home/monky/scripts version that carried the sudo-pass machinery) is
+# re-pointed at pull + install. Retired in B6 with the ctx-report cost leg.
+link_owned "$HOME/scripts/pi-token-cost.py" "$JARATE_DIR/scripts/pi-token-cost.py"
 
 # --- 3a. PATH verify (issue #71, #151) -------------------------------------
 # Assert every family member resolves in the unit's PATH AND is jarate-owned
