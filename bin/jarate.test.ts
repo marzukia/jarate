@@ -464,8 +464,6 @@ function fakeCheckout(f: Fixture): string {
     "deploy/pi.service",
     "deploy/jarate-deploy.service",
     "deploy/jarate-deploy.timer",
-    "deploy/jarate-bg-watchdog.service",
-    "deploy/jarate-bg-watchdog.timer",
   ]) {
     const dst = path.join(dir, rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -762,19 +760,6 @@ describe("setup", () => {
     expect(jd).toContain(`WorkingDirectory=${repo}`);
     expect(jd).toContain(`ExecStart=${repo}/deploy/deploy.sh`);
 
-    // watchdog units: %h-only templates copied verbatim (no checkout path)
-    const wdSvc = fs.readFileSync(
-      path.join(ud, "jarate-bg-watchdog.service"),
-      "utf8",
-    );
-    expect(wdSvc).toContain("ExecStart=%h/scripts/jarate-bg-watchdog");
-    const wdTmr = fs.readFileSync(
-      path.join(ud, "jarate-bg-watchdog.timer"),
-      "utf8",
-    );
-    expect(wdTmr).toContain("OnUnitActiveSec=15min");
-    expect(wdTmr).toContain("WantedBy=timers.target");
-
     // systemctl sequence; loginctl failure is a note, not a failure
     const scLog = fs
       .readFileSync(path.join(f.bin, "systemctl.log"), "utf8")
@@ -783,7 +768,6 @@ describe("setup", () => {
     expect(scLog).toContain("--user daemon-reload");
     expect(scLog).toContain("--user enable --now pi.service");
     expect(scLog).toContain("--user enable --now jarate-deploy.timer");
-    expect(scLog).toContain("--user enable --now jarate-bg-watchdog.timer");
     expect(scLog).toContain("--user is-active pi.service");
     expect(r.err).toContain("enable-linger needs root");
     fs.rmSync(f.tmp, { recursive: true, force: true });

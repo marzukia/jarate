@@ -2,6 +2,20 @@
 
 Notable changes to the jarate stack (pi + piscord bridge). Newest first.
 
+## 2026-11-06 — jarate-bg-watchdog units retired from the repo (#348)
+
+The completion-sweep watchdog left the repo script side with #280/3c (the sweep work centralised to hall-monitor, hm #59/#60), but `deploy/jarate-bg-watchdog.{service,timer}` stayed and `jarate setup` kept installing + enabling the timer for every new agent. On hydrogen no agent carries the unit or the script anymore (verified 2026-11-06), so the templates are deleted and the setup path installs `pi.service` + `jarate-deploy.{service,timer}` only.
+
+- `deploy/jarate-bg-watchdog.{service,timer}`: deleted.
+- `bin/jarate` setup: no watchdog template check, copy, or enable; setup tests follow.
+- `docs/SETUP.md`: step 8, §4, and the manual-units block no longer install the watchdog; §4 notes pre-#348 boxes may keep a dormant inert unit (`systemctl --user disable --now jarate-bg-watchdog.timer` to silence).
+- `install.sh` keeps `jarate-bg-watchdog` in the retired-shim list: it still removes dangling pre-#280 symlinks from `~/scripts`/`~/.local/bin`.
+
+Deploy: merge = live for new onboards; nothing to remove on live boxes (verified absent).
+
+Migration: jarate -> hallmon (jarate-migration A4). Assessment:
+https://drop.junkyard.sh/1bcee530ad1bc202d4ac4de1.html
+
 ## 2026-11-03 — one-shot work-run pi no longer dies at the 80% context handoff (#337)
 
 A fleet work-run pi (one-shot, launched by run-wrapper.sh as the agent user, no XDG_RUNTIME_DIR in the env) hit the 80% auto-compact and ran the discord-pi restart-into-fresh-session op. That op only completes where systemd can respawn the process (a user unit); a one-shot run has no unit, so the 15s watchdog fired and F7 `process.exit(1)` killed the run at 80% context (t1510, t1527 - both janky atkspeed, 2026-11-03), posting `handing-off...` + `restart failed - check unit pi.service` to the agent channel each time.
