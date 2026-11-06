@@ -27,25 +27,12 @@ Last revised: 2026-10-20 (v4).
     header line (`**todos · N open**`) with a BLANK line before the
     bullets. Applies to: the todo board, /todos, /jobs, /usage,
     /context, /tasks, /sleep list, restart wake, handover state.
-2.4 Every /command reply ships in a code fence - success, error, and
-    usage paths alike (operator 2026-09-16) - EXCEPT summary bodies,
-    which ship as markdown per 2.3 (2026-10-18). No 40-col wrap inside
-    any fence; raw log lines are hard-capped at 160 chars, not
-    wrapped (2026-10-05 C9). SUPERSEDED for machine surfaces (Andryo
-    2026-10-31): jarate machine lines (op ticks, placeholders,
-    /stop·/compact acks, restart wakes, [queued]/[buffered] notes,
-    command one-liners) are PLAIN TEXT - one-liners ship italic
-    (`*text*`), multi-line blocks ship plain, no code fences, no
-    embeds. Agent final output keeps the markdown pipeline.
+2.4 /command replies ship as PLAIN MARKDOWN, no fence (fence rule removed per Andryo 2026-10-29) - EXCEPT summary bodies, which ship as markdown per 2.3 (2026-10-18). No 40-col wrap inside any fence; raw log lines are hard-capped at 160 chars, not wrapped (2026-10-05 C9). SUPERSEDED for machine surfaces (Andryo 2026-10-31): jarate machine lines (op ticks, placeholders, /stop·/compact acks, restart wakes, [queued]/[buffered] notes, command one-liners) are PLAIN TEXT - one-liners ship italic (`*text*`), multi-line blocks ship plain, no code fences, no embeds. Agent final output keeps the markdown pipeline.
 2.5 State glyphs (in-turn frames only): `┣` active, `├` pending/done,
     `┤` cancelled.
 
 ## 3 Plain text
-3.1 No emoji. [ok]/[!] are MACHINE OUTPUT only (Andryo 2026-10-20):
-    fenced /command replies, pi-postcheck lines, bg-card embeds. Chat
-    one-liners (compacted, restart wake, interrupted, run failure) are
-    plain words. Queue acks ([queued] N in line) + the mid-run
-    interrupt are SILENT at verbose 0, post at verbose 1+.
+3.1 No emoji. [ok]/[!] are MACHINE OUTPUT only (Andryo 2026-10-20): pi-postcheck lines, bg-card embeds. Chat one-liners (compacted, restart wake, interrupted, run failure) are plain words. Queue acks ([queued] N in line) + the mid-run interrupt are SILENT at verbose 0, post at verbose 1+.
 3.2 URLs bare or [label](url) — never in inline code.
 3.3 No walls of text. Short paragraphs, one idea each.
 3.4 Code: only when it is code. Numbers/ids in prose stay bare.
@@ -53,7 +40,7 @@ Last revised: 2026-10-20 (v4).
 ## 4 Tool output (jarate + jarate-bg)
 4.1 jarate stdout: ONE JSON document, snake_case, no color, no emoji.
     (docs/JARATE.md)
-4.2 Slash commands: defer to 2.4 (fence; summary bodies per 2.3).
+4.2 Slash commands: defer to 2.4 (plain markdown; summary bodies per 2.3).
     (docs/COMMANDS.md tag table)
 4.3 pi-bg embeds: `┌ ok · <run_id>` frame, untagged, <= 40 cols.
     (retired lane; last full frame spec in pre-#281 docs/DISPATCH.md)

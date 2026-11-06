@@ -48,8 +48,7 @@ bash install.sh --dry-run          # installer regression check
 - **No emoji in user-facing strings.** Anything posted to Discord uses
   kimaki-style ASCII tags where the scheme applies: `[new]`/`[..]`/`[queued]`
   state, `- ` list items. `[ok]`/`[!]` are MACHINE OUTPUT ONLY (Andryo
-  2026-10-20): fenced `/command` replies, `pi-postcheck` lines, bg-card
-  embeds. Chat one-liners (op status: compacted, restart wake, interrupted,
+  2026-10-20): `pi-postcheck` lines, bg-card embeds. Chat one-liners (op status: compacted, restart wake, interrupted,
   run failure) are plain words - no tag. Queue acks + interrupt
   notifications are SILENT at verbose 0, post at verbose 1+. Full rules:
   `docs/STYLE.md` §3.1. (operator, 2026-09-10; tag scope 2026-10-20)
