@@ -60,7 +60,7 @@ smoke_target() {
   fi
 }
 
-# resolve_key_file <home>: the first EXISTING candidate of the fleet agent-key paths — $home/.config/hall-monitor/agent-key (onboarding shape: comment lines, then BASE_URL=, then X_AGENT_KEY=), $home/.config/hall-monitor/key (bare key after comment lines), $home/hall-monitor.key (bare key) — lanes onboarded at different times carry different paths on the same host; 1 when none exist (the caller names them in the die message).
+# resolve_key_file <home>: the first EXISTING candidate of the fleet agent-key paths — $home/.config/hall-monitor/agent-key (onboarding shape: comment lines, then BASE_URL=, then X_AGENT_KEY=), $home/.config/hall-monitor/key (bare key after comment lines), $home/hall-monitor.key (bare key) — lanes onboarded at different times carry different paths on the same host; 1 when none exist (the caller names them in the die message). The two legacy candidates are kept for one rollout cycle after the 2026-11-06 host migration (#347 moved every live agent to the canonical path); their removal is scheduled for the next rollout cycle.
 resolve_key_file() {
   local home="$1"
   local f
