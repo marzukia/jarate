@@ -44,6 +44,16 @@ set -uo pipefail
 
 JARATE_ROOT="${JARATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}"
 TMO="${JARATE_TIMEOUT_S:-25}"
+# run_tmo <cmd...> — bound an external call to $TMO seconds. GNU timeout on
+# the boxes, gtimeout (brew coreutils) where present, neither (bare macOS)
+# runs unbounded: the calls self-bound (urllib 30s cap, fast local scans).
+if command -v timeout >/dev/null 2>&1; then
+  run_tmo() { timeout "$TMO" "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  run_tmo() { gtimeout "$TMO" "$@"; }
+else
+  run_tmo() { "$@"; }
+fi
 WARN_CAP=100   # max warning lines per agent
 
 COMMANDS=("setup" "ctx-report" "journal-errors")
@@ -76,7 +86,7 @@ since_is_abs() {
 # Print {"tokens": N|null} for the newest assistant usage in a session jsonl.
 # Same accounting as pi-token-cost.py: totalTokens == input+output+cacheRead.
 session_last_usage() {
-  timeout "$TMO" python3 -c '
+  run_tmo python3 -c '
 import json, sys
 last = None
 try:
@@ -193,7 +203,7 @@ cmd_ctx_report() {
   if [ -z "$ptc" ] || [ ! -f "$ptc" ]; then
     cost_error="pi-token-cost.py not found (set JARATE_TOKEN_COST)"
   else
-    if raw="$(timeout "$TMO" python3 "$ptc" --json "$home" 2>/dev/null)"; then
+    if raw="$(run_tmo python3 "$ptc" --json "$home" 2>/dev/null)"; then
       cost="$(jq -cn --argjson r "$raw" '
         ($r.agents[0] // null) as $a
         | if $a == null then null else
@@ -321,7 +331,7 @@ cmd_journal_errors() {
     fi
     local text=""
     src="local"
-    if text="$(timeout "$TMO" env XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+    if text="$(run_tmo env XDG_RUNTIME_DIR="/run/user/$(id -u)" \
       journalctl --user -u pi.service -p warning --since "$since" -q 2>/dev/null)"; then
       :
     else

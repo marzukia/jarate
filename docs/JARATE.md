@@ -65,6 +65,14 @@ unavailable.
   pricing). A single-home call yields one block, so this is the full cost.
 - `pi-token-cost` is a machine-local script: resolved from `JARATE_TOKEN_COST`,
   `~/scripts/pi-token-cost.py`, or `<repo>/scripts/pi-token-cost.py`.
+  Vendored in `scripts/pi-token-cost.py` (A2, #346); the box ~/scripts copy
+  tracks the repo file (repo is the source). DEPRECATED ESTIMATOR:
+  authoritative cost/pricing is the hall-monitor price sheet
+  (`deploy/fleetwork/price-sheet.json` + `pi_token_cost.py`) and the Run
+  ledger; the cost leg moves to the ledger in B5 and the script is deleted
+  in B6. Cross-home scans run keyless ssh + passwordless sudo (no secret in
+  argv or env); the legacy `~/.config/sudo-pass` file is a last-resort
+  fallback only (SSHPASS env via `sshpass -e`, never hardcoded).
 
 ### `journal-errors [--since S] [--agent NAME]`
 
