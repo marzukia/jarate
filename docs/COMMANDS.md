@@ -353,7 +353,7 @@ in-flight runs fleet-wide), so the in-flight ps view and the `kill`/`tail`
 wrappers (which spawned the removed `jarate-bg-kill`/`jarate-bg-tail`
 scripts) are gone. The `jarate-bg` launcher is a stub (rc 10 retirement
 notice); new work goes to hall-monitor dispatch (`POST /fleet/dispatch`).
-Recent history comes from the `~/.pi-bg-art` artifacts each run leaves. Markdown list layout (2026-10-18): recent bullets are
+Recent history comes from the `~/.pi-bg-art` artifacts each run leaves. Archive ruling (2026-11-06, #349): `~/.pi-bg-art` is a READ-ONLY archive of the retired jarate-bg era; billing data lives in the session files + hall-monitor run records, not in these artifacts. Retiring /jobs itself is a follow-up a release out. Markdown list layout (2026-10-18): recent bullets are
 state-first (raw states `done` / `webhook-failed` / `killed` / `lost`),
 age, then id - no fence, no width budget:
 
