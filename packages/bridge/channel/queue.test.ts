@@ -32,10 +32,16 @@ import {
   midTurnQueues,
   queuedAcks,
   queueMidTurnInbound,
+  unansweredRequeue,
   updateQueuedInbound,
 } from "./queue";
 import { setSystemdRestartHookForTest } from "./restart-ops";
-import { loadRewakeQueue, rewakeAddPending } from "./restart-queue";
+import {
+  loadRewakeQueue,
+  rewakeAddPending,
+  rewakeCommitDelivered,
+  setCurrentSessionFile,
+} from "./restart-queue";
 import { resetStartupMessageSuppressionForTests } from "./startup-suppress";
 import type { ChannelMessage } from "./types";
 
@@ -1228,5 +1234,105 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     const f2 = loadRewakeQueue(rewakeDir(), "ch1");
     expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
     expect(f2.delivered).toContain("2000");
+  });
+});
+
+// ─── #315 (incident 2026-11-03): delivered-but-unanswered re-kick ─────────
+
+describe("unansweredRequeue (#315: the roll killed a live turn mid-question)", () => {
+  let tmp = "";
+  let SESSION = "";
+  const stateDir = () => path.join(tmp, ".tmp");
+  const CH: import("./types").ChannelConfig = {
+    id: "ch1",
+    name: "Test",
+    type: "discord",
+    enabled: true,
+    channel: "111",
+    botToken: "tok1",
+  };
+  const PROMPT = "op question 777";
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-rekickq-"));
+    SESSION = path.join(tmp, "session.jsonl");
+    setCurrentSessionFile(SESSION);
+  });
+  afterEach(() => {
+    setCurrentSessionFile(null);
+    midTurnQueues.clear();
+    queuedAcks.clear();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const commit = (id: string, prompt: string) => {
+    rewakeCommitDelivered(stateDir(), "ch1", id, {
+      prompt,
+      msg: {
+        channelId: "ch1",
+        channelName: "Test",
+        channelType: "discord",
+        messageId: id,
+        from: "op",
+        body: prompt,
+        timestamp: new Date().toISOString(),
+        attachments: [],
+        isRoom: false,
+      },
+      at: Date.now(),
+      sf: SESSION,
+    });
+  };
+
+  test("incident: persisted trigger + no answer -> file pending + memory queue (the startup kick picks it up)", () => {
+    commit("777", PROMPT);
+    fs.writeFileSync(
+      SESSION,
+      `${[
+        JSON.stringify({ type: "custom_message", content: PROMPT }),
+        JSON.stringify({
+          type: "message",
+          message: { role: "system", content: "" },
+        }),
+        JSON.stringify({ type: "custom_message", content: "machine wake" }),
+      ].join("\n")}\n`,
+    );
+    expect(unansweredRequeue(stateDir(), [CH])).toBe(1);
+    const f = loadRewakeQueue(stateDir(), "ch1");
+    expect(f.pending.map((p) => p.msg.messageId)).toEqual(["777"]);
+    expect(midTurnQueues.get("ch1")?.map((q) => q.msg.messageId)).toEqual([
+      "777",
+    ]);
+  });
+
+  test("answered trigger -> nothing re-queued", () => {
+    commit("777", PROMPT);
+    fs.writeFileSync(
+      SESSION,
+      `${[
+        JSON.stringify({ type: "custom_message", content: PROMPT }),
+        JSON.stringify({
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "answer" }],
+          },
+        }),
+      ].join("\n")}\n`,
+    );
+    expect(unansweredRequeue(stateDir(), [CH])).toBe(0);
+    expect(loadRewakeQueue(stateDir(), "ch1").pending).toEqual([]);
+  });
+
+  test("idempotent: a second run (or a concurrent amnesiaRequeue) does not double-queue", () => {
+    commit("777", PROMPT);
+    fs.writeFileSync(
+      SESSION,
+      [JSON.stringify({ type: "custom_message", content: PROMPT })].join("\n") +
+        "\n",
+    );
+    expect(unansweredRequeue(stateDir(), [CH])).toBe(1);
+    expect(unansweredRequeue(stateDir(), [CH])).toBe(1); // already pending: file no-op, memory guard
+    expect(midTurnQueues.get("ch1")?.length).toBe(1);
   });
 });

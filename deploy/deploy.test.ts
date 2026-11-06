@@ -35,7 +35,7 @@
  *
  * 3. #319 guards (the 2026-11-01 franky incident: the backoff skipped the whole tick, so a dead pi.service stayed down 11h): - liveness decoupled from the backoff: the pi liveness check runs on EVERY tick (even backed-off / up-to-date ticks), counts consecutive down ticks in state line 3 ("pi-down <n>"), and on the 3rd down tick ("> 2", per the issue design) restarts the service + logs one PAGE line per episode; an active service resets the counter (line 3 dropped); record_fail preserves line 3 and stamps line 2 with the fail epoch. - backoff expiry: a backed-off commit's skip is time-boxed by the first-fail epoch on line 2 (JARATE_BACKOFF_MAX_AGE_S, default 3600s); a stale or legacy (timestamp-less) line forces a deploy attempt, which re-arms the backoff with a fresh timestamp.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -557,5 +557,157 @@ describe("deploy.sh #235: sourced harness (real on_exit + real traps, ec=143)", 
     const z = await f.harness("exit-zero");
     expect(z.code).toBe(0);
     expect(read(f.harnessFile("rec"))).toBe("");
+  });
+});
+
+/**
+ * The #315 idle-boundary harness. Extracts the REAL IDLE_* defaults +
+ * wait_idle_boundary from deploy.sh, stubs log/sleep (fast), and drives
+ * the function against session-file fixtures under a fake HOME.
+ * $1 = tmp dir, $2 = deploy.sh path, $3 = scenario.
+ */
+const IDLE_HARNESS = `#!/usr/bin/env bash
+set -euo pipefail
+T="$1"
+SRC="$2"
+SCENARIO="$3"
+
+envs="$(sed -n '/^IDLE_QUIET_S=/p;/^IDLE_WAIT_S=/p;/^IDLE_POLL_S=/p' "$SRC")"
+block="$(sed -n '/^wait_idle_boundary() {/,/^}/p' "$SRC")"
+[[ -n "$block" ]] || { echo "harness: extraction from deploy.sh failed" >&2; exit 90; }
+eval "$envs"
+eval "$block"
+
+log() { echo "log: $*" >> "$T/hlog"; }
+sleep() { return 0; } # the poll: no real waiting in the harness
+FORCE=0 # main() sets this in the real script; the force scenario overrides
+
+mkdir -p "$HOME/.pi/agent/sessions/--cwd--"
+
+case "$SCENARIO" in
+  quiet)
+    touch -d '10 minutes ago' "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
+    ;;
+  busy-wait)
+    # Fresh session file; a second of "wall" passes (the harness sleep is
+    # a no-op, so backdate the file manually once to simulate the turn
+    # settling mid-wait).
+    touch "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
+    sleep() {
+      SLEEPCOUNT=$(( \${SLEEPCOUNT:-0} + 1 ))
+      if [[ $SLEEPCOUNT -ge 1 ]]; then touch -d '10 minutes ago' "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"; fi
+      return 0
+    }
+    ;;
+  busy-deadline)
+    touch "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
+    IDLE_WAIT_S=1
+    IDLE_POLL_S=1
+    sleep() { command sleep 0.2; } # real short poll so the deadline is reached
+    ;;
+  force)
+    touch "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
+    FORCE=1
+    ;;
+  no-sessions)
+    # no session files at all (fresh lane, or the tree is gone)
+    ;;
+  reset-only)
+    # only a rotation archive (a .reset-*) — not an active session
+    touch -d '1 second ago' "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl.reset-123"
+    ;;
+esac
+wait_idle_boundary
+echo "rc=0" >> "$T/hlog"
+`;
+
+describe("deploy.sh #315: idle boundary (no mid-turn roll)", () => {
+  let tmp = "";
+  const harness = async (scenario: string, env?: Record<string, string>) => {
+    const script = path.join(tmp, "idle-harness.sh");
+    fs.writeFileSync(script, IDLE_HARNESS);
+    const proc = spawn(["bash", script, tmp, DEPLOY, scenario], {
+      env: {
+        ...process.env,
+        HOME: path.join(tmp, "home"),
+        ...env,
+      },
+    });
+    const code = await proc.exited;
+    return {
+      code,
+      log: fs.readFileSync(path.join(tmp, "hlog"), "utf8"),
+    };
+  };
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-idle-test-"));
+    tmpDirs.push(tmp);
+    fs.mkdirSync(path.join(tmp, "home"), { recursive: true });
+  });
+
+  test("quiet session (last write 10min ago >= 120s) -> restarts immediately", async () => {
+    const r = await harness("quiet");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("idle boundary: last session write");
+    expect(r.log).toContain("restarting");
+    expect(r.log).toContain("rc=0");
+  });
+
+  test("busy lane -> waits, then restarts once the session settles", async () => {
+    const r = await harness("busy-wait");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("idle boundary: last session write");
+    expect(r.log).not.toContain("restarting anyway");
+  });
+
+  test("busy lane that never settles -> bounded wait, restarts anyway", async () => {
+    const r = await harness("busy-deadline");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("restarting anyway");
+  });
+
+  test("--force skips the wait entirely (the operator's override path)", async () => {
+    const r = await harness("force");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("idle wait: skipped (--force)");
+    expect(r.log).not.toContain("idle boundary");
+  });
+
+  test("no session files (fresh lane) -> no signal, never blocks", async () => {
+    const r = await harness("no-sessions");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("no session files; restarting");
+  });
+
+  test("only a rotation archive (.reset-*) -> not an active session", async () => {
+    const r = await harness("reset-only");
+    expect(r.code).toBe(0);
+    expect(r.log).toContain("no session files; restarting");
+  });
+
+  test("env overrides are honored (JARATE_IDLE_QUIET_S)", async () => {
+    // File is 30s old: under the 120s default it is still "busy", but a
+    // 20s quiet window says idle.
+    const script = path.join(tmp, "idle-harness.sh");
+    fs.writeFileSync(
+      script,
+      IDLE_HARNESS.replace(
+        'case "$SCENARIO" in',
+        `touch -d '30 seconds ago' "$HOME/.pi/agent/sessions/--cwd--/sess.jsonl"
+case "$SCENARIO" in`,
+      ),
+    );
+    const p = spawn(["bash", script, tmp, DEPLOY, "no-sessions"], {
+      env: {
+        ...process.env,
+        HOME: path.join(tmp, "home"),
+        JARATE_IDLE_QUIET_S: "20",
+      },
+    });
+    const code = await p.exited;
+    const log = fs.readFileSync(path.join(tmp, "hlog"), "utf8");
+    expect(code).toBe(0);
+    expect(log).toContain("idle boundary: last session write");
   });
 });

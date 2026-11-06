@@ -130,6 +130,7 @@ import {
   queuedAcks,
   queueMidTurnInbound,
   resolveChannel,
+  unansweredRequeue,
   updateQueuedInbound,
 } from "./queue";
 import { buildRepliedMessageBlock } from "./reply-context";
@@ -1635,6 +1636,8 @@ export default function (pi: ExtensionAPI) {
     if (event?.reason === "startup") {
       drainRewakeSurvival(rewakeStateDir, enabled);
       amnesiaRequeue(rewakeStateDir, enabled);
+      // #315: mirror of the amnesia path — prompt persisted, turn killed pre-answer.
+      unansweredRequeue(rewakeStateDir, enabled);
     } else {
       for (const ch of enabled)
         if (ch.type === "discord") rewakeClearPending(rewakeStateDir, ch.id);
