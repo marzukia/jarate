@@ -25,6 +25,7 @@ import extension, {
   verboseOverride,
 } from "./index";
 import { stopAllOpTicks } from "./live";
+import { setLivenessHttp } from "./liveness-event";
 import {
   clearQueuedInbound,
   deleteQueuedInbound,
@@ -1199,41 +1200,62 @@ describe("restart-queue survival (#180): incident-shape e2e", () => {
     midTurnQueues.clear(); // module state a real respawn never carries
     script.polls = [[wakeRaw("w1")], [wakeRaw("w1")], [], []];
     script.scan = [];
-    await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
-    // the survival drain re-queued BOTH entries (ack-less loads)…
-    expect(midTurnQueues.get("ch1")?.length).toBe(2);
-    // …and restored ONLY the entry whose ack survived, at its line
-    // position — the machine-wake entry has no (nonexistent) line
-    expect(queuedAcks.get("2000")?.ackId).toBe("w1");
-    expect(queuedAcks.get("2000")?.pos).toBe(1);
-    expect(queuedAcks.has("3000")).toBe(false);
+    // leg B: the unclean startup's back_online event target (the
+    // pre-leg-B posted-card path: posted -> no kick, the queue stays
+    // intact for the agent_end pop).
+    const savedLivenessEnv = new Map<string, string | undefined>([
+      ["JARATE_INBOX_URL", process.env.JARATE_INBOX_URL],
+      ["JARATE_INBOX_KEY", process.env.JARATE_INBOX_KEY],
+      ["JARATE_INBOX_AGENT", process.env.JARATE_INBOX_AGENT],
+      ["JARATE_INBOX_KEY_FILE", process.env.JARATE_INBOX_KEY_FILE],
+    ]);
+    process.env.JARATE_INBOX_URL = "http://hm.example/api";
+    process.env.JARATE_INBOX_KEY = "test-agent-key";
+    process.env.JARATE_INBOX_AGENT = "testagent";
+    process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-test-agent-key";
+    let livenessPosted = 0;
+    setLivenessHttp((async () => {
+      livenessPosted += 1;
+      return { ok: true, status: 200 };
+    }) as never);
+    try {
+      await p2.handlers.session_start?.({ reason: "startup" }, ctx2);
+      // the survival drain re-queued BOTH entries (ack-less loads)…
+      expect(midTurnQueues.get("ch1")?.length).toBe(2);
+      // …and restored ONLY the entry whose ack survived, at its line
+      // position — the machine-wake entry has no (nonexistent) line
+      expect(queuedAcks.get("2000")?.ackId).toBe("w1");
+      expect(queuedAcks.get("2000")?.pos).toBe(1);
+      expect(queuedAcks.has("3000")).toBe(false);
 
-    // the wake run ends -> the re-wake pop delivers the survived
-    // inbound and consumes the restored ack
-    await waitFor(() =>
-      customSends(p2.sent).some((s) =>
-        String(s.m.details?.body ?? "").includes("Author: pi-bg restart-wake"),
-      ),
-    );
-    await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
-    const delivered = customSends(p2.sent).filter((s) =>
-      String(s.m.details?.body ?? "").includes("fix the thing"),
-    );
-    expect(delivered).toHaveLength(1);
-    // the kept [queued] line is deleted EXACTLY ONCE: the crash left
-    // it live (no shutdown fast path), the restored id is consumed —
-    // no orphan, no double delete
-    expect(
-      script.calls.filter(
-        (c) => c.method === "DELETE" && c.url.endsWith("/messages/w1"),
-      ),
-    ).toHaveLength(1);
-    expect(queuedAcks.get("2000")).toBeUndefined();
-    // the machine-wake entry is still queued (no line to delete) and the
-    // delivered set now holds the committed id
-    const f2 = loadRewakeQueue(rewakeDir(), "ch1");
-    expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
-    expect(f2.delivered).toContain("2000");
+      // the wake run ends -> the liveness event landed (leg B: no card)
+      await waitFor(() => livenessPosted === 1);
+      await p2.handlers.agent_end?.({ type: "agent_end", messages: [] }, ctx2);
+      const delivered = customSends(p2.sent).filter((s) =>
+        String(s.m.details?.body ?? "").includes("fix the thing"),
+      );
+      expect(delivered).toHaveLength(1);
+      // the kept [queued] line is deleted EXACTLY ONCE: the crash left
+      // it live (no shutdown fast path), the restored id is consumed —
+      // no orphan, no double delete
+      expect(
+        script.calls.filter(
+          (c) => c.method === "DELETE" && c.url.endsWith("/messages/w1"),
+        ),
+      ).toHaveLength(1);
+      expect(queuedAcks.get("2000")).toBeUndefined();
+      // the machine-wake entry is still queued (no line to delete) and the
+      // delivered set now holds the committed id
+      const f2 = loadRewakeQueue(rewakeDir(), "ch1");
+      expect(f2.pending.map((p) => p.msg.messageId)).toEqual(["3000"]);
+      expect(f2.delivered).toContain("2000");
+    } finally {
+      setLivenessHttp(null);
+      for (const [k, v] of savedLivenessEnv) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });
 

@@ -49,6 +49,7 @@ import extension, {
   workingMaxMs,
 } from "./index";
 import { machine, opTicks, settleOpTick, stopAllOpTicks } from "./live";
+import { setLivenessHttp } from "./liveness-event";
 import {
   isPiCompactInFlight,
   PI_COMPACT_STALE_MS,
@@ -4781,42 +4782,65 @@ describe("fleet dispatch run gate (hall-monitor #35 gut, 2026-10-20)", () => {
   });
 
   test("#306 amnesia: session_start re-queues accepted-but-unpersisted inbounds", async () => {
-    // The resumed session file (a DIFFERENT prompt — the committed id
-    // was never persisted: the mid-turn restart killed pi first).
-    const sessionFile = path.join(tmp, "session.jsonl");
-    fs.writeFileSync(
-      sessionFile,
-      `${JSON.stringify({
-        type: "custom_message",
-        content: "ctx\n\nsome other body",
-      })}\n`,
-    );
-    (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
-    // A delivered id committed against THIS session file, with metadata.
-    rewakeCommitDelivered(path.join(tmp, ".tmp"), "ch1", "100", {
-      prompt: "ctx\n\nbody 100",
-      msg: {
-        channelId: "ch1",
-        channelName: "Test",
-        channelType: "discord",
-        messageId: "100",
-        from: "Beepy",
-        body: "body 100",
-        timestamp: new Date().toISOString(),
-        attachments: [],
-        isRoom: false,
-      },
-      at: Date.now(),
-      sf: sessionFile,
-    });
-    midTurnQueues.clear();
-    await handlers.session_start?.({ reason: "startup" }, ctx);
-    // The amnesia re-queue is synchronous: the entry is back in the
-    // in-memory re-wake queue (delivered at the next agent_end).
-    const q = midTurnQueues.get("ch1");
-    expect(q?.some((e) => e.msg.messageId === "100")).toBe(true);
-    // The session file slot was captured for the commit stamp.
-    expect(getCurrentSessionFile()).toBe(sessionFile);
+    // leg B: the unclean startup's back_online event target — the event
+    // POST succeeds, so the survived queue stays for the next agent_end
+    // (the pre-leg-B posted-card path; without config the wake falls
+    // through to the immediate kick and pops the queue here).
+    const savedLivenessEnv = new Map<string, string | undefined>([
+      ["JARATE_INBOX_URL", process.env.JARATE_INBOX_URL],
+      ["JARATE_INBOX_KEY", process.env.JARATE_INBOX_KEY],
+      ["JARATE_INBOX_AGENT", process.env.JARATE_INBOX_AGENT],
+      ["JARATE_INBOX_KEY_FILE", process.env.JARATE_INBOX_KEY_FILE],
+    ]);
+    process.env.JARATE_INBOX_URL = "http://hm.example/api";
+    process.env.JARATE_INBOX_KEY = "test-agent-key";
+    process.env.JARATE_INBOX_AGENT = "testagent";
+    process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-test-agent-key";
+    setLivenessHttp((async () => ({ ok: true, status: 200 })) as never);
+    try {
+      // The resumed session file (a DIFFERENT prompt — the committed id
+      // was never persisted: the mid-turn restart killed pi first).
+      const sessionFile = path.join(tmp, "session.jsonl");
+      fs.writeFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          type: "custom_message",
+          content: "ctx\n\nsome other body",
+        })}\n`,
+      );
+      (ctx as any).sessionManager = { getSessionFile: () => sessionFile };
+      // A delivered id committed against THIS session file, with metadata.
+      rewakeCommitDelivered(path.join(tmp, ".tmp"), "ch1", "100", {
+        prompt: "ctx\n\nbody 100",
+        msg: {
+          channelId: "ch1",
+          channelName: "Test",
+          channelType: "discord",
+          messageId: "100",
+          from: "Beepy",
+          body: "body 100",
+          timestamp: new Date().toISOString(),
+          attachments: [],
+          isRoom: false,
+        },
+        at: Date.now(),
+        sf: sessionFile,
+      });
+      midTurnQueues.clear();
+      await handlers.session_start?.({ reason: "startup" }, ctx);
+      // The amnesia re-queue is synchronous: the entry is back in the
+      // in-memory re-wake queue (delivered at the next agent_end).
+      const q = midTurnQueues.get("ch1");
+      expect(q?.some((e) => e.msg.messageId === "100")).toBe(true);
+      // The session file slot was captured for the commit stamp.
+      expect(getCurrentSessionFile()).toBe(sessionFile);
+    } finally {
+      setLivenessHttp(null);
+      for (const [k, v] of savedLivenessEnv) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 
   test("#306 amnesia: a persisted (answered) commit is NOT re-queued", async () => {

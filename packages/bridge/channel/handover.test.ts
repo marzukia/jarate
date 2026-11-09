@@ -68,6 +68,45 @@ import {
   tagLastSentMissing,
 } from "./last-sent";
 import { stopAllOpTicks } from "./live";
+import { setLivenessHttp } from "./liveness-event";
+
+// fake liveness event POST (hall-monitor#757 leg B): a queue of
+// (status|Error) results per call; records the url, the X-Agent-Key
+// header and the body.
+function flake(results: Array<number | Error>): {
+  calls: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body: string | undefined;
+  }>;
+  impl: (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ) => Promise<{ ok: boolean; status: number }>;
+} {
+  const calls: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body: string | undefined;
+  }> = [];
+  const impl = (
+    url: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<{ ok: boolean; status: number }> =>
+    (async () => {
+      const r = results.shift();
+      calls.push({
+        url: String(url),
+        headers: (init?.headers ?? {}) as Record<string, string>,
+        body: typeof init?.body === "string" ? init.body : undefined,
+      });
+      if (r instanceof Error) throw r;
+      const status = r ?? 200;
+      return { ok: status >= 200 && status < 300, status };
+    })();
+  return { calls, impl };
+}
+
 import { settlePiCompact } from "./pi-compact-guard";
 import { setSystemdRestartHookForTest } from "./restart-ops";
 import { renderBoard, saveBoard, type Todo } from "./todos";
@@ -2808,12 +2847,22 @@ describe("#315 P1: buildHandover doc-write self-check (INCOMPLETE-ASKS)", () => 
   });
 });
 
-describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
+describe("#315 P1: runSessionStartAskCheck (session_start wiring; hall-monitor#757 leg B)", () => {
   let tmp = "";
   let oldHome = "";
   let storeDir = "";
-  let sentBodies: string[] = [];
   const realFetch = globalThis.fetch;
+  let fl: {
+    calls: Array<{
+      url: string;
+      headers: Record<string, string>;
+      body: string | undefined;
+    }>;
+    impl: (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ) => Promise<{ ok: boolean; status: number }>;
+  };
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-315w-"));
     oldHome = process.env.HOME || "";
@@ -2825,8 +2874,14 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
     );
     storeDir = path.join(tmp, "handovers");
     fs.mkdirSync(storeDir, { recursive: true });
-    sentBodies = [];
-    globalThis.fetch = (async (url: any, init?: any) => {
+    // the bridge's hall-monitor setting (the event target; leg B)
+    process.env.JARATE_INBOX_URL = "http://hm.example/api";
+    process.env.JARATE_INBOX_KEY = "test-agent-key";
+    process.env.JARATE_INBOX_AGENT = "testagent";
+    process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-test-agent-key";
+    fl = flake([200]);
+    setLivenessHttp(fl.impl);
+    globalThis.fetch = (async (url: any) => {
       const u = String(url);
       if (u.includes("/messages?limit=")) {
         // the history fetch: one unanswered operator message 10 min ago
@@ -2843,15 +2898,6 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
           text: async () => "",
         };
       }
-      if (init?.method === "POST" && u.endsWith("/messages")) {
-        sentBodies.push(String(init?.body));
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ id: "out1" }),
-          text: async () => "",
-        };
-      }
       return {
         ok: true,
         status: 200,
@@ -2861,8 +2907,13 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
     }) as any;
   });
   afterEach(() => {
+    setLivenessHttp(null);
     globalThis.fetch = realFetch;
     process.env.HOME = oldHome;
+    delete process.env.JARATE_INBOX_URL;
+    delete process.env.JARATE_INBOX_KEY;
+    delete process.env.JARATE_INBOX_AGENT;
+    delete process.env.JARATE_INBOX_KEY_FILE;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -2876,7 +2927,7 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
   };
   const writeDoc = (asks: string) => {
     const doc = [
-      "# Handover - 2026-11-01 · session x · 100k tokens → handoff",
+      "# Handover - 2026-11-01 \u00b7 session x \u00b7 100k tokens \u2192 handoff",
       "",
       "## Last user asks",
       asks,
@@ -2893,13 +2944,18 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
     );
   };
 
-  test("doc (none) + an unanswered operator message < 30 min in history → say to the channel", async () => {
+  test("doc (none) + an unanswered operator message < 30 min in history \u2192 ONE session_start event (no channel post)", async () => {
     writeDoc("(none)");
     await runSessionStartAskCheck(tmp, [ch] as any);
-    expect(sentBodies.length).toBe(1);
-    expect(sentBodies[0]).toContain("issue #315 P1");
+    expect(fl.calls.length).toBe(1);
+    expect(fl.calls[0].url).toBe("http://hm.example/api/fleet/liveness/event");
+    expect(fl.calls[0].headers["X-Agent-Key"]).toBe("test-agent-key");
+    const body = JSON.parse(fl.calls[0].body ?? "{}");
+    expect(body.agent).toBe("testagent");
+    expect(body.event).toBe("session_start");
+    expect(body.detail).toContain("issue #315 P1");
   });
-  test("no doc in the store → no fetch, no say", async () => {
+  test("no doc in the store \u2192 no history fetch, no event", async () => {
     let historyFetched = false;
     const probe = globalThis.fetch;
     globalThis.fetch = (async (url: any, init?: any) => {
@@ -2908,12 +2964,12 @@ describe("#315 P1: runSessionStartAskCheck (session_start wiring)", () => {
     }) as any;
     await runSessionStartAskCheck(tmp, [ch] as any);
     expect(historyFetched).toBe(false);
-    expect(sentBodies.length).toBe(0);
+    expect(fl.calls.length).toBe(0);
   });
-  test("the doc lists an ask (not (none)) → no say", async () => {
+  test("the doc lists an ask (not (none)) \u2192 no event", async () => {
     writeDoc("1. do the thing");
     await runSessionStartAskCheck(tmp, [ch] as any);
-    expect(sentBodies.length).toBe(0);
+    expect(fl.calls.length).toBe(0);
   });
 });
 
@@ -3542,12 +3598,22 @@ describe("#315 P1 leg: sessionStartSentFlag (the session-start guard)", () => {
   });
 });
 
-describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
+describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring (hall-monitor#757 leg B)", () => {
   let tmp = "";
   let oldHome = "";
   let storeDir = "";
-  let sentBodies: string[] = [];
   const realFetch = globalThis.fetch;
+  let fl: {
+    calls: Array<{
+      url: string;
+      headers: Record<string, string>;
+      body: string | undefined;
+    }>;
+    impl: (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ) => Promise<{ ok: boolean; status: number }>;
+  };
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-lsw-"));
     oldHome = process.env.HOME || "";
@@ -3559,8 +3625,13 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
     );
     storeDir = path.join(tmp, "handovers");
     fs.mkdirSync(storeDir, { recursive: true });
-    sentBodies = [];
-    globalThis.fetch = (async (url: any, init?: any) => {
+    process.env.JARATE_INBOX_URL = "http://hm.example/api";
+    process.env.JARATE_INBOX_KEY = "test-agent-key";
+    process.env.JARATE_INBOX_AGENT = "testagent";
+    process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-test-agent-key";
+    fl = flake([200]);
+    setLivenessHttp(fl.impl);
+    globalThis.fetch = (async (url: any) => {
       const u = String(url);
       if (u.includes("/messages?limit=")) {
         // the history fetch: one post by this agent 10 min ago
@@ -3577,15 +3648,6 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
           text: async () => "",
         };
       }
-      if (init?.method === "POST" && u.endsWith("/messages")) {
-        sentBodies.push(String(init?.body));
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ id: "out1" }),
-          text: async () => "",
-        };
-      }
       return {
         ok: true,
         status: 200,
@@ -3595,8 +3657,13 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
     }) as any;
   });
   afterEach(() => {
+    setLivenessHttp(null);
     globalThis.fetch = realFetch;
     process.env.HOME = oldHome;
+    delete process.env.JARATE_INBOX_URL;
+    delete process.env.JARATE_INBOX_KEY;
+    delete process.env.JARATE_INBOX_AGENT;
+    delete process.env.JARATE_INBOX_KEY_FILE;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
   const ch = {
@@ -3609,7 +3676,7 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
   };
   const writeDoc = (sent: string) => {
     const doc = [
-      "# Handover - 2026-11-02 · session x · 100k tokens → handoff",
+      "# Handover - 2026-11-02 \u00b7 session x \u00b7 100k tokens \u2192 handoff",
       "",
       "## Last user asks",
       "1. do the thing",
@@ -3629,15 +3696,17 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring", () => {
     );
   };
 
-  test("doc (none) + a post by this agent < 30 min in history → say to the channel", async () => {
+  test("doc (none) + a post by this agent < 30 min in history \u2192 ONE session_start event (no channel post)", async () => {
     writeDoc("(none)");
     await runSessionStartAskCheck(tmp, [ch] as any);
-    expect(sentBodies.length).toBe(1);
-    expect(sentBodies[0]).toContain("issue #315 P1 leg");
+    expect(fl.calls.length).toBe(1);
+    const body = JSON.parse(fl.calls[0].body ?? "{}");
+    expect(body.event).toBe("session_start");
+    expect(body.detail).toContain("issue #315 P1 leg");
   });
-  test("the doc lists the sent message (not (none)) → no say", async () => {
+  test("the doc lists the sent message (not (none)) \u2192 no event", async () => {
     writeDoc("the reply that was sent");
     await runSessionStartAskCheck(tmp, [ch] as any);
-    expect(sentBodies.length).toBe(0);
+    expect(fl.calls.length).toBe(0);
   });
 });

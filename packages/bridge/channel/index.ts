@@ -1752,67 +1752,54 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Post-restart wake (issue #111, P0): on a real process start
-    // (reason "startup"), post ONE "back online" message — planned /
-    // unplanned restart class + the in-flight pi-bg summary — to the
-    // default channel. Fire-and-forget: never blocks or fails startup;
-    // no channel/token/webhook = silent no-op; two startups racing
-    // within 60s post once.
-    {
-      const wakeCh =
-        defaultCh ?? enabled.find((c) => c.type === "discord") ?? null;
-      // event?.reason: the test harness fires session_start(null, ctx);
-      // real pi always passes the event (reason "startup" on process start)
-      void runRestartWake({
-        reason: event?.reason,
-        stateDir: rewakeStateDir,
-        target:
-          wakeCh && (wakeCh.botToken || wakeCh.webhookUrl)
-            ? {
-                channelId: getDiscordChannelId(wakeCh.id) ?? wakeCh.channel,
-                botToken: wakeCh.botToken,
-                webhookUrl: wakeCh.webhookUrl,
-              }
-            : null,
+    // Post-restart wake (issue #111, P0; hall-monitor#757 leg B): on a
+    // real process start (reason "startup"), the unclean class fires ONE
+    // fire-and-forget back_online liveness event to hall-monitor (the
+    // channel line arrives via the webhook leg, non-agent identity). Fire
+    // and forget: never blocks or fails startup; hall-monitor config
+    // unset = one local log line; two startups racing within 60s post
+    // once.
+    void runRestartWake({
+      reason: event?.reason,
+      stateDir: rewakeStateDir,
+    })
+      .then((r) => {
+        if (r.posted) {
+          console.log(
+            `[wake] posted back_online liveness event (${r.restartClass})`,
+          );
+          return;
+        }
+        if (r.reason === "dedup") return; // a racing start owns the post
+        // #328: "suppressed-planned" falls through here too — the card
+        // is intentionally not sent, so nothing else wakes the agent;
+        // the kick keeps the survived queue alive (same as post-failed).
+        // #180: the wake post never lands — the wake inbound is what
+        // starts the run whose agent_end re-wakes the survived queue.
+        // Kick the oldest entry directly (the bridge is idle at
+        // startup; if a run is live, its agent_end owns the queue and
+        // the pop is left to it — no double delivery).
+        const queued = ctx.isIdle() ? popOldestQueuedInbound() : null;
+        if (queued) {
+          console.log(
+            `[channel] wake post failed: delivering queued inbound directly (${queued.channelId})`,
+          );
+          // #328: mark the directly delivered id seen so an op-window
+          // replay (first poll after a rewound cursor) drops it instead
+          // of double-delivering (the kick bypasses the poller's
+          // seenDrop site).
+          markSeenDirectDelivery(queued.channelId, queued.msg.messageId);
+          handleInbound(pi, queued.msg, ctx, true).catch((e) =>
+            console.error(
+              "[channel] wake-fail direct delivery failed:",
+              sanitizeUnknownValue(e),
+            ),
+          );
+        }
       })
-        .then((r) => {
-          if (r.posted) {
-            console.log(
-              `[wake] posted restart wake (${r.restartClass}) to ${wakeCh?.id}`,
-            );
-            return;
-          }
-          if (r.reason === "dedup") return; // a racing start owns the post
-          // #328: "suppressed-planned" falls through here too — the card
-          // is intentionally not sent, so nothing else wakes the agent;
-          // the kick keeps the survived queue alive (same as post-failed).
-          // #180: the wake post never lands — the wake inbound is what
-          // starts the run whose agent_end re-wakes the survived queue.
-          // Kick the oldest entry directly (the bridge is idle at
-          // startup; if a run is live, its agent_end owns the queue and
-          // the pop is left to it — no double delivery).
-          const queued = ctx.isIdle() ? popOldestQueuedInbound() : null;
-          if (queued) {
-            console.log(
-              `[channel] wake post failed: delivering queued inbound directly (${queued.channelId})`,
-            );
-            // #328: mark the directly delivered id seen so an op-window
-            // replay (first poll after a rewound cursor) drops it instead
-            // of double-delivering (the kick bypasses the poller's
-            // seenDrop site).
-            markSeenDirectDelivery(queued.channelId, queued.msg.messageId);
-            handleInbound(pi, queued.msg, ctx, true).catch((e) =>
-              console.error(
-                "[channel] wake-fail direct delivery failed:",
-                sanitizeUnknownValue(e),
-              ),
-            );
-          }
-        })
-        .catch((e) =>
-          console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
-        );
-    }
+      .catch((e) =>
+        console.error("[wake] restart wake failed:", sanitizeUnknownValue(e)),
+      );
 
     // #180 (option 1): bounded startup history scan — ONE fetch per
     // channel (messages?before=<cursor>&limit=$PISCORD_REWAKE_LOOKBACK,
