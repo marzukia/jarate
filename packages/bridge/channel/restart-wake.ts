@@ -1,31 +1,37 @@
-// restart-wake — post-restart wake (issue #111, P0).
+// restart-wake — post-restart wake (issue #111, P0; the self-post removed
+// by hall-monitor#757 leg B, 2026-11-09).
 //
 // When the pi process really starts (session_start reason "startup"), the
-// bridge posts ONE "back online" message to the agent's channel. Shape
-// (2026-10-31, Andryo: machine surfaces are plain text + italics - no
-// embeds, no code fences; this SUPERSEDES the 2026-10-19 EMBED CARD
-// convention for this surface):
-//   - ONE short italic line, no more than a few words: the content is
-//     `*restart-wake · planned*` / `*restart-wake · unplanned*` - the
-//     planned/unplanned distinction is the functional signal (no
-//     author/title/description/footer/embed at all)
-//   - bg runs in flight at restart: a compact suffix on the SAME line:
-//     `*restart-wake · planned · in-flight N*` (N = count of
-//     state=running records; the old multiline in-flight field is gone,
-//     detail lives in /jobs)
-//   - the WAKE itself rides webhook_id: isBgWebhook exempts any
-//     webhook-posted message from the other-bot filter, so the post
-//     lands as an agent turn. isBgCallbackBody classifies the plain
-//     `restart-wake ·` content prefix (and the legacy `Author: pi-bg`
-//     embed shape, kept for in-flight history)
+// UNCLEAN class (no fresh clean-stop marker: crash / OOM / SIGKILL / power
+// loss) fires ONE fire-and-forget back_online liveness event to
+// hall-monitor (POST /api/fleet/liveness/event, liveness-event.ts). The
+// channel line arrives, when it lands, via the hall-monitor webhook leg
+// under a non-agent identity — the bridge no longer self-posts the
+// "back online" line (the self-signal class is gone; the sweep + the 30s
+// live marker remain the independent signal). An event POST failure is
+// log-only, never a startup failure.
 //
-// Guards (issue #111):
+// The event detail carries the pre-leg-B card text, plain (the italic
+// channel markup is the webhook leg's format concern, not the event's):
+//   - `restart-wake · unplanned` — the unplanned-restart signal
+//   - bg runs in flight at restart: a compact suffix on the SAME line:
+//     `restart-wake · unplanned · in-flight N` (N = count of
+//     state=running records; job rows live in /jobs)
+//   - the PLANNED class posts nothing (the startup message is the one
+//     post, #328): no event, no card
+//
+// Guards (issue #111, adapted to leg B):
 //   - never blocks startup: the caller fires and forgets (void + catch);
-//     the post itself is bounded — 3 attempts, 15s hard timeout each,
-//     3s*i backoff (the pi-bg webhook pattern, bg_post)
-//   - no channel with a bot token or webhook (dev runs) = silent no-op
+//     the event POST is bounded — one attempt, 10s hard timeout,
+//     log-only on failure (a dead hall-monitor must not take startup down)
+//   - hall-monitor config unset (JARATE_INBOX_URL/JARATE_INBOX_KEY)
+//     = one local log line, no event (dev runs degrade to the sweep +
+//     marker)
 //   - two startups racing within 60s post once (atomic O_EXCL claim)
 //   - hot reload / session switch (reason != "startup") never posts
+//
+// ("post" in the marker layout + #322 guards + #328 one-post-per-restart
+// below means the liveness event POST since leg B.)
 //
 // Marker layout (runtime state dir, <agent-cwd>/.tmp on the live boxes):
 //   clean-stop        last session_shutdown timestamp (written on every
@@ -63,6 +69,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { egressText } from "./discord";
+import { resolveLivenessTarget, sendLivenessEvent } from "./liveness-event";
 import { suppressStartupMessageForThisStart } from "./startup-suppress";
 
 // ─── constants ───────────────────────────────────────────────────────────
@@ -88,13 +95,6 @@ export const WAKE_AUDIT_WINDOW_MS = 60 * 60_000;
 /** Cap the inflight list (a restart can strand many tickets; keep the
  *  message bounded, point at /jobs for the rest). */
 export const MAX_INFLIGHT = 10;
-
-// pi-bg bg_post pattern: 3 attempts, --max-time 15, backoff i*3s.
-export const POST_ATTEMPTS = 3;
-export const POST_TIMEOUT_MS = 15_000;
-export const POST_BACKOFF_MS = 3_000;
-
-const DISCORD_API = "https://discord.com/api/v10";
 
 // ─── run records ─────────────────────────────────────────────────────────
 
@@ -192,7 +192,10 @@ export function elapsedStr(sec: number): string {
 export const WAKE_TAG = "restart-wake \u00b7";
 
 /** The wake post body: ONE short italic content line (Andryo 2026-10-31
- *  - machine surfaces are plain text + italics, no embeds). */
+ *  - machine surfaces are plain text + italics, no embeds). Kept since
+ *  leg B: the event detail is derived from this line (the channel
+ *  markup is the webhook leg's concern; the result's `message` field
+ *  still carries the pre-leg-B shape for logs/audit). */
 export interface WakePayload {
   content: string;
 }
@@ -225,12 +228,6 @@ export function buildWakePayload({
       ? `restart-wake \u00b7 ${klass} \u00b7 in-flight ${count}`
       : `restart-wake \u00b7 ${klass}`;
   return { content: `*${line}*` };
-}
-
-/** Censor the wake's content (docs/secret-censor.md): the in-flight
- *  count ships in the content line. */
-function egressPayload(p: WakePayload): WakePayload {
-  return { content: egressText(p.content) };
 }
 
 // ─── clean-stop marker ───────────────────────────────────────────────────
@@ -524,98 +521,6 @@ export function wakeAuditOutcome(
   else state.noChannel += 1;
 }
 
-// ─── bounded post ────────────────────────────────────────────────────────
-
-export interface WakeTarget {
-  /** Discord channel id (numeric). */
-  channelId: string;
-  botToken?: string;
-  webhookUrl?: string;
-}
-
-export interface PostOpts {
-  fetchImpl?: typeof fetch;
-  attempts?: number;
-  timeoutMs?: number;
-  backoffMs?: number;
-}
-
-/** Bounded post of the wake payload, pi-bg bg_post pattern: up to
- *  `attempts` tries per route, hard timeout per try, backoff
- *  i*backoffMs between tries, 2xx = success. WEBHOOK FIRST (the
- *  webhook post IS the wake: isBgWebhook exempts any webhook-posted
- *  message from the other-bot filter, so it lands as a turn), bot API
- *  second for configs without a webhook. Neither configured = silent no-op. Never throws —
- *  a dead network must not take startup down. */
-export async function postWakePayload(
-  target: WakeTarget,
-  payload: WakePayload,
-  opts: PostOpts = {},
-): Promise<boolean> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  const attempts = opts.attempts ?? POST_ATTEMPTS;
-  const timeoutMs = opts.timeoutMs ?? POST_TIMEOUT_MS;
-  const backoffMs = opts.backoffMs ?? POST_BACKOFF_MS;
-  const body = JSON.stringify(payload);
-  const routes: Array<{ url: string; headers: Record<string, string> }> = [];
-  if (target.webhookUrl) {
-    routes.push({
-      url: target.webhookUrl,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-  if (target.botToken) {
-    routes.push({
-      url: `${DISCORD_API}/channels/${encodeURIComponent(target.channelId)}/messages`,
-      headers: {
-        Authorization: `Bot ${target.botToken}`,
-        "Content-Type": "application/json",
-      },
-    });
-  }
-  if (routes.length === 0) return false;
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  for (const route of routes) {
-    for (let i = 1; i <= attempts; i++) {
-      try {
-        const resp = await fetchImpl(route.url, {
-          method: "POST",
-          headers: route.headers,
-          body,
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (resp.ok) return true;
-      } catch {
-        // timeout / network error: retry
-      }
-      if (i < attempts) await sleep(backoffMs * i);
-    }
-  }
-  return false;
-}
-
-/** The pi-bg callback bus webhook: $PI_DISPATCH_WEBHOOK or
- *  ~/.config/pi-dispatch/webhook (the SAME source pi-bg's launcher reads;
- *  missing file = null). This is the route the framed wake posts through.
- */
-export function defaultDispatchWebhook(
-  home: string = process.env.HOME || os.homedir(),
-): string | null {
-  const env = process.env.PI_DISPATCH_WEBHOOK?.trim();
-  if (env) return env;
-  try {
-    const raw = fs
-      .readFileSync(
-        path.join(home, ".config", "pi-dispatch", "webhook"),
-        "utf8",
-      )
-      .trim();
-    return raw ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── orchestrator ────────────────────────────────────────────────────────
 
 export interface RestartWakeDeps {
@@ -624,18 +529,13 @@ export interface RestartWakeDeps {
   reason: string | undefined;
   /** Bridge runtime state dir (<agent-cwd>/.tmp). */
   stateDir: string;
-  /** null = no channel/token/webhook → silent no-op. */
-  target: WakeTarget | null;
   /** Run-record dir (default: $PI_DISPATCH_RECORD_DIR or ~/.pi-dispatch/runs). */
   runDir?: string;
   now?: number;
-  fetchImpl?: typeof fetch;
-  /** Post timing overrides (tests shrink the backoff); defaults are the
-   *  pi-bg pattern. */
-  postOpts?: PostOpts;
-  log?: (line: string) => void;
   /** G2 audit state (default: the per-process/per-agent counter). */
   auditState?: WakeAuditState;
+  /** Log sink (default: console.log). */
+  log?: (line: string) => void;
 }
 
 export interface RestartWakeResult {
@@ -675,9 +575,11 @@ export async function runRestartWake(
     return { posted: false, reason: "not-startup" };
   }
   wakeAuditStart(audit, now);
-  if (!deps.target) {
+  if (resolveLivenessTarget() === null) {
     wakeAuditOutcome(audit, "no-channel");
-    log("[wake] no-channel: no channel/token/webhook configured");
+    log(
+      "[wake] no-channel: hall-monitor config unset (JARATE_INBOX_URL/JARATE_INBOX_KEY) - the back_online event is not sent (log-only; the sweep + live marker remain the independent signal)",
+    );
     return { posted: false, reason: "no-channel" };
   }
   // Consume the marker only on a real process start: in-process /new and
@@ -714,10 +616,7 @@ export async function runRestartWake(
     return { posted: false, reason: "dedup", restartClass };
   }
   const runs = readRunRecords(deps.runDir ?? defaultRunDir());
-  // Build the payload now (deterministic given the snapshot). Every
-  // string part is censored at egress (egressPayload, single choke point
-  // per docs/secret-censor.md): ticket/run ids come from run records and
-  // can carry secrets.
+  // Build the payload now (deterministic given the snapshot).
   const payload = buildWakePayload({
     clean: false, // #328: the planned class returned above; only unclean posts
     runs,
@@ -726,18 +625,16 @@ export async function runRestartWake(
   log(
     `[wake] restart class=${restartClass} inflight=${runs.filter((r) => r.state === "running").length}`,
   );
-  // Bus webhook resolution: the channel config's webhookUrl when set,
-  // else the pi-bg dispatch bus (the webhook route that wakes the agent).
-  const target: WakeTarget = {
-    ...deps.target,
-    webhookUrl: deps.target.webhookUrl || defaultDispatchWebhook() || undefined,
-  };
-  // egressText = the single egress choke point (docs/secret-censor.md):
-  // ticket/task text comes from run records and can carry secrets.
-  const ok = await postWakePayload(target, egressPayload(payload), {
-    ...deps.postOpts,
-    fetchImpl: deps.fetchImpl ?? deps.postOpts?.fetchImpl,
-  });
+  // hall-monitor#757 leg B: the wake is no longer a self-post (webhook
+  // or bot); ONE fire-and-forget back_online liveness event. The detail
+  // carries the pre-leg-B card text, plain (the italic channel markup is
+  // the webhook leg's format concern, not the event's). egressText stays
+  // the single egress choke point (docs/secret-censor.md): the line can
+  // be re-posted to the channel by hall-monitor, so it is censored here.
+  const detail = egressText(
+    payload.content.replace(/^\*/, "").replace(/\*$/, ""),
+  );
+  const ok = await sendLivenessEvent("back_online", detail);
   if (ok) {
     // G3: mark the claim posted — only a POSTED claim suppresses the
     // next same-class start in-window; a crash between claim and post
@@ -754,7 +651,7 @@ export async function runRestartWake(
   }
   wakeAuditOutcome(audit, "post-failed");
   log(
-    "[wake] post-failed: up to 2 routes x 3 attempts, 15s each - no wake in channel",
+    "[wake] post-failed: the back_online event did not land (log-only - the sweep + live marker remain the independent signal)",
   );
   return {
     posted: false,

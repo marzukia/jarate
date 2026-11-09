@@ -27,7 +27,6 @@ import {
   getDiscordChannelId,
   getDiscordStates,
   getDiscordToken,
-  sendDiscordMessage,
 } from "./discord";
 import { fmtTokensLC } from "./format";
 import { jobsView } from "./jobs";
@@ -38,7 +37,7 @@ import {
   sessionStartSentFlag,
   tagLastSentMissing,
 } from "./last-sent";
-import { machine } from "./live";
+import { sendLivenessEvent } from "./liveness-event";
 import { REWAKE_LOOKBACK_DEFAULT } from "./restart-queue";
 import { sanitizeUnknownValue } from "./sanitize";
 import { formatTaskLine, loadTasks } from "./tasks";
@@ -1337,7 +1336,7 @@ export function sessionStartAskFlag(
   return `session start: the handoff doc says (none) but ${unanswered.length} unanswered operator message(s) < 30m old in channel history (issue #315 P1)`;
 }
 
-/** #315 P1 wiring (session_start): load the latest handoff doc; when it exists, ONE bounded history fetch per enabled Discord channel (the #180 lookback) runs BOTH session-start checks: the unanswered-ask flag (the doc's "Last user asks" = (none) + an unanswered operator message < 30 min old) and the last-sent flag (the doc's "Last sent message" = (none) + a post by this agent < 30 min old - the restored agent posted just before rotation; the doc dropped it). Each flag = one log line + one say to that channel (the existing machine() one-liner say path). Fire-and-forget: a dead network at boot is a silent no-op, never a startup failure. */
+/** #315 P1 wiring (session_start): load the latest handoff doc; when it exists, ONE bounded history fetch per enabled Discord channel (the #180 lookback) runs BOTH session-start checks: the unanswered-ask flag (the doc's "Last user asks" = (none) + an unanswered operator message < 30 min old) and the last-sent flag (the doc's "Last sent message" = (none) + a post by this agent < 30 min old - the restored agent posted just before rotation; the doc dropped it). hall-monitor#757 leg B: a fired flag is NO LONGER self-posted to the channel (the self-signal class is gone); it is ONE log line + ONE fire-and-forget session_start liveness event POST (liveness-event.ts; the channel line, when it lands, arrives via the hall-monitor webhook leg under a non-agent identity). A dead hall-monitor at boot is a log-only no-op, never a startup failure. */
 export async function runSessionStartAskCheck(
   cwd: string,
   channels: ChannelConfig[],
@@ -1349,6 +1348,10 @@ export async function runSessionStartAskCheck(
     const askGate = docAsksIsNone(doc);
     const sentGate = docLastSentIsNone(doc);
     if (!askGate && !sentGate) return;
+    // Collect the fired flag lines across all enabled channels (deduped - the
+    // same flag fires identically in every channel that shows it); ONE event
+    // per session start, not one per channel.
+    const flagLines = new Set<string>();
     for (const ch of channels) {
       if (ch.type !== "discord") continue;
       const discordId = getDiscordChannelId(ch.id) ?? ch.channel;
@@ -1375,11 +1378,7 @@ export async function runSessionStartAskCheck(
         const sentLine = sentGate
           ? sessionStartSentFlag(doc, history, botUserId, Date.now())
           : null;
-        for (const l of [line, sentLine]) {
-          if (!l) continue;
-          console.log(`[handoff] ${l}`);
-          sendDiscordMessage(ch, machine(l)).catch(() => {});
-        }
+        for (const l of [line, sentLine]) if (l) flagLines.add(l);
       } catch (e) {
         console.error(
           "[handover] session-start ask check failed:",
@@ -1387,6 +1386,13 @@ export async function runSessionStartAskCheck(
         );
       }
     }
+    if (flagLines.size === 0) return;
+    const detail = [...flagLines].join(" | ");
+    console.log(`[handoff] ${detail}`);
+    // hall-monitor#757 leg B: the flag is no longer self-posted; ONE
+    // fire-and-forget session_start event POST (hall-monitor owns the
+    // channel line via the webhook leg). Log-only on failure.
+    await sendLivenessEvent("session_start", detail);
   } catch (e) {
     console.error(
       "[handover] session-start ask check failed:",

@@ -2,16 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setLivenessHttp } from "./liveness-event";
 import {
   buildWakePayload,
   claimWake,
   cleanStopPath,
-  defaultDispatchWebhook,
   elapsedSeconds,
   elapsedStr,
   MAX_INFLIGHT,
   markWakePosted,
-  postWakePayload,
   type RunRecord,
   readCleanStop,
   readRunRecords,
@@ -19,8 +18,6 @@ import {
   selectInflight,
   WAKE_AUDIT_WINDOW_MS,
   WAKE_DEDUP_POSTED_WINDOW_MS,
-  type WakePayload,
-  type WakeTarget,
   wakeAuditEvaluate,
   wakeAuditInit,
   wakeAuditOutcome,
@@ -67,21 +64,27 @@ function rec(over: Partial<RunRecord>): RunRecord {
   };
 }
 
-// fake fetch: queue of (status|Error) results per call
-function fakeFetch(results: Array<number | Error>): {
-  impl: typeof fetch;
+// fake liveness event POST (hall-monitor#757 leg B): a queue of
+// (status|Error) results per call; records the url, the X-Agent-Key
+// header and the body. arm/disarm swap the injected HTTP leg.
+function fakeLiveness(results: Array<number | Error>): {
   calls: Array<{
     url: string;
     headers: Record<string, string>;
     body: string | undefined;
   }>;
+  arm: () => void;
+  disarm: () => void;
 } {
   const calls: Array<{
     url: string;
     headers: Record<string, string>;
     body: string | undefined;
   }> = [];
-  const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+  const impl = async (
+    url: string,
+    init: RequestInit,
+  ): Promise<{ ok: boolean; status: number }> => {
     const r = results.shift();
     calls.push({
       url: String(url),
@@ -89,9 +92,37 @@ function fakeFetch(results: Array<number | Error>): {
       body: typeof init?.body === "string" ? init.body : undefined,
     });
     if (r instanceof Error) throw r;
-    return new Response(null, { status: r ?? 200 });
-  }) as unknown as typeof fetch;
-  return { impl, calls };
+    const status = r ?? 200;
+    return { ok: status >= 200 && status < 300, status };
+  };
+  return {
+    calls,
+    arm: () => setLivenessHttp(impl as never),
+    disarm: () => setLivenessHttp(null),
+  };
+}
+
+// the bridge's existing hall-monitor setting (the event target).
+const LIVENESS_ENV = {
+  url: "http://hm.example/api",
+  key: "test-agent-key",
+  agent: "testagent",
+};
+
+function armLivenessEnv(): void {
+  process.env.JARATE_INBOX_URL = LIVENESS_ENV.url;
+  process.env.JARATE_INBOX_KEY = LIVENESS_ENV.key;
+  process.env.JARATE_INBOX_AGENT = LIVENESS_ENV.agent;
+  // pin the key-file seam to a missing file: the env key is the source,
+  // never a real on-box key file
+  process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-test-agent-key";
+}
+
+function disarmLivenessEnv(): void {
+  delete process.env.JARATE_INBOX_URL;
+  delete process.env.JARATE_INBOX_KEY;
+  delete process.env.JARATE_INBOX_AGENT;
+  delete process.env.JARATE_INBOX_KEY_FILE;
 }
 
 // ─── wake line builder (2026-10-31: plain italic, no embeds) ──────────
@@ -189,32 +220,6 @@ describe("selectInflight / elapsed", () => {
     expect(elapsedStr(1500)).toBe("25m");
     expect(elapsedStr(3 * 3600 + 12 * 60)).toBe("3h12m");
     expect(elapsedStr(2 * 86400)).toBe("2d");
-  });
-});
-
-// ─── bus webhook resolution (file branch + env precedence) ─────────────
-
-describe("defaultDispatchWebhook", () => {
-  const savedEnv = process.env.PI_DISPATCH_WEBHOOK;
-
-  afterEach(() => {
-    if (savedEnv === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
-    else process.env.PI_DISPATCH_WEBHOOK = savedEnv;
-  });
-
-  test("file branch: <home>/.config/pi-dispatch/webhook when env unset", () => {
-    delete process.env.PI_DISPATCH_WEBHOOK;
-    const p = path.join(tmp, ".config", "pi-dispatch");
-    fs.mkdirSync(p, { recursive: true });
-    fs.writeFileSync(path.join(p, "webhook"), "https://file.example/hook\n");
-    expect(defaultDispatchWebhook(tmp)).toBe("https://file.example/hook");
-  });
-
-  test("env beats file; env unset + missing file = null", () => {
-    process.env.PI_DISPATCH_WEBHOOK = "https://env.example/hook";
-    expect(defaultDispatchWebhook(tmp)).toBe("https://env.example/hook");
-    delete process.env.PI_DISPATCH_WEBHOOK;
-    expect(defaultDispatchWebhook(tmp)).toBe(null);
   });
 });
 
@@ -369,307 +374,169 @@ describe("markWakePosted (#322 G3)", () => {
   });
 });
 
-// ─── bounded post (pi-bg pattern) ────────────────────────────────────────
-
-describe("postWakePayload (issue #111)", () => {
-  const target: WakeTarget = { channelId: "1545018100590846033" };
-  const opts = { backoffMs: 1, timeoutMs: 50 };
-  const payload = (): WakePayload => ({
-    content: "*restart-wake \u00b7 planned*",
-  });
-
-  test("no token, no webhook = silent no-op (dev runs)", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    await expect(
-      postWakePayload(target, payload(), { ...opts, fetchImpl: impl }),
-    ).resolves.toBe(false);
-    expect(calls).toHaveLength(0);
-  });
-
-  test("bot route: posts the italic wake content to the channel messages API", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    await expect(
-      postWakePayload({ ...target, botToken: "tok" }, payload(), {
-        ...opts,
-        fetchImpl: impl,
-      }),
-    ).resolves.toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe(
-      "https://discord.com/api/v10/channels/1545018100590846033/messages",
-    );
-    expect(calls[0].headers.Authorization).toBe("Bot tok");
-    const body = JSON.parse(calls[0].body ?? "{}");
-    expect(body.content).toBe(payload().content);
-    expect(body.embeds).toBeUndefined();
-  });
-
-  test("webhook-only route works", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    await expect(
-      postWakePayload(
-        { ...target, webhookUrl: "https://discord.com/api/webhooks/1/abc" },
-        payload(),
-        { ...opts, fetchImpl: impl },
-      ),
-    ).resolves.toBe(true);
-    expect(calls[0].url).toBe("https://discord.com/api/webhooks/1/abc");
-  });
-
-  test("3 attempts on failure, backoff between (pi-bg pattern)", async () => {
-    const { impl, calls } = fakeFetch([500, 502, 200]);
-    const t0 = Date.now();
-    await expect(
-      postWakePayload({ ...target, botToken: "tok" }, payload(), {
-        ...opts,
-        fetchImpl: impl,
-      }),
-    ).resolves.toBe(true);
-    expect(calls).toHaveLength(3);
-    expect(Date.now() - t0).toBeLessThan(5_000); // backoff is 1ms here
-  });
-
-  test("all attempts fail = false (never throws)", async () => {
-    const boom = new Error("network down");
-    const { impl, calls } = fakeFetch([boom, 500, boom]);
-    await expect(
-      postWakePayload({ ...target, botToken: "tok" }, payload(), {
-        ...opts,
-        fetchImpl: impl,
-      }),
-    ).resolves.toBe(false);
-    expect(calls).toHaveLength(3);
-  });
-
-  test("webhook FIRST when both configured (the webhook bus is the wake route)", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    await expect(
-      postWakePayload(
-        {
-          ...target,
-          botToken: "tok",
-          webhookUrl: "https://discord.com/api/webhooks/1/abc",
-        },
-        payload(),
-        { ...opts, fetchImpl: impl },
-      ),
-    ).resolves.toBe(true);
-    expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe("https://discord.com/api/webhooks/1/abc");
-  });
-
-  test("webhook dead falls through to bot route", async () => {
-    const { impl, calls } = fakeFetch([500, 500, 500, 200]);
-    await expect(
-      postWakePayload(
-        { ...target, botToken: "tok", webhookUrl: "https://h/1" },
-        payload(),
-        { ...opts, fetchImpl: impl },
-      ),
-    ).resolves.toBe(true);
-    expect(calls).toHaveLength(4);
-    expect(calls[3].url).toBe(
-      "https://discord.com/api/v10/channels/1545018100590846033/messages",
-    );
-  });
-});
-
 // ─── orchestrator ────────────────────────────────────────────────────────
 
-describe("runRestartWake (issue #111)", () => {
+describe("runRestartWake (issue #111; hall-monitor#757 leg B)", () => {
   const runDir = () => path.join(tmp, "runs");
   const stateDir = () => path.join(tmp, ".tmp");
-  const target: WakeTarget = { channelId: "1", botToken: "tok" };
   let log: string[];
-  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
     // #328: an unclean start sets the once-per-process startup-suppress
     // flag; reset between tests (shared module registry)
     resetStartupMessageSuppressionForTests();
     log = [];
-    // deterministic bus-webhook resolution (the real file is env-dependent)
-    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+    armLivenessEnv();
   });
 
   afterEach(() => {
-    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
-    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
+    disarmLivenessEnv();
   });
 
-  test("reason != startup: no post, marker NOT consumed (hot reload)", async () => {
+  test("reason != startup: no event, marker NOT consumed (hot reload)", async () => {
     writeCleanStop(stateDir(), new Date(T0 - 60_000));
-    const { impl } = fakeFetch([200]);
+    const fl = fakeLiveness([200]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "reload",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r).toEqual({ posted: false, reason: "not-startup" });
     expect(fs.existsSync(cleanStopPath(stateDir()))).toBe(true);
+    expect(fl.calls).toHaveLength(0);
   });
 
-  test("no target (dev run): silent no-op, fetch never called", async () => {
-    const { impl, calls } = fakeFetch([200]);
+  test("no liveness config (dev run): one local log line, no event", async () => {
+    disarmLivenessEnv();
+    const fl = fakeLiveness([200]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target: null,
       now: T0,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r).toEqual({ posted: false, reason: "no-channel" });
-    expect(calls).toHaveLength(0);
+    expect(fl.calls).toHaveLength(0);
+    expect(log.join("\n")).toContain("[wake] no-channel");
   });
 
-  test("full wake: unclean restart, 1 inflight, italic line, bus webhook first", async () => {
+  test("full wake: unclean restart, 1 inflight = ONE back_online event, agent key + detail", async () => {
     // #328: the planned class no longer posts a card (the startup
-    // message is the post), so the card path is exercised here with
+    // message is the post), so the event path is exercised here with
     // the unclean class (no marker).
     writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
-    const { impl, calls } = fakeFetch([200]);
+    const fl = fakeLiveness([200]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r.posted).toBe(true);
     expect(r.reason).toBe("posted");
     expect(r.restartClass).toBe("unclean");
-    expect(calls).toHaveLength(1);
-    // the channel config has no webhookUrl -> the pi-bg bus resolves it,
-    // and the webhook post is the FIRST route (isBgWebhook)
-    expect(calls[0].url).toBe("https://bus.example/hook");
-    const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toBe(
-      "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
+    expect(fl.calls).toHaveLength(1);
+    expect(fl.calls[0].url).toBe(`${LIVENESS_ENV.url}/fleet/liveness/event`);
+    expect(fl.calls[0].headers["X-Agent-Key"]).toBe(LIVENESS_ENV.key);
+    const posted = JSON.parse(fl.calls[0].body ?? "{}");
+    expect(posted.agent).toBe(LIVENESS_ENV.agent);
+    expect(posted.event).toBe("back_online");
+    // plain (the italic channel markup is the webhook leg's concern)
+    expect(posted.detail).toBe(
+      "restart-wake \u00b7 unplanned \u00b7 in-flight 1",
     );
-    expect(posted.embeds).toBeUndefined();
+    // the result message still carries the pre-leg-B shape (logs/audit)
     expect(r.message).toBe(
       "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
     );
   });
 
-  test("channel webhookUrl beats the resolved bus webhook", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    await runRestartWake({
-      reason: "startup",
-      stateDir: stateDir(),
-      runDir: runDir(),
-      target: { ...target, webhookUrl: "https://ch.example/hook" },
-      now: T0,
-      fetchImpl: impl,
-      log: (l) => log.push(l),
-    });
-    expect(calls[0].url).toBe("https://ch.example/hook");
-  });
-
-  test("unclean + inflight posted line matches the builder", async () => {
-    writeRuns(runDir(), [rec({ run: "20261001-113000-7" })]);
-    const { impl, calls } = fakeFetch([200]);
+  test("unclean, zero inflight = the plain unplanned line (no suffix)", async () => {
+    const fl = fakeLiveness([200]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r.posted).toBe(true);
     expect(r.restartClass).toBe("unclean");
-    const posted = JSON.parse(calls[0].body ?? "{}");
-    expect(posted.content).toBe(
-      "*restart-wake \u00b7 unplanned \u00b7 in-flight 1*",
-    );
-    expect(posted.embeds).toBeUndefined();
+    const posted = JSON.parse(fl.calls[0].body ?? "{}");
+    expect(posted.detail).toBe("restart-wake \u00b7 unplanned");
   });
 
   test("dedup: second startup within the 5m window of a posted claim does not post", async () => {
-    const { impl, calls } = fakeFetch([200, 200]);
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
     const a = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
     const b = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0 + 30_000,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(a.posted).toBe(true);
     expect(b).toMatchObject({ posted: false, reason: "dedup" });
-    expect(calls).toHaveLength(1);
+    expect(fl.calls).toHaveLength(1);
   });
 
-  test("post failure: bounded, reported, never throws", async () => {
-    const { impl } = fakeFetch([
-      new Error("e1"),
-      new Error("e2"),
-      new Error("e3"), // bus webhook route: 3 attempts
-      new Error("e4"),
-      new Error("e5"),
-      new Error("e6"), // bot route: 3 attempts
-    ]);
+  test("post failure: reported, never throws (log-only)", async () => {
+    const fl = fakeLiveness([500]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
-      postOpts: { backoffMs: 1, timeoutMs: 50 },
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r).toMatchObject({ posted: false, reason: "post-failed" });
     expect(log.join(" ")).toContain("post-failed");
   });
 
   test("G3: a failed post leaves the claim unposted — the next start in-window still posts", async () => {
-    const boom = [500, 500, 500, 500, 500, 500, 200]; // 6 failures, then success
-    const { impl, calls } = fakeFetch(boom);
-    const postOpts = { backoffMs: 1, timeoutMs: 50 };
+    const fl = fakeLiveness([500, 200]);
+    fl.arm();
     const a = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
-      fetchImpl: impl,
-      postOpts,
       log: (l) => log.push(l),
     });
-    expect(a).toMatchObject({ posted: false, reason: "post-failed" });
     const b = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0 + 30_000,
-      fetchImpl: impl,
-      postOpts,
       log: (l) => log.push(l),
     });
+    fl.disarm();
+    expect(a).toMatchObject({ posted: false, reason: "post-failed" });
     expect(b.posted).toBe(true);
-    expect(calls).toHaveLength(7); // the signal cannot go dark twice in a row
+    expect(fl.calls).toHaveLength(2); // the signal cannot go dark twice in a row
   });
 
   test("G3: a legacy 2-field claim does not suppress", async () => {
@@ -678,27 +545,26 @@ describe("runRestartWake (issue #111)", () => {
       path.join(stateDir(), "restart-wake.lock"),
       `${T0} planned\n`,
     );
-    const { impl, calls } = fakeFetch([200]);
+    const fl = fakeLiveness([200]);
+    fl.arm();
     const r = await runRestartWake({
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0 + 10_000,
-      fetchImpl: impl,
       log: (l) => log.push(l),
     });
+    fl.disarm();
     expect(r.posted).toBe(true);
-    expect(calls).toHaveLength(1);
+    expect(fl.calls).toHaveLength(1);
   });
 
   test("G3: posted claim <= 5m old suppresses; posted claim > 5m old posts", async () => {
-    const { impl, calls } = fakeFetch([200, 200]);
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
     const base = {
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
-      fetchImpl: impl,
       log: (l: string) => log.push(l),
     };
     await runRestartWake({ ...base, reason: "startup", now: T0 });
@@ -715,8 +581,9 @@ describe("runRestartWake (issue #111)", () => {
       reason: "startup",
       now: T0 + 6 * 60_000,
     });
+    fl.disarm();
     expect(c.posted).toBe(true);
-    expect(calls).toHaveLength(2);
+    expect(fl.calls).toHaveLength(2);
   });
 });
 
@@ -725,21 +592,17 @@ describe("runRestartWake (issue #111)", () => {
 describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
   const runDir = () => path.join(tmp, "runs");
   const stateDir = () => path.join(tmp, ".tmp");
-  const target: WakeTarget = { channelId: "1", botToken: "tok" };
   let log: string[];
-  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
-    // #328: an unclean start sets the once-per-process startup-suppress
-    // flag; reset between tests (shared module registry)
     resetStartupMessageSuppressionForTests();
     log = [];
-    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+    armLivenessEnv();
   });
 
   afterEach(() => {
-    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
-    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
+    disarmLivenessEnv();
+    resetStartupMessageSuppressionForTests();
   });
 
   const run = (over: Partial<Parameters<typeof runRestartWake>[0]>) =>
@@ -747,101 +610,115 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
       log: (l) => log.push(l),
       ...over,
     } as Parameters<typeof runRestartWake>[0]);
 
-  // the terminal tokens (including the #328 suppressed-planned branch);
-  // each startup must end in exactly one
-  const terminalTokens =
-    /not-startup|no-channel|dedup suppressed|posted:|post-failed|suppressed-planned/;
-
   test("not-startup logs its reason", async () => {
+    const fl = fakeLiveness([200]);
+    fl.arm();
     await run({ reason: "reload" });
+    fl.disarm();
     expect(log.join("\n")).toContain("[wake] not-startup: reason=reload");
   });
 
   test("no-channel logs its reason", async () => {
-    await run({ target: null });
+    disarmLivenessEnv();
+    const fl = fakeLiveness([200]);
+    fl.arm();
+    await run({});
+    fl.disarm();
     expect(log.join("\n")).toContain("[wake] no-channel");
   });
 
   test("posted logs its reason", async () => {
-    const { impl } = fakeFetch([200]);
-    await run({ fetchImpl: impl });
+    const fl = fakeLiveness([200]);
+    fl.arm();
+    await run({});
+    fl.disarm();
     expect(log.join("\n")).toContain("[wake] posted: class=unclean");
   });
 
   test("post-failed logs its reason", async () => {
-    const { impl } = fakeFetch([500, 500, 500, 500, 500, 500]);
-    await run({ fetchImpl: impl, postOpts: { backoffMs: 1, timeoutMs: 50 } });
+    const fl = fakeLiveness([500]);
+    fl.arm();
+    await run({});
+    fl.disarm();
     expect(log.join("\n")).toContain("[wake] post-failed");
   });
 
-  test("dedup suppresses with the G1 line: age and same-class values are correct", async () => {
-    const { impl } = fakeFetch([200, 200]);
-    await run({ fetchImpl: impl });
+  test("dedup logs its G1 line: age and same-class value are correct", async () => {
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
+    await run({});
     log = [];
-    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    const b = await run({ now: T0 + 30_000 });
+    fl.disarm();
     expect(b).toMatchObject({ posted: false, reason: "dedup" });
-    // the dedup path logs EXACTLY one line, with the prior claim's age
-    // and its same-class verdict
     expect(log).toEqual(["[wake] dedup suppressed: age=30000 same-class=true"]);
   });
 
+  // terminal tokens (incl. the #328 suppressed-planned branch); every startup
+  // must end in exactly one
+  const terminalTokens =
+    /not-startup|no-channel|dedup suppressed|posted:|post-failed|suppressed-planned/;
+
   test("every startup ends in exactly one terminal line (grep-able)", async () => {
-    const cases: Array<{ label: string; over: Record<string, unknown> }> = [
+    type Case = {
+      label: string;
+      over: Record<string, unknown>;
+      noLiveness?: boolean;
+      fail?: boolean;
+      cleanStop?: boolean;
+    };
+    const cases: Case[] = [
       { label: "not-startup", over: { reason: "reload" } },
-      { label: "no-channel", over: { target: null } },
+      { label: "no-channel", over: {}, noLiveness: true },
       { label: "posted", over: {} },
+      { label: "post-failed", over: {}, fail: true },
       {
-        label: "post-failed",
-        over: { postOpts: { backoffMs: 1, timeoutMs: 50 } },
-      },
-      { label: "suppressed-planned", over: {} }, // #328: fresh marker = planned
+        label: "suppressed-planned",
+        over: {},
+        cleanStop: true,
+      }, // #328: a fresh marker = planned
     ];
     for (const c of cases) {
-      // fresh state dir per case: the claim file must not leak across
       const sd = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-g1-"));
       try {
-        // the suppressed-planned branch: a fresh clean-stop marker makes
-        // the start classified planned (startup message is the post)
-        if (c.label === "suppressed-planned")
-          writeCleanStop(sd, new Date(T0 - 60_000));
-        const { impl } = fakeFetch(
-          c.label === "posted" ? [200] : [500, 500, 500, 500, 500, 500],
-        );
+        if (c.cleanStop) writeCleanStop(sd, new Date(T0 - 60_000));
+        if (c.noLiveness) disarmLivenessEnv();
+        else armLivenessEnv();
+        const fl = fakeLiveness(c.fail ? [500] : [200]);
+        fl.arm();
         log = [];
         await runRestartWake({
           reason: "startup",
           stateDir: sd,
           runDir: runDir(),
-          target,
           now: T0,
-          fetchImpl: impl,
           log: (l) => log.push(l),
           ...c.over,
         });
+        fl.disarm();
         const hits = log.filter((l) => terminalTokens.test(l));
         expect(hits, c.label).toHaveLength(1);
       } finally {
         fs.rmSync(sd, { recursive: true, force: true });
       }
     }
-    // the dedup branch: one state dir, posted first start, second start
+    // the dedup branch: a shared state dir, first start posts, the second
     const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "piscord-g1-"));
     try {
-      const { impl: impl2 } = fakeFetch([200, 200]);
+      armLivenessEnv();
+      const fl = fakeLiveness([200, 200]);
+      fl.arm();
       log = [];
       await runRestartWake({
         reason: "startup",
         stateDir: fresh,
         runDir: runDir(),
-        target,
         now: T0,
-        fetchImpl: impl2,
         log: (l) => log.push(l),
       });
       log = [];
@@ -849,11 +726,10 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
         reason: "startup",
         stateDir: fresh,
         runDir: runDir(),
-        target,
         now: T0 + 30_000,
-        fetchImpl: impl2,
         log: (l) => log.push(l),
       });
+      fl.disarm();
       expect(log.filter((l) => terminalTokens.test(l))).toHaveLength(1);
       expect(log.join("\n")).toContain("dedup suppressed");
     } finally {
@@ -861,8 +737,6 @@ describe("runRestartWake G1 (issue #322: no silent terminal state)", () => {
     }
   });
 });
-
-// ─── #322 G2: per-window numeric audit (no inference) ──────────────────
 
 describe("wake audit G2 (issue #322)", () => {
   const W = WAKE_AUDIT_WINDOW_MS;
@@ -922,12 +796,12 @@ describe("wake audit G2 (issue #322)", () => {
     const s = wakeAuditInit();
     const ws = Math.floor(T0 / W) * W;
     const log: string[] = [];
-    const { impl, calls } = fakeFetch([200, 200]);
+    armLivenessEnv();
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
     const base = {
       stateDir: path.join(tmp, ".tmp"),
       runDir: path.join(tmp, "runs"),
-      target: { channelId: "1", botToken: "tok" } as WakeTarget,
-      fetchImpl: impl,
       log: (l: string) => log.push(l),
       auditState: s,
     };
@@ -944,8 +818,10 @@ describe("wake audit G2 (issue #322)", () => {
       reason: "startup",
       now: ws + W + 10_000,
     });
+    fl.disarm();
+    disarmLivenessEnv();
     expect(r2.reason).toBe("posted");
-    expect(calls).toHaveLength(2);
+    expect(fl.calls).toHaveLength(2);
     const joined = log.join("\n");
     expect(joined).toContain("[wake] audit flag:");
     expect(joined).toContain("starts=2");
@@ -957,22 +833,19 @@ describe("wake audit G2 (issue #322)", () => {
 // ─── #328: one post per restart (planned -> startup message only,
 // unplanned -> restart-wake card only) ──────────────────────────────
 
-describe("runRestartWake #328 (one post per restart)", () => {
+describe("runRestartWake #328 (one post per restart; leg B: event + startup message)", () => {
   const runDir = () => path.join(tmp, "runs");
   const stateDir = () => path.join(tmp, ".tmp");
-  const target: WakeTarget = { channelId: "1", botToken: "tok" };
   let log: string[];
-  const savedBusHook = process.env.PI_DISPATCH_WEBHOOK;
 
   beforeEach(() => {
     log = [];
-    process.env.PI_DISPATCH_WEBHOOK = "https://bus.example/hook";
+    armLivenessEnv();
     resetStartupMessageSuppressionForTests();
   });
 
   afterEach(() => {
-    if (savedBusHook === undefined) delete process.env.PI_DISPATCH_WEBHOOK;
-    else process.env.PI_DISPATCH_WEBHOOK = savedBusHook;
+    disarmLivenessEnv();
     resetStartupMessageSuppressionForTests();
   });
 
@@ -981,22 +854,23 @@ describe("runRestartWake #328 (one post per restart)", () => {
       reason: "startup",
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
       now: T0,
       log: (l) => log.push(l),
       ...over,
     } as Parameters<typeof runRestartWake>[0]);
 
-  test("planned: the card is NOT sent (zero fetch calls), reason is suppressed-planned, the startup message is NOT suppressed", async () => {
+  test("planned: the event is NOT sent (zero event calls), reason is suppressed-planned, the startup message is NOT suppressed", async () => {
     writeCleanStop(stateDir(), new Date(T0 - 60_000));
-    const { impl, calls } = fakeFetch([200]);
-    const r = await run({ fetchImpl: impl });
+    const fl = fakeLiveness([200]);
+    fl.arm();
+    const r = await run({});
+    fl.disarm();
     expect(r).toEqual({
       posted: false,
       reason: "suppressed-planned",
       restartClass: "planned",
     });
-    expect(calls).toHaveLength(0); // no card -> no hall-monitor page
+    expect(fl.calls).toHaveLength(0); // no card -> no hall-monitor page
     expect(log.join("\n")).toContain(
       "[wake] suppressed-planned: startup message is the post",
     );
@@ -1004,50 +878,55 @@ describe("runRestartWake #328 (one post per restart)", () => {
     expect(isStartupMessageSuppressedForThisStart()).toBe(false);
   });
 
-  test("planned consumes the marker but takes no claim: the next unclean start still posts its card", async () => {
+  test("planned consumes the marker but takes no claim: the next unclean start still sends its event", async () => {
     writeCleanStop(stateDir(), new Date(T0 - 60_000));
-    const { impl, calls } = fakeFetch([200, 200]);
-    const a = await run({ fetchImpl: impl });
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
+    const a = await run({});
     expect(a.reason).toBe("suppressed-planned");
     expect(fs.existsSync(cleanStopPath(stateDir()))).toBe(false); // consumed
-    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    const b = await run({ now: T0 + 30_000 });
+    fl.disarm();
     expect(b).toMatchObject({ posted: true, reason: "posted" });
-    expect(calls).toHaveLength(1); // only the unclean card was ever posted
+    expect(fl.calls).toHaveLength(1); // only the unclean event was ever sent
   });
 
-  test("unclean: the card is the post and the startup message is suppressed (flag set)", async () => {
-    const { impl, calls } = fakeFetch([200]);
-    const r = await run({ fetchImpl: impl });
+  test("unclean: the event is the post and the startup message is suppressed (flag set)", async () => {
+    const fl = fakeLiveness([200]);
+    fl.arm();
+    const r = await run({});
+    fl.disarm();
     expect(r).toMatchObject({
       posted: true,
       reason: "posted",
       restartClass: "unclean",
     });
-    expect(calls).toHaveLength(1);
+    expect(fl.calls).toHaveLength(1);
     expect(isStartupMessageSuppressedForThisStart()).toBe(true);
   });
 
-  test("crash-flap: the deduped second unclean start also suppresses the startup message (one card total)", async () => {
-    const { impl, calls } = fakeFetch([200, 200]);
-    const a = await run({ fetchImpl: impl });
+  test("crash-flap: the deduped second unclean start also suppresses the startup message (one event total)", async () => {
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
+    const a = await run({});
     expect(a.posted).toBe(true);
     expect(isStartupMessageSuppressedForThisStart()).toBe(true);
-    const b = await run({ fetchImpl: impl, now: T0 + 30_000 });
+    const b = await run({ now: T0 + 30_000 });
+    fl.disarm();
     expect(b).toMatchObject({ posted: false, reason: "dedup" });
     expect(isStartupMessageSuppressedForThisStart()).toBe(true);
-    expect(calls).toHaveLength(1); // the second start adds no post
+    expect(fl.calls).toHaveLength(1); // the second start adds no post
   });
 
   test("G2: a window mixing posted + suppressed-planned + dedup stays closed (no flag)", async () => {
     const s = wakeAuditInit();
     const ws = Math.floor(T0 / WAKE_AUDIT_WINDOW_MS) * WAKE_AUDIT_WINDOW_MS;
     const logLines: string[] = [];
-    const { impl } = fakeFetch([200, 200]);
+    const fl = fakeLiveness([200, 200]);
+    fl.arm();
     const base = {
       stateDir: stateDir(),
       runDir: runDir(),
-      target,
-      fetchImpl: impl,
       log: (l: string) => logLines.push(l),
       auditState: s,
     };
@@ -1072,6 +951,7 @@ describe("runRestartWake #328 (one post per restart)", () => {
       reason: "startup",
       now: ws + 25_000,
     });
+    fl.disarm();
     expect(r3.reason).toBe("dedup");
     expect(wakeAuditEvaluate(s)).toBeNull();
     expect(logLines.join("\n")).not.toContain("[wake] audit flag:");
