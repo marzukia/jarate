@@ -16,10 +16,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { sendDiscordMessage } from "./discord";
 import { resolveHandoffSettings } from "./handover";
 import { lastActiveChannel } from "./index";
 import { machine } from "./live";
+import { sendLivenessEvent } from "./liveness-event";
 import { sanitizeUnknownValue } from "./sanitize";
 import { defaultHome } from "./todos";
 import { getDefaultChannel, loadChannelConfig } from "./types";
@@ -119,9 +119,15 @@ function rotationStaleTick(ctx: ExtensionContext): void {
     liveSizeBytes,
   });
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(ctx.cwd));
+  // op order 2026-11-12 (piboy channel): the #315 alert fires through the
+  // hall-monitor webhook leg (liveness event, the #370 leg-B pattern) - the
+  // line lands under the WEBHOOK identity (post_channel_line), never the
+  // agent's own bot. Fire-and-forget, log-only on failure (a dead
+  // hall-monitor degrades to the console log + the sweep, the #370 posture).
+  // ch is kept for the discord-type gate only.
   const say = (line: string): void => {
     if (ch?.type === "discord")
-      sendDiscordMessage(ch, machine(line)).catch(() => {});
+      void sendLivenessEvent("rotation_stale", machine(line));
   };
   if (stale) {
     console.log(

@@ -30,6 +30,7 @@ import extension, {
   verboseOverride,
 } from "./index";
 import { machine, stopAllOpTicks } from "./live";
+import { setLivenessHttp } from "./liveness-event";
 import { settlePiCompact } from "./pi-compact-guard";
 import {
   clearQueuedInbound,
@@ -1841,12 +1842,28 @@ describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
   let storeDir = "";
   let liveFile = "";
   let posted: string[] = [];
-  const realFetch = globalThis.fetch;
+  const oldInboxEnv: Record<string, string | undefined> = {};
 
   beforeEach(() => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), "315-watch-"));
     oldHome = process.env.HOME || "";
     process.env.HOME = path.join(tmp, "home");
+    // op order 2026-11-12: the alert fires through the liveness-event
+    // seam (hall-monitor webhook leg, #370 leg B), not the agent-bot
+    // /messages POST — the test arms that seam (#757 house pattern:
+    // injected HTTP leg + JARATE_INBOX_* config), so no leg touches the
+    // live hall-monitor API and no real key file is read.
+    for (const k of [
+      "JARATE_INBOX_URL",
+      "JARATE_INBOX_KEY",
+      "JARATE_INBOX_AGENT",
+      "JARATE_INBOX_KEY_FILE",
+    ])
+      oldInboxEnv[k] = process.env[k];
+    process.env.JARATE_INBOX_URL = "http://test.local/api";
+    process.env.JARATE_INBOX_KEY = "testkey";
+    process.env.JARATE_INBOX_AGENT = "testagent";
+    process.env.JARATE_INBOX_KEY_FILE = "/nonexistent/jarate-315-test-key";
     fs.mkdirSync(path.join(tmp, "home", ".pi", "agent"), { recursive: true });
     proj = path.join(tmp, "proj");
     fs.mkdirSync(proj, { recursive: true });
@@ -1881,28 +1898,24 @@ describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
     // (the fake clock is pinned at 2000) and the live file is older.
     fs.utimesSync(liveFile, new Date(500), new Date(500));
     posted = [];
-    globalThis.fetch = (async (url: any, init?: any) => {
-      if (init?.method === "POST" && String(url).endsWith("/messages")) {
-        posted.push(String(init?.body));
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ id: "out1" }),
-          text: async () => "",
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({}),
-        text: async () => "",
-      };
-    }) as any;
+    // The alert leg: one POST per say. The capture runs synchronously
+    // (the impl is invoked before sendLivenessEvent's first await), so
+    // the latch assertions below need no flush.
+    setLivenessHttp((url: any, init?: any) => {
+      if (!String(url).endsWith("/fleet/liveness/event"))
+        throw new Error(`unexpected liveness url ${url}`);
+      posted.push(String(init?.body));
+      return Promise.resolve({ ok: true, status: 200 });
+    });
   });
   afterEach(() => {
     jest.useRealTimers();
     clearRotationStaleWatch();
-    globalThis.fetch = realFetch;
+    setLivenessHttp(null);
+    for (const [k, v] of Object.entries(oldInboxEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
     process.env.HOME = oldHome;
     fs.rmSync(tmp, { recursive: true, force: true });
   });
@@ -1919,6 +1932,7 @@ describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
     ctx.sessionManager = { getSessionFile: () => liveFile };
     armRotationStaleWatch(ctx);
     expect(posted.length).toBe(1); // the immediate check: stale
+    expect(posted[0]).toContain("rotation_stale"); // the machine-lane event
     expect(posted[0]).toContain("ROTATION-STALE");
     jest.advanceTimersByTime(5 * 60_000); // one tick: still latched
     expect(posted.length).toBe(1);
@@ -1946,6 +1960,7 @@ describe("#315 P0: rotation-stale watch (arm / tick / clear)", () => {
     fs.utimesSync(liveFile, new Date(2_001), new Date(2_001));
     armRotationStaleWatch(ctx);
     expect(posted.length).toBe(1);
+    expect(posted[0]).toContain("rotation_stale"); // the machine-lane event
     expect(posted[0]).toContain("above 1.5 MB");
     expect(posted[0]).not.toContain("ROTATION-STALE");
   });
