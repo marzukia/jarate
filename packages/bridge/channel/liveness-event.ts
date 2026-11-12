@@ -27,7 +27,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { keyFileCandidates, readKeyFile } from "./version-drift";
 
-export type LivenessEvent = "session_start" | "back_online" | "online";
+export type LivenessEvent =
+  | "session_start"
+  | "back_online"
+  | "online"
+  | "rotation_stale";
 
 export interface LivenessTarget {
   base: string;
