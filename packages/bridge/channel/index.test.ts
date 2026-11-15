@@ -63,6 +63,7 @@ import {
 } from "./queue";
 import { setProcessExitHookForTest } from "./restart-ops";
 import { getCurrentSessionFile, rewakeCommitDelivered } from "./restart-queue";
+import { loadWakes, markClaimed, scheduleWake } from "./sleep";
 import { resetStartupMessageSuppressionForTests } from "./startup-suppress";
 import { fit } from "./todos";
 import { type ChannelMessage, loadChannelConfig } from "./types";
@@ -2950,6 +2951,121 @@ describe("extension handlers (A1/A2/A4)", () => {
     await handlers.session_start?.(null, ctx);
     process.env.HOME = oldHome;
     expect(sent.length).toBe(sentBefore);
+  });
+
+  // #373: a fleet say (machine-wake lane, webhook-posted) must NOT cancel
+  // the agent's pending sleep wakes; a human inbound cancels and the
+  // injected body carries a note listing every cancelled wake. The wake
+  // store follows defaultHome() = process.env.HOME — pointed at the
+  // per-test tmp dir (the harness's .pi dir lives there already).
+  const T0746 = Date.parse("2026-11-15T07:46:00Z");
+  const T0747 = Date.parse("2026-11-15T07:47:00Z");
+
+  test("#373: a webhook (machine-wake lane) inbound does NOT cancel pending wakes", async () => {
+    const oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    try {
+      const a = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0746,
+        home: tmp,
+        now: T0746,
+      });
+      const b = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0747,
+        home: tmp,
+        now: T0746,
+      });
+      // a peer agent's say: bot message posted via webhook
+      const say = inbound("say hello from the fleet", "m373a");
+      say.fromWebhook = true;
+      await handleInbound(pi, say, ctx);
+      const wakes = loadWakes(tmp);
+      expect(wakes.map((w) => w.id).sort()).toEqual([a.id, b.id].sort());
+      expect(wakes.every((w) => w.status === "pending")).toBe(true);
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+
+  test("#373: a human inbound cancels pending wakes AND the injected body carries the note (every wake id + time)", async () => {
+    const oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    try {
+      const a = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0746,
+        home: tmp,
+        now: T0746,
+      });
+      const b = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0747,
+        home: tmp,
+        now: T0746,
+      });
+      const sentBefore = sent.length;
+      await handleInbound(pi, inbound("stop the noise", "m373b"), ctx);
+      expect(loadWakes(tmp)).toHaveLength(0); // both pending wakes gone
+      const m = sent
+        .slice(sentBefore)
+        .find((s) => s.m.customType === "channel-inbound");
+      expect(m).toBeDefined();
+      const expectedNote = `\n(this message cancelled your pending sleep wakes: 07:46Z ${a.id}, 07:47Z ${b.id} - re-sleep if you still need them)`;
+      // LLM context + TUI display body both carry the note
+      expect(m?.m.content).toContain(expectedNote);
+      expect(m?.m.details?.body).toContain(expectedNote);
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+
+  test("#373: claimed (mid-delivery) wakes are left alone on BOTH paths", async () => {
+    const oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    try {
+      // webhook path: pending + claimed both survive
+      const p1 = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0746,
+        home: tmp,
+        now: T0746,
+      });
+      const c1 = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0747,
+        home: tmp,
+        now: T0746,
+      });
+      markClaimed(c1.id, T0746, tmp);
+      const say = inbound("say again", "m373c0");
+      say.fromWebhook = true;
+      await handleInbound(pi, say, ctx);
+      expect(
+        loadWakes(tmp)
+          .map((w) => w.id)
+          .sort(),
+      ).toEqual([p1.id, c1.id].sort());
+      expect(loadWakes(tmp).find((w) => w.id === c1.id)?.status).toBe(
+        "claimed",
+      );
+      // human path: the pending one is cancelled, the claimed one survives
+      const p2 = scheduleWake({
+        channelId: "ch1",
+        wakeAt: T0747 + 60000,
+        home: tmp,
+        now: T0746,
+      });
+      await handleInbound(pi, inbound("human hi", "m373c1"), ctx);
+      const remaining = loadWakes(tmp);
+      expect(remaining.map((w) => w.id).sort()).toEqual([c1.id]);
+      // the pending one is gone; the claimed one is still claimed
+      expect(remaining.find((w) => w.id === p2.id)).toBeUndefined();
+      expect(remaining.find((w) => w.id === c1.id)?.status).toBe("claimed");
+    } finally {
+      process.env.HOME = oldHome;
+    }
   });
 });
 

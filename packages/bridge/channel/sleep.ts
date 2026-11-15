@@ -200,6 +200,30 @@ export function completeWake(id: string, home = defaultHome()): boolean {
 }
 
 /**
+ * Cancel all PENDING wakes for a channel and return the removed entries
+ * (claimed ones are mid-delivery and left alone). #373: the cancel-on-
+ * inbound note needs each cancelled wake's id + time, so the detailed
+ * variant hands the entries back. Kimaki parity: any real inbound human
+ * message means the agent is awake again, so the pending wake is stale.
+ */
+export function cancelPendingWakesDetailed(
+  channelId: string,
+  home = defaultHome(),
+): SleepWake[] {
+  const wakes = wakeStore.load(home);
+  const removed = wakes.filter(
+    (w) => w.channelId === channelId && w.status === "pending",
+  );
+  if (removed.length > 0) {
+    const next = wakes.filter(
+      (w) => !(w.channelId === channelId && w.status === "pending"),
+    );
+    wakeStore.save(next, home);
+  }
+  return removed;
+}
+
+/**
  * Cancel all PENDING wakes for a channel (claimed ones are mid-delivery and
  * left alone). Kimaki parity: any real inbound user message means the agent
  * is awake again, so the pending wake is stale. Returns the count removed.
@@ -208,13 +232,28 @@ export function cancelPendingWakes(
   channelId: string,
   home = defaultHome(),
 ): number {
-  const wakes = wakeStore.load(home);
-  const next = wakes.filter(
-    (w) => !(w.channelId === channelId && w.status === "pending"),
-  );
-  const removed = wakes.length - next.length;
-  if (removed > 0) wakeStore.save(next, home);
-  return removed;
+  return cancelPendingWakesDetailed(channelId, home).length;
+}
+
+/**
+ * #373: the note appended to an inbound that cancelled the agent's pending
+ * sleep wakes - a silent state change of the agent's own scheduler is the
+ * bug class, so the transcript must show it. Lists every cancelled wake
+ * (HH:MMZ UTC + id, oldest first):
+ *   (this message cancelled your pending sleep wakes: 07:46Z mwhir59d-9atn,
+ *    07:47Z mwhivspp-bevq - re-sleep if you still need them)
+ */
+export function formatCancelledWakesNote(wakes: SleepWake[]): string {
+  const items = [...wakes]
+    .sort((a, b) => a.wakeAt - b.wakeAt)
+    .map((w) => {
+      const d = new Date(w.wakeAt);
+      const hh = String(d.getUTCHours()).padStart(2, "0");
+      const mm = String(d.getUTCMinutes()).padStart(2, "0");
+      return `${hh}:${mm}Z ${w.id}`;
+    })
+    .join(", ");
+  return `(this message cancelled your pending sleep wakes: ${items} - re-sleep if you still need them)`;
 }
 
 /**

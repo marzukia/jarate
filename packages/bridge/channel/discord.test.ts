@@ -7,6 +7,7 @@ import { clearRegistryCache } from "./censor";
 import { pruneSeenIds, seedSeenSets, wakeEmbedKey } from "./channel-state";
 import {
   allowedMentionsFor,
+  buildChannelMessageFromRaw,
   clearDiscordStatesForTest,
   connectDiscord,
   connectDiscordPresence,
@@ -1396,6 +1397,36 @@ test("isBgWebhook exempts ANY webhook-posted bot message (no keyword filter)", (
   // non-webhook bot message with [bg: text is NOT exempt
   expect(isBgWebhook({ content: "[bg:x]", author: { bot: true } })).toBe(false);
   expect(isBgWebhook(null)).toBe(false);
+});
+
+test("buildChannelMessageFromRaw plumbs fromWebhook (machine-wake lane, #373)", () => {
+  const config = { id: "c1", name: "Test" } as any;
+  // webhook-posted bot message (fleet say / bg callback): flagged
+  expect(
+    buildChannelMessageFromRaw(config, {
+      id: "900",
+      content: "say hi",
+      webhook_id: "w1",
+      author: { bot: true, username: "bot" },
+      timestamp: "2026-11-15T07:38:29Z",
+    }).fromWebhook,
+  ).toBe(true);
+  // plain (non-webhook) inbound: undefined (the human path)
+  expect(
+    buildChannelMessageFromRaw(config, {
+      id: "901",
+      content: "hi",
+      author: { username: "u" },
+    }).fromWebhook,
+  ).toBeUndefined();
+  // non-webhook bot message (filtered upstream anyway): undefined
+  expect(
+    buildChannelMessageFromRaw(config, {
+      id: "902",
+      content: "x",
+      author: { bot: true, username: "bot" },
+    }).fromWebhook,
+  ).toBeUndefined();
 });
 
 // ─── Queue control: MESSAGE_UPDATE / MESSAGE_DELETE gateway dispatch ─────
