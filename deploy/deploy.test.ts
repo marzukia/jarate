@@ -33,7 +33,18 @@
  *    receives); the EXIT-only path records once on nonzero exit, zero on
  *    zero; an early TERM (DEPLOY_TRIED empty) no-ops via the existing guard.
  *
- * 3. #319 guards (the 2026-11-01 franky incident: the backoff skipped the whole tick, so a dead pi.service stayed down 11h): - liveness decoupled from the backoff: the pi liveness check runs on EVERY tick (even backed-off / up-to-date ticks), counts consecutive down ticks in state line 3 ("pi-down <n>"), and on the 3rd down tick ("> 2", per the issue design) restarts the service + logs one PAGE line per episode; an active service resets the counter (line 3 dropped); record_fail preserves line 3 and stamps line 2 with the fail epoch. - backoff expiry: a backed-off commit's skip is time-boxed by the first-fail epoch on line 2 (JARATE_BACKOFF_MAX_AGE_S, default 3600s); a stale or legacy (timestamp-less) line forces a deploy attempt, which re-arms the backoff with a fresh timestamp.
+ * 3. #319 guards (the 2026-11-01 franky incident: the backoff skipped the whole tick, so a dead pi.service stayed down 11h): - liveness decoupled from the backoff: the pi liveness check runs on EVERY tick (even backed-off / up-to-date ticks), counts consecutive down ticks in state line 3 ("pi-down <n>"), and on the 3rd down tick ("> 2", per the issue design) restarts the service + logs one PAGE line per episode; an active service resets the counter (line 3 dropped); record_fail preserves line 3 and stamps line 2 with the fail epoch.
+ *
+ * 4. Hermeticity (#375): the fixture's git processes run under
+ *    GIT_CONFIG_GLOBAL=GIT_CONFIG_SYSTEM=/dev/null, and the bare test
+ *    origin is pinned to an empty scratch core.hooksPath, so a
+ *    user-global gitconfig whose core.hooksPath pre-receive protects
+ *    main (a fleetwork mirror guard) can neither reject the fixture
+ *    push (13 of 29 tests failed on the one agent box that carries it,
+ *    backing the deploy off on a CI-green commit) nor reach the deploy
+ *    under test. The regression below simulates exactly that hostile
+ *    global config and asserts the push flow still succeeds, with a
+ *    negative control proving an unisolated origin is rejected. - backoff expiry: a backed-off commit's skip is time-boxed by the first-fail epoch on line 2 (JARATE_BACKOFF_MAX_AGE_S, default 3600s); a stale or legacy (timestamp-less) line forces a deploy attempt, which re-arms the backoff with a fresh timestamp.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
@@ -57,10 +68,54 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const countOf = (s: string, needle: string) => s.split(needle).length - 1;
 
-const revParse = (repo: string, ref: string) =>
+const revParse = (repo: string, ref: string, env: Record<string, string>) =>
   execSync(`git -C "${repo}" rev-parse "${ref}"`, {
     encoding: "utf8",
+    env: { ...process.env, ...env },
   }).trim();
+
+/**
+ * The self-test git flow (shared by every fixture and the #375
+ * regression): a bare origin + a work repo; commit A pushed to main,
+ * then wip commit B pushed on top. Every git call runs under `env` so
+ * the caller controls the git config environment. The bare origin is
+ * additionally pinned to an empty scratch core.hooksPath, so a hostile
+ * user-global hooksPath (a mirror-guard pre-receive protecting main)
+ * can never be inherited by the test origin.
+ */
+function makeGitOrigin(
+  repo: string,
+  origin: string,
+  hooksDir: string,
+  env: Record<string, string>,
+): void {
+  fs.mkdirSync(hooksDir, { recursive: true });
+  const run = (cmd: string) =>
+    execSync(cmd, { encoding: "utf8", env: { ...process.env, ...env } });
+  run(`git init --bare -q -b main "${origin}"`);
+  run(`git -C "${origin}" config core.hooksPath "${hooksDir}"`);
+  run(`git init -q -b main "${repo}"`);
+  run(
+    `git -C "${repo}" config user.email deploy@test && ` +
+      `git -C "${repo}" config user.name deploy-test && ` +
+      `git -C "${repo}" config commit.gpgsign false && ` +
+      `git -C "${repo}" config core.hooksPath "${hooksDir}"`,
+  );
+  run(
+    `printf 'a\\n' > "${repo}/f" && ` +
+      `git -C "${repo}" add f && ` +
+      `git -C "${repo}" commit -qm A && ` +
+      `git -C "${repo}" remote add origin "${origin}" && ` +
+      `git -C "${repo}" push -q origin HEAD:main`,
+  );
+  run(
+    `git -C "${repo}" checkout -qb wip && ` +
+      `printf 'b\\n' >> "${repo}/f" && ` +
+      `git -C "${repo}" commit -qam B && ` +
+      `git -C "${repo}" push -q origin wip:main && ` +
+      `git -C "${repo}" checkout -q main`,
+  );
+}
 
 const read = (p: string) =>
   fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
@@ -173,30 +228,19 @@ function fixture(): Fixture {
   fs.mkdirSync(bunBin, { recursive: true });
   fs.mkdirSync(xdg, { recursive: true });
 
+  // Hermetic git config for every git process the fixture touches
+  // (#375): a user-global gitconfig whose core.hooksPath pre-receive
+  // protects main (a fleetwork mirror guard) must neither reject the
+  // fixture push nor reach the deploy under test. The origin is
+  // additionally pinned to an empty scratch core.hooksPath.
+  const gitEnv = {
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  };
   // Local git origin: main = A locally, B on origin (one pending roll).
-  execSync(`git init --bare -q -b main "${origin}"`);
-  execSync(`git init -q -b main "${repo}"`);
-  execSync(
-    `git -C "${repo}" config user.email deploy@test && ` +
-      `git -C "${repo}" config user.name deploy-test && ` +
-      `git -C "${repo}" config commit.gpgsign false`,
-  );
-  execSync(
-    `printf 'a\\n' > "${repo}/f" && ` +
-      `git -C "${repo}" add f && ` +
-      `git -C "${repo}" commit -qm A && ` +
-      `git -C "${repo}" remote add origin "${origin}" && ` +
-      `git -C "${repo}" push -q origin HEAD:main`,
-  );
-  execSync(
-    `git -C "${repo}" checkout -qb wip && ` +
-      `printf 'b\\n' >> "${repo}/f" && ` +
-      `git -C "${repo}" commit -qam B && ` +
-      `git -C "${repo}" push -q origin wip:main && ` +
-      `git -C "${repo}" checkout -q main`,
-  );
-  const a = revParse(repo, "main");
-  const b = revParse(repo, "origin/main");
+  makeGitOrigin(repo, origin, path.join(tmp, "origin-hooks"), gitEnv);
+  const a = revParse(repo, "main", gitEnv);
+  const b = revParse(repo, "origin/main", gitEnv);
 
   // State: A deployed, no fails yet. install.sh stub (deploy.sh runs
   // `bash $REPO/install.sh --jarate-dir $REPO` for the machine links).
@@ -241,6 +285,8 @@ function fixture(): Fixture {
   env.XDG_RUNTIME_DIR = xdg;
   env.DEPLOY_TEST_BUN_MARK = markerPath;
   env.DEPLOY_TEST_BUN_MODE = "fail";
+  env.GIT_CONFIG_GLOBAL = gitEnv.GIT_CONFIG_GLOBAL;
+  env.GIT_CONFIG_SYSTEM = gitEnv.GIT_CONFIG_SYSTEM;
 
   const state = () => fs.readFileSync(path.join(repo, ".deploy-state"), "utf8");
   const failLine = () =>
@@ -630,6 +676,8 @@ describe("deploy.sh #315: idle boundary (no mid-turn roll)", () => {
       env: {
         ...process.env,
         HOME: path.join(tmp, "home"),
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
         ...env,
       },
     });
@@ -702,6 +750,8 @@ case "$SCENARIO" in`,
       env: {
         ...process.env,
         HOME: path.join(tmp, "home"),
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
         JARATE_IDLE_QUIET_S: "20",
       },
     });
@@ -709,5 +759,68 @@ case "$SCENARIO" in`,
     const log = fs.readFileSync(path.join(tmp, "hlog"), "utf8");
     expect(code).toBe(0);
     expect(log).toContain("idle boundary: last session write");
+  });
+});
+
+describe("deploy self-tests: hermetic against a hostile user-global gitconfig (#375)", () => {
+  test("the fixture push flow succeeds under a global hooksPath that protects main", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jarate-deploy-git-"));
+    tmpDirs.push(tmp);
+    const repo = path.join(tmp, "repo");
+    const origin = path.join(tmp, "origin.git");
+
+    // The hostile global config: core.hooksPath -> a dir whose
+    // pre-receive rejects pushes to main (a fleetwork mirror guard).
+    const globalHooks = path.join(tmp, "global-hooks");
+    fs.mkdirSync(globalHooks, { recursive: true });
+    const preReceive = path.join(globalHooks, "pre-receive");
+    fs.writeFileSync(
+      preReceive,
+      [
+        "#!/bin/sh",
+        'echo "fleetwork mirror: refs/heads/main is protected"',
+        "exit 1",
+      ].join("\n"),
+    );
+    fs.chmodSync(preReceive, 0o755);
+    const hostile = path.join(tmp, "global-gitconfig");
+    fs.writeFileSync(hostile, `[core]\n\thooksPath = ${globalHooks}\n`);
+    const env = {
+      GIT_CONFIG_GLOBAL: hostile,
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    };
+
+    // The exact push flow every deploy fixture uses, run under the hostile
+    // global config. Must succeed: the env pair (where honored) and the
+    // origin's pinned scratch core.hooksPath both keep the guard out.
+    makeGitOrigin(repo, origin, path.join(tmp, "scratch-hooks"), env);
+    const main = revParse(origin, "main", env);
+    expect(main).toMatch(/^[0-9a-f]{40,64}$/);
+    expect(revParse(repo, "main", env)).not.toBe("");
+
+    // Negative control: an UNisolated bare origin under the same hostile
+    // config runs the global pre-receive and rejects the push — proves
+    // the simulation is not vacuous.
+    const rogueOrigin = path.join(tmp, "rogue-origin.git");
+    execSync(`git init --bare -q -b main "${rogueOrigin}"`, {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    });
+    let rejected = false;
+    let rejectOut = "";
+    try {
+      execSync(`git -C "${repo}" push "${rogueOrigin}" main:main`, {
+        encoding: "utf8",
+        env: { ...process.env, ...env },
+      });
+    } catch (e) {
+      rejected = true;
+      const err = e as { stderr?: string };
+      rejectOut = `${err.stderr ?? ""}`;
+    }
+    expect(rejected).toBe(true);
+    expect(rejectOut).toContain(
+      "fleetwork mirror: refs/heads/main is protected",
+    );
   });
 });
