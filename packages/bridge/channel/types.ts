@@ -76,6 +76,10 @@ export interface ChannelMessage {
   isRoom: boolean;
   /** Room name (if isRoom). */
   roomName?: string;
+  /** True when the message was posted via a webhook (the machine-wake
+   *  lane, see isBgWebhook in discord.ts). #373: such inbounds start a
+   *  turn but do NOT cancel the agent's pending sleep wakes. */
+  fromWebhook?: boolean;
 }
 
 /** Reference to an attachment — downloaded when the message arrives. */

@@ -570,6 +570,9 @@ export function buildChannelMessageFromRaw(
     attachments: mapAttachmentRefs(raw.attachments),
     repliedMessage,
     isRoom: false,
+    // #373: machine-wake lane flag — a webhook-posted inbound must not
+    // cancel the agent's pending sleep wakes (handleInbound gates on it).
+    fromWebhook: isBgWebhook(raw) || undefined,
   };
 }
 

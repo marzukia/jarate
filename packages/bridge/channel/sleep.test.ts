@@ -5,10 +5,12 @@ import * as path from "node:path";
 import {
   CLAIM_TTL_MS,
   cancelPendingWakes,
+  cancelPendingWakesDetailed,
   cancelWake,
   collectOrphanTmpFiles,
   completeWake,
   dueWakes,
+  formatCancelledWakesNote,
   formatDurationMs,
   formatWakePrompt,
   loadWakes,
@@ -222,6 +224,69 @@ describe("sleep: state file", () => {
     expect(cancelPendingWakes("ch1", tmp)).toBe(0); // nothing pending left
     expect(loadWakes(tmp)).toHaveLength(2); // claimed + other-channel survive
     expect(pending).toBeDefined();
+  });
+
+  test("cancelPendingWakesDetailed returns the removed pending entries (#373)", () => {
+    const a = scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW + 60000,
+      home: tmp,
+      now: NOW,
+    });
+    const b = scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW + 120000,
+      home: tmp,
+      now: NOW,
+    });
+    const other = scheduleWake({
+      channelId: "ch2",
+      wakeAt: NOW + 60000,
+      home: tmp,
+      now: NOW,
+    });
+    const claimed = scheduleWake({
+      channelId: "ch1",
+      wakeAt: NOW + 180000,
+      home: tmp,
+      now: NOW,
+    });
+    markClaimed(claimed.id, NOW, tmp);
+    const removed = cancelPendingWakesDetailed("ch1", tmp);
+    expect(removed.map((w) => w.id).sort()).toEqual([a.id, b.id].sort());
+    const ids = loadWakes(tmp)
+      .map((w) => w.id)
+      .sort();
+    expect(ids).toEqual([claimed.id, other.id].sort()); // claimed + other survive
+    expect(cancelPendingWakesDetailed("ch1", tmp)).toHaveLength(0); // idempotent
+    expect(loadWakes(tmp)).toHaveLength(2);
+  });
+
+  test("formatCancelledWakesNote lists every cancelled wake (HH:MMZ UTC + id, oldest first)", () => {
+    // 07:46Z + 07:47Z UTC — the #373 incident shape (two pending wakes).
+    const w1 = {
+      id: "mwhir59d-9atn",
+      channelId: "ch1",
+      wakeAt: Date.parse("2026-11-15T07:46:00Z"),
+      createdAt: NOW,
+      status: "pending" as const,
+    };
+    const w2 = {
+      id: "mwhivspp-bevq",
+      channelId: "ch1",
+      wakeAt: Date.parse("2026-11-15T07:47:00Z"),
+      createdAt: NOW,
+      status: "pending" as const,
+    };
+    // input order is newest first; the note must sort oldest first
+    const note = formatCancelledWakesNote([w2, w1]);
+    expect(note).toBe(
+      "(this message cancelled your pending sleep wakes: 07:46Z mwhir59d-9atn, 07:47Z mwhivspp-bevq - re-sleep if you still need them)",
+    );
+    // single wake: no trailing comma
+    expect(formatCancelledWakesNote([w1])).toBe(
+      "(this message cancelled your pending sleep wakes: 07:46Z mwhir59d-9atn - re-sleep if you still need them)",
+    );
   });
 
   test("collectOrphanTmpFiles removes wakes.json.*.tmp, leaves the rest", () => {

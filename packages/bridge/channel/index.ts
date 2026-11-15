@@ -157,10 +157,11 @@ import {
 } from "./rotation-stale";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import {
-  cancelPendingWakes,
+  cancelPendingWakesDetailed,
   collectOrphanTmpFiles,
   completeWake,
   dueWakes,
+  formatCancelledWakesNote,
   formatWakePrompt,
   markClaimed,
 } from "./sleep";
@@ -3497,15 +3498,24 @@ export async function handleInbound(
   // Kimaki parity: a real inbound user message means the agent is awake
   // again — cancel this channel's PENDING wakes (claimed ones are
   // mid-delivery and left alone). /btw and commands returned above and
-  // never reach this line.
-  try {
-    const cancelled = cancelPendingWakes(ch.id);
-    if (cancelled > 0)
-      console.log(
-        `[sleep] ${cancelled} pending wake(s) cancelled by inbound message in ${ch.name || ch.id}`,
+  // never reach this line. #373: a webhook (machine-wake lane) inbound does NOT cancel — a peer's say did not put the agent awake.
+  let cancelNote = "";
+  if (!msg.fromWebhook) {
+    try {
+      const removed = cancelPendingWakesDetailed(ch.id);
+      if (removed.length > 0) {
+        console.log(
+          `[sleep] ${removed.length} pending wake(s) cancelled by inbound message in ${ch.name || ch.id}`,
+        );
+        // #373: the cancellation is a transcript note (each wake's id + time)
+        cancelNote = formatCancelledWakesNote(removed);
+      }
+    } catch (e) {
+      console.error(
+        "[sleep] cancel-on-inbound failed:",
+        sanitizeUnknownValue(e),
       );
-  } catch (e) {
-    console.error("[sleep] cancel-on-inbound failed:", sanitizeUnknownValue(e));
+    }
   }
 
   // ── pi-bg worker intake: a callback body carrying "TODO: " lines adds
@@ -3788,6 +3798,7 @@ export async function handleInbound(
         );
       }
     }
+    if (cancelNote) prompt = `${prompt}\n\n${cancelNote}`; // #373
     const fwd = [attParts.join("\n\n"), ...voiceLines, prompt]
       .filter(Boolean)
       .join("\n\n");
@@ -3822,11 +3833,12 @@ export async function handleInbound(
         .join("\n");
       return `<user-action-ctx>User attached file(s) in ${b.folder}/\n${files}</user-action-ctx>`;
     });
-    const fwd = [attParts.join("\n\n"), ...allVoiceLines, body]
+    const batchBody = cancelNote ? `${body}\n\n${cancelNote}` : body; // #373
+    const fwd = [attParts.join("\n\n"), ...allVoiceLines, batchBody]
       .filter(Boolean)
       .join("\n\n");
     const disp =
-      [attachmentSummary(allFiles), ...allVoiceLines, body]
+      [attachmentSummary(allFiles), ...allVoiceLines, batchBody]
         .filter(Boolean)
         .join("\n\n") || "(empty)";
     const fwdText = withCtx(fwd);
@@ -3847,7 +3859,8 @@ export async function handleInbound(
   // turn in the re-wake queue (kimaki parity: interrupt = jump the queue,
   // ". queue" = wait your turn).
   const { prompt: queuedBody, forceQueue } = extractQueueSuffix(body);
-  const disp = queuedBody || "(empty)";
+  const finalBody = cancelNote ? `${queuedBody}\n\n${cancelNote}` : queuedBody; // #373
+  const disp = finalBody || "(empty)";
   const plainText = withCtx(disp);
   if (gateForRewake(plainText, title, disp, !forceQueue)) return;
 
