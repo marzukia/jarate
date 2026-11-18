@@ -404,6 +404,130 @@ describe("todo board (integration)", () => {
     expect(board?.boardMessageId).toBe("gone1");
   });
 
+  test("todo tool: a dead board message (10008) clears the id; next sync re-creates (#377)", async () => {
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+        boardMessageId: "gone1",
+      },
+      tmp,
+    );
+    fetchImpl = (_url: any, init?: any) => {
+      if (init?.method === "PATCH") {
+        return Promise.resolve({
+          ok: false,
+          status: 404,
+          json: async () => ({}),
+          text: async () => '{"message": "Unknown Message", "code": 10008}',
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ok,
+        text: async () => "",
+      });
+    };
+    const t = tools.todo;
+    // 1) edit hits 10008 → id cleared + persisted, no post yet
+    await t.execute(
+      "1",
+      { todos: [{ content: "a", status: "completed" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    let board = loadBoard("ch1", tmp);
+    expect(board?.todos[0].status).toBe("completed");
+    expect(board?.boardMessageId).toBeUndefined();
+    let posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(posts.length).toBe(0);
+    // 2) next sync: no id → create path posts a fresh anchor message
+    await t.execute(
+      "2",
+      { todos: [{ content: "a", status: "in_progress" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    board = loadBoard("ch1", tmp);
+    expect(board?.boardMessageId).toBe("out1");
+    posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(posts.length).toBe(1);
+    expect(JSON.parse(posts[0].body).content).toContain("- **a**");
+  });
+
+  test("todo tool: a non-10008 board edit failure retains the id (#377)", async () => {
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+        boardMessageId: "gone1",
+      },
+      tmp,
+    );
+    fetchImpl = (_url: any, init?: any) => {
+      if (init?.method === "PATCH") {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          json: async () => ({}),
+          text: async () => "Bad Gateway",
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ok,
+        text: async () => "",
+      });
+    };
+    const t = tools.todo;
+    await t.execute(
+      "1",
+      { todos: [{ content: "a", status: "completed" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const board = loadBoard("ch1", tmp);
+    expect(board?.todos[0].status).toBe("completed");
+    expect(board?.boardMessageId).toBe("gone1");
+  });
+
+  test("todo tool: no board message id → create path posts (#377)", async () => {
+    saveBoard(
+      {
+        channelId: "ch1",
+        todos: [{ content: "a", status: "pending" }],
+        updatedAt: "t",
+      },
+      tmp,
+    );
+    const t = tools.todo;
+    const r = await t.execute(
+      "1",
+      { todos: [{ content: "a", status: "pending" }] },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(r.content[0].text).toContain("- a");
+    const posts = fetchCalls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/channels/ch1/messages"),
+    );
+    expect(posts.length).toBe(1);
+    const board = loadBoard("ch1", tmp);
+    expect(board?.boardMessageId).toBe("out1");
+  });
+
   test("todo tool: no channel available", async () => {
     await handlers.session_shutdown(); // clears lastActiveChannel
     const barePi: any = {

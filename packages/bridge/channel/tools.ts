@@ -281,6 +281,15 @@ Skip when:
 When in doubt, use it.`;
 
 /**
+ * Discord code 10008 (Unknown Message) — the target message is gone
+ * (deleted, pruned, or id-rotated). Deterministic match on the
+ * editDiscordMessage error text ("Discord API 404: {"message": "Unknown
+ * Message", "code": 10008}"); no inference, no status-word guessing.
+ * (#377)
+ */
+const DISCORD_UNKNOWN_MESSAGE = /"code"\s*:\s*10008\b/;
+
+/**
  * Post or edit the channel's Discord todo board message. Never throws:
  * a failed post/edit is logged, and the state file remains authoritative
  * (the next sync retries, or re-posts when the message id was lost).
@@ -302,10 +311,23 @@ export async function syncTodoBoard(
     const text = renderBoard(board.todos);
     if (board.boardMessageId) {
       const r = await editDiscordMessage(ch, board.boardMessageId, text);
-      if (!r.success)
-        console.error(
-          `[todos] board edit failed: ${sanitizeSensitiveText(r.error || "")}`,
-        );
+      if (!r.success) {
+        // #377: 10008 = the anchor message is gone. Clear the id and
+        // persist so the NEXT sync re-creates the anchor via the create
+        // branch below. Transient failures (5xx, rate-limit, network)
+        // keep the id — the next sync retries the same message.
+        if (DISCORD_UNKNOWN_MESSAGE.test(r.error ?? "")) {
+          console.error(
+            `[todos] board anchor gone (10008); re-creating on next sync: ${sanitizeSensitiveText(r.error || "")}`,
+          );
+          board.boardMessageId = undefined;
+          saveBoard(board);
+        } else {
+          console.error(
+            `[todos] board edit failed: ${sanitizeSensitiveText(r.error || "")}`,
+          );
+        }
+      }
       return;
     }
     const r = await sendDiscordMessage(ch, text);
