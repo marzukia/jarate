@@ -29,9 +29,21 @@ import {
   getDiscordToken,
 } from "./discord";
 import { fmtTokensLC } from "./format";
+import {
+  docGateCheck,
+  formatEntryLine,
+  inWindowEntries,
+  inWindowLines,
+  type SessionStartUnanswered,
+  sessionStartSeedFeed,
+  sessionStartUnansweredMessages,
+  setSessionStartSeedFeed,
+} from "./instruction-ledger";
 import { jobsView } from "./jobs";
 import {
   docLastSentIsNone,
+  entryTs,
+  isFinalAssistant,
   lastSentMessage,
   lastSentMissing,
   sessionStartSentFlag,
@@ -142,6 +154,9 @@ export interface ParsedState {
   lastSentTs: number;
   /** /compact operator focus instructions (absent when none passed). */
   operatorFocus?: string;
+  /** #380: in-window instruction-ledger lines (`ts | msgId | body`,
+   *  unacked first) — the "Operator instructions (recent)" section body. */
+  operatorInstructions: string[];
 }
 
 /** Context inputs extractDeterministic needs from the live ctx. */
@@ -438,6 +453,7 @@ export function extractDeterministic(
       .map((a) => (a.length > 280 ? `${a.slice(0, 277)}...` : a)),
     lastSent: sent?.text ?? "",
     lastSentTs: sent?.ts ?? 0,
+    operatorInstructions: [],
   };
 }
 
@@ -668,6 +684,7 @@ const GUARD_PROTECTED = [
   "References",
   "Gotchas",
   "State (machine)",
+  "Operator instructions",
   "user asks",
   "sent message",
 ];
@@ -686,6 +703,12 @@ const GUARD_CONDENSE_ORDER = [
 
 const CONDENSE_MARKER = "… (condensed by size guard)";
 
+// #380 (I4): human turn lines carry a stable "HUMAN:" role prefix
+// (transcript.ts formatTranscriptLine). The size cut NEVER drops a human
+// line: the cut applies to non-human lines only; a human line that alone
+// exceeds the budget is TRUNCATED (the 200-char head rule), not dropped.
+const HUMAN_LINE_PREFIX = "HUMAN: ";
+
 // #306: the Transcript section is current-state-first (transcript.ts:
 // serializeTranscript renders the newest span at the top and the oldest
 // task framing at the bottom) — keep BOTH ends and condense the middle.
@@ -698,14 +721,22 @@ function condenseBody(body: string): string {
   if (lines.length <= 2) return body;
   const content = lines.filter((l) => l !== CONDENSE_MARKER);
   if (content.length <= 2) return body;
-  const keep = Math.max(2, Math.floor(content.length * 0.4));
+  const human = content.filter((l) => l.startsWith(HUMAN_LINE_PREFIX));
+  const rest = content.filter((l) => !l.startsWith(HUMAN_LINE_PREFIX));
+  const trunc = (l: string) => (l.length > 200 ? `${l.slice(0, 197)}...` : l);
+  const keep = Math.max(2, Math.floor(rest.length * 0.4));
   const headKeep = Math.max(1, Math.floor(keep / 2));
   const tailKeep = Math.max(0, keep - headKeep);
-  if (headKeep + tailKeep >= content.length) return body;
-  const trunc = (l: string) => (l.length > 200 ? `${l.slice(0, 197)}...` : l);
-  const head = content.slice(0, headKeep).map(trunc);
-  const tail = tailKeep > 0 ? content.slice(-tailKeep) : [];
-  return [...head, CONDENSE_MARKER, ...tail].join("\n");
+  if (headKeep + tailKeep >= rest.length) {
+    // Nothing to cut among the non-human lines: human lines stay whole
+    // (the truncation applies only when a cut actually happens).
+    return body;
+  }
+  const head = rest.slice(0, headKeep).map(trunc);
+  const tail = tailKeep > 0 ? rest.slice(-tailKeep) : [];
+  // #380: human lines are never dropped — kept (truncated to the 200-char
+  // cap when alone over budget) between the marker and the tail.
+  return [...head, CONDENSE_MARKER, ...human.map(trunc), ...tail].join("\n");
 }
 
 /** Cap the doc at maxTokens (default 12k). Deterministic sections and the
@@ -810,6 +841,40 @@ export function loadPreviousHandover(
   } catch {
     return null;
   }
+}
+
+// ─── #380: doc-write gate (deterministic; the I1 → doc enforcement) ──────
+
+/** The ts of the LAST FINAL assistant entry on the branch (null when
+ *  there is none) — the boundary of the #344 "(none) is only valid" rule. */
+export function lastFinalAssistantTs(
+  branchEntries: SessionEntry[],
+): number | null {
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    if (isFinalAssistant(branchEntries[i])) {
+      const t = entryTs(branchEntries[i]);
+      return Number.isFinite(t) ? t : null;
+    }
+  }
+  return null;
+}
+
+// #380: the doc-write gate + the session-start seed seam live in
+// instruction-ledger.ts (they read the ledger); re-exported so the
+// existing imports keep working.
+export {
+  docGateCheck,
+  type SessionStartUnanswered,
+  sessionStartSeedFeed,
+  sessionStartUnansweredMessages,
+  setSessionStartSeedFeed,
+};
+
+/** #380: the doc-write gate's verdict on a written doc (the INCOMPLETE-ASKS
+ *  tag is the audit surface; the tag lands in the sizeGuard-protected
+ *  "Last user asks" section, so it survives the size cut). */
+export function docGateFailed(doc: string): boolean {
+  return doc.includes("INCOMPLETE-ASKS");
 }
 
 // ─── buildHandover (the orchestrator) ──────────────────────────────────────
@@ -935,6 +1000,13 @@ export function renderDeterministic(
     header,
     `## Transcript (current state first)\n${or(transcript)}`,
     `## References\n${renderReferences(state)}`,
+    // #380 (I2): the operator-instructions section is positionally BEFORE
+    // "## State" — a recent operator instruction outranks the board state.
+    `## Operator instructions (recent)\n${
+      state.operatorInstructions.length
+        ? state.operatorInstructions.join("\n")
+        : "(none)"
+    }`,
     `## State\n${renderState(state)}`,
     `## Last user asks\n${renderLastAsks(state)}`,
     `## Last sent message\n${or(state.lastSent)}`,
@@ -969,63 +1041,48 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
     preparation,
     keptTailMessages(preparation, branchEntries),
   );
+  // #380 (I1 → doc): merge the in-window instruction-ledger lines (the
+  // channel truth; a message queued during the compaction window never
+  // became a session turn but IS in the ledger) into the "Operator
+  // instructions (recent)" section, unacked first. Window = the 30-min
+  // self-check window.
+  const nowMs = now.getTime();
+  const ledgerWindow = inWindowEntries(
+    nowMs - ASK_SELF_CHECK_WINDOW_MS,
+    nowMs,
+    settings.storeDir,
+  );
+  state.operatorInstructions = ledgerWindow
+    .filter((e) => e.ackedTs == null)
+    .concat(ledgerWindow.filter((e) => e.ackedTs != null))
+    .map(formatEntryLine);
   let doc = renderDeterministic(state, transcript, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
-  // #315 P1: doc-write self-check - count UNANSWERED operator asks in
-  // [write_ts - 30 min, write_ts] present in the session transcript
-  // ("unanswered" = no assistant entry after it, the same check the
-  // extraction uses; the doc lists at most 2, so the expected count is
-  // capped at 2) vs the count listed under the doc's "Last user asks".
-  // Mismatch = warn + tag the doc INCOMPLETE-ASKS: the tag lands in the
-  // protected "Last user asks" section body (sizeGuard never condenses
-  // it) and parseKickoff's lastAsk only reads numbered lines, so the
-  // tag stays inert for the boot seed. The check runs only when the
-  // doc's list is a branch-asks list: when the branch carries no
-  // pending ask, the list is the span fallback (older summarized span
-  // content, never in-window) or (none), and the window does not apply.
-  const nowMs = now.getTime();
-  const inAskWindow = (e: SessionEntry): boolean => {
-    const t = Date.parse(
-      String((e as { timestamp?: unknown }).timestamp ?? ""),
+  // #380: doc-write gate (deterministic; replaces the warn-only #315
+  // transcript-vs-transcript self-check, which counted the transcript
+  // against itself and could never see a message that never became a
+  // session turn). The in-window ledger inbounds must be carried in the
+  // doc's asks + instructions sections (by msgId / body), and "(none)"
+  // is only valid when no unacked ledger entry has ts newer than the
+  // last final assistant ts (the #344 spec, verbatim). Fail = the
+  // INCOMPLETE-ASKS tag (kept, audit surface) + docGateFailed(doc) = true
+  // (the write is marked incomplete).
+  const gate = docGateCheck(
+    doc,
+    ledgerWindow,
+    lastFinalAssistantTs(branchEntries),
+  );
+  if (gate.fail) {
+    console.warn(
+      `[handover] INCOMPLETE-ASKS: ${gate.reason} (doc-write gate, issue #380)`,
     );
-    return (
-      Number.isFinite(t) && t >= nowMs - ASK_SELF_CHECK_WINDOW_MS && t <= nowMs
+    const parts = splitDoc(doc);
+    const asksSection = parts.sections.find((x) =>
+      x.title.includes("user asks"),
     );
-  };
-  let lastAssistantIdx = -1;
-  for (let i = branchEntries.length - 1; i >= 0; i--) {
-    const e = branchEntries[i];
-    if (
-      e.type === "message" &&
-      (e as { message?: { role?: string } }).message?.role === "assistant"
-    ) {
-      lastAssistantIdx = i;
-      break;
-    }
-  }
-  const isPendingBranchAsk = (e: SessionEntry, i: number): boolean =>
-    e.type === "custom_message" &&
-    e.customType === "channel-inbound" &&
-    isHumanInbound(e) &&
-    lastAssistantIdx <= i;
-  const anyBranchAsk = branchEntries.some((e, i) => isPendingBranchAsk(e, i));
-  if (anyBranchAsk) {
-    const windowUnanswered = branchEntries.filter(
-      (e, i) => isPendingBranchAsk(e, i) && inAskWindow(e),
-    ).length;
-    const expectedAsks = Math.min(2, windowUnanswered);
-    if (expectedAsks !== state.lastUserAsks.length) {
-      console.warn(
-        `[handover] INCOMPLETE-ASKS: ${windowUnanswered} unanswered operator ask(s) in the last 30 min, ${state.lastUserAsks.length} listed (self-check, issue #315)`,
-      );
-      const parts = splitDoc(doc);
-      const asksSection = parts.sections.find((x) =>
-        x.title.includes("user asks"),
-      );
-      if (asksSection)
-        asksSection.body = `${asksSection.body}\n> INCOMPLETE-ASKS: ${windowUnanswered} unanswered operator ask(s) in the last 30 min, ${state.lastUserAsks.length} listed`;
-      doc = assembleDoc(parts);
-    }
+    if (asksSection)
+      asksSection.body = `${asksSection.body}\n> INCOMPLETE-ASKS: ${gate.reason} (doc-write gate, issue #380)`;
+    doc = assembleDoc(parts);
   }
   // #315 P1 leg: doc-write self-check for the last sent message — re-scan the FULL transcript; an assistant final newer than the field (or any, when the field is (none)) means the extraction dropped the last reply: one LAST-SENT-MISSING flag line + tag the doc (the #315 P1 section-tag mechanism; the section is sizeGuard-protected, so the tag survives the size cut).
   const missed = lastSentMissing(
@@ -1101,8 +1158,25 @@ export function buildSeedKickoff(
   live?: KickoffLiveState,
 ): string {
   const latest = path.join(expandHome(storeDir, home), "latest.md");
+  // #380 (I3): EVERY in-window operator instruction (acked or not) leads
+  // the seed, positionally BEFORE the Mission line — the board-derived
+  // Mission is read as stale when an in-window instruction contradicts it
+  // (case 1: "helium stays as is" outranks the 64G line; case 2: the two
+  // unacked 06:14 asks lead even though the doc's asks say (none)).
+  const now = Date.now();
+  const inbounds = inWindowLines(
+    now - ASK_SELF_CHECK_WINDOW_MS,
+    now,
+    storeDir,
+    home,
+  );
   return [
     "Context handed off: the previous session was compacted and the process restarted with a fresh, small context.",
+    ...(inbounds.length > 0
+      ? [
+          `Recent operator inbounds (unacked first; outrank the Mission line):\n${inbounds.join("\n")}`,
+        ]
+      : []),
     parseKickoff(doc, live),
     `Read ${latest} before continuing. Answer the last pending user question if any.`,
   ].join("\n");
@@ -1298,6 +1372,10 @@ export interface ChannelHistoryMessage {
   webhook: boolean;
   /** author id (null when unknown). */
   authorId: string | null;
+  /** channel message id (the ledger dedupe key). */
+  msgId: string;
+  /** message body (the ledger body source). */
+  body: string;
 }
 
 /** True when the doc's "Last user asks" section lists NO asks (the
@@ -1322,15 +1400,11 @@ export function sessionStartAskFlag(
   botUserId: string | null,
   now: number = Date.now(),
 ): string | null {
-  if (!docAsksIsNone(doc)) return null;
-  const isAnswer = (m: ChannelHistoryMessage): boolean =>
-    botUserId != null ? m.authorId === botUserId : m.bot && !m.webhook;
-  const unanswered = history.filter(
-    (m) =>
-      !m.bot &&
-      Number.isFinite(m.ts) &&
-      now - m.ts < ASK_SELF_CHECK_WINDOW_MS &&
-      !history.some((x) => x.ts > m.ts && isAnswer(x)),
+  const unanswered = sessionStartUnansweredMessages(
+    doc,
+    history,
+    botUserId,
+    now,
   );
   if (unanswered.length === 0) return null;
   return `session start: the handoff doc says (none) but ${unanswered.length} unanswered operator message(s) < 30m old in channel history (issue #315 P1)`;
@@ -1370,11 +1444,22 @@ export async function runSessionStartAskCheck(
           bot: !!m.author?.bot,
           webhook: m.webhook_id != null,
           authorId: typeof m.author?.id === "string" ? m.author.id : null,
+          msgId: m.id != null ? String(m.id) : "",
+          body: typeof m.content === "string" ? m.content : "",
         }));
         const botUserId = getDiscordStates().get(ch.id)?.botUserId ?? null;
-        const line = askGate
-          ? sessionStartAskFlag(doc, history, botUserId, Date.now())
-          : null;
+        // #380 (I3): the fired lines feed the boot seed (the production
+        // sink appends them to the instruction ledger, the same source
+        // buildSeedKickoff reads) - no longer log-only.
+        const unacked = askGate
+          ? sessionStartUnansweredMessages(doc, history, botUserId, Date.now())
+          : [];
+        const line =
+          unacked.length > 0
+            ? `session start: the handoff doc says (none) but ${unacked.length} unanswered operator message(s) < 30m old in channel history (issue #315 P1)`
+            : null;
+        if (unacked.length > 0)
+          sessionStartSeedFeed(ch.id, settings.storeDir, unacked);
         const sentLine = sentGate
           ? sessionStartSentFlag(doc, history, botUserId, Date.now())
           : null;

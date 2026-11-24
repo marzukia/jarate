@@ -15,6 +15,8 @@ import {
   buildSeedKickoff,
   type ChannelHistoryMessage,
   docAsksIsNone,
+  docGateCheck,
+  docGateFailed,
   type ExtractCtxState,
   estTokens,
   extractDeterministic,
@@ -42,8 +44,10 @@ import {
   renderDeterministic,
   resolveHandoffSettings,
   runSessionStartAskCheck,
+  type SessionStartUnanswered,
   serializeTranscript,
   sessionStartAskFlag,
+  setSessionStartSeedFeed,
   shouldHandoff,
   sizeGuard,
   splitDoc,
@@ -1054,6 +1058,38 @@ describe("sizeGuard", () => {
     expect(out).toContain("… (condensed by size guard)");
     expect(out).toContain(framing);
   });
+  test("#380 (I4): a MIDDLE HUMAN line survives the condense (short: whole; long: truncated, not dropped)", () => {
+    const humanShort =
+      "HUMAN: [user] helium stays as is, the upgrade option is off the table";
+    const longBody = `helium stays as is ${"y".repeat(280)} end of the long instruction`;
+    const humanLong = `HUMAN: [user] ${longBody}`;
+    const lines = [
+      "[assistant] latest work item 0 in flight",
+      ...Array.from(
+        { length: 149 },
+        (_, i) =>
+          `[assistant] middle work item ${i} with a fairly long description to burn space`,
+      ),
+      humanShort,
+      ...Array.from(
+        { length: 149 },
+        (_, i) =>
+          `[assistant] middle work item ${1000 + i} with a fairly long description to burn space`,
+      ),
+      humanLong,
+      "[assistant] tail work item 0 in flight",
+    ];
+    const d = renderDeterministic(state, lines.join("\n"), header);
+    expect(estTokens(d)).toBeGreaterThan(4_000);
+    const out = sizeGuard(d, 4_000);
+    expect(out).toContain("… (condensed by size guard)");
+    // both HUMAN lines survive the cut
+    expect(out).toContain(humanShort);
+    expect(out).toContain("HUMAN: [user]");
+    // the long one is truncated to the 200-char cap, not dropped
+    expect(out).toContain(humanLong.slice(0, 197));
+    expect(out).not.toContain(longBody);
+  });
 });
 
 // ─── splitDoc / assembleDoc header round-trip (issue #134 double-##) ────────
@@ -1572,6 +1608,96 @@ describe("buildSeedKickoff (F4/F8)", () => {
   test("absolute storeDir is not re-expanded", () => {
     const k = buildSeedKickoff(doc, "/abs/handovers", "/home/monky");
     expect(k).toContain("Read /abs/handovers/latest.md before continuing.");
+  });
+});
+
+describe("#380 (I3): buildSeedKickoff leads with the in-window ledger lines", () => {
+  let tmp = "";
+  let oldHome = "";
+  let storeDir = "";
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-380s-"));
+    oldHome = process.env.HOME || "";
+    process.env.HOME = tmp;
+    storeDir = path.join(tmp, "handovers");
+  });
+  afterEach(() => {
+    process.env.HOME = oldHome;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test("in-window ledger lines (one acked + two unacked) lead the seed, before the Mission line", () => {
+    fs.mkdirSync(path.join(tmp, "instructions"), { recursive: true });
+    const now = Date.now();
+    const lines = [
+      JSON.stringify({
+        ts: now - 25 * 60_000,
+        msgId: "case1",
+        authorId: "op1",
+        body: "helium stays as is, the upgrade option is off the table",
+      }),
+      JSON.stringify({ ackAllBefore: now - 24 * 60_000 }),
+      JSON.stringify({
+        ts: now - 27_000,
+        msgId: "case2a",
+        authorId: "op1",
+        body: "do not restart the box",
+      }),
+      JSON.stringify({
+        ts: now - 5_000,
+        msgId: "case2b",
+        authorId: "op1",
+        body: "keep the 1-GPU pin",
+      }),
+    ];
+    fs.writeFileSync(
+      path.join(tmp, "instructions", "ch1.jsonl"),
+      lines.join("\n"),
+    );
+    const k = buildSeedKickoff(
+      [
+        "# Handover - 2026-11-24 · session s · 100k tokens → handoff",
+        "",
+        "## 1 · Mission",
+        "64G box upgrade decision (the board framing the instruction kills)",
+        "",
+        "## State",
+        "- todos: 1 open: 64G box upgrade decision",
+        "",
+        "## Last user asks",
+        "(none)",
+      ].join("\n"),
+      storeDir,
+      tmp,
+    );
+    // every in-window ledger line is in the seed (I3: acked OR unacked)
+    expect(k).toContain(
+      "helium stays as is, the upgrade option is off the table",
+    );
+    expect(k).toContain("do not restart the box");
+    expect(k).toContain("keep the 1-GPU pin");
+    // and BEFORE the Mission line (the board-derived framing)
+    expect(k.indexOf("case1")).toBeLessThan(k.indexOf("Mission:"));
+    expect(k.indexOf("case2a")).toBeLessThan(k.indexOf("Mission:"));
+    // unacked entries lead the block
+    expect(k.indexOf("case2a")).toBeLessThan(k.indexOf("case1"));
+  });
+  test("no ledger → seed is unchanged (no inbounds block)", () => {
+    const k = buildSeedKickoff(
+      [
+        "# Handover - 2026-11-24 · session s · 100k tokens → handoff",
+        "",
+        "## 1 · Mission",
+        "1 open: ship it",
+        "",
+        "## Last user asks",
+        "(none)",
+      ].join("\n"),
+      storeDir,
+      tmp,
+    );
+    expect(k).not.toContain("Recent operator inbounds");
+    expect(k.split("\n")[1]).toBe("Mission: 1 open: ship it");
   });
 });
 
@@ -2640,18 +2766,24 @@ describe("#315 P1: sessionStartAskFlag (the exact condition)", () => {
     bot: false,
     webhook: false,
     authorId: id,
+    msgId: "",
+    body: "",
   });
   const bot = (ts: number, id: string): ChannelHistoryMessage => ({
     ts,
     bot: true,
     webhook: false,
     authorId: id,
+    msgId: "",
+    body: "",
   });
   const wake = (ts: number, id: string): ChannelHistoryMessage => ({
     ts,
     bot: true,
     webhook: true,
     authorId: id,
+    msgId: "",
+    body: "",
   });
 
   test("doc (none) + unanswered operator message < 30 min old = flag", () => {
@@ -2735,17 +2867,19 @@ describe("#315 P1: sessionStartAskFlag (the exact condition)", () => {
       bot: false,
       webhook: false,
       authorId: "op1",
+      msgId: "",
+      body: "",
     };
     expect(sessionStartAskFlag(docNone, [bad], "bot1", t)).toBeNull();
   });
 });
 
-describe("#315 P1: buildHandover doc-write self-check (INCOMPLETE-ASKS)", () => {
+describe("#380: buildHandover doc-write gate (INCOMPLETE-ASKS, the ledger source)", () => {
   let tmp = "";
   let oldHome = "";
   let storeDir = "";
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-315-"));
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "handover-380-"));
     oldHome = process.env.HOME || "";
     process.env.HOME = tmp;
     storeDir = path.join(tmp, "handovers");
@@ -2767,7 +2901,7 @@ describe("#315 P1: buildHandover doc-write self-check (INCOMPLETE-ASKS)", () => 
     modelRegistry: {},
     sessionManager: {
       getSessionFile: () => null,
-      getSessionId: () => "sess-315",
+      getSessionId: () => "sess-380",
       getEntries: () => new Array(5).fill({ type: "message" }),
     },
     getContextUsage: () => ({
@@ -2776,74 +2910,145 @@ describe("#315 P1: buildHandover doc-write self-check (INCOMPLETE-ASKS)", () => 
       percent: 90,
     }),
   };
-
-  const human = (id: string, body: string, ts: number) => ({
-    id,
-    type: "custom_message",
-    customType: "channel-inbound",
-    timestamp: new Date(ts).toISOString(),
-    content: `<channel-ctx type="discord" from="op1">ctx</channel-ctx>\n\n${body}`,
-    details: { body },
+  /** prep whose "Last user asks" falls back to (none) (no pending span ask). */
+  const nonePrep = (): HandoverPreparation => ({
+    ...basePrep(),
+    turnPrefixMessages: [],
   });
-  const assistant = (id: string, ts: number) => ({
+  const writeLedger = (
+    entries: Array<{
+      msgId: string;
+      ts: number;
+      body: string;
+      ackedTs?: number | null;
+    }>,
+  ): void => {
+    fs.mkdirSync(path.join(tmp, "instructions"), { recursive: true });
+    const lines = entries.map((e) =>
+      JSON.stringify({
+        ts: e.ts,
+        msgId: e.msgId,
+        authorId: "op1",
+        body: e.body,
+      }),
+    );
+    for (const e of entries)
+      if (typeof e.ackedTs === "number")
+        lines.push(JSON.stringify({ ackAllBefore: e.ackedTs }));
+    fs.writeFileSync(
+      path.join(tmp, "instructions", "ch1.jsonl"),
+      `${lines.join("\n")}\n`,
+    );
+  };
+  const finalEntry = (id: string, ts: number): any => ({
     id,
+    parentId: "",
     type: "message",
     timestamp: new Date(ts).toISOString(),
-    message: { role: "assistant", content: "reply" },
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Understood" }],
+    },
   });
 
-  test("an in-window unanswered ask is listed by the extraction → no mismatch, no tag", async () => {
+  test("case-2 regression (queued inbounds): the section carries them even when branchEntries does not; asks still (none)", async () => {
     const t = Date.now();
+    writeLedger([
+      {
+        msgId: "m1",
+        ts: t - 27_000,
+        body: "helium stays as is, the upgrade option is off the table",
+      },
+      { msgId: "m2", ts: t - 5_000, body: "also: do not restart the box" },
+    ]);
     const doc = await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [human("h1", "do the thing", t - 5 * 60_000)] as any[],
+      preparation: nonePrep(),
+      branchEntries: [],
       ctx,
       settings: settings(),
       now: new Date(t),
     });
-    expect(doc).not.toContain("INCOMPLETE-ASKS");
-    expect(loadPreviousHandover({ storeDir })).not.toContain("INCOMPLETE-ASKS");
+    expect(doc).toContain("## Operator instructions (recent)");
+    expect(doc).toContain(
+      "helium stays as is, the upgrade option is off the table",
+    );
+    expect(doc).toContain("also: do not restart the box");
+    // extraction unchanged: the asks section is still (none)
+    const { sections } = splitDoc(doc);
+    const asks = sections.find((x) => x.title.includes("user asks"));
+    expect(asks?.body).toContain("(none)");
+    // the (none) rule fails the gate (unacked, no final on the branch)
+    expect(docGateFailed(doc)).toBe(true);
   });
-  test("an answered in-window ask (an assistant entry after it) + no other branch asks → no mismatch (the span fallback is not windowed)", async () => {
+  test("case-1 ordering: the instructions section sits positionally before ## State", async () => {
     const t = Date.now();
+    writeLedger([
+      {
+        msgId: "m1",
+        ts: t - 60_000,
+        body: "helium stays as is, the upgrade option is off the table",
+        ackedTs: t - 55_000,
+      },
+    ]);
     const doc = await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [
-        human("h1", "do the thing", t - 5 * 60_000),
-        assistant("a1", t - 4 * 60_000),
-      ] as any[],
+      preparation: nonePrep(),
+      branchEntries: [finalEntry("f1", t - 55_000)],
       ctx,
       settings: settings(),
       now: new Date(t),
     });
-    expect(doc).not.toContain("INCOMPLETE-ASKS");
+    expect(doc).toContain("## Operator instructions (recent)");
+    expect(doc.indexOf("## Operator instructions")).toBeLessThan(
+      doc.indexOf("## State"),
+    );
   });
-  test("an ask outside the 30 min window (still listed by the extraction) → mismatch → warn + INCOMPLETE-ASKS tag on the written doc", async () => {
+  test("gate fails on an uncovered in-window inbound (pure docGateCheck)", () => {
     const t = Date.now();
+    const doc = ["# Handover", "", "## Last user asks", "(none)", ""].join(
+      "\n",
+    );
+    const gate = docGateCheck(
+      doc,
+      [
+        {
+          ts: t - 27_000,
+          msgId: "m1",
+          authorId: "op1",
+          body: "b1",
+          ackedTs: null,
+        },
+      ],
+      t - 5_000,
+    );
+    expect(gate.fail).toBe(true);
+  });
+  test("gate fails when (none) but an unacked inbound is newer than the last final → tag + docGateFailed", async () => {
+    const t = Date.now();
+    writeLedger([{ msgId: "m1", ts: t - 27_000, body: "b1" }]);
     const doc = await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [human("h1", "do the thing", t - 40 * 60_000)] as any[],
+      preparation: nonePrep(),
+      branchEntries: [finalEntry("f1", t - 40_000)],
       ctx,
       settings: settings(),
       now: new Date(t),
     });
     expect(doc).toContain("INCOMPLETE-ASKS");
-    expect(loadPreviousHandover({ storeDir })).toContain("INCOMPLETE-ASKS");
+    expect(docGateFailed(doc)).toBe(true);
   });
-  test("three in-window unanswered asks (the doc caps at 2) → expected 2 = listed 2 → no tag", async () => {
+  test("covered ledger (acked, older than the last final) → no tag, complete", async () => {
     const t = Date.now();
+    writeLedger([
+      { msgId: "m1", ts: t - 40_000, body: "b1", ackedTs: t - 30_000 },
+    ]);
     const doc = await buildHandover({
-      preparation: basePrep(),
-      branchEntries: [
-        human("h1", "a", t - 29 * 60_000),
-        human("h2", "b", t - 20 * 60_000),
-        human("h3", "c", t - 10 * 60_000),
-      ] as any[],
+      preparation: nonePrep(),
+      branchEntries: [finalEntry("f1", t - 20_000)],
       ctx,
       settings: settings(),
       now: new Date(t),
     });
     expect(doc).not.toContain("INCOMPLETE-ASKS");
+    expect(docGateFailed(doc)).toBe(false);
   });
 });
 
@@ -3503,18 +3708,24 @@ describe("#315 P1 leg: sessionStartSentFlag (the session-start guard)", () => {
     bot: true,
     webhook: false,
     authorId: id,
+    msgId: "",
+    body: "",
   });
   const wake = (ts: number, id: string): ChannelHistoryMessage => ({
     ts,
     bot: true,
     webhook: true,
     authorId: id,
+    msgId: "",
+    body: "",
   });
   const other = (ts: number, id: string): ChannelHistoryMessage => ({
     ts,
     bot: false,
     webhook: false,
     authorId: id,
+    msgId: "",
+    body: "",
   });
 
   test("doc (none) + a post by this agent < 30 min old = flag", () => {
@@ -3593,6 +3804,8 @@ describe("#315 P1 leg: sessionStartSentFlag (the session-start guard)", () => {
       bot: true,
       webhook: false,
       authorId: "bot1",
+      msgId: "",
+      body: "",
     };
     expect(sessionStartSentFlag(docNone, [bad], "bot1", T0)).toBeNull();
   });
@@ -3708,5 +3921,103 @@ describe("#315 P1 leg: runSessionStartAskCheck last-sent wiring (hall-monitor#75
     writeDoc("the reply that was sent");
     await runSessionStartAskCheck(tmp, [ch] as any);
     expect(fl.calls.length).toBe(0);
+  });
+  const writeDocNone = () => {
+    const doc = [
+      "# Handover - 2026-11-02 \u00b7 session x \u00b7 100k tokens \u2192 handoff",
+      "",
+      "## Last user asks",
+      "(none)",
+      "",
+      "## Last sent message",
+      "(none)",
+      "",
+      "<read-files>",
+      "</read-files>",
+      "<modified-files>",
+      "</modified-files>",
+    ].join("\n");
+    fs.writeFileSync(path.join(storeDir, "20261102-0300-x.md"), doc);
+    fs.writeFileSync(
+      path.join(storeDir, "latest.md"),
+      `# Handover pointer\npath: ${path.join(storeDir, "20261102-0300-x.md")}\nupdated: 2026-11-02T03:00:00Z\n`,
+    );
+  };
+
+  test("#380: the check feeds the in-window entries to the seed (spy seam)", async () => {
+    writeDocNone();
+    const now = Date.now();
+    const realFetchInner = globalThis.fetch;
+    globalThis.fetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes("/messages?limit="))
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              id: "a1",
+              timestamp: new Date(now - 27_000).toISOString(),
+              author: { id: "op1", bot: false },
+              content: "helium stays as is",
+            },
+            {
+              id: "a2",
+              timestamp: new Date(now - 5_000).toISOString(),
+              author: { id: "op1", bot: false },
+              content: "do not restart the box",
+            },
+          ],
+          text: async () => "",
+        };
+      return realFetchInner(url);
+    }) as any;
+    const fed: SessionStartUnanswered[][] = [];
+    setSessionStartSeedFeed((_chId, _storeDir, items) => {
+      fed.push(items);
+    });
+    try {
+      await runSessionStartAskCheck(tmp, [ch] as any);
+    } finally {
+      setSessionStartSeedFeed(null);
+      globalThis.fetch = realFetchInner;
+    }
+    const all = fed.flat();
+    expect(all.some((m) => m.msgId === "a1")).toBe(true);
+    expect(all.some((m) => m.msgId === "a2")).toBe(true);
+    expect(fl.calls.length).toBe(1); // the session_start event still fired
+  });
+  test("#380: the default seam appends the in-window entries to the ledger (I1)", async () => {
+    writeDocNone();
+    const now = Date.now();
+    const realFetchInner = globalThis.fetch;
+    globalThis.fetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes("/messages?limit="))
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              id: "s1",
+              timestamp: new Date(now - 27_000).toISOString(),
+              author: { id: "op1", bot: false },
+              content: "helium stays as is",
+            },
+          ],
+          text: async () => "",
+        };
+      return realFetchInner(url);
+    }) as any;
+    try {
+      await runSessionStartAskCheck(tmp, [ch] as any);
+    } finally {
+      globalThis.fetch = realFetchInner;
+    }
+    const file = path.join(tmp, "instructions", "ch1.jsonl");
+    expect(fs.existsSync(file)).toBe(true);
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]).msgId).toBe("s1");
   });
 });
