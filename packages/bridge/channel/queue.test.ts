@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isolateHomeForTests } from "../test/home-isolation";
 import {
   clearDiscordStatesForTest,
   loadPersistedCursors,
@@ -52,6 +53,10 @@ import type { ChannelMessage } from "./types";
 // in every test. Clear it here (#273 review (C): replicate the
 // index.test.ts guard in the split-off files).
 delete process.env.PI_SESSION_ID;
+
+// #380 review t3452: isolate HOME so the handleInbound fixtures' ledger
+// appends (appendInbound(defaultHome())) never write the real $HOME.
+isolateHomeForTests();
 
 describe("extractQueueSuffix", () => {
   test("dot + space + queue at end", () => {

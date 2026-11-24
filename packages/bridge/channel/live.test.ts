@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isolateHomeForTests } from "../test/home-isolation";
 import { clearDiscordStatesForTest } from "./discord";
 import { styleGuard } from "./format";
 import extension, {
@@ -34,6 +35,10 @@ import {
 import { settlePiCompact } from "./pi-compact-guard";
 import { midTurnQueues, queuedAcks, queueMidTurnInbound } from "./queue";
 import type { ChannelMessage } from "./types";
+
+// #380 review t3452: isolate HOME so the handleInbound fixtures' ledger
+// appends (appendInbound(defaultHome())) never write the real $HOME.
+isolateHomeForTests();
 
 describe("machine (plain-italic surfaces)", () => {
   test("single line with one inner * ships italic with the star escaped", () => {

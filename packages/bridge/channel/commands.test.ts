@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isolateHomeForTests } from "../test/home-isolation";
 import {
   buildInteractionHandler,
   channelError,
@@ -107,6 +108,10 @@ const interactionUrlViolation = (
   }
   return `${m} ${u}`;
 };
+
+// #380 review t3452: isolate HOME so the handleInbound fixtures' ledger
+// appends (appendInbound(defaultHome())) never write the real $HOME.
+isolateHomeForTests();
 
 describe("matchCommand (A3)", () => {
   test("slash commands match, with and without args", () => {
