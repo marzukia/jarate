@@ -87,6 +87,7 @@ import {
   recordChannelPost,
   redeliverOnCompact,
 } from "./inbox";
+import { ackUpTo, recordInboundInstruction } from "./instruction-ledger";
 import { registerJarateTool } from "./jarate";
 import {
   armOpTick,
@@ -2687,14 +2688,13 @@ export default function (pi: ExtensionAPI) {
             );
         } catch {}
       }
-      // SPEC B: the final is out — delete the ephemeral live-text message
-      // (best effort; the agent_end delete is the safety net for runs
-      // whose final never reaches this path).
+      // SPEC B: the final is out — delete the ephemeral live-text message (best effort; the agent_end delete is the safety net for runs whose final never reaches this path).
       if (isLiveTextChannel(ch)) await deleteLiveText(ch);
+      // #380 (I1 ack): a posted final answers every unacked ledger inbound before it (append-only {ackAllBefore} record; no-op when none).
+      ackUpTo(ch.id, resolveHandoffSettings(ctx.cwd).storeDir, Date.now());
     }
-    // Unreact the 👀 ack on this channel's last inbound message (A1):
-    // the final lands on this path, so the ack is cleared here too.
-    // No-op when the ack was never added (suppressed / ack off).
+    // Unreact the 👀 ack on this channel's last inbound message (A1): the
+    // final lands here, so the ack is cleared too (no-op if never added).
     if (ch.type === "discord") {
       const inboundId = lastInboundIds.get(ch.id);
       const token = getDiscordToken(ch.id) || ch.botToken;
@@ -3084,6 +3084,8 @@ export default function (pi: ExtensionAPI) {
             unreactMessage(token, channelId, f.replyTo, "👀").catch(() => {});
         }
       }
+      // #380 (I1 ack): a posted final answers every unacked ledger inbound before it (no-op when none; failText error posts never reach here).
+      ackUpTo(ch.id, resolveHandoffSettings(ctx.cwd).storeDir, Date.now());
     } finally {
       // #84: last line of defense — the frame reaches a terminal state on
       // EVERY exit path. No-op on the normal path (the close above already
@@ -3338,7 +3340,6 @@ export async function maybeAutoCompactByToken(
   console.log(
     `[handoff] auto-compact: ctx ${percent}% >= ${settings.threshold * 100}%`,
   );
-  // Same path /compact uses (postPlaceholder = the text-command path).
   const err = await startCompact(pi, { ch }, ctx, true);
   if (err !== null) console.error(`[handoff] auto-compact failed: ${err}`);
 }
@@ -3427,7 +3428,6 @@ export async function handleInbound(
   }
   resetFinalRepeats(ch.id); // a new inbound user message restarts the repetition counter
 
-  // Update status to show active channel
   ctx.ui.setStatus("Channel", channelTitle(ch, msg));
 
   const rawBody = msg.body.trim();
@@ -3495,10 +3495,6 @@ export async function handleInbound(
     }
   }
 
-  // Kimaki parity: a real inbound user message means the agent is awake
-  // again — cancel this channel's PENDING wakes (claimed ones are
-  // mid-delivery and left alone). /btw and commands returned above and
-  // never reach this line. #373: a webhook (machine-wake lane) inbound does NOT cancel — a peer's say did not put the agent awake.
   let cancelNote = "";
   if (!msg.fromWebhook) {
     try {
@@ -3579,11 +3575,17 @@ export async function handleInbound(
   // ── Side-question suffix: "fix the bug. btw" → brief-answer flag ─────
   const { prompt: body, forceBtw } = extractBtwSuffix(rawBody);
 
-  // Channel ctx (+ btw hint) — LLM-only, not shown in the TUI.
   const channelCtx = buildChannelContext(ch, msg, { btw: forceBtw });
   const repliedBlock = buildRepliedMessageBlock(msg.repliedMessage);
   const ctxBlock = [channelCtx, repliedBlock].filter(Boolean).join("\n\n");
   const withCtx = (text: string) => `${ctxBlock}\n\n${text}`;
+
+  // #380 (I1): ledger record BEFORE the queue decision — a message queued during the compaction window is recorded even though it never became a session turn (deduped by messageId; the #306 redelivery face).
+  recordInboundInstruction(
+    ch.id,
+    resolveHandoffSettings(ctx.cwd).storeDir,
+    msg,
+  );
 
   // A run is in flight (streaming or has pending messages). Mid-turn inbounds
   // are queued for a guaranteed re-wake at agent_end instead of steered into
@@ -3662,7 +3664,6 @@ export async function handleInbound(
   };
 
   // ── Handle attachments ──────────────────────────────────────────────
-  // Create a batch folder per incoming message batch and download the
   // files NOW (eagerly), so they are on disk before the LLM sees the
   // folder reference.
   if (msg.attachments.length > 0) {
