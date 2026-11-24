@@ -86,7 +86,7 @@ export function serializeTranscript(
   const range = [...allSpan, ...allTail];
   let anchor = -1;
   for (let i = range.length - 1; i >= 0; i--) {
-    if (range[i].startsWith("[user] ")) {
+    if (range[i].startsWith("HUMAN: [user] ")) {
       anchor = i;
       break;
     }
@@ -211,7 +211,9 @@ export function serializeTranscript(
   return out.join("\n");
 }
 
-/** One transcript line: `[role] body`, per-message capped. null = none. */
+/** One transcript line: `[role] body`, per-message capped. Human turns
+ *  (the user role) carry the stable `HUMAN: ` prefix (#380 I4: the size
+ *  guard's condense never drops a HUMAN line). null = none. */
 function formatTranscriptLine(
   m: HandoverMessage | null | undefined,
 ): string | null {
@@ -225,7 +227,7 @@ function formatTranscriptLine(
         : "user";
   let body = text;
   if (body.length > MSG_CAP) body = `${body.slice(0, MSG_CAP)}\n…[truncated]`;
-  return `[${role}] ${body}`;
+  return role === "user" ? `HUMAN: [user] ${body}` : `[${role}] ${body}`;
 }
 
 /**
