@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isolateHomeForTests } from "../test/home-isolation";
 import {
   clearDiscordStatesForTest,
   seedChannelStateForTest,
@@ -133,6 +134,18 @@ const _interactionUrlViolation = (
   }
   return `${m} ${u}`;
 };
+
+// #380 review t3452 (FAIL, root-cause verified): the non-HOME-isolated
+// handleInbound fixtures (across every describe below) append to the
+// instruction ledger via recordInboundInstruction -> appendInbound(defaultHome()),
+// writing ch1.jsonl/ch2.jsonl into the REAL $HOME/.jarate/instructions/.
+// The handover.test.ts buildSeedKickoff digest test (a hardcoded home) then
+// reads those <30m entries into the seed and breaks its digest assertion when
+// $HOME equals that home (order-dependent flake: base green / PR not green).
+// File-scope HOME isolation: every test in this file runs against a fresh tmp
+// $HOME, so the ledger appends (and the undo store + settings read, all
+// defaultHome()-keyed) never touch the real $HOME.
+isolateHomeForTests();
 
 describe("chunkText", () => {
   test("short fenced block is unchanged", () => {
