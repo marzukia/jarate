@@ -4469,6 +4469,71 @@ describe("handoff token gate: agent_settled re-check (issue #85)", () => {
     expect(isCompacting("ch1")).toBe(false);
   });
 
+  test("2nd timer firing after the compact's session swap: stale ctx skips the gate, the run survives (2026-11-24 T3445 exit-1, #381)", async () => {
+    // T3445: firing 1 (ctx live, 85% >= 80%) fired the gate into
+    // startCompact; the compact's session replacement left the ctx
+    // captured by firing 2 (the agent_settled shot) stale. Pre-fix
+    // the stale assert escaped the Timeout callback and killed the
+    // run (exit-1, 76 min, verdict lost). Now: firing 2 logs one
+    // leg-named skip line and no-ops.
+    const rejections: unknown[] = [];
+    const exceptions: unknown[] = [];
+    const errors: string[] = [];
+    const logs: string[] = [];
+    const onRejection = (r: unknown) => rejections.push(r);
+    const onException = (e: unknown) => exceptions.push(e);
+    const realError = console.error;
+    const realLog = console.log;
+    process.on("unhandledRejection", onRejection);
+    process.on("uncaughtException", onException);
+    console.error = (...a: unknown[]) => errors.push(a.map(String).join(" "));
+    console.log = (...a: unknown[]) => logs.push(a.map(String).join(" "));
+    try {
+      // Simulated session swap: firing 1's compact replaces the
+      // session, so the captured ctx's cwd getter starts asserting
+      // stale (pi's ExtensionRunner.assertActive message).
+      ctx.compact = () => {
+        Object.defineProperty(ctx, "cwd", {
+          get() {
+            throw new Error(
+              "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession().",
+            );
+          },
+          configurable: true,
+        });
+      };
+      // Firing 1 (agent_end shot): ctx live -> the gate fires, the
+      // compact performs the session replacement.
+      autoCompactByToken(pi, ctx);
+      await tick(25);
+      // Firing 2 (agent_settled shot): the captured ctx is stale now.
+      autoCompactByToken(pi, ctx);
+      await tick(50);
+    } finally {
+      console.error = realError;
+      console.log = realLog;
+      process.off("unhandledRejection", onRejection);
+      process.off("uncaughtException", onException);
+    }
+    // The run survives: nothing escaped the Timeout callback.
+    expect(rejections).toEqual([]);
+    expect(exceptions).toEqual([]);
+    // Firing 1 did the compact; the gate fired exactly once.
+    expect(compactPosts()).toHaveLength(1);
+    expect(
+      logs.filter((l) => l.startsWith("[handoff] auto-compact: ctx")),
+    ).toHaveLength(1);
+    // Firing 2 no-oped: one leg-named skip line, no failure line.
+    expect(
+      errors.filter((l) =>
+        l.startsWith("[handoff] auto-compact timer: stale ctx, skipping"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      errors.filter((l) => l.includes("[handoff] auto-compact timer failed")),
+    ).toHaveLength(0);
+  });
+
   test("pi-compact guard: armed on session_before_compact (reason != manual), settled by session_compact AND session_compact_failed; manual does not arm (2026-11-02 #franky)", async () => {
     // A manual compact is owned by startCompact's own op window: no arm.
     await handlers.session_before_compact?.(

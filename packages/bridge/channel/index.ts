@@ -28,6 +28,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { logTimerGateFailure, staleSkipPrefix } from "./auto-compact";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
 import {
@@ -3275,46 +3276,37 @@ export function autoCompactByToken(
   ctx: ExtensionContext,
 ): void {
   setTimeout(() => {
+    // The gate is async: a throw inside REJECTS the promise, it does
+    // not hit this try/catch (sync throws only). A stale ctx (session
+    // replaced after the timer armed — pi -p always: the session ends
+    // at run end) rejects on the first ctx.cwd read; the gate's guard
+    // catches it and the belt below logs it: nothing escapes the
+    // Timeout callback (2026-10-19 crash; 2026-11-24 T3445, #381).
     try {
-      // The gate is async: a throw inside REJECTS the promise, it does
-      // not hit this try/catch (sync throws only). A stale ctx (session
-      // replaced after the timer armed — pi -p always: the session ends
-      // at run end) rejects on the first ctx.cwd read; unhandled, that
-      // rejection kills `pi -p` at exit (2026-10-19 crash).
-      maybeAutoCompactByToken(pi, ctx).catch((e) => {
-        console.error(
-          "[handoff] auto-compact gate failed:",
-          sanitizeUnknownValue(e),
-        );
-      });
+      maybeAutoCompactByToken(pi, ctx, "timer").catch(logTimerGateFailure);
     } catch (e) {
-      console.error(
-        "[handoff] auto-compact gate failed:",
-        sanitizeUnknownValue(e),
-      );
+      logTimerGateFailure(e);
     }
   }, 0);
 }
 
 /** The actual token-% gate + compact trigger (exported for direct tests).
  *  Failure-tolerant: any error logs and returns — never crashes the
- *  settle path. */
+ *  settle path. `leg` names the caller in the stale-skip line (#381). */
 export async function maybeAutoCompactByToken(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
+  leg: "gate" | "timer" = "gate",
 ): Promise<void> {
   // The settle timer may fire after the session was replaced or reloaded:
   // the ctx.cwd getter throws "stale" then. Guard the first read — a
-  // stale ctx logs one line and skips the gate (the replacement session's
-  // own settle re-runs it).
+  // stale ctx logs one line (leg-named) and skips the gate (the
+  // replacement session's own settle re-runs it).
   let cwd: string;
   try {
     cwd = ctx.cwd;
   } catch (e) {
-    console.error(
-      "[handoff] auto-compact gate: stale ctx, skipping:",
-      sanitizeUnknownValue(e),
-    );
+    console.error(staleSkipPrefix(leg), sanitizeUnknownValue(e));
     return;
   }
   const settings = resolveHandoffSettings(cwd);
