@@ -29,6 +29,7 @@ import {
   getDiscordToken,
 } from "./discord";
 import { fmtTokensLC } from "./format";
+import { applyHandoverCap } from "./handover-cap";
 import {
   docGateCheck,
   formatEntryLine,
@@ -52,8 +53,9 @@ import {
 import { sendLivenessEvent } from "./liveness-event";
 import { REWAKE_LOOKBACK_DEFAULT } from "./restart-queue";
 import { sanitizeUnknownValue } from "./sanitize";
+import { compactionLoopCapBytes } from "./size-caps";
 import { formatTaskLine, loadTasks } from "./tasks";
-import { defaultHome, loadBoard, renderBoard } from "./todos";
+import { boardDocText, defaultHome, loadBoard, renderBoard } from "./todos";
 import { keptTailMessages, msgText, serializeTranscript } from "./transcript";
 import {
   type ChannelConfig,
@@ -716,7 +718,7 @@ const HUMAN_LINE_PREFIX = "HUMAN: ";
 // are kept whole (the active-task framing must survive). Repeated passes
 // converge: an existing marker is stripped before re-cutting, and a
 // 2-content-line body is the fixed point (idempotent).
-function condenseBody(body: string): string {
+export function condenseBody(body: string): string {
   const lines = body.split("\n");
   if (lines.length <= 2) return body;
   const content = lines.filter((l) => l !== CONDENSE_MARKER);
@@ -959,9 +961,10 @@ function liveTodoState(cwd: string): {
   }
 }
 
-/** Rendered board for the doc's State section; "" when none. */
+/** Rendered board for the doc's State section; "" when none. #384
+ *  guard C: the todos field IS the guard-B capped <todo-board> block. */
 function defaultTodoText(cwd: string): string {
-  return liveTodoState(cwd).text ?? "";
+  return boardDocText(cwd);
 }
 /** issue #140: rendered scheduled-task lines (pending + claimed) from the
  *  bridge's task store — the THIRD durable state the old seed and doc
@@ -1058,6 +1061,9 @@ export async function buildHandover(args: BuildHandoverArgs): Promise<string> {
     .map(formatEntryLine);
   let doc = renderDeterministic(state, transcript, header);
   doc = sizeGuard(doc, settings.sizeGuardTokens);
+  // #384 guard C: the write-time cap (K_bytes) + per-section budgets.
+  const cap = compactionLoopCapBytes(safeContextUsage(ctx)?.contextWindow);
+  doc = applyHandoverCap(doc, cap);
   // #380: doc-write gate (deterministic; replaces the warn-only #315
   // transcript-vs-transcript self-check, which counted the transcript
   // against itself and could never see a message that never became a

@@ -31,6 +31,7 @@ import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { logTimerGateFailure, staleSkipPrefix } from "./auto-compact";
 import { BTW_HINT, extractBtwSuffix } from "./btw";
 import { censor } from "./censor";
+import { applyCitationLint } from "./citation-lint";
 import {
   buildInteractionHandler,
   channelError,
@@ -41,6 +42,7 @@ import {
   runShellPassthrough,
   startCompact,
 } from "./commands";
+import { autoCompactGateBlocked, noteAutoCompact } from "./compact-breaker";
 import {
   connectDiscord,
   connectDiscordPresence,
@@ -158,6 +160,7 @@ import {
   clearRotationStaleWatch,
 } from "./rotation-stale";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
+import { setRuntimeContextWindow } from "./size-caps";
 import {
   cancelPendingWakesDetailed,
   collectOrphanTmpFiles,
@@ -179,9 +182,8 @@ import {
   fit,
   isBgCallbackBody,
   loadBoard,
+  loadedBoardContextBlock,
   mergeTodoLines,
-  saveBoard,
-  todoBoardContextBlock,
 } from "./todos";
 import {
   registerChannelSendTool,
@@ -189,6 +191,7 @@ import {
   registerSleepTool,
   registerTaskTool,
   registerTodoTool,
+  saveBoardOrWake,
   syncTodoBoard,
 } from "./tools";
 import { isVoiceAudio, transcribeVoice } from "./transcribe";
@@ -1199,7 +1202,7 @@ async function sendFinalWithFiles(
   files: string[],
   replyTo?: string,
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
-  const md = mdToDiscord(text);
+  const md = mdToDiscord(applyCitationLint(text, ch.id)); // #384 guard E
   if (files.length === 0)
     return sendDiscordMessage(
       ch,
@@ -2785,7 +2788,10 @@ export default function (pi: ExtensionAPI) {
   // deterministic (no LLM call); a throw → undefined → pi falls back to
   // the built-in compact (console.error in the catch below).
   pi.on("session_before_compact", (event, ctx) => {
-    if (event.reason !== "manual") armPiCompact();
+    if (event.reason !== "manual") {
+      armPiCompact();
+      noteAutoCompact(ctx.cwd, lastActiveChannel); // #384 guard D
+    }
     const settings = resolveHandoffSettings(ctx.cwd);
     let percent: number | null = null;
     try {
@@ -3206,9 +3212,7 @@ export function buildChannelContext(
   // channel-ctx block so the model sees it on EVERY run (survives
   // compaction and restarts).
   if (!ch) return block;
-  const board = loadBoard(ch.id);
-  const todoBlock =
-    board && board.todos.length > 0 ? todoBoardContextBlock(board.todos) : "";
+  const todoBlock = loadedBoardContextBlock(ch.id);
   return todoBlock ? `${block}\n\n${todoBlock}` : block;
 }
 
@@ -3316,6 +3320,8 @@ export async function maybeAutoCompactByToken(
   const ch = lastActiveChannel ?? getDefaultChannel(loadChannelConfig(cwd));
   if (ch?.type !== "discord") return;
   if (isCompacting(ch.id) || isPiCompactInFlight()) return;
+  // #384 guard D: compact-loop breaker skip (manual /compact unaffected).
+  if (autoCompactGateBlocked(cwd, ch.id)) return;
   // Handover doc build in flight, or a doc was just written (the fresh window covers the just-seeded session): don't re-compact.
   if (isHandoffInFlight()) return;
   if (isHandoffFreshWindow(settings.storeDir)) return;
@@ -3323,7 +3329,9 @@ export async function maybeAutoCompactByToken(
   if (!ctx.isIdle()) return;
   let percent: number | null = null;
   try {
-    percent = ctx.getContextUsage?.()?.percent ?? null;
+    const usage = ctx.getContextUsage?.() ?? null;
+    setRuntimeContextWindow(usage?.contextWindow ?? null);
+    percent = usage?.percent ?? null;
   } catch {
     percent = null;
   }
@@ -3334,6 +3342,7 @@ export async function maybeAutoCompactByToken(
   );
   const err = await startCompact(pi, { ch }, ctx, true);
   if (err !== null) console.error(`[handoff] auto-compact failed: ${err}`);
+  else noteAutoCompact(cwd, ch); // #384 guard D: rate-breaker event
 }
 
 // ─── Inbound handler ──────────────────────────────────────────────────────
@@ -3522,8 +3531,7 @@ export async function handleInbound(
         };
         board.todos = mergeTodoLines(board.todos, lines);
         board.updatedAt = new Date().toISOString();
-        saveBoard(board);
-        await syncTodoBoard(ch, board);
+        if (await saveBoardOrWake(ch, board)) await syncTodoBoard(ch, board);
       } catch (e) {
         console.error(
           `[todos] worker intake failed: ${sanitizeUnknownValue(e)}`,

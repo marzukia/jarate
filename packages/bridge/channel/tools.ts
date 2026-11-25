@@ -24,12 +24,14 @@ import {
   sendFilesToDiscord,
 } from "./discord";
 import { lastActiveChannel } from "./index";
+import { machine } from "./live";
 import { sanitizeSensitiveText, sanitizeUnknownValue } from "./sanitize";
 import { parseWakeAt, scheduleWake } from "./sleep";
 import { parseTaskSpec, scheduleTask } from "./tasks";
 import {
   loadBoard,
   renderBoard,
+  type SaveBoardResult,
   sanitizeTodos,
   saveBoard,
   type TodoBoard,
@@ -321,7 +323,13 @@ export async function syncTodoBoard(
             `[todos] board anchor gone (10008); re-creating on next sync: ${sanitizeSensitiveText(r.error || "")}`,
           );
           board.boardMessageId = undefined;
-          saveBoard(board);
+          const sr = saveBoard(board);
+          if (!sr.saved) {
+            // #384 guard A: over-cap board — the metadata update does not
+            // persist; the wake line names the trim, the anchor
+            // re-creates on the next under-cap save.
+            if (sr.wakeLine) console.error(`[todos] ${sr.wakeLine}`);
+          }
         } else {
           console.error(
             `[todos] board edit failed: ${sanitizeSensitiveText(r.error || "")}`,
@@ -343,6 +351,31 @@ export async function syncTodoBoard(
   } catch (e) {
     console.error(`[todos] board sync failed: ${sanitizeUnknownValue(e)}`);
   }
+}
+
+/** #384 guard A (worker intake): save the board; on an over-cap save
+ *  the existing board stays UNCHANGED (the verbatim archive + wake line
+ *  are the saveBoard result), the wake line is posted to the channel,
+ *  and false is returned — the caller must NOT sync the rejected board
+ *  to the Discord message. */
+export async function saveBoardOrWake(
+  ch: ChannelConfig,
+  board: TodoBoard,
+): Promise<boolean> {
+  const r = saveBoard(board);
+  if (r.saved) return true;
+  if (r.wakeLine) {
+    console.error(`[todos] ${r.wakeLine}`);
+    await sendDiscordMessage(ch, machine(r.wakeLine)).catch(() => {});
+  }
+  return false;
+}
+
+/** #384 guard A: surface a rejected (over-cap) board save — the
+ *  deterministic wake line to the log (the channel post belongs to the
+ *  call site that owns the channel: the todo tool / worker intake). */
+export function logBoardSaveReject(r: SaveBoardResult): void {
+  if (r.wakeLine) console.error(`[todos] ${r.wakeLine}`);
 }
 
 export function registerTodoTool(
@@ -410,16 +443,29 @@ export function registerTodoTool(
           : {}),
       };
       let stateNote = "";
+      let rejectNote = "";
       try {
-        saveBoard(board);
+        const r = saveBoard(board);
+        if (r.saved) {
+          await syncTodoBoard(ch, board);
+        } else if (r.wakeLine) {
+          // #384 guard A: over-cap save — the existing board is
+          // unchanged, the verbatim archive is written, the wake line
+          // is posted to the channel, and the tool surfaces the
+          // rejection (no silent growth).
+          console.error(`[todos] ${r.wakeLine}`);
+          await sendDiscordMessage(ch, machine(r.wakeLine)).catch(() => {});
+          rejectNote = `todo board rejected: ${r.wakeLine}`;
+        }
       } catch (e) {
         // State write failed — report it but still echo the list so the
         // model keeps its copy.
         stateNote = `\n\n[!] board save failed: ${channelError(e) ?? "error"}`;
+        await syncTodoBoard(ch, board);
       }
-      await syncTodoBoard(ch, board);
       const text =
-        todos.length === 0 ? "todo board cleared" : renderBoard(todos);
+        rejectNote ||
+        (todos.length === 0 ? "todo board cleared" : renderBoard(todos));
       return {
         content: [{ type: "text", text: text + stateNote }],
         details: {},
