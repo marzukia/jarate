@@ -12,8 +12,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { atomicWriteJson } from "./durable-store";
+import { compactionLoopCapBytes } from "./size-caps";
+import { getDefaultChannel, loadChannelConfig } from "./types";
 
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
@@ -89,9 +90,60 @@ export function loadBoard(
   }
 }
 
-/** Save a board atomically (write tmp file in the same dir, rename over). */
-export function saveBoard(board: TodoBoard, home = defaultHome()): void {
-  atomicWriteJson(boardPath(board.channelId, home), board);
+/** Save a board atomically (write tmp file in the same dir, rename over).
+ *
+ * #384 guard A — the write cap: when the serialized board exceeds
+ * MAX_BOARD_BYTES (= K_bytes, derived from the runtime context window),
+ * the board is written VERBATIM to a sibling archive
+ * `<boardfile>.oversize-<UTC stamp>`, the existing board file is left
+ * UNCHANGED, and the result carries the deterministic channel wake line.
+ * Property: a board on disk never exceeds the cap via saveBoard. */
+export interface SaveBoardResult {
+  saved: boolean;
+  /** Serialized UTF-8 byte size. */
+  size: number;
+  /** The derived cap (K_bytes) at save time. */
+  cap: number;
+  /** Set when rejected: the verbatim archive path. */
+  archivePath?: string;
+  /** Set when rejected: the deterministic channel wake line. */
+  wakeLine?: string;
+}
+
+/** Compact UTC stamp for archive names: YYYYMMDD-HHMMSS. */
+export function utcStamp(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+export function saveBoard(
+  board: TodoBoard,
+  home = defaultHome(),
+  now = new Date(),
+): SaveBoardResult {
+  const target = boardPath(board.channelId, home);
+  const json = JSON.stringify(board, null, 2); // atomicWriteJson shape
+  const size = Buffer.byteLength(json, "utf8");
+  const cap = compactionLoopCapBytes(undefined, home);
+  if (size <= cap) {
+    atomicWriteJson(target, board);
+    return { saved: true, size, cap };
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const archivePath = `${target}.oversize-${utcStamp(now)}`;
+  fs.writeFileSync(archivePath, json);
+  const wakeLine = `board_oversize ${board.channelId}: new board ${size} B > cap ${cap} B — archived to ${archivePath}; trim the board`;
+  return { saved: false, size, cap, archivePath, wakeLine };
+}
+
+/** The board file's byte size (0 when absent). Guard B: the render cap
+ *  names the on-disk size in its marker line. */
+export function boardFileSize(channelId: string, home = defaultHome()): number {
+  try {
+    return fs.statSync(boardPath(channelId, home)).size;
+  } catch {
+    return 0;
+  }
 }
 
 /** Remove a channel's board file (no-op when absent). */
@@ -213,10 +265,107 @@ export function renderBoard(todos: Todo[], title = "todos"): string {
 /**
  * <todo-board> LLM context block (re-injected on every inbound run), or
  * "" when the board is empty.
- */
-export function todoBoardContextBlock(todos: Todo[]): string {
+ *
+ * #384 guard B — the render cap: a HARD bound (MAX_BOARD_INJECT_BYTES
+ * = K_bytes) on every injection on every path. saveBoard is bypassable
+ * (direct JSON edits were the actual growth path of the 2026-11-25
+ * incident), so this cap is the real bound. `totalBoardBytes` names the
+ * on-disk size in the marker line. */
+export function todoBoardContextBlock(
+  todos: Todo[],
+  totalBoardBytes = 0,
+  capBytes = compactionLoopCapBytes(),
+): string {
+  return renderBoardBlock(todos, totalBoardBytes, capBytes);
+}
+
+/** Per-item text budget: 2000 chars, truncated with an ellipsis. */
+export const BOARD_INJECT_ITEM_CHAR_CAP = 2000;
+
+/** The guard-B cap marker line (one deterministic line for the whole
+ *  excluded remainder). */
+export function boardCapMarkerLine(
+  excluded: number,
+  totalBoardBytes: number,
+): string {
+  return `… ${excluded} more board items over the inject cap — the board file is ${totalBoardBytes} B, trim it`;
+}
+
+/** The capped <todo-board> block for a channel's on-disk board ("" when
+ *  absent/empty) — the single injection path (inbound channel-ctx and
+ *  the handover doc's State section). */
+export function loadedBoardContextBlock(
+  channelId: string,
+  home = defaultHome(),
+): string {
+  const board = loadBoard(channelId, home);
+  if (!board || board.todos.length === 0) return "";
+  return todoBoardContextBlock(board.todos, boardFileSize(channelId, home));
+}
+
+/** The guard-B capped doc text for a cwd's default channel's board
+ *  ("" when none/empty/broken) — the handover doc's State section.
+ *  One board load; a broken board must not break the doc. */
+export function boardDocText(cwd: string, home = defaultHome()): string {
+  try {
+    const cfg = loadChannelConfig(cwd);
+    const ch = cfg ? getDefaultChannel(cfg) : null;
+    if (!ch) return "";
+    const board = loadBoard(ch.id, home);
+    return board ? boardContextBlock(board, home) : "";
+  } catch {
+    return "";
+  }
+}
+
+/** The guard-B capped block for an already-loaded board ("" when
+ *  empty) — one board load for the doc's State section. */
+function boardContextBlock(board: TodoBoard, home = defaultHome()): string {
+  if (board.todos.length === 0) return "";
+  return todoBoardContextBlock(
+    board.todos,
+    boardFileSize(board.channelId, home),
+  );
+}
+
+/**
+ * Capped <todo-board> block. Per-item text budget 2000 chars (fit);
+ * items in board order until the byte cap; the remainder replaced by
+ * one deterministic marker line. A board that fits renders
+ * byte-identical to the historical (uncapped) output. Property: block
+ * bytes <= cap + fixed overhead (one marker line) for any input. */
+export function renderBoardBlock(
+  todos: Todo[],
+  totalBoardBytes = 0,
+  capBytes = compactionLoopCapBytes(),
+): string {
   if (todos.length === 0) return "";
-  return `<todo-board>\n${todos.map(todoLine).join("\n")}\n</todo-board>`;
+  const itemLines = todos.map((t) =>
+    todoLine({ ...t, content: fit(t.content, BOARD_INJECT_ITEM_CHAR_CAP) }),
+  );
+  const open = "<todo-board>\n";
+  const close = "\n</todo-board>";
+  const kept: string[] = [];
+  let used = Buffer.byteLength(open, "utf8");
+  let stopped = false;
+  for (let i = 0; i < itemLines.length; i++) {
+    const cost =
+      (kept.length > 0 ? 1 : 0) + Buffer.byteLength(itemLines[i], "utf8");
+    // The first item always ships (after the 2000-char clip a single
+    // item is far under any real cap); later items stop at the cap.
+    if (kept.length > 0 && used + cost > capBytes) {
+      stopped = true;
+      break;
+    }
+    kept.push(itemLines[i]);
+    used += cost;
+  }
+  let block = `${open}${kept.join("\n")}${close}`;
+  if (stopped) {
+    const excluded = itemLines.length - kept.length;
+    block = `${open}${[...kept, boardCapMarkerLine(excluded, totalBoardBytes)].join("\n")}${close}`;
+  }
+  return block;
 }
 
 // ─── Worker intake (pi-bg callbacks) ───────────────────────────────────────
