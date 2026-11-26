@@ -29,6 +29,14 @@
  *
  * Single-writer assumption: same as the sleep tool — one pi process per
  * HOME, read-modify-write without a lock.
+ *
+ * Duplicate guard (the 2026-11-26 20-way stacked-cron incident, op order):
+ * a channel may not hold two tasks on the same schedule — a cron with an
+ * identical (cron, tz) pair, or an at-task with an identical fire time.
+ * Scheduling a duplicate RETURNS THE EXISTING TASK instead of adding one,
+ * so a "recreate the timer after a restart" path can never stack again.
+ * This is the code half of the fix; the other half is the fire-time
+ * self-check carried in the task prompt itself.
  */
 import * as path from "node:path";
 
@@ -417,7 +425,29 @@ export function parseTaskSpec(
 
 // ─── Scheduling / lifecycle ────────────────────────────────────────────────
 
-/** Record a task. `nextFireAt` must come from parseTaskSpec. */
+/**
+ * Same-schedule task for this channel: a cron with an identical (cron, tz)
+ * pair, or an at-task with an identical fire time. Any status counts — a
+ * claimed (firing now) twin is still a twin.
+ */
+function findScheduleDuplicate(
+  tasks: ScheduledTask[],
+  channelId: string,
+  spec: TaskSpec,
+): ScheduledTask | undefined {
+  return tasks.find((t) => {
+    if (t.channelId !== channelId || t.kind !== spec.kind) return false;
+    if (spec.kind === "cron")
+      return t.cron === spec.cron && (t.tz ?? "") === (spec.tz ?? "");
+    return t.atMs === spec.atMs;
+  });
+}
+
+/**
+ * Record a task. `nextFireAt` must come from parseTaskSpec. A task with the
+ * same schedule identity in the same channel is returned as-is (its id and
+ * original prompt win) — the store never stacks two tasks on one schedule.
+ */
 export function scheduleTask(opts: {
   channelId: string;
   channelName?: string;
@@ -428,6 +458,9 @@ export function scheduleTask(opts: {
 }): ScheduledTask {
   const home = opts.home ?? defaultHome();
   const now = opts.now ?? Date.now();
+  const tasks = loadTasks(home);
+  const dup = findScheduleDuplicate(tasks, opts.channelId, opts.spec);
+  if (dup) return dup;
   const id = generateStoreId(now);
   const task: ScheduledTask = {
     id,
@@ -443,7 +476,7 @@ export function scheduleTask(opts: {
     task.atMs = opts.spec.atMs;
   if (opts.spec.kind === "cron" && opts.spec.cron) task.cron = opts.spec.cron;
   if (opts.spec.kind === "cron" && opts.spec.tz) task.tz = opts.spec.tz;
-  saveTasks([...loadTasks(home), task], home);
+  saveTasks([...tasks, task], home);
   return task;
 }
 
