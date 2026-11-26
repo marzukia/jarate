@@ -335,6 +335,96 @@ describe("tasks: state file + lifecycle (fake clock, tmp home)", () => {
     });
   });
 
+  test("duplicate schedule identity returns the existing task, never stacks (2026-11-26 stacked-cron incident)", () => {
+    const spec = {
+      kind: "cron" as const,
+      cron: "*/30 * * * *",
+      tz: "Australia/Melbourne",
+      nextFireAt: NOW + 30 * 60000,
+    };
+    const a = scheduleTask({
+      channelId: "ch1",
+      prompt: "pulse v1",
+      spec,
+      home: tmp,
+      now: NOW,
+    });
+    // the "recreate after a restart" path: same channel + same schedule,
+    // different prompt + timestamp -> must NOT add a second task
+    const b = scheduleTask({
+      channelId: "ch1",
+      prompt: "pulse v2 RECREATE (file was wiped, right?)",
+      spec,
+      home: tmp,
+      now: NOW + 1000,
+    });
+    expect(b.id).toBe(a.id);
+    expect(b.prompt).toBe("pulse v1");
+    expect(loadTasks(tmp)).toHaveLength(1);
+
+    // a claimed (firing now) twin is still a twin
+    markTaskClaimed(a.id, NOW + 2000, tmp);
+    const c = scheduleTask({
+      channelId: "ch1",
+      prompt: "pulse v3",
+      spec,
+      home: tmp,
+      now: NOW + 3000,
+    });
+    expect(c.id).toBe(a.id);
+    expect(loadTasks(tmp)).toHaveLength(1);
+
+    // different cron on the same channel = different schedule -> both allowed
+    const other = scheduleTask({
+      channelId: "ch1",
+      prompt: "hourly check",
+      spec: {
+        kind: "cron",
+        cron: "0 * * * *",
+        tz: "Australia/Melbourne",
+        nextFireAt: NOW + 60 * 60000,
+      },
+      home: tmp,
+      now: NOW + 4000,
+    });
+    expect(other.id).not.toBe(a.id);
+    expect(loadTasks(tmp)).toHaveLength(2);
+
+    // same cron, different channel -> both allowed
+    const d = scheduleTask({
+      channelId: "ch2",
+      prompt: "pulse v1",
+      spec,
+      home: tmp,
+      now: NOW + 5000,
+    });
+    expect(d.id).not.toBe(a.id);
+    expect(loadTasks(tmp)).toHaveLength(3);
+
+    // one-shot: identical fire time in the same channel dedupes too
+    const atSpec = {
+      kind: "at" as const,
+      atMs: NOW + 120 * 60000,
+      nextFireAt: NOW + 120 * 60000,
+    };
+    const e = scheduleTask({
+      channelId: "ch1",
+      prompt: "one v1",
+      spec: atSpec,
+      home: tmp,
+      now: NOW + 6000,
+    });
+    const f = scheduleTask({
+      channelId: "ch1",
+      prompt: "one v2",
+      spec: atSpec,
+      home: tmp,
+      now: NOW + 7000,
+    });
+    expect(f.id).toBe(e.id);
+    expect(loadTasks(tmp)).toHaveLength(4);
+  });
+
   test("corrupt or missing file -> empty list", () => {
     expect(loadTasks(tmp)).toHaveLength(0);
     fs.mkdirSync(path.dirname(tasksPath(tmp)), { recursive: true });
